@@ -158,3 +158,10 @@ def test_obs_non_routine_rows_are_excluded(tmp_path: Path) -> None:
     ]
     _write(tmp_path, "us-obs-avail", rows)
     assert c1.build_evidence(tmp_path)["lag_samples_ns"]["obs"] == [7 * _MIN]
+
+
+def test_left_truncation_offsets_are_recorded_per_source(tmp_path: Path) -> None:
+    trunc = c1.build_evidence(tmp_path)["left_truncation_ns"]
+    assert trunc["lav-iem"] == 10 * _MIN
+    assert trunc["mos-gfs"] == 120 * _MIN
+    assert trunc["lamp-mdl"] == trunc["pfm"] == trunc["obs"] == 0

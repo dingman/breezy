@@ -35,7 +35,7 @@ import hashlib
 import os
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -156,6 +156,12 @@ LATE_AFTER_NS: Final[dict[str, int]] = {
 #: A displaced rerun still polls for this long (it starts past the nominal window).
 _LATE_MAX_POLL_NS: Final[int] = 10 * _MINUTE_NS
 _STALE_ALERT_REPEAT_NS: Final[int] = 6 * _HOUR_NS
+#: Polling time with zero ``seen`` rows before a lag leg alerts (per leg cadence, C1 legs only).
+NEVER_SEEN_AFTER_NS: Final[Mapping[str, int]] = {
+    "lav": 3 * _HOUR_NS,
+    "mos": 12 * _HOUR_NS,
+    "obs": 3 * _HOUR_NS,
+}
 _LAMP_RUN_MINUTE_NS: Final[int] = 30 * _MINUTE_NS
 _PFM_REQUEST_BUDGET: Final[int] = 20
 _DEFAULT_NTP_BOUND_MS: Final[int] = 1000  # provisional; frozen in the prereg after B0/A0
@@ -473,24 +479,61 @@ class _Collector:
     # -- alerts ----------------------------------------------------------------------
 
     def refuse_payload(
-        self, station: str, run_ts_ns: int | None, body: bytes, exc: Exception
+        self,
+        station: str,
+        run_ts_ns: int | None,
+        body: bytes,
+        exc: Exception,
+        *,
+        alert_repeat_ns: int | None = None,
     ) -> None:
+        """Ledger the refusal always; alert every time unless ``alert_repeat_ns`` dedupes it."""
         sha = hashlib.sha256(body).hexdigest()
         reason = getattr(exc, "reason", type(exc).__name__)
         self.record_refused(station, run_ts_ns, sha, str(reason))
-        self.ctx.alert("payload_refused", self.source_key, f"{station}: {reason}")
+        now = self.ctx.clock()
+        if alert_repeat_ns is not None:
+            prior = self.ledger.last_alert_ns(self.source_key, "refused_alert")
+            if prior is not None and now - prior < alert_repeat_ns:
+                return
+        delivered = self.ctx.alert("payload_refused", self.source_key, f"{station}: {reason}")
+        if delivered and alert_repeat_ns is not None:
+            self.ledger.record(self.source_key, {"kind": "refused_alert", "fetched_at_ns": now})
 
     def check_stale(self, now_ns: int) -> None:
         last = self.ledger.last_seen_ns(self.source_key)
-        if last is None or now_ns - last <= guards.STALE_AFTER_NS[self.cli_source]:
+        if last is None:
+            self._check_never_seen(now_ns)
             return
+        if now_ns - last <= guards.STALE_AFTER_NS[self.cli_source]:
+            return
+        self._alert_stale(now_ns, f"newest observed run is {(now_ns - last) / _HOUR_NS:.1f} h old")
+
+    def _check_never_seen(self, now_ns: int) -> None:
+        """A leg that polled for its grace period without ever recording a ``seen`` row is broken
+        (wrong label/format/host response, or a pinned minute that never matches)."""
+        grace = NEVER_SEEN_AFTER_NS.get(self.cli_source)
+        if grace is None:
+            return
+        stamps = [
+            int(e["fetched_at_ns"])
+            for e in self.ledger.events(self.source_key)
+            if "fetched_at_ns" in e
+        ]
+        if not stamps:  # the first firing: mark where polling started
+            self.ledger.record(self.source_key, {"kind": "first_poll", "fetched_at_ns": now_ns})
+            return
+        polled_ns = now_ns - min(stamps)
+        if polled_ns >= grace:
+            self._alert_stale(
+                now_ns, f"no run ever observed after {polled_ns / _HOUR_NS:.1f} h of polling"
+            )
+
+    def _alert_stale(self, now_ns: int, detail: str) -> None:
         prior = self.ledger.last_alert_ns(self.source_key)
         if prior is not None and now_ns - prior < _STALE_ALERT_REPEAT_NS:
             return
-        age_h = (now_ns - last) / _HOUR_NS
-        delivered = self.ctx.alert(
-            "stale_source", self.source_key, f"newest observed run is {age_h:.1f} h old"
-        )
+        delivered = self.ctx.alert("stale_source", self.source_key, detail)
         if delivered:  # an undelivered alert is retried next cycle, never deduped away
             self.ledger.record(self.source_key, {"kind": "stale_alert", "fetched_at_ns": now_ns})
 

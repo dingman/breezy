@@ -36,12 +36,16 @@ from breezy.ingest.http import ForbiddenError, RateLimitedError, ServerError, Tr
 from breezy.ingest.us_source_availability import LagPrereg, Observation, available_at
 
 __all__ = [
+    "BACKOFF_KINDS",
+    "BACKOFF_NS",
     "IEM_LEGS",
     "OBS_BACKOFF_NS",
     "OBS_FETCH_LIMIT",
     "OBS_LATE_AFTER_NS",
     "OBS_ROUTINE_MINUTE",
     "OBS_SOURCE_KEY",
+    "OBS_TRANSPORT_FAILURES_TO_BACKOFF",
+    "REFUSAL_ALERT_REPEAT_NS",
     "STATIONS",
     "FetchedPayload",
     "IemLeg",
@@ -75,8 +79,15 @@ OBS_FETCH_LIMIT: Final[int] = 12
 OBS_LATE_AFTER_NS: Final[int] = 35 * _MINUTE_NS
 #: Firings land up to AccuracySec past the nominal slot; the window end tolerates that.
 _OBS_WINDOW_SLACK_NS: Final[int] = 30 * _NS
-#: After a 429 / 5xx / 403 from the observation host the leg stays silent this long.
-OBS_BACKOFF_NS: Final[int] = 30 * _MINUTE_NS
+#: After a 429 / 5xx / 403 from a leg's host the leg stays silent this long.
+BACKOFF_NS: Final[int] = 30 * _MINUTE_NS
+OBS_BACKOFF_NS: Final[int] = BACKOFF_NS
+#: A repeated shape refusal alerts at most this often per leg (each is still ledgered).
+REFUSAL_ALERT_REPEAT_NS: Final[int] = 6 * _HOUR_NS
+#: The errors that stop a pass and start the back-off (IEM and the observation host alike).
+BACKOFF_KINDS: Final[tuple[type[Exception], ...]] = (RateLimitedError, ServerError, ForbiddenError)
+#: Consecutive firings in which every fetch failed (timeout / OSError) before the obs leg backs off.
+OBS_TRANSPORT_FAILURES_TO_BACKOFF: Final[int] = 3
 _OBS_SPACING_S: Final[float] = 1.0  # S2: never two requests for one host within a second
 
 
@@ -219,6 +230,9 @@ def iem_cycle(col: Any, leg: IemLeg, fetch: Callable[[str, int], FetchedPayload]
     """One pass: every (run, station) in an open window with no ``seen`` row is polled once."""
     out = LegOutcome()
     start = col.ctx.clock()
+    if start < _backoff_until(col, leg.source_key):
+        _log(f"{leg.cli} is backing off after a rate-limit or server error; skipping this firing")
+        return out
     for run in pending_runs(leg, start):
         for station in STATIONS:
             if col.ledger.find_seen(leg.source_key, station, run) is not None:
@@ -226,7 +240,8 @@ def iem_cycle(col: Any, leg: IemLeg, fetch: Callable[[str, int], FetchedPayload]
             if _over_budget(col, leg.cli, start):
                 out.deadline = True
                 return out
-            _poll_one(col, leg, fetch, station, run, out)
+            if not _poll_one(col, leg, fetch, station, run, out):
+                return out  # back-off entered: the pass stops
     return out
 
 
@@ -237,22 +252,26 @@ def _poll_one(
     station: str,
     run: int,
     out: LegOutcome,
-) -> None:
+) -> bool:
+    """Poll one (station, run); False when a back-off was entered and the pass must stop."""
     now = col.ctx.clock()
     try:
         payload = fetch(station, run)
     except NotPublishedError:
         col.record_miss(station, run, now)
         out.misses += 1
-        return
+        return True
+    except BACKOFF_KINDS as exc:
+        _enter_backoff(col, leg.source_key, leg.cli, station, exc, col.ctx.clock(), out)
+        return False
     except (TransportError, OSError) as exc:
         _log(f"{leg.cli} {station} fetch failed: {type(exc).__name__}")
         out.errors += 1
-        return
+        return True
     except ValueError as exc:
         col.refuse_payload(station, run, b"", exc)
         out.refused += 1
-        return
+        return True
     event = _seen_event(
         col,
         availability_source=leg.availability_source,
@@ -263,6 +282,7 @@ def _poll_one(
     )
     col.ledger.record(leg.source_key, event)
     out.collected += 1
+    return True
 
 
 # -- routine observations (obs) --------------------------------------------------------------
@@ -297,9 +317,9 @@ def obs_window_start(station: str, now_ns: int) -> int | None:
     return start if now_ns - start <= OBS_LATE_AFTER_NS + _OBS_WINDOW_SLACK_NS else None
 
 
-def _backoff_until(col: Any) -> int:
+def _backoff_until(col: Any, source_key: str) -> int:
     stamps = [
-        int(e["until_ns"]) for e in col.ledger.events(OBS_SOURCE_KEY) if e.get("kind") == "backoff"
+        int(e["until_ns"]) for e in col.ledger.events(source_key) if e.get("kind") == "backoff"
     ]
     return max(stamps, default=0)
 
@@ -314,15 +334,46 @@ def _eligible(col: Any, now_ns: int) -> list[str]:
     return found
 
 
-def _enter_backoff(col: Any, station: str, exc: Exception, now_ns: int, out: LegOutcome) -> None:
-    until = now_ns + OBS_BACKOFF_NS
+def _enter_backoff(
+    col: Any,
+    source_key: str,
+    cli: str,
+    station: str,
+    exc: Exception,
+    now_ns: int,
+    out: LegOutcome,
+) -> None:
+    until = now_ns + BACKOFF_NS
     col.ledger.record(
-        OBS_SOURCE_KEY,
+        source_key,
         {"kind": "backoff", "station": station, "fetched_at_ns": now_ns, "until_ns": until},
     )
-    _log(f"obs {station} {type(exc).__name__}: backing off until {until}")
-    col.ctx.alert("rate_limited", OBS_SOURCE_KEY, f"{station}: {type(exc).__name__}; backing off")
+    _log(f"{cli} {station} {type(exc).__name__}: backing off until {until}")
+    col.ctx.alert("rate_limited", source_key, f"{station}: {type(exc).__name__}; backing off")
     out.errors += 1
+
+
+def _transport_failure_streak(col: Any) -> int:
+    """Consecutive all-failed obs firings recorded since the last success or back-off."""
+    streak = 0
+    for event in col.ledger.events(OBS_SOURCE_KEY):
+        kind = event.get("kind")
+        if kind == "transport_fail":
+            streak += 1
+        elif kind in ("transport_ok", "backoff"):
+            streak = 0
+    return streak
+
+
+def _settle_firing(col: Any, now_ns: int, fetched: int, failed: int, out: LegOutcome) -> None:
+    """Record the firing-level transport outcome; enough failed firings in a row back off."""
+    if failed and not fetched:
+        col.ledger.record(OBS_SOURCE_KEY, {"kind": "transport_fail", "fetched_at_ns": now_ns})
+        if _transport_failure_streak(col) >= OBS_TRANSPORT_FAILURES_TO_BACKOFF:
+            exc = TransportError("consecutive transport failures")
+            _enter_backoff(col, OBS_SOURCE_KEY, "obs", "*", exc, col.ctx.clock(), out)
+    elif fetched and _transport_failure_streak(col):
+        col.ledger.record(OBS_SOURCE_KEY, {"kind": "transport_ok", "fetched_at_ns": now_ns})
 
 
 def obs_cycle(col: Any, fetch: Callable[[str], FetchedPayload]) -> LegOutcome:
@@ -331,25 +382,29 @@ def obs_cycle(col: Any, fetch: Callable[[str], FetchedPayload]) -> LegOutcome:
     a 429 / 5xx / 403 stops the pass and silences the leg for ``OBS_BACKOFF_NS``."""
     out = LegOutcome()
     start = col.ctx.clock()
-    if start < _backoff_until(col):
+    if start < _backoff_until(col, OBS_SOURCE_KEY):
         _log("obs is backing off after a rate-limit or server error; skipping this firing")
         return out
+    fetched = failed = 0
     for index, station in enumerate(_eligible(col, start)):
         if _over_budget(col, "obs", start):
             out.deadline = True
-            return out
+            break
         if index:
             col.ctx.sleep(_OBS_SPACING_S)
         try:
             payload = fetch(station)
-        except (RateLimitedError, ServerError, ForbiddenError) as exc:
-            _enter_backoff(col, station, exc, col.ctx.clock(), out)
+        except BACKOFF_KINDS as exc:
+            _enter_backoff(col, OBS_SOURCE_KEY, "obs", station, exc, col.ctx.clock(), out)
             return out
         except (TransportError, OSError) as exc:
             _log(f"obs {station} fetch failed: {type(exc).__name__}")
             out.errors += 1
+            failed += 1
             continue
+        fetched += 1
         _record_reports(col, station, payload, out)
+    _settle_firing(col, start, fetched, failed, out)
     return out
 
 
@@ -357,7 +412,9 @@ def _record_reports(col: Any, station: str, payload: FetchedPayload, out: LegOut
     try:
         reports = _reports(payload.body)
     except (ValueError, KeyError, TypeError) as exc:
-        col.refuse_payload(station, None, payload.body, exc)
+        col.refuse_payload(
+            station, None, payload.body, exc, alert_repeat_ns=REFUSAL_ALERT_REPEAT_NS
+        )
         out.refused += 1
         return
     for report_ns, raw in reports:

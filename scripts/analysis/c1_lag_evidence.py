@@ -18,9 +18,11 @@ right-censored and dropped. ``lav-iem`` / ``mos-gfs`` / ``obs`` come from the
 availability-only collector legs (``us-lav-iem-avail``, ``us-mos-gfs-avail``,
 ``us-obs-avail``): availability = first-seen, so the lag is first-seen minus the nominal run
 (lav: IEM hourly label; mos: model runtime; obs: routine report time), an upper bound by one poll
-interval (C1-R3). A source whose ledger does not exist yet is listed under ``no_live_path``; it is
-never invented. Read-only on the archive; the output is written atomically and always, even when
-the evidence is insufficient.
+interval (C1-R3). ``left_truncation_ns`` {source: ns} records each leg's polling-start offset after
+the nominal run (lav +10 min, mos +2 h; 0 elsewhere): a run is never polled before it, so lags
+below the offset are truncated and the p50 of those legs is biased high by that floor; the p99
+rule is unaffected (the pins sit far above the offset). A source whose ledger does not exist yet
+is listed under ``no_live_path``; it is XX
 """
 
 from __future__ import annotations
@@ -51,6 +53,15 @@ _LIVE: Final[Mapping[str, tuple[str, str]]] = {
     "pfm": ("us-pfm-afos", "first_seen_ns"),
     "mos-gfs": ("us-mos-gfs-avail", "available_ts_ns"),
     "obs": ("us-obs-avail", "available_ts_ns"),
+}
+#: polling-start offset per source (scripts/collect/us_source_lag_legs.IEM_LEGS start_offset_ns);
+#: lags below it are left-truncated. 0 = polled from the nominal time.
+_LEFT_TRUNCATION_NS: Final[Mapping[str, int]] = {
+    "lamp-mdl": 0,
+    "lav-iem": 10 * _NS_PER_MIN,
+    "pfm": 0,
+    "mos-gfs": 120 * _NS_PER_MIN,
+    "obs": 0,
 }
 #: the runner's level-source keys (multisource_blend_features.LEVEL_SOURCES) -> pin key.
 _LEVEL_KEY: Final[Mapping[str, str]] = {"lamp": "lamp-mdl", "pfm": "pfm", "mos": "mos-gfs"}
@@ -163,6 +174,7 @@ def build_evidence(archive_root: Path) -> dict[str, Any]:
         "measured_days": measured,
         "uncensored": uncensored,
         "censored": censored,
+        "left_truncation_ns": dict(_LEFT_TRUNCATION_NS),
         "no_live_path": no_live,
         "stats": stats,
         "malformed_lines": malformed,
