@@ -491,6 +491,18 @@ def _write_streak(tmp_path: Path, **body: object) -> Path:
     return path
 
 
+def _deny_streak_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make reading the streak file (only) raise EACCES."""
+    real = Path.read_text
+
+    def _read(self: Path, *a: object, **kw: object) -> str:
+        if self.name == STATE_FILENAME:
+            raise OSError(13, "denied")
+        return real(self, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", _read)
+
+
 def _no_pending_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An instance exists (so the run is not a usage error) but nothing counts
     as pending -- the existing exit-3 tests use the same monkeypatch."""
@@ -573,31 +585,29 @@ class TestStreakResetDelivery:
     ) -> None:
         _write_streak(tmp_path, first_deferred_utc=None, consecutive_runs=0)
         _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
-        real = Path.read_text
-
-        def _read(self: Path, *a: object, **kw: object) -> str:
-            if self.name == STATE_FILENAME:
-                raise OSError(13, "denied")
-            return real(self, *a, **kw)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(Path, "read_text", _read)
+        _deny_streak_read(monkeypatch)
         code, out, _err = _pending_run(tmp_path)
         assert code == _EXIT_RESET
         assert "DEFERRAL_STREAK_RESET reason=io_error pending_units=" in out
+
+    def test_oversized_integer_literal_with_pending_exits_5_no_traceback(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / STATE_FILENAME).write_text(
+            '{"version": 1, "consecutive_runs": ' + "9" * 5000 + ', "first_deferred_utc": null, '
+            '"runs_since_alert": -1}'
+        )
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        code, out, _err = _pending_run(tmp_path)
+        assert code == _EXIT_RESET
+        assert "DEFERRAL_STREAK_RESET reason=unparseable pending_units=" in out
 
     def test_load_oserror_nothing_pending_exits_0(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _write_streak(tmp_path, first_deferred_utc=None, consecutive_runs=0)
         _no_pending_fixture(tmp_path, monkeypatch)
-        real = Path.read_text
-
-        def _read(self: Path, *a: object, **kw: object) -> str:
-            if self.name == STATE_FILENAME:
-                raise OSError(13, "denied")
-            return real(self, *a, **kw)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(Path, "read_text", _read)
+        _deny_streak_read(monkeypatch)
         code, out, _err = _run_cli(_tiny_deadline_argv(tmp_path))
         assert code == EXIT_OK
         assert "DEFERRAL_STREAK_RESET" not in out

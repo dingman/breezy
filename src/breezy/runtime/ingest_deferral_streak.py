@@ -82,8 +82,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-#: Bumped only on an incompatible on-disk shape change. `load_state` treats
-#: any other value (including a missing key) as corrupt -- see the module
+#: Bumped only on an incompatible on-disk shape change. `load_state_checked`
+#: treats any other value (including a missing key) as corrupt -- see the module
 #: docstring.
 STATE_VERSION = 1
 
@@ -276,6 +276,10 @@ def load_state_checked(path: Path) -> tuple[DeferralStreakState, StreakResetReas
     except _FieldError as exc:
         reason = StreakResetReason.BAD_FIELD
         field = exc.field
+    except ValueError:
+        # Plain ValueError from json.loads (e.g. an integer literal over the
+        # 4300-digit limit). Last: the specific ValueError subclasses above win.
+        reason = StreakResetReason.UNPARSEABLE
     logger.warning(
         "%s is corrupt or unreadable (reason=%s field=%s); resetting the "
         "ingest deferral-stall streak to a fresh start",
@@ -287,7 +291,11 @@ def load_state_checked(path: Path) -> tuple[DeferralStreakState, StreakResetReas
 
 
 def load_state(path: Path) -> DeferralStreakState:
-    """:func:`load_state_checked` without the reason."""
+    """:func:`load_state_checked` without the reason.
+
+    Retained for compatibility: the ingest run uses the checked variant, but
+    tests and external callers use this signature.
+    """
     return load_state_checked(path)[0]
 
 

@@ -47,9 +47,6 @@ from breezy.runtime.ingest_deferral_streak import (
     StreakResetReason as _StreakResetReason,
 )
 from breezy.runtime.ingest_deferral_streak import (
-    load_state as _load_deferral_streak_state,
-)
-from breezy.runtime.ingest_deferral_streak import (
     load_state_checked as _load_deferral_streak_state_checked,
 )
 from breezy.runtime.ingest_deferral_streak import (
@@ -155,7 +152,6 @@ __all__ = [
     "_is_non_disjoint_refusal",
     "_is_salvage_marked",
     "_ladder_rank",
-    "_load_deferral_streak_state",
     "_load_deferral_streak_state_checked",
     "_mark_converted",
     "_mark_file_converted",

@@ -387,6 +387,17 @@ class TestLoadStateReasons:
             streak_module.StreakResetReason.UNPARSEABLE,
         )
 
+    def test_oversized_integer_literal_is_unparseable_not_a_crash(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text(
+            '{"version": 1, "consecutive_runs": ' + "9" * 5000 + ', "first_deferred_utc": null, '
+            '"runs_since_alert": -1}'
+        )
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.UNPARSEABLE,
+        )
+
     @pytest.mark.parametrize("text", ["[]", json.dumps({"version": 2})])
     def test_unsupported_version(self, tmp_path: Path, text: str) -> None:
         path = tmp_path / STATE_FILENAME
