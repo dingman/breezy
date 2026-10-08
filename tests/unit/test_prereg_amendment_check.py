@@ -519,6 +519,9 @@ def test_payload_key_equal_to_nested_parent_key_is_refused(tmp_path: Path) -> No
 
 _A1_ID = "F5_prereg_v2_A1_floor"
 _A1_FILE = _PLAN / "F5_prereg_v2_amendment_A1.json"
+# The A1 freeze commit and the content_digest recorded in its stamp commit.
+_A1_FROZEN_SHA = "8756dcc42ca40c7d137e20adb49eca38ccd6e5ff"
+_A1_CONTENT_DIGEST = "29bf24ddc24583597a3c8d91e8e41ec07190392820db6d36c320f8b1ad39e674"
 _INPUT_KEYS = frozenset({"sign_rule", "fill_rule", "fee_rule", "void_rule", "truth_sha_rule"})
 _MEASURED_POWER_KEYS = frozenset({"-0.16", "-0.08", "-0.04"})
 
@@ -804,9 +807,9 @@ def test_a2_payload_remains_undefined() -> None:
         assert [d.code for d in defects] == ["PAYLOAD_NOT_YET_DEFINED"]
 
 
-def test_a1_draft_file_matches_r3_and_passes_only_as_draft() -> None:
+def test_a1_file_matches_r3_and_is_frozen() -> None:
     body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
-    assert body["frozen_sha"] == UNFROZEN
+    assert body["frozen_sha"] == _A1_FROZEN_SHA
     assert body["amendment_id"] == _A1_ID
     inputs = body["loss_stop_floor"]["inputs"]
     assert set(inputs) == _INPUT_KEYS
@@ -817,9 +820,22 @@ def test_a1_draft_file_matches_r3_and_passes_only_as_draft() -> None:
     if _is_shallow_repository():
         pytest.skip(_SHALLOW_SKIP)
     chk = _chk()
-    assert chk.validate_amendment(_A1_FILE, draft=True) == []
-    assert chk.main(["--draft", str(_A1_FILE)]) == 0
-    assert chk.main([str(_A1_FILE)]) == 1
+    assert chk.validate_amendment(_A1_FILE, draft=False) == []
+    assert chk.main([str(_A1_FILE)]) == 0
+    assert chk.main(["--draft", str(_A1_FILE)]) != 0
+
+
+def test_F5_prereg_v2_A1_floor_content_digest_pinned() -> None:
+    amendment = json.loads(_A1_FILE.read_text(encoding="utf-8"))
+    assert content_digest(amendment) == _A1_CONTENT_DIGEST
+
+
+@pytest.mark.skipif(_is_shallow_repository(), reason=_SHALLOW_SKIP)
+def test_a1_loads_through_load_verified_amendment() -> None:
+    loaded = _chk().load_verified_amendment(_A1_FILE, _A1_ID)
+    assert loaded["amendment_id"] == _A1_ID
+    assert loaded["loss_stop_floor"]["floor_mode"] == "unreachable_veto"
+    assert loaded["loss_stop_floor"]["c"] is None
 
 
 def _provenance_defects(provenance: Any, *, draft: bool, root: Path | None = None) -> list[Any]:
