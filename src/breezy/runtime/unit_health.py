@@ -7,13 +7,26 @@ One pass, in this order (the snapshot FIRST, so every failure it lists predates 
 3. for each in-scope entry, in journal order: classification record (``O_EXCL``, deduped on
    ``USER_INVOCATION_ID``), the alert (enqueued: the health row has no network), action record;
 4. reconcile every in-scope failed unit of the snapshot against a classification record, with one
-   targeted lookup by ``InvocationID`` when none exists; a unit the journal cannot show is
-   ``journal_blind`` and makes the pass UNKNOWN;
-5. only when every entry has both records: the ``seen`` files, then the cursor LAST.
+   targeted lookup by ``InvocationID`` when none exists; a unit the journal cannot show gets a
+   ``journal_blind`` CRITICAL (enqueued once) and makes the pass UNKNOWN, but once that alert is
+   durably enqueued it no longer holds the cursor back from the other units;
+5. when every entry has both records: the ``seen`` files, then the cursor LAST.
 
-Any systemd or journal error, the 90 s budget, an unreadable fold and an enqueue refusal make the
-pass UNKNOWN: the streak grows, the heartbeat keeps its old ``ts_ns`` and nothing reads as zero
-failures. The health unit changes nothing in systemd and reads none of the trading gates (X-6).
+Delivery is at-least-once. The alert is enqueued BEFORE its action record is written, so a crash
+between the two replays the entry on the next pass and may page twice; it never writes two action
+records and never loses the page.
+
+Any systemd or journal error, the 90 s budget, an unreadable fold, an unreadable class record, a
+store error, unknown ownership and an enqueue refusal make the pass UNKNOWN: the streak grows, the
+heartbeat keeps its old ``ts_ns`` and nothing reads as zero failures. The health unit changes
+nothing in systemd and reads none of the trading gates (X-6).
+
+Known limitation: scope is judged by unit name and, for ``run-*`` transients, by the path
+properties of the show block. A Breezy transient started with a custom ``--unit=`` name that is
+neither ``breezy-*`` nor ``run-*`` is read as foreign (listed under ``foreign_failed``), because
+nothing else about it is visible to the snapshot reads. A ``run-*`` transient that has left the
+snapshot (``--collect``, reset, failed between the snapshot and the journal read) is
+``UNRESOLVED_TRANSIENT``, never foreign.
 """
 
 from __future__ import annotations
@@ -21,14 +34,12 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 
 from breezy.registry.health_model import AlertPayload
-from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, default_alerts_root
-from breezy.runtime.alert_proof import enqueue_alert
 from breezy.runtime.autonomy_sandbox.bus_handoff import (
     BusSnapshot,
     BusSnapshotError,
@@ -39,9 +50,7 @@ from breezy.runtime.unit_health_journal import (
     PER_CALL_CAP_S,
     JournalBatch,
     JournalError,
-    JournalSource,
     SubprocessJournal,
-    run_bounded,
 )
 from breezy.runtime.unit_health_model import (
     FOREIGN_UNIT_PREFIXES,
@@ -49,10 +58,11 @@ from breezy.runtime.unit_health_model import (
     FailureEntry,
     Ownership,
     UnitFacts,
+    WorktreesUnavailable,
     classify,
     facts_from_block,
-    is_explained,
     is_transient,
+    needs_worktrees,
     ownership,
 )
 from breezy.runtime.unit_health_obs import (
@@ -61,17 +71,38 @@ from breezy.runtime.unit_health_obs import (
     UnitObservation,
     parse_observation,
 )
+from breezy.runtime.unit_health_rollup import heartbeat_body, rollup_body, rollup_days
 from breezy.runtime.unit_health_store import (
+    NS,
+    RECENT_INVOCATIONS_KEPT,
     HealthStore,
+    StoreRecordError,
     alerts_delivered,
     day_of_ns,
     day_start_s,
     previous_day,
 )
+from breezy.runtime.unit_health_support import (
+    DRIFT_CRITICAL_FROM,
+    EVENT_JOURNAL_BLIND,
+    DriftFinding,
+    enqueue_health_alert,
+    unexplained_for_day,
+    unit_config_drift,
+)
+from breezy.runtime.unit_health_types import (
+    PRODUCER_STALE_DETECTOR,
+    FoldUnreadable,
+    HostVerdict,
+    NewFailure,
+    PassEnv,
+    PassResult,
+)
 
 __all__ = [
     "DRIFT_CRITICAL_FROM",
     "FOREIGN_UNIT_PREFIXES",
+    "RECENT_INVOCATIONS_KEPT",
     "DriftFinding",
     "FoldUnreadable",
     "HostVerdict",
@@ -87,12 +118,9 @@ __all__ = [
 ]
 
 EVENT_UNIT_FAILED: Final = "unit_health_unit_failed"
-EVENT_JOURNAL_BLIND: Final = "unit_health_journal_blind"
 EVENT_FOLD_UNREADABLE: Final = "fold_unreadable"
 EVENT_CONFIG_DRIFT: Final = "unit_config_drift"
-HEALTH_WRITER: Final = "health"
-#: Row #24: WARN until this date, CRITICAL from it (``detector_catalog``).
-DRIFT_CRITICAL_FROM: Final = "2026-10-16"
+EVENT_UNPARSEABLE: Final = "journal_entry_unparseable"
 #: Units whose resident memory is added back to ``MemAvailable`` (section 3.10.1 item 6). S5 widens
 #: this to the studies holders and own-lock units; the node lives in the supervisor's cgroup.
 MEMORY_ADDBACK_UNITS: Final = frozenset(
@@ -102,118 +130,13 @@ MEMORY_ADDBACK_UNITS: Final = frozenset(
         "breezy-trade-supervisor.service",
     }
 )
-PRODUCER_STALE_DETECTOR: Final = "aut6.producer_stale"
+#: ``systemctl show`` prints an unset ``MemoryCurrent`` as 2**64 - 1.
+_MEMORY_UNSET_FROM: Final = 2**63
 _INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
 _KEY_SAFE: Final = re.compile(r"[^A-Za-z0-9_.-]")
 _HOST: Final = "_host"
-_WORKTREE_TIMEOUT_S: Final = 3.0
-_REPO_ROOT: Final = "/home/jon/breezy"
-_US: Final = 1_000_000
-
-
-class FoldUnreadable(Exception):
-    """The fold could not be read (F4); ``reason`` is ``unreadable`` or ``empty``."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-@dataclass(frozen=True, slots=True)
-class HostVerdict:
-    """A ``#26`` FAIL for the ``_host`` subject; S6 makes it a C4 verdict (the pin lands last)."""
-
-    detector: str
-    outcome: str
-    metrics: Mapping[str, str]
-    ts_ns: int
-
-
-@dataclass(frozen=True, slots=True)
-class DriftFinding:
-    unit: str
-    dropin: str
-    severity: str
-    detail: str
-
-
-@dataclass(frozen=True, slots=True)
-class NewFailure:
-    unit: str
-    invocation_id: str
-    unit_class: str
-    severity: str
-
-
-@dataclass(frozen=True, slots=True)
-class PassResult:
-    pass_result: str  # OK | FINDINGS | UNKNOWN | LOCKED
-    unknown_reasons: tuple[str, ...] = ()
-    failed_units: int | None = None
-    new_failures: tuple[NewFailure, ...] = ()
-    foreign_failed: tuple[str, ...] = ()
-    journal_blind: tuple[str, ...] = ()
-    cursor_reset: bool = False
-    drift: tuple[DriftFinding, ...] = ()
-
-
-def read_meminfo() -> tuple[int, int] | None:
-    """``(MemAvailable, MemTotal)`` in KiB from ``/proc/meminfo``, or ``None`` when unreadable."""
-    try:
-        text = Path("/proc/meminfo").read_text(encoding="ascii")
-    except OSError:
-        return None
-    values = {k: v.split()[0] for k, _, v in (ln.partition(":") for ln in text.splitlines()) if v}
-    try:
-        return int(values["MemAvailable"]), int(values["MemTotal"])
-    except (KeyError, ValueError):
-        return None
-
-
-def default_worktrees() -> tuple[str, ...]:
-    """Paths of ``git worktree list --porcelain`` (read-only); ``()`` when git cannot answer."""
-    result = run_bounded(
-        ["/usr/bin/git", "-C", _REPO_ROOT, "worktree", "list", "--porcelain"], _WORKTREE_TIMEOUT_S
-    )
-    if result.rc != 0 or result.timed_out or result.oversize:
-        return ()
-    return tuple(
-        line[len("worktree ") :].strip()
-        for line in result.stdout.splitlines()
-        if line.startswith("worktree ")
-    )
-
-
-@dataclass
-class PassEnv:
-    store: HealthStore
-    read_snapshot: Callable[[], BusSnapshot]
-    journal: JournalSource
-    alert: Callable[[AlertPayload], bool]
-    delivered: Callable[[str, str], bool]
-    now_ns: Callable[[], int] = time.time_ns
-    monotonic: Callable[[], float] = time.monotonic
-    worktrees: Callable[[], Sequence[str]] = default_worktrees
-    meminfo: Callable[[], tuple[int, int] | None] = read_meminfo
-    fold_probe: Callable[[], None] | None = None
-    host_verdict: Callable[[HostVerdict], None] | None = None
-    #: ``None`` skips the drift check (no committed baseline was readable): inconclusive.
-    committed_dropins: Mapping[str, frozenset[str]] | None = None
-    invocation_id: str = ""
-
-
-# --------------------------------------------------------------------------- production wiring
-
-
-def enqueue_health_alert(alerts_root: Path | None = None) -> Callable[[AlertPayload], bool]:
-    """The health row's alert seam: queue to the outbox as writer ``health`` (X-4, no network)."""
-    root = alerts_root if alerts_root is not None else default_alerts_root()
-    outbox, records = AlertOutbox(root), DeliveryRecordWriter(root)
-
-    def enqueue(payload: AlertPayload) -> bool:
-        return enqueue_alert(payload, writer=HEALTH_WRITER, outbox=outbox, records=records)
-
-    return enqueue
+_LOST_CURSOR_DAYS: Final = 2
+_DAY_S: Final = 86_400
 
 
 def production_env(
@@ -246,42 +169,6 @@ def observe_units(
     return parse_observation(snapshot, now_ns())
 
 
-# --------------------------------------------------------------------------- explained, drift
-
-
-def unexplained_for_day(
-    store: HealthStore, day: str, delivered: Callable[[str, str], bool]
-) -> tuple[str, ...]:
-    """``<unit>__<invocation>`` of every failure of ``day`` lacking a class and a proven action."""
-    names: list[str] = []
-    for body in store.class_records_on(day):
-        unit, invocation = str(body.get("unit")), str(body.get("invocation_id"))
-        if not is_explained(body, store.read_action(unit, invocation), delivered):
-            names.append(f"{unit}__{invocation}")
-    return tuple(sorted(names))
-
-
-def unit_config_drift(
-    blocks: Mapping[str, Mapping[str, str]],
-    committed: Mapping[str, frozenset[str]],
-    *,
-    today: str,
-    critical_from: str = DRIFT_CRITICAL_FROM,
-) -> tuple[DriftFinding, ...]:
-    """Drop-ins in a unit's ``DropInPaths`` that have no committed copy (row #24)."""
-    severity = "CRITICAL" if today >= critical_from else "WARNING"
-    found: list[DriftFinding] = []
-    for unit in sorted(blocks):
-        known = committed.get(unit, frozenset())
-        for path in blocks[unit].get("DropInPaths", "").split():
-            name = path.rsplit("/", 1)[-1]
-            if name not in known:
-                found.append(
-                    DriftFinding(unit, name, severity, f"unit={unit} dropin={name} uncommitted")
-                )
-    return tuple(found)
-
-
 # --------------------------------------------------------------------------- the pass
 
 
@@ -300,6 +187,7 @@ class _Scan:
     foreign: set[str] = field(default_factory=set)
     blind: list[str] = field(default_factory=list)
     touched: dict[str, list[str]] = field(default_factory=dict)
+    days: set[str] = field(default_factory=set)
     failed_owned: int = 0
     batch: JournalBatch | None = None
     cursor_reset: bool = False
@@ -320,6 +208,7 @@ class _Pass:
         self.now = env.now_ns()
         self.today = day_of_ns(self.now)
         self._worktrees: tuple[str, ...] | None = None
+        self._worktrees_failed = False
         self.scan = _Scan()
         self.observation = UnitObservation(0, {}, (), {})
 
@@ -335,17 +224,44 @@ class _Pass:
         if self.env.monotonic() >= self.deadline:
             raise _Budget
 
+    def block(self) -> None:
+        self.scan.blocking = True
+
     # ---- scope
 
-    def ownership_of(self, unit: str, block: Mapping[str, str]) -> Ownership:
+    def ownership_of(self, unit: str, block: Mapping[str, str]) -> Ownership | None:
+        """``None`` when ownership cannot be decided (git cannot list the worktrees)."""
         paths: tuple[str, ...] = ()
-        if unit.startswith("run-"):
+        if needs_worktrees(unit, block):
             if self._worktrees is None:
-                self._worktrees = tuple(self.env.worktrees())
+                if self._worktrees_failed:
+                    return None
+                try:
+                    self._worktrees = tuple(self.env.worktrees(self.allowance()))
+                except WorktreesUnavailable:
+                    self._worktrees_failed = True
+                    self.scan.reasons.append("ownership_unknown")
+                    self.block()
+                    return None
             paths = self._worktrees
         return ownership(unit, block, paths)
 
     # ---- journal
+
+    def fallback_since_s(self, state_ts_ns: int | None) -> int:
+        """Where a re-read starts. A rejected cursor: its own commit time. A lost cursor: the
+        oldest of its surviving timestamp, the oldest unrolled day and today minus two days."""
+        if state_ts_ns is not None:
+            return state_ts_ns // NS
+        floor = day_start_s(self.today) - _LOST_CURSOR_DAYS * _DAY_S
+        candidates = [floor]
+        hint = self.store.cursor_ts_hint()
+        if hint is not None:
+            candidates.append(hint // NS)
+        oldest = self.store.oldest_unrolled_day()
+        if oldest is not None:
+            candidates.append(day_start_s(oldest))
+        return min(candidates)
 
     def read_failures(self) -> JournalBatch:
         state = self.store.read_cursor()
@@ -354,15 +270,18 @@ class _Pass:
             try:
                 return journal.failures(
                     after_cursor=state.cursor,
-                    since_s=None if state.cursor else (state.since_us or 0) // _US,
+                    since_s=None if state.cursor else (state.since_us or 0) // 1_000_000,
                     timeout_s=self.allowance(),
                 )
-            except JournalError:
-                if state.cursor is None:
+            except JournalError as exc:
+                # Only a genuine rejection of the stored cursor falls back; a timeout, an
+                # oversize read or any other failure stays UNKNOWN.
+                if state.cursor is None or not exc.cursor_rejected:
                     raise
-        latest = self.store.latest_rollup_day() or self.today
         batch = journal.failures(
-            after_cursor=None, since_s=day_start_s(latest), timeout_s=self.allowance()
+            after_cursor=None,
+            since_s=self.fallback_since_s(state.ts_ns if state is not None else None),
+            timeout_s=self.allowance(),
         )
         self.store.write_cursor_reset(
             self.today, self.now, "cursor_missing" if state is None else "cursor_rejected"
@@ -385,7 +304,9 @@ class _Pass:
                 return True
         return False
 
-    def class_body(self, entry: FailureEntry, block: Mapping[str, str], day: str) -> dict[str, Any]:
+    def class_body(
+        self, entry: FailureEntry, block: Mapping[str, str], day: str, unresolved: bool
+    ) -> dict[str, Any]:
         facts = facts_from_block(block, entry)
         if entry.unit_result == "timeout":
             seen = self.env.journal.resources_for_invocation(
@@ -407,6 +328,7 @@ class _Pass:
             facts,
             transient=is_transient(entry.unit, block),
             suspect=self.is_repeat(entry, facts, day),
+            unresolved=unresolved,
         )
         return {
             "schema": "unit_health_class/v1",
@@ -430,19 +352,26 @@ class _Pass:
 
     def process_entry(self, entry: FailureEntry) -> None:
         block = self.observation.blocks.get(entry.unit, {})
-        if self.ownership_of(entry.unit, block) is Ownership.FOREIGN:
+        owner = self.ownership_of(entry.unit, block)
+        if owner is None:
+            return
+        if owner is Ownership.FOREIGN:
             self.scan.foreign.add(entry.unit)
             return
         unit, invocation = entry.unit, entry.invocation_id
         day = day_of_ns(entry.ts_us * 1000)
         body = self.store.read_class(unit, invocation)
         if body is None:
-            self.store.write_class(day, unit, invocation, self.class_body(entry, block, day))
+            record = self.class_body(entry, block, day, owner is Ownership.UNRESOLVED)
+            self.store.write_class(day, unit, invocation, record)
             body = self.store.read_class(unit, invocation)
         if body is None:
-            raise _EnqueueFailed
+            raise StoreRecordError("class_record_unreadable")
+        day = str(body.get("day", day))
+        self.scan.days.add(day)
         if not self.store.has_action(unit, invocation):
-            unit_class, severity = str(body["unit_class"]), str(body["severity"])
+            unit_class = str(body.get("unit_class", "UNHEALABLE"))
+            severity = str(body.get("severity", "CRITICAL"))
             detail = f"unit={unit} class={unit_class} result={entry.unit_result}"
             if body.get("warn"):
                 detail += f" {body['warn']}"
@@ -459,7 +388,7 @@ class _Pass:
                 "action": "ALERT",
                 "enqueued_ns": self.env.now_ns(),
             }
-            self.store.write_action(str(body.get("day", day)), unit, invocation, action)
+            self.store.write_action(day, unit, invocation, action)
             self.scan.new_failures.append(NewFailure(unit, invocation, unit_class, severity))
         recent = self.scan.touched.setdefault(unit, [])
         if invocation not in recent:
@@ -468,6 +397,7 @@ class _Pass:
     def commit_finding(self, kind: str, unit: str, key: str, severity: str, detail: str) -> None:
         """One class record and one enqueued alert per ``(unit, key)``, ever."""
         safe = _KEY_SAFE.sub("_", key)
+        self.scan.days.add(self.today)
         self.store.write_class(
             self.today,
             unit,
@@ -509,7 +439,10 @@ class _Pass:
     def reconcile(self) -> None:
         for name in self.observation.failed_names:
             block = self.observation.blocks.get(name, {})
-            if self.ownership_of(name, block) is Ownership.FOREIGN:
+            owner = self.ownership_of(name, block)
+            if owner is None:
+                continue
+            if owner is Ownership.FOREIGN:
                 self.scan.foreign.add(name)
                 continue
             self.scan.failed_owned += 1
@@ -529,8 +462,9 @@ class _Pass:
                 self.process_entry(entry)
 
     def blind(self, unit: str, key: str) -> None:
+        """Page the blind unit once. The pass is UNKNOWN, but once the page is durably enqueued
+        this unit no longer holds the cursor back from the others."""
         self.scan.blind.append(unit)
-        self.scan.blocking = True
         self.commit_finding(
             EVENT_JOURNAL_BLIND, unit, key, "CRITICAL", f"unit={unit} journal_blind"
         )
@@ -542,6 +476,10 @@ class _Pass:
         batch = self.read_failures()
         self.scan.batch = batch
         self.check_budget()
+        for key in batch.unparseable:
+            self.commit_finding(
+                EVENT_UNPARSEABLE, _HOST, key, "CRITICAL", f"journal entry {key} unparseable"
+            )
         for entry in batch.entries:
             self.check_budget()
             self.process_entry(entry)
@@ -577,14 +515,14 @@ class _Pass:
                     EVENT_CONFIG_DRIFT, finding.unit, key, finding.severity, finding.detail
                 )
 
-    def commit_state(self, since_us: int) -> None:
+    def commit_state(self) -> None:
         batch = self.scan.batch
         if batch is None:
             return
         for unit, invocations in sorted(self.scan.touched.items()):
             previous = self.store.read_seen(unit) or {}
             recent = [*previous.get("invocations", []), *invocations]
-            deduped = list(dict.fromkeys(recent))[-32:]
+            deduped = list(dict.fromkeys(recent))[-RECENT_INVOCATIONS_KEPT:]
             self.store.write_seen(
                 unit, {"schema": "unit_health_seen/v1", "unit": unit, "invocations": deduped}
             )
@@ -592,7 +530,7 @@ class _Pass:
         if end is not None:
             self.store.write_cursor(end, self.now, None)
         elif self.store.read_cursor() is None:
-            self.store.write_cursor(None, self.now, since_us)
+            self.store.write_cursor(None, self.now, self.now // 1000)
 
     def sample_memory(self, observation: UnitObservation) -> None:
         meminfo = self.env.meminfo()
@@ -602,43 +540,9 @@ class _Pass:
         addback = 0
         for unit in MEMORY_ADDBACK_UNITS:
             current = observation.blocks.get(unit, {}).get("MemoryCurrent", "")
-            if current.isdigit():
+            if current.isdigit() and int(current) < _MEMORY_UNSET_FROM:
                 addback += int(current) // 1024
         self.store.append_memavail(self.env.now_ns(), available, available + addback)
-
-
-def _heartbeat(env: PassEnv, store: HealthStore, completed: bool, result: str) -> dict[str, Any]:
-    previous = store.read_heartbeat() or {}
-    end = env.now_ns()
-    old_ts = previous.get("ts_ns")
-    old_streak = previous.get("passes_unknown_streak")
-    streak = 0 if completed else (old_streak if isinstance(old_streak, int) else 0) + 1
-    ts_ns = end if completed else (old_ts if isinstance(old_ts, int) else 0)
-    return {
-        "schema": "health_heartbeat/v1",
-        "ts_ns": ts_ns,
-        "last_attempt_ns": end,
-        "invocation_id": env.invocation_id,
-        "pass_result": result,
-        "passes_unknown_streak": streak,
-    }
-
-
-def _rollup(env: PassEnv, day: str, completed: bool, streak: int, scan: _Scan) -> dict[str, Any]:
-    previous = env.store.read_rollup(day) or {}
-    names = unexplained_for_day(env.store, day, env.delivered)
-    foreign = sorted({*previous.get("foreign_failed", []), *scan.foreign})
-    return {
-        "schema": "unit_health_day/v1",
-        "day": day,
-        "unexplained_failed_units": {"count": len(names), "names": list(names)},
-        "foreign_failed": foreign,
-        "passes_completed": int(previous.get("passes_completed", 0)) + int(completed),
-        "passes_unknown": int(previous.get("passes_unknown", 0)) + int(not completed),
-        "max_passes_unknown_streak": max(int(previous.get("max_passes_unknown_streak", 0)), streak),
-        "cursor_reset": bool(previous.get("cursor_reset")) or scan.cursor_reset,
-        "produced_at_ns": env.now_ns(),
-    }
 
 
 def _snapshot(env: PassEnv, now_ns: int) -> tuple[UnitObservation | None, list[str]]:
@@ -652,6 +556,56 @@ def _snapshot(env: PassEnv, now_ns: int) -> tuple[UnitObservation | None, list[s
         return None, ["bus_snapshot_error"]
 
 
+def _scan_guarded(run: _Pass, observation: UnitObservation | None) -> None:
+    scan = run.scan
+    try:
+        if observation is not None:
+            run.run_scan(observation)
+        run.run_extras(observation)
+    except _Budget:
+        scan.reasons.append("pass_budget")
+        run.block()
+    except JournalError as exc:
+        scan.reasons.append(f"journal:{exc.reason}")
+        run.block()
+    except _EnqueueFailed:
+        scan.reasons.append("alert_enqueue_failed")
+        run.block()
+    except StoreRecordError as exc:
+        scan.reasons.append(exc.reason)
+        run.block()
+    except (OSError, KeyError):
+        scan.reasons.append("store_error")
+        run.block()
+
+
+def _finish(env: PassEnv, run: _Pass, unknown: bool, label: str) -> None:
+    """Heartbeat first, then the rollups. A failing write is a reason, never an exception."""
+    scan = run.scan
+    beat = heartbeat_body(env, not unknown, label)
+    try:
+        env.store.write_heartbeat(beat)
+    except OSError:
+        scan.reasons.append("heartbeat_write_failed")
+    try:
+        for day in rollup_days(env, run.today, scan.days):
+            own = day == run.today
+            env.store.write_rollup(
+                day,
+                rollup_body(
+                    env,
+                    day,
+                    own_day=own,
+                    completed=not unknown,
+                    streak=beat["passes_unknown_streak"],
+                    foreign=scan.foreign,
+                    cursor_reset=scan.cursor_reset,
+                ),
+            )
+    except OSError:
+        scan.reasons.append("rollup_write_failed")
+
+
 def run_health_pass(env: PassEnv) -> PassResult:
     """One health pass. Reads systemd only through the bus snapshot, and reads it first."""
     started = env.monotonic()
@@ -663,38 +617,30 @@ def run_health_pass(env: PassEnv) -> PassResult:
         scan = run.scan
         scan.reasons.extend(reasons)
         scan.blocking = bool(reasons)
-        try:
-            if observation is not None:
-                run.run_scan(observation)
-            run.run_extras(observation)
-        except _Budget:
-            scan.reasons.append("pass_budget")
-            scan.blocking = True
-        except JournalError as exc:
-            scan.reasons.append(f"journal:{exc.reason}")
-            scan.blocking = True
-        except _EnqueueFailed:
-            scan.reasons.append("alert_enqueue_failed")
-            scan.blocking = True
+        _scan_guarded(run, observation)
         if scan.blind:
             scan.reasons.append("journal_blind")
         if not scan.blocking and observation is not None:
-            run.commit_state(run.now // 1000)
+            try:
+                run.commit_state()
+            except OSError:
+                scan.reasons.append("store_error")
         unknown = bool(scan.reasons)
-        completed = not unknown
-        if completed and observation is not None:
-            run.sample_memory(observation)
+        if not unknown and observation is not None:
+            try:
+                run.sample_memory(observation)
+            except OSError:
+                scan.reasons.append("store_error")
+                unknown = True
         if unknown:
             label = "UNKNOWN"
         elif scan.new_failures or scan.new_findings or scan.failed_owned:
             label = "FINDINGS"
         else:
             label = "OK"
-        beat = _heartbeat(env, env.store, completed, label)
-        env.store.write_heartbeat(beat)
-        env.store.write_rollup(
-            run.today, _rollup(env, run.today, completed, beat["passes_unknown_streak"], scan)
-        )
+        _finish(env, run, unknown, label)
+        if scan.reasons and label != "UNKNOWN":
+            label = "UNKNOWN"
         return PassResult(
             label,
             tuple(scan.reasons),

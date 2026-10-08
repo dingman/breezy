@@ -99,7 +99,7 @@ RUN_TRANSIENT_SHOW_ARGV: Final[tuple[str, ...]] = (
     "--user",
     "show",
     "-p",
-    "Id,Description,ExecStart,InvocationID,Result,Transient",
+    "Id,Description,ExecStart,WorkingDirectory,InvocationID,Result,Transient",
     "--",
     "run-*.service",
 )

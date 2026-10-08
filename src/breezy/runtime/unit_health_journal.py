@@ -8,6 +8,7 @@ raises ``JournalError``: the pass turns that into UNKNOWN, never into "no failur
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,14 +37,17 @@ _CURSOR_PREFIX: Final = "-- cursor: "
 _INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
 _ENV: Final = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "SYSTEMD_PAGER": ""}
 _CHUNK: Final = 1 << 16
+_REAP_S: Final = 1.0
 
 
 class JournalError(Exception):
     """A journal read failed; ``reason`` is a short code (``rc=1``, ``timed_out`` ...)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, cursor_rejected: bool = False) -> None:
         super().__init__(reason)
         self.reason = reason
+        #: True only when ``journalctl`` exited non-zero while seeking to a stored cursor.
+        self.cursor_rejected = cursor_rejected
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +65,8 @@ Run = Callable[[Sequence[str], float], RunResult]
 class JournalBatch:
     entries: tuple[FailureEntry, ...]
     end_cursor: str | None
+    #: ``sha256(line)[:16]`` of every line that could not be parsed at all (skipped, paged).
+    unparseable: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,8 +101,17 @@ def _kill_group(pid: int) -> None:
         pass  # already gone
 
 
+def _reap(proc: subprocess.Popen[bytes]) -> None:
+    """Kill the whole process group, then reap its leader (bounded)."""
+    _kill_group(proc.pid)
+    try:
+        proc.wait(timeout=_REAP_S)
+    except subprocess.TimeoutExpired:
+        pass  # SIGKILLed: the kernel finishes it; the group is already signalled
+
+
 def run_bounded(argv: Sequence[str], timeout_s: float) -> RunResult:
-    """Run ``argv`` in its own process group; on timeout or oversize output kill the group."""
+    """Run ``argv`` in its own process group; on timeout or oversize output kill and reap it."""
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -109,8 +124,11 @@ def run_bounded(argv: Sequence[str], timeout_s: float) -> RunResult:
         )
     except OSError:
         return RunResult(127, "", False, False)
-    assert proc.stdout is not None
-    fd = proc.stdout.fileno()
+    stream = proc.stdout
+    if stream is None:
+        _reap(proc)
+        return RunResult(127, "", False, False)
+    fd = stream.fileno()
     deadline = time.monotonic() + timeout_s
     chunks: list[bytes] = []
     total = 0
@@ -118,24 +136,22 @@ def run_bounded(argv: Sequence[str], timeout_s: float) -> RunResult:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                _kill_group(proc.pid)
-                proc.wait(timeout=1.0)
+                _reap(proc)
                 return RunResult(-signal.SIGKILL, "", True, False)
             chunk = os.read(fd, _CHUNK)
             if not chunk:
                 break
             total += len(chunk)
             if total > MAX_OUTPUT_BYTES:
-                _kill_group(proc.pid)
-                proc.wait(timeout=1.0)
+                _reap(proc)
                 return RunResult(-signal.SIGKILL, "", False, True)
             chunks.append(chunk)
         rc = proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
     except subprocess.TimeoutExpired:
-        _kill_group(proc.pid)
+        _reap(proc)
         return RunResult(-signal.SIGKILL, "", True, False)
     finally:
-        proc.stdout.close()
+        stream.close()
     return RunResult(rc, b"".join(chunks).decode("utf-8", errors="replace"), False, False)
 
 
@@ -149,8 +165,10 @@ def _checked(result: RunResult) -> str:
     return result.stdout
 
 
-def _failure_entries(text: str) -> tuple[tuple[FailureEntry, ...], str | None]:
+def _failure_entries(text: str) -> tuple[tuple[FailureEntry, ...], str | None, tuple[str, ...]]:
+    """Per-line parsing: a bad line is skipped and reported, it never fails the batch."""
     entries: list[FailureEntry] = []
+    bad: list[str] = []
     end_cursor: str | None = None
     for line in text.splitlines():
         if not line.strip():
@@ -163,8 +181,8 @@ def _failure_entries(text: str) -> tuple[tuple[FailureEntry, ...], str | None]:
             try:
                 entries.append(parse_failure_line(line))
             except ValueError:
-                raise JournalError("parse") from None
-    return tuple(entries), end_cursor
+                bad.append(hashlib.sha256(line.encode()).hexdigest()[:16])
+    return tuple(entries), end_cursor, tuple(bad)
 
 
 def _int_field(raw: dict[str, object], key: str) -> int | None:
@@ -190,8 +208,11 @@ class SubprocessJournal:
         elif since_s is not None:
             argv.append(f"--since=@{since_s}")
         argv.append(f"MESSAGE_ID={MESSAGE_ID_UNIT_FAILED}")
-        entries, end_cursor = _failure_entries(_checked(self._run(argv, timeout_s)))
-        return JournalBatch(entries, end_cursor)
+        result = self._run(argv, timeout_s)
+        if after_cursor is not None and not (result.timed_out or result.oversize or result.rc == 0):
+            raise JournalError(f"rc={result.rc}", cursor_rejected=True)
+        entries, end_cursor, bad = _failure_entries(_checked(result))
+        return JournalBatch(entries, end_cursor, bad)
 
     def failures_for_invocation(
         self, invocation_id: str, *, timeout_s: float
@@ -203,7 +224,7 @@ class SubprocessJournal:
             f"MESSAGE_ID={MESSAGE_ID_UNIT_FAILED}",
             f"USER_INVOCATION_ID={invocation_id}",
         ]
-        entries, _ = _failure_entries(_checked(self._run(argv, timeout_s)))
+        entries, _, _ = _failure_entries(_checked(self._run(argv, timeout_s)))
         return entries
 
     def resources_for_invocation(self, invocation_id: str, *, timeout_s: float) -> Resources | None:

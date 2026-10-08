@@ -36,6 +36,8 @@ MEMAVAIL_INSUFFICIENT: Final = "memavail_samples_insufficient"
 RECENT_INVOCATIONS_KEPT: Final = 32
 CLASS_SUFFIX: Final = "__class.json"
 ACTION_SUFFIX: Final = "__action.json"
+CLASS_SCHEMA: Final = "unit_health_class/v1"
+_KINDS: Final = frozenset({"unit_failure", "finding"})
 _DAY_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
 _DIR_MODE: Final = 0o700
 _RECORD_MODE: Final = 0o444
@@ -119,6 +121,18 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
+class StoreRecordError(Exception):
+    """A record that must exist is unreadable or malformed; ``reason`` is the pass reason."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True, slots=True)
 class CursorState:
     """``cursor`` is the journal position after the last committed entry; with no entry yet,
@@ -188,8 +202,14 @@ class HealthStore:
         return write_once(self.root / day / f"{unit}__{invocation_id}{ACTION_SUFFIX}", body)
 
     def read_class(self, unit: str, invocation_id: str) -> dict[str, Any] | None:
+        """``None`` when absent; ``StoreRecordError`` when present but unreadable or malformed."""
         path = self._find(unit, invocation_id, CLASS_SUFFIX)
-        return read_json(path) if path is not None else None
+        if path is None:
+            return None
+        body = read_json(path)
+        if body is None or body.get("schema") != CLASS_SCHEMA or body.get("kind") not in _KINDS:
+            raise StoreRecordError("class_record_unreadable")
+        return body
 
     def read_action(self, unit: str, invocation_id: str) -> dict[str, Any] | None:
         path = self._find(unit, invocation_id, ACTION_SUFFIX)
@@ -203,9 +223,41 @@ class HealthStore:
         out: list[dict[str, Any]] = []
         for path in sorted((self.root / day).glob(f"*{CLASS_SUFFIX}")):
             body = read_json(path)
-            if body is not None and body.get("kind") == "unit_failure":
+            if body is None or body.get("schema") != CLASS_SCHEMA or body.get("kind") not in _KINDS:
+                unit, _, rest = path.name[: -len(CLASS_SUFFIX)].partition("__")
+                # An unreadable record still counts: it is never explained.
+                out.append(
+                    {
+                        "kind": "unit_failure",
+                        "unit": unit,
+                        "invocation_id": rest,
+                        "unit_class": "UNREADABLE",
+                    }
+                )
+            elif body.get("kind") == "unit_failure":
                 out.append(body)
         return out
+
+    def finding_records_on(self, day: str, finding: str) -> list[dict[str, Any]]:
+        found = (read_json(p) for p in sorted((self.root / day).glob(f"*{CLASS_SUFFIX}")))
+        return [
+            b for b in found if b and b.get("kind") == "finding" and b.get("finding") == finding
+        ]
+
+    def oldest_unrolled_day(self) -> str | None:
+        """The oldest day directory that has records but no ``day_<date>.json`` rollup."""
+        unrolled = [
+            d.name
+            for d in self._days_newest_first()
+            if not (self.root / f"day_{d.name}.json").exists()
+        ]
+        return min(unrolled) if unrolled else None
+
+    def cursor_ts_hint(self) -> int | None:
+        """``ts_ns`` of a cursor file that no longer validates, if it still parses."""
+        raw = read_json(self.root / "cursor.json")
+        ts = raw.get("ts_ns") if raw else None
+        return ts if _is_int(ts) else None
 
     def class_records_for(self, unit: str, day: str) -> list[dict[str, Any]]:
         return [b for b in self.class_records_on(day) if b.get("unit") == unit]
@@ -231,11 +283,13 @@ class HealthStore:
         if raw is None or raw.get("schema") != "health_cursor/v1":
             return None
         cursor, since, ts = raw.get("cursor"), raw.get("since_us"), raw.get("ts_ns")
-        if not isinstance(ts, int) or not (cursor is None or isinstance(cursor, str)):
+        if not isinstance(ts, int) or isinstance(ts, bool):
             return None
-        if cursor is None and not isinstance(since, int):
+        if not (cursor is None or isinstance(cursor, str)):
             return None
-        return CursorState(cursor, since if isinstance(since, int) else None, ts)
+        if cursor is None and not _is_int(since):
+            return None
+        return CursorState(cursor, since if _is_int(since) else None, ts)
 
     def write_cursor(self, cursor: str | None, ts_ns: int, since_us: int | None) -> None:
         body = {

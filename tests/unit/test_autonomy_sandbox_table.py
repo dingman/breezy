@@ -185,7 +185,7 @@ def test_constants_have_the_seam_b_values() -> None:
         "--user",
         "show",
         "-p",
-        "Id,Description,ExecStart,InvocationID,Result,Transient",
+        "Id,Description,ExecStart,WorkingDirectory,InvocationID,Result,Transient",
         "--",
         "run-*.service",
     )

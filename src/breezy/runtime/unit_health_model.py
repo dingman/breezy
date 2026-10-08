@@ -9,6 +9,7 @@ restarts nothing, systemd's own watchdog does).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -67,6 +68,8 @@ class UnitClass(StrEnum):
     TRANSIENT_ADHOC = "TRANSIENT_ADHOC"
     EXPECTED_FAILURE_SUSPECT = "EXPECTED_FAILURE_SUSPECT"
     WATCHDOG = "WATCHDOG"
+    #: A ``run-*`` transient gone from the snapshot (``--collect``, reset, failed in between).
+    UNRESOLVED_TRANSIENT = "UNRESOLVED_TRANSIENT"
 
 
 #: G5, the journal's ``UNIT_RESULT`` to a class. Any other value is UNHEALABLE plus a WARN.
@@ -97,6 +100,12 @@ _CRITICAL: Final = frozenset(
 class Ownership(StrEnum):
     OWNED = "OWNED"
     FOREIGN = "FOREIGN"
+    #: No show block to judge by: treated as ours (WARNING), never as foreign.
+    UNRESOLVED = "UNRESOLVED"
+
+
+class WorktreesUnavailable(Exception):
+    """``git worktree list`` could not answer: ownership of a ``run-*`` unit is unknown."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,10 +158,11 @@ def parse_failure_line(line: str) -> FailureEntry:
         raise ValueError("not a unit-failed entry")
     if not (isinstance(unit, str) and unit and isinstance(result, str) and result):
         raise ValueError("entry lacks USER_UNIT or UNIT_RESULT")
-    if not (isinstance(inv, str) and _INVOCATION_RE.fullmatch(inv)):
-        raise ValueError("entry lacks a valid USER_INVOCATION_ID")
     if not (isinstance(ts, str) and ts.isdigit() and isinstance(cursor, str) and cursor):
         raise ValueError("entry lacks a timestamp or cursor")
+    if not (isinstance(inv, str) and _INVOCATION_RE.fullmatch(inv)):
+        # Never poison the batch: a stable synthetic key, so the entry is still classified.
+        inv = "noinv-" + hashlib.sha256(cursor.encode()).hexdigest()[:16]
     return FailureEntry(unit, inv, result, int(ts), cursor)
 
 
@@ -247,6 +257,7 @@ def classify(
     *,
     transient: bool = False,
     suspect: bool = False,
+    unresolved: bool = False,
 ) -> Classification:
     """The class, detector, action and severity of one unit-failed entry."""
     known = facts if facts is not None else UnitFacts()
@@ -270,23 +281,47 @@ def classify(
         unit_class, severity = UnitClass.EXPECTED_FAILURE_SUSPECT, "WARNING"
     if transient and unit_class not in {UnitClass.OOM, UnitClass.MEMORY_CEILING_SUSPECT}:
         unit_class, severity = UnitClass.TRANSIENT_ADHOC, "WARNING"
+    if unresolved:
+        unit_class, severity = UnitClass.UNRESOLVED_TRANSIENT, "WARNING"
     return Classification(unit_class, detector, action, severity, warn)
 
 
 # --------------------------------------------------------------------------- scope
 
 
+def _run_text(block: Mapping[str, str]) -> str:
+    parts = (block.get(k, "") for k in ("Description", "ExecStart", "WorkingDirectory"))
+    return " ".join(parts).strip()
+
+
+def _in_repo(text: str) -> bool:
+    padded = text + " "
+    return REPO_PREFIX in padded or REPO_PREFIX.rstrip("/") + " " in padded
+
+
+def needs_worktrees(unit: str, block: Mapping[str, str]) -> bool:
+    """Only an undecided ``run-*`` unit with a non-repo path needs the worktree list."""
+    if not _RUN_UNIT_RE.fullmatch(unit) or unit.startswith(FOREIGN_UNIT_PREFIXES):
+        return False
+    text = _run_text(block)
+    return bool(text) and not _in_repo(text)
+
+
 def ownership(unit: str, block: Mapping[str, str], worktrees: Sequence[str]) -> Ownership:
-    """G13: ``breezy-*`` units are ours; a ``run-*`` transient is ours when its Description or
-    ExecStart names the repo path or a listed worktree; everything else is foreign."""
+    """G13: ``breezy-*`` units are ours; a ``run-*`` transient is ours when its Description,
+    ExecStart or WorkingDirectory names the repo path or a listed worktree. With no block (or no
+    path property at all) it is ``UNRESOLVED``, never foreign. Everything else is foreign."""
     if unit.startswith(FOREIGN_UNIT_PREFIXES):
         return Ownership.FOREIGN
     if _BREEZY_UNIT_RE.fullmatch(unit):
         return Ownership.OWNED
     if _RUN_UNIT_RE.fullmatch(unit):
-        text = f"{block.get('Description', '')} {block.get('ExecStart', '')}"
-        roots = (REPO_PREFIX, *(w.rstrip("/") + "/" for w in worktrees if w.strip("/")))
-        if any(root in text for root in roots):
+        text = _run_text(block)
+        if not text:
+            return Ownership.UNRESOLVED
+        padded = text + " "
+        roots = [w.rstrip("/") for w in worktrees if w.strip("/")]
+        if _in_repo(text) or any(r + "/" in padded or r + " " in padded for r in roots):
             return Ownership.OWNED
     return Ownership.FOREIGN
 
@@ -303,7 +338,7 @@ def is_explained(
     """Explained = a classification, a proven action, and never an EXPECTED_FAILURE_SUSPECT."""
     if class_body is None or action_body is None:
         return False
-    if class_body.get("unit_class") == UnitClass.EXPECTED_FAILURE_SUSPECT:
+    if class_body.get("unit_class") in {UnitClass.EXPECTED_FAILURE_SUSPECT, "UNREADABLE"}:
         return False
     event, site = action_body.get("event"), action_body.get("site")
     return isinstance(event, str) and isinstance(site, str) and delivered(event, site)

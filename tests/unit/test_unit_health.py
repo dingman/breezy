@@ -117,7 +117,7 @@ class FakeJournal:
         if self.clock is not None:
             self.clock.advance(self.advance_s)
         if self.fail_first_with_cursor and after_cursor is not None:
-            raise JournalError("rc=1")
+            raise JournalError("rc=1", cursor_rejected=True)
         return JournalBatch(self.entries, self.end_cursor if self.entries else None)
 
     def failures_for_invocation(
@@ -196,6 +196,11 @@ def harness(
         return snap()
 
     jr = journal if journal is not None else FakeJournal(trace, entries=entries, clock=clock)
+    wiring: dict[str, Any] = {
+        "worktrees": lambda timeout_s: (),
+        "meminfo": lambda: (8_000_000, 16_000_000),
+        **extra,
+    }
     env = PassEnv(
         store=store,
         read_snapshot=read_snapshot,
@@ -204,10 +209,8 @@ def harness(
         delivered=lambda event, site: (event, site) in delivered,
         now_ns=clock.wall,
         monotonic=clock.monotonic,
-        worktrees=lambda: (),
-        meminfo=lambda: (8_000_000, 16_000_000),
         invocation_id=inv(0xFEED),
-        **extra,
+        **wiring,
     )
     return Harness(env, store, trace, alerts, jr, clock, delivered)
 
@@ -379,7 +382,7 @@ def test_cursor_reset_falls_back_to_day_start_and_is_journaled(tmp_path: Path) -
     h = harness(tmp_path)
     result = h.run()
     call = h.journal.calls[0]
-    assert (call["after_cursor"], call["since_s"]) == (None, DAY_START_S)
+    assert (call["after_cursor"], call["since_s"]) == (None, DAY_START_S - 2 * 86_400)
     assert result.cursor_reset is True
     assert len(h.store.cursor_reset_records(DAY)) == 1
     day = h.store.read_rollup(DAY)
@@ -547,7 +550,7 @@ def test_snapshot_older_than_75s_is_rejected(tmp_path: Path) -> None:
 
 def test_snapshot_is_the_first_read_of_the_pass(tmp_path: Path) -> None:
     unit = "run-p1-i1.service"
-    block = show_block(unit, Transient="yes", ExecStart=f"{{ path={REPO}/x }}", InvocationID=inv(3))
+    block = show_block(unit, Transient="yes", ExecStart="{ path=/opt/x }", InvocationID=inv(3))
     h = harness(
         tmp_path,
         snapshot=make_snapshot(run_transient=[block], failed=[unit]),
@@ -562,7 +565,7 @@ def test_snapshot_is_the_first_read_of_the_pass(tmp_path: Path) -> None:
         trace.add("meminfo")
         return (1, 2)
 
-    def worktrees() -> tuple[str, ...]:
+    def worktrees(timeout_s: float) -> tuple[str, ...]:
         trace.add("worktrees")
         return ()
 
@@ -596,7 +599,7 @@ def test_failed_unit_missing_from_journal_is_unknown_and_journal_blind(tmp_path:
     assert h.alerts.events == ["unit_health_journal_blind"]
     assert h.alerts.payloads[0].severity == "CRITICAL"
     assert h.trace.events.count("journal:invocation") == 1
-    assert h.store.read_cursor() is None
+    assert h.store.read_cursor() is not None  # a blind unit never stalls the others
     beat = h.store.read_heartbeat()
     assert beat is not None
     assert beat["passes_unknown_streak"] == 1
@@ -786,7 +789,6 @@ def test_subprocess_journal_argv_is_a_list_with_message_id_and_no_shell() -> Non
         RunResult(1, "", False, False),
         RunResult(-9, "", True, False),
         RunResult(0, "", False, True),
-        RunResult(0, "garbage\n", False, False),
     ],
 )
 def test_subprocess_journal_error_modes_raise(result: RunResult) -> None:
