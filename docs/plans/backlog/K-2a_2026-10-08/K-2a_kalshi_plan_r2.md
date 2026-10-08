@@ -1,6 +1,7 @@
 # K-2a plan r2: Kalshi sibling family (desk-only; K-2b runs after programme KILL), 2026-10-08
 
 **Status:** r2 is a complete replacement for r1.
+- **Precedence (r2.1):** where §0–§11 or "Applied with interpretation" conflict with the Convergence amendments or the r2.1 delta at the end, the amendments govern (B1→§8 N-4/N-0; B2→§5 and interpretation 4; B3→§7 WA-4; B4→§4 holdout window; N1–N5 as named; R1–R6 of r2.1).
 - It applies every WA-1 round-1 review item plus the coordinator rulings.
 - Reviewer tags: T = trading-bot-architect, M = prediction-market-reviewer, L = mle-reviewer, A = architect, S = security-reviewer.
 - The planner wrote it read-only and the coordinator transcribed it.
@@ -463,3 +464,61 @@ Happy path: KILL → N-S START → WB-0..WB-10 → goal state.
    - F_K = 2026-10-08 [M7];
    - EXCLUDED defined as Wilson upper < 0.99.
 6. **N-5 loop** is uncapped. T2 did not bound it, and adding a cap would be invention.
+
+---
+## Convergence amendments (BINDING), round 2 architect review, 2026-10-08
+
+**Review outcome.** Verdict NOT-CONVERGED, with 4 blockers. The exact edits below are adopted.
+
+**Already verified.**
+- The M1 arithmetic: zero misses needs n ≥ 381. One miss needs about n ≈ 560.
+- The M2 switch claim: the fixtures show KXHIGHNY switched to TWC between 07-02 and 09-01.
+
+**B1. Goal-state reachability (L-3).** At about 1 event/day/series, n = 381 arrives around July–September 2027 at the earliest.
+- N-4 now reads: "Re-check monthly until ADMITTED or EXCLUDED, or until the series' projected admission date (§3) + 60 days, capped at 2027-12-31. A series that has not admitted by then goes to N-0."
+- The first sentence of N-0 now reads: "Record the evidence; while any series is still HELD under N-4, K-2 stays open as monitoring and does not close."
+- The coordinator records an expectation: N-0 is the likely outcome before late 2027. K-2's near-term value is the monitored accrual and the design itself, not a 2027-Q1 trading start.
+
+**B2. α accounting is enforceable.** This replaces the "α accounting" paragraph in §5.
+- **Kalshi budget.** PROGRAMME_ALPHA_K and RE_ARM_GATING_PROGRAMME_ALPHA_K equal the corresponding PM.us total minus Σ allocated_alpha of the PM.us look-taking records.
+  - That sum is read once from the PM.us ledger, read-only, and frozen in WA-3.
+- **Later PM.us registrations.** Every later PM.us look-taking registration must narrow its allocation via `programme_alpha_override`, by WA-3 ruling.
+- **Combined-budget test.** A Kalshi-side test reads both ledgers. It refuses if combined allocated_alpha exceeds 0.05, or if combined re-arm-gating alpha exceeds 0.025.
+- **Why.** The ledger allocates fixed-slot Bonferroni: `allocated = programme_alpha / MAX_HYPOTHESES` (`hypothesis_ledger.py:1118`), and the budget is counted in slots (`:815-824`). Two ledgers each carrying 0.05 would therefore produce a family-wise error rate (FWER) of 0.10.
+
+**B3. WA-4 design.** This replaces the WA-4 "Chosen" paragraph.
+- Import only the serialisation helpers and schema-version constants from the PM.us module.
+- Define `KalshiHypothesisRecord` with duplicated fields. Its `__post_init__` is keyed on the K constants.
+- Define K-local `programme_budget_remaining`, `register_hypothesis` and `may_gate_re_arm`.
+- A test asserts that Kalshi records validate against the K constants, never against PM.us `MAX_HYPOTHESES`.
+- **Why.** `HypothesisRecord.__post_init__` (`:581-587`) checks `allocated_alpha * MAX_HYPOTHESES(=4) ≤ 0.025`, which would wrongly refuse valid Kalshi records.
+
+**B4. SEARCH and confirmatory holdout are disjoint.**
+- **Holdout window.** In §4 the holdout window becomes "[max(2026-07-01, F_K), F_H)". TWC-era days before F_K are SEARCH-only and are never scored by G2.x.
+- **WA-3 corpus partition.** Add: "SEARCH ∩ confirmatory holdout = ∅, with a test."
+
+**Nits (adopted).**
+- **N1. §3 event classification.** Classify each event as TWC, NWS or UNNAMED from `rules_primary`.
+  - UNNAMED (legacy) and BOTH are excluded from the count and listed.
+  - The series-level `settlement_sources` is current state only and never dates an event.
+- **N2. Projected admission date.** Replace "the date n reaches 381" with "the date the Wilson lower bound would exceed 0.99 given the observed miss count (381 only if zero misses)".
+- **N3. N-1 fallback.** Replace "Try the M1 fallback" with "Try the per-station fallback (drop failing stations, retain passing ones)".
+- **N4. N-5 bound.** Append "The loop is bounded by the §5 horizon; parity not passed by then → N-0."
+- **N5. MAX_VARIANTS_K.** It is fixed in WA-3, with a default proposal of 4 mirroring PM.us.
+
+---
+## r2.1 delta (BINDING): round-3 convergence items, 2026-10-08
+
+- **R1 (precedence).** A precedence line has been added under Status: where the plan body and the amendments disagree, the amendments govern.
+- **R2 (replaces B3's first bullet).** What WA-4 shares with `hypothesis_ledger.py`, and what it duplicates:
+  - Import from it only the schema-version constants and the pure helpers `parse_stratum_filter`, `break_even` and `recompute_mde`.
+  - Duplicate `to_dict`/`from_dict` (`:598`, `:635`) and the read/write functions (`:1355`, `:1373`) for `KalshiHypothesisRecord`.
+  - Use PM.us `read_hypothesis_ledger` only for B2's read-only PM.us total.
+- **R3 (appended to B3).** The parity test is kept. It runs the PM.us registration vectors through the K functions, with the K constants injected as the PM.us values, and the outcomes must be identical.
+- **R4 (appended to B2).**
+  - If the frozen PROGRAMME_ALPHA_K is ≤ 0, or below MAX_HYPOTHESES_K × MAX_VARIANTS_K × 0.003125 (the PM.us `MIN_PER_VARIANT_ALPHA` floor), write a zero-look record and go to N-2.
+  - In §5, "asserted, never re-derived" means asserted from the frozen WA-3 value.
+- **R5 (replaces nit N4).** The N-5 loop is bounded by the N-4 cap (2027-12-31). If parity has not passed by then, go to N-0.
+- **R6 (§3).** In "If every station's date falls past the horizon…" and in "none projectable within the horizon → N-0", "the horizon" now reads "the N-4 cap (2027-12-31)".
+
+**Verdict:** CONVERGED. All six round-3 items were transcribed verbatim from the architect's re-check. K-2a WA-1 is complete. WA-2 to WA-4 are desk documents and come next.
