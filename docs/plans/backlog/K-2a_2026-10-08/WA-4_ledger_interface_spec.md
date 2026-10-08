@@ -1,6 +1,6 @@
 # WA-4: Kalshi hypothesis ledger interface spec (desk spec, lands in WB-4)
 
-**Status:** desk spec written 2026-10-08. **READY**: the architect review returned CHANGES, and the binding amendments W1–W14 at the end of this file are applied.
+**Status:** desk spec written 2026-10-08. **READY**: the architect review returned CHANGES, and the binding amendments W1–W15a at the end of this file are applied and govern.
 
 K-2a touches no file under `src/`, `tests/` or `scripts/`.
 
@@ -412,3 +412,65 @@ Where these amendments conflict with the text above, they govern.
   - R29: `break_even_k` on an exact-cent raw value (θ 0.08, a 0.5 gives fee 0.02 with no bump), and raw = 0 at a ∈ {0, 1}.
   - R30: with `re_arm_alpha ≤ 0`, a re-arm request is zero-look and `may_gate_re_arm_k` returns False.
   - R31 (WB-7b freeze commit): the `K_CONSTANTS` budget values equal the Kalshi PREREG values.
+
+---
+## W15 (BINDING, from WA-3 P4′, 2026-10-08): K computes its own MDE
+
+This supersedes the G1 "adopt `recompute_mde`" decision and the variance-bound part of R7.
+
+**Function.** K defines `recompute_mde_k(*, n_clusters: int, per_variant_alpha: Fraction, power: Fraction) -> Fraction`:
+- MDE_K = √(ln(1/α_v)/(2n)) + √(ln(1/(1−power))/(2n)).
+- It is the Azuma–Hoeffding form, computed in float with a stated tolerance.
+- The record field `mde_at_allocated_alpha` must equal it.
+
+**Import change.** `recompute_mde` is **removed** from the import set in §1.
+
+**Constants.**
+- R7 keeps a POWER cross-set equality test: K power 0.80 equals PM.us `POWER`.
+- `variance_bound` is dropped from `KConstants`.
+- `mde_variance_bound` is retired on K records. It is replaced by `mde_method: Literal["AZUMA_HOEFFDING_DATE_MEAN"]`.
+
+**Parity.** In §10, MDE values are compared only for that field's presence. The numbers differ by design and are listed as `DIVERGENT_BY_DESIGN`.
+
+**New RED tests.**
+- R32: golden values `recompute_mde_k(n=85, α_v=1/120, power=0.8)` ≈ 0.2651, and ≈ 0.1279 at n=365.
+- R33: the record refuses an `mde_at_allocated_alpha` that differs from `recompute_mde_k` beyond tolerance.
+
+## W15a (BINDING, from the architect's W15 confirmation, 2026-10-08)
+
+**Gaps closed:**
+- **F-1.** `recompute_mde_k(*, n_clusters: int, per_variant_alpha: Fraction, power: Fraction) -> float`. Callers pass `per_variant_alpha=Fraction(str(record.per_variant_alpha))`.
+- **F-2.** The tolerance is `mde_tolerance = 1e-4`, absolute: `abs(stated − recomputed) ≤ tol`.
+- **F-3.** Raise ValueError when `n_clusters ≤ 0`, when α_v is not in (0, 1), or when power is not in (0, 1). This mirrors `:870-871`. Zero-look records (α_v = 0) skip the MDE check.
+- **F-4 (coordinator ruling).** The MDE check runs in the **register**, mirroring PM.us `:1123`, not in `__post_init__`. R33 tests it there.
+- **F-5.**
+  - K `from_dict` refuses `mde_variance_bound`.
+  - A K line forged to v3 also fails at PM.us `:650-654`, because `mde_variance_bound` is missing.
+  - R4 and R5 cover both cases.
+
+**Stale text superseded.** Where these conflict with earlier text, these govern:
+1. §1: the `recompute_mde` import row is deleted, and "Deliberately not imported" gains `recompute_mde`. R3 asserts that neither `recompute_mde` nor `VARIANCE_BOUND` is imported.
+2. §2, G1 MDE block: K computes MDE locally with `recompute_mde_k` (W15, WA-3 P4′, Azuma–Hoeffding).
+   - `KConstants` carries `power=0.80`.
+   - A cross-set equality test checks it against PM.us `POWER`.
+   - There is no variance constant.
+3. §4 table:
+   - MDE_MISMATCH_TOLERANCE: mirrored at 1e-4, absolute, applied to `recompute_mde_k`.
+   - VARIANCE_BOUND: **Dropped**, replaced by the record field `mde_method`.
+   - POWER: kept, cross-set equality (R7).
+4. §6: the single call site is `recompute_mde_k(n_clusters=min_climate_day_clusters, …)`.
+5. §3 and W1 key lists:
+   - `mde_method` joins the keys PM.us does not expect.
+   - `mde_variance_bound` joins the keys missing from a forged K line.
+   - `mde_variance_bound` joins the PM.us-only keys that K refuses.
+6. §8 fields:
+   - `mde_variance_bound` is replaced by `mde_method: Literal["AZUMA_HOEFFDING_DATE_MEAN"]`.
+   - `mde_variance_bound_justification` becomes a required, non-null `str`. It records the P4′ Azuma range-1 argument, the predictable-selection condition and the note on deliberate conservatism.
+7. §9 signature: `mde_variance_bound` becomes `mde_method`, and the justification parameter has no default.
+8. §10 and W10 parity:
+   - Parity compares status, allocated, per_variant and is_zero_look. MDE is `DIVERGENT_BY_DESIGN`.
+   - PM.us vectors that raise `UnjustifiedVarianceBoundError` or `MdeMismatchError` are listed as `DIVERGENT_BY_DESIGN` in the W11 table.
+   - `PM_MIRROR` has no `variance_bound` literal.
+9. R7: K `power` equals PM.us `POWER`, and `KConstants` has no `variance_bound` field.
+
+Status: **READY** (the architect confirmed W15 with these edits).
