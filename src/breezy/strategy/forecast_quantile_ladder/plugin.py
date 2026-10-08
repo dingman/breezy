@@ -12,7 +12,8 @@ Registering it is the change that admits the kind (ARCH C6), which WP7/WP8 make.
 
 from typing import Any, ClassVar, Final
 
-from breezy.persistence.autonomy.plugin import Detector, PluginRefused
+from breezy.persistence.autonomy.detector_catalog import CATALOG
+from breezy.persistence.autonomy.plugin import Detector, DetectorKind, PluginRefused
 from breezy.strategy.forecast_quantile_ladder.capture_adapter import (
     CaptureContext,
     FqCaptureAdapter,
@@ -24,6 +25,12 @@ __all__ = ["FQ_COMPOSITION_KIND", "FqNodePlugin", "build_fq_node_plugin"]
 FQ_COMPOSITION_KIND: Final[str] = "forecast_quantile_ladder"
 
 
+#: The NODE_LOCAL ids the catalogue declares: the only detectors a composition may hand the plug-in.
+_NODE_LOCAL_IDS: Final[frozenset[str]] = frozenset(
+    row.id for row in CATALOG if row.kind == "NODE_LOCAL"
+)
+
+
 def _not_provided(member: str) -> PluginRefused:
     return PluginRefused(f"{FQ_COMPOSITION_KIND} does not yet provide {member} (another plan's)")
 
@@ -31,8 +38,13 @@ def _not_provided(member: str) -> PluginRefused:
 class FqNodePlugin:
     refusing: ClassVar[bool] = False
 
-    def __init__(self, capture_adapter: FqCaptureAdapter) -> None:
+    def __init__(
+        self,
+        capture_adapter: FqCaptureAdapter,
+        node_detectors: tuple[Detector, ...] | None = None,
+    ) -> None:
         self._capture_adapter = capture_adapter
+        self._node_detectors = _checked_node_detectors(node_detectors)
 
     @property
     def capture_adapter(self) -> FqCaptureAdapter:
@@ -58,11 +70,40 @@ class FqNodePlugin:
 
     @property
     def detectors(self) -> tuple[Detector, ...]:
-        raise _not_provided("detectors")
+        """The NODE_LOCAL detectors composition handed in (AUT-6); refuses until it does.
+
+        VERDICT detectors are evaluated by the AUT-6 producers from the catalogue, not here.
+        """
+        if self._node_detectors is None:
+            raise _not_provided("detectors")
+        return self._node_detectors
 
     def refit(self, windows: Any) -> Any:
         raise _not_provided("refit")
 
 
-def build_fq_node_plugin(capture_adapter: FqCaptureAdapter) -> FqNodePlugin:
-    return FqNodePlugin(capture_adapter)
+def _checked_node_detectors(
+    detectors: tuple[Detector, ...] | None,
+) -> tuple[Detector, ...] | None:
+    """Validate what composition hands in: catalogued ids, NODE_LOCAL kind, no duplicates.
+
+    Completeness of the NODE_LOCAL set (all five ids present) is WP6's job, not checked here.
+    """
+    if detectors is None:
+        return None
+    seen: set[str] = set()
+    for detector in detectors:
+        if detector.kind is not DetectorKind.NODE_LOCAL:
+            raise PluginRefused(f"{detector.id} is not a NODE_LOCAL detector")
+        if detector.id not in _NODE_LOCAL_IDS:
+            raise PluginRefused(f"{detector.id} is not a catalogued NODE_LOCAL detector")
+        if detector.id in seen:
+            raise PluginRefused(f"duplicate detector {detector.id}")
+        seen.add(detector.id)
+    return detectors
+
+
+def build_fq_node_plugin(
+    capture_adapter: FqCaptureAdapter, node_detectors: tuple[Detector, ...] | None = None
+) -> FqNodePlugin:
+    return FqNodePlugin(capture_adapter, node_detectors)
