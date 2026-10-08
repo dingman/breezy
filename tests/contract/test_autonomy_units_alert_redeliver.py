@@ -188,6 +188,22 @@ _MOUNT_NAMESPACE_DIRECTIVES: Final = (
     "BindPaths",
     "BindReadOnlyPaths",
     "TemporaryFileSystem",
+    "ProtectKernelTunables",
+    "ProtectKernelModules",
+    "ProtectKernelLogs",
+    "ProtectControlGroups",
+    "ProtectProc",
+    "ProcSubset",
+    "MountAPIVFS",
+    "RootDirectory",
+    "RootImage",
+    "ReadWriteDirectories",
+    "ReadOnlyDirectories",
+    "InaccessibleDirectories",
+    "PrivateUsers",
+    "PrivateNetwork",
+    "PrivateIPC",
+    "ProtectHostname",
 )
 
 
