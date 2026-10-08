@@ -58,8 +58,8 @@ def reingest_quarantine(
     would_accept: Counter[str] = Counter()
     # One batch for the run: payloads stay durable, coverage.json is rewritten
     # every COVERAGE_FLUSH_EVERY products and again when the run exits.
-    batch = contextlib.nullcontext() if store is None else store.coverage_batch()
-    with batch:
+    batch = contextlib.nullcontext(None) if store is None else store.coverage_batch()
+    with batch as outcome:
         for entry in _lines(quarantine_dir):
             if only_reasons is not None and entry["reason"] not in only_reasons:
                 skipped["reason_filter"] += 1
@@ -104,6 +104,13 @@ def reingest_quarantine(
             ):
                 report.status = "store_busy"
                 break
+    flushed = 0 if outcome is None else int(outcome.flushed)
+    dropped = 0 if outcome is None else len(outcome.dropped)
+    stranded = [] if outcome is None else list(outcome.stranded)
+    if dropped or stranded:
+        for leg in legs.values():
+            if leg.status == "complete":
+                leg.status = "coverage_incomplete"
     return {
         "mode": "dry_run" if store is None else "apply",
         "quarantine_dir": str(quarantine_dir),
@@ -111,5 +118,10 @@ def reingest_quarantine(
         "still_refused": dict(sorted(still_refused.items())),
         "skipped": dict(sorted(skipped.items())),
         "legs": [leg.to_dict() for leg in legs.values()],
-        "complete": all(leg.status == "complete" for leg in legs.values()),
+        "coverage_flushed": flushed,
+        "coverage_dropped": dropped,
+        "coverage_stranded_sources": stranded,
+        "complete": all(leg.status == "complete" for leg in legs.values())
+        and not dropped
+        and not stranded,
     }

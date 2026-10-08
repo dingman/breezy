@@ -29,11 +29,12 @@ import errno
 import fcntl
 import hashlib
 import json
+import logging
 import os
-import signal
 import threading
+import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -41,6 +42,7 @@ from typing import Any, Final, Protocol
 from breezy.persistence.archive_cache import (
     MANIFEST_VERSION,
     ArchiveCache,
+    ArchiveCacheConcurrentWriterError,
     ArchiveRequest,
     CoverageEntry,
     _atomic_write,
@@ -54,6 +56,8 @@ from breezy.persistence.us_source_request import (
 
 __all__ = [
     "AppendOutcome",
+    "CoverageDrop",
+    "CoverageFlushResult",
     "RevisionPayloadRefusedError",
     "RevisionResult",
     "RevisionStoreBusyError",
@@ -71,6 +75,12 @@ COVERAGE_FLUSH_EVERY: Final[int] = 200
 #: so another process can see them before this one releases collector.lock.
 _JOURNAL_NAME: Final[str] = "coverage.pending.jsonl"
 _SYMLINKED_LOCK_ERRNOS: Final[frozenset[int]] = frozenset({errno.ELOOP, errno.EMLINK})
+#: Non-blocking coverage-lock attempts before a flush leaves the journal in place.
+_COVERAGE_LOCK_ATTEMPTS: Final[int] = 10
+#: Pause between those attempts. 9 * 0.5 s is about five seconds, then we stop.
+_COVERAGE_LOCK_BACKOFF_S: Final[float] = 0.5
+
+logger = logging.getLogger(__name__)
 
 _LEDGER_FIELDS: Final[dict[str, type]] = {
     "base_product": str,
@@ -119,6 +129,23 @@ class RevisionResult:
     request: ArchiveRequest | None
 
 
+@dataclass(frozen=True, slots=True)
+class CoverageDrop:
+    """One journaled key left unpublished. ``reason`` is csv_missing or sha_mismatch."""
+
+    key: str
+    reason: str
+
+
+@dataclass(slots=True)
+class CoverageFlushResult:
+    """What a flush published, refused, or left on disk for a later replay."""
+
+    flushed: int = 0
+    dropped: list[CoverageDrop] = field(default_factory=list)
+    stranded: list[str] = field(default_factory=list)
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -133,29 +160,6 @@ def _manifest_stamp(path: Path) -> tuple[int, int] | None:
     except FileNotFoundError:
         return None
     return (stat.st_mtime_ns, stat.st_size)
-
-
-def _arm_sigterm() -> Callable[[], None] | None:
-    """Turn SIGTERM into SystemExit so a batch ``finally`` can flush.
-
-    The default action kills the process before ``finally`` runs. Ignored
-    SIGTERM stays ignored. Only the main thread can install a handler.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return None
-    previous = signal.getsignal(signal.SIGTERM)
-    if previous == signal.SIG_IGN:
-        return None
-
-    def _handler(signum: int, _frame: object) -> None:
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, _handler)
-
-    def _restore() -> None:
-        signal.signal(signal.SIGTERM, previous)
-
-    return _restore
 
 
 class _BatchedCoverageCache(ArchiveCache):
@@ -175,46 +179,124 @@ class _BatchedCoverageCache(ArchiveCache):
         super().__init__(root, fetch, clock)
         self._stamp: dict[str, tuple[int, int] | None] = {}
         self._journal_stamp: dict[str, tuple[int, int] | None] = {}
-        self._dirty: dict[str, dict[str, CoverageEntry]] = {}
         self._batch_depth = 0
+        self._batch_flushed = 0
+        self._batch_dropped: list[CoverageDrop] = []
+        self._batch_stranded: list[str] = []
 
     @contextlib.contextmanager
-    def coverage_batch(self) -> Iterator[None]:
+    def coverage_batch(self) -> Iterator[CoverageFlushResult]:
         """Write each payload now; rewrite the manifest on a cadence and on the way out.
 
         Each new key is appended to ``coverage.pending.jsonl`` before the unit
         lock is released, so another process dedupes against it. The manifest is
-        rewritten every ``COVERAGE_FLUSH_EVERY`` new keys, when this context
-        exits, and when it is left by an exception or by SIGTERM (delivered as
-        ``SystemExit`` so this ``finally`` runs). A flush drops any pending key
-        whose file is missing or whose digest does not match, then removes the
-        journal. A crash before that rewrite never leaves ``coverage.json``
-        claiming bytes that are not on disk.
+        rewritten every ``COVERAGE_FLUSH_EVERY`` journal lines and when this
+        context exits. A flush drops any pending key whose file is missing or
+        whose digest does not match, logs that drop, and removes the journal
+        only once every journaled key was published or dropped. A crash before
+        that rewrite leaves the journal for the next open to replay. This
+        library does not install a signal handler: SIGTERM and SIGKILL are safe
+        because the journal is the pending set.
         """
         self._batch_depth += 1
-        restore_sigterm = _arm_sigterm() if self._batch_depth == 1 else None
+        if self._batch_depth == 1:
+            self._batch_flushed = 0
+            self._batch_dropped = []
+            self._batch_stranded = []
+        outcome = CoverageFlushResult()
+        pending: BaseException | None = None
         try:
-            yield
+            yield outcome
+        except BaseException as exc:
+            pending = exc
+            raise
         finally:
-            self._batch_depth -= 1
+            outermost = self._batch_depth == 1
             try:
-                if self._batch_depth == 0:
-                    self.flush_coverage()
+                if outermost:
+                    try:
+                        self.flush_coverage()
+                    except Exception:
+                        logger.exception("coverage flush failed; journal left for replay")
+                        if pending is None:
+                            raise
             finally:
-                if restore_sigterm is not None:
-                    restore_sigterm()
+                if outermost:
+                    outcome.flushed = self._batch_flushed
+                    outcome.dropped = list(self._batch_dropped)
+                    outcome.stranded = list(self._batch_stranded)
+                self._batch_depth -= 1
 
-    def flush_coverage(self) -> None:
-        """Fold pending journals into ``coverage.json``. No-op if nothing is pending."""
+    def flush_coverage(self) -> CoverageFlushResult:
+        """Fold every pending journal into ``coverage.json``.
+
+        One source's lock or write failure does not skip the others. Lock
+        exhaustion leaves that journal in place and does not raise. A corrupt
+        journal line, or any other flush error, is raised after the remaining
+        sources have been attempted.
+        """
+        total = CoverageFlushResult()
+        hard: Exception | None = None
         for source in self._pending_sources():
-            fd = self._acquire_lock(self._lock_path(source))
+            fd: int | None = None
             try:
-                self._flush_source(source)
+                fd = self._acquire_coverage_lock(source)
+            except ArchiveCacheConcurrentWriterError:
+                logger.error(
+                    "coverage flush for %s gave up after %d attempts; journal left for replay",
+                    source,
+                    _COVERAGE_LOCK_ATTEMPTS,
+                )
+                total.stranded.append(source)
+                continue
+            try:
+                part = self._flush_source(source)
+            except Exception as exc:
+                logger.exception("coverage flush failed for %s; journal left for replay", source)
+                total.stranded.append(source)
+                if hard is None:
+                    hard = exc
+                continue
+            else:
+                total.flushed += part.flushed
+                total.dropped.extend(part.dropped)
             finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+                if fd is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+        self._tally(total)
+        if hard is not None:
+            raise hard
+        return total
+
+    def _tally(self, part: CoverageFlushResult) -> None:
+        if self._batch_depth <= 0:
+            return
+        self._batch_flushed += part.flushed
+        self._batch_dropped.extend(part.dropped)
+        for source in part.stranded:
+            if source not in self._batch_stranded:
+                self._batch_stranded.append(source)
+
+    def _acquire_coverage_lock(self, source: str) -> int:
+        lock_path = self._lock_path(source)
+        last: ArchiveCacheConcurrentWriterError | None = None
+        for attempt in range(_COVERAGE_LOCK_ATTEMPTS):
+            try:
+                return self._acquire_lock(lock_path)
+            except ArchiveCacheConcurrentWriterError as exc:
+                last = exc
+                if attempt + 1 < _COVERAGE_LOCK_ATTEMPTS:
+                    time.sleep(_COVERAGE_LOCK_BACKOFF_S)
+        if last is None:  # pragma: no cover - attempts is a positive constant
+            raise ArchiveCacheConcurrentWriterError(f"coverage lock loop did not run for {source}")
+        raise last
 
     def _load_source(self, source: str) -> dict[str, CoverageEntry]:
+        # A journal left by a crashed run is replayed before this source is trusted.
+        # An open batch owns its journal; flushing here would take the lock we hold.
+        if self._batch_depth == 0 and self._has_journal(source):
+            self.flush_coverage()
         path = self._manifest_path(source)
         journal = self._journal_path(source)
         stamp = _manifest_stamp(path)
@@ -230,7 +312,10 @@ class _BatchedCoverageCache(ArchiveCache):
         ):
             return cached
         entries = self._read_manifest(path)
-        for key, entry in self._read_journal(source).items():
+        journal_entries, _bad = self._read_journal(source)
+        for key, entry in journal_entries.items():
+            if not self._payload_exists(source, entry):
+                continue
             entries.setdefault(key, entry)
         self._loaded[source] = entries
         self._stamp[source] = stamp
@@ -239,16 +324,9 @@ class _BatchedCoverageCache(ArchiveCache):
 
     def _commit_miss(self, request: ArchiveRequest, body: bytes) -> None:
         if self._batch_depth == 0:
-            journal = self._journal_path(request.source)
-            if journal.is_file() and not journal.is_symlink():
-                fd = self._acquire_lock(self._lock_path(request.source))
-                try:
-                    self._flush_source(request.source)
-                finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
+            if self._has_journal(request.source):
+                self.flush_coverage()
             super()._commit_miss(request, body)
-            self._dirty.pop(request.source, None)
             self._stamp[request.source] = _manifest_stamp(self._manifest_path(request.source))
             self._journal_stamp[request.source] = _manifest_stamp(
                 self._journal_path(request.source)
@@ -279,34 +357,75 @@ class _BatchedCoverageCache(ArchiveCache):
     def _journal_path(self, source: str) -> Path:
         return self._root / source / _JOURNAL_NAME
 
+    def _has_journal(self, source: str) -> bool:
+        path = self._journal_path(source)
+        return path.is_file() and not path.is_symlink()
+
     def _pending_sources(self) -> list[str]:
-        found = {source for source, dirty in self._dirty.items() if dirty}
         root = self._root
-        if root.is_dir() and not root.is_symlink():
-            for child in root.iterdir():
-                if child.is_symlink() or not child.is_dir():
-                    continue
-                journal = child / _JOURNAL_NAME
-                if journal.is_file() and not journal.is_symlink():
-                    found.add(child.name)
+        if not root.is_dir() or root.is_symlink():
+            return []
+        found: list[str] = []
+        for child in root.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if self._has_journal(child.name):
+                found.append(child.name)
         return sorted(found)
 
-    def _read_journal(self, source: str) -> dict[str, CoverageEntry]:
+    def _journal_line_count(self, source: str) -> int:
         path = self._journal_path(source)
         if not path.is_file() or path.is_symlink():
-            return {}
+            return 0
+        with path.open("rb") as handle:
+            return sum(1 for _line in handle)
+
+    def _parse_journal_entry(self, line: str) -> CoverageEntry | None:
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            entry = CoverageEntry.from_dict(raw)
+        except (KeyError, TypeError):
+            return None
+        if not entry.cache_key:
+            return None
+        return entry
+
+    def _read_journal(self, source: str) -> tuple[dict[str, CoverageEntry], int]:
+        """Journal entries plus the count of bad lines.
+
+        A bad trailing line (a crash tore the last append) is logged and counted.
+        A bad line with a later non-empty line is on-disk corruption and raises.
+        """
+        path = self._journal_path(source)
+        if not path.is_file() or path.is_symlink():
+            return {}, 0
+        lines = path.read_text(encoding="utf-8").splitlines()
         found: dict[str, CoverageEntry] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
+        bad = 0
+        for index, line in enumerate(lines):
             if not line:
                 continue
-            try:
-                raw = json.loads(line)
-                entry = CoverageEntry.from_dict(raw) if isinstance(raw, dict) else None
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
-            if entry is not None and entry.cache_key:
+            entry = self._parse_journal_entry(line)
+            if entry is not None:
                 found[entry.cache_key] = entry
-        return found
+                continue
+            bad += 1
+            if all(not later for later in lines[index + 1 :]):
+                logger.warning(
+                    "coverage journal %s: torn trailing line tolerated (bad_lines=%d)",
+                    source,
+                    bad,
+                )
+                continue
+            raise RevisionStoreIntegrityError(
+                f"corrupt coverage journal line {index + 1} for {source}"
+            )
+        return found, bad
 
     def _append_journal_line(self, source: str, entry: CoverageEntry) -> None:
         """Durably record one key before the caller releases the unit lock."""
@@ -347,35 +466,51 @@ class _BatchedCoverageCache(ArchiveCache):
             raise RevisionStoreIntegrityError(f"refusing a symlinked coverage journal at {path}")
         path.unlink(missing_ok=True)
 
-    def _payload_matches(self, source: str, entry: CoverageEntry) -> bool:
-        path = self._root / source / f"{entry.cache_key}.csv"
-        if not path.is_file() or path.is_symlink():
-            return False
-        return hashlib.sha256(path.read_bytes()).hexdigest() == entry.sha256
+    def _payload_path_for(self, source: str, entry: CoverageEntry) -> Path:
+        return self._root / source / f"{entry.cache_key}.csv"
 
-    def _flush_source(self, source: str) -> None:
+    def _payload_exists(self, source: str, entry: CoverageEntry) -> bool:
+        path = self._payload_path_for(source, entry)
+        return path.is_file() and not path.is_symlink()
+
+    def _drop_reason(self, source: str, entry: CoverageEntry) -> str | None:
+        path = self._payload_path_for(source, entry)
+        if path.is_symlink() or not path.is_file():
+            return "csv_missing"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != entry.sha256:
+            return "sha_mismatch"
+        return None
+
+    def _flush_source(self, source: str) -> CoverageFlushResult:
         """Publish pending keys whose files match. Caller holds the coverage lock.
 
         The on-disk manifest wins when it already has a key. A pending entry is
         dropped, not published, when the csv is missing or its digest differs.
+        The journal is removed only when every parsed key was published or dropped.
         """
-        pending = self._read_journal(source)
-        pending.update(self._dirty.get(source) or {})
+        pending, _bad = self._read_journal(source)
+        result = CoverageFlushResult()
         path = self._manifest_path(source)
         base = self._read_manifest(path)
         published = dict(base)
         for key, entry in pending.items():
             if key in base:
                 continue
-            if self._payload_matches(source, entry):
-                published[key] = entry
-        if len(published) != len(base):
+            reason = self._drop_reason(source, entry)
+            if reason is not None:
+                logger.error("coverage drop source=%s key=%s reason=%s", source, key, reason)
+                result.dropped.append(CoverageDrop(key, reason))
+                continue
+            published[key] = entry
+            result.flushed += 1
+        if result.flushed:
             _atomic_write(path, self._encode_manifest(published))
         self._unlink_journal(source)
         self._loaded[source] = published
         self._stamp[source] = _manifest_stamp(path)
         self._journal_stamp[source] = None
-        self._dirty[source] = {}
+        return result
 
     def _commit_batched(self, request: ArchiveRequest, body: bytes) -> None:
         """Payload and journal now, manifest later. Caller holds the coverage lock."""
@@ -388,11 +523,9 @@ class _BatchedCoverageCache(ArchiveCache):
         entry = self._new_entry(request, body)
         entries[request.cache_key()] = entry
         self._loaded[request.source] = entries
-        dirty = self._dirty.setdefault(request.source, {})
-        dirty[entry.cache_key] = entry
         self._append_journal_line(request.source, entry)
-        if len(dirty) >= COVERAGE_FLUSH_EVERY:
-            self._flush_source(request.source)
+        if self._journal_line_count(request.source) >= COVERAGE_FLUSH_EVERY:
+            self._tally(self._flush_source(request.source))
 
 
 class UsSourceRevisionStore:
@@ -512,14 +645,15 @@ class UsSourceRevisionStore:
     # -- the append --------------------------------------------------------
 
     @contextlib.contextmanager
-    def coverage_batch(self) -> Iterator[None]:
+    def coverage_batch(self) -> Iterator[CoverageFlushResult]:
         """Defer this store's ``coverage.json`` rewrite until the batch ends.
 
         Append, quarantine, refusal and dedupe semantics are unchanged. See
-        :meth:`_BatchedCoverageCache.coverage_batch`.
+        :meth:`_BatchedCoverageCache.coverage_batch`. The yielded result is
+        filled in when the outermost batch exits.
         """
-        with self._cache.coverage_batch():
-            yield
+        with self._cache.coverage_batch() as outcome:
+            yield outcome
 
     def append_if_new(
         self,

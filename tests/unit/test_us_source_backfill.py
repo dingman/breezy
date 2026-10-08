@@ -10,6 +10,7 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -181,6 +182,116 @@ def test_reingest_apply_opens_one_coverage_batch(
     assert entered == [1]
     assert report["mode"] == "apply"
     assert report["skipped"] == {"no_issuance": 1}
+
+
+def test_leg_report_counts_coverage_and_a_drop_is_not_complete(tmp_path: Path) -> None:
+    """A csv deleted before the leg's exit flush is counted and the leg is not complete."""
+    clock = _Clock(_utc(9, 12))
+    inner = _store(tmp_path, clock)
+
+    class _DropCsv:
+        def coverage_batch(self) -> Any:
+            return inner.coverage_batch()
+
+        def append_if_new(self, **kwargs: Any) -> Any:
+            result = inner.append_if_new(**kwargs)
+            for payload in (tmp_path / US_PFM_AFOS_SOURCE).glob("*.csv"):
+                payload.unlink()
+            return result
+
+    report = bf.run_pfm_leg(
+        station="KNYC",
+        start=dt.date(2026, 10, 5),
+        end=dt.date(2026, 10, 5),
+        fetch=_Catalog(["051901"]),
+        store=_DropCsv(),  # type: ignore[arg-type]
+        clock_ns=clock,
+        window_ok=lambda _now: True,
+        sleep=_Sleeps(),
+        page_limit=10,
+    )
+
+    assert report.coverage_flushed == 0
+    assert report.coverage_dropped == 1
+    assert report.coverage_stranded_sources == ()
+    assert report.status == "coverage_incomplete"
+    body = report.to_dict()
+    assert body["coverage_flushed"] == 0
+    assert body["coverage_dropped"] == 1
+    assert body["coverage_stranded_sources"] == []
+
+
+def test_successful_leg_records_zero_drops(tmp_path: Path) -> None:
+    report = _leg(tmp_path, _Catalog(["051901"]), end=dt.date(2026, 10, 5), page_limit=10)
+
+    assert report.status == "complete"
+    assert report.coverage_flushed == report.appended == 1
+    assert report.coverage_dropped == 0
+    assert report.to_dict()["coverage_stranded_sources"] == []
+
+
+def test_missing_coverage_batch_warns_once_per_run(caplog: pytest.LogCaptureFixture) -> None:
+    from breezy.persistence.us_source_revision_store import RevisionStoreIntegrityError
+
+    bf._coverage_batch_unavailable_warned = False
+    caplog.set_level(logging.WARNING, logger="us_source_backfill")
+    store = _FailingStore(RevisionStoreIntegrityError("digest not in set"))
+    _leg_with_store(store, _Catalog(["051901"]))
+    _leg_with_store(store, _Catalog(["051901"]))
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "batch" in warnings[0].message.lower()
+
+
+def test_reingest_report_counts_a_stranded_journal_drop(tmp_path: Path) -> None:
+    from us_source_pfm_reingest import reingest_quarantine
+
+    from breezy.persistence.archive_cache import MANIFEST_VERSION, CoverageEntry
+
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    (quarantine / "refusals.jsonl").write_text(
+        json.dumps(
+            {
+                "issued": None,
+                "raw_file": "ab.raw",
+                "reason": "unparsed",
+                "sha256": "ab",
+                "station": "KNYC",
+                "wfo": "OKX",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    archive = tmp_path / "archive"
+    source = archive / US_PFM_AFOS_SOURCE
+    source.mkdir(parents=True)
+    entry = CoverageEntry(
+        cache_key="a" * 64,
+        station="KNYC",
+        product="pfm-r0",
+        window_start=1,
+        window_end=2,
+        rows=1,
+        bytes=1,
+        sha256="b" * 64,
+        fetched_at_ns=1,
+        model="OKX",
+        manifest_version=MANIFEST_VERSION,
+    )
+    (source / "coverage.pending.jsonl").write_text(
+        json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    store = UsSourceRevisionStore(archive, _Clock(_utc(9, 12)))
+
+    report = reingest_quarantine(quarantine, store, sleep=lambda _seconds: None)
+
+    assert report["coverage_flushed"] == 0
+    assert report["coverage_dropped"] == 1
+    assert report["coverage_stranded_sources"] == []
+    assert report["complete"] is False
 
 
 def test_split_products_splits_on_soh_strips_etx_and_drops_empties() -> None:
