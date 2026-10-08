@@ -981,6 +981,16 @@ def test_reachable_floor_is_false_for_an_unloadable_file(tmp_path: Path) -> None
     assert _chk().reachable_floor(tmp_path) is False
 
 
+def test_reachable_floor_is_false_when_loader_raises_key_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise_key_error(_path: Path, _amendment_id: str) -> None:
+        raise KeyError("loss_stop_floor")
+
+    monkeypatch.setattr(_chk(), "load_verified_amendment", _raise_key_error)
+    assert _chk().reachable_floor(tmp_path) is False
+
+
 def test_reachable_floor_is_true_for_a_frozen_sqrt_boundary_fixture(tmp_path: Path) -> None:
     plan_dir = _frozen_sqrt_boundary_plan(tmp_path)
     assert _chk().reachable_floor(plan_dir) is True
