@@ -12,11 +12,16 @@ these tests drive it directly with a hand-advanced clock. Wiring it into
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+import breezy.runtime.ingest_deferral_streak as streak_module
 from breezy.runtime.ingest_deferral_streak import (
     INITIAL_STATE,
     REALERT_EVERY_RUNS,
@@ -229,3 +234,230 @@ class TestAtomicIO:
         with caplog.at_level(_logging.WARNING, logger="breezy.runtime.ingest_deferral_streak"):
             state = load_state(path)
         assert state == INITIAL_STATE
+
+
+# ---------------------------------------------------------------------------
+# DEFER-STREAK-LOAD r2: strict field validation, reason enum, I/O failures.
+# The new API is reached through the module object so a missing name fails
+# the individual test (RED), not the whole file's collection.
+# ---------------------------------------------------------------------------
+
+_LOGGER = "breezy.runtime.ingest_deferral_streak"
+_GOOD_FIRST = _T0.isoformat()
+
+
+def _write_raw(path: Path, **overrides: object) -> None:
+    body: dict[str, object] = {
+        "version": STATE_VERSION,
+        "consecutive_runs": 5,
+        "first_deferred_utc": _GOOD_FIRST,
+        "runs_since_alert": -1,
+    }
+    body.update(overrides)
+    path.write_text(json.dumps(body))
+
+
+_BAD_FIRST = [
+    12345,
+    ["x"],
+    {"a": 1},
+    True,
+    False,
+    0,
+    "",
+    "not-a-date",
+    "2026-09-27T00:00:00",
+]
+_BAD_RUNS = [True, False, 3.5, 1.0, "4", -1, None]
+_BAD_SINCE = [-1000, -2, 16, True, -1.0]
+_CROSS_FIELD = [
+    {"consecutive_runs": 5, "first_deferred_utc": None},
+    {"consecutive_runs": 0, "first_deferred_utc": _GOOD_FIRST},
+]
+_ALL_BAD = (
+    [{"first_deferred_utc": v} for v in _BAD_FIRST]
+    + [{"consecutive_runs": v} for v in _BAD_RUNS]
+    + [{"runs_since_alert": v} for v in _BAD_SINCE]
+    + _CROSS_FIELD
+)
+
+
+def _field_of(override: dict[str, object]) -> str:
+    if "runs_since_alert" in override:
+        return "runs_since_alert"
+    if "consecutive_runs" in override and "first_deferred_utc" in override:
+        return "first_deferred_utc"  # cross-field violations name this field
+    if "consecutive_runs" in override:
+        return "consecutive_runs"
+    return "first_deferred_utc"
+
+
+class TestLoadStateRejectsMalformedFields:
+    @pytest.mark.parametrize("bad", _BAD_FIRST, ids=repr)
+    def test_bad_first_deferred_utc_resets_without_echoing_value(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, bad: object
+    ) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path, first_deferred_utc=bad)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            state, reason = streak_module.load_state_checked(path)
+        assert state == INITIAL_STATE
+        assert reason == streak_module.StreakResetReason.BAD_FIELD
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "corrupt" in message
+        assert "field=first_deferred_utc" in message
+        if isinstance(bad, str) and bad:
+            assert bad not in message
+
+    @pytest.mark.parametrize("bad", _BAD_RUNS, ids=repr)
+    def test_bad_consecutive_runs_resets(self, tmp_path: Path, bad: object) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path, consecutive_runs=bad)
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.BAD_FIELD,
+        )
+
+    @pytest.mark.parametrize("bad", _BAD_SINCE, ids=repr)
+    def test_bad_runs_since_alert_resets(self, tmp_path: Path, bad: object) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path, runs_since_alert=bad)
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.BAD_FIELD,
+        )
+
+    @pytest.mark.parametrize("override", _CROSS_FIELD, ids=repr)
+    def test_cross_field_rule_resets(self, tmp_path: Path, override: dict[str, object]) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path, **override)
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.BAD_FIELD,
+        )
+
+    @pytest.mark.parametrize("override", _ALL_BAD, ids=repr)
+    def test_loaded_state_never_crashes_step(
+        self, tmp_path: Path, override: dict[str, object]
+    ) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path, **override)
+        state = load_state(path)
+        _new, alert_due = step(state, pending=True, now=_T0 + timedelta(hours=2))
+        assert alert_due is False
+
+    def test_every_writer_producible_state_round_trips_unchanged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / STATE_FILENAME
+        state = INITIAL_STATE
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            for i in range(41):
+                state, _ = step(state, pending=True, now=_advance(i))
+                save_state(path, state)
+                assert streak_module.load_state_checked(path) == (state, None)
+            state, _ = step(state, pending=False, now=_advance(41))
+            save_state(path, state)
+            assert streak_module.load_state_checked(path) == (INITIAL_STATE, None)
+        assert caplog.records == []
+
+
+class TestLoadStateReasons:
+    def test_unparseable(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text("{not json")
+        assert streak_module.load_state_checked(path)[1] == (
+            streak_module.StreakResetReason.UNPARSEABLE
+        )
+
+    def test_non_utf8_bytes_are_unparseable(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_bytes(b"\xff\xfe\x00{\x80")
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.UNPARSEABLE,
+        )
+
+    def test_deeply_nested_json_is_unparseable_not_a_crash(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text("[" * 200_000 + "]" * 200_000)
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.UNPARSEABLE,
+        )
+
+    @pytest.mark.parametrize("text", ["[]", json.dumps({"version": 2})])
+    def test_unsupported_version(self, tmp_path: Path, text: str) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text(text)
+        assert streak_module.load_state_checked(path)[1] == (
+            streak_module.StreakResetReason.UNSUPPORTED_VERSION
+        )
+
+    def test_missing_field(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text(
+            json.dumps(
+                {"version": STATE_VERSION, "consecutive_runs": 0, "first_deferred_utc": None}
+            )
+        )
+        assert streak_module.load_state_checked(path)[1] == (
+            streak_module.StreakResetReason.MISSING_FIELD
+        )
+
+    def test_read_oserror_is_io_error_not_a_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / STATE_FILENAME
+        _write_raw(path)
+
+        def _boom(self: Path, *a: object, **kw: object) -> str:
+            raise OSError(errno.EIO, "boom")
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+        assert streak_module.load_state_checked(path) == (
+            INITIAL_STATE,
+            streak_module.StreakResetReason.IO_ERROR,
+        )
+
+    def test_missing_file_is_a_silent_fresh_start(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = streak_module.load_state_checked(tmp_path / STATE_FILENAME)
+        assert result == (INITIAL_STATE, None)
+        assert caplog.records == []
+
+    def test_non_bad_field_reasons_log_field_dash(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / STATE_FILENAME
+        path.write_text("{not json")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            streak_module.load_state_checked(path)
+        assert "field=-" in caplog.records[0].getMessage()
+
+    def test_loader_never_returns_save_failed(self, tmp_path: Path) -> None:
+        path = tmp_path / STATE_FILENAME
+        reasons = set()
+        for text in ("{x", "[]", "{}", json.dumps({"version": 1})):
+            path.write_text(text)
+            reasons.add(streak_module.load_state_checked(path)[1])
+        _write_raw(path, consecutive_runs=True)
+        reasons.add(streak_module.load_state_checked(path)[1])
+        assert streak_module.StreakResetReason.SAVE_FAILED not in reasons
+
+
+class TestSaveStateFailure:
+    def test_failed_replace_reraises_and_leaves_no_tmp_orphan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _boom(src: object, dst: object) -> None:
+            raise OSError(errno.ENOSPC, "full")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(OSError) as info:
+            save_state(tmp_path / STATE_FILENAME, INITIAL_STATE)
+        assert info.value.errno == errno.ENOSPC
+        assert [p.name for p in tmp_path.iterdir()] == []

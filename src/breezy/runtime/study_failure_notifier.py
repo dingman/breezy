@@ -85,6 +85,7 @@ from breezy.runtime.health import (
 from breezy.runtime.quote_tape_exit_codes import (
     EXIT_CONVERSION_FAILED,
     EXIT_DEFERRAL_STALLED,
+    EXIT_DEFERRAL_STREAK_RESET,
     EXIT_USAGE,
 )
 from breezy.runtime.quote_tape_exit_codes import PROGRAM as _QUOTE_TAPE_INGEST_PROGRAM
@@ -149,6 +150,7 @@ _QUOTE_TAPE_INGEST_EXIT_NAMES: Final[Mapping[int, str]] = {
     EXIT_USAGE: "USAGE",
     EXIT_CONVERSION_FAILED: "CONVERSION_FAILED",
     EXIT_DEFERRAL_STALLED: "DEFERRAL_STALLED",
+    EXIT_DEFERRAL_STREAK_RESET: "DEFERRAL_STREAK_RESET",
 }
 
 

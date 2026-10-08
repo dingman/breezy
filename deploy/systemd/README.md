@@ -668,11 +668,20 @@ conversion path (never earning the blanket `.converted-<type>` marker --
 see the 6b memo section above, and the three known 09-27 instances) would
 count as pending on every single run and alert forever.
 
-A missing, corrupt, or unknown-version streak file resets to a fresh
-streak with one WARNING, never a fabricated "already stalled" state: losing
-history only delays a real stall's next alert by at most one stall window,
-while treating garbage as "already alerted" could suppress every future
-alert instead. A `--dry-run` never reads or writes the streak file.
+A missing streak file starts a fresh streak silently. An unreadable,
+corrupt, unknown-version, or field-invalid streak file also resets to a
+fresh streak (one value-free WARNING), never a fabricated "already stalled"
+state: losing history only delays a real stall's next alert by at most one
+stall window, while treating garbage as "already alerted" could suppress
+every future alert instead. If that reset (or a failed save of the streak
+file) happens on a run with work pending, the run also prints
+`DEFERRAL_STREAK_RESET reason=<io_error|unparseable|unsupported_version|missing_field|bad_field|save_failed>`
+and exits 5 so `OnFailure=` delivers it (exit 3/4 outrank 5; their lines
+still print). With nothing pending it is the WARNING only. The off-box
+payload is the same closed-enum `study_unit_failed` for every exit; the
+name `DEFERRAL_STREAK_RESET` appears in the notifier's journal line, and
+delivery of the payload itself is journalled and durably queued by the alert
+sink (AUT-6 WP1). A `--dry-run` never reads or writes the streak file.
 
 ---
 

@@ -230,11 +230,15 @@ conversion failure                read (see "Per-file conversion" above)
 Deferral-stall alert             4  pending work deferred >= 4 consecutive
 (EDGE-6 6f)                        runs AND >= 60 minutes (see
                                    :mod:`breezy.runtime.ingest_deferral_streak`)
+Streak lost / unsaveable         5  pending work AND the streak state file was
+(DEFER-STREAK-LOAD)                unreadable, corrupt, invalid, or could not
+                                   be saved (``DEFERRAL_STREAK_RESET``)
 ===========================  ====  ==========================================
 
 Exit-code precedence when more than one condition applies on the SAME run
 (EDGE-6 6f, C-5): usage (2) beats a conversion failure (3), which beats a
-deferral-stall alert (4), which beats a clean run (0). A conversion
+deferral-stall alert (4), which beats a lost/unsaveable streak with work
+pending (5), which beats a clean run (0). A conversion
 failure with pending work also stalled still exits 3 -- but the
 ``DEFERRAL_STALLED`` line still prints in that invocation's journal, so
 ``OnFailure=`` fires exactly once and the reason is visible either way (see
@@ -265,6 +269,7 @@ from breezy.runtime.quote_tape_ingest_core import (
     DEFERRED_DEADLINE,
     EXIT_CONVERSION_FAILED,
     EXIT_DEFERRAL_STALLED,
+    EXIT_DEFERRAL_STREAK_RESET,
     EXIT_OK,
     EXIT_USAGE,
     EXTEND_CHUNK_ROWS,
@@ -320,6 +325,7 @@ from breezy.runtime.quote_tape_ingest_core import (
     _is_salvage_marked,
     _ladder_rank,
     _load_deferral_streak_state,
+    _load_deferral_streak_state_checked,
     _mark_converted,
     _mark_file_converted,
     _marker_path,
@@ -383,6 +389,7 @@ __all__ = [
     "DEFERRED_DEADLINE",
     "EXIT_CONVERSION_FAILED",
     "EXIT_DEFERRAL_STALLED",
+    "EXIT_DEFERRAL_STREAK_RESET",
     "EXIT_OK",
     "EXIT_USAGE",
     "EXTEND_CHUNK_ROWS",
@@ -442,6 +449,7 @@ __all__ = [
     "_is_salvage_marked",
     "_ladder_rank",
     "_load_deferral_streak_state",
+    "_load_deferral_streak_state_checked",
     "_mark_converted",
     "_mark_file_converted",
     "_marker_path",

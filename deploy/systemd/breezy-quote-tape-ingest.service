@@ -118,10 +118,14 @@ SyslogIdentifier=breezy-quote-tape-ingest
 # src/breezy/runtime/ingest_deferral_streak.py). Exit 3 outranks exit 4 when
 # both apply on the same run: the run still exits 3, but the
 # `DEFERRAL_STALLED` line still prints in that SAME invocation's journal, so
-# the reason is visible either way. Because there is no SuccessExitStatus=
-# override, exits 2/3/4 are ALL, already, ordinary systemd unit failures --
-# `OnFailure=` above fires on every one of them without any further
-# configuration; nothing here is unique to exit 4. See
+# the reason is visible either way; exit 5 = DEFER-STREAK-LOAD
+# (EXIT_DEFERRAL_STREAK_RESET) -- pending work AND the deferral-streak state
+# file was unreadable, corrupt, invalid, or could not be saved, so stall
+# detection was blind for that run (a `DEFERRAL_STREAK_RESET reason=...` line
+# names why; exits 3 and 4 outrank it, and their line still prints). Because
+# there is no SuccessExitStatus= override, exits 2/3/4/5 are ALL, already,
+# ordinary systemd unit failures -- `OnFailure=` above fires on every one of
+# them without any further configuration; nothing here is unique to exit 4. See
 # src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
 
 # NOTE: no [Install] section. This unit is started BY the timer, never

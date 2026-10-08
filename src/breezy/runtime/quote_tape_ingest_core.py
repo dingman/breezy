@@ -44,7 +44,13 @@ from breezy.runtime.ingest_deferral_streak import (
     STATE_FILENAME as DEFERRAL_STREAK_STATE_FILENAME,
 )
 from breezy.runtime.ingest_deferral_streak import (
+    StreakResetReason as _StreakResetReason,
+)
+from breezy.runtime.ingest_deferral_streak import (
     load_state as _load_deferral_streak_state,
+)
+from breezy.runtime.ingest_deferral_streak import (
+    load_state_checked as _load_deferral_streak_state_checked,
 )
 from breezy.runtime.ingest_deferral_streak import (
     save_state as _save_deferral_streak_state,
@@ -56,6 +62,7 @@ from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_exit_codes import (
     EXIT_CONVERSION_FAILED,
     EXIT_DEFERRAL_STALLED,
+    EXIT_DEFERRAL_STREAK_RESET,
     EXIT_USAGE,
     PROGRAM,
 )
@@ -90,6 +97,7 @@ __all__ = [
     "DEFERRED_DEADLINE",
     "EXIT_CONVERSION_FAILED",
     "EXIT_DEFERRAL_STALLED",
+    "EXIT_DEFERRAL_STREAK_RESET",
     "EXIT_OK",
     "EXIT_USAGE",
     "EXTEND_CHUNK_ROWS",
@@ -148,6 +156,7 @@ __all__ = [
     "_is_salvage_marked",
     "_ladder_rank",
     "_load_deferral_streak_state",
+    "_load_deferral_streak_state_checked",
     "_mark_converted",
     "_mark_file_converted",
     "_marker_path",
@@ -197,7 +206,8 @@ __all__ = [
     "write_fresh_capture_rows",
 ]
 
-#: `PROGRAM`, `EXIT_USAGE`, `EXIT_CONVERSION_FAILED` and `EXIT_DEFERRAL_STALLED`
+#: `PROGRAM`, `EXIT_USAGE`, `EXIT_CONVERSION_FAILED`, `EXIT_DEFERRAL_STALLED`
+#: and `EXIT_DEFERRAL_STREAK_RESET`
 #: live in `quote_tape_exit_codes` (a stdlib-only leaf module) and are
 #: imported above -- re-exported here under the same names so nothing that
 #: already reads them off this module breaks. See that module's docstring
@@ -2234,6 +2244,7 @@ def run(
     # never touches the streak file, since it never converts or marks
     # anything real).
     alert_due = False
+    streak_reset_due = False
     if not namespace.dry_run:
         pending_units = _count_pending_deferral_units(
             results,
@@ -2244,16 +2255,34 @@ def run(
             grace_minutes=namespace.live_grace_minutes,
             service_active_probe=lambda: default_service_active_probe(namespace.service_unit),
         )
+        # The ONE pending boolean: it is both what `step` consumes and the
+        # only gate for the reset alert (DEFER-STREAK-LOAD, no second read).
+        pending = pending_units > 0
         streak_path = root / DEFERRAL_STREAK_STATE_FILENAME
-        streak_state = _load_deferral_streak_state(streak_path)
+        streak_state, reset_reason = _load_deferral_streak_state_checked(streak_path)
         now_utc = datetime.fromtimestamp(
             (now_ns if now_ns is not None else time.time_ns()) / 1_000_000_000,
             tz=UTC,
         )
         new_streak_state, alert_due = _step_deferral_streak(
-            streak_state, pending=pending_units > 0, now=now_utc
+            streak_state, pending=pending, now=now_utc
         )
-        _save_deferral_streak_state(streak_path, new_streak_state)
+        reset_reasons: list[_StreakResetReason] = []
+        if reset_reason is not None:
+            reset_reasons.append(reset_reason)
+        try:
+            _save_deferral_streak_state(streak_path, new_streak_state)
+        except OSError as exc:
+            # Only OSError: anything else is a bug and must stay loud. A save
+            # that keeps failing would otherwise pin the streak at old+1 and
+            # silently suppress the stall alert.
+            logger.warning(
+                "deferral streak save failed (%s errno=%s); next run will re-read "
+                "the previous state",
+                type(exc).__name__,
+                exc.errno,
+            )
+            reset_reasons.append(_StreakResetReason.SAVE_FAILED)
         if alert_due:
             assert new_streak_state.first_deferred_utc is not None
             first_deferred = datetime.fromisoformat(new_streak_state.first_deferred_utc)
@@ -2263,15 +2292,25 @@ def run(
                 f"age_s={age_s} pending_units={pending_units}",
                 file=out,
             )
+        if pending:
+            for reason in reset_reasons:
+                print(
+                    f"{PROGRAM}: DEFERRAL_STREAK_RESET reason={reason.value} "
+                    f"pending_units={pending_units}",
+                    file=out,
+                )
+                streak_reset_due = True
 
     # Exit-code precedence (C-5): usage (2, already returned above) beats a
     # conversion failure (3), which beats a deferral-stall alert (4), which
-    # beats a clean run (0). A failure with a stall also due still exits 3
-    # -- the DEFERRAL_STALLED line above already printed either way, so
-    # `OnFailure=` fires exactly once and the reason is visible regardless
-    # of which code wins.
+    # beats a lost/unpersistable streak with work pending (5), which beats a
+    # clean run (0). Every applicable line has printed above, so the journal
+    # shows all causes whichever code wins and `OnFailure=` fires exactly
+    # once (exit 3/4 mask 5 in the notifier's exit NAME only).
     if any(result.outcome == "failed" for result in results):
         return EXIT_CONVERSION_FAILED
     if alert_due:
         return EXIT_DEFERRAL_STALLED
+    if streak_reset_due:
+        return EXIT_DEFERRAL_STREAK_RESET
     return EXIT_OK

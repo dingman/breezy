@@ -134,3 +134,11 @@ def test_systemd_analyze_verify_passes_when_available() -> None:
     assert result.returncode == 0, (
         f"systemd-analyze verify failed:\nstdout={result.stdout}\nstderr={result.stderr}"
     )
+
+
+def test_failure_of_any_exit_reaches_the_study_failed_notifier() -> None:
+    """DEFER-STREAK-LOAD r2 (T15 a/b): exit 5 (and 3/4) rely on OnFailure=."""
+    lines = [line.strip() for line in _unit_text().splitlines()]
+    active = [line for line in lines if not line.startswith("#")]
+    assert "OnFailure=breezy-study-failed@%n.service" in active
+    assert not any(line.startswith("SuccessExitStatus=") for line in active)

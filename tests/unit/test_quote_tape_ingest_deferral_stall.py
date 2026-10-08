@@ -16,6 +16,7 @@ corrupt-file contracts.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import time
@@ -60,6 +61,10 @@ from tests.unit.test_quote_tape_ingest_cli import (
 )
 
 _INACTIVE_SERVICE_UNIT = "definitely-not-a-real-unit.service"
+
+#: DEFER-STREAK-LOAD r2: the new exit code, pinned as a literal so a renumbering
+#: fails a test instead of silently following the constant.
+_EXIT_RESET = 5
 
 
 class _TickingClock:
@@ -277,11 +282,14 @@ class TestStreakFileAndDryRun:
         (tmp_path / STATE_FILENAME).write_text("{not json")
         _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
         with caplog.at_level(logging.WARNING, logger="breezy.runtime.ingest_deferral_streak"):
-            code, _out, _err = _run_cli(
+            code, out, _err = _run_cli(
                 _tiny_deadline_argv(tmp_path),
                 clock_ns=_TickingClock(step_ns=2_000_000_000),
             )
-        assert code == EXIT_OK
+        # DEFER-STREAK-LOAD r2 (T10): a reset with work pending is delivered
+        # (exit 5 -> OnFailure=), not silent. Every other assert is kept.
+        assert code == _EXIT_RESET
+        assert "DEFERRAL_STREAK_RESET reason=unparseable" in out
         assert any("corrupt" in r.message.lower() for r in caplog.records)
         # A fresh streak starts counting from THIS run, not a poisoned value.
         state = load_state(tmp_path / STATE_FILENAME)
@@ -460,3 +468,202 @@ class TestExitPrecedenceWithAConversionFailure:
         state = load_state(tmp_path / STATE_FILENAME)
         assert state.consecutive_runs == 0
         assert state.first_deferred_utc is None
+
+
+# ---------------------------------------------------------------------------
+# DEFER-STREAK-LOAD r2: a lost or unpersistable streak with work pending is
+# delivered (exit 5, DEFERRAL_STREAK_RESET), never only logged.
+# ---------------------------------------------------------------------------
+
+_STREAK_LOGGER = "breezy.runtime.ingest_deferral_streak"
+
+
+def _write_streak(tmp_path: Path, **body: object) -> Path:
+    path = tmp_path / STATE_FILENAME
+    raw: dict[str, object] = {
+        "version": 1,
+        "consecutive_runs": 5,
+        "first_deferred_utc": 12345,
+        "runs_since_alert": -1,
+    }
+    raw.update(body)
+    path.write_text(json.dumps(raw))
+    return path
+
+
+def _no_pending_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An instance exists (so the run is not a usage error) but nothing counts
+    as pending -- the existing exit-3 tests use the same monkeypatch."""
+    _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+    monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 0)
+
+
+def _pending_run(tmp_path: Path, **kwargs: object) -> tuple[int, str, str]:
+    return _run_cli(
+        _tiny_deadline_argv(tmp_path),
+        clock_ns=_TickingClock(step_ns=2_000_000_000),
+        **kwargs,
+    )
+
+
+class TestStreakResetDelivery:
+    def test_exit_code_is_five(self) -> None:
+        from breezy.runtime import quote_tape_exit_codes, quote_tape_ingest_cli
+
+        assert quote_tape_exit_codes.EXIT_DEFERRAL_STREAK_RESET == _EXIT_RESET
+        assert quote_tape_ingest_cli.EXIT_DEFERRAL_STREAK_RESET == _EXIT_RESET
+
+    def test_malformed_field_with_pending_exits_5_value_free_and_heals(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = _write_streak(tmp_path)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        with caplog.at_level(logging.WARNING):
+            code, out, err = _pending_run(tmp_path)
+        assert code == _EXIT_RESET
+        assert "DEFERRAL_STREAK_RESET reason=bad_field pending_units=" in out
+        for blob in (out, err, caplog.text):
+            assert "12345" not in blob
+        state = load_state(path)
+        assert state.consecutive_runs == 1
+        assert state.runs_since_alert == -1
+        assert state.first_deferred_utc is not None
+        assert datetime.fromisoformat(state.first_deferred_utc).utcoffset() is not None
+
+    def test_malformed_field_nothing_pending_is_warn_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = _write_streak(tmp_path)
+        _no_pending_fixture(tmp_path, monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=_STREAK_LOGGER):
+            code, out, _err = _run_cli(_tiny_deadline_argv(tmp_path))
+        assert code == EXIT_OK
+        assert "DEFERRAL_STREAK_RESET" not in out
+        assert any("corrupt" in r.getMessage() for r in caplog.records)
+        assert load_state(path) == DeferralStreakState()
+
+    def test_conversion_failure_outranks_reset_but_line_still_prints(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_failing_instance(tmp_path, monkeypatch)
+        _write_streak(tmp_path)
+        monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 2)
+        code, out, _err = _run_cli(
+            ["--catalog", str(tmp_path), "--service-unit", _INACTIVE_SERVICE_UNIT],
+        )
+        assert code == EXIT_CONVERSION_FAILED
+        assert "DEFERRAL_STREAK_RESET reason=bad_field pending_units=2" in out
+
+    def test_reset_alert_is_one_shot_and_leaves_no_armed_counter(self, tmp_path: Path) -> None:
+        path = _write_streak(tmp_path)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        first_code, _o, _e = _pending_run(tmp_path)
+        saved = load_state(path)
+        second_code, out, _e = _pending_run(tmp_path)
+        assert first_code == _EXIT_RESET
+        assert second_code == EXIT_OK
+        assert "DEFERRAL_STREAK_RESET" not in out
+        again = load_state(path)
+        assert again.consecutive_runs == 2
+        assert again.first_deferred_utc == saved.first_deferred_utc
+        assert again.runs_since_alert == -1
+
+    def test_load_oserror_pending_exits_5_io_error_no_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_streak(tmp_path, first_deferred_utc=None, consecutive_runs=0)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        real = Path.read_text
+
+        def _read(self: Path, *a: object, **kw: object) -> str:
+            if self.name == STATE_FILENAME:
+                raise OSError(13, "denied")
+            return real(self, *a, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", _read)
+        code, out, _err = _pending_run(tmp_path)
+        assert code == _EXIT_RESET
+        assert "DEFERRAL_STREAK_RESET reason=io_error pending_units=" in out
+
+    def test_load_oserror_nothing_pending_exits_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_streak(tmp_path, first_deferred_utc=None, consecutive_runs=0)
+        _no_pending_fixture(tmp_path, monkeypatch)
+        real = Path.read_text
+
+        def _read(self: Path, *a: object, **kw: object) -> str:
+            if self.name == STATE_FILENAME:
+                raise OSError(13, "denied")
+            return real(self, *a, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", _read)
+        code, out, _err = _run_cli(_tiny_deadline_argv(tmp_path))
+        assert code == EXIT_OK
+        assert "DEFERRAL_STREAK_RESET" not in out
+
+    def _fail_save(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(path: Path, state: DeferralStreakState) -> None:
+            raise OSError(28, "no space")
+
+        monkeypatch.setattr(ingest_core_module, "_save_deferral_streak_state", _boom)
+
+    def test_save_failure_pending_exits_5(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._fail_save(monkeypatch)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        code, out, _err = _pending_run(tmp_path)
+        assert code == _EXIT_RESET
+        assert "DEFERRAL_STREAK_RESET reason=save_failed pending_units=" in out
+
+    def test_save_failure_nothing_pending_is_warn_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._fail_save(monkeypatch)
+        _no_pending_fixture(tmp_path, monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            code, out, _err = _run_cli(_tiny_deadline_argv(tmp_path))
+        assert code == EXIT_OK
+        assert "DEFERRAL_STREAK_RESET" not in out
+        assert any("save failed" in r.getMessage() for r in caplog.records)
+
+    def test_save_failure_on_the_stall_crossing_run_exits_4_with_both_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._fail_save(monkeypatch)
+        base_ns = time.time_ns()
+        save_state(
+            tmp_path / STATE_FILENAME,
+            DeferralStreakState(
+                consecutive_runs=3,
+                first_deferred_utc=datetime.fromtimestamp(base_ns / 1e9 - 3000, tz=UTC).isoformat(),
+                runs_since_alert=-1,
+            ),
+        )
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        code, out, _err = _pending_run(tmp_path, now_ns=base_ns + 700 * 1_000_000_000)
+        assert code == EXIT_DEFERRAL_STALLED
+        assert "DEFERRAL_STALLED runs=4" in out
+        assert "DEFERRAL_STREAK_RESET reason=save_failed" in out
+
+    @pytest.mark.parametrize("pending", [0, 3])
+    def test_reset_line_present_iff_the_pending_passed_to_step_is_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pending: int
+    ) -> None:
+        _write_streak(tmp_path)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        monkeypatch.setattr(
+            ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: pending
+        )
+        seen: list[bool] = []
+        real_step = ingest_core_module._step_deferral_streak
+
+        def _spy(state: DeferralStreakState, *, pending: bool, now: datetime):  # type: ignore[no-untyped-def]
+            seen.append(pending)
+            return real_step(state, pending=pending, now=now)
+
+        monkeypatch.setattr(ingest_core_module, "_step_deferral_streak", _spy)
+        _code, out, _err = _run_cli(_tiny_deadline_argv(tmp_path))
+        assert seen == [pending > 0]
+        assert ("DEFERRAL_STREAK_RESET" in out) is seen[0]
