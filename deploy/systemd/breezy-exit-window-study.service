@@ -27,15 +27,22 @@ OnFailure=breezy-study-failed@%n.service
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
 
-# Own cgroup memory ceiling: this unit reads a read-only sqlite3 copy plus
-# per-station Depth10 catalog frames and an ASOS fetch-on-miss -- heavier
-# than breezy-position-monitor-report's pure parquet join
-# (MemoryHigh=512M/MemoryMax=1G) but still far under the three heavy
-# nightly studies' own MemoryHigh=12G/MemoryMax=16G floor
+# Own cgroup memory ceiling. EXITSTUDY-MEM (2026-10-08): the original
+# MemoryHigh=1G/MemoryMax=2G was sized on a "pure parquet join" assumption.
+# 2026-10-04..10-08 the unit stalled in memory reclaim (30-min timeouts)
+# because the quote-tape fallback loaded ALL ~131k catalog instruments
+# (1.57 GB RSS) under a 1G MemoryHigh with host swap full. That load is now
+# restricted to the filled trials' instrument ids (measured, read-only,
+# MemorySwapMax=0: 656 MB peak RSS for 200 ids, 419 MB for 20, vs 1851 MB
+# for the unfiltered load; a prior whole-study manual run peaked 1.7G with
+# the unfiltered load). MemoryHigh=2G / MemoryMax=3G is ~3x the measured
+# post-fix load step plus the Depth10 frames, ASOS text and sqlite copy,
+# and stays far under the three heavy nightly studies' own
+# MemoryHigh=12G/MemoryMax=16G floor
 # (tests/unit/test_analysis_units_memory_capped.py). A runaway run's OOM
 # lands on the study, never the node.
-MemoryHigh=1G
-MemoryMax=2G
+MemoryHigh=2G
+MemoryMax=3G
 
 # Same deliberate opt-in as breezy-position-monitor-report.service (see
 # that unit's own comment): this unit reads from the same quote-tape-
@@ -72,9 +79,11 @@ Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec
 ExecStart=/home/jon/breezy/deploy/systemd/exit-window-study-run.sh
 
 # Reads a network ASOS fetch-on-miss (--obs-source fetch) plus a Depth10
-# catalog scan per station -- generous, mirroring breezy-k1-daily.service's
-# own budget for a comparable per-station analysis pass.
-TimeoutStartSec=1800
+# catalog scan per station. EXITSTUDY-MEM: a healthy run measured ~15 s
+# unthrottled (2026-10-08); 600 s leaves ~40x headroom for an ASOS 429
+# retry backlog while a reclaim stall fails fast (was 1800) to the
+# OnFailure= alert instead of burning 30 minutes.
+TimeoutStartSec=600
 
 # No Restart=. A missed run is not an incident on its own -- tomorrow's run
 # subsumes today's. The timer's Persistent=true is what recovers a run

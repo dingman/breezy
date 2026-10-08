@@ -15,13 +15,14 @@ instead of a capture.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import sys
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import Self
+from typing import Any, ClassVar, Self
 
 import httpx
 import pytest
@@ -2218,3 +2219,138 @@ def test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes
     assert report.exists()
     written = json.loads(report.read_text(encoding="utf-8"))
     assert written["summary"]["n_positions"] == 1
+
+
+# --------------------------------------------------------------------------
+# EXITSTUDY-MEM (2026-10-08): the quote-tape fallback must load ONLY the
+# instrument definitions this run's filled trials need, never the whole
+# ~131k-instrument catalog (1.57 GB RSS; stalled the 1G-capped unit).
+# --------------------------------------------------------------------------
+
+
+class _FakeInstrument:
+    def __init__(self, instrument_id: str) -> None:
+        self.id = instrument_id
+        self.info = {"marker": instrument_id}
+
+
+class _RecordingCatalog:
+    """Mirrors ``ParquetDataCatalog.instruments``' native filter contract and
+    records every call's ``instrument_ids`` argument (class-level, since the
+    study constructs the catalog itself)."""
+
+    calls: ClassVar[list[list[str] | None]] = []
+    universe: ClassVar[tuple[str, ...]] = ()
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def instruments(
+        self, instrument_type: type | None = None, instrument_ids: list[str] | None = None,
+    ) -> list[_FakeInstrument]:
+        del instrument_type
+        type(self).calls.append(None if instrument_ids is None else list(instrument_ids))
+        wanted = type(self).universe if instrument_ids is None else instrument_ids
+        return [_FakeInstrument(i) for i in type(self).universe if i in wanted]
+
+
+def _install_recording_catalog(
+    monkeypatch: pytest.MonkeyPatch, universe: Sequence[str],
+) -> type[_RecordingCatalog]:
+    _RecordingCatalog.calls = []
+    _RecordingCatalog.universe = tuple(universe)
+    monkeypatch.setattr(study_mod, "ParquetDataCatalog", _RecordingCatalog)
+    monkeypatch.setattr(
+        study_mod,
+        "read_weather_bucket_facts",
+        lambda info: WeatherBucketFacts(
+            settlement_station="LAX",
+            climate_day=_CLIMATE_DAY,
+            measure=Measure.HIGH,
+            lower_f=86,
+            upper_f=87,
+        ),
+    )
+    return _RecordingCatalog
+
+
+def test_quote_tape_fallback_requests_only_the_needed_instrument_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _install_recording_catalog(monkeypatch, ["a.V", "b.V", "c.V"])
+
+    facts = study_mod._quote_tape_bucket_by_instrument(tmp_path, ["a.V", "c.V"])
+
+    assert catalog.calls == [["a.V", "c.V"]]
+    assert sorted(facts) == ["a.V", "c.V"]
+
+
+def test_quote_tape_fallback_loads_nothing_when_no_ids_are_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _install_recording_catalog(monkeypatch, ["a.V"])
+
+    assert study_mod._quote_tape_bucket_by_instrument(tmp_path, []) == {}
+    assert catalog.calls == []
+
+
+def _unresolved_trial_installer(
+    monkeypatch: pytest.MonkeyPatch, instrument_id: str,
+) -> None:
+    def _trials(
+        state_db: Path, *, family_prefix: str, city: str, cli_location: str,
+        since_climate_day: str, stations: Sequence[str],
+    ) -> tuple[tuple[FilledTrial, ...], tuple[object, ...], dict[str, object], dict[str, object]]:
+        del state_db, family_prefix, cli_location, since_climate_day, stations
+        base = _synthetic_trial(city)
+        return (dataclasses.replace(base, instrument_id=instrument_id, bucket=None),), (), {}, {}
+
+    monkeypatch.setattr(study_mod, "read_filled_trials_state_db", _trials)
+
+
+def _run_one_city(tmp_path: Path) -> tuple[Any, Any]:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    result: tuple[Any, Any] = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_CACHED_CITY,),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="cache",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
+    )
+    return result
+
+
+def test_run_requests_only_the_filled_trials_instruments_from_the_quote_tape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    needed = "lax-86-87.POLYMARKET_US"
+    catalog = _install_recording_catalog(
+        monkeypatch, [needed, "other-1.POLYMARKET_US", "other-2.POLYMARKET_US"],
+    )
+    _install_offline_study_fakes(monkeypatch, _StatusClient(200))
+    _unresolved_trial_installer(monkeypatch, needed)
+
+    rows, _missing = _run_one_city(tmp_path)
+
+    assert catalog.calls == [[needed]]
+    assert [row.position.instrument_id for row in rows] == [needed]
+
+
+def test_run_never_touches_the_quote_tape_when_every_trial_carries_its_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _install_recording_catalog(monkeypatch, ["x.V"])
+    _install_offline_study_fakes(monkeypatch, _StatusClient(200))
+
+    rows, _missing = _run_one_city(tmp_path)
+
+    assert catalog.calls == []
+    assert len(rows) == 1
