@@ -44,18 +44,15 @@ only via a ruling under `docs/evidence/`. L-1 null-hypothesis verdict per increm
 via `systemd-run --user` (L-26); worktree commands need `PYTHONPATH=<wt>/src`; never `uv`/`pip` from a
 worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/`.
 
-**Revival path (RA-13):** R3 only; viability kill-screen R3V-b runs 10-01 (`R3-VIABILITY_plan_r2_delta`), as an evidence-gated watch (EDGE-4 ≥300 post-freeze CONFIRM station-days + `census_provenance:`); R2 physically absent, R4 unestimated. Programme KILL backstop 2027-01-25; Kalshi K-2 is the post-KILL successor.
+**Revival path (RA-13):** R3 NOT VIABLE 10-08 (`RULING_R3-VIABILITY_NOT_VIABLE_2026-10-08.md`; Wilson .26–.56 < f_req .625); KILL backstop 2027-01-25 kept; routes R4 + FQ-v2 T1–T3. Kalshi K-2a desk plan CONVERGED (`docs/plans/backlog/K-2a_2026-10-08/`, WA-0..WA-4); WB build gated on KILL.
 
-### LIVE-PROOF owed (all merged 09-28, gate green after each merge; loads noted)
-| ID | Merge | Proof owed (exact) |
-|---|---|---|
-| ING-2-AMEND2 | 9730f1e | 09-29 ~09:45Z post-rotation ingest: `extend_dedupe:` shows `custom_depth_truncation:<n>/0` + `flat_root=none`, deferred_instances=0, ≤600 s, cgroup `memory.peak` ≤2G (measured directly, never from RSS) → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. `flat_root=custom_depth_truncation` WARN = native flat write happened → open structural fix |
-| BL-10 | fdf28aa | Boot clean PROVEN 09-28 16:50Z (0 FATAL, permit issued ttl 10 h). Owed: first create-path order shows no permit refusal (none possible while A1 halt SET). |
-| FAILURE-KIND-DURABLE | bdba573 | Next node spawn; a restart with an OPEN AMBIGUOUS intent names the durable kind (not `none`) in the stale CRITICAL |
-| RECON-MIA-0913 | 97c4325 | 09-29 15:20Z exit study: per-trial reconciliation `matched=True` with `n_fee_unverified_excluded=1` |
-| AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
-| R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
-| R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
+### LIVE-PROOF owed
+| ID | Proof owed (exact) |
+|---|---|
+| ING-2-AMEND2 | Post-rotation ingest still fails daily (606–705 s, peak 4.3–9.8G) → TEMPORARY drop-in STAYS; superseded by ING-3 (plan r2 READY, `docs/plans/backlog/ING-3_2026-10-08/`): Stage 0 snapshot at 09:00Z rotation, runs after 09:30Z alone |
+| FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
+| R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
+| Failed units | fee-evidence-pull (check 10-09 11:10Z), portfolio-roi (WP3), stale transients reset-failed in WP3 |
 
 ### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
 Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
@@ -77,7 +74,7 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
-| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | OPEN |
+| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1 merged bd32de69; WP3b+WP5 staged (waves 1/2); WP2, WP3, WP9 next |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
 | 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
@@ -90,22 +87,23 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| CF-12-STAGE | LOW | READY plan `BP/CF-12-STAGE_plan_r1.md` (regenerate 185 ignores on HEAD; before W3) | CF-12 |
-| CF-12-W3 | LOW | READY plan `BP/CF-12-W3_plan_r4.md`, after CF-12-STAGE | CF-12 trial 09-29 |
-| DEFER-STREAK-LOAD | LOW | READY plan `BP/DEFER-STREAK-LOAD_plan_r2.md` | CF-12 triage 09-29 |
+| CF-12-STAGE | LOW | READY `BP/CF-12-STAGE_plan_r1.1_delta_2026-10-08.md`; build after waves 1/2 merge | CF-12 |
+| CF-12-W3 | LOW | needs r5 re-plan after STAGE + WP3b | CF-12 |
+| DEFER-STREAK-LOAD | LOW | built 71bdc124, staged in wave 1 | CF-12 |
+| SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |
 |---|---|
-| AUD-07 | 20k drain: `breezy-aud07-m1c-seg-0929a` armed 09-29 02:10Z (8 cells/night ⇒ ~4 nights; rename `20k/DEFERRED` before each run); then 80k → `--final` → AC7 ruling |
-| AUD-10b | C12 met at 10G peak; cause = conversion of 16 cache-miss instances (`ANALYSIS_replay_10g_2026-09-28.md`); Stage 0 + R3-5 before drop-in removal, run after ING-2-AMEND2 proves out |
-| R3 blockers (only if R3V-b says viable) | (1) MECHANISM_ONLY validity = AUD-11+AUD-12 landing; (2) `UNDERPOWERED_NOT_REGISTERED` not in `_ACTIVE_STATUSES`; (3) no post-freeze filter in `_completed_on_whole_days`. Real f so far 2/5 (Wilson .12–.77); f_req 0.625 |
+| AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
+| AUD-10b | Blocked on ING-3 |
+| F13 backfills | PFM 1008bc unit (ETA 10-09 ~04:30Z) → GFS MOS archive → `source_breaks`; smoke build waits C1 freeze ≥10-21 |
 
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | READY plan `BP/AMBIG-LATCH-RESUME_plan_r6.md` (two-phase merge; supersedes L-36 no-id clause) |
-| SUP-RESTART-ANYTIME | READY plan `BP/SUP-RESTART-ANYTIME_plan_r4.md` |
+| AMBIG-LATCH-RESUME | READY r6.1 + amendments R1–R15; build after SUP-RESTART activated |
+| SUP-RESTART-ANYTIME | built bb5f4c24 (fixes the hourly false permit_absent CRITICAL), staged wave 2; activation = supervisor restart 01:00–16:40Z |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
 ### Comment backlog (R0.1)
