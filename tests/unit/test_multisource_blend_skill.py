@@ -351,15 +351,23 @@ def test_runner_refuses_until_c1_has_14_days_of_measured_lags(tmp_path: Path) ->
     assert not (scenario.out / "stage_a.json").exists()
 
 
+def test_pinned_lags_match_c1_lag_sources() -> None:
+    assert set(_PINNED_LAGS) == set(msb.C1_LAG_SOURCES)
+
+
 def _pin_key_evidence(path: Path, *, omit: str | None = None) -> Path:
-    """Counts for the five pin keys. Omitting one keeps the level-source aliases filled."""
+    """Counts for the five pin keys. An omit keeps the other level-source aliases filled.
+
+    Delete after the alias fill: ``pfm`` is both a pin key and a level alias, so filling
+    aliases first would put an omitted ``pfm`` back.
+    """
     days = {key: 20 for key in _PINNED_LAGS}
     counts = {key: 30 for key in _PINNED_LAGS}
     if omit is not None:
-        del days[omit]
-        del counts[omit]
         days.update({"lamp": 20, "pfm": 20, "mos": 20})
         counts.update({"lamp": 30, "pfm": 30, "mos": 30})
+        del days[omit]
+        del counts[omit]
     path.write_text(
         json.dumps(
             {
@@ -378,9 +386,10 @@ def test_check_c1_accepts_evidence_keyed_by_the_five_pin_keys(tmp_path: Path) ->
     skill._check_c1(_pin_key_evidence(tmp_path / "c1.json"), _design())
 
 
-def test_check_c1_refuses_evidence_missing_a_pin_key(tmp_path: Path) -> None:
-    with pytest.raises(skill.Refusal, match="obs"):
-        skill._check_c1(_pin_key_evidence(tmp_path / "c1.json", omit="obs"), _design())
+@pytest.mark.parametrize("omit", msb.C1_LAG_SOURCES)
+def test_check_c1_refuses_evidence_missing_a_pin_key(tmp_path: Path, omit: str) -> None:
+    with pytest.raises(skill.Refusal, match=omit):
+        skill._check_c1(_pin_key_evidence(tmp_path / "c1.json", omit=omit), _design())
 
 
 def test_runner_refuses_sealed_holdout_rows(tmp_path: Path) -> None:
