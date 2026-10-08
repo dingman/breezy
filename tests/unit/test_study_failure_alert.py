@@ -51,7 +51,7 @@ _NOTIFIER_TEMPLATE_UNIT: Final[str] = "breezy-study-failed@.service"
 _ONFAILURE_LINE: Final[str] = "OnFailure=breezy-study-failed@%n.service"
 #: Autonomy units are wrapped and notify through ``breezy-autonomy-failed@`` instead: the unit lint
 #: refuses ``breezy-study-failed@`` on them by name (E-7a). Widened by exactly one reviewed unit,
-#: AUT-6 WP1's alert redeliver; each must carry the autonomy line.
+#: AUT-6 WP1's alert redeliver, then AUT-6 WP2's canary; each must carry the autonomy line.
 _AUTONOMY_ONFAILURE_LINE: Final[str] = "OnFailure=breezy-autonomy-failed@%n.service"
 #: AUT-6 WP3 S2 adds the health pass (and the WP2 canary, present on this base, was missing).
 _AUTONOMY_NOTIFIED_UNITS: Final[frozenset[str]] = frozenset(
