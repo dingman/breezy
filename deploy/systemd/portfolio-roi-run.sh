@@ -41,7 +41,8 @@
 # Exit status: 0 on a completed report (including one whose roi_status is
 # gated -- a detected, reported condition is a success of the detector, per
 # section 6 D9, not a crash); 1 if the score-live-trials marker is absent
-# or the report script itself fails; 75 on lock-infrastructure failure; 0
+# or the report script itself fails (a score-live-trials skip marker with a
+# closed reason is NO_INPUT, exit 0); 75 on lock-infrastructure failure; 0
 # on lock contention (SKIPPED, not a failure). Reported to `systemctl
 # --user status breezy-portfolio-roi.service`.
 set -uo pipefail
@@ -93,6 +94,21 @@ STAMP=$(date -u +%Y-%m-%d)
 # D2: the SAME 14:15 UTC score-live-trials success marker
 # family-tally-v2-run.sh requires -- never AUD-05's family tally (open;
 # this item must still produce a number while it is failing).
+# AUT-6 WP3 S1: a by-design upstream skip (score-live-trials writes the
+# sibling `.skipped` marker, one closed `reason=` line) is NO_INPUT, exit 0,
+# not a failure. Only a marker whose whole content is a closed-set reason is
+# trusted; anything else is treated as an absent marker (exit 1). The success
+# marker, when present, always wins.
+SKIP_MARKER="$OUT/score_live_trials_ok_$STAMP.skipped"
+if [ ! -f "$OUT/score_live_trials_ok_$STAMP" ] && [ -f "$SKIP_MARKER" ]; then
+  SKIP_REASON=$(head -c 256 "$SKIP_MARKER" 2>/dev/null || true)
+  case "$SKIP_REASON" in
+    "reason=composition_kind_has_no_scorer")
+      say "PORTFOLIO ROI NO_INPUT -- upstream skipped: composition_kind_has_no_scorer"
+      exit 0
+      ;;
+  esac
+fi
 if [ ! -f "$OUT/score_live_trials_ok_$STAMP" ]; then
   say "PORTFOLIO ROI SKIPPED -- no score-live-trials success marker for $STAMP"
   exit 1

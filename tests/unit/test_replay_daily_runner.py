@@ -1012,6 +1012,20 @@ def test_main_report_skip_dispatches_without_the_run_once_flags(tmp_path: Path) 
     assert runner.read_skip_state(state_path) == (1, "LOCK_CONTENTION")
 
 
+def test_main_reset_skip_state_clears_a_lock_contention_streak(tmp_path: Path) -> None:
+    """After an FQ composition skip the persisted counter must be 0, or a
+    stale LOCK_CONTENTION streak re-pages STALLED on any later collision."""
+    state_path = tmp_path / "wrapper_skip_state"
+    for _ in range(5):
+        runner.main(["--report-skip", "LOCK_CONTENTION", "--skip-state-path", str(state_path)])
+    assert runner.read_skip_state(state_path)[0] == 5
+
+    exit_code = runner.main(["--reset-skip-state", "--skip-state-path", str(state_path)])
+
+    assert exit_code == 0
+    assert runner.read_skip_state(state_path)[0] == 0
+
+
 def test_main_requires_the_usual_flags_when_report_skip_is_absent() -> None:
     with pytest.raises(SystemExit):
         runner.main([])

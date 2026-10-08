@@ -49,7 +49,11 @@
 # `DRAFT_NOT_REGISTERED` (or a non-`polymarket_us` venue, e.g.
 # `kalshi_crh_v1.json`) is skipped with a logged reason, never invoked.
 #
-# Exit status: 0 only when the marker was written; 1 if the state-DB env
+# Exit status: 0 when the marker was written, or when the sending family's
+# composition has no scorer by design (forecast_quantile_ladder) -- in that
+# case ONLY the sibling `score_live_trials_ok_$STAMP.skipped` marker is
+# written (one `reason=composition_kind_has_no_scorer` line); otherwise
+# non-zero; 1 if the state-DB env
 # var is unset, the node-env pre-flight refuses (MISMATCH/DISCOVERY_FAILED),
 # either counter fails, either counter's JSON is malformed/unreadable, the
 # v1 counter's fetch_start drifts from the registered v1 D0, the champion
@@ -131,6 +135,10 @@ STATUS=0
 # pre-flight -- so a later failing run never leaves a prior success's marker
 # in place for the tally wrappers to accept by mere existence.
 rm -f "$OUT/score_live_trials_ok_$STAMP"
+# AUT-6 WP3 S1: the sibling SKIP marker follows the same rule -- a stale one
+# from an earlier same-day run must not outlive a run that did not skip.
+SKIP_MARKER="$OUT/score_live_trials_ok_$STAMP.skipped"
+rm -f "$SKIP_MARKER"
 
 STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required}"
 
@@ -193,6 +201,18 @@ resolve_sending_family_manifest
 resolve_rc=$?
 if [ "$resolve_rc" -eq 2 ]; then
   rm -f "$CJSON" "$CJSON_CHAMPION"
+  # AUT-6 WP3 S1: a by-design skip says WHY in a closed-vocabulary marker so
+  # portfolio-roi-run.sh reports NO_INPUT (exit 0) instead of failing on a
+  # missing success marker. The success marker itself is NOT written.
+  # Atomic (tmp then mv -T) and CHECKED: a marker that cannot land is a real
+  # failure, never an exit 0 that leaves the downstream wrapper guessing.
+  SKIP_TMP="$SKIP_MARKER.tmp.$$"
+  if ! { printf 'reason=composition_kind_has_no_scorer\n' > "$SKIP_TMP" \
+         && mv -T "$SKIP_TMP" "$SKIP_MARKER"; } 2>>"$LOG"; then
+    rm -f "$SKIP_TMP"
+    say "SCORE LIVE TRIALS FAILED -- cannot write the skip marker $SKIP_MARKER"
+    exit 1
+  fi
   exit 0
 fi
 if [ "$resolve_rc" -ne 0 ]; then

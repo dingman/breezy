@@ -31,7 +31,9 @@ def _systemctl_stub(tmp_path: Path, *, environment_line: str = "", exit_code: in
     return stub
 
 
-def _python_stub(tmp_path: Path, *, report_skip_exit_code: int = 0) -> tuple[Path, Path]:
+def _python_stub(
+    tmp_path: Path, *, report_skip_exit_code: int = 0, reset_exit_code: int = 0
+) -> tuple[Path, Path]:
     """A `$PY` stub that logs every invocation shape -- the census, the
     runner's real path, and `--report-skip` are all dispatched here, never
     a real script. `report_skip_exit_code` models the skip recorder
@@ -42,6 +44,10 @@ def _python_stub(tmp_path: Path, *, report_skip_exit_code: int = 0) -> tuple[Pat
         f"""#!/usr/bin/env bash
 ARGV_LOG={shlex.quote(str(argv_log))}
 case "$*" in
+  *"--reset-skip-state"*)
+    echo "RESET_SKIP_STATE $*" >> "$ARGV_LOG"
+    exit {reset_exit_code}
+    ;;
   *"--report-skip"*)
     echo "REPORT_SKIP $*" >> "$ARGV_LOG"
     exit {report_skip_exit_code}
@@ -158,7 +164,24 @@ def test_a_forecast_quantile_ladder_sending_family_skips_without_replay_tooling(
         "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder "
         "has no replay_daily_runner"
     ) in log_text
-    assert not argv_log.exists() or argv_log.read_text(encoding="utf-8").strip() == ""
+    # The ONLY runner call is the skip-state reset: an FQ composition skip is
+    # a healthy skip, so it must clear any LOCK_CONTENTION streak (no census,
+    # no replay run, no skip RECORD).
+    calls = argv_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1 and calls[0].startswith("RESET_SKIP_STATE "), calls
+    assert "--skip-state-path" in calls[0]
+
+
+def test_a_failing_skip_state_reset_on_the_fq_skip_exits_nonzero(tmp_path: Path) -> None:
+    python_stub, _ = _python_stub(tmp_path, reset_exit_code=1)
+    systemctl_stub = _systemctl_stub(
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1",
+    )
+    result = _run_wrapper(tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub)
+    assert result.returncode == 1
+    log_text = (tmp_path / "derived" / "replay_daily.log").read_text(encoding="utf-8")
+    assert "skip state reset FAILED" in log_text
 
 
 def test_no_armed_family_exits_zero_and_records_a_skip(tmp_path: Path) -> None:
