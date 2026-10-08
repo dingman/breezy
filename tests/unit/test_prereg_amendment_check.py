@@ -1,7 +1,7 @@
 """F5 amendment checker: sibling of the parent precommit check (r2 §2.5, §3.3).
 
 Git-history cases use a temporary repository. The A0 content-digest pin and the
-loader success path stay xfail until the coordinator's freeze stamps them.
+loader success path are pinned to the frozen A0 (stamped 2026-10-08).
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ _KILL_KEYS = frozenset(
         "kill_bar_rule",
     }
 )
-# Replaced with the real digest in the stamp commit. Not a guess at the digest.
-_A0_CONTENT_DIGEST = "STAMPED_AT_FREEZE"
+# content_digest of the frozen A0, recorded in its stamp commit (PIN-R8(c) style).
+_A0_CONTENT_DIGEST = "ad9aff968dab8cf2acc5b9e813ef73afced583f4753318c6b532054dc011312f"
 
 
 def _chk() -> Any:
@@ -372,14 +372,12 @@ def test_a0_payload_keys_disjoint_from_parent() -> None:
     assert occupied.isdisjoint(parent)
 
 
-@pytest.mark.xfail(strict=True, reason="stamped at freeze")
 def test_F5_prereg_v2_A0_kill_content_digest_pinned() -> None:
     amendment = json.loads(_A0.read_text(encoding="utf-8"))
     assert content_digest(amendment) == _A0_CONTENT_DIGEST
 
 
 @pytest.mark.skipif(_is_shallow_repository(), reason=_SHALLOW_SKIP)
-@pytest.mark.xfail(strict=True, reason="stamped at freeze")
 def test_a0_loads_through_load_verified_amendment() -> None:
     loaded = _chk().load_verified_amendment(_A0, _A0_ID)
     assert loaded["amendment_id"] == _A0_ID
