@@ -94,7 +94,7 @@ def _freeze(repo: Path, rel: str, body: dict[str, Any]) -> tuple[Path, str]:
 
 
 def _parent_body() -> dict[str, Any]:
-    design = json.loads(_PARENT.read_text(encoding="utf-8"))
+    design: dict[str, Any] = json.loads(_PARENT.read_text(encoding="utf-8"))
     design.pop("frozen_sha")
     return design
 
@@ -363,7 +363,7 @@ def test_a0_payload_keys_disjoint_from_parent() -> None:
     assert set(amendment) == _ENVELOPE | {"kill"}
     assert set(amendment["amends"]) == {"path", "frozen_sha"}
     assert amendment["amendment_id"] == _A0_ID
-    assert amendment["frozen_sha"] == UNFROZEN
+    assert amendment["frozen_sha"] == "43cc3e0f08bab20eab71792643ed5b40bb60eb7e"
     assert amendment["amends"]["path"] == _PARENT.relative_to(REPO_ROOT).as_posix()
     assert amendment["amends"]["frozen_sha"] == parent["frozen_sha"]
     occupied = {key for key in amendment if key not in _ENVELOPE}
