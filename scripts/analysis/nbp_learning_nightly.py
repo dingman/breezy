@@ -34,7 +34,6 @@ from settlement_truth_dataset import (  # type: ignore[import-not-found]
 
 from breezy.analysis.brier_decomposition import bin_by_value, murphy_decomposition
 from breezy.analysis.nbp_calibration import (
-    DEFAULT_SPLITS,
     FIT_STATUS_OK,
     G20_MONTH_MIN_DATES,
     G20_MONTH_N,
@@ -46,11 +45,26 @@ from breezy.analysis.nbp_calibration import (
     apply_probability_recalibration,
     artefact_from_json_dict,
     artefact_sha256,
-    crps_numerical,
     parse_correction_form,
     write_artefact,
 )
 from breezy.analysis.nbp_comparator_models import m1_rung_probabilities
+from breezy.analysis.nbp_drift import (
+    DRIFT_MEAN_RESIDUAL_THRESHOLD_F,
+    FINAL_LABEL_STALE_AFTER,
+    HOLDOUT_START,
+    LABEL_STATUS_FINAL,
+    LABEL_STATUS_PROVISIONAL,
+    NBP_STALE_CYCLE_AFTER,
+    DriftResult,
+    FreshnessResult,
+    LearningRow,
+    compute_freshness,
+    drift_flags,
+    final_pre_holdout_rows,
+    instant_from_ns,
+    newest_final_label_day,
+)
 from breezy.persistence.nbp_derived_store import (
     DerivedNbpRow,
     load_manifest,
@@ -108,7 +122,6 @@ __all__ = [
 ]
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
-HOLDOUT_START: Final[dt.date] = DEFAULT_SPLITS.holdout_start
 
 DEFAULT_NBP_DERIVED_ROOT: Final[Path] = Path.home() / ".local/share/breezy/derived/nbp"
 DEFAULT_LABEL_PATH: Final[Path] = (
@@ -122,9 +135,6 @@ DEFAULT_CANDIDATE_ROOT: Final[Path] = (
 )
 DEFAULT_ARCHIVE_ROOT: Final[Path] = Path.home() / ".local/share/breezy/archive"
 
-LABEL_STATUS_FINAL: Final[str] = "FINAL"
-LABEL_STATUS_PROVISIONAL: Final[str] = "PROVISIONAL"
-
 NBP_STALE_CYCLE_ALERT_EVENT: Final[str] = "nbp_nightly_stale_cycle"
 NBP_STALE_FINAL_LABEL_ALERT_EVENT: Final[str] = "nbp_nightly_stale_final_label"
 NBP_DRIFT_ALERT_EVENT: Final[str] = "nbp_nightly_drift"
@@ -134,21 +144,6 @@ NBP_SCORING_FAILED_EVENT: Final[str] = "nbp_nightly_scoring_failed"
 _ALERT_SEVERITY: Final[str] = "WARN"
 _ALERT_SITE: Final[str] = "global"
 _TEST_POSITIVE_CONTROL: Final[str] = "TEST_POSITIVE_CONTROL"
-
-# NBP TXN cycles used by this family are 01Z, 13Z and 19Z; the longest normal
-# gap is 12h (01Z->13Z). 18h gives one missed/pending cycle's worth of slack
-# while still alerting before a whole cadence day disappears.
-NBP_STALE_CYCLE_AFTER: Final[dt.timedelta] = dt.timedelta(hours=18)
-
-# Final CLI rows usually publish after the climate day has ended, with
-# overnight local lag. 72h tolerates weekend/backfill latency but alerts
-# before the learning loop can silently run for several nights on old labels.
-FINAL_LABEL_STALE_AFTER: Final[dt.timedelta] = dt.timedelta(hours=72)
-
-DRIFT_MEAN_RESIDUAL_THRESHOLD_F: Final[float] = 2.5
-# A >0.75 degF average CRPS regression is larger than routine tenth-degree
-# numerical jitter and large enough to matter before it can dominate rung edge.
-DRIFT_CALIBRATION_CRPS_DELTA_THRESHOLD_F: Final[float] = 0.75
 
 
 class HoldoutAuthorizationError(RuntimeError):
@@ -161,42 +156,6 @@ class PositiveControl(str, Enum):
     DRIFT = "drift"
     CALIBRATION_DRIFT = "calibration-drift"
     ALL = "all"
-
-
-@dataclass(frozen=True, slots=True)
-class LearningRow:
-    station: str
-    climate_day: dt.date
-    label_status: str
-    cli_tmax_f: float
-    m2_median_f: float
-    p_m2: float
-    p_m1: float
-    outcome: bool
-    percentiles: Percentiles | None = None
-    nbm_version: str = "v5.0"
-
-    @property
-    def residual_f(self) -> float:
-        return self.cli_tmax_f - self.m2_median_f
-
-
-@dataclass(frozen=True, slots=True)
-class FreshnessResult:
-    newest_cycle: dt.datetime | None
-    newest_final_label_day: dt.date | None
-    stale_cycle: bool
-    stale_label: bool
-
-
-@dataclass(frozen=True, slots=True)
-class DriftResult:
-    n: int
-    mean_residual_f: float | None
-    shift_f: float | None
-    drifted: bool
-    calibration_crps_delta: float | None
-    calibration_drifted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,29 +204,6 @@ def _send_alarm(
     send_alert(sink, event=event, detail=detail)
 
 
-def _instant_from_ns(ns: int) -> dt.datetime:
-    return dt.datetime.fromtimestamp(ns / _NS_PER_SECOND, tz=dt.UTC)
-
-
-def final_pre_holdout_rows(rows: Sequence[LearningRow]) -> tuple[LearningRow, ...]:
-    return tuple(
-        row
-        for row in rows
-        if row.label_status == LABEL_STATUS_FINAL and row.climate_day < HOLDOUT_START
-    )
-
-
-def newest_final_label_day(rows: Sequence[LearningRow]) -> dt.date | None:
-    return max(
-        (
-            row.climate_day
-            for row in rows
-            if row.label_status == LABEL_STATUS_FINAL
-        ),
-        default=None,
-    )
-
-
 def final_rows_for_report(
     rows: Sequence[LearningRow],
     *,
@@ -292,20 +228,17 @@ def check_freshness(
     sink: AlertSink,
     positive_control: PositiveControl | None = None,
 ) -> FreshnessResult:
-    if now.tzinfo is None:
-        raise ValueError("now must be timezone-aware")
-    newest_cycle = max((_instant_from_ns(row.cycle_runtime_ns) for row in nbp_rows), default=None)
+    newest_cycle = max((instant_from_ns(row.cycle_runtime_ns) for row in nbp_rows), default=None)
     newest_label_day = (
         max(final_label_days, default=None)
         if final_label_days is not None
         else newest_final_label_day(label_rows)
     )
-
-    stale_cycle = newest_cycle is None or now - newest_cycle > NBP_STALE_CYCLE_AFTER
-    stale_label = (
-        newest_label_day is None
-        or now - _label_freshness_instant(newest_label_day) > FINAL_LABEL_STALE_AFTER
+    measured = compute_freshness(
+        newest_cycle=newest_cycle, newest_label_day=newest_label_day, now=now
     )
+    stale_cycle = measured.stale_cycle
+    stale_label = measured.stale_label
 
     if positive_control in (PositiveControl.STALE_CYCLE, PositiveControl.ALL):
         stale_cycle = True
@@ -334,11 +267,6 @@ def check_freshness(
     )
 
 
-def _label_freshness_instant(day: dt.date) -> dt.datetime:
-    next_utc_midnight = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min, tzinfo=dt.UTC)
-    return next_utc_midnight
-
-
 def check_drift(
     *,
     rows: Sequence[LearningRow],
@@ -348,88 +276,28 @@ def check_drift(
     positive_control: bool = False,
     calibration_positive_control: bool = False,
 ) -> DriftResult:
-    final_rows = final_pre_holdout_rows(rows)
-    if not final_rows and not positive_control and not calibration_positive_control:
-        return DriftResult(
-            n=0,
-            mean_residual_f=None,
-            shift_f=None,
-            drifted=False,
-            calibration_crps_delta=None,
-            calibration_drifted=False,
-        )
-    mean_residual = (
-        frozen_mean_residual_f + DRIFT_MEAN_RESIDUAL_THRESHOLD_F + 0.1
-        if positive_control
-        else statistics.fmean(row.residual_f for row in final_rows)
-        if final_rows
-        else None
+    result = drift_flags(
+        rows=rows,
+        frozen_mean_residual_f=frozen_mean_residual_f,
+        frozen_artefact=frozen_artefact,
+        positive_control=positive_control,
+        calibration_positive_control=calibration_positive_control,
     )
-    shift = None if mean_residual is None else mean_residual - frozen_mean_residual_f
-    drifted = shift is not None and abs(shift) > DRIFT_MEAN_RESIDUAL_THRESHOLD_F
-    calibration_crps_delta = _calibration_crps_delta(final_rows, frozen_artefact=frozen_artefact)
-    if calibration_positive_control:
-        calibration_crps_delta = DRIFT_CALIBRATION_CRPS_DELTA_THRESHOLD_F + 0.1
-    calibration_drifted = (
-        calibration_crps_delta is not None
-        and calibration_crps_delta > DRIFT_CALIBRATION_CRPS_DELTA_THRESHOLD_F
-    )
-    if drifted:
+    if result.drifted:
         _send_alarm(
             sink,
             event=NBP_DRIFT_ALERT_EVENT,
             detail="mean_residual_shift",
             positive_control=positive_control,
         )
-    if calibration_drifted:
+    if result.calibration_drifted:
         _send_alarm(
             sink,
             event=NBP_CALIBRATION_DRIFT_ALERT_EVENT,
             detail="calibration_crps_delta",
             positive_control=calibration_positive_control,
         )
-    return DriftResult(
-        n=len(final_rows),
-        mean_residual_f=mean_residual,
-        shift_f=shift,
-        drifted=drifted,
-        calibration_crps_delta=calibration_crps_delta,
-        calibration_drifted=calibration_drifted,
-    )
-
-
-def _calibration_crps_delta(
-    rows: Sequence[LearningRow],
-    *,
-    frozen_artefact: NbpCalibrationArtefact | None,
-) -> float | None:
-    if frozen_artefact is None:
-        return None
-    if frozen_artefact.fit_status != FIT_STATUS_OK:
-        raise FitNotConvergedError(
-            f"frozen artefact refused: fit_status={frozen_artefact.fit_status!r}, not {FIT_STATUS_OK!r}"
-        )
-    method = CdfMethod(frozen_artefact.cdf_method)
-    deltas: list[float] = []
-    for row in rows:
-        if row.percentiles is None:
-            continue
-        params = frozen_artefact.emos_params_by_version.get(row.nbm_version)
-        if params is None:
-            continue
-        a, gamma = params
-        base_cdf = build_cdf(method, row.percentiles)
-        frozen_cdf = apply_emos(
-            base_cdf,
-            row.percentiles,
-            EmosParams(a=a, gamma=gamma, delta=frozen_artefact.delta),
-        )
-        frozen_crps = crps_numerical(frozen_cdf, row.cli_tmax_f, center=row.percentiles.q50)
-        raw_crps = crps_numerical(base_cdf, row.cli_tmax_f, center=row.percentiles.q50)
-        deltas.append(frozen_crps - raw_crps)
-    if not deltas:
-        return None
-    return statistics.fmean(deltas)
+    return result
 
 
 def _forecast_centered_ladder(center_f: int) -> tuple[Rung, ...]:
