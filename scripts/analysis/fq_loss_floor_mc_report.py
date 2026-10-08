@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 import numpy as np
 
 from breezy.analysis.fq_loss_stop_core import T_MIN_GRID, VARIANCE_EPS
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, with_s7_skips
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
     AlphaEval,
@@ -75,6 +75,7 @@ _CAL: tuple[tuple[str, str], ...] = (
     ("S5", "bind"),
     ("S5", "half"),
     ("S6", "none"),
+    ("S7", "none"),
 )
 _BINDING: frozenset[tuple[str, str]] = frozenset({("H0", "none"), ("S4", "none"), ("S5", "bind")})
 
@@ -290,7 +291,7 @@ def finish_document(
         "seed": seed,
         "replicates": replicates,
         "outcome": outcome.as_dict(),
-        "rows": list(rows),
+        "rows": with_s7_skips(rows, admitted),
         "gates": list(gates),
         "refused_count": refused_count,
         "refused_templates": list(refused_templates),

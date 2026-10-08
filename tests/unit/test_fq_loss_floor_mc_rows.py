@@ -12,11 +12,14 @@ from breezy.analysis.fq_loss_stop_core import ReasonCode
 from breezy.analysis.fq_loss_stop_shrink import shrunk_joint
 from breezy.strategy.weather_common.costs import venue_fee_prob
 from scripts.analysis.fq_loss_floor_mc import build_parser, default_out
+from scripts.analysis.fq_loss_floor_mc_draw import prepare_day
 from scripts.analysis.fq_loss_floor_mc_engine import run_floor
 from scripts.analysis.fq_loss_floor_mc_gate import FloorConfig
 from scripts.analysis.fq_loss_floor_mc_rows import (
+    StationDay,
     all_lose_z,
     apply_mix,
+    cell_q,
     clamped_leg_share,
     estimate_rho,
     exit_coefficient,
@@ -176,7 +179,16 @@ def test_run_floor_outcome_has_the_pinned_fields() -> None:
     else:
         assert outcome["c"] is None
     assert document["rows"]
-    assert {row["row"] for row in document["rows"]} >= {"H0", "S1", "S2", "S3", "S4", "S5", "S6"}
+    assert {row["row"] for row in document["rows"]} >= {
+        "H0",
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "S7",
+    }
     assert document["max_abs_carry_over_sigma_next"] >= 0.0
 
 
@@ -189,3 +201,87 @@ def test_parser_requires_a_seed_and_defaults_the_ladder() -> None:
     assert args.alpha is None
     assert args.max_memory_gib == pytest.approx(8.0)
     assert default_out(11).name == "fq_loss_floor_mc_seed11.json"
+
+
+def _kappa_prime(day: StationDay) -> float | None:
+    """Errata E-1 open item: κ' on a mixed overround day, else None."""
+    qs = tuple(cell_q(leg) for leg in day.legs)
+    sides = tuple(leg.side for leg in day.legs)
+    sum_no = sum(q for q, side in zip(qs, sides, strict=True) if side == "no")
+    sum_yes = sum(q for q, side in zip(qs, sides, strict=True) if side == "yes")
+    if sum_no <= 0.0 or sum_yes <= 0.0 or sum_no + sum_yes <= 1.0:
+        return None
+    outside = max(0.0, math.prod(1.0 - q for q in qs))
+    return (1.0 - sum_no - outside) / sum_yes
+
+
+def test_s2_all_yes_overround_scales_to_one_minus_m0() -> None:
+    day = make_station_day("K", (make_leg("A", "yes", 0.7), make_leg("B", "yes", 0.6)))
+    prepared = prepare_day(day)
+    qs = tuple(cell_q(leg) for leg in prepared.day.legs)
+    m0 = math.prod(1.0 - q for q in qs)
+    assert m0 == pytest.approx(0.12)
+    assert prepared.proportional == pytest.approx(tuple(q / sum(qs) * (1.0 - m0) for q in qs))
+    mixed = make_station_day("K", (make_leg("A", "yes", 0.8), make_leg("B", "no", 0.7)))
+    mixed_prep = prepare_day(mixed)
+    mixed_q = tuple(cell_q(leg) for leg in mixed_prep.day.legs)
+    assert sum(mixed_prep.proportional) == pytest.approx(1.0)
+    assert mixed_prep.proportional == pytest.approx(tuple(q / sum(mixed_q) for q in mixed_q))
+
+
+def test_subset_path_admits_an_all_yes_overround_day() -> None:
+    day = make_station_day("K", (make_leg("A", "yes", 0.7), make_leg("B", "yes", 0.6)))
+    admitted, refused = partition_station_days((day,))
+    assert refused == ()
+    assert admitted == (day,)
+
+
+def test_s7_is_report_only_and_counts_skipped_mixed_days() -> None:
+    skip = make_station_day(
+        "K",
+        (
+            make_leg("Y", "yes", 0.30),
+            make_leg("N1", "no", 0.40),
+            make_leg("N2", "no", 0.70),
+        ),
+    )
+    kept = make_station_day("K", (make_leg("T70", "yes", 0.45),))
+    skip_kappa = _kappa_prime(skip)
+    assert skip_kappa is not None
+    assert skip_kappa < 0.0
+    assert _kappa_prime(kept) is None
+    assert production_variance(skip) > 0.0
+    assert prepare_day(skip).s7 is None
+    kept_mass = make_station_day("K", (make_leg("A", "yes", 0.8), make_leg("B", "no", 0.7)))
+    kept_prep = prepare_day(kept_mass)
+    kept_q = tuple(cell_q(leg) for leg in kept_prep.day.legs)
+    kept_sides = tuple(leg.side for leg in kept_prep.day.legs)
+    outside = max(0.0, math.prod(1.0 - q for q in kept_q))
+    sum_no = sum(q for q, side in zip(kept_q, kept_sides, strict=True) if side == "no")
+    sum_yes = sum(q for q, side in zip(kept_q, kept_sides, strict=True) if side == "yes")
+    kappa = (1.0 - sum_no - outside) / sum_yes
+    assert kappa >= 0.0
+    assert kept_prep.s7 == pytest.approx(
+        tuple(kappa * q if side == "yes" else q for q, side in zip(kept_q, kept_sides, strict=True))
+    )
+    config = FloorConfig(
+        take_rate_lower=0.25,
+        theta=0.0,
+        lambda_pool=0.25,
+        r_sd=1.0,
+        lambda_sd=1.0,
+        half_spread=0.03,
+        pool_exit_fraction=0.0,
+        rho_hat=0.1,
+        freeze=date(2026, 10, 8),
+        horizon=date(2026, 10, 11),
+    )
+    document = _obj_dict(
+        run_floor(((skip, kept),), replicates=4, seed=1, config=config, alphas=(0.10,))
+    )
+    s7 = [row for row in document["rows"] if row["row"] == "S7"]
+    assert {row["mix"] for row in s7} == {"M-pool", "M-yes", "M-no"}
+    assert all(row["role"] == "report" for row in s7)
+    assert all(math.isfinite(float(row["rate"])) for row in s7)
+    assert {row["mix"]: row["skipped"] for row in s7} == {"M-pool": 1, "M-yes": 0, "M-no": 0}
+    assert document["binding_cell"] is None or document["binding_cell"][0] != "S7"

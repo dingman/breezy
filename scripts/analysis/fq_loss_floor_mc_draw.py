@@ -20,13 +20,14 @@ from breezy.analysis.fq_loss_stop_core import (
     FqLossStopRefusal,
     step_clock,
 )
-from breezy.analysis.fq_loss_stop_shrink import shrunk_joint
+from breezy.analysis.fq_loss_stop_shrink import mixed_overround_kappa, shrunk_joint
 from breezy.settlement.current_rung_hold_v2 import StratumRow
 from scripts.analysis.fq_loss_floor_mc_rows import (
     Leg,
     StationDay,
     _normalised,
     _pnl,
+    apply_mix,
     cell_q,
     exit_coefficient,
     h1_win_probability,
@@ -97,19 +98,37 @@ class PreparedDay:
     proportional: tuple[float, ...]
     xs: tuple[float, ...]
     h1: Mapping[float, tuple[float, ...] | None]
+    s7: tuple[float, ...] | None
+
+
+def _s7_masses(
+    qs: tuple[float, ...],
+    sides: tuple[str, ...],
+    production: tuple[float, ...],
+) -> tuple[float, ...] | None:
+    """Production masses, S7's scaled YES masses, or None when κ' < 0."""
+    kappa = mixed_overround_kappa(qs, sides)
+    if kappa is None:
+        return production
+    if kappa < 0.0:
+        return None
+    return tuple(kappa * q if side == "yes" else q for q, side in zip(qs, sides, strict=True))
 
 
 def prepare_day(day: StationDay, *, deltas: Sequence[float] = ()) -> PreparedDay:
     if not day.legs:
-        return PreparedDay(day, 0.0, (), (), (0.0,), {})
+        return PreparedDay(day, 0.0, (), (), (0.0,), {}, ())
     qs = tuple(cell_q(leg) for leg in day.legs)
+    sides = tuple(leg.side for leg in day.legs)
     if sum(qs) > 1.0:
-        masses: tuple[float, ...] = shrunk_joint(stratum_rows(day)).masses
+        joint = shrunk_joint(stratum_rows(day))
+        masses: tuple[float, ...] = joint.masses
         total = sum(qs)
-        proportional = tuple(q / total for q in qs)
+        proportional = tuple(q / total * (1.0 - joint.residual_mass) for q in qs)
     else:
         masses = qs
         proportional = qs
+    s7 = _s7_masses(qs, sides, masses)
     xs = tuple(
         sum(
             x_piece(_outcome_h(leg, index, slot), Decimal(str(leg.be)))
@@ -118,7 +137,7 @@ def prepare_day(day: StationDay, *, deltas: Sequence[float] = ()) -> PreparedDay
         for index in range(len(day.legs) + 1)
     )
     h1 = {delta: _h1_masses(day, delta) for delta in deltas}
-    return PreparedDay(day, production_variance(day), masses, proportional, xs, h1)
+    return PreparedDay(day, production_variance(day), masses, proportional, xs, h1, s7)
 
 
 def clock_block(day: StationDay) -> str | None:
@@ -187,6 +206,8 @@ def advance_prepared(
             masses = prep.h1.get(delta, ())
         elif row == "S2":
             masses = prep.proportional
+        elif row == "S7":
+            masses = () if prep.s7 is None else prep.s7
         else:
             masses = prep.masses
         if masses is None:
@@ -254,3 +275,53 @@ def critical_values(
     if return_paths:
         return paths
     return crits
+
+
+def day_pool(
+    row: str,
+    mix: str,
+    *,
+    pooled: Mapping[str, Sequence[Sequence[PreparedDay]]],
+    feasible: Mapping[str, Sequence[Sequence[PreparedDay]]],
+) -> Sequence[Sequence[PreparedDay]]:
+    """S6 uses the feasible pool. S7 drops mixed days whose κ' is negative."""
+    if row == "S6":
+        return feasible[mix]
+    if row != "S7":
+        return pooled[mix]
+    return [[prep for prep in group if prep.s7 is not None] for group in pooled[mix]]
+
+
+def _s7_skip_count(days: Sequence[StationDay], mix: str) -> int:
+    skipped = 0
+    for day in days:
+        mixed = apply_mix(day, mix)
+        if not mixed.legs:
+            continue
+        kappa = mixed_overround_kappa(
+            tuple(cell_q(leg) for leg in mixed.legs),
+            tuple(leg.side for leg in mixed.legs),
+        )
+        if kappa is not None and kappa < 0.0:
+            skipped += 1
+    return skipped
+
+
+def with_s7_skips(
+    rows: Sequence[Mapping[str, object]],
+    admitted: Sequence[StationDay],
+) -> list[dict[str, object]]:
+    """Copy report rows, attaching each S7 row's skipped-day count."""
+    counts: dict[str, int] = {}
+    stamped: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        if item.get("row") == "S7":
+            mix = item.get("mix")
+            if not isinstance(mix, str):
+                raise TypeError(f"S7 mix must be a string, got {mix!r}")
+            if mix not in counts:
+                counts[mix] = _s7_skip_count(admitted, mix)
+            item["skipped"] = counts[mix]
+        stamped.append(item)
+    return stamped

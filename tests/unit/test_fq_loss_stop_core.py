@@ -385,8 +385,67 @@ def test_mixed_overround_matches_hand_computed_moments() -> None:
 
     joint = shrunk_joint(rows)
     assert joint.kappa == pytest.approx(0.875, abs=1e-12)
+    assert joint.residual_mass == pytest.approx(0.0, abs=1e-12)
     assert joint.variance == pytest.approx(0.84, abs=1e-12)
     assert joint.drifts == pytest.approx((-0.1, 0.0), abs=1e-12)
+
+
+def test_all_yes_overround_reserves_the_outside_mass() -> None:
+    """Two YES legs, q = (0.7, 0.6). m0 = 0.12 and κ = 0.88/1.3.
+
+    The outside outcome is x = −ΣBE. Variance is the k+1 enumeration, and
+    the day is not a zero-variance refusal.
+    """
+    qs = (0.7, 0.6)
+    rows = tuple(
+        StratumRow(
+            entry_ask=Decimal(str(q)),
+            fee=Decimal(0),
+            held=False,
+            station=_STATION,
+            side="yes",
+            rung=rung,
+        )
+        for q, rung in zip(qs, ("a", "b"), strict=True)
+    )
+    m0 = (1.0 - qs[0]) * (1.0 - qs[1])
+    kappa = (1.0 - m0) / sum(qs)
+    masses = (kappa * qs[0], kappa * qs[1])
+    bes = qs
+    outcomes = (
+        (masses[0], (1.0 - bes[0]) + (0.0 - bes[1])),
+        (masses[1], (0.0 - bes[0]) + (1.0 - bes[1])),
+        (m0, -(bes[0] + bes[1])),
+    )
+    expect = sum(prob * outcome for prob, outcome in outcomes)
+    second = sum(prob * outcome * outcome for prob, outcome in outcomes)
+    hand = second - expect * expect
+    assert m0 == pytest.approx(0.12)
+    assert kappa == pytest.approx(0.88 / 1.3)
+    assert hand > 0.0
+    assert outcomes[2][1] == pytest.approx(-(bes[0] + bes[1]))
+
+    joint = shrunk_joint(rows)
+    assert joint.residual_mass == pytest.approx(m0, abs=1e-12)
+    assert joint.kappa == pytest.approx(kappa, abs=1e-12)
+    assert joint.masses == pytest.approx(masses, abs=1e-12)
+    assert joint.variance == pytest.approx(hand, abs=1e-12)
+
+    step = step_clock(
+        NormalisedDay(
+            station=_STATION,
+            legs=(),
+            shifts=(),
+            rows=rows,
+            x_rand=outcomes[2][1],
+            shift=0.0,
+            variance=joint.variance,
+        ),
+        0.0,
+    )
+    assert step.z is not None
+    assert math.isfinite(step.z)
+    assert bundle_variance(rows) == pytest.approx(joint.variance, abs=1e-12)
 
 
 def test_sigma_no_above_one_refuses() -> None:
@@ -443,7 +502,8 @@ def test_shrunk_variance_matches_brute_force_enumeration(
     assert day.variance == pytest.approx(_brute_shrunk_variance(day.rows))
     joint: ShrunkJoint = shrunk_joint(day.rows)
     assert joint.variance == pytest.approx(day.variance)
-    assert joint.kappa == pytest.approx(2.0 / 3.0)
+    assert joint.residual_mass == pytest.approx(0.5**3)
+    assert joint.kappa == pytest.approx((1.0 - 0.5**3) / 1.5)
 
 
 def test_no_leg_be_is_the_instrument_price_not_the_wire() -> None:
@@ -649,7 +709,8 @@ def _brute_shrunk_variance(rows: tuple[StratumRow, ...]) -> float:
         qs.append(q)
     sum_no = sum(q for q, side in zip(qs, sides, strict=True) if side == "no")
     sum_yes = sum(q for q, side in zip(qs, sides, strict=True) if side == "yes")
-    kappa = (1.0 - sum_no) / sum_yes
+    outside = math.prod(1.0 - q for q in qs) if sum_no == 0.0 else 0.0
+    kappa = (1.0 - outside if sum_no == 0.0 else 1.0 - sum_no) / sum_yes
     masses = [kappa * q if side == "yes" else q for q, side in zip(qs, sides, strict=True)]
     probs = masses + [1.0 - sum(masses)]
     k = len(rows)

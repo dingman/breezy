@@ -14,7 +14,7 @@ from dataclasses import replace
 import numpy as np
 
 from breezy.analysis.fq_loss_stop_core import ALPHA_FLOOR_GRID
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, prepare_day
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, day_pool, prepare_day
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
     FloorConfig,
@@ -59,6 +59,7 @@ _CAL: tuple[tuple[str, str], ...] = (
     ("S5", "bind"),
     ("S5", "half"),
     ("S6", "none"),
+    ("S7", "none"),
 )
 # Calibration rows × mixes, plus G3 deltas × mixes × the four epoch lengths.
 PATH_FAMILIES: int = len(_CAL) * len(MIXES) + len(DELTAS) * len(MIXES) * 4
@@ -276,7 +277,7 @@ def run_floor(
     cal_sims: dict[tuple[str, str, str], Simulation] = {}
     for row, mode in _CAL:
         for mix in MIXES:
-            source = feasible[mix] if row == "S6" else pooled[mix]
+            source = day_pool(row, mix, pooled=pooled, feasible=feasible)
             cal_sims[(row, mode, mix)] = _run(
                 source,
                 replicates=replicates,
