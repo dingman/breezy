@@ -1,0 +1,124 @@
+{
+  "seed": 20261008,
+  "replicates": 2000,
+  "deltas": [
+    0.0,
+    -0.04,
+    -0.08,
+    -0.16
+  ],
+  "design": {
+    "m_cap": 2,
+    "x_max": 4.0,
+    "alpha_kill": 0.05,
+    "earliest_look_n": 20,
+    "source": "frozen parent via load_design(amends.path)"
+  },
+  "rows": [
+    {
+      "delta": 0.0,
+      "p_kill_by_kill_date": 0.0,
+      "se_p_kill_by_kill_date": 0.0,
+      "p_kill_by_n_max": 0.2915,
+      "se_p_kill_by_n_max": 0.010161883437631037,
+      "median_n_at_kill": null,
+      "se_median_n_at_kill": null,
+      "clipped_mean_y": -0.006461912453263683,
+      "take_rate": 0.248,
+      "take_rate_target": 0.25,
+      "take_rate_realised": 0.248,
+      "be_ask_source": "Kalshi pre-holdout quote tape (fq_mc_livedata.load_pool, climate_day < holdout start). TakeRecord.ask is the quote the shipped take rule saw; TakeRecord.be is the haircut ask plus the fee, using the frozen parent haircut (1 tick of 0.01) and theta 0.0695: BE = haircut_ask + theta*p*(1-p). This is the Monte Carlo break-even, not a ledger fill BE."
+    },
+    {
+      "delta": -0.04,
+      "p_kill_by_kill_date": 0.0,
+      "se_p_kill_by_kill_date": 0.0,
+      "p_kill_by_n_max": 0.9995,
+      "se_p_kill_by_n_max": 0.000499874984371065,
+      "median_n_at_kill": 539.0,
+      "se_median_n_at_kill": 7.008177205143537,
+      "clipped_mean_y": -0.01811653100347804,
+      "take_rate": 0.248,
+      "take_rate_target": 0.25,
+      "take_rate_realised": 0.248,
+      "be_ask_source": "Kalshi pre-holdout quote tape (fq_mc_livedata.load_pool, climate_day < holdout start). TakeRecord.ask is the quote the shipped take rule saw; TakeRecord.be is the haircut ask plus the fee, using the frozen parent haircut (1 tick of 0.01) and theta 0.0695: BE = haircut_ask + theta*p*(1-p). This is the Monte Carlo break-even, not a ledger fill BE."
+    },
+    {
+      "delta": -0.08,
+      "p_kill_by_kill_date": 0.0,
+      "se_p_kill_by_kill_date": 0.0,
+      "p_kill_by_n_max": 1.0,
+      "se_p_kill_by_n_max": 0.0,
+      "median_n_at_kill": 286.0,
+      "se_median_n_at_kill": 2.428758807855088,
+      "clipped_mean_y": -0.029423230013921605,
+      "take_rate": 0.248,
+      "take_rate_target": 0.25,
+      "take_rate_realised": 0.248,
+      "be_ask_source": "Kalshi pre-holdout quote tape (fq_mc_livedata.load_pool, climate_day < holdout start). TakeRecord.ask is the quote the shipped take rule saw; TakeRecord.be is the haircut ask plus the fee, using the frozen parent haircut (1 tick of 0.01) and theta 0.0695: BE = haircut_ask + theta*p*(1-p). This is the Monte Carlo break-even, not a ledger fill BE."
+    },
+    {
+      "delta": -0.16,
+      "p_kill_by_kill_date": 0.0,
+      "se_p_kill_by_kill_date": 0.0,
+      "p_kill_by_n_max": 1.0,
+      "se_p_kill_by_n_max": 0.0,
+      "median_n_at_kill": 160.0,
+      "se_median_n_at_kill": 0.893271188993257,
+      "clipped_mean_y": -0.04959794397427356,
+      "take_rate": 0.248,
+      "take_rate_target": 0.25,
+      "take_rate_realised": 0.248,
+      "be_ask_source": "Kalshi pre-holdout quote tape (fq_mc_livedata.load_pool, climate_day < holdout start). TakeRecord.ask is the quote the shipped take rule saw; TakeRecord.be is the haircut ask plus the fee, using the frozen parent haircut (1 tick of 0.01) and theta 0.0695: BE = haircut_ask + theta*p*(1-p). This is the Monte Carlo break-even, not a ledger fill BE."
+    }
+  ],
+  "be_ask_source": "Kalshi pre-holdout quote tape (fq_mc_livedata.load_pool, climate_day < holdout start). TakeRecord.ask is the quote the shipped take rule saw; TakeRecord.be is the haircut ask plus the fee, using the frozen parent haircut (1 tick of 0.01) and theta 0.0695: BE = haircut_ask + theta*p*(1-p). This is the Monte Carlo break-even, not a ledger fill BE.",
+  "take_rate": 0.25,
+  "take_rate_target": 0.25,
+  "take_rate_realised": 0.248,
+  "take_rate_source": "Frozen parent take_rate_lower, realised by fq_mc_livedata.calibrate_take_rate (pi_fav bisection on the shipped take rule). n_by_kill_date uses the target rate, the MC --d0 default, the parent uptime_floor and fq_resume_n_mc.KILL_DATE. take_rate on each row is the realised mean takes per resampled day; take_rate_target is the parent rate the kill-date censor uses.",
+  "n_max": 2000,
+  "n_by_kill_date": 24,
+  "kill_date": "2027-01-25",
+  "d0": "2026-10-10",
+  "uptime_floor": 0.9,
+  "amendment_id": "F5_prereg_v2_A0_kill",
+  "pool": {
+    "rows": 26052,
+    "days": 1273,
+    "sampled_days": 500,
+    "load_stats": {
+      "candle_lines_undecodable": 0,
+      "candle_lines_unparsed": 0,
+      "candle_lines_holdout_skipped": 1890,
+      "markets_files_undecodable": 0,
+      "markets_holdout_skipped": 1890
+    },
+    "pi_fav": 0.0185546875,
+    "stations": 8,
+    "horizon_days": 9000
+  },
+  "provenance": {
+    "amendment_id": "F5_prereg_v2_A0_kill",
+    "amendment_path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F5_prereg_v2_amendment_A0.json",
+    "parent_path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F5_prereg_v2_design.json",
+    "amendment_frozen_sha": "43cc3e0f08bab20eab71792643ed5b40bb60eb7e",
+    "parent_frozen_sha": "072ab026cdc790dd6e9a51d62d8164766b85fd82",
+    "mc_module": "scripts/analysis/fq_mc_eprocess.py",
+    "engine": "kill_first_n",
+    "outcome": "Bernoulli(clamp(BE + delta, 0, 1))",
+    "delta_zero_role": "harness row; same stream as the MC null and p_kill \u2248 0",
+    "edges_in_frozen_a0": [
+      -0.04,
+      -0.08,
+      -0.16
+    ],
+    "seed": 20261008,
+    "role": "reporting_only_changes_no_constant",
+    "anchor": "docs/evidence/f5/fq_resume_n_mc_seed20261006.json clipped_mean_y -0.019 p_kill_under_null_stream 0.0025"
+  },
+  "runtime_seconds": 37.673,
+  "peak_rss_mib": 1319.9,
+  "chunk": 250,
+  "horizon_days": 9000
+}
