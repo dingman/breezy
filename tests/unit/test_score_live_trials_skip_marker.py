@@ -102,4 +102,4 @@ def test_unwritable_skip_marker_exits_one_with_a_clear_line_and_no_marker(
     assert not blocker.is_file()
     log_text = (tmp_path / "derived" / "score_live_trials.log").read_text()
     assert "SCORE LIVE TRIALS FAILED -- cannot write the skip marker" in log_text
-    assert not list((tmp_path / "derived").glob("*.skip.tmp*"))
+    assert not list((tmp_path / "derived").glob("*.skipped.tmp.*"))

@@ -41,6 +41,15 @@ _LOOKAHEAD = 3
 _RETURN = re.compile(r"\breturn\s+(\d+)\b")
 
 
+# `exit 0` must sit INSIDE the `$resolve_rc -eq N` branch: the body lines are
+# consumed only while they do not open the next column-0 elif/else/fi, so a
+# later unrelated `exit 0` elsewhere in the file can never satisfy the rule.
+_IN_BLOCK_EXIT_0 = (
+    r'"\$resolve_rc" -eq {rc} \]; then[^\n]*\n'
+    r"(?:(?!(?:elif|else|fi)\b)[^\n]*\n)*?[ \t]*exit 0\b"
+)
+
+
 @dataclass(frozen=True)
 class _CarveOut:
     """A benign skip whose ``say`` is NOT followed by an ``exit`` and so cannot
@@ -60,14 +69,14 @@ _CARVE_OUTS: tuple[_CarveOut, ...] = (
         "replay-daily-run.sh",
         re.compile(r"composition_kind=forecast_quantile_ladder"),
         3,
-        re.compile(r'"\$resolve_rc" -eq 3 \]; then\s*\n\s*(?:[^\n]*\n\s*)*?exit 0'),
+        re.compile(_IN_BLOCK_EXIT_0.format(rc=3), re.MULTILINE),
         "resolve_family_manifest returns 3; the caller maps rc 3 to exit 0",
     ),
     _CarveOut(
         "score-live-trials-run.sh",
         re.compile(r"composition_kind=forecast_quantile_ladder"),
         2,
-        re.compile(r'"\$resolve_rc" -eq 2 \]; then\s*\n(?:[^\n]*\n)*?\s*exit 0'),
+        re.compile(_IN_BLOCK_EXIT_0.format(rc=2), re.MULTILINE),
         "resolve_sending_family_manifest returns 2; caller writes .skipped, exits 0",
     ),
     _CarveOut(
@@ -218,6 +227,16 @@ def test_a_carve_out_whose_caller_path_is_gone_is_flagged() -> None:
 def test_a_carve_out_with_the_wrong_return_code_is_flagged() -> None:
     fixture = (
         'say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder x"\nreturn 1\n'
+    )
+    assert len(_offenders("replay-daily-run.sh", fixture)) == 1
+
+
+def test_a_carve_out_whose_branch_exits_one_is_flagged_despite_a_later_exit_zero() -> None:
+    fixture = (
+        'f() {\n  say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder x"\n'
+        "  return 3\n}\nf\nresolve_rc=$?\n"
+        'if [ "$resolve_rc" -eq 3 ]; then\n  exit 1\nelif [ "$resolve_rc" -ne 0 ]; then\n'
+        "  exit 1\nfi\nexit 0\n"
     )
     assert len(_offenders("replay-daily-run.sh", fixture)) == 1
 
