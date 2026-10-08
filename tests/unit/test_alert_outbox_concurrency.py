@@ -126,6 +126,7 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
     assert sorted(events) == sorted(f"RACE_{index}" for index in range(50))
     delivered = [path.name for path in root.rglob("*_d.json")]
     assert len(delivered) == 50
+    assert AlertOutbox(root).occupancy() == 0
 
     stall_root = tmp_path / "stall"
     stall_root.mkdir()
@@ -147,7 +148,10 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
         entry = next((root / "outbox").glob("*.json"))
         claimed = outbox.claim(entry, "stall")
         ready.write_text(str(claimed))
-        time.sleep(8)
+        go = ready.with_name("go")
+        deadline = time.time() + 30
+        while not go.exists() and time.time() < deadline:
+            time.sleep(0.02)
         if outbox.restamp(Path(ready.read_text())):
             ready.with_name("sent").write_text("sent")
         else:
@@ -191,10 +195,12 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
         )
     finally:
         sink.close()
-    assert proc.wait(timeout=15) == 0
+    (stall_root / "go").write_text("go", encoding="utf-8")  # release the stalled claimant
+    assert proc.wait(timeout=30) == 0
     server.shutdown()
     assert summary.reclaims == 1
-    assert len(posts) <= 2
+    assert len(posts) == 1
+    assert AlertOutbox(stall_root).occupancy() == 0
     assert (stall_root / "enoent").is_file()
     assert not (stall_root / "sent").exists()
     del entry

@@ -96,8 +96,11 @@ def JournalingWebhookAlertSink(
     It stays an exact ``WebhookAlertSink`` (the egress tests compare ``type(branch)``), so ``emit``
     is replaced on the instance. Construction does not touch disk. The writer id is
     ``legacy_<component>`` (X-2).
+
+    TODO(WP1b/AUT-5a, X-2): every migrated site passes one ``legacy_runtime`` id today; the per-site
+    ``legacy_<component>`` ids arrive when the node sites are swapped.
     """
-    sink = WebhookAlertSink(url, client=client)
+    sink = WebhookAlertSink(url, timeout_s=float(ALERT_DELIVERY_TIMEOUT_S), client=client)
 
     def _emit(payload: AlertPayload) -> None:
         root = default_alerts_root()
@@ -112,5 +115,5 @@ def JournalingWebhookAlertSink(
         if not proof.delivered:
             raise AlertNotDeliveredError(proof.status_class)
 
-    setattr(sink, "emit", _emit)  # noqa: B010 - instance-level override of a method
+    sink.emit = _emit  # type: ignore[method-assign]  # instance-level override, see docstring
     return sink

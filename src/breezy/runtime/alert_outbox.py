@@ -7,10 +7,12 @@ published with ``mkstemp`` then ``os.link`` (write-once), 0600 in 0700 directori
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -72,22 +74,32 @@ def _publish(directory: Path, name: str, body: dict[str, object]) -> Path:
     _mkdir(directory)
     fd, tmp_name = tempfile.mkstemp(prefix=".", suffix=".partial", dir=directory)
     tmp = Path(tmp_name)
-    try:
-        os.fchmod(fd, _FILE_MODE)
-        os.write(fd, json.dumps(body, sort_keys=True).encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
     dest = directory / name
     try:
+        try:
+            os.fchmod(fd, _FILE_MODE)
+            data = memoryview(json.dumps(body, sort_keys=True).encode())
+            while data:
+                data = data[os.write(fd, data) :]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.link(tmp, dest)
-    except FileExistsError:
-        os.unlink(tmp)
-        raise
-    os.unlink(tmp)
-    os.chmod(dest, _FILE_MODE)
+        os.chmod(dest, _FILE_MODE)
+    finally:
+        # the temp name never outlives the call, on success or on any failure
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
     _fsync_dir(directory)
     return dest
+
+
+def is_regular(path: Path) -> bool:
+    """A regular file, never a symlink (C1): ``lstat`` and ``S_ISREG``, no following."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 class AlertOutbox:
@@ -101,7 +113,7 @@ class AlertOutbox:
         out = self.root / "outbox"
         if not out.is_dir():
             return 0
-        return sum(1 for path in out.rglob("*.json") if path.is_file())
+        return sum(1 for path in out.rglob("*.json") if is_regular(path))
 
     def refuses(self, severity: str) -> bool:
         """Non-CRITICAL stops at 112; CRITICAL stops at 128."""
@@ -133,29 +145,35 @@ class AlertOutbox:
                 stamp += 1
 
     def claim(self, entry: Path, drainer: str) -> Path | None:
-        """E-1: utime, then rename into ``claimed/<drainer>/``, then directory fsync.
+        """E-1: utime, then rename into ``claimed/<drainer>/``, then directory fsyncs.
 
-        ``FileNotFoundError`` (the loser) returns ``None``. Any other ``OSError`` propagates so a
+        ``None`` for the loser (``ENOENT``), for a non-regular file (never followed) and for a
+        destination that already exists (never overwritten). Any other ``OSError`` propagates so a
         crash between utime and rename leaves the entry where it was.
         """
+        if not is_regular(entry):
+            return None
         try:
-            os.utime(entry)
+            os.utime(entry, follow_symlinks=False)
         except FileNotFoundError:
             return None
         dest_dir = self.root / "outbox" / "claimed" / drainer
         _mkdir(dest_dir)
         dest = dest_dir / entry.name
+        if os.path.lexists(dest):
+            return None
         try:
             os.rename(entry, dest)
         except FileNotFoundError:
             return None
         _fsync_dir(dest_dir)
+        _fsync_dir(entry.parent)
         return dest
 
     def restamp(self, claimed: Path) -> bool:
         """Refresh the claim mtime. ``False`` on ENOENT: another drainer already took it."""
         try:
-            os.utime(claimed)
+            os.utime(claimed, follow_symlinks=False)
         except FileNotFoundError:
             return False
         return True
@@ -168,14 +186,14 @@ class AlertOutbox:
             return []
         found: list[Path] = []
         for holder in sorted(claimed_root.iterdir()):
-            if not holder.is_dir() or holder.name == drainer:
+            if holder.is_symlink() or not holder.is_dir() or holder.name == drainer:
                 continue
             for entry in sorted(holder.glob("*.json")):
                 try:
-                    age = clock - entry.stat().st_mtime
+                    age = clock - os.lstat(entry).st_mtime
                 except FileNotFoundError:
                     continue
-                if age <= ALERT_CLAIM_STALE_S:
+                if age <= ALERT_CLAIM_STALE_S or not is_regular(entry):
                     continue
                 moved = self.claim(entry, drainer)
                 if moved is not None:
@@ -183,11 +201,27 @@ class AlertOutbox:
         return found
 
     def complete(self, claimed: Path) -> None:
-        """Remove a claimed entry only after a delivered record was written, then fsync."""
+        """Remove a claimed entry only after a delivered record was written, then fsync.
+
+        A claim reclaimed by another drainer during the POST is already gone from here: nothing
+        to remove (at-least-once delivery, the reclaimer removes its own copy).
+        """
         directory = claimed.parent
-        os.unlink(claimed)
+        try:
+            os.unlink(claimed)
+        except FileNotFoundError:
+            return
         if directory.is_dir():
             _fsync_dir(directory)
+
+    def quarantine(self, claimed: Path) -> Path | None:
+        """Rename an unreadable claimed entry to ``<name>.bad`` so it is never retried."""
+        bad = claimed.with_name(claimed.name + ".bad")
+        try:
+            os.rename(claimed, bad)
+        except OSError:
+            return None
+        return bad
 
 
 class DeliveryRecordWriter:

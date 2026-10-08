@@ -35,10 +35,6 @@ JOURNAL_PATH: Final = "%h/.local/share/breezy/evidence/alerts"
 #: The wrapper-secret rule: a key naming a secret, or any value carrying a URL.
 _SECRET_SUFFIXES: Final = ("_URL", "_TOKEN", "_KEY", "_SECRET", "_PASSWORD")
 _WEBHOOK_VAR: Final = "BREEZY_ALERT_WEBHOOK_URL"
-#: Alerting sandboxed units that cannot list the journal yet. discovery-pull's ReadWritePaths is
-#: pinned to exactly one line by ``test_discovery_pull_deploy``; widening that pin is its own
-#: change.
-KNOWN_JOURNAL_GAP: Final = frozenset({"breezy-discovery-pull.service"})
 
 
 def _unit(path: Path) -> UnitFile:
@@ -119,8 +115,12 @@ def test_redeliver_timeout_start_sec_is_55_and_stop_sec_5() -> None:
     assert start_phase_bound_s(SERVICE) == 5
     (line,) = unit.values("Service", "ExecStart")
     tokens = shlex.split(line)
-    assert (int(tokens[2]), int(tokens[3])) == (5, 50)
-    assert int(tokens[2]) + int(tokens[3]) <= 55
+    assert (int(tokens[2]), int(tokens[3])) == (4, 46)
+    exec_bound = int(tokens[2]) + int(tokens[3])
+    assert exec_bound <= 55
+    # worst end = AccuracySec + pre lines (T + K) + ExecStart (K + T) + TimeoutStopSec = 61 s
+    accuracy = int(_unit(TIMER).values("Timer", "AccuracySec")[0].removesuffix("s"))
+    assert accuracy + start_phase_bound_s(SERVICE) + exec_bound + 5 == 61
 
 
 def test_redeliver_config_names_the_autonomy_failed_notifier_and_resolves_dns() -> None:
@@ -129,7 +129,6 @@ def test_redeliver_config_names_the_autonomy_failed_notifier_and_resolves_dns() 
     assert unit.values("Unit", "OnFailure") == ["breezy-autonomy-failed@%n.service"]
     row = AUTONOMY_BWRAP_TABLE[UNIT]
     assert (row.network, row.resolves_dns, row.binds) == ("egress", True, ("evidence/alerts",))
-    assert "breezy-autonomy-failed@" in row.units
 
 
 def test_redeliver_config_loads_alerts_env_and_lists_the_delivery_journal() -> None:
@@ -147,9 +146,11 @@ def test_redeliver_timer_config_is_slot_critical_and_never_persistent() -> None:
     assert unit.values("Timer", "Unit") == [f"{UNIT}.service"]
 
 
-def test_deploy_units_config_lint_clean_with_the_redeliver_pair_present() -> None:
+def test_deploy_units_config_lint_reports_only_the_x3_gap() -> None:
+    """X-3: the notifier row does not exist yet, so its scope error is the one recorded gap."""
     assert SERVICE.is_file() and TIMER.is_file()
-    assert lint_units(DEPLOY_SYSTEMD_DIR, AUTONOMY_BWRAP_TABLE) == ()
+    errors = lint_units(DEPLOY_SYSTEMD_DIR, AUTONOMY_BWRAP_TABLE)
+    assert [(e.unit, e.rule) for e in errors] == [(f"{UNIT}.service", "onfailure_scope")]
 
 
 # -- the rules AUT-6 holds over every unit it owns ------------------------------------------------
@@ -157,7 +158,7 @@ def test_deploy_units_config_lint_clean_with_the_redeliver_pair_present() -> Non
 
 def test_every_alerting_sandboxed_unit_config_lists_the_delivery_journal() -> None:
     assert _alerting_sandboxed(DEPLOY_SYSTEMD_DIR), "the scan must judge at least one unit"
-    assert _journal_gaps(DEPLOY_SYSTEMD_DIR) == set(KNOWN_JOURNAL_GAP)
+    assert _journal_gaps(DEPLOY_SYSTEMD_DIR) == set()
 
 
 def test_alerting_sandboxed_unit_config_without_the_journal_path_fails(tmp_path: Path) -> None:
@@ -203,6 +204,7 @@ def test_slot_critical_timer_config_pin_fires_on_a_default_accuracy_fixture(tmp_
 def _aut6_unit_files(directory: Path) -> list[Path]:
     """Each ``breezy-autonomy-*`` unit and drop-in that AUT-6 owns (every one at WP1)."""
     files = [p for p in sorted(directory.glob("breezy-autonomy-*.service"))]
+    files.append(directory / "breezy-discovery-pull.service")  # changed by AUT-6 WP1 (E-7)
     for dropin in sorted(directory.glob("breezy-autonomy-*.service.d")):
         files += sorted(dropin.glob("*.conf"))
     return files
@@ -210,7 +212,7 @@ def _aut6_unit_files(directory: Path) -> list[Path]:
 
 def test_aut6_unit_config_has_no_environment_secrets() -> None:
     files = _aut6_unit_files(DEPLOY_SYSTEMD_DIR)
-    assert SERVICE in files
+    assert SERVICE in files and DEPLOY_SYSTEMD_DIR / "breezy-discovery-pull.service" in files
     findings = {p.name: _secret_findings(_unit(p)) for p in files}
     assert {name: found for name, found in findings.items() if found} == {}
 

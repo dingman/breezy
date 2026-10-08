@@ -61,7 +61,11 @@ def test_protect_home_read_only_with_matching_read_write_path() -> None:
     protect_home = [line for line in lines if line.startswith("ProtectHome=")]
     read_write = [line for line in lines if line.startswith("ReadWritePaths=")]
     assert protect_home == ["ProtectHome=read-only"]
-    assert read_write == ["ReadWritePaths=/home/jon/breezy/data/evidence/discovery_set_equality"]
+    # AUT-6 WP1 adds the delivery journal (the unit loads alerts.env); the first line is unchanged.
+    assert read_write == [
+        "ReadWritePaths=/home/jon/breezy/data/evidence/discovery_set_equality",
+        "ReadWritePaths=%h/.local/share/breezy/evidence/alerts",
+    ]
 
 
 def test_service_declares_breezy_env_required_and_alerts_env_optional() -> None:

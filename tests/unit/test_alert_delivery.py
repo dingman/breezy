@@ -136,12 +136,12 @@ class _RecordingOs:
         self._real = real
         self.ops: list[tuple[object, ...]] = []
 
-    def utime(self, path: object, times: object = None) -> None:
+    def utime(self, path: object, times: object = None, **kwargs: object) -> None:
         self.ops.append(("utime", Path(str(path))))
         if times is None:
-            self._real.utime(path)  # type: ignore[attr-defined]
+            self._real.utime(path, **kwargs)  # type: ignore[attr-defined]
         else:
-            self._real.utime(path, times)  # type: ignore[attr-defined]
+            self._real.utime(path, times, **kwargs)  # type: ignore[attr-defined]
 
     def rename(self, src: object, dst: object) -> None:
         self.ops.append(("rename", Path(str(src)), Path(str(dst))))

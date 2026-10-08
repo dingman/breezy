@@ -5,7 +5,8 @@
 # coordinator at activation and opened O_RDONLY by the CLI; a missing lock is an INTEGRITY exit 3.
 #
 # Bounds (E-9): TimeoutStartSec re-arms per command. Pre line T + K = 4 + 1 = 5 s; ExecStart
-# K + T = 5 + 50 = 55 s; TimeoutStopSec=5. In-process: stop claiming at 40 s, one 5 s attempt.
+# K + T = 4 + 46 = 50 s; TimeoutStopSec=5. With the timer's AccuracySec=1s the worst
+# end is slot + 1 + 5 + 50 + 5 = slot + 61 s (plan l.1063). In-process: stop claiming at 40 s, one 5 s attempt.
 # OnFailure target: X-3 ships the line before the notifier unit exists (WP4/WP7).
 [Unit]
 Description=Breezy AUT-6 alert outbox redeliver (every 5 minutes, sandboxed)
@@ -23,7 +24,7 @@ EnvironmentFile=-%h/.config/breezy/alerts.env
 # bwrap row is the control.
 ReadWritePaths=%h/.local/share/breezy/evidence/alerts
 ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/evidence/alerts
-ExecStart=/usr/bin/timeout -k 5 50 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-alert-redeliver /home/jon/breezy/.venv/bin/python3 -I -m breezy.runtime.alert_redeliver_cli
+ExecStart=/usr/bin/timeout -k 4 46 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-alert-redeliver /home/jon/breezy/.venv/bin/python3 -I -m breezy.runtime.alert_redeliver_cli
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=breezy-autonomy-alert-redeliver

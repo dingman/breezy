@@ -40,6 +40,8 @@ UMask=0077
 # restrictive of the two.
 ProtectHome=read-only
 ReadWritePaths=/home/jon/breezy/data/evidence/discovery_set_equality
+# AUT-6 WP1 (E-7, configuration only): the delivery journal, because this unit loads alerts.env.
+ReadWritePaths=%h/.local/share/breezy/evidence/alerts
 
 # breezy.env (mode 0600, BREEZY_USER_AGENT only -- same non-credential
 # operator contact string breezy-fee-evidence-pull.service already sources)

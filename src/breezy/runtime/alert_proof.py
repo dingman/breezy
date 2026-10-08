@@ -73,6 +73,8 @@ class DeliveryCounters:
     outbox_write_failures: int = 0
 
 
+#: Not thread-safe: plain ``+=`` on a module global. Every AUT-6 oneshot is single-threaded; the
+#: node worker (WP1b) must hold its own lock or count per thread before it touches these.
 COUNTERS = DeliveryCounters()
 
 
@@ -196,11 +198,16 @@ def _queue_and_claim(
         entry = outbox.write_entry(
             attempt.payload, writer=attempt.writer, drill=attempt.drill, ts_ns=ts_ns
         )
-        claimed = outbox.claim(entry, attempt.writer)
     except OSError:
         COUNTERS.outbox_write_failures += 1
         _LOG.error("alert_outbox_unwritable exception_type=OSError")
         return _Queued(None, "", True)
+    try:
+        claimed = outbox.claim(entry, attempt.writer)
+    except OSError:
+        # The entry is durable: leave it for a drainer. No direct send, and not a write failure.
+        _LOG.error("alert_outbox_claim_failed exception_type=OSError")
+        return "lost"
     if claimed is None:
         return "lost"
     return _Queued(claimed, entry.name, False)
