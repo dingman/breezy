@@ -25,3 +25,35 @@ The WP decomposition was done by the planner, read-only, on 2026-10-08. Only WP1
 - l.894: there are now five node sites: `trade.py:474,533,782,1201` and `node_config.py:521`.
 - l.1142: `tests/unit/test_systemd_unit_contracts.py` does not exist. Use `tests/contract/test_autonomy_units*.py`.
 - §3.8: the list of failing units dates from 10-02. Re-check it before WP3.
+
+## WP3 slice plan (planner, 2026-10-08; built strictly in order, each slice branching from the previous one's tip)
+
+| Slice | Content | Files |
+|---|---|---|
+| S1 | Failing units, wrapper exits and disposition | `deploy/systemd/{score-live-trials,portfolio-roi,asos-refresh,replay-daily}-run.sh`; `docs/evidence/unit_health/DISPOSITION_failed_units_2026-10-08.md`; `docs/evidence/aut6/WP3_verify_first_2026-10-08.md` (F2); `tests/unit/test_portfolio_roi_run_no_input.py`; `tests/unit/test_score_live_trials_skip_marker.py`; `tests/contract/test_autonomy_units_programme.py` |
+| S2 | Health bwrap row, unit files and contract tests | V-6 in its E-7e form: in-row `systemctl` fails and reads go through the bus snapshot. STOP on any mismatch. The timer is not enabled |
+| S3 | `unit_health.py` core | No permit or orders read anywhere (X-6, FQ-v2 NO-TRADE) |
+| S4 | `unit_health_daemons.py`: invocation and daemon rules, intraday-stage classification | Fixtures only until WP6. `WATCHDOG_DAEMON_UNITS` stays empty until WP4 |
+| S5 | `monitor_watch.py`: timers (both templates), producer, alert delivery, memory #31 | A not-deployed producer or canary is INCONCLUSIVE, never FAIL (decision X-8 below) |
+| S6 | CLI pass, rollup, C4, runbook marker, `aut6.health` pin (last) | F6: p99 ≤ 90 s over 20 runs. STOP if it fails |
+
+**Stale anchors found by the planner:**
+- `discovery-pull` is now at 17:12Z, not 16:52Z.
+- Exit 75 also occurs in `portfolio-roi-run.sh` and `replay-daily-run.sh`.
+- The health bound is slot + 146 s (E-7e).
+- There is a second timer template, `us-source-collector@`.
+- The ARCH programme tests already exist in `test_capture_units.py:182` and `test_launch_window_table.py:421`. Extend them; do not copy them.
+
+**Decisions that carry over to later work packages:**
+- Watchdog checks move to WP4.
+- AF3 moves to WP6.
+- The AG3 stage-reset half moves to WP5b.
+
+## Later decisions
+
+| # | Decision | Ruling |
+|---|---|---|
+| X-8 | The monitor_watch checks for producer and canary staleness meet units that are not deployed yet (WP2, WP6, WP7) | They report `INCONCLUSIVE(not_deployed)`, never FAIL. The state is keyed on the unit file being absent from `~/.config/systemd/user`, not on a timer being disabled, because a disabled timer is a FAIL (#28). This needs peer review before S5 is built. |
+| X-9 | WP2 verify-first | Path B. See `AUT-6-WP2-pathB-ruling_2026-10-08.md` (in peer review). |
+| X-10 | Redeliver unit `ReadWritePaths=` broke bwrap on this host | Fixed by a65ee68f/03789239, with a contract ban on mount-namespace directives in any wrapped unit. Every new AUT-6 unit inherits the ban. |
+| X-11 | `nbp_drift.py` placement | `nbp_drift.py` holds the pure predicates; `check_drift`/`check_freshness` stay in the script. This is an accepted divergence from the plan text. |
