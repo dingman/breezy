@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, advance_prepared
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, TickDraw, advance_prepared
 
 __all__ = ["Simulation", "simulate_family"]
 
@@ -26,6 +26,7 @@ class Simulation:
     multi_tick_share: float
     h1_fallback_uses: int = 0
     h1_draws: int = 0
+    draws: tuple[tuple[TickDraw, ...], ...] = ()
 
 
 def _phi(x: float) -> float:
@@ -60,6 +61,7 @@ def simulate_family(
     p_exit: float = 0.0,
     half_spread: float | None = None,
     theta: float = 0.0,
+    record_draws: bool = False,
 ) -> Simulation:
     """``n_days`` resampled calendar days. A station-day is kept with ``p_keep``."""
     if replicates < 1:
@@ -73,6 +75,7 @@ def simulate_family(
     rng = np.random.default_rng(seed)
     paths: list[tuple[float, ...]] = []
     cuts: list[tuple[int, ...]] = []
+    draw_paths: list[tuple[TickDraw, ...]] = []
     ratios: list[float] = []
     absorbed: list[float] = []
     multi = 0
@@ -81,6 +84,7 @@ def simulate_family(
     slots = replicates * n_days
     for _rep in range(replicates):
         increments: list[float] = []
+        draw_increments: list[TickDraw] = []
         day_cuts: list[int] = []
         carry = 0.0
         for _day in range(n_days):
@@ -103,6 +107,7 @@ def simulate_family(
                     p_exit=p_exit,
                     half_spread=half_spread,
                     theta=theta,
+                    draw_sink=draw_increments if record_draws else None,
                 )
                 carry = step.carry_out
                 if delta is not None:
@@ -118,9 +123,14 @@ def simulate_family(
             if ticks_today >= 2:
                 multi += 1
             day_cuts.append(len(increments))
+        if record_draws and len(draw_increments) != len(increments):
+            raise RuntimeError("tick draws and z increments diverged")
         paths.append(tuple(increments))
         cuts.append(tuple(day_cuts))
+        if record_draws:
+            draw_paths.append(tuple(draw_increments))
     mean = float(sum(absorbed) / len(absorbed)) if absorbed else 0.0
     worst = max(ratios) if ratios else 0.0
     share = multi / slots if slots else 0.0
-    return Simulation(tuple(paths), tuple(cuts), worst, mean, share, h1_uses, h1_draws)
+    recorded = tuple(draw_paths) if record_draws else ()
+    return Simulation(tuple(paths), tuple(cuts), worst, mean, share, h1_uses, h1_draws, recorded)

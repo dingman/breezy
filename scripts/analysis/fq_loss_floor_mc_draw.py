@@ -40,6 +40,7 @@ from scripts.analysis.fq_loss_floor_mc_solve import critical_value
 
 __all__ = [
     "PreparedDay",
+    "TickDraw",
     "advance_prepared",
     "critical_values",
     "prepare_day",
@@ -177,6 +178,20 @@ def invert_cdf(masses: Sequence[float], u: float) -> int:
     return len(masses)
 
 
+@dataclass(frozen=True, slots=True)
+class TickDraw:
+    """One ticking station-day's outcome. ``hs`` is set only for a Bernoulli draw.
+
+    ``carry`` is the incoming carry ``step_clock`` saw. It is stored only when a
+    draw sink is attached, so leaving the sink off does not touch the RNG stream.
+    """
+
+    prep: PreparedDay
+    index: int | None
+    hs: tuple[float, ...] | None
+    carry: float = 0.0
+
+
 def advance_prepared(
     prep: PreparedDay,
     *,
@@ -190,16 +205,24 @@ def advance_prepared(
     p_exit: float,
     half_spread: float | None,
     theta: float,
+    draw_sink: list[TickDraw] | None = None,
 ) -> tuple[ClockStep, float, bool]:
-    """One station-day through ``step_clock``. Carry in, then the H1 Bernoulli fallback flag."""
+    """One station-day through ``step_clock``. Carry in, then the H1 Bernoulli fallback flag.
+
+    ``draw_sink`` receives the outcome only when the day ticks. The RNG stream
+    is unchanged when the sink is omitted.
+    """
     day = prep.day
     h1_fallback = bool(delta is not None and prep.h1.get(delta) is None and day.legs)
     independent = row == "S1" or h1_fallback
+    drawn_index: int | None = None
+    drawn_hs: tuple[float, ...] | None = None
     if independent:
         ps = [
             leg.be if delta is None else h1_win_probability(leg.be, delta=delta) for leg in day.legs
         ]
         hs = [1.0 if float(rng.random()) < p else 0.0 for p in ps]
+        drawn_hs = tuple(hs)
         x_rand = _pnl(day, hs, pnl_scale)
     else:
         if delta is not None:
@@ -212,7 +235,8 @@ def advance_prepared(
             masses = prep.masses
         if masses is None:
             masses = ()
-        x_rand = prep.xs[invert_cdf(masses, u)] * pnl_scale
+        drawn_index = invert_cdf(masses, u)
+        x_rand = prep.xs[drawn_index] * pnl_scale
     shift = (day.netting if netting else 0.0) * pnl_scale
     if row == "S4":
         for leg in day.legs:
@@ -222,6 +246,8 @@ def advance_prepared(
                 cost = exit_coefficient(spread, price=leg.price, theta=theta)
                 shift -= pnl_scale * fraction * cost
     step = step_clock(_normalised(day.station, x_rand, shift, prep.variance), carry)
+    if draw_sink is not None and step.is_tick and step.z is not None:
+        draw_sink.append(TickDraw(prep, drawn_index, drawn_hs, carry))
     return step, carry, h1_fallback
 
 
