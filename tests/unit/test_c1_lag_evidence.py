@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from breezy.analysis.multisource_blend_stats import C1_LAG_SOURCES
 from scripts.analysis import c1_lag_evidence as c1
 from scripts.analysis import multisource_blend_pin_guards as guards
 
@@ -85,14 +86,21 @@ def test_source_without_ledger_is_reported_missing_not_invented(tmp_path: Path) 
         assert ev["measured_days"][src] == 0
 
 
-def test_runner_level_source_keys_are_present(tmp_path: Path) -> None:
+def test_measured_counts_use_pin_keys_not_level_aliases(tmp_path: Path) -> None:
     _write(tmp_path, "us-lamp-live", [_seen(_T0, lag=_MIN)])
     _write(tmp_path, "us-pfm-afos", [_seen(_T0, lag=0, station="KSFO")])
     ev = c1.build_evidence(tmp_path)
-    assert ev["measured_days"]["lamp"] == 1
+    assert ev["measured_days"]["lamp-mdl"] == 1
     assert ev["measured_days"]["pfm"] == 1
-    assert ev["uncensored"]["lamp"] == 1
-    assert ev["measured_days"]["mos"] == 0
+    assert ev["uncensored"]["lamp-mdl"] == 1
+    assert ev["uncensored"]["pfm"] == 1
+    assert ev["measured_days"]["mos-gfs"] == 0
+    assert set(ev["measured_days"]) == set(C1_LAG_SOURCES)
+    assert set(ev["uncensored"]) == set(C1_LAG_SOURCES)
+    assert "lamp" not in ev["measured_days"]
+    assert "lamp" not in ev["uncensored"]
+    assert "mos" not in ev["measured_days"]
+    assert "mos" not in ev["uncensored"]
 
 
 def test_malformed_lines_are_counted_not_fatal(tmp_path: Path) -> None:
@@ -165,3 +173,8 @@ def test_left_truncation_offsets_are_recorded_per_source(tmp_path: Path) -> None
     assert trunc["lav-iem"] == 10 * _MIN
     assert trunc["mos-gfs"] == 120 * _MIN
     assert trunc["lamp-mdl"] == trunc["pfm"] == trunc["obs"] == 0
+
+
+def test_live_and_left_truncation_keys_match_c1_lag_sources() -> None:
+    assert set(c1._LIVE) == set(C1_LAG_SOURCES)
+    assert set(c1._LEFT_TRUNCATION_NS) == set(C1_LAG_SOURCES)

@@ -454,6 +454,10 @@ def test_anchor_pin_shapes_are_validated() -> None:
 # ------------------------------------------------------------------ pins and lags (FB-R4)
 
 
+def test_lag_floor_keys_match_c1_lag_sources() -> None:
+    assert set(fb.LAG_FLOORS_NS) == set(msb.C1_LAG_SOURCES)
+
+
 def test_lag_below_conservative_refused(tmp_path: Path) -> None:
     lags = {**_LAGS_NS, "lamp-mdl": 30 * _MIN}
     world = _build_world(tmp_path, pins=_pins(source_lags_ns=lags))

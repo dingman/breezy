@@ -6,7 +6,7 @@ parses (multisource_blend_skill._check_c1, PIN-R6):
 
 * ``lag_samples_ns``  {pin source: [UNCENSORED lag, integer ns]} for sources with a live path
 * ``uncensored``      {source: count}   ``measured_days`` {source: distinct UTC run days}
-  (both keyed by the pin keys AND by the runner's level keys lamp / pfm / mos)
+  (both keyed only by the pin keys in ``C1_LAG_SOURCES``)
 * ``censored`` (``late`` rows, F13-R21), ``no_live_path`` (sources C1 does not collect),
   ``ready`` (every pin source meets the day and sample minimums) and per-source stats.
 
@@ -64,8 +64,6 @@ _LEFT_TRUNCATION_NS: Final[Mapping[str, int]] = {
     "mos-gfs": 120 * _NS_PER_MIN,
     "obs": 0,
 }
-#: the runner's level-source keys (multisource_blend_features.LEVEL_SOURCES) -> pin key.
-_LEVEL_KEY: Final[Mapping[str, str]] = {"lamp": "lamp-mdl", "pfm": "pfm", "mos": "mos-gfs"}
 
 
 def _read_ledger(path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -165,9 +163,6 @@ def build_evidence(archive_root: Path) -> dict[str, Any]:
         measured[source] = len(got["days"])
         censored[source] = got["censored"]
         stats[source] = _stats(got["samples"], got["days"])
-    for level, pin in _LEVEL_KEY.items():
-        uncensored[level] = uncensored[pin]
-        measured[level] = measured[pin]
     ready = all(measured[s] >= MIN_DAYS and uncensored[s] >= MIN_UNCENSORED for s in C1_LAG_SOURCES)
     return {
         "schema": "c1_lag_evidence/v1",
