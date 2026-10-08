@@ -64,11 +64,11 @@ Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
 | F2 truth fetch | LIVE (timers 11:40Z/12:40Z) |
 | F4 labels | build-now DONE (WP0-3,5,6,8 + plugins); promote waits AUT-6; see F4-open-items_2026-10-06.md |
 | F5 prereg | design 072ab026; A0 KILL frozen; A1 floor frozen 8756dcc4 = unreachable_veto |
-| F6 bridge | permanent veto on FQ v2; F6b CANCELLED; next FQ-R8-2-UNDER-VETO_plan_r2 |
+| F6 bridge | permanent veto: RULING_FQ-v2-NO-TRADE_2026-10-08 (FQ-R8-2 G-B); F6b CANCELLED |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
 | F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
 | F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07 |
-Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B); owes HALT_INERT retirement test (R8-2f).
+Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 live stages); owes HALT_INERT test (R8-2f).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
@@ -78,7 +78,7 @@ Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits 
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
 | 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | OPEN |
-| 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | OPEN |
+| 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
 | 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
 | 10 | AUT-4 | BUILD eval (4a move, live sequential, offline) | 9 | OPEN |
