@@ -1,0 +1,49 @@
+# Failed-unit disposition, 2026-10-08 (AUT-6 WP3 slice S1)
+
+Supersedes the 10-02 list in plan r15 §3.8, which was stale. Evidence is read-only `systemctl --user` and
+`journalctl --user` (no secret values quoted). Verify-first record: `docs/evidence/aut6/WP3_verify_first_2026-10-08.md`.
+
+## A. Units failed at the time of the census (`list-units --failed --all`, ~20:50Z)
+
+| Unit | Root cause (journal) | Disposition |
+|---|---|---|
+| `breezy-autonomy-alert-redeliver.service` | `2026-10-08T20:10:09 ... bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.` then `Main process exited, code=exited, status=1/FAILURE`; also `Failed to enqueue OnFailure=breezy-autonomy-failed@breezy-autonomy-alert-redeliver.service.service job, ignoring: Unit ... not found.` Both failures (20:10:09, 20:10:58Z) were manual starts of the timer-linked-but-not-enabled unit during WP1 bring-up (`is-enabled`: `linked`; the timer has never triggered). | **Fixed upstream of S1** by a65ee68f / 03789239 (X-10: `ReadWritePaths=` mount namespace broke the bwrap userns; contract ban added), committed 20:14Z, after this failure. **Reset at activation**: one `reset-failed` once the fixed unit is live and a manual run exits 0. The missing `OnFailure=` target is X-3 (lands with WP4/WP7); not a defect of S1. |
+
+## B. Units named in plan §3.8 that are no longer failed
+
+Already reset before this slice began (`LoadState=not-found` or `Result=success`). Listed so none is silently dropped.
+
+| Unit | Root cause | Disposition |
+|---|---|---|
+| `breezy-portfolio-roi.service` | `2026-10-08T17:40:00Z PORTFOLIO ROI SKIPPED -- no score-live-trials success marker for 2026-10-08`, `status=1/FAILURE` (also 10-07). `score-live-trials` correctly SKIPs the FQ sending family (`score_live_trials.log`: `2026-10-08T14:15:00Z SCORE LIVE TRIALS SKIPPED -- composition_kind=forecast_quantile_ladder has no score_live_trials`) and wrote no marker, so the downstream report failed every day. | **Fixed by S1**: `score-live-trials-run.sh` writes `score_live_trials_ok_<date>.skipped` (`reason=composition_kind_has_no_scorer`); `portfolio-roi-run.sh` prints `PORTFOLIO ROI NO_INPUT -- upstream skipped: composition_kind_has_no_scorer`, exit 0. An absent marker, or one with a reason outside the closed set, still exits 1. Takes effect at the next 17:40Z run once the primary tree carries the commit (wrappers are read at run time; no daemon-reload needed). |
+| `breezy-fee-evidence-pull.service` | `2026-10-08T11:10:00 fee_drift_evidence_pull: date=2026-10-08 complete=False markets_listed=0 ok=0 reason=empty listing: the /v1/markets query (categories=['climate'], active=True, closed=False, archived=False) matched zero weather markets`, `status=1/FAILURE`. Same signature on 2026-10-01 (11:10Z); the other 11 days of 2026-09-27..10-07 show `complete=True markets_listed=60 ok=60`. Both empty days were Thursdays (n=2, a pattern worth watching, not a finding). | **Keep, exit 1 is correct**: an empty listing is incomplete evidence and must not look like a clean day. It self-recovered the next day both times. No S1 change. Recommend the health pass classify it as a data-availability finding (the 12 other days are the control), not a unit fault. |
+| `breezy-replay-daily.service` | Not failed: every run since 10-01 is `Finished`, but replay has not run since 09-30. See section C. | See section C. |
+| `breezy-parity-mem-1d`, `breezy-parity-mem-7d` (transient) | `2026-10-01T03:56:54 ... status=1/FAILURE` (74 s, 2 GB) and `04:17:43 ... status=1/FAILURE` (20 min, 5.8 GB). Exit 1 is a parity mismatch (`nbp_shadow_parity.py`, per plan r15). | Agent benchmarks, real signal tracked by #16. Already reset. **Retire the unit names**: nothing to do. |
+| `run-p814078-i21773018` (transient) | `2026-10-02T19:09:06 ... status=2/INVALIDARGUMENT` after 1.3 s. | Agent ad-hoc run. Already reset; nothing to do. |
+| `breezy-replay-backfill-0929` (transient) | `2026-09-29T12:38:25 ... status=1/FAILURE`, 2 h 08 min, 10 G peak. | One-time backfill, superseded. Already reset; nothing to do. |
+| `fq-halt-20261005` (transient) | No journal left for the name; `LoadState=not-found`. | Already reset; superseded by the 10-06 re-time. Nothing to do. |
+| `breezy-discovery-pull.service` | 10-02/10-03 `Failed with result 'timeout'`, 13.9 s CPU over 30 min, 4 GB swap peak (working set > 1 GB, L-49). | **Fixed by WP3b** (wave 1). Latest run `2026-10-08T20:09:50Z Finished`. |
+| `jetbrains-remote-dev.service` | Foreign (`Invalid environment assignment, ignoring: -Xmx2g`). | Foreign per plan §3.9; the health rollup lists it under `foreign_failed`. Not ours. |
+
+## C. replay-daily stalled since 10-01 (R3V-a): by design idle, with a masking bug
+
+Facts (`replay_daily.log`, `wrapper_skip_state`, journal):
+
+- Last real replay: `2026-09-29T15:54:30Z replay daily ok`; last runner activity `2026-09-30T16:17:39Z REPLAY DAILY FAILED` (MIA `DRIVER_TIMEOUT`). `replay_results.jsonl` mtime 2026-09-30 16:17:38Z.
+- 10-01, 10-02, 10-03: `REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder has no replay_daily_runner` (S7 branch, `resolve_rc=3`, exit 0). The sending family is `pm_us_crh_fq_v1`, so there is nothing to replay: **by design idle**.
+- 10-04 .. 10-08: `SKIPPED -- another study holds the studies lock` (`wrapper_skip_state` = `5 LOCK_CONTENTION`), with `BREEZY_REPLAY_SKIPPED_STALLED ... 5 consecutive wrapper skips` alerts on 10-06, 10-07, 10-08.
+- Cause of the contention: `breezy-exit-window-study` starts at 15:20Z and was killed by its 30 min `TimeoutStartSec` at **15:50:02Z** on 10-07 and 10-08 (`Failed with result 'timeout' ... Consumed 13.065s CPU time over 30min 2.042s wall clock time`), i.e. 2 s after replay-daily fires at 15:50:00Z. Since 10-04 the two have collided. The study was contained in wave 1 (20:10Z run: `Finished`, 8 s).
+
+Conclusion: the replay is idle by design for the FQ family (no replay machinery applies), so replaying nothing is correct. What is broken is order of checks: the wrapper takes the studies lock BEFORE resolving the family, so a lock collision records `LOCK_CONTENTION` and raises `STALLED` alerts for a job that would have skipped for composition anyway. Exit 75 is not involved (the 75 paths are lock-infra failures, never hit).
+
+Proposed disposition (not built in S1, outside its file list's intent): (1) with the exit-window-study containment live, the collision should not recur; confirm at the 10-09 15:50Z run (`wrapper_skip_state` resets, no `STALLED`). (2) Separate follow-up: resolve the family and take the `composition_kind` skip (exit 0, no recorder) before the lock in `replay-daily-run.sh`, so an FQ day never counts toward `LOCK_CONTENTION`. This needs a new test next to `test_a_forecast_quantile_ladder_sending_family_skips_without_replay_tooling` and must keep `systemctl show` failure non-zero.
+
+## D. Exit 75 (EX_TEMPFAIL) wrapper paths: kept as real failures
+
+Plan r15 §3.8 listed `asos-refresh-run.sh`, `portfolio-roi-run.sh` and `replay-daily-run.sh` `SKIPPED-INFRA ... exit 75` as "would fail as expected behaviour". Re-read: all nine lock-taking wrappers (`asos-refresh`, `decision-funnel-digest`, `decisions-retention`, `exit-window-study`, `hypothesis-triage`, `portfolio-roi`, `position-monitor-report`, `replay-daily`, `station-candidate-register`) share one preamble where 75 means the studies lock directory or file cannot be created/opened (or `HOME` and `XDG_RUNTIME_DIR` are both unset). That is a broken environment, not an expected condition: continuing would let 10-24 GB studies overlap. The existing test `tests/unit/test_analysis_units_serialized.py::test_every_flock_wrapper_refuses_loudly_when_the_lock_dir_is_unwritable` pins exit 75 and `SKIPPED-INFRA`, and every owning unit carries `OnFailure=`. None of the three has ever exited 75 in the retained journal.
+
+Decision: exit 0 would hide a failure; `SuccessExitStatus=75` would do the same (and `us-source-collector@.service`, which does use it, is a per-instance `flock -E 75` overlap guard, a different meaning). Neither was done. The lock-busy paths already exit 0. `tests/contract/test_autonomy_units_programme.py` encodes the distinction and forbids `SuccessExitStatus=75` on those units.
+
+## E. score-live-trials with no sending family
+
+`BREEZY_SENDING_FAMILY_ID` is present on `breezy-trade-supervisor.service` today (`systemctl --user show -p Environment` lists the name; value not printed here), and the score-live-trials unit has no `Environment`/`EnvironmentFile` of its own. An absent id still means the supervisor unit drifted, not "nothing is armed": the wrapper keeps exit 1 and writes **no** skip marker, pinned by the existing `test_the_counter_refuses_when_the_sending_family_id_is_absent_or_unregistered` and a new test. No family ids are invented; `no_sending_family` is NOT in the closed reason vocabulary.
