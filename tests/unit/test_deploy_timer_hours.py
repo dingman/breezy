@@ -30,6 +30,12 @@ _STEP_MINUTES_RE = re.compile(r":0/\d+")
 
 _UNIT_RE = re.compile(r"^Unit=(.+)$")
 
+#: Timers that are periodic by design with no sibling timer of their unit: AUT-6 WP1's alert
+#: redeliver fires at minutes 3, 8, ..., 58 (`OnCalendar=*:03/5`, plan r15 section 3.10). Its
+#: launch-window behaviour is judged by `test_launch_window_table.py`, not by the HH:MM model.
+#: Widened by exactly this one reviewed name.
+_SLOT_PERIODIC_TIMERS = frozenset({"breezy-autonomy-alert-redeliver.timer"})
+
 
 def _timer_unit(timer_path: Path) -> str | None:
     """The `Unit=` target this timer fires, or `None` if the file has none
@@ -66,6 +72,8 @@ def _is_periodic(timer_path: Path, all_timers: Sequence[Path]) -> bool:
     # be a `0/N` step (an hour list alone, e.g. `00,06,12,18:15:00`, is not).
     if not lines or not all(_PERIODIC_RE.match(line) for line in lines):
         return False
+    if timer_path.name in _SLOT_PERIODIC_TIMERS:
+        return True
     if not any(_STEP_MINUTES_RE.search(line) for line in lines):
         return False
     unit = _timer_unit(timer_path)

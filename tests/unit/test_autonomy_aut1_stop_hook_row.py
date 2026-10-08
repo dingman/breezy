@@ -107,4 +107,8 @@ def test_a_hook_line_naming_another_row_or_a_prefix_is_a_lint_error(tmp_path: Pa
 
 
 def test_the_real_deploy_dir_lints_clean_with_the_row() -> None:
-    assert lint_units(REPO_ROOT / "deploy" / "systemd", AUTONOMY_BWRAP_TABLE) == ()
+    errors = lint_units(REPO_ROOT / "deploy" / "systemd", AUTONOMY_BWRAP_TABLE)
+    # X-3 recorded gap (AUT-6 WP1): the only error is the redeliver unit's notifier OnFailure scope.
+    assert [(e.unit, e.rule) for e in errors] == [
+        ("breezy-autonomy-alert-redeliver.service", "onfailure_scope")
+    ]

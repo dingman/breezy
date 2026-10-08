@@ -16,11 +16,12 @@ Exit contract:
 * ``3`` -- CONFIGURED but NOT DELIVERED. Transport failure, TLS failure,
   timeout, or a non-2xx response.
 
-**This tool does NOT use** :func:`breezy.runtime.health.emit_alert`.
-That function's contract is to CONTAIN every failure so an alert sink can
-never abort the poll cycle it reports on -- exactly wrong here, where the
-failure IS the answer. This process has no poll cycle to protect, so it
-calls ``sink.emit`` directly and converts the outcome into an exit code.
+**Production path (G26).** When no ``sink_factory`` is injected this tool
+does not call ``sink.emit``. It calls ``deliver_with_proof``
+(``attempt_kind="alert"``, writer ``check``) and exits
+``EXIT_DELIVERY_FAILED`` iff that proof is not delivered. An injected
+``sink_factory`` keeps the direct ``sink.emit`` path so a test double is
+not forced through the journal.
 
 **Nothing but the four allowlisted payload fields reaches the wire.** The
 ``detail`` is a closed-enum value (:class:`CheckAlertDetail`), never free
@@ -136,6 +137,8 @@ def check_alerts(
         site=CHECK_ALERT_SITE,
         detail=CheckAlertDetail.OPERATOR_CHANNEL_TEST.value,
     )
+    if sink_factory is None:
+        return _deliver_with_proof(sink, payload, out=out, err=err)
     try:
         try:
             sink.emit(payload)
@@ -154,6 +157,46 @@ def check_alerts(
     print(
         f"{_PROG}: delivered -- event={CHECK_ALERT_EVENT} "
         f"severity={args.severity} detail={CheckAlertDetail.OPERATOR_CHANNEL_TEST.value}",
+        file=out,
+    )
+    return EXIT_OK
+
+
+def _deliver_with_proof(
+    sink: AlertSink,
+    payload: AlertPayload,
+    *,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """G26: the production verdict is the delivery proof, not ``sink.emit``."""
+    import breezy.runtime.alert_delivery as delivery
+
+    root = delivery.default_alerts_root()
+    try:
+        proof = delivery.deliver_with_proof(
+            sink,
+            payload,
+            writer="check",
+            records=delivery.DeliveryRecordWriter(root),
+            attempt_kind="alert",
+            outbox=delivery.AlertOutbox(root),
+        )
+    except Exception as exc:  # noqa: BLE001 - the failure IS the answer
+        print(
+            f"{_PROG}: NOT DELIVERED -- {type(exc).__name__} "
+            f"(message withheld: it can embed the webhook URL).",
+            file=err,
+        )
+        return EXIT_DELIVERY_FAILED
+    finally:
+        _close_quietly(sink)
+    if not proof.delivered:
+        print(f"{_PROG}: NOT DELIVERED -- status_class={proof.status_class}", file=err)
+        return EXIT_DELIVERY_FAILED
+    print(
+        f"{_PROG}: delivered -- event={CHECK_ALERT_EVENT} "
+        f"severity={payload.severity} detail={CheckAlertDetail.OPERATOR_CHANNEL_TEST.value}",
         file=out,
     )
     return EXIT_OK

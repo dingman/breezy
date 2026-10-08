@@ -420,7 +420,14 @@ def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     url = active_env.get(ALERT_WEBHOOK_URL_ENV_VAR)
     if not url:
         return LoggingAlertSink()
-    return TeeAlertSink(LoggingAlertSink(), WebhookAlertSink(url))
+    # Imported here: alert_delivery imports this module at load, and this call is the only
+    # construction site that changes (AUT-6 §3.6.5). Writer id is legacy_runtime (X-2).
+    from breezy.runtime.alert_delivery import JournalingWebhookAlertSink
+
+    return TeeAlertSink(
+        LoggingAlertSink(),
+        JournalingWebhookAlertSink(url, writer="legacy_runtime"),
+    )
 
 
 def alert_egress_configured(env: Mapping[str, str] | None = None) -> bool:

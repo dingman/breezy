@@ -122,7 +122,10 @@ LAUNCH_PATH_TABLE: Final[tuple[LaunchPathRow, ...]] = (
 
 #: Deployed units that are launch-path rows. None at seam 4a; AUT-2, AUT-5 and AUT-6 add rows here
 #: and their unit files in the same change. Pinned by equality so a landing unit cannot be missed.
-DEPLOYED_LAUNCH_PATH_UNITS: Final[frozenset[str]] = frozenset()
+#: AUT-6 WP1 adds the alert redeliver (table row ``alert_redeliver``, every five minutes).
+DEPLOYED_LAUNCH_PATH_UNITS: Final[frozenset[str]] = frozenset(
+    {"breezy-autonomy-alert-redeliver.service"}
+)
 
 
 def next_fixed_point_s(start_s: int) -> int | None:

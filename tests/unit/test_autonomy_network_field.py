@@ -167,6 +167,8 @@ def test_every_row_declares_network() -> None:
         *((AUTONOMY_BWRAP_TABLE[name], "none") for name in CAPTURE_ROWS),
         # AUT-2 WP6 (E-15): the label run declares egress (DNS) for its injected delivery seam
         (AUTONOMY_BWRAP_TABLE["breezy-label-outcomes"], "egress"),
+        # AUT-6 WP1 (E-15): the redeliver row declares egress for delivery
+        (AUTONOMY_BWRAP_TABLE["breezy-autonomy-alert-redeliver"], "egress"),
     )
     assert {row.name for row, _ in expected} == set(AUTONOMY_BWRAP_TABLE)
     for row, value in expected:

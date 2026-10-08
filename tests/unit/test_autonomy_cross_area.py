@@ -34,7 +34,10 @@ from tests.unit.autonomy_owner_placeholders import CROSS_AREA_FILE, OWNER_PLACEH
 #: ``test_voided_pair_fills_excluded_from_all_n`` stubs), so the carried count is 157 - 5.
 #: WP8 delivered three more (the canary-store reconciliation and entry_guard halves and the drill
 #: test), so 152 - 3.
-EXPECTED_CROSS_AREA_STUBS: Final = 149
+#: AUT-6 WP1 delivered five (the deliver_with_proof, critical-alert, detector, SIGKILL and
+#: concurrent-drainer tests, now in ``test_alert_delivery.py`` and
+#: ``test_alert_outbox_concurrency.py``), so 149 - 5.
+EXPECTED_CROSS_AREA_STUBS: Final = 144
 R5_AUT_5A_STUBS: Final = (
     "test_l1_cutover_lock_acquired_at_164454_aborts",
     "test_l1_cutover_late_write_completion_aborts",
@@ -864,31 +867,6 @@ def test_drawdown_producer_handshake_with_labels() -> None:
 )
 def test_detectors_and_drawdown_include_drill_fills(case: str) -> None:
     await_owner(f"test_detectors_and_drawdown_include_drill_fills[{case}]")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_deliver_with_proof_reports_non_2xx_through_tee() -> None:
-    await_owner("test_deliver_with_proof_reports_non_2xx_through_tee")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_critical_alerts_use_delivery_proof() -> None:
-    await_owner("test_critical_alerts_use_delivery_proof")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_detector_and_failure_mode_alerts_use_delivery_proof() -> None:
-    await_owner("test_detector_and_failure_mode_alerts_use_delivery_proof")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_critical_survives_sigkill() -> None:
-    await_owner("test_critical_survives_sigkill")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_concurrent_drainers_send_at_most_once_per_claim_window() -> None:
-    await_owner("test_concurrent_drainers_send_at_most_once_per_claim_window")
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")

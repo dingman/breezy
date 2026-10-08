@@ -211,6 +211,23 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "window range through skip_journal.write_json_once",
         "write_once",
     ),
+    # AUT-6 WP1 (plan r15 sections 3.6.2, 3.6.3; U3): the delivery journal and the durable outbox.
+    # Both are published by alert_outbox._publish (mkstemp, fsync, os.link: write-once, no replace).
+    FileWriter(
+        "evidence/alerts/<YYYY-MM-DD>/<ts_ns>_<writer>_<d|f>.json",
+        "each delivering process writes its own attempt record, under its own writer id "
+        "(node, intraday, daily, health, redeliver, canary, check, deadman, engine, probe or "
+        "legacy_<component>); alert_outbox.DeliveryRecordWriter, 0600 in 0700 directories",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/alerts/outbox/*.json",
+        "create: every originating process through alert_outbox.AlertOutbox.write_entry; claim: "
+        "the drainer's utime then rename into outbox/claimed/<drainer>/ (E-1; the originator for "
+        "its own entry, the node worker, redeliver, deadman); remove: the current claimant only, "
+        "after its delivered record was written",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "

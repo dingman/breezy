@@ -150,8 +150,18 @@ def test_good_units_lint_clean(tmp_path: Path) -> None:
     assert _lint(tmp_path, GOOD_FILES) == ()
 
 
+# X-3 recorded gap (AUT-6 WP1): the redeliver unit names OnFailure=breezy-autonomy-failed@ before
+# the notifier row exists (WP4/WP7). It is the ONE lint error the real tree may carry.
+X3_GAP = [("breezy-autonomy-alert-redeliver.service", "onfailure_scope")]
+
+
+def _real_tree_errors() -> list[tuple[str, str]]:
+    errors = lint_units(REPO_ROOT / "deploy" / "systemd", AUTONOMY_BWRAP_TABLE)
+    return [(e.unit, e.rule) for e in errors]
+
+
 def test_real_deploy_units_lint_clean_and_lint_is_not_vacuous(tmp_path: Path) -> None:
-    assert lint_units(REPO_ROOT / "deploy" / "systemd", AUTONOMY_BWRAP_TABLE) == ()
+    assert _real_tree_errors() == X3_GAP
     assert _lint(tmp_path, {"breezy-autonomy-t1.service": _unit("/usr/bin/true")}) != ()
 
 
@@ -162,7 +172,7 @@ def test_wrapper_file_never_parsed_as_unit(tmp_path: Path) -> None:
 
 def test_wrapper_script_in_the_real_deploy_dir_is_not_linted_as_a_unit() -> None:
     assert (REPO_ROOT / "deploy" / "systemd" / "breezy-autonomy-bwrap").is_file()
-    assert lint_units(REPO_ROOT / "deploy" / "systemd", AUTONOMY_BWRAP_TABLE) == ()
+    assert _real_tree_errors() == X3_GAP
 
 
 # ------------------------------------------------------------ exec line shapes
