@@ -76,9 +76,11 @@ from breezy.runtime.trade_supervisor_core import (
     MIDDAY_READINESS_RECHECK_TIMEOUT,  # noqa: F401 - re-exported: moved/used via this module's namespace
     MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
+    NODE_LOG_NAME_RE,
     PERMIT_EXPIRY_CEILING_NS_ENV_VAR,
     PERMIT_ISSUED_MARKER,  # noqa: F401 - re-exported: moved/used via this module's namespace
     PERMIT_NOT_REQUESTED_MARKER,
+    READY_ADOPTION_EVIDENCE_TERMINALS,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,  # noqa: F401 - re-exported: moved/used via this module's namespace
     SELF_CHECK_ESCALATION_STORE_KEY,
@@ -99,6 +101,7 @@ from breezy.runtime.trade_supervisor_core import (
     PermitAlertDecision,
     PermitCapability,
     Phase,
+    ReadyAdoptionVerdict,
     RelaunchCause,
     SelfCheckEscalationState,
     StopPriorAction,
@@ -116,6 +119,8 @@ from breezy.runtime.trade_supervisor_core import (
     decide_midday_recheck,
     decide_midday_relaunch,  # noqa: F401 - re-exported: moved/used via this module's namespace
     decide_permit_alert,
+    decide_ready_adoption,
+    decide_ready_adoption_alert,
     decide_relaunch,
     decide_stop_prior_action,
     decode_self_check_escalation_state,
@@ -123,8 +128,10 @@ from breezy.runtime.trade_supervisor_core import (
     encode_self_check_escalation_state,
     escalated_self_check_severity,  # noqa: F401 - re-exported: moved/used via this module's namespace
     initial_scheduler_state,
+    is_deferral,
     latch_log_facts,
     latch_midday_log_facts,
+    latest_liveness_line_ns,
     launch_time_ns,
     mark_phase_fired,
     midday_boot_retry_dispatch_due,
@@ -134,6 +141,7 @@ from breezy.runtime.trade_supervisor_core import (
     midday_watch_idle,
     midday_watch_window_end,  # noqa: F401 - re-exported: moved/used via this module's namespace
     next_due,
+    node_log_spawned_at,
     parse_permit_expiry_ns,
     permit_capability_valid,
     permit_expiry_valid,  # noqa: F401 - re-exported: moved/used via this module's namespace
@@ -152,6 +160,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_boot_zero_instruments_seen,
     record_child_adopted,
     record_first_boot_permit_seen,
+    record_liveness_line_seen,
     record_midday_alert_sent,
     record_midday_cause_seen,
     record_midday_ceiling_unknown_alert_sent,
@@ -165,9 +174,14 @@ from breezy.runtime.trade_supervisor_core import (
     record_permit_issued_seen,
     record_permit_not_required_warned,
     record_readiness_observed,
+    record_ready_adoption,
+    record_ready_adoption_alert_sent,
+    record_ready_adoption_deferral,
+    record_ready_adoption_terminal_logged,
     record_relaunch_attempt,
     record_self_check_result,
     record_strategy_subscribed_seen,
+    reset_ready_adoption_deferral,
     seed_permit_alert,
     self_check,
     self_check_gap_hours,
@@ -795,7 +809,10 @@ def node_log_path(log_dir: Path, now: dt.datetime) -> Path:
 #: (``breezy-trade-supervisor.log`` and its ``-stdout-``/``.launch-``
 #: variants) all share the ``breezy-trade-`` prefix but must never qualify
 #: as an adopted node's log.
-_NODE_LOG_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^breezy-trade-\d{8}T\d{6}Z\.log$")
+#: [SUP-RESTART-ANYTIME] The pattern now lives in (stdlib-only) core as the
+#: public ``NODE_LOG_NAME_RE`` (one capture group around the stamp); this
+#: module keeps the historical private name as an alias of the same object.
+_NODE_LOG_NAME_RE: Final[re.Pattern[str]] = NODE_LOG_NAME_RE
 
 
 def supervisor_log_path(log_dir: Path) -> Path:
@@ -1049,6 +1066,9 @@ def configure_supervisor_logging(log_dir: Path) -> None:
     logger.addHandler(stream_handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    # httpx logs request URLs at INFO and webhook URLs are secrets: keep the
+    # library silent even if a root handler is ever added.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1345,11 @@ def _do_relaunch_check(
     # shared reader's offset past it.
     if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now)
+    # [SUP-RESTART-ANYTIME ops review, 2026-10-08] An orders-off node prints
+    # this on log line 2, so this first drain is the only one that sees it;
+    # unlatched, every later B1 poll reported a false ABSENT CRITICAL.
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
         state = record_permit_issued_seen(state, now, permit_expiry_ns)
@@ -1351,6 +1376,10 @@ def _do_relaunch_check(
     # well before 17:00Z, so no later handler's read can be first to see it.
     if zero_instruments_refusal_in(log_text):
         state = record_boot_zero_instruments_seen(state, now)
+    # [SUP-RESTART-ANYTIME] Same drain-safe parity as every latch above.
+    liveness_ns = latest_liveness_line_ns(log_text, now_ns=int(now.timestamp() * 1e9))
+    if liveness_ns is not None:
+        state = record_liveness_line_seen(state, now, liveness_ns)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
@@ -2136,6 +2165,100 @@ def _permit_watch_adopt_and_evaluate(
     return tracked_pid, node_log, state
 
 
+def _ready_adoption_step(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    now_ns: int,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+) -> DaySchedulerState:
+    """[SUP-RESTART-ANYTIME] After B1's adoption/replay/drain on this poll,
+    re-derive ``launch_done`` + ``readiness_observed`` for a node proven
+    ready (so MIDDAY_WATCH becomes due again after a supervisor restart).
+
+    Returns at once, with no port call, when readiness is already observed,
+    ``now`` is outside B1's window, or nothing is tracked (B1 pages NO_NODE
+    for that; the counter is neither counted nor reset). The step has NO
+    spawn, signal or store-write capability: its only port calls are
+    ``process_alive``, ``resolve_intent_lock_holder`` and ``alert_sink``.
+    An ``OSError`` is logged and counted; any other exception propagates to
+    B1's ``[D8]`` containment (WATCH_FAILED, never a mark)."""
+    if state.readiness_observed or tracked_pid is None:
+        return state
+    window_open, window_close = permit_watch_window(state.day)
+    if not window_open <= now < window_close:
+        return state
+
+    child_alive = False
+    holder_is_tracked = False
+    try:
+        child_alive = ports.process_alive(tracked_pid)
+        if child_alive:
+            holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
+            holder_is_tracked = holder is not None and holder == tracked_pid
+    except OSError as exc:
+        log_decision("ready_adoption_io_error", error_type=type(exc).__name__)
+        verdict = ReadyAdoptionVerdict.IO_ERROR
+    else:
+        verdict = decide_ready_adoption(
+            state=state,
+            now=now,
+            now_ns=now_ns,
+            child_alive=child_alive,
+            holder_is_tracked=holder_is_tracked,
+            log_spawned_at=node_log_spawned_at(node_log.name) if node_log is not None else None,
+        )
+
+    if verdict is ReadyAdoptionVerdict.MARK:
+        liveness_ns = state.liveness_line_last_ns or now_ns
+        state = record_ready_adoption(state, now)
+        log_decision(
+            "restart_adopted_ready_node",
+            pid=tracked_pid,
+            liveness_age_s=max(0, (now_ns - liveness_ns) // 1_000_000_000),
+        )
+        return state
+    if not is_deferral(verdict):
+        state = reset_ready_adoption_deferral(state, now)
+        if (
+            verdict in READY_ADOPTION_EVIDENCE_TERMINALS
+            and not state.ready_adoption_terminal_logged
+        ):
+            log_decision("ready_adoption_terminal", verdict=verdict.value, pid=tracked_pid)
+            state = record_ready_adoption_terminal_logged(state, now)
+        return state
+
+    return _ready_adoption_defer(ports=ports, state=state, now=now, verdict=verdict)
+
+
+def _ready_adoption_defer(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    verdict: ReadyAdoptionVerdict,
+) -> DaySchedulerState:
+    """Count one deferral, log it (first poll and every alert), and send the
+    WARN/CRITICAL when due; an unsent alert is retried next poll (A2)."""
+    state = record_ready_adoption_deferral(state, now)
+    spec = decide_ready_adoption_alert(state)
+    polls = state.ready_adoption_deferral_polls
+    if polls == 1 or spec is not None:
+        log_decision("ready_adoption_deferred", reason=verdict.value, polls=polls)
+    if spec is not None:
+        sent = _send_permit_alert(
+            ports.alert_sink, event=spec.event, severity=spec.severity, detail=spec.detail
+        )
+        if sent:  # [A2] an unsent alert is retried on the next poll, never latched.
+            state = record_ready_adoption_alert_sent(
+                state, now, critical=spec.severity == "CRITICAL"
+            )
+    return state
+
+
 def _do_permit_watch(
     *,
     ports: SupervisorPorts,
@@ -2187,7 +2310,7 @@ def _do_permit_watch(
             return tracked_pid, node_log, state
 
         now_ns = int(now.timestamp() * 1e9)
-        return _permit_watch_adopt_and_evaluate(
+        tracked_pid, node_log, state = _permit_watch_adopt_and_evaluate(
             ports=ports,
             state=state,
             now=now,
@@ -2198,6 +2321,18 @@ def _do_permit_watch(
             log_dir=log_dir,
             handler_read_log=handler_read_log,
         )
+        # [SUP-RESTART-ANYTIME] ``state`` is rebound to B1's result first, so
+        # a fault in the step below is contained with B1's updates intact.
+        state = _ready_adoption_step(
+            ports=ports,
+            state=state,
+            now=now,
+            now_ns=now_ns,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+        )
+        return tracked_pid, node_log, state
     except _AdoptionLogPermanentlyUnreadableError as exc:
         # [SUP-ADOPT-PERMIT] The exception carries the state update (failure
         # counter latched) that a bare re-raise inside the helper would

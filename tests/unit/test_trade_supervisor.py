@@ -16,19 +16,31 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import fcntl
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
+import breezy.runtime.trade_supervisor as _ts_module
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
-from breezy.runtime.health import AlertPayload
+from breezy.runtime.alert_delivery import (
+    REDELIVER_MIN_AGE_S,
+    AlertOutbox,
+    DeliveryRecordWriter,
+    JournalingWebhookAlertSink,
+    drain_outbox,
+)
+from breezy.runtime.health import AlertPayload, LoggingAlertSink, TeeAlertSink, WebhookAlertSink
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
@@ -4321,6 +4333,20 @@ class TestSupervisorLoggingConfiguration:
         assert len(file_handlers) == 1
         assert Path(file_handlers[0].baseFilename) == supervisor_log_path(tmp_path / "logs-b")
 
+    def test_configure_supervisor_logging_pins_httpx_logger_to_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """httpx logs request URLs at INFO; webhook URLs are secrets, so the
+        library logger must stay silent even if a root handler appears."""
+        httpx_logger = logging.getLogger("httpx")
+        previous = httpx_logger.level
+        httpx_logger.setLevel(logging.NOTSET)
+        try:
+            configure_supervisor_logging(tmp_path / "logs")
+            assert httpx_logger.level == logging.WARNING
+        finally:
+            httpx_logger.setLevel(previous)
+
     def test_configured_logger_actually_emits_at_info_level(self, tmp_path):
         log_dir = tmp_path / "logs"
         configure_supervisor_logging(log_dir)
@@ -5831,6 +5857,44 @@ class TestGapHandlersLatchEveryLogFact:
         )
         assert capability is PermitCapability.NOT_REQUIRED
 
+    def test_relaunch_check_latches_the_not_requested_marker_from_its_own_read(
+        self, tmp_path: Path
+    ) -> None:
+        """Live evidence 2026-10-08: an orders-off node prints the marker on
+        log line 2; the RELAUNCH_CHECK poll drains it first. If that handler
+        does not latch it, every later B1 poll reports a false ABSENT."""
+        from breezy.runtime.trade_supervisor_core import (
+            PermitCapability,
+            permit_capability_valid,
+        )
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("boot\n" + PERMIT_NOT_REQUESTED_MARKER + "\n")
+        reader = IncrementalLogReader()
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+
+        _pid, _log, state = _do_relaunch_check(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=_utc(16, 55),
+            tracked_pid=1001,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+
+        assert state.orders_not_requested_seen is True
+        capability = permit_capability_valid(
+            state,
+            int(_utc(18, 5).timestamp() * 1e9),
+            child_alive=True,
+            log_available=True,
+            midday_budget_live=False,
+        )
+        assert capability is PermitCapability.NOT_REQUIRED
+
     def test_relaunch_check_latches_the_midday_cause_from_its_own_read(self, tmp_path):
         """A transient-fault line may print well before the process is
         actually observed dead -- this poll (process still alive) may be
@@ -5909,6 +5973,137 @@ class TestGapHandlersLatchEveryLogFact:
             state, now_ns, child_alive=True, log_available=True, midday_budget_live=True
         )
         assert capability is PermitCapability.NOT_REQUIRED
+
+
+_LATCH_PARITY_FIELDS = (
+    "strategy_subscribed_seen",
+    "permit_issued_seen_expires_at_ns",
+    "first_boot_permit_expires_at_ns",
+    "midday_cause_seen",
+    "orders_not_requested_seen",
+    "boot_zero_instruments_seen",
+    "liveness_line_last_ns",
+)
+
+
+def _every_latched_log_fact_text(now: dt.datetime) -> str:
+    """ONE log delta carrying every fact `latch_log_facts` latches."""
+    from breezy.runtime.trade_supervisor_core import (
+        LIVENESS_POSITIVE_MARKER,
+        STRATEGY_SUBSCRIBED_MARKER,
+    )
+
+    stamp = (now - dt.timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
+    return (
+        f"{stamp} [INFO] {STRATEGY_SUBSCRIBED_MARKER}\n"
+        + _CHILD2_PERMIT_ISSUED_LINE
+        + PERMIT_NOT_REQUESTED_MARKER
+        + "\n"
+        + _TRADING_NODE_FAILED_LINE
+        + f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} 2026-09-27 (SFO=0){ZERO_INSTRUMENTS_REFUSAL_SUFFIX}\n"
+        + f"{stamp} [INFO] X: {LIVENESS_POSITIVE_MARKER}{{'k': 1}}\n"
+    )
+
+
+def _latch_snapshot(state: DaySchedulerState) -> dict[str, Any]:
+    return {name: getattr(state, name) for name in _LATCH_PARITY_FIELDS}
+
+
+class TestEveryLogDrainingHandlerLatchesWhatLatchLogFactsLatches:
+    """Parity guard: every handler that drains the shared, offset-advancing
+    `IncrementalLogReader` must latch inline the same facts as
+    `latch_log_facts` would from the identical text, because the drained
+    delta is never seen again (FU-1/FU-17 class of gap)."""
+
+    @staticmethod
+    def _reference(now: dt.datetime, text: str) -> dict[str, Any]:
+        from breezy.runtime.trade_supervisor_core import latch_log_facts
+
+        ref = _latch_snapshot(latch_log_facts(initial_scheduler_state(_DAY), now, text))
+        # Guard against a vacuous comparison: every field must be populated.
+        assert all(v not in (None, False) for v in ref.values()), ref
+        return ref
+
+    def _ports(self, tmp_path: Path, text: str) -> tuple[Path, SupervisorPorts]:
+        node_log = tmp_path / "node.log"
+        node_log.write_text(text)
+        reader = IncrementalLogReader()
+        return node_log, _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+
+    def test_relaunch_check_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(16, 55)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _p, _l, state = _do_relaunch_check(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=now,
+            tracked_pid=1001,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_midday_watch_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(20, 0)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _p, _l, state = _do_midday_watch(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=now,
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_self_check_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(17, 5)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _a, _b, state = _do_self_check(
+            ports=ports,
+            now=now,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=1001,
+            node_log=node_log,
+            state=initial_scheduler_state(_DAY),
+        )
+        assert state is not None
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_boot_retry_poll_latches_its_declared_subset(self) -> None:
+        """`_poll_boot_retry_child` latches strategy-subscribed and zero-
+        instruments (read facts), then cause + not-requested marker (no-permit
+        facts). The permit itself is latched by `_boot_retry_hand_off_to_midday`
+        (not here), and liveness is deliberately NOT latched: boot-retry only
+        runs for a child that has not yet reached ready-adoption."""
+        from breezy.runtime.trade_supervisor import (
+            _latch_boot_retry_no_permit_facts,
+            _latch_boot_retry_read_facts,
+        )
+
+        now = _utc(16, 55)
+        text = _every_latched_log_fact_text(now)
+        state = initial_scheduler_state(_DAY)
+        state, _expiry = _latch_boot_retry_read_facts(state, now, text)
+        state, _cause = _latch_boot_retry_no_permit_facts(state, now, text)
+        reference = self._reference(now, text)
+        subset = (
+            "strategy_subscribed_seen",
+            "midday_cause_seen",
+            "orders_not_requested_seen",
+            "boot_zero_instruments_seen",
+        )
+        assert {k: v for k, v in _latch_snapshot(state).items() if k in subset} == {
+            k: reference[k] for k in subset
+        }
+        assert state.liveness_line_last_ns is None
 
 
 # ===========================================================================
@@ -7024,3 +7219,1027 @@ class TestB1PermitWatch:
             max_iterations=30,
         )
         assert terminate_calls == [42]
+
+
+# ===========================================================================
+# [SUP-RESTART-ANYTIME] ready-adoption: shell tests (T8-T16d, T14, T14c)
+# ===========================================================================
+
+_RA_PID = 777
+_RA_STAMP = "20260904T165100Z"
+_RA_NS = 1_000_000_000
+_RA_CEILING_ENV = "BREEZY_PERMIT_EXPIRY_CEILING_NS"
+_RA_EVENT = "TRADE_SUPERVISOR_READY_ADOPTION_DEFERRED"
+
+
+def _ra_epoch_ns(at: dt.datetime) -> int:
+    return int(at.timestamp()) * _RA_NS
+
+
+def ra_shadow_line(at: dt.datetime) -> str:
+    """A SHADOW_DECISION line in the real ANSI-wrapped Nautilus prefix format."""
+    return (
+        f"\x1b[1m{at:%Y-%m-%dT%H:%M:%S}.123456789Z\x1b[0m [INFO] "
+        "BREEZY-L001.FORECAST-QUANTILE-LADDER: SHADOW_DECISION {'k': 1}\n"
+    )
+
+
+def ra_boot_text(
+    expiry_ns: int,
+    *,
+    permit: bool = True,
+    subscribed: bool = True,
+    not_requested: bool = False,
+) -> str:
+    parts = []
+    if not_requested:
+        parts.append(PERMIT_NOT_REQUESTED_MARKER + "\n")
+    if permit:
+        parts.append(
+            f"live-trading permit issued issued_at_ns=1 expires_at_ns={expiry_ns} ttl_s=1\n"
+        )
+    if subscribed:
+        parts.append(_STRATEGY_SUBSCRIBED_LINE)
+    return "".join(parts)
+
+
+class RaWorld:
+    """One live node (pid, real log file, scripted flock holder) plus ports
+    built from it. The log reader is the REAL ``IncrementalLogReader``."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        pid: int = _RA_PID,
+        stamp: str = _RA_STAMP,
+        expiry_ns: int = _FAR_FUTURE_EXPIRES_AT_NS,
+        boot_text: str | None = None,
+        sink: _RecordingAlertSink | None = None,
+    ) -> None:
+        self.tmp_path = tmp_path
+        self.log_dir = tmp_path / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.pid = pid
+        self.expiry_ns = expiry_ns
+        self.log = self.log_dir / f"breezy-trade-{stamp}.log"
+        self.log.write_text(boot_text if boot_text is not None else ra_boot_text(expiry_ns))
+        self.alive = True
+        self.emitting = True
+        self.holder_script: list[int | None | BaseException] | None = None
+        self.reader = IncrementalLogReader()
+        self.sink: _RecordingAlertSink = sink if sink is not None else _RecordingAlertSink()
+        self.spawner = FakeSpawner()
+        self.terminated: list[int] = []
+
+    def append(self, text: str) -> None:
+        with open(self.log, "a", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def tick(self, now: dt.datetime) -> None:
+        if self.emitting and self.alive:
+            self.append(ra_shadow_line(now))
+
+    def _holder(self, _path: Path) -> int | None:
+        if self.holder_script is None:
+            return self.pid if self.alive else None
+        script = self.holder_script
+        item = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def ports(self, **overrides: Any) -> SupervisorPorts:
+        base = {
+            "find_node_pid": lambda: self.pid if self.alive else None,
+            "resolve_intent_lock_holder": self._holder,
+            "intent_lock_free": lambda _p: not self.alive,
+            "process_alive": lambda pid: self.alive and pid == self.pid,
+            "find_adopted_log": lambda _d, _p: self.log,
+            "read_log_new": self.reader.read_new,
+            "read_log_from_start": self.reader.read_from_start_and_mark_consumed,
+            "alert_sink": self.sink,
+            "spawn": self.spawner,
+            "terminate_after_recheck": lambda pid, **kw: self.terminated.append(pid),
+        }
+        base.update(overrides)
+        return _make_ports(**base)
+
+
+def ra_run_loop(
+    world: RaWorld,
+    ports: SupervisorPorts,
+    *,
+    start: dt.datetime,
+    iterations: int,
+    on_sleep: Callable[[FakeClock], None] | None = None,
+) -> FakeClock:
+    """``_run_forever`` over a fake clock; the world's node emits one line per sleep."""
+    clock = FakeClock(start)
+    world.tick(start)
+
+    def fake_sleep(seconds: float) -> None:
+        clock.advance(seconds)
+        world.tick(clock.current)
+        if on_sleep is not None:
+            on_sleep(clock)
+
+    _run_forever(
+        store_path=world.tmp_path / "state" / "store.sqlite3",
+        repo_root=world.tmp_path,
+        node_bin=world.tmp_path / "node_bin",
+        log_dir=world.log_dir,
+        clock=clock,
+        sleep=fake_sleep,
+        ports=ports,
+        max_iterations=iterations,
+    )
+    return clock
+
+
+def ra_poll(
+    world: RaWorld,
+    ports: SupervisorPorts,
+    *,
+    start: dt.datetime,
+    polls: int,
+    state: DaySchedulerState | None = None,
+    tracked_pid: int | None = None,
+    node_log: Path | None = None,
+    step_s: int = 60,
+    before_poll: Callable[[int, dt.datetime], None] | None = None,
+) -> tuple[DaySchedulerState, int | None, Path | None, list[DaySchedulerState]]:
+    """Drive B1 (``_do_permit_watch``) once per fake minute, exactly as
+    ``_run_forever``'s idle branch does. Returns (state, pid, log, per-poll states)."""
+    state = state if state is not None else initial_scheduler_state(_DAY)
+    trace = []
+    for k in range(polls):
+        now = start + dt.timedelta(seconds=step_s * k)
+        world.tick(now)
+        if before_poll is not None:
+            before_poll(k, now)
+        tracked_pid, node_log, state = _do_permit_watch(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            handler_read_log=False,
+            **_b1_common_kwargs(world.tmp_path),
+        )
+        trace.append(state)
+    return state, tracked_pid, node_log, trace
+
+
+def _ra_sub(root: Path, name: str) -> Path:
+    path = root / name
+    path.mkdir()
+    return path
+
+
+def _ra_messages(caplog: pytest.LogCaptureFixture, prefix: str) -> list[str]:
+    return [m for m in caplog.messages if m.startswith(prefix)]
+
+
+def _ra_step_alerts(sink: _RecordingAlertSink) -> list[AlertPayload]:
+    return [p for p in sink.payloads if p.event == _RA_EVENT]
+
+
+def _ra_signature(sink: _RecordingAlertSink) -> list[tuple[str, str, str]]:
+    return [(p.event, p.severity, p.detail) for p in sink.payloads if p.event != _RA_EVENT]
+
+
+def _ra_ready_state(**overrides: Any) -> DaySchedulerState:
+    """Permit, subscribed and anchor latched for the tracked child; no liveness."""
+    base = replace(
+        initial_scheduler_state(_DAY),
+        permit_issued_seen_expires_at_ns=_FAR_FUTURE_EXPIRES_AT_NS,
+        first_boot_permit_expires_at_ns=_FAR_FUTURE_EXPIRES_AT_NS,
+        strategy_subscribed_seen=True,
+    )
+    return replace(base, **overrides)
+
+
+class TestReadyAdoptionShell:
+    def test_restart_at_2000_with_ready_node_restores_midday_watch_without_spawn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T8"""
+        world = RaWorld(tmp_path)
+        world.append(ra_shadow_line(_utc(19, 59, 40)))
+        midday_calls: list[int] = []
+        real_midday = _ts_module._do_midday_watch
+
+        def recording_midday(**kwargs: Any) -> Any:
+            midday_calls.append(1)
+            return real_midday(**kwargs)
+
+        monkeypatch.setattr(_ts_module, "_do_midday_watch", recording_midday)
+        with caplog.at_level("INFO"):
+            ra_run_loop(world, world.ports(), start=_utc(20, 0), iterations=4)
+        assert _ra_messages(caplog, "restart_adopted_ready_node pid=777 ")
+        assert midday_calls
+        assert world.spawner.calls == []
+        assert world.terminated == []
+
+    def test_ct13_transient_holder_none_defers_mark_and_never_spawns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """T9"""
+        world = RaWorld(tmp_path)
+        world.holder_script = [_RA_PID, None, _RA_PID]
+        with caplog.at_level("INFO"):
+            _s, _p, _l, trace = ra_poll(world, world.ports(), start=_utc(20, 0), polls=3)
+        assert [t.readiness_observed for t in trace] == [False, True, True]
+        assert trace[0].ready_adoption_deferral_polls == 1
+        assert world.spawner.calls == []
+        assert _ra_step_alerts(world.sink) == []
+
+    def test_persistent_holder_none_pages_warn_at_5_and_critical_at_12_and_never_marks(
+        self, tmp_path: Path
+    ) -> None:
+        """T9 variant"""
+        world = RaWorld(tmp_path)
+        world.holder_script = [_RA_PID, None]
+        state, _p, _l, _trace = ra_poll(world, world.ports(), start=_utc(20, 0), polls=14)
+        assert state.readiness_observed is False
+        assert [(p.severity, p.detail) for p in _ra_step_alerts(world.sink)] == [
+            ("WARN", AlertDetail.READY_ADOPTION_DEFERRED.value),
+            ("CRITICAL", AlertDetail.READY_ADOPTION_UNPROVEN.value),
+        ]
+        assert world.spawner.calls == []
+
+    def test_expired_permit_node_is_never_marked(self, tmp_path: Path) -> None:
+        """T10: B1's alert set is unchanged versus the step disabled."""
+        now = _utc(20, 0)
+        expired_ns = _ra_epoch_ns(now) - 5 * _RA_NS
+        runs = {}
+        for label, disable in (("with_step", False), ("without_step", True)):
+            sub = _ra_sub(tmp_path, label)
+            world = RaWorld(sub, expiry_ns=expired_ns)
+            ports = world.ports()
+            if disable:
+                original = _ts_module._ready_adoption_step
+                _ts_module._ready_adoption_step = lambda **kw: kw["state"]
+            try:
+                state, *_ = ra_poll(world, ports, start=now, polls=6)
+            finally:
+                if disable:
+                    _ts_module._ready_adoption_step = original
+            runs[label] = (state, _ra_signature(world.sink), _ra_step_alerts(world.sink))
+        assert runs["with_step"][0].readiness_observed is False
+        assert runs["with_step"][2] == []
+        assert runs["with_step"][1] == runs["without_step"][1]
+        assert runs["with_step"][1]  # B1 itself does page the lapsed permit
+
+    def test_permit_that_lapses_on_the_marking_poll_is_not_marked(self, tmp_path: Path) -> None:
+        """T10 variant: unexpired at poll N-1, expired at poll N, fresh line at N."""
+        start = _utc(20, 0)
+        outcomes = {}
+        for label, expiry in (
+            ("lapses", _ra_epoch_ns(start) + 150 * _RA_NS),  # alive at 0/60/120 s, gone at 180 s
+            ("control", _FAR_FUTURE_EXPIRES_AT_NS),
+        ):
+            world = RaWorld(_ra_sub(tmp_path, label), expiry_ns=expiry)
+            world.emitting = False
+
+            def fresh_line_on_fourth_poll(k: int, now: dt.datetime, world: RaWorld = world) -> None:
+                if k == 3:
+                    world.append(ra_shadow_line(now))
+
+            _s, _p, _l, trace = ra_poll(
+                world, world.ports(), start=start, polls=4, before_poll=fresh_line_on_fourth_poll
+            )
+            outcomes[label] = [t.readiness_observed for t in trace]
+        assert outcomes["lapses"] == [False, False, False, False]
+        assert outcomes["control"] == [False, False, False, True]
+
+    def test_unarmed_node_is_not_required_never_marked_never_paged_by_step(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """T10b (SM2)"""
+        results = {}
+        for label, disable in (("with_step", False), ("without_step", True)):
+            sub = _ra_sub(tmp_path, label)
+            world = RaWorld(sub, boot_text=ra_boot_text(0, permit=False, not_requested=True))
+            original = _ts_module._ready_adoption_step
+            if disable:
+                _ts_module._ready_adoption_step = lambda **kw: kw["state"]
+            try:
+                caplog.clear()
+                with caplog.at_level("INFO"):
+                    ra_run_loop(world, world.ports(), start=_utc(20, 0), iterations=200)
+            finally:
+                _ts_module._ready_adoption_step = original
+            results[label] = (
+                world,
+                list(caplog.messages),
+            )
+        world, messages = results["with_step"]
+        assert not [m for m in messages if m.startswith("restart_adopted_ready_node")]
+        assert _ra_step_alerts(world.sink) == []
+        not_required = [
+            p
+            for p in world.sink.payloads
+            if p.detail == AlertDetail.PERMIT_NOT_REQUIRED_SHADOW.value
+        ]
+        assert [p.severity for p in not_required] == ["WARN"]
+        assert _ra_signature(world.sink) == _ra_signature(results["without_step"][0].sink)
+        assert [m for m in messages if m.startswith("ready_adoption_terminal")] == [
+            "ready_adoption_terminal verdict=not_required pid=777"
+        ]
+        assert world.spawner.calls == []
+        assert world.terminated == []
+
+    def test_d_minus_1_node_after_restart_is_paged(self, tmp_path: Path) -> None:
+        """T10c (SM1)"""
+        world = RaWorld(tmp_path, stamp="20260903T165100Z")
+        ra_run_loop(world, world.ports(), start=_utc(20, 0), iterations=75)
+        alerts = _ra_step_alerts(world.sink)
+        assert [p.severity for p in alerts] == ["WARN", "CRITICAL", "CRITICAL"]
+        assert world.spawner.calls == []
+        assert world.terminated == []
+
+    def test_retry_looping_node_is_never_marked(self, tmp_path: Path) -> None:
+        """T11 (S1): a retry loop writes reconnect/error lines, never the marker."""
+        world = RaWorld(tmp_path)
+        world.emitting = False
+        noise = (
+            "2026-09-04T20:00:00.000000000Z [WARN] websocket: reconnecting after error\n"
+            "2026-09-04T20:00:00.000000001Z [ERROR] websocket: connection reset by peer\n"
+        ) * 250
+
+        def grow(_k: int, _now: dt.datetime) -> None:
+            world.append(noise)
+
+        state, *_ = ra_poll(world, world.ports(), start=_utc(20, 0), polls=14, before_poll=grow)
+        assert state.readiness_observed is False
+        assert [p.severity for p in _ra_step_alerts(world.sink)] == ["WARN", "CRITICAL"]
+
+    def test_stale_liveness_line_is_never_marked(self, tmp_path: Path) -> None:
+        """T11b: 601 s old -> no mark; 599 s old -> mark."""
+        now = _utc(20, 0)
+        for age_s, marks in ((601, False), (599, True)):
+            sub = _ra_sub(tmp_path, f"age{age_s}")
+            world = RaWorld(sub)
+            world.emitting = False
+            world.append(ra_shadow_line(now - dt.timedelta(seconds=age_s)))
+            state, *_ = ra_poll(world, world.ports(), start=now, polls=1)
+            assert state.readiness_observed is marks, age_s
+
+    def test_future_stamped_liveness_line_never_latches_and_never_marks(
+        self, tmp_path: Path
+    ) -> None:
+        """T11b future-stamp variants (r4 item 1)."""
+        now = _utc(20, 0)
+        world = RaWorld(_ra_sub(tmp_path, "a"))
+        world.emitting = False
+        world.append(ra_shadow_line(now + dt.timedelta(hours=1)))
+        state, _p, _l, trace = ra_poll(world, world.ports(), start=now, polls=30)
+        assert state.liveness_line_last_ns is None
+        assert state.readiness_observed is False
+        assert [p.severity for p in _ra_step_alerts(world.sink)] == ["WARN", "CRITICAL"]
+        assert all(t.liveness_line_last_ns is None for t in trace)
+
+        # An old (630 s) correctly stamped line followed by a future-stamped one.
+        sub = _ra_sub(tmp_path, "b")
+        world_b = RaWorld(sub)
+        world_b.emitting = False
+        old = now - dt.timedelta(seconds=630)
+        world_b.append(ra_shadow_line(old) + ra_shadow_line(now + dt.timedelta(hours=1)))
+        state_b, _p, _l, trace_b = ra_poll(world_b, world_b.ports(), start=now, polls=2)
+        assert trace_b[0].liveness_line_last_ns == _ra_epoch_ns(old) + 123456789
+        assert state_b.liveness_line_last_ns == _ra_epoch_ns(old) + 123456789
+        assert state_b.readiness_observed is False
+
+    def test_replayed_old_liveness_line_does_not_mark(self, tmp_path: Path) -> None:
+        """T11c"""
+        now = _utc(20, 0)
+        world = RaWorld(tmp_path)
+        world.emitting = False
+        world.append(ra_shadow_line(now - dt.timedelta(hours=3)))
+        state, *_ = ra_poll(world, world.ports(), start=now, polls=3)
+        assert state.readiness_observed is False
+
+    def test_depth_truncation_only_node_is_never_marked(self, tmp_path: Path) -> None:
+        """T11d (SM3): the dropped depth-truncation WARN is really not a marker."""
+        world = RaWorld(tmp_path)
+        world.emitting = False
+
+        def warn(_k: int, now: dt.datetime) -> None:
+            stamp = f"{now:%Y-%m-%dT%H:%M:%S}.000000000Z"
+            world.append(f"{stamp} [WARN] data: 100 book level(s) discarded so far\n")
+
+        state, *_ = ra_poll(world, world.ports(), start=_utc(20, 0), polls=14, before_poll=warn)
+        assert state.readiness_observed is False
+        assert [p.severity for p in _ra_step_alerts(world.sink)] == ["WARN", "CRITICAL"]
+
+    def test_node_down_at_restart_is_never_marked_and_never_spawned(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """T12 (C8)"""
+        world = RaWorld(tmp_path)
+        world.alive = False
+        with caplog.at_level("INFO"):
+            ra_run_loop(world, world.ports(), start=_utc(20, 0), iterations=10)
+        assert not _ra_messages(caplog, "restart_adopted_ready_node")
+        assert world.spawner.calls == []
+        assert _ra_step_alerts(world.sink) == []
+
+    def test_node_down_at_1702_restart_pages_self_check_then_no_node(self, tmp_path: Path) -> None:
+        """T12b (C0, characterisation): SELF_CHECK_FAIL WARN, then B1 NO_NODE."""
+        sink_times: list[tuple[dt.datetime, AlertPayload]] = []
+        clock_box: list[FakeClock] = []
+
+        class TimedSink(_RecordingAlertSink):
+            def emit(self, payload: AlertPayload) -> None:
+                super().emit(payload)
+                sink_times.append((clock_box[0].current, payload))
+
+        world = RaWorld(tmp_path, sink=TimedSink())
+        world.alive = False
+        clock = FakeClock(_utc(17, 2))
+        clock_box.append(clock)
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=world.log_dir,
+            clock=clock,
+            sleep=fake_sleep,
+            ports=world.ports(),
+            max_iterations=25,
+        )
+        assert world.spawner.calls == []
+        by_event: dict[str, list[tuple[dt.datetime, AlertPayload]]] = {}
+        for at, payload in sink_times:
+            by_event.setdefault(payload.event, []).append((at, payload))
+        check = by_event["TRADE_SUPERVISOR_SELF_CHECK_FAIL"]
+        assert check[0][0] >= _utc(17, 5) and check[0][1].severity == "WARN"
+        no_node = [
+            (at, p)
+            for at, p in by_event["TRADE_SUPERVISOR_PERMIT_WATCH"]
+            if p.detail == AlertDetail.PERMIT_NO_NODE_IN_DECISION_WINDOW.value
+        ]
+        assert no_node and no_node[0][0] == _utc(17, 10) and no_node[0][1].severity == "CRITICAL"
+        assert _RA_EVENT not in by_event
+
+    def test_1655_lock_held_adoption_flake_recovered_at_1710(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T13 (B6)"""
+        world = RaWorld(tmp_path, stamp="20260904T165000Z")
+        clock_box: list[FakeClock] = []
+
+        def holder(_p: Path) -> int | None:
+            return None if clock_box[0].current < _utc(16, 55, 30) else _RA_PID
+
+        midday_calls: list[dt.datetime] = []
+        real_midday = _ts_module._do_midday_watch
+
+        def recording_midday(**kwargs: Any) -> Any:
+            midday_calls.append(kwargs["now"])
+            return real_midday(**kwargs)
+
+        monkeypatch.setattr(_ts_module, "_do_midday_watch", recording_midday)
+        clock = FakeClock(_utc(16, 55))
+        clock_box.append(clock)
+        world.append(ra_shadow_line(_utc(16, 54)))
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+            world.tick(clock.current)
+
+        with caplog.at_level("INFO"):
+            _run_forever(
+                store_path=tmp_path / "state" / "store.sqlite3",
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=world.log_dir,
+                clock=clock,
+                sleep=fake_sleep,
+                ports=world.ports(resolve_intent_lock_holder=holder),
+                max_iterations=40,
+            )
+        assert _ra_messages(caplog, "launch_refused_lock_held")
+        assert _ra_messages(caplog, "restart_adopted_ready_node pid=777 ")
+        assert midday_calls and midday_calls[0] >= _utc(17, 10)
+        assert world.spawner.calls == []
+
+    def test_restart_sweep_never_double_launches_real_scheduler(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T14 (S6): a restart every 5 min across 24 h through the real
+        scheduler, real handlers and a REAL ``IncrementalLogReader``; only the
+        process/flock ports are fakes, all driven from one world model."""
+        violations: list[str] = []
+        restored = 0
+        for minute in range(0, 24 * 60, 5):
+            restart = _utc(0, 0) + dt.timedelta(minutes=minute)
+            restored += _ra_sweep_one(tmp_path / f"r{minute}", restart, monkeypatch, violations)
+        assert violations == []
+        # 17:10 .. 00:55 inclusive, every 5 minutes: not vacuous.
+        assert restored == 94
+
+    def test_ready_adoption_step_exceptions(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """T16: OSError is counted and logged; any other exception is B1's [D8]."""
+        # (a) OSError on every poll: IO_ERROR, line per poll, counted, no mark.
+        world = RaWorld(_ra_sub(tmp_path, "a"))
+        world.holder_script = [OSError("proc")]
+        world.emitting = False
+        with caplog.at_level("INFO"):
+            state, *_ = ra_poll(
+                world,
+                world.ports(),
+                start=_utc(20, 0),
+                polls=13,
+                state=_ra_ready_state(),
+                tracked_pid=_RA_PID,
+                node_log=world.log,
+            )
+        assert len(_ra_messages(caplog, "ready_adoption_io_error error_type=OSError")) == 13
+        assert state.readiness_observed is False
+        assert state.ready_adoption_deferral_polls == 13
+        assert [p.severity for p in _ra_step_alerts(world.sink)] == ["WARN", "CRITICAL"]
+
+        # (b) RuntimeError on every poll: B1 WATCH_FAILED, counter frozen, B1's
+        # own updates (the drained liveness latch) survive.
+        sub = _ra_sub(tmp_path, "b")
+        world_b = RaWorld(sub)
+        world_b.holder_script = [RuntimeError("boom")]
+        state_b, *_ = ra_poll(
+            world_b,
+            world_b.ports(),
+            start=_utc(20, 0),
+            polls=20,
+            state=_ra_ready_state(ready_adoption_deferral_polls=2),
+            tracked_pid=_RA_PID,
+            node_log=world_b.log,
+        )
+        assert state_b.ready_adoption_deferral_polls == 2
+        assert _ra_step_alerts(world_b.sink) == []
+        failed = [
+            p
+            for p in world_b.sink.payloads
+            if p.detail == AlertDetail.PERMIT_WATCH_EXCEPTION_CONTAINED.value
+        ]
+        assert failed and failed[0].severity == "CRITICAL"
+        assert state_b.permit_alert_last_capability == "watch_failed"
+        assert state_b.liveness_line_last_ns is not None
+        assert state_b.readiness_observed is False
+
+        # (c) B1's adoption probe None for 20 polls (nothing tracked): the
+        # counter neither increments nor resets, and B1 pages NO_NODE.
+        sub = _ra_sub(tmp_path, "c")
+        world_c = RaWorld(sub)
+        world_c.alive = False
+        state_c, *_ = ra_poll(
+            world_c,
+            world_c.ports(),
+            start=_utc(20, 0),
+            polls=20,
+            state=replace(initial_scheduler_state(_DAY), ready_adoption_deferral_polls=3),
+        )
+        assert state_c.ready_adoption_deferral_polls == 3
+        assert any(
+            p.detail == AlertDetail.PERMIT_NO_NODE_IN_DECISION_WINDOW.value
+            for p in world_c.sink.payloads
+        )
+
+    def test_ready_adoption_alert_send_failure_is_retried_not_latched(self, tmp_path: Path) -> None:
+        """T16b: a raising sink (not the production Tee) leaves the CRITICAL unlatched."""
+        attempts: list[tuple[str, int]] = []
+
+        class FlakySink:
+            def __init__(self) -> None:
+                self.failed_once = False
+
+            def emit(self, payload: AlertPayload) -> None:
+                if payload.severity == "CRITICAL" and payload.event == _RA_EVENT:
+                    attempts.append((payload.severity, len(attempts)))
+                    if not self.failed_once:
+                        self.failed_once = True
+                        raise OSError("sink down")
+
+        world = RaWorld(tmp_path)
+        world.emitting = False
+        sink = FlakySink()
+        state, *_ = ra_poll(world, world.ports(alert_sink=sink), start=_utc(20, 0), polls=16)
+        assert len(attempts) == 2  # poll 12 raised, poll 13 delivered, then latched
+        assert state.ready_adoption_critical_last_poll == 13
+
+    def test_ready_adoption_critical_through_real_tee_with_failing_webhook(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """T16c (SH1). NOT the production branch type (that is T16d): a bare
+        ``WebhookAlertSink`` on an in-process 503 MockTransport; no socket."""
+        requests: list[httpx.Request] = []
+
+        def refuse(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(503)
+
+        url = "https://alerts.invalid/hook"
+        tee = TeeAlertSink(
+            LoggingAlertSink(),
+            WebhookAlertSink(url, client=httpx.Client(transport=httpx.MockTransport(refuse))),
+        )
+        world = RaWorld(tmp_path)
+        world.emitting = False
+        at_polls: dict[str, list[int]] = {"WARN": [], "CRITICAL": []}
+        seen = {"WARN": 0, "CRITICAL": 0}
+        poll_no = [0]
+
+        def watch(_k: int, _now: dt.datetime) -> None:
+            if _k:
+                _record_new()
+            poll_no[0] = _k + 1
+
+        def _record_new() -> None:
+            for severity in ("WARN", "CRITICAL"):
+                count = len(
+                    [
+                        m
+                        for m in caplog.messages
+                        if m.startswith(f"breezy alert event={_RA_EVENT} ")
+                        and f"severity={severity} " in m
+                    ]
+                )
+                if count > seen[severity]:
+                    at_polls[severity].append(poll_no[0])
+                    seen[severity] = count
+
+        with caplog.at_level("INFO"):
+            state, *_ = ra_poll(
+                world,
+                world.ports(alert_sink=tee),
+                start=_utc(20, 0),
+                polls=133,
+                before_poll=watch,
+            )
+            _record_new()
+        assert state.liveness_line_last_ns is None
+        assert state.ready_adoption_deferral_polls == 133
+        assert at_polls == {"WARN": [5], "CRITICAL": [12, 72, 132]}
+        failed = [
+            m
+            for m in caplog.messages
+            if m.startswith(f"alert sink failed to emit event={_RA_EVENT} ")
+            and "exception_type=HTTPStatusError" in m
+        ]
+        assert len(failed) == 4
+        bodies = [json.loads(r.content) for r in requests]
+        assert len([b for b in bodies if b["event"] == _RA_EVENT]) == 4
+        assert state.ready_adoption_critical_last_poll == 132  # latched although the webhook failed
+        assert url not in "\n".join(
+            r.getMessage() for r in caplog.records if r.name.startswith("breezy")
+        )
+
+    def test_ready_adoption_critical_queued_in_outbox_through_production_sink(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T16d (D1): the production branch type is queued and redelivered."""
+        monkeypatch.setattr("breezy.runtime.alert_delivery.default_alerts_root", lambda: tmp_path)
+        url = "https://alerts.invalid/hook"
+        down = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+        tee = TeeAlertSink(LoggingAlertSink(), JournalingWebhookAlertSink(url, client=down))
+        world = RaWorld(_ra_sub(tmp_path, "node"))
+        world.emitting = False
+        outbox_counts: dict[int, int] = {}
+
+        def count_outbox(k: int, _now: dt.datetime) -> None:
+            outbox_counts[k] = len(list((tmp_path / "outbox").rglob("*.json")))
+
+        with caplog.at_level("INFO"):
+            ra_poll(
+                world,
+                world.ports(alert_sink=tee),
+                start=_utc(20, 0),
+                polls=13,
+                before_poll=count_outbox,
+            )
+        claimed_dir = tmp_path / "outbox" / "claimed" / "legacy_runtime"
+        # (b) the poll-5 WARN leaves no outbox entry; (a) the poll-12 CRITICAL leaves one.
+        assert outbox_counts[11] == 0  # before poll index 11 (= the 12th poll)
+        entries = sorted(claimed_dir.glob("*_TRADE_SUPERVISOR_READY_ADOPTION_DEFERRED.json"))
+        assert len(entries) == 1
+        # (c)
+        assert "exception_type=AlertNotDeliveredError" in caplog.text
+        # (f) a delivery record, writer legacy_runtime, 5xx, referencing the claimed entry
+        records = [
+            p
+            for p in tmp_path.rglob("*_legacy_runtime_*.json")
+            if "outbox" not in p.relative_to(tmp_path).parts
+        ]
+        bodies = [json.loads(p.read_text()) for p in records]
+        critical = [b for b in bodies if b["event"] == _RA_EVENT and b["severity"] == "CRITICAL"]
+        assert len(critical) == 1
+        assert critical[0]["status_class"] == "5xx"
+        assert critical[0]["outbox_entry"] == entries[0].name
+        # (d) age the claim past 60 s, redeliver through a 200 transport
+        stale = time.time() - 61
+        os.utime(entries[0], (stale, stale))
+        up = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+        summary = drain_outbox(
+            drainer="redeliver",
+            outbox=AlertOutbox(tmp_path),
+            sink=TeeAlertSink(LoggingAlertSink(), WebhookAlertSink(url, client=up)),
+            records=DeliveryRecordWriter(tmp_path),
+            min_age_s=REDELIVER_MIN_AGE_S,
+        )
+        assert summary.reclaims == 1
+        assert summary.delivered == 1
+        assert not list((tmp_path / "outbox" / "claimed" / "legacy_runtime").glob("*.json"))
+        assert not list((tmp_path / "outbox" / "claimed" / "redeliver").glob("*.json"))
+        # (e)
+        assert "alerts.invalid" not in "\n".join(
+            r.getMessage() for r in caplog.records if r.name.startswith("breezy")
+        )
+
+
+def _ra_sweep_one(
+    root: Path, restart: dt.datetime, monkeypatch: pytest.MonkeyPatch, violations: list[str]
+) -> int:
+    """One 30-minute run of the real loop from ``restart`` over a one-node world."""
+    root.mkdir(parents=True)
+    trading_day = restart.date()
+    if restart.time() < dt.time(16, 40):
+        trading_day -= dt.timedelta(days=1)
+    clock = FakeClock(restart)
+    end = restart + dt.timedelta(minutes=30)
+    live: dict[int, Path] = {}
+    flock_owner: list[int | None] = [None]
+    next_pid = [4000]
+    spawns: list[dt.datetime] = []
+    terminations: list[dt.datetime] = []
+    marks: list[dt.datetime] = []
+    midday: list[tuple[int, dt.datetime]] = []
+    sleeps = [0]
+    reader = IncrementalLogReader()
+    log_dir = root / "logs"
+    log_dir.mkdir()
+    sink = _RecordingAlertSink()
+
+    def make_node(stamp_at: dt.datetime) -> int:
+        next_pid[0] += 1
+        pid = next_pid[0]
+        path = log_dir / f"breezy-trade-{stamp_at:%Y%m%dT%H%M%SZ}.log"
+        expiry = _ra_epoch_ns(stamp_at) + 10 * 3600 * _RA_NS
+        path.write_text(ra_boot_text(expiry))
+        live[pid] = path
+        flock_owner[0] = pid
+        if len(live) > 1:
+            violations.append(f"{restart:%H:%M} concurrent nodes: {sorted(live)}")
+        return pid
+
+    # The world at the restart instant: the node of the last 16:50 launch.
+    if restart.time() >= dt.time(16, 50):
+        make_node(_utc(16, 50, day=restart.date()))
+    else:
+        make_node(_utc(16, 50, day=restart.date() - dt.timedelta(days=1)))
+
+    def spawn(**kwargs: Any) -> FakePopen:
+        spawns.append(clock.current)
+        pid = make_node(kwargs["log_path"] and clock.current)
+        return FakePopen(pid)
+
+    def terminate(pid: int, **_kw: Any) -> None:
+        terminations.append(clock.current)
+        live.pop(pid, None)
+        flock_owner[0] = None
+
+    def node_log_for(_d: Path, pid: int) -> Path | None:
+        return live.get(pid)
+
+    def tick() -> None:
+        for path in live.values():
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(ra_shadow_line(clock.current))
+
+    ports = _make_ports(
+        find_node_pid=lambda: next(iter(live), None),
+        resolve_intent_lock_holder=lambda _p: flock_owner[0],
+        intent_lock_free=lambda _p: flock_owner[0] is None,
+        count_intent_lock_holders=lambda _p: 0 if flock_owner[0] is None else 1,
+        terminate_after_recheck=terminate,
+        process_alive=lambda pid: pid in live,
+        spawn=spawn,
+        find_adopted_log=node_log_for,
+        read_log_new=reader.read_new,
+        read_log_from_start=reader.read_from_start_and_mark_consumed,
+        alert_sink=sink,
+    )
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            message = record.getMessage()
+            if message.startswith("restart_adopted_ready_node"):
+                marks.append(clock.current)
+
+    real_midday = _ts_module._do_midday_watch
+
+    def recording_midday(**kwargs: Any) -> Any:
+        midday.append((sleeps[0], kwargs["now"]))
+        return real_midday(**kwargs)
+
+    monkeypatch.setattr(_ts_module, "_do_midday_watch", recording_midday)
+    handler = Capture(level=logging.INFO)
+    target = logging.getLogger(_ts_module.__name__)
+    target.addHandler(handler)
+    previous_level = target.level
+    target.setLevel(logging.INFO)
+    tick()
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps[0] += 1
+        clock.advance(seconds)
+        tick()
+        if clock.current >= end:
+            raise KeyboardInterrupt  # the loop ends cleanly on SIGINT
+
+    try:
+        _run_forever(
+            store_path=root / "state" / "store.sqlite3",
+            repo_root=root,
+            node_bin=root / "node_bin",
+            log_dir=log_dir,
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=1000,
+        )
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous_level)
+        monkeypatch.setattr(_ts_module, "_do_midday_watch", real_midday)
+
+    tag = f"restart {restart:%H:%M}"
+    if len(spawns) > 1:
+        violations.append(f"{tag}: {len(spawns)} spawns")
+    for at in terminations:
+        if not dt.time(16, 40) <= at.time() < dt.time(16, 50):
+            violations.append(f"{tag}: terminate at {at:%H:%M:%S}")
+    for at in marks:
+        at_day = at.date() if at.time() >= dt.time(16, 40) else at.date() - dt.timedelta(days=1)
+        if not _utc(17, 10, day=at_day) <= at < _utc(1, 0, day=at_day + dt.timedelta(days=1)):
+            violations.append(f"{tag}: mark outside window at {at:%H:%M:%S}")
+    window_open = _utc(17, 10, day=trading_day)
+    window_close = _utc(1, 0, day=trading_day + dt.timedelta(days=1))
+    if window_open <= restart <= window_close - dt.timedelta(minutes=5):
+        if not midday or midday[0][0] > 2:
+            violations.append(f"{tag}: MIDDAY_WATCH not restored within 2 iterations: {midday[:1]}")
+            return 0
+        return 1
+    return 0
+
+
+class TestRealReaderReplayCapAndCarry:
+    def test_real_reader_replay_cap_and_carry_paths(self, tmp_path: Path) -> None:
+        """T14c (SL1): the production reader's 2 MiB cap, resume-at-EOF and carry."""
+        now = _utc(20, 0)
+        filler = "2026-09-04T16:52:00.000000000Z [INFO] node: heartbeat padding padding padding\n"
+        cap = 2 * 1024 * 1024
+
+        # (a) cap: boot lines in the first 2 MiB; the only fresh lines lie beyond it.
+        world = RaWorld(_ra_sub(tmp_path, "a"))
+        world.emitting = False
+        blob = filler * (cap // len(filler) + 1)
+        world.append(blob[:cap] + filler * (1024 * 1024 // len(filler)))
+        world.append(ra_shadow_line(now - dt.timedelta(seconds=5)))
+        state, pid, log, _ = ra_poll(world, world.ports(), start=now, polls=1)
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        assert state.strategy_subscribed_seen and state.first_boot_permit_expires_at_ns
+        assert state.liveness_line_last_ns is None and not state.readiness_observed
+        # Two lines: the first is glued onto the replay's cut-off carry fragment
+        # (a stale parse that fails safe); the second parses cleanly.
+        world.append(
+            ra_shadow_line(now + dt.timedelta(seconds=54))
+            + ra_shadow_line(now + dt.timedelta(seconds=55))
+        )
+        state, *_ = ra_poll(
+            world,
+            world.ports(),
+            start=now + dt.timedelta(seconds=60),
+            polls=1,
+            state=state,
+            tracked_pid=pid,
+            node_log=log,
+        )
+        assert state.readiness_observed is True
+
+        # (b) carry: the 2 MiB replay ends inside a long (stale) SHADOW_DECISION
+        # line, so the 256-char carry is a headless marker fragment.
+        world_b = RaWorld(_ra_sub(tmp_path, "b"))
+        world_b.emitting = False
+        boot = world_b.log.read_text(encoding="utf-8")
+        cut_into_line = 300
+        long_stale = (
+            f"\x1b[1m{now - dt.timedelta(hours=3):%Y-%m-%dT%H:%M:%S}.000000000Z\x1b[0m [INFO] "
+            "BREEZY: SHADOW_DECISION " + "p" * 700 + "\n"
+        )
+        pad = "x" * (cap - cut_into_line - len(boot) - 1) + "\n"
+        world_b.log.write_text(boot + pad + long_stale + filler * 100, encoding="utf-8")
+        state_b, pid_b, log_b, _ = ra_poll(world_b, world_b.ports(), start=now, polls=1)
+        stale_ns = state_b.liveness_line_last_ns
+        assert stale_ns == _ra_epoch_ns(now - dt.timedelta(hours=3))
+        state_b, *_ = ra_poll(
+            world_b,
+            world_b.ports(),
+            start=now + dt.timedelta(seconds=60),
+            polls=1,
+            state=state_b,
+            tracked_pid=pid_b,
+            node_log=log_b,
+        )
+        # no fresh line appended: not marked, and the carry fragment moved nothing
+        assert state_b.readiness_observed is False
+        assert state_b.liveness_line_last_ns == stale_ns
+        world_b.append(
+            ra_shadow_line(now + dt.timedelta(seconds=114))
+            + ra_shadow_line(now + dt.timedelta(seconds=115))
+        )
+        state_b, *_ = ra_poll(
+            world_b,
+            world_b.ports(),
+            start=now + dt.timedelta(seconds=120),
+            polls=1,
+            state=state_b,
+            tracked_pid=pid_b,
+            node_log=log_b,
+        )
+        assert state_b.readiness_observed is True
+
+        # (c) partial write: the delta ends mid-line after the marker; the
+        # earlier parseable line of the same delta is used.
+        sub = _ra_sub(tmp_path, "c")
+        world_c = RaWorld(sub)
+        world_c.emitting = False
+        state_c, pid_c, log_c, _ = ra_poll(world_c, world_c.ports(), start=now, polls=1)
+        world_c.append(
+            ra_shadow_line(now + dt.timedelta(seconds=50)) + "garbage SHADOW_DECISION {'cu"
+        )
+        state_c, *_ = ra_poll(
+            world_c,
+            world_c.ports(),
+            start=now + dt.timedelta(seconds=60),
+            polls=1,
+            state=state_c,
+            tracked_pid=pid_c,
+            node_log=log_c,
+        )
+        assert state_c.readiness_observed is True
+
+    def test_marked_adopted_child_death_relaunches_with_adopted_ceiling(
+        self, tmp_path: Path
+    ) -> None:
+        """T15 (S4), variants (a) B1, (b) _do_launch+RELAUNCH_CHECK, (c) SELF_CHECK."""
+        for label, start, stamp_at in (
+            ("a", _utc(20, 0), _utc(16, 51)),
+            ("b", _utc(16, 55), _utc(16, 50)),
+            ("c", _utc(17, 6), _utc(16, 50)),
+        ):
+            sub = _ra_sub(tmp_path, label)
+            world = RaWorld(sub, stamp=f"{stamp_at:%Y%m%dT%H%M%SZ}")
+            world.append(ra_shadow_line(start - dt.timedelta(seconds=5)))
+            clock_box: list[FakeClock] = []
+
+            def kill_at_2000(clock: FakeClock, world: RaWorld = world) -> None:
+                if clock.current >= _utc(20, 0):
+                    if world.alive:
+                        world.append("breezy-trade: trading node failed: ConnectionError\n")
+                    world.alive = False
+                    world.emitting = False
+
+            clock = ra_run_loop(
+                world,
+                world.ports(),
+                start=start,
+                iterations=((_utc(20, 5) - start).seconds // 60) + 5,
+                on_sleep=kill_at_2000,
+            )
+            clock_box.append(clock)
+            assert len(world.spawner.calls) == 1, label
+            env = world.spawner.calls[0]["env"]
+            assert env[_RA_CEILING_ENV] == str(world.expiry_ns), label
+
+        # (d) permit latched, anchor unknown: ANCHOR_UNKNOWN, counted, never marks, never spawns
+        sub = _ra_sub(tmp_path, "d")
+        world = RaWorld(sub, boot_text=ra_boot_text(0, permit=False))
+        state, *_ = ra_poll(
+            world,
+            world.ports(),
+            start=_utc(20, 0),
+            polls=14,
+            state=_ra_ready_state(first_boot_permit_expires_at_ns=None, liveness_line_last_ns=None),
+            tracked_pid=_RA_PID,
+            node_log=world.log,
+        )
+        assert state.readiness_observed is False
+        assert state.ready_adoption_deferral_polls == 14
+        assert world.spawner.calls == []

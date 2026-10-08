@@ -1381,6 +1381,56 @@ would SIGTERM a node holding a live position, directly contradicting
 `KillMode=process` and L-26 — the exact failure this design exists to
 prevent.
 
+## Supervisor restart window and ready-adoption (SUP-RESTART-ANYTIME)
+
+**Restriction unchanged: restart `breezy-trade-supervisor` only in
+[01:00Z, 16:40Z) (at or after 01:00:00Z, strictly before 16:40:00Z).** The
+ready-adoption step is shipped (it re-derives `launch_done` and
+`readiness_observed` for a proven-ready adopted node, so MIDDAY_WATCH becomes
+due again after a restart inside [17:10Z, 01:00Z)), but the restriction
+retires only after the live acceptance proof below, which is DEFERRED until
+the first armed boot that coincides with an in-window supervisor restart.
+
+What a restart inside [17:10Z, 01:00Z) shows in the supervisor journal:
+
+- Unarmed node (orders-off drop-in, the expected state while no family
+  trades): `permit_watch phase=permit_watch capability=not_required`, then
+  `ready_adoption_terminal verdict=not_required pid=<node pid>` (once per
+  child, in the same poll as or after the B1 line). Nothing else: no
+  `restart_adopted_ready_node`, no `ready_adoption_deferred`, no MIDDAY_WATCH
+  dispatch, no spawn or signal. On such an orders-off node the 17:05Z
+  self-check still reports `FAIL_SHADOW_MODE_NO_PERMIT`
+  (`derive_self_check_facts` ignores `orders_not_requested_seen`) and pages
+  CRITICAL `TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED`; this is expected while
+  orders are deliberately off and is tracked as backlog item
+  SELF-CHECK-ORDERS-OFF (self-check semantics are unchanged).
+- Armed, healthy FQ node: `permit_watch_adopted_live_node`, then
+  `restart_adopted_ready_node pid=... liveness_age_s=...` within two polls,
+  then a MIDDAY_WATCH dispatch (the deferred acceptance proof).
+- `TRADE_SUPERVISOR_READY_ADOPTION_DEFERRED` (WARN after 5 deferred polls,
+  CRITICAL after 12, re-fired every 60 polls) means MIDDAY_WATCH is not
+  restored: expected for a node without the FQ family composed (no
+  `SHADOW_DECISION` lines) or a D-1 node. Read the `ready_adoption_deferred`
+  decision line's `reason=`.
+
+Alert semantics: the deferral count is consecutive. A terminal verdict
+(`not_required`, `permit_expired`, `no_child`) or a MARK resets the count and
+the CRITICAL re-fire anchor, so a node whose verdict alternates between
+terminal and deferral can restart the WARN/CRITICAL budget; this is bounded
+(at most floor(470 / 13) = 36 CRITICALs per night, see
+`decide_ready_adoption_alert`) and needs child turnover that B1 and
+MIDDAY_WATCH already page.
+
+Alerts: CRITICALs are queued in the alert outbox and redelivered by
+`breezy-autonomy-alert-redeliver.timer`; WARNs are best effort. Check the
+supervisor log, not only the webhook receiver. Before any restart confirm
+that timer is active.
+
+Hand relaunches mirror `spawn()`, including the permit-expiry ceiling env: a
+hand launch with a full TTL widens the A-1 ceiling anchor that the adopted
+child's own permit line latches, and a marked node's mid-day relaunch then
+uses that wider ceiling.
+
 ## Protected window and serialization
 
 **AUD-15 (2026-09-22): `breezy-mb-daily` and `breezy-offer-gate-daily` are

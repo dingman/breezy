@@ -23,11 +23,14 @@ the supervisor reads.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
+import inspect
 import io
 import json
 import logging
 import subprocess
+import textwrap
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final, cast
@@ -60,6 +63,7 @@ from breezy.runtime.trade_supervisor_core import (
     CONTINUOUS_STARTUP_EVIDENCE_KEY,
     FATAL_EXEC_CLIENT_FAULT_MARKER,
     FATAL_MARKET_DATA_FAULT_MARKER,
+    LIVENESS_POSITIVE_MARKER,
     PERMIT_EXPIRY_CEILING_NS_ENV_VAR,
     PERMIT_ISSUED_MARKER,
     PERMIT_NOT_ISSUED_MARKER,
@@ -92,6 +96,7 @@ from breezy.strategy.current_rung_hold.set_family_halt_cli import (
 from breezy.strategy.current_rung_hold.set_family_halt_cli import (
     set_family_halt,
 )
+from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
 from tests.strategy.forecast_quantile_ladder.test_d1_cache_union import (
     _D1,
     _STATION,
@@ -526,3 +531,53 @@ def test_fq_halt_set_fails_self_check_then_clear_passes(
 
 def _idle_spawn(**_kwargs: object) -> subprocess.Popen[bytes]:
     raise AssertionError("self-check must not spawn")
+
+
+def test_liveness_marker_is_pinned_to_real_emitter() -> None:
+    """T19 (SUP-RESTART-ANYTIME): the ready-adoption liveness marker is a
+    prefix of the f-string literal ``_emit_shadow_decision`` logs, and
+    ``evaluate_snapshot`` calls that emitter unconditionally after
+    ``evaluate(...)``. A reworded or newly gated emitter fails here rather
+    than silently disabling the mark."""
+    emitter = textwrap.dedent(
+        inspect.getsource(ForecastQuantileLadderStrategy._emit_shadow_decision)
+    )
+    literals = [
+        node
+        for node in ast.walk(ast.parse(emitter))
+        if isinstance(node, ast.JoinedStr) and node.values
+    ]
+    first_parts = [
+        part.value
+        for node in literals
+        if isinstance(part := node.values[0], ast.Constant) and isinstance(part.value, str)
+    ]
+    assert any(text.startswith(LIVENESS_POSITIVE_MARKER) for text in first_parts), first_parts
+
+    evaluate = ast.parse(
+        textwrap.dedent(inspect.getsource(ForecastQuantileLadderStrategy.evaluate_snapshot))
+    ).body[0]
+    assert isinstance(evaluate, ast.FunctionDef)
+    body = evaluate.body
+
+    def _assigns_decision(stmt: ast.stmt) -> bool:
+        return isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "decision" for t in stmt.targets
+        )
+
+    def _calls_emitter(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "_emit_shadow_decision"
+        )
+
+    decision_at = next(i for i, stmt in enumerate(body) if _assigns_decision(stmt))
+    emit_at = next(i for i, stmt in enumerate(body) if _calls_emitter(stmt))
+    assert emit_at > decision_at
+    between = body[decision_at + 1 : emit_at]
+    assert not any(isinstance(stmt, (ast.If, ast.Return, ast.Raise, ast.Try)) for stmt in between)
+
+    # SM3: the dropped depth-truncation WARN is not a liveness marker.
+    assert "book level(s) discarded so far" not in LIVENESS_POSITIVE_MARKER
