@@ -5,6 +5,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
+import os
+import signal
 import threading
 from pathlib import Path
 from typing import Any
@@ -12,8 +15,9 @@ from typing import Any
 import pytest
 
 from breezy.persistence import us_source_revision_store as store_module
-from breezy.persistence.archive_cache import ArchiveCache
+from breezy.persistence.archive_cache import MANIFEST_VERSION, ArchiveCache, CoverageEntry
 from breezy.persistence.us_source_request import (
+    US_LAV_IEM_SOURCE,
     lamp_live_request,
     normalised_request,
     pfm_afos_request,
@@ -55,6 +59,31 @@ def _revisions(store: UsSourceRevisionStore) -> tuple[tuple[int, str], ...]:
 
 def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _append_product(store: UsSourceRevisionStore, index: int) -> Any:
+    """One distinct issuance. Different ``run_ts`` so each product is its own cache key."""
+    payload = f"station,valid,tmax\nKSFO,2026-10-06,{index}\n".encode()
+    return store.append_if_new(
+        source=SOURCE,
+        station="KSFO",
+        run_ts_ns=RUN_TS + index * 1_000_000_000,
+        model="MTR",
+        payload=payload,
+    )
+
+
+def _manifest_replaces(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    writes: list[str] = []
+    real_replace = os.replace
+
+    def spy(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst).name == "coverage.json":
+            writes.append(Path(dst).name)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    return writes
 
 
 def test_first_payload_is_written_as_revision_zero(tmp_path: Path) -> None:
@@ -462,3 +491,396 @@ def test_malformed_quarantine_row_is_an_integrity_error_not_a_keyerror(
         store.quarantined_count(SOURCE, "KSFO", RUN_TS, BASE)
     with pytest.raises(store_module.RevisionStoreIntegrityError):
         _append(store, V0)
+
+
+def test_coverage_batch_writes_the_manifest_once_per_batch_not_per_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Appending k products in one batch rewrites coverage.json O(1) times, not k."""
+    writes = _manifest_replaces(monkeypatch)
+    store = _store(tmp_path)
+    k = 12
+    with store.coverage_batch():
+        for index in range(k):
+            assert _append_product(store, index).outcome is AppendOutcome.APPENDED
+        assert writes == []
+        assert list((tmp_path / SOURCE).glob("*.csv"))
+        assert not (tmp_path / SOURCE / "coverage.json").exists()
+        # The unit lock is not held between products. Another store must still
+        # see each key (via the journal) before coverage.json is rewritten.
+        other = _store(tmp_path)
+        for index in range(k):
+            seen = other.revisions(SOURCE, "KSFO", RUN_TS + index * 1_000_000_000, BASE)
+            assert len(seen) == 1
+
+    assert writes == ["coverage.json"]
+    assert not (tmp_path / SOURCE / "coverage.pending.jsonl").exists()
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert len(manifest["entries"]) == k
+
+
+def test_coverage_batch_flushes_every_m_products_and_again_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert store_module.COVERAGE_FLUSH_EVERY > 1
+    monkeypatch.setattr(store_module, "COVERAGE_FLUSH_EVERY", 4)
+    writes = _manifest_replaces(monkeypatch)
+    store = _store(tmp_path)
+    with store.coverage_batch():
+        for index in range(5):
+            _append_product(store, index)
+        assert len(writes) == 1
+    assert len(writes) == 2
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert len(manifest["entries"]) == 5
+
+
+def test_coverage_batch_manifest_bytes_match_per_append_commits(tmp_path: Path) -> None:
+    def fill(root: Path, *, batched: bool) -> bytes:
+        store = _store(root)
+        if batched:
+            with store.coverage_batch():
+                for index in range(6):
+                    _append_product(store, index)
+        else:
+            for index in range(6):
+                _append_product(store, index)
+        return (root / SOURCE / "coverage.json").read_bytes()
+
+    assert fill(tmp_path / "plain", batched=False) == fill(tmp_path / "batched", batched=True)
+
+
+def test_interrupted_coverage_batch_does_not_publish_unflushed_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = os.replace
+
+    def crash(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst).name == "coverage.json":
+            raise OSError("crash before manifest commit")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", crash)
+    store = _store(tmp_path)
+    with pytest.raises(OSError, match="crash before manifest commit"), store.coverage_batch():
+        for index in range(4):
+            _append_product(store, index)
+
+    manifest = tmp_path / SOURCE / "coverage.json"
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    assert not manifest.exists()
+    assert journal.is_file()
+    assert len(list((tmp_path / SOURCE).glob("*.csv"))) == 4
+    fresh = ArchiveCache(tmp_path, fetch=lambda _request: b"", clock=_Clock())
+    assert fresh.entries(SOURCE) == ()
+
+    monkeypatch.setattr(os, "replace", real_replace)
+    resumed = _store(tmp_path)
+    with resumed.coverage_batch():
+        for index in range(4):
+            # The journal survived, so the digest is already stored. Resume
+            # must not allocate another revision, and the batch exit publishes it.
+            result = _append_product(resumed, index)
+            assert result.outcome is AppendOutcome.UNCHANGED
+    assert len(json.loads(manifest.read_text(encoding="utf-8"))["entries"]) == 4
+    assert not journal.exists()
+    with resumed.coverage_batch():
+        for index in range(4):
+            assert _append_product(resumed, index).outcome is AppendOutcome.UNCHANGED
+
+
+def test_coverage_batch_flushes_when_the_batch_raises(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(RuntimeError, match="boom"), store.coverage_batch():
+        _append_product(store, 0)
+        raise RuntimeError("boom")
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert len(manifest["entries"]) == 1
+
+
+def test_coverage_batch_does_not_install_a_signal_handler(tmp_path: Path) -> None:
+    """SIGTERM and SIGKILL stay the process default. The journal is the crash story."""
+    before = signal.getsignal(signal.SIGTERM)
+    store = _store(tmp_path)
+    with store.coverage_batch():
+        during = signal.getsignal(signal.SIGTERM)
+        _append_product(store, 0)
+    assert during is before
+    assert signal.getsignal(signal.SIGTERM) is before
+    assert not hasattr(store_module, "_arm_sigterm")
+
+
+def _journal_entry(key: str, sha: str, body: bytes) -> CoverageEntry:
+    return CoverageEntry(
+        cache_key=key,
+        station="KSFO",
+        product="pfm-r0",
+        window_start=RUN_TS,
+        window_end=RUN_TS + 1,
+        rows=1,
+        bytes=len(body),
+        sha256=sha,
+        fetched_at_ns=1,
+        model="MTR",
+        manifest_version=MANIFEST_VERSION,
+    )
+
+
+def _write_journal(root: Path, source: str, entry: CoverageEntry) -> Path:
+    directory = root / source
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "coverage.pending.jsonl"
+    line = json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
+    path.write_text(line + "\n", encoding="utf-8")
+    return path
+
+
+def test_second_store_during_open_batch_does_not_double_append_or_miss(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path)
+    second = _store(tmp_path)
+    with first.coverage_batch():
+        assert _append_product(first, 0).outcome is AppendOutcome.APPENDED
+        assert _append_product(second, 0).outcome is AppendOutcome.UNCHANGED
+        assert _append_product(second, 1).outcome is AppendOutcome.APPENDED
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert len(manifest["entries"]) == 2
+    assert len(list((tmp_path / SOURCE).glob("*.csv"))) == 2
+    assert not (tmp_path / SOURCE / "coverage.pending.jsonl").exists()
+
+
+def test_flush_drops_missing_csv_and_sha_mismatch_and_counts_them(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _store(tmp_path)
+    with caplog.at_level(logging.ERROR), store.coverage_batch() as result:
+        _append_product(store, 0)
+        _append_product(store, 1)
+        _append_product(store, 2)
+        csvs = sorted((tmp_path / SOURCE).glob("*.csv"))
+        csvs[0].unlink()
+        csvs[1].write_bytes(b"not-the-bytes-we-hashed\n")
+    reasons = sorted(drop.reason for drop in result.dropped)
+    assert reasons == ["csv_missing", "sha_mismatch"]
+    assert result.flushed == 1
+    assert result.stranded == []
+    assert not (tmp_path / SOURCE / "coverage.pending.jsonl").exists()
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert len(manifest["entries"]) == 1
+    messages = [record.message for record in caplog.records if record.levelno >= logging.ERROR]
+    assert any("csv_missing" in message for message in messages)
+    assert any("sha_mismatch" in message for message in messages)
+
+
+def test_torn_trailing_journal_line_is_tolerated_and_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _store(tmp_path)
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    with caplog.at_level(logging.WARNING), store.coverage_batch() as result:
+        _append_product(store, 0)
+        with journal.open("ab") as handle:
+            handle.write(b'{"torn"')
+    assert result.flushed == 1
+    assert result.dropped == []
+    assert not journal.exists()
+    warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("bad_lines=1" in message for message in warnings)
+
+
+def test_corrupt_middle_journal_line_raises(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    with pytest.raises(store_module.RevisionStoreIntegrityError), store.coverage_batch():
+        _append_product(store, 0)
+        _append_product(store, 1)
+        lines = journal.read_text(encoding="utf-8").splitlines()
+        journal.write_text(lines[0] + "\n{not-json}\n" + lines[1] + "\n", encoding="utf-8")
+    assert journal.is_file()
+    assert not (tmp_path / SOURCE / "coverage.json").exists()
+
+
+def test_flush_retries_lock_leaves_journal_and_keeps_in_flight_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert store_module._COVERAGE_LOCK_ATTEMPTS == 10
+    assert store_module._COVERAGE_LOCK_BACKOFF_S == 0.5
+    monkeypatch.setattr(store_module, "_COVERAGE_LOCK_ATTEMPTS", 3)
+    monkeypatch.setattr(store_module, "_COVERAGE_LOCK_BACKOFF_S", 0.0)
+    slept: list[float] = []
+    monkeypatch.setattr(
+        "breezy.persistence.us_source_revision_store.time.sleep",
+        lambda seconds: slept.append(seconds),
+    )
+    phase = {"flush": False}
+    calls = {"n": 0}
+    real_acquire = ArchiveCache._acquire_lock
+
+    def counting(self: ArchiveCache, path: Path) -> int:
+        if phase["flush"]:
+            calls["n"] += 1
+        return real_acquire(self, path)
+
+    monkeypatch.setattr(ArchiveCache, "_acquire_lock", counting)
+    store = _store(tmp_path)
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    held: int | None = None
+    try:
+        with pytest.raises(RuntimeError, match="in-flight"), store.coverage_batch() as failed:
+            _append_product(store, 0)
+            held = os.open(tmp_path / SOURCE / "coverage.json.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            phase["flush"] = True
+            raise RuntimeError("in-flight")
+        assert calls["n"] == 3
+        assert slept == [0.0, 0.0]
+        assert failed.stranded == [SOURCE]
+        assert journal.is_file()
+        assert not (tmp_path / SOURCE / "coverage.json").exists()
+    finally:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+
+    calls["n"] = 0
+    slept.clear()
+    phase["flush"] = False
+    store = _store(tmp_path)
+    held = None
+    try:
+        with store.coverage_batch() as quiet:
+            _append_product(store, 1)
+            held = os.open(tmp_path / SOURCE / "coverage.json.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            phase["flush"] = True
+        assert calls["n"] == 3
+        assert quiet.stranded == [SOURCE]
+        assert journal.is_file()
+    finally:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+
+
+def test_flush_continues_to_later_sources_when_one_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "_COVERAGE_LOCK_ATTEMPTS", 2)
+    monkeypatch.setattr(store_module, "_COVERAGE_LOCK_BACKOFF_S", 0.0)
+    monkeypatch.setattr(
+        "breezy.persistence.us_source_revision_store.time.sleep",
+        lambda _seconds: None,
+    )
+    body = b"station,valid,tmax\nKSFO,2026-10-06,71\n"
+    digest = hashlib.sha256(body).hexdigest()
+    blocked = _journal_entry("a" * 64, digest, body)
+    published = _journal_entry("b" * 64, digest, body)
+    _write_journal(tmp_path, "aaa-blocked", blocked)
+    ready = _write_journal(tmp_path, "bbb-ready", published)
+    (tmp_path / "bbb-ready" / f"{published.cache_key}.csv").write_bytes(body)
+    held = os.open(tmp_path / "aaa-blocked" / "coverage.json.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = _store(tmp_path)._cache.flush_coverage()
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    assert result.stranded == ["aaa-blocked"]
+    assert result.flushed == 1
+    assert not ready.exists()
+    assert (tmp_path / "aaa-blocked" / "coverage.pending.jsonl").is_file()
+    manifest = json.loads((tmp_path / "bbb-ready" / "coverage.json").read_text(encoding="utf-8"))
+    assert published.cache_key in manifest["entries"]
+
+
+def test_opening_a_source_replays_a_stranded_journal(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _append(store, V0)
+    manifest_path = tmp_path / SOURCE / "coverage.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = next(iter(manifest["entries"].values()))
+    manifest_path.unlink()
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    journal.write_text(
+        json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    fresh = _store(tmp_path)
+    assert fresh.revisions(SOURCE, "KSFO", RUN_TS, BASE) == ((0, _sha(V0)),)
+    assert not journal.exists()
+    assert manifest_path.is_file()
+    assert _sha(V0) in manifest_path.read_text(encoding="utf-8")
+
+
+def test_journal_key_without_csv_is_not_reported_present(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _append(store, V0)
+    manifest_path = tmp_path / SOURCE / "coverage.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(iter(manifest["entries"]))
+    entry = manifest["entries"][key]
+    (tmp_path / SOURCE / f"{key}.csv").unlink()
+    manifest_path.unlink()
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    journal.write_text(
+        json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    fresh = _store(tmp_path)
+    assert fresh.revisions(SOURCE, "KSFO", RUN_TS, BASE) == ()
+
+
+def test_flush_result_counts_cadence_flushes_and_the_exit_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "COVERAGE_FLUSH_EVERY", 4)
+    store = _store(tmp_path)
+    with store.coverage_batch() as result:
+        for index in range(5):
+            _append_product(store, index)
+    assert result.flushed == 5
+    assert result.dropped == []
+    assert result.stranded == []
+
+
+def test_corrupt_journal_does_not_fail_an_append_to_another_source(tmp_path: Path) -> None:
+    """Depth 0 replays only the source being opened. Source A's tear must not block B."""
+    store = _store(tmp_path)
+    corrupt = tmp_path / SOURCE
+    corrupt.mkdir()
+    (corrupt / "coverage.pending.jsonl").write_text("{not-json}\n{still-bad}\n", encoding="utf-8")
+    other = tmp_path / US_LAV_IEM_SOURCE
+    other.mkdir()
+    (other / "coverage.pending.jsonl").write_text("", encoding="utf-8")
+
+    result = store.append_if_new(
+        source=US_LAV_IEM_SOURCE,
+        station="KSFO",
+        run_ts_ns=RUN_TS,
+        model="LAV",
+        payload=V0,
+    )
+
+    assert result.outcome is AppendOutcome.APPENDED
+    assert (corrupt / "coverage.pending.jsonl").is_file()
+    with pytest.raises(store_module.RevisionStoreIntegrityError, match="corrupt"):
+        _append(store, V1)
+
+
+def test_torn_tail_then_append_parses_as_torn_plus_valid(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_bytes(b'{"torn"')
+
+    with store.coverage_batch() as result:
+        assert _append_product(store, 0).outcome is AppendOutcome.APPENDED
+        entries, bad = store._cache._read_journal(SOURCE)
+        lines = journal.read_text(encoding="utf-8").splitlines()
+
+    assert bad == 1
+    assert len(entries) == 1
+    assert lines[0] == '{"torn"'
+    assert json.loads(lines[-1])["cache_key"] == next(iter(entries))
+    assert result.torn_journal_lines == 1
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert next(iter(entries)) in manifest["entries"]

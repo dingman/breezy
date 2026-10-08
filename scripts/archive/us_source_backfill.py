@@ -24,7 +24,8 @@ runs; a single unplaceable product is only refused and counted, never mis-placed
 (a revision-store error other than an expected payload refusal); ``throttled`` / ``forbidden``
 (an IEM 403 abuse block) /
 ``paused_launch_window`` (stop ALL remaining stations and the GFS leg);
-``budget_exhausted``, ``store_busy``. Any status but ``complete`` exits 1.
+``budget_exhausted``, ``store_busy``, ``coverage_incomplete`` (a coverage flush
+dropped a key or left a journal stranded). Any status but ``complete`` exits 1.
 
 Safety: ``--dry-run`` plans only (no network, no write); ``--apply`` needs ``BREEZY_LIVE=1`` and
 a request budget. A request never starts inside, or close enough to meet, the 16:30-17:10Z
@@ -36,8 +37,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime as dt
 import json
+import logging
 import math
 import os
 import re
@@ -47,7 +50,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import httpx
 
@@ -276,6 +279,10 @@ class LegReport:
     truncated_days: tuple[dt.date, ...] = ()
     resume_sdate: dt.date | None = None
     error: str | None = None
+    coverage_flushed: int = 0
+    coverage_dropped: int = 0
+    coverage_stranded_sources: tuple[str, ...] = ()
+    coverage_torn_journal_lines: int = 0
 
     @property
     def refused_total(self) -> int:
@@ -296,6 +303,10 @@ class LegReport:
             "truncated_days": [d.isoformat() for d in self.truncated_days],
             "resume_sdate": self.resume_sdate.isoformat() if self.resume_sdate else None,
             "error": self.error,
+            "coverage_flushed": self.coverage_flushed,
+            "coverage_dropped": self.coverage_dropped,
+            "coverage_stranded_sources": list(self.coverage_stranded_sources),
+            "coverage_torn_journal_lines": self.coverage_torn_journal_lines,
         }
 
 
@@ -617,6 +628,40 @@ def _ingest_page(
     return last, False, False
 
 
+_coverage_batch_unavailable_warned = False
+
+
+def _warn_coverage_batch_unavailable() -> None:
+    """One warning per process. Test doubles that only implement append stay usable."""
+    global _coverage_batch_unavailable_warned
+    if _coverage_batch_unavailable_warned:
+        return
+    _coverage_batch_unavailable_warned = True
+    logging.getLogger("us_source_backfill").warning(
+        "coverage batching unavailable; falling back to per-append manifest writes"
+    )
+
+
+def _coverage_batch(store: object) -> contextlib.AbstractContextManager[Any]:
+    batch = getattr(store, "coverage_batch", None)
+    if not callable(batch):
+        _warn_coverage_batch_unavailable()
+        return contextlib.nullcontext(None)
+    return cast("contextlib.AbstractContextManager[Any]", batch())
+
+
+def _record_coverage(report: LegReport, outcome: Any) -> None:
+    if outcome is None:
+        return
+    report.coverage_flushed = int(outcome.flushed)
+    report.coverage_dropped = len(outcome.dropped)
+    report.coverage_stranded_sources = tuple(outcome.stranded)
+    report.coverage_torn_journal_lines = int(outcome.torn_journal_lines)
+    uncovered = report.coverage_dropped or report.coverage_stranded_sources
+    if report.status == "complete" and uncovered:
+        report.status = "coverage_incomplete"
+
+
 def run_pfm_leg(
     *,
     station: str,
@@ -638,11 +683,17 @@ def run_pfm_leg(
     report = LegReport(station=station, wfo=wfo)
     truncated: list[dt.date] = []
     cursor = [dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC)]  # mutable: error path
+    outcome: Any = None
     try:
-        _page_loop(
-            report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
-            sleep, page_limit, quarantine,
-        )  # fmt: skip
+        # One manifest rewrite for the leg (and every COVERAGE_FLUSH_EVERY products),
+        # including when the leg raises. The journal, not a signal handler, is what
+        # makes SIGTERM safe. Doubles that only implement append_if_new stay on the
+        # per-append path and log once that batching is unavailable.
+        with _coverage_batch(store) as outcome:
+            _page_loop(
+                report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
+                sleep, page_limit, quarantine,
+            )  # fmt: skip
     except Exception as exc:  # noqa: BLE001 - the station boundary: record, never crash the run
         report.status = "error"
         report.error = f"{type(exc).__name__}: {exc}"
@@ -651,6 +702,7 @@ def run_pfm_leg(
     report.truncated_days = tuple(truncated)
     if report.store_errors and report.status == "complete":
         report.status = "degraded"
+    _record_coverage(report, outcome)
     return report
 
 
