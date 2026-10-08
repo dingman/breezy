@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -149,6 +151,13 @@ class FollowState:
 #: the multi-hundred-MB historical logs, never a plausible same-day launch.
 HISTORICAL_STAMP_SLACK_NS: Final[int] = 60 * 60 * 1_000_000_000
 
+#: G12: the poll reads node logs in chunks of this size (never whole files).
+READ_CHUNK_BYTES: Final[int] = 1024 * 1024
+
+#: The one component whose records the pull consumes (the INITIAL discovery
+#: summary); every other record is dropped at parse time (G12).
+DISCOVERY_COMPONENT_SUFFIX: Final[str] = "DataClient-POLYMARKET_US"
+
 
 def _is_historical(path: Path, since_ns: int) -> bool:
     """True when ``path``'s filename stamp predates ``since_ns`` by more than
@@ -158,23 +167,68 @@ def _is_historical(path: Path, since_ns: int) -> bool:
     return int(stamp.timestamp() * 1_000_000_000) < since_ns - HISTORICAL_STAMP_SLACK_NS
 
 
+def _record_from_line(path: Path, raw_line: str) -> NodeLogRecord | None:
+    """The parsed record for one log line, or ``None`` unless it is a
+    ``DataClient-POLYMARKET_US`` line -- the only component the pull's
+    consumer (:func:`find_initial_trigger`) ever reads (G12)."""
+    match = LINE_RE.match(ANSI_RE.sub("", raw_line))
+    if match is None or not match.group("component").endswith(DISCOVERY_COMPONENT_SUFFIX):
+        return None
+    return NodeLogRecord(
+        source=path,
+        ts_ns=parse_ts_ns(match.group("ts")),
+        level=match.group("level"),
+        component=match.group("component"),
+        message=match.group("message"),
+    )
+
+
+def _read_new_lines(path: Path, offset: int) -> tuple[list[NodeLogRecord], int]:
+    """Read ``path`` from ``offset`` in :data:`READ_CHUNK_BYTES` chunks and
+    return ``(kept records, new offset)``.
+
+    Peak memory is one chunk plus the longest line, never the file (G12).
+    Chunks are split on the newline BYTE and only complete lines are decoded;
+    the new offset stops just after the last newline, so a trailing partial
+    line (and any multi-byte character cut by it) is re-read from disk whole
+    on the next poll -- nothing is decoded lossily and no tail is carried.
+    """
+    records: list[NodeLogRecord] = []
+    pending = b""
+    read_total = 0
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        while chunk := fh.read(READ_CHUNK_BYTES):
+            read_total += len(chunk)
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for raw in lines:
+                for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+                    record = _record_from_line(path, raw_line)
+                    if record is not None:
+                        records.append(record)
+    return records, offset + read_total - len(pending)
+
+
 def poll_node_logs_once(
     log_dir: Path, state: FollowState, *, since_ns: int | None = None
 ) -> tuple[FollowState, tuple[NodeLogRecord, ...], frozenset[Path]]:
     """One poll: read newly appended, COMPLETE lines from every
     ``NODE_LOG_GLOB`` file under ``log_dir``.
 
-    F2: a line split across two polls is buffered whole (the byte offset
-    still advances past it -- only the in-memory ``tail`` carries the
-    unconsumed partial text -- so nothing is re-read from disk). A file
+    F2: a line split across two polls is never consumed: the offset stops
+    after the last newline and the partial line is re-read whole next poll
+    (``FileCursor.tail`` is therefore always empty). A file
     whose size shrank since the last poll is TRUNCATED: its cursor resets to
     a fresh read from byte 0 and the path is reported in the third element.
 
     O1: with ``since_ns`` given, a not-yet-followed file whose filename stamp
     is historical (see :func:`_is_historical`) is seeded at EOF instead of
     read from byte 0 -- the multi-GB node history is never pulled through a
-    256M cgroup -- and is then followed from EOF like any other file. Reads
-    are streamed line by line, so memory is bounded by the longest line.
+    memory cgroup -- and is then followed from EOF like any other file.
+
+    G12: reads are bounded 1 MiB chunks (:func:`_read_new_lines`) and only
+    ``DataClient-POLYMARKET_US`` records are kept.
     """
     new_cursors: dict[Path, FileCursor] = {}
     records: list[NodeLogRecord] = []
@@ -189,36 +243,12 @@ def poll_node_logs_once(
             new_cursors[path] = FileCursor(offset=size, tail="")
             continue
         offset = prior.offset if prior is not None else 0
-        carry = prior.tail if prior is not None else ""
         if size < offset:
             truncated.add(path)
             offset = 0
-            carry = ""
-        consumed = 0
-        with open(path, "rb") as fh:
-            fh.seek(offset)
-            for raw in fh:
-                consumed += len(raw)
-                text = carry + raw.decode("utf-8", errors="replace")
-                if not raw.endswith(b"\n"):
-                    carry = text
-                    break
-                carry = ""
-                for raw_line in text.splitlines():
-                    stripped = ANSI_RE.sub("", raw_line)
-                    match = LINE_RE.match(stripped)
-                    if match is None:
-                        continue
-                    records.append(
-                        NodeLogRecord(
-                            source=path,
-                            ts_ns=parse_ts_ns(match.group("ts")),
-                            level=match.group("level"),
-                            component=match.group("component"),
-                            message=match.group("message"),
-                        )
-                    )
-        new_cursors[path] = FileCursor(offset=offset + consumed, tail=carry)
+        kept, new_offset = _read_new_lines(path, offset)
+        records.extend(kept)
+        new_cursors[path] = FileCursor(offset=new_offset, tail="")
     return FollowState(cursors=new_cursors), tuple(records), frozenset(truncated)
 
 
@@ -233,7 +263,7 @@ def find_initial_trigger(
     initials = [
         r
         for r in records
-        if r.component.endswith("DataClient-POLYMARKET_US")
+        if r.component.endswith(DISCOVERY_COMPONENT_SUFFIX)
         and r.ts_ns >= since_ns
         and (m := SUMMARY_PREFIX_RE.match(r.message)) is not None
         and m.group("cycle") == "initial"
@@ -272,9 +302,10 @@ def _replay_node_active_slugs(path: Path, *, up_to_ns: int) -> tuple[str, ...]:
     including P (``up_to_ns``), using the SAME parser/replay the offline
     analysis uses -- never a second, competing reimplementation.
     """
-    from scripts.analysis.discovery_set_equality import iter_node_log_records, replay_cycles
+    from scripts.analysis.discovery_set_equality import replay_cycles, stream_node_log_records
 
-    records = tuple(r for r in iter_node_log_records(path) if r.ts_ns <= up_to_ns)
+    # G12: stream the file and hold only the records up to P, never the whole log.
+    records = tuple(r for r in stream_node_log_records(path) if r.ts_ns <= up_to_ns)
     result = replay_cycles(records)
     return tuple(sorted(set(result.final_active) | set(result.final_blocked)))
 
@@ -393,6 +424,21 @@ def _today_window_ns(now: datetime) -> tuple[int, int]:
     return int(since.timestamp() * 1_000_000_000), int(deadline.timestamp() * 1_000_000_000)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """``mkstemp`` in ``path``'s directory, then ``os.replace``: a reader
+    never sees a partial file and a failed write leaves the old one."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 async def _main_async(argv: Sequence[str] | None, *, now: datetime | None = None) -> int:
     args = _parse_args(argv)
     from scripts.venue.fee_drift_evidence_pull import build_default_client
@@ -420,10 +466,10 @@ async def _main_async(argv: Sequence[str] | None, *, now: datetime | None = None
         "venue_active": list(outcome.venue_active),
         "by_slug_lookup": dict(outcome.by_slug_lookup),
     }
-    (args.out_dir / f"{day}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _write_text_atomic(args.out_dir / f"{day}.json", json.dumps(payload, indent=2))
     if outcome.pages:
-        (args.out_dir / f"{day}_pages.json").write_text(
-            json.dumps(list(outcome.pages), indent=2), encoding="utf-8"
+        _write_text_atomic(
+            args.out_dir / f"{day}_pages.json", json.dumps(list(outcome.pages), indent=2)
         )
     return 0
 

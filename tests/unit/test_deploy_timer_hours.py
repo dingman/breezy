@@ -228,16 +228,15 @@ def test_1720_utc_is_owned_by_exactly_one_timer() -> None:
     assert owners == ["breezy-family-tally@.timer"]
 
 
-def test_1652_utc_is_owned_by_exactly_one_timer() -> None:
-    # AUD-02 WP-D1: 16:52 UTC is the ONE breezy-discovery-pull.timer tick --
-    # free on the pre-existing schedule and, deliberately, inside the
-    # protected no-start window [16:35Z, 01:15Z) under the light-job
-    # exemption (see the timer's own comment and
+def test_1712_utc_is_owned_by_exactly_one_timer() -> None:
+    # AUD-02 WP-D1 / AUT-6 WP3b: 17:12 UTC (moved from 16:52) is the ONE
+    # breezy-discovery-pull.timer tick -- free on the pre-existing schedule and
+    # outside the launch window [16:30Z, 17:10Z) (see the timer's own comment and
     # deploy/systemd/README.md's "Light-job exemption" paragraph).
     owners = [
         timer_path.name
         for timer_path in _all_timer_files()
-        if ("16", "52") in _clock_ticks(timer_path)
+        if ("17", "12") in _clock_ticks(timer_path)
     ]
     assert owners == ["breezy-discovery-pull.timer"]
 

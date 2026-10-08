@@ -1445,13 +1445,14 @@ avoids.
 each is <=1 GB / <=60 s, well under the exemption threshold, and none is
 retimed or wrapped by this item.
 
-**AUD-02 WP-D1 addition (2026-09-26).** `breezy-discovery-pull` (16:52Z)
-joins this exemption: MemoryHigh=128M/MemoryMax=256M, no
+**AUD-02 WP-D1 addition (2026-09-26).** `breezy-discovery-pull` (17:12Z since AUT-6 WP3b)
+joins this exemption: MemoryHigh=460M/MemoryMax=512M (set from the measured
+working set, `docs/evidence/aut6/WP3b_discovery_pull_memory_2026-10-08.md`), no
 `breezy-studies.slice`, no flock. Unlike the three units above, its WALL
 CLOCK can run considerably longer than 60s -- it polls the trade node's own
 log file every 10s for the node's initial discovery summary, up to a 17:12Z
 deadline, before making a single bounded round of venue GETs
-(`TimeoutStartSec=1800` covers this). Its MEMORY footprint stays in the same
+(`TimeoutStartSec=900`, `TimeoutStopSec=5` cover this). Its MEMORY footprint stays in the same
 light band as its siblings; only its wall-clock budget differs, because it
 is a wait-for-trigger job, not a fixed-cost read. It takes no studies flock
 and shares no state with the node (r2.1 Blocker A).

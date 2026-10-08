@@ -413,7 +413,12 @@ def test_historical_log_is_still_followed_from_eof_on_later_polls(tmp_path: Path
     old, _today = _plant_logs(tmp_path, old_summary_ts="2026-10-02T20:55:25.000000000")
     state, _records, _truncated = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
 
-    appended = _plain_line("2026-10-03T16:55:00.000000000", "INFO", "X.Y", "later line")
+    appended = _plain_line(
+        "2026-10-03T16:55:00.000000000",
+        "INFO",
+        "BREEZY-L001.DataClient-POLYMARKET_US",
+        "later line",
+    )
     with open(old, "ab") as fh:
         fh.write(("\n" + appended + "\n").encode())
 

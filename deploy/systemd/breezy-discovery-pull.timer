@@ -1,5 +1,5 @@
 [Unit]
-Description=16:52 UTC trigger for the Breezy AUD-02 WP-D1 discovery venue pull
+Description=17:12 UTC trigger for the Breezy AUD-02 WP-D1 discovery venue pull
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/discovery_venue_pull.py
 Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-02_WP-D1_plan_r2_2026-09-26.md
@@ -7,16 +7,16 @@ Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-02
 [Timer]
 Unit=breezy-discovery-pull.service
 
-# 16:52 UTC -- this tick is free (tests/unit/test_deploy_timer_hours.py):
-# not a 15-minute quote-tape ingest tick, and not the 17:15/17:25 ticks the
-# WP-11b template merge retired. It falls INSIDE the protected no-start
-# window [16:35Z, 01:15Z), which is deliberate: the service itself claims
-# the LIGHT-JOB EXEMPTION (deploy/systemd/README.md's "Light-job exemption"
-# paragraph, same one breezy-pm-crh-v2-tally/breezy-live-tally/
-# breezy-score-live-trials use) -- it takes no studies flock, sits outside
-# breezy-studies.slice, and its own network GETs start only after the
-# node's initial discovery summary appears, never before (r2.1 Blocker A).
-OnCalendar=*-*-* 16:52:00 UTC
+# 17:12 UTC (AUT-6 WP3b, plan r15 section 3.8.1; was 16:52) -- this tick is
+# free (tests/unit/test_deploy_timer_hours.py) and now sits OUTSIDE the
+# launch window [16:30Z, 17:10Z), so the unit is no longer a known overlap.
+# The service still claims the LIGHT-JOB EXEMPTION (deploy/systemd/README.md's
+# "Light-job exemption" paragraph, same one breezy-pm-crh-v2-tally/
+# breezy-live-tally/breezy-score-live-trials use) -- it takes no studies
+# flock, sits outside breezy-studies.slice, and its own network GETs start
+# only after the node's initial discovery summary appears, never before
+# (r2.1 Blocker A).
+OnCalendar=*-*-* 17:12:00 UTC
 
 # A run missed because the host was down fires as soon as the timer is next
 # active. The script's own deadline check (17:12Z) degrades a late start to

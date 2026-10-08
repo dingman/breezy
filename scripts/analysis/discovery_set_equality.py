@@ -20,7 +20,7 @@ import ast
 import calendar
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -59,6 +59,7 @@ __all__ = [
     "replay_cycles",
     "replay_file",
     "select_day_files",
+    "stream_node_log_records",
     "venue_active_set",
     "venue_payloads_from_pages",
 ]
@@ -146,6 +147,26 @@ def file_stamp(path: Path) -> str:
     return match.group(1)
 
 
+def stream_node_log_records(path: Path) -> Iterator[NodeLogRecord]:
+    """Lazily yield every Nautilus-format line in ``path``, ANSI-stripped and
+    parsed -- :func:`iter_node_log_records`' parser, one line resident at a
+    time (G12). ``splitlines`` per line keeps the old separator semantics."""
+    with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+        for chunk in fh:
+            for raw_line in chunk.splitlines():
+                stripped = ANSI_RE.sub("", raw_line)
+                match = LINE_RE.match(stripped)
+                if match is None:
+                    continue
+                yield NodeLogRecord(
+                    source=path,
+                    ts_ns=parse_ts_ns(match.group("ts")),
+                    level=match.group("level"),
+                    component=match.group("component"),
+                    message=match.group("message"),
+                )
+
+
 def iter_node_log_records(path: Path) -> tuple[NodeLogRecord, ...]:
     """Every Nautilus-format line in ``path``, ANSI-stripped and parsed.
 
@@ -154,23 +175,7 @@ def iter_node_log_records(path: Path) -> tuple[NodeLogRecord, ...]:
     detect a truncation or an unparseable line compare the byte length they
     read against what parsed, e.g. :func:`select_day_files`.
     """
-    text = path.read_text(encoding="utf-8", errors="replace")
-    records: list[NodeLogRecord] = []
-    for raw_line in text.splitlines():
-        stripped = ANSI_RE.sub("", raw_line)
-        match = LINE_RE.match(stripped)
-        if match is None:
-            continue
-        records.append(
-            NodeLogRecord(
-                source=path,
-                ts_ns=parse_ts_ns(match.group("ts")),
-                level=match.group("level"),
-                component=match.group("component"),
-                message=match.group("message"),
-            )
-        )
-    return tuple(records)
+    return tuple(stream_node_log_records(path))
 
 
 def _window_bounds(day: date) -> tuple[datetime, datetime]:
