@@ -178,8 +178,8 @@ def test_evidence_without_the_sample_object_refuses(tmp_path: Path) -> None:
     scenario.evidence.write_text(
         json.dumps(
             {
-                "measured_days": {"lamp": 20, "pfm": 20, "mos": 20},
-                "uncensored": {"lamp": 30, "pfm": 30, "mos": 30},
+                "measured_days": {key: 20 for key in _PINNED_LAGS},
+                "uncensored": {key: 30 for key in _PINNED_LAGS},
             }
         ),
         encoding="utf-8",
@@ -201,8 +201,8 @@ def test_malformed_lag_samples_refuse(tmp_path: Path, bad: Any) -> None:
 def _evidence_raw(samples: dict[str, Any]) -> str:
     return json.dumps(
         {
-            "measured_days": {"lamp": 20, "pfm": 20, "mos": 20},
-            "uncensored": {"lamp": 30, "pfm": 30, "mos": 30},
+            "measured_days": {key: 20 for key in _PINNED_LAGS},
+            "uncensored": {key: 30 for key in _PINNED_LAGS},
             "lag_samples_ns": samples,
         }
     )

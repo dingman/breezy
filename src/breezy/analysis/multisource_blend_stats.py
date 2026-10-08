@@ -403,6 +403,10 @@ def diagnostics(
     }
 
 
+#: C1 lag evidence and ``pins.source_lags_ns`` (C1-R4). Not the feature ``LEVEL_SOURCES``.
+C1_LAG_SOURCES: Final[tuple[str, ...]] = ("lamp-mdl", "lav-iem", "pfm", "mos-gfs", "obs")
+
+
 def require_c1_measured_lags(
     measured_days: Mapping[str, int],
     *,

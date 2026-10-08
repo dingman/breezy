@@ -102,6 +102,7 @@ from breezy.analysis.multisource_blend_io import (
 )
 from breezy.analysis.multisource_blend_stats import (
     ALPHA_ONE_SIDED,
+    C1_LAG_SOURCES,
     AcceptanceDecision,
     AcceptanceInputs,
     DeltaSummary,
@@ -133,6 +134,7 @@ from breezy.analysis.multisource_blend_stats import (
 __all__ = [
     "ALPHA_ONE_SIDED",
     "ARM_NAMES",
+    "C1_LAG_SOURCES",
     "DISAGREEMENT_SD_FLOOR_F",
     "HOLDOUT_START",
     "HORIZONS",

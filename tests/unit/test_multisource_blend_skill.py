@@ -196,8 +196,8 @@ class _Scenario:
         self.evidence.write_text(
             json.dumps(
                 {
-                    "measured_days": {"lamp": 20, "pfm": 20, "mos": 20},
-                    "uncensored": {"lamp": 30, "pfm": 30, "mos": 30},
+                    "measured_days": {key: 20 for key in _PINNED_LAGS},
+                    "uncensored": {key: 30 for key in _PINNED_LAGS},
                     "lag_samples_ns": c1_lag_samples(),
                 }
             ),
@@ -334,13 +334,53 @@ def test_runner_commits_floor_before_scoring_m1_m3(
 
 def test_runner_refuses_until_c1_has_14_days_of_measured_lags(tmp_path: Path) -> None:
     scenario = _Scenario(tmp_path)
+    short = {key: 20 for key in _PINNED_LAGS}
+    short["lamp-mdl"] = 13
     scenario.evidence.write_text(
-        json.dumps({"measured_days": {"lamp": 13, "pfm": 20, "mos": 20}, "uncensored": {}}),
+        json.dumps(
+            {
+                "measured_days": short,
+                "uncensored": {key: 30 for key in _PINNED_LAGS},
+                "lag_samples_ns": c1_lag_samples(),
+            }
+        ),
         encoding="utf-8",
     )
     with pytest.raises(skill.Refusal, match="14"):
         scenario.run()
     assert not (scenario.out / "stage_a.json").exists()
+
+
+def _pin_key_evidence(path: Path, *, omit: str | None = None) -> Path:
+    """Counts for the five pin keys. Omitting one keeps the level-source aliases filled."""
+    days = {key: 20 for key in _PINNED_LAGS}
+    counts = {key: 30 for key in _PINNED_LAGS}
+    if omit is not None:
+        del days[omit]
+        del counts[omit]
+        days.update({"lamp": 20, "pfm": 20, "mos": 20})
+        counts.update({"lamp": 30, "pfm": 30, "mos": 30})
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "c1_lag_evidence/v1",
+                "measured_days": days,
+                "uncensored": counts,
+                "lag_samples_ns": c1_lag_samples(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_check_c1_accepts_evidence_keyed_by_the_five_pin_keys(tmp_path: Path) -> None:
+    skill._check_c1(_pin_key_evidence(tmp_path / "c1.json"), _design())
+
+
+def test_check_c1_refuses_evidence_missing_a_pin_key(tmp_path: Path) -> None:
+    with pytest.raises(skill.Refusal, match="obs"):
+        skill._check_c1(_pin_key_evidence(tmp_path / "c1.json", omit="obs"), _design())
 
 
 def test_runner_refuses_sealed_holdout_rows(tmp_path: Path) -> None:

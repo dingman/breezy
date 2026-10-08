@@ -37,6 +37,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+from breezy.analysis.multisource_blend_stats import C1_LAG_SOURCES
+
 __all__ = ["build_evidence", "main"]
 
 LEDGER_NAME: Final[str] = "poll_ledger.jsonl"
@@ -45,7 +47,6 @@ MIN_UNCENSORED: Final[int] = 30
 _NS_PER_MIN: Final[int] = 60 * 10**9
 _NS_PER_S: Final[int] = 10**9
 _LAMP_EXT: Final[str] = "ALLEXT"
-_SOURCES: Final[tuple[str, ...]] = ("lamp-mdl", "lav-iem", "pfm", "mos-gfs", "obs")
 #: pin source -> (ledger source key, lag basis); absent = no live C1 path.
 _LIVE: Final[Mapping[str, tuple[str, str]]] = {
     "lamp-mdl": ("us-lamp-live", "available_ts_ns"),
@@ -144,13 +145,13 @@ def _measure(events: Sequence[dict[str, Any]], basis: str) -> dict[str, Any]:
 
 def build_evidence(archive_root: Path) -> dict[str, Any]:
     lag_samples: dict[str, list[int]] = {}
-    uncensored = dict.fromkeys(_SOURCES, 0)
-    measured = dict.fromkeys(_SOURCES, 0)
-    censored = dict.fromkeys(_SOURCES, 0)
+    uncensored = dict.fromkeys(C1_LAG_SOURCES, 0)
+    measured = dict.fromkeys(C1_LAG_SOURCES, 0)
+    censored = dict.fromkeys(C1_LAG_SOURCES, 0)
     stats: dict[str, Any] = {}
     no_live: list[str] = []
     malformed = 0
-    for source in _SOURCES:
+    for source in C1_LAG_SOURCES:
         live = _LIVE.get(source)
         ledger = archive_root / live[0] / LEDGER_NAME if live else None
         if live is None or ledger is None or not ledger.is_file():
@@ -167,7 +168,7 @@ def build_evidence(archive_root: Path) -> dict[str, Any]:
     for level, pin in _LEVEL_KEY.items():
         uncensored[level] = uncensored[pin]
         measured[level] = measured[pin]
-    ready = all(measured[s] >= MIN_DAYS and uncensored[s] >= MIN_UNCENSORED for s in _SOURCES)
+    ready = all(measured[s] >= MIN_DAYS and uncensored[s] >= MIN_UNCENSORED for s in C1_LAG_SOURCES)
     return {
         "schema": "c1_lag_evidence/v1",
         "lag_samples_ns": lag_samples,

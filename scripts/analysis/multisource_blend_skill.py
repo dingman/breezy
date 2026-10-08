@@ -373,7 +373,7 @@ def _check_c1(path: Path, design: Mapping[str, Any]) -> None:
     try:
         msb.require_c1_measured_lags(
             measured,
-            required=msb.LEVEL_SOURCES,
+            required=msb.C1_LAG_SOURCES,
             min_days=int(design["fixed_by_plan"]["c1_min_measured_days"]),
             uncensored=uncensored,
             min_uncensored=int(design["pins"]["min_uncensored_lag_samples"]),
