@@ -9,8 +9,10 @@ them. A bwrap row (``AUTONOMY_BWRAP_TABLE``) enforces the write scope at the OS 
 literals are the defence-in-depth lint's input and are never described as enforced for the
 unwrapped lines (E-7a rule 5).
 
-Data only. Process calls name no in-sandbox ``systemctl`` read: those arrive through the bus
-snapshot pre-line (E-7e(h)). Later work packages add their own rows beside these.
+Data only, plus ``declare_with_ruling`` and ``declare_without_ruling`` (WP5), which are pure
+functions over the literal catalogue and do no I/O. Process calls name no in-sandbox ``systemctl``
+read: those arrive through the bus snapshot pre-line (E-7e(h)). Later work packages add their own
+rows beside these.
 """
 
 from __future__ import annotations
@@ -209,6 +211,7 @@ CATALOG: Final[tuple[DetectorRow, ...]] = (
                 "N", 0),
     DetectorRow("3", "capture_gap", "freshness", "NODE_LOCAL", "", "node", "ENTRY_VETO", "",
                 "WARN", "n/a", "INFRA", ("aut6.transient_veto_persistent",), "N", 0),
+    # severity CRITICAL is window-gated: PermitLapsedDetector pages only inside [17:10Z, 01:00Z).
     DetectorRow("4", "permit_lapsed", "liveness", "NODE_LOCAL", "", "node", "ENTRY_VETO", "",
                 "CRITICAL", "n/a", "INFRA", ("aut6.node_liveness",), "N", 0),
     DetectorRow("5", "alerts_undeliverable", "unit_health", "NODE_LOCAL", "", "node",

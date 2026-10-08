@@ -219,5 +219,41 @@ def test_fq_plugin_detectors_are_provided_by_composition_and_refuse_by_default()
 
     with pytest.raises(PluginRefused, match="rogue_detector"):
         build_fq_node_plugin(_Adapter(), node_detectors=(_Rogue(),))  # type: ignore[arg-type]
+
+    class _Mislabelled(_Rogue):
+        id = "permit_lapsed"
+        kind = DetectorKind.VERDICT
+
+    with pytest.raises(PluginRefused, match="NODE_LOCAL"):
+        build_fq_node_plugin(_Adapter(), node_detectors=(_Mislabelled(),))  # type: ignore[arg-type]
     with pytest.raises(PluginRefused, match="duplicate"):
         build_fq_node_plugin(_Adapter(), node_detectors=(permit, permit))  # type: ignore[arg-type]
+
+
+def test_persistent_unknown_pages_once_recovers_then_repages_once() -> None:
+    t0 = _ns(2026, 10, 9, 18, 0)
+    state: dict[str, bool] = {"fail": True}
+
+    def read() -> int | None:
+        if state["fail"]:
+            raise OSError("unreadable")
+        return t0 + 86_400 * _NS
+
+    detector = PermitLapsedDetector(read_expiry_ns=read)
+    detector.observe(t0)
+    first = detector.observe(t0 + 181 * _NS)
+    assert (first.veto, first.page_event) == (
+        VetoReason.PERMIT_LAPSED,
+        "aut6_detector_unknown_persistent",
+    )
+    assert detector.observe(t0 + 300 * _NS).page_event is None
+    state["fail"] = False
+    assert detector.observe(t0 + 400 * _NS).state == "AGREE"
+    state["fail"] = True
+    assert detector.observe(t0 + 500 * _NS).page_event is None  # timer restarts, no veto yet
+    second = detector.observe(t0 + 500 * _NS + 181 * _NS)
+    assert (second.veto, second.page_event) == (
+        VetoReason.PERMIT_LAPSED,
+        "aut6_detector_unknown_persistent",
+    )
+    assert detector.observe(t0 + 900 * _NS).page_event is None

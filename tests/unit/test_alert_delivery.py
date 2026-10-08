@@ -630,7 +630,13 @@ def test_critical_alerts_use_delivery_proof(
 def test_detector_and_failure_mode_alerts_use_delivery_proof() -> None:
     import breezy.persistence.autonomy.detector_catalog as catalog
 
-    assert hasattr(catalog, "CATALOG")  # WP5 lands the catalogue (WP1 pinned its absence)
+    # the detector half is derived from the catalogue so a new CRITICAL detector cannot be missed
+    critical_rows = [row for row in catalog.CATALOG if row.severity == "CRITICAL"]
+    assert critical_rows
+    for row in critical_rows:
+        assert is_proof_bearing(_payload(event=row.id, severity="CRITICAL")) is True, row.id
+    # TODO(WP6): also assert every ALERT/WARN detector-action event name is in
+    # PROOF_BEARING_EVENTS; those event names are defined by the WP6/WP7 producers.
     critical = {
         event for event, severity in CAPTURE_ALERT_SEVERITIES.items() if severity == "CRITICAL"
     }

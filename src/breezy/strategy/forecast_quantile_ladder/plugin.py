@@ -13,7 +13,7 @@ Registering it is the change that admits the kind (ARCH C6), which WP7/WP8 make.
 from typing import Any, ClassVar, Final
 
 from breezy.persistence.autonomy.detector_catalog import CATALOG
-from breezy.persistence.autonomy.plugin import Detector, PluginRefused
+from breezy.persistence.autonomy.plugin import Detector, DetectorKind, PluginRefused
 from breezy.strategy.forecast_quantile_ladder.capture_adapter import (
     CaptureContext,
     FqCaptureAdapter,
@@ -85,10 +85,16 @@ class FqNodePlugin:
 def _checked_node_detectors(
     detectors: tuple[Detector, ...] | None,
 ) -> tuple[Detector, ...] | None:
+    """Validate what composition hands in: catalogued ids, NODE_LOCAL kind, no duplicates.
+
+    Completeness of the NODE_LOCAL set (all five ids present) is WP6's job, not checked here.
+    """
     if detectors is None:
         return None
     seen: set[str] = set()
     for detector in detectors:
+        if detector.kind is not DetectorKind.NODE_LOCAL:
+            raise PluginRefused(f"{detector.id} is not a NODE_LOCAL detector")
         if detector.id not in _NODE_LOCAL_IDS:
             raise PluginRefused(f"{detector.id} is not a catalogued NODE_LOCAL detector")
         if detector.id in seen:

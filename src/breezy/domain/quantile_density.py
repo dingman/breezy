@@ -71,6 +71,7 @@ __all__ = [
 #: the SKEW_NORMAL non-convergence fallback (review item 2). Does not affect
 #: the module's determinism or purity -- the same inputs always produce the
 #: same CDF regardless of whether a handler is configured.
+# Hard-coded on purpose: the pre-move logger name is pinned by test_ladder_ev_domain_move.
 _logger = logging.getLogger("breezy.strategy.ladder_ev.quantile_density")
 
 _SQRT2: float = math.sqrt(2.0)
