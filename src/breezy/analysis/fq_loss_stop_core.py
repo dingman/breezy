@@ -30,9 +30,11 @@ ALPHA_FLOOR_GRID: Final[tuple[float, ...]] = (0.10, 0.20, 0.30)
 G3_FLOOR_MULTIPLIER: Final[float] = 2.5
 #: r3 §4.5. t_min is chosen from this grid; ties go to the smallest.
 T_MIN_GRID: Final[tuple[int, ...]] = (1, 2, 3, 5)
-#: n9. A tick requires σ > SIGMA_EPS. A variance at or below −SIGMA_EPS
-#: is a numerical defect, not a zero-σ day.
-SIGMA_EPS: Final[float] = 1e-12
+#: n9. VARIANCE_EPS is a variance threshold, not a σ threshold. A tick
+#: requires variance > VARIANCE_EPS. σ = sqrt(variance) is computed only
+#: for those days. A variance at or below −VARIANCE_EPS is a numerical
+#: defect, not a zero-σ day.
+VARIANCE_EPS: Final[float] = 1e-12
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
@@ -50,6 +52,7 @@ class ReasonCode(StrEnum):
     INVALID_EXIT_FILL = "invalid_exit_fill"
     MISSING_SETTLEMENT = "missing_settlement"
     ADMISSION_REFUSED = "admission_refused"
+    ZERO_VARIANCE_REALISED = "zero_variance_realised"
 
 
 class FqLossStopRefusal(Exception):
@@ -171,13 +174,18 @@ def per_contract_exit_v(*, cost: Decimal, fee: Decimal, sold_qty: Decimal) -> De
 
 
 def sigma_from_variance(variance: float) -> float:
-    """σ for a day. Refuse a variance at or below ``−SIGMA_EPS`` (n9)."""
-    if not math.isfinite(variance) or variance <= -SIGMA_EPS:
+    """σ for a ticking day. Refuse a variance at or below ``−VARIANCE_EPS``.
+
+    ``−VARIANCE_EPS < variance <= VARIANCE_EPS`` is a zero-σ day and returns
+    0 without a square root. σ = sqrt(variance) is computed only when
+    variance > VARIANCE_EPS (n9).
+    """
+    if not math.isfinite(variance) or variance <= -VARIANCE_EPS:
         raise FqLossStopRefusal(
             ReasonCode.NEGATIVE_VARIANCE,
-            f"variance {variance!r} is at or below -SIGMA_EPS",
+            f"variance {variance!r} is at or below -VARIANCE_EPS",
         )
-    if variance <= 0.0:
+    if variance <= VARIANCE_EPS:
         return 0.0
     return math.sqrt(variance)
 
@@ -198,17 +206,23 @@ def first_crossing(increments: Sequence[float], *, c: float, t_min: int) -> int 
 
 
 def step_clock(day: NormalisedDay, carry: float) -> ClockStep:
-    """Advance one station-day. A tick is ``σ > SIGMA_EPS``; the carry then resets.
+    """Advance one station-day. A tick is ``variance > VARIANCE_EPS``; the carry then resets.
 
     A zero-σ day is not a tick. Its deterministic shift (Σ δ_net, plus any
     same-rung exit that is not itself a bundle leg) is added to the carry
-    and enters the next tick (r3 §4.1 step 8). ``x_rand`` is not carried:
-    on the days the pin names it is zero.
+    and enters the next tick (r3 §4.1 step 8). ``x_rand`` is not carried.
+    A zero-variance day with a nonzero ``x_rand`` is an invariant break:
+    dropping it would hide realised P&L, so the clock refuses instead.
     """
     sigma = sigma_from_variance(day.variance)
-    if sigma > SIGMA_EPS:
+    if day.variance > VARIANCE_EPS:
         x = day.x_rand + day.shift + carry
         return ClockStep(is_tick=True, z=x / sigma, x=x, sigma=sigma, carry_out=0.0)
+    if day.x_rand != 0.0:
+        raise FqLossStopRefusal(
+            ReasonCode.ZERO_VARIANCE_REALISED,
+            f"zero-variance day would drop realised P&L x_rand={day.x_rand!r}",
+        )
     return ClockStep(is_tick=False, z=None, x=day.shift, sigma=sigma, carry_out=carry + day.shift)
 
 
@@ -317,9 +331,11 @@ def _apply_exits(
         side = grouped.get(fill.rung, {}).get(fill.side)
         if side is None:
             raise FqLossStopRefusal(ReasonCode.INVALID_EXIT_FILL, f"{key!r} exit has no buy")
-        value = per_contract_exit_v(cost=fill.cost, fee=fill.fee, sold_qty=fill.qty)
+        # Validate, then keep the total. Storing per-contract v and multiplying
+        # by qty rounds Σ(cost − fee) before the later division.
+        per_contract_exit_v(cost=fill.cost, fee=fill.fee, sold_qty=fill.qty)
         side.sold += fill.qty
-        side.proceeds += value * fill.qty
+        side.proceeds += fill.cost - fill.fee
 
 
 def _bundle(
@@ -383,8 +399,10 @@ def _emit(
         return None, _ZERO
     fraction = sold / non_paired
     held_pay = _ONE if state.held else _ZERO
-    exit_v = state.proceeds / sold if sold > 0 else _ZERO
-    h_eff = (_ONE - fraction) * held_pay + fraction * exit_v
+    # Σ(cost − fee) / non_paired. Dividing the total by sold and multiplying
+    # by fraction undoes that division and reintroduces the round trip.
+    exited = state.proceeds / non_paired if sold > 0 else _ZERO
+    h_eff = (_ONE - fraction) * held_pay + exited
     row = StratumRow(
         entry_ask=state.be,
         fee=_ZERO,

@@ -2,7 +2,7 @@
 
 Covers r3's pure-core list, the r2 rows it names (L-40 formulas, the
 YES-first shrink and its refusal, the NO instrument price, fee refusal,
-exits and voids), and the step-2 additions: σ-epsilon, the BE̅ guard,
+exits and voids), and the step-2 additions: variance-epsilon, the BE̅ guard,
 per-contract exit v, shrink drift, Σ_NO q > 1, shrunk variance against
 an independent enumeration, and feasible variance equal to
 ``combine_station_day``.
@@ -19,8 +19,8 @@ import pytest
 from breezy.analysis.fq_loss_stop_core import (
     ALPHA_FLOOR_GRID,
     G3_FLOOR_MULTIPLIER,
-    SIGMA_EPS,
     T_MIN_GRID,
+    VARIANCE_EPS,
     BundleLeg,
     BuyFill,
     ClockStep,
@@ -102,8 +102,8 @@ def test_pinned_constants_match_the_r3_grids() -> None:
     assert ALPHA_FLOOR_GRID == (0.10, 0.20, 0.30)
     assert G3_FLOOR_MULTIPLIER == 2.5
     assert T_MIN_GRID == (1, 2, 3, 5)
-    assert isinstance(SIGMA_EPS, float)
-    assert SIGMA_EPS > 0.0
+    assert isinstance(VARIANCE_EPS, float)
+    assert VARIANCE_EPS > 0.0
 
 
 def test_reason_codes_are_a_closed_set() -> None:
@@ -117,6 +117,7 @@ def test_reason_codes_are_a_closed_set() -> None:
         ReasonCode.INVALID_EXIT_FILL,
         ReasonCode.MISSING_SETTLEMENT,
         ReasonCode.ADMISSION_REFUSED,
+        ReasonCode.ZERO_VARIANCE_REALISED,
     )
 
 
@@ -349,6 +350,45 @@ def test_shrink_gives_every_leg_drift_at_most_zero() -> None:
     assert joint.drifts[2] == pytest.approx(0.0)
 
 
+def test_mixed_overround_matches_hand_computed_moments() -> None:
+    """YES on rung A at BE 0.8 and NO on rung B at BE 0.7.
+
+    Σq = 0.8 + (1 − 0.7) = 1.1. κ = (1 − 0.3) / 0.8 = 0.875.
+    Outcomes are x = +0.5 w.p. 0.7 and x = −1.5 w.p. 0.3, so
+    E[x] = −0.1, E[x²] = 0.85 and variance = 0.84. Drifts are
+    (E[H] − BE) = (−0.1, 0.0). Written out here, not via
+    ``_brute_shrunk_variance``.
+    """
+    rows = (
+        StratumRow(
+            entry_ask=Decimal("0.8"),
+            fee=Decimal(0),
+            held=False,
+            station=_STATION,
+            side="yes",
+            rung="A",
+        ),
+        StratumRow(
+            entry_ask=Decimal("0.7"),
+            fee=Decimal(0),
+            held=False,
+            station=_STATION,
+            side="no",
+            rung="B",
+        ),
+    )
+    expect = 0.7 * 0.5 + 0.3 * -1.5
+    second = 0.7 * 0.5**2 + 0.3 * (-1.5) ** 2
+    assert expect == pytest.approx(-0.1)
+    assert second == pytest.approx(0.85)
+    assert second - expect**2 == pytest.approx(0.84)
+
+    joint = shrunk_joint(rows)
+    assert joint.kappa == pytest.approx(0.875, abs=1e-12)
+    assert joint.variance == pytest.approx(0.84, abs=1e-12)
+    assert joint.drifts == pytest.approx((-0.1, 0.0), abs=1e-12)
+
+
 def test_sigma_no_above_one_refuses() -> None:
     rows = (
         StratumRow(
@@ -531,17 +571,35 @@ def test_sigma_eps_gates_ticks_and_refuses_negative_variance() -> None:
     assert ticked.z == pytest.approx(-0.25)
     assert ticked.carry_out == 0.0
 
-    dust = step_clock(_bare(variance=(SIGMA_EPS / 2) ** 2, shift=0.5), 0.0)
+    # Variance units: half the threshold must not tick. Its square root is
+    # many orders above the threshold, so a σ-unit comparison would tick.
+    dust = step_clock(_bare(variance=VARIANCE_EPS / 2, shift=0.5), 0.0)
     assert dust.is_tick is False
+    assert dust.sigma == 0.0
     assert dust.carry_out == pytest.approx(0.5)
 
     with pytest.raises(FqLossStopRefusal) as exc:
-        step_clock(_bare(variance=-SIGMA_EPS), 0.0)
+        step_clock(_bare(variance=-VARIANCE_EPS), 0.0)
     assert exc.value.reason is ReasonCode.NEGATIVE_VARIANCE
 
-    soft = step_clock(_bare(variance=-(SIGMA_EPS / 2), shift=0.2), 0.0)
+    soft = step_clock(_bare(variance=-(VARIANCE_EPS / 2), shift=0.2), 0.0)
     assert soft.is_tick is False
     assert soft.carry_out == pytest.approx(0.2)
+
+
+def test_variance_1e_17_does_not_tick() -> None:
+    """1e-17 is under the variance threshold (σ would be about 3e-9)."""
+    step = step_clock(_bare(variance=1e-17, shift=0.4), 0.0)
+    assert step.is_tick is False
+    assert step.sigma == 0.0
+    assert step.z is None
+    assert step.carry_out == pytest.approx(0.4)
+
+
+def test_zero_variance_day_does_not_drop_x_rand() -> None:
+    with pytest.raises(FqLossStopRefusal, match="realised P&L") as err:
+        step_clock(_bare(variance=0.0, x_rand=-0.4, shift=0.1), 0.0)
+    assert err.value.reason is ReasonCode.ZERO_VARIANCE_REALISED
 
 
 def test_first_crossing_returns_the_first_t_or_none() -> None:

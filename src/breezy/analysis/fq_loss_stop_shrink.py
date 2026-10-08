@@ -42,8 +42,8 @@ def shrunk_joint(rows: Sequence[StratumRow]) -> ShrunkJoint:
         _refuse("SIGMA_NO_EXCEEDS_ONE", f"sum of NO cell probabilities is {sum_no!r}")
     if sum(parts.qs) <= 1.0:
         raise ValueError("shrunk joint is only defined when sum q > 1")
-    if sum_yes <= 0.0:
-        _refuse("SIGMA_NO_EXCEEDS_ONE", "no YES mass left to shrink")
+    # ΣNO ≤ 1 (refused above) and Σq > 1 imply ΣYES = Σq − ΣNO > 0, so a
+    # "no YES mass" refusal is unreachable and is not a branch here.
     kappa = (1.0 - sum_no) / sum_yes
     masses = tuple(
         kappa * q if side == "yes" else q for q, side in zip(parts.qs, parts.sides, strict=True)
