@@ -313,7 +313,8 @@ def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None
     # 29: AUT-2 WP6 adds the run marker, the label-hold journal and the measured-peak artefact.
     # 31: AUT-6 WP1 adds the delivery-journal and the durable-outbox rows (evidence/alerts/**).
     # 32: AUT-6 WP2 adds the write-once armed marker row (evidence/alerts/armed.json).
-    assert len(paths) == len(set(paths)) == 32
+    # 35: AUT-6 WP3 S3 adds the unit health rows (records, replaced state, MemAvailable samples).
+    assert len(paths) == len(set(paths)) == 35
 
 
 def test_the_aut6_alert_rows_name_the_outbox_and_record_writers() -> None:
