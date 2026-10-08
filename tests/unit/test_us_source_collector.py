@@ -511,6 +511,7 @@ def test_lock_busy_for_two_retries_then_collects(
     assert report.exit_code == 0
     err = capsys.readouterr().err
     assert "lock acquired after waiting 10.000s" in err
+    assert [e for e in _events(tmp_path, LAMP_SOURCE) if e.get("kind") == "skipped"] == []
 
 
 def test_lock_busy_beyond_wait_budget_is_skipped_locked(
@@ -542,6 +543,9 @@ def test_lock_busy_beyond_wait_budget_is_skipped_locked(
     err = capsys.readouterr().err
     assert "after waiting 120.000s" in err
     assert "skipping this cycle" in err
+    # Written without the unit lock: the lock was busy for every attempt.
+    skipped = [e for e in _events(tmp_path, LAMP_SOURCE) if e.get("kind") == "skipped"]
+    assert skipped == [{"fetched_at_ns": clock(), "kind": "skipped", "reason": "locked"}]
 
 
 def _busy_obs_wait(
@@ -579,6 +583,8 @@ def test_lock_wait_for_a_240s_work_budget_is_capped_at_210s(
     assert sum(sleeps) == 210
     assert clock() == start + 210 * NS
     assert report.status is col.CycleStatus.SKIPPED_LOCKED
+    skipped = [e for e in _events(tmp_path, col.SOURCE_KEYS["obs"]) if e.get("kind") == "skipped"]
+    assert skipped == [{"fetched_at_ns": clock(), "kind": "skipped", "reason": "locked"}]
 
 
 def test_lock_wait_that_uses_up_the_work_budget_is_skipped_locked(
@@ -1069,6 +1075,24 @@ def _run_script(
         env=env,
         timeout=120,
         check=False,
+    )
+
+
+def test_poll_ledger_kind_set_is_widened_by_skipped_only() -> None:
+    """L-12: the closed kind set gains ``skipped`` and keeps every kind already written."""
+    assert ledger_mod.LEDGER_KINDS == frozenset(
+        {
+            "backoff",
+            "first_poll",
+            "miss",
+            "refused",
+            "refused_alert",
+            "seen",
+            "skipped",
+            "stale_alert",
+            "transport_fail",
+            "transport_ok",
+        }
     )
 
 

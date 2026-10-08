@@ -923,6 +923,11 @@ def _run_locked(
                     f"{key} is locked by another run after waiting {waited_s:.3f}s; "
                     "skipping this cycle"
                 )
+                # Append-only poll ledger: no revision-store lock (the unit lock is still busy).
+                collector.ledger.record(
+                    key,
+                    {"kind": "skipped", "fetched_at_ns": fresh, "reason": "locked"},
+                )
                 return CycleReport(key, CycleStatus.SKIPPED_LOCKED)
             ctx.sleep(step_s)
             waited_s += step_s

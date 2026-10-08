@@ -1,0 +1,106 @@
+{
+  "derived_from": "journalctl --user --since 2026-10-06 --until 2026-10-09 -g status=skipped_locked _SYSTEMD_USER_UNIT=us-source-collector@<source>.service (sources lamp,pfm,nbp,lav,mos,obs and the ledger-key instance names; only us-source-collector@pfm.service had status=skipped_locked, source=us-pfm-afos)",
+  "schema": "c1_historical_skips/v1",
+  "skips": [
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791294000602302000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791297600649746000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791340800896549000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791344400547214000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791348000768860000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791351600635729000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791355200846798000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791358801140282000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791362400561353000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791366000621676000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791369600627047000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791373200684639000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791380400582702000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791384000572049000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791387600647563000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791394800608238000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791398400584075000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791402000543914000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791409200578795000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791420000737646000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791423600677649000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791427200586685000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791430800527941000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791438000640865000
+    },
+    {
+      "source": "us-pfm-afos",
+      "ts_ns": 1791441600550756000
+    }
+  ]
+}

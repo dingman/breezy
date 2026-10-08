@@ -124,7 +124,16 @@ def test_output_satisfies_runner_pin_guard(tmp_path: Path) -> None:
 def test_main_writes_report_atomically_even_when_insufficient(tmp_path: Path) -> None:
     _write(tmp_path, "us-lamp-live", [_seen(_T0, lag=_MIN)])
     out = tmp_path / "out" / "c1.json"
-    rc = c1.main(["--archive-root", str(tmp_path), "--out", str(out)])
+    rc = c1.main(
+        [
+            "--archive-root",
+            str(tmp_path),
+            "--out",
+            str(out),
+            "--historical-skips",
+            str(tmp_path / "absent-skips.json"),
+        ]
+    )
     assert rc == 0
     data = json.loads(out.read_text())
     assert data["ready"] is False
@@ -201,8 +210,19 @@ def _stamped(
     }
 
 
-def test_poll_gap_censors_seen_row_three_hours_after_previous_ledger_row(tmp_path: Path) -> None:
-    """3 h after the previous ledger row, lag 2.5 h: censored_poll_gap, out of samples and p99."""
+def _skipped(ts_ns: int) -> dict[str, Any]:
+    return {"kind": "skipped", "fetched_at_ns": ts_ns, "reason": "locked"}
+
+
+def _avail(run: int, seen_at: int, *, station: str = "KSFO") -> dict[str, Any]:
+    """Availability-only row: lag is first-seen minus the nominal run."""
+    row = _stamped(run, fetched_at_ns=seen_at, first_seen_ns=seen_at, station=station)
+    row["available_ts_ns"] = seen_at
+    return row
+
+
+def test_three_hour_gap_without_a_skipped_row_is_not_censored(tmp_path: Path) -> None:
+    """A 3 h gap between ledger rows is kept when neither row is a skipped firing."""
     previous_at = _T0
     kept = _stamped(_T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN)
     recovery_at = previous_at + 3 * 60 * _MIN
@@ -215,12 +235,10 @@ def test_poll_gap_censors_seen_row_three_hours_after_previous_ledger_row(tmp_pat
     )
     _write(tmp_path, "us-pfm-afos", [kept, recovery])
     ev = c1.build_evidence(tmp_path)
-    assert ev["censored_poll_gap"]["pfm"] == 1
+    assert ev["censored_poll_gap"]["pfm"] == 0
     assert ev["censored"]["pfm"] == 0
     assert set(ev["censored_poll_gap"]) == set(C1_LAG_SOURCES)
-    assert ev["lag_samples_ns"]["pfm"] == [10 * _MIN]
-    assert lag not in ev["lag_samples_ns"]["pfm"]
-    assert ev["stats"]["pfm"]["p99_min"] == 10
+    assert sorted(ev["lag_samples_ns"]["pfm"]) == [10 * _MIN, lag]
     assert ev["schema"] == "c1_lag_evidence/v1"
 
 
@@ -237,44 +255,127 @@ def test_seen_row_fifty_five_minutes_after_previous_ledger_row_is_kept(tmp_path:
     assert sorted(ev["lag_samples_ns"]["pfm"]) == [10 * _MIN, lag]
 
 
-def test_poll_gap_uses_the_previous_ledger_row_not_the_previous_seen_sample(
-    tmp_path: Path,
-) -> None:
-    """A miss 20 min earlier keeps the sample, even if the previous ``seen`` was 3 h ago."""
-    previous_at = _T0
-    first = _stamped(_T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN)
-    miss_at = previous_at + 160 * _MIN
+def test_a_miss_row_is_not_a_skipped_firing(tmp_path: Path) -> None:
+    """A miss three hours earlier is not a skipped cycle. The seen row stays."""
+    miss_at = _T0
     miss = _stamped(_T0, fetched_at_ns=miss_at, first_seen_ns=miss_at, station="KNYC", kind="miss")
-    seen_at = miss_at + 20 * _MIN
+    seen_at = miss_at + 3 * 60 * _MIN
     lag = int(2.5 * 60 * _MIN)
-    second = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KSFO")
-    _write(tmp_path, "us-pfm-afos", [first, miss, second])
+    seen = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KSFO")
+    _write(tmp_path, "us-pfm-afos", [miss, seen])
     ev = c1.build_evidence(tmp_path)
     assert ev["censored_poll_gap"]["pfm"] == 0
-    assert sorted(ev["lag_samples_ns"]["pfm"]) == [10 * _MIN, lag]
+    assert ev["lag_samples_ns"]["pfm"] == [lag]
 
 
-def test_poll_gap_censors_every_station_written_in_the_recovery_firing(tmp_path: Path) -> None:
-    """Sibling stations 4 s apart share the firing's predecessor, not each other."""
-    previous_at = _T0
-    previous = _stamped(
-        _T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN, station="KNYC"
-    )
-    recovery_at = previous_at + 3 * 60 * _MIN
-    lag = int(2.5 * 60 * _MIN)
-    first = _stamped(
-        recovery_at - lag, fetched_at_ns=recovery_at, first_seen_ns=recovery_at, station="KLAX"
-    )
-    second_at = recovery_at + 4 * 10**9
-    second = _stamped(
-        second_at - lag, fetched_at_ns=second_at, first_seen_ns=second_at, station="KSFO"
-    )
-    _write(tmp_path, "us-pfm-afos", [previous, first, second])
+def test_hourly_lav_first_poll_seen_rows_with_no_miss_rows_are_not_censored(tmp_path: Path) -> None:
+    """Hourly lav first-poll ``seen`` rows, 60 min apart and with no miss rows, stay in."""
+    assert c1.MAX_POLL_GAP_NS["lav-iem"] == 55 * _MIN
+    step = 60 * _MIN
+    rows = [_avail(_T0 + i * step, _T0 + (i + 1) * step, station="KSFO") for i in range(3)]
+    assert all(row["kind"] == "seen" for row in rows)
+    assert not any(row["kind"] == "miss" for row in rows)
+    _write(tmp_path, "us-lav-iem-avail", rows)
     ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["lav-iem"] == 0
+    assert ev["censored"]["lav-iem"] == 0
+    assert ev["uncensored"]["lav-iem"] == 3
+    assert ev["lag_samples_ns"]["lav-iem"] == [step, step, step]
+
+
+def test_obs_seen_only_rows_fifty_seven_minutes_apart_are_not_censored(tmp_path: Path) -> None:
+    """Obs seen-only rows 57 min apart exceed the 55 min gap and are still kept."""
+    assert c1.MAX_POLL_GAP_NS["obs"] == 55 * _MIN
+    step = 57 * _MIN
+    rows = [_avail(_T0 + i * step, _T0 + i * step + 20 * _MIN) for i in range(3)]
+    _write(tmp_path, "us-obs-avail", rows)
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["obs"] == 0
+    assert ev["uncensored"]["obs"] == 3
+    assert ev["lag_samples_ns"]["obs"] == [20 * _MIN, 20 * _MIN, 20 * _MIN]
+
+
+def test_seen_row_following_a_skipped_row_within_the_gap_is_censored(tmp_path: Path) -> None:
+    """A skipped firing censors every station of the next firing inside one scheduled gap.
+
+    The window is ``[first_seen_ns - MAX_POLL_GAP_NS, first_seen_ns)``, so a skip exactly one
+    gap earlier is included.
+    """
+    gap = c1.MAX_POLL_GAP_NS["pfm"]
+    seen_at = _T0 + 2 * gap
+    lag = 10 * _MIN
+    edge = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KNYC")
+    _write(tmp_path, "us-pfm-afos", [_skipped(seen_at - gap), edge])
+    assert c1.build_evidence(tmp_path)["censored_poll_gap"]["pfm"] == 1
+
+    sibling_at = seen_at + 4 * 10**9
+    skip_at = seen_at - _MIN  # inside the gap for both stations, 4 s apart
+    rows = [
+        _skipped(skip_at),
+        _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KLAX"),
+        _stamped(
+            sibling_at - lag,
+            fetched_at_ns=sibling_at,
+            first_seen_ns=sibling_at,
+            station="KSFO",
+        ),
+    ]
+    _write(tmp_path / "siblings", "us-pfm-afos", rows)
+    ev = c1.build_evidence(tmp_path / "siblings")
     assert ev["censored_poll_gap"]["pfm"] == 2
     assert ev["censored"]["pfm"] == 0
-    assert ev["lag_samples_ns"]["pfm"] == [10 * _MIN]
-    assert lag not in ev["lag_samples_ns"]["pfm"]
+    assert ev["lag_samples_ns"]["pfm"] == []
+
+
+def test_seen_row_whose_skip_is_older_than_the_gap_is_not_censored(tmp_path: Path) -> None:
+    gap = c1.MAX_POLL_GAP_NS["pfm"]
+    seen_at = _T0 + 2 * gap
+    lag = 12 * _MIN
+    seen = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KNYC")
+    _write(tmp_path, "us-pfm-afos", [_skipped(seen_at - gap - 1), seen])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 0
+    assert ev["lag_samples_ns"]["pfm"] == [lag]
+
+
+def test_historical_skip_file_censors_the_same_way(tmp_path: Path) -> None:
+    """Journal key ``us-pfm-afos`` maps to pin ``pfm``. The window matches a ledger skip."""
+    gap = c1.MAX_POLL_GAP_NS["pfm"]
+    seen_at = _T0 + gap
+    lag = 8 * _MIN
+    seen = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KNYC")
+    _write(tmp_path, "us-pfm-afos", [seen])
+    hist = tmp_path / "skips.json"
+    hist.write_text(
+        json.dumps(
+            {
+                "schema": "c1_historical_skips/v1",
+                "derived_from": (
+                    "journalctl --user _SYSTEMD_USER_UNIT=us-source-collector@pfm.service"
+                ),
+                "skips": [{"source": "us-pfm-afos", "ts_ns": _T0}],
+            }
+        )
+    )
+    ev = c1.build_evidence(tmp_path, historical_skips=hist)
+    assert ev["censored_poll_gap"]["pfm"] == 1
+    assert ev["lag_samples_ns"]["pfm"] == []
+
+    older = tmp_path / "older.json"
+    older.write_text(
+        json.dumps(
+            {
+                "schema": "c1_historical_skips/v1",
+                "derived_from": (
+                    "journalctl --user _SYSTEMD_USER_UNIT=us-source-collector@pfm.service"
+                ),
+                "skips": [{"source": "us-pfm-afos", "ts_ns": seen_at - gap - 1}],
+            }
+        )
+    )
+    kept = c1.build_evidence(tmp_path, historical_skips=older)
+    assert kept["censored_poll_gap"]["pfm"] == 0
+    assert kept["lag_samples_ns"]["pfm"] == [lag]
 
 
 def test_first_ledger_row_has_no_predecessor_and_is_kept(tmp_path: Path) -> None:
