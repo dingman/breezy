@@ -21,13 +21,20 @@ from tests.support.entry_points import DEPLOY_SYSTEMD_DIR, SRC_DIR
 
 ROW: Final = "breezy-autonomy-alert-redeliver"
 #: AUT-6 rows and their exact bind sets (§3.1.1). Rows with ``host_proc`` are the named
-#: ``--unshare-pid`` exceptions; WP1 has none.
+#: ``--unshare-pid`` exceptions; the health row (WP3 S2) is the only one.
 CANARY_ROW: Final = "breezy-autonomy-canary"  # AUT-6 WP2
+HEALTH_ROW: Final = "breezy-autonomy-health"  # AUT-6 WP3 S2 (E7A_R2_PROC, network none)
 AUT6_ROWS: Final[dict[str, tuple[str, ...]]] = {
     ROW: ("evidence/alerts",),
     CANARY_ROW: ("evidence/alerts",),
+    HEALTH_ROW: (
+        "evidence/unit_health",
+        "derived/verdicts",
+        "evidence/alerts",
+        "cache/aut6_health_bus",
+    ),
 }
-AUT6_PROC_EXCEPTION_ROWS: Final[frozenset[str]] = frozenset()
+AUT6_PROC_EXCEPTION_ROWS: Final[frozenset[str]] = frozenset({HEALTH_ROW})
 ROOTS: Final = SandboxRoots(
     home=Path("/home/u"),
     data_root=Path("/home/u/.local/share/breezy"),
@@ -90,8 +97,13 @@ def test_aut6_bwrap_rows_exact_binds_and_unshare_pid_exceptions() -> None:
         assert row.binds == binds, name
         assert row.host_proc is (name in AUT6_PROC_EXCEPTION_ROWS), name
         argv = _argv(row)
-        assert ("--unshare-pid" in argv) is (name not in AUT6_PROC_EXCEPTION_ROWS), name
-        assert "--unshare-net" not in argv, "egress rows keep the host network"
+        # The shipped wrapper always unshares the pid namespace; a ``host_proc`` row (E7A_R2_PROC)
+        # differs by not mounting a fresh ``/proc``, so the read-only root's host procfs stays
+        # (V-6: a host pid's /proc/<pid>/status is readable in-row). Every other row gets both.
+        assert "--unshare-pid" in argv, name
+        assert ("--proc" in argv) is (name not in AUT6_PROC_EXCEPTION_ROWS), name
+        # egress rows keep the host network; a network-none row (health) unshares it
+        assert ("--unshare-net" in argv) is (row.network == "none"), name
         assert row.credential_names == () and row.credential_env == {}
 
 

@@ -36,8 +36,14 @@ _UNIT_RE = re.compile(r"^Unit=(.+)$")
 #: AUT-6 WP2's canary fires hourly at :45 plus 16:30Z and 17:10Z (plan r15 sections 3.7 and 3.10);
 #: its 17:10Z firing is the plan's, and shares that tick with the US-source collector's 17:10Z
 #: firing of a different service. Widened by exactly these two reviewed names.
+#: AUT-6 WP3 S2's health pass fires at minutes 1, 11, ..., 51 (`OnCalendar=*:01/10`, plan r15
+#: sections 3.9 and 3.10): one more reviewed name.
 _SLOT_PERIODIC_TIMERS = frozenset(
-    {"breezy-autonomy-alert-redeliver.timer", "breezy-autonomy-canary.timer"}
+    {
+        "breezy-autonomy-alert-redeliver.timer",
+        "breezy-autonomy-canary.timer",
+        "breezy-autonomy-health.timer",
+    }
 )
 
 

@@ -360,6 +360,50 @@ _CANARY_ROW: Final = BwrapRow(
 )
 
 
+#: AUT-6 WP3 S2 (plan r15 sections 3.1.1 and 3.9; E-7e(f)/(h), E-9): the unit health pass. No
+#: network and no credential (a page is enqueued to the outbox; ``redeliver`` delivers). It has NO
+#: in-row bus: its ``systemctl --user`` reads run unsandboxed in ``ExecStartPre`` and arrive through
+#: the bus snapshot in ``cache/aut6_health_bus``; an in-row ``systemctl`` is expected to fail
+#: (V-6). ``journalctl --user -o json`` is the one in-row read that works. ``host_proc`` is the
+#: named ``E7A_R2_PROC`` exception: the pass reads ``/proc/<pid>/status`` of the node and the
+#: supervisor for the section 3.9 resident-memory add-back, so the row has no ``--unshare-pid``.
+#: The pass makes no state-changing call. Unit properties are a fixed set: no ``Environment`` or
+#: ``Credential`` property can be named (B6-R3). ``show -- 'breezy-*'`` also lists timers and
+#: slices, so the consumer filters on ``Id`` ending ``.service``.
+_HEALTH_SHOW_PROPERTIES: Final = (
+    "Id,ActiveState,SubState,Result,InvocationID,NRestarts,ExecMainStatus,ExecMainCode,"
+    "ExecMainStartTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,MemoryCurrent,MemoryPeak,"
+    "MemorySwapPeak,MemoryHigh,MemoryMax,Type,Restart,TimeoutStartUSec,LastTriggerUSec,"
+    "NextElapseUSecRealtime,NextElapseUSecMonotonic,Unit,FragmentPath,DropInPaths"
+)
+_HEALTH_BUS_BIND: Final = "cache/aut6_health_bus"
+_HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
+    BusRead(
+        "units_show", (SYSTEMCTL, "--user", "show", "-p", _HEALTH_SHOW_PROPERTIES, "--", "breezy-*")
+    ),
+    BusRead(
+        "failed_list",
+        (SYSTEMCTL, "--user", "list-units", "--failed", "--all", "--plain", "--no-legend"),
+    ),
+    BusRead("timers_list", (SYSTEMCTL, "--user", "list-timers", "--all", "--plain", "--no-legend")),
+    BusRead("run_transient", RUN_TRANSIENT_SHOW_ARGV),
+)
+_AUTONOMY_HEALTH_ROW: Final = BwrapRow(
+    name="breezy-autonomy-health",
+    owner_plan="AUT-6",
+    units=frozenset({"breezy-autonomy-health.service"}),
+    binds=("evidence/unit_health", "derived/verdicts", "evidence/alerts", _HEALTH_BUS_BIND),
+    entry_modules=("breezy.runtime.autonomy_health_cli",),
+    resolves_dns=False,
+    network="none",
+    host_proc=True,
+    exceptions=frozenset({"E7A_R2_PROC"}),
+    bus_reads=_HEALTH_BUS_READS,
+    bus_snapshot_bind=_HEALTH_BUS_BIND,
+    bus_snapshot_budget_s=15,
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -417,6 +461,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             _LABEL_OUTCOMES_ROW,
             _ALERT_REDELIVER_ROW,
             _CANARY_ROW,
+            _AUTONOMY_HEALTH_ROW,
         )
     }
 )

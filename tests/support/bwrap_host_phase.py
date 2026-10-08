@@ -29,9 +29,10 @@ BWRAP_HOST_TEST_FILES: Final[frozenset[str]] = frozenset(
 #: 3 witness tests + the 24 namespace tests of WP-B2b-3 + the 2 bus-handoff tests of
 #: WP-B2c + the 4 WAL-snapshot tests of WP-B3 + the 1 production-interpreter test of B11 + the 2
 #: in-process studies-lock tests of AUT-1 WP5 stage 3 + the 2 AUT-6 WP1 row cases (EXDEV control
-#: and the redeliver row's self-probe) + the 1 AUT-6 WP2 canary row self-probe.
+#: and the redeliver row's self-probe) + the 1 AUT-6 WP2 canary row self-probe + the 2 AUT-6 WP3 S2
+#: health row cases (its self-probe and the V-6 systemd/journal/proc read test).
 #: Each WP that adds a real-namespace test widens this in the same commit (L-12).
-BWRAP_HOST_EXPECTED_TESTS: Final[int] = 39
+BWRAP_HOST_EXPECTED_TESTS: Final[int] = 41
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _BASE_REFUSED: Final[frozenset[str]] = frozenset({"nautilus_trader", "breezy.adapters"})

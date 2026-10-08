@@ -1,0 +1,17 @@
+# AUT-6 WP3 (plan r15 sections 3.9 and 3.10, R-e): slot-critical, so AccuracySec=1s and no
+# RandomizedDelaySec. Every 10 minutes at :01, :11, ... Never Persistent: a missed pass is
+# recovered by the next firing (the journal cursor catches up). The 16:31, 16:41, 16:51 and 17:01
+# passes are launch-path rows ending by slot + 146 s (E-9).
+# Enabled by the coordinator, not by the build.
+[Unit]
+Description=Every-10-minutes (:01) trigger for the Breezy AUT-6 unit health pass
+
+[Timer]
+Unit=breezy-autonomy-health.service
+OnCalendar=*:01/10
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -74,6 +74,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "breezy.runtime.clear_submit_intent_cli",
     "breezy.runtime.alert_redeliver_cli",
     "breezy.runtime.autonomy_canary_cli",
+    "breezy.runtime.autonomy_health_cli",
     "breezy.runtime.mark_no_side_position_captured_cli",
     "breezy.runtime.trade_supervisor",
     "breezy.runtime.check_alerts_cli",

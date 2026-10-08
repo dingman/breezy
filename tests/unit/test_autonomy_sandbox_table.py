@@ -89,6 +89,7 @@ def test_shipped_table_has_exactly_the_seam_b_stop_hook_and_capture_rows() -> No
         "breezy-label-outcomes",  # AUT-2 WP6 (E-15)
         "breezy-autonomy-alert-redeliver",  # AUT-6 WP1 (E-15)
         "breezy-autonomy-canary",  # AUT-6 WP2 (E-7a)
+        "breezy-autonomy-health",  # AUT-6 WP3 S2 (E-7e)
     }
     assert all(name == row.name for name, row in AUTONOMY_BWRAP_TABLE.items())
 

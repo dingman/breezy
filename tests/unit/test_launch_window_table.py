@@ -113,7 +113,8 @@ LAUNCH_PATH_TABLE: Final[tuple[LaunchPathRow, ...]] = (
         140,
     ),
     LaunchPathRow("dead_man", ("16:30", "17:00"), 10, 60, 70),
-    LaunchPathRow("aut6_health", ("16:31", "16:41", "16:51", "17:01"), 0, 120, 120),
+    # E-9 amends ARCH 5.2 aut6.health: pre lines 5 + 20, ExecStart 115, stop 5, accuracy 1 = 146 s.
+    LaunchPathRow("aut6_health", ("16:31", "16:41", "16:51", "17:01"), 0, 146, 146),
     LaunchPathRow("canary_scheduled", ("16:30", "16:45"), 0, 60, 60),
     LaunchPathRow("alert_redeliver", _every_five_minutes("16:30", "17:05"), 0, 60, 60),
     # E-6: the one-time L1 bootstrap, ending <= 16:41:15 (before the 16:42:30 intraday pass).
@@ -123,9 +124,14 @@ LAUNCH_PATH_TABLE: Final[tuple[LaunchPathRow, ...]] = (
 #: Deployed units that are launch-path rows. None at seam 4a; AUT-2, AUT-5 and AUT-6 add rows here
 #: and their unit files in the same change. Pinned by equality so a landing unit cannot be missed.
 #: AUT-6 WP1 adds the alert redeliver (table row ``alert_redeliver``, every five minutes); WP2 adds
-#: the canary (table row ``canary_scheduled``, 16:30 and 16:45).
+#: the canary (table row ``canary_scheduled``, 16:30 and 16:45); WP3 S2 adds the health pass
+#: (table row ``aut6_health``, ends by slot + 146 s).
 DEPLOYED_LAUNCH_PATH_UNITS: Final[frozenset[str]] = frozenset(
-    {"breezy-autonomy-alert-redeliver.service", "breezy-autonomy-canary.service"}
+    {
+        "breezy-autonomy-alert-redeliver.service",
+        "breezy-autonomy-canary.service",
+        "breezy-autonomy-health.service",
+    }
 )
 
 
@@ -276,8 +282,12 @@ class UnitSpec(NamedTuple):
     runtime_max_s: float
     timeout_stop_s: float
     flock_wait_s: int
+    #: Sum of each start-phase command's own bound (E-9, AA1): ``timeout -k K T`` counts
+    #: ``min(TimeoutStartSec, K + T)``, any other command counts ``TimeoutStartSec``.
+    command_bound_s: float = _UNBOUNDED
 
 
+_TIMEOUT_BINARIES: Final = frozenset({"/usr/bin/timeout", "timeout"})
 _FLOCK_WAIT_RE: Final = re.compile(r"\bflock\b[^\n]*?\s-w\s+(\d+)")
 
 
@@ -289,6 +299,27 @@ def _flock_wait_s(service_text: str, directory: Path) -> int:
             if candidate.suffix == ".sh" and (directory / candidate.name).is_file():
                 texts.append((directory / candidate.name).read_text(encoding="utf-8"))
     return max((int(m.group(1)) for t in texts for m in _FLOCK_WAIT_RE.finditer(t)), default=0)
+
+
+def command_bound_s(line: str, timeout_start_s: float) -> float:
+    """One start-phase command's own bound (E-9, AA1).
+
+    ``TimeoutStartSec`` re-arms for every command, so a command is bounded by it. A command
+    wrapped in ``timeout -k K T`` (plain integers) is bounded by ``K + T`` if that is smaller. A
+    oneshot with no ``TimeoutStartSec`` stays unbounded: the unit file does not bound it.
+    """
+    if timeout_start_s == _UNBOUNDED:
+        return _UNBOUNDED
+    tokens = line.lstrip("-@+!:").split()
+    if (
+        len(tokens) >= 4
+        and tokens[0] in _TIMEOUT_BINARIES
+        and tokens[1] == "-k"
+        and tokens[2].isdigit()
+        and tokens[3].isdigit()
+    ):
+        return min(timeout_start_s, float(int(tokens[2]) + int(tokens[3])))
+    return timeout_start_s
 
 
 def parse_service(name: str, text: str, directory: Path) -> UnitSpec:
@@ -310,9 +341,17 @@ def parse_service(name: str, text: str, directory: Path) -> UnitSpec:
         if "TimeoutStopSec" in found
         else float(_DEFAULT_TIMEOUT_STOP_S)
     )
+    lines = [
+        line
+        for key in ("ExecStartPre", "ExecStart", "ExecStartPost")
+        for line in found.get(key, [])
+    ]
+    command_bound = (
+        sum(command_bound_s(line, timeout_start) for line in lines) if lines else timeout_start
+    )
     return UnitSpec(
         name, service_type, max(commands, 1), timeout_start, runtime_max, timeout_stop,
-        _flock_wait_s(text, directory),
+        _flock_wait_s(text, directory), command_bound,
     )  # fmt: skip
 
 
@@ -349,7 +388,7 @@ def firings(directory: Path) -> list[Firing]:
             if "RandomizedDelaySec" in timer_directives
             else 0.0
         )
-        bound = spec.timeout_start_s * spec.start_commands + spec.runtime_max_s
+        bound = spec.command_bound_s + spec.runtime_max_s
         for expression in timer_directives.get("OnCalendar", []):
             for slot in parse_on_calendar(expression):
                 end = slot + accuracy + delay + spec.flock_wait_s + bound + spec.timeout_stop_s

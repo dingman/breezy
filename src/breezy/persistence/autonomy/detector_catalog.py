@@ -56,6 +56,17 @@ AUT6_SELF_PROBE_PATHS: Final[MappingProxyType[str, SelfProbe]] = MappingProxyTyp
             negative=("state", "registry", "evidence"),
             positive=("evidence/alerts/.bwrap_probe",),
         ),
+        # AUT-6 WP3 S2: the health row binds four directories; the parents of the three unbound
+        # ones (evidence/, derived/, cache/) must refuse as well.
+        "breezy-autonomy-health": SelfProbe(
+            negative=("state", "registry", "evidence", "derived", "cache"),
+            positive=(
+                "evidence/unit_health/.bwrap_probe",
+                "derived/verdicts/.bwrap_probe",
+                "evidence/alerts/.bwrap_probe",
+                "cache/aut6_health_bus/.bwrap_probe",
+            ),
+        ),
     }
 )
 
@@ -71,7 +82,12 @@ AUT6_WRITE_AUTHORITY: Final[MappingProxyType[str, AuthorityRow]] = MappingProxyT
             ("derived/verdicts/**", _ALERTS, "cache/aut6_daily_exec_snapshot/")
         ),
         "breezy-autonomy-health": AuthorityRow(
-            ("evidence/unit_health/**", "derived/verdicts/**", _ALERTS)
+            (
+                "evidence/unit_health/**",
+                "derived/verdicts/**",
+                _ALERTS,
+                "cache/aut6_health_bus/",  # E-7e(h): the consumed bus snapshot is unlinked
+            )
         ),
         "breezy-autonomy-alert-redeliver": AuthorityRow((_ALERTS,)),
         "breezy-autonomy-canary": AuthorityRow((_ALERTS,)),
