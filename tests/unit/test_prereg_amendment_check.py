@@ -902,16 +902,26 @@ def test_floor_provenance_requires_mc_module_and_core_module(tmp_path: Path) -> 
 
 
 def test_draft_accepts_pending_floor_provenance() -> None:
+    # The real A1 now carries filled provenance; the pending shape is a fixture.
     body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
-    assert body["provenance"]["mc_evidence_sha256"] == "PENDING_MC"
-    assert body["provenance"]["mc_seed"] == "PENDING_COORDINATOR"
-    assert _provenance_defects(body["provenance"], draft=True) == []
-    refused = _provenance_defects(body["provenance"], draft=False)
+    pending = {
+        **body["provenance"],
+        "mc_evidence": "PENDING_MC",
+        "mc_evidence_sha256": "PENDING_MC",
+        "mc_seed": "PENDING_COORDINATOR",
+    }
+    assert _provenance_defects(pending, draft=True) == []
+    refused = _provenance_defects(pending, draft=False)
     assert refused
     assert {d.code for d in refused} == {"BAD_FLOOR_PROVENANCE"}
-    if _is_shallow_repository():
-        pytest.skip(_SHALLOW_SKIP)
-    chk = _chk()
-    assert chk.validate_amendment(_A1_FILE, draft=True) == []
-    frozen = chk.validate_amendment(_A1_FILE, draft=False)
-    assert any(d.code == "BAD_FLOOR_PROVENANCE" for d in frozen)
+
+
+def test_a1_filled_provenance_binds_the_e2_evidence() -> None:
+    body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
+    provenance = body["provenance"]
+    assert provenance["mc_seed"] == 20261008
+    assert provenance["mc_evidence"] == "docs/evidence/f5/fq_loss_floor_mc_seed20261008.json"
+    assert _provenance_defects(provenance, draft=False) == []
+    floor = body["loss_stop_floor"]
+    assert floor["floor_mode"] == "unreachable_veto"
+    assert floor["power_class"] == "none"

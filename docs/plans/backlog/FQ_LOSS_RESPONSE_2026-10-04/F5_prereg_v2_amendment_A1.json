@@ -6,32 +6,32 @@
     "frozen_sha": "072ab026cdc790dd6e9a51d62d8164766b85fd82"
   },
   "loss_stop_floor": {
-    "floor_mode": "PENDING_GATE (sqrt_boundary | unreachable_veto)",
-    "power_class": "PENDING_GATE (edge_capable | gross_loss_tripwire | none)",
-    "alpha_floor": "PENDING_GATE (0.10 | 0.20 | 0.30)",
+    "floor_mode": "unreachable_veto",
+    "power_class": "none",
+    "alpha_floor": 0.1,
     "alpha_selection_rule": "§4.6 of F5-pin-request_r3: 0.10 if G1 passes; else smallest of {0.20,0.30} with G1 margin t_cross <= floor(0.8*T_low(e)); else unreachable_veto; never escalate on G3",
     "g3_floor_multiplier": 2.5,
-    "gate_rate_rule": "calibration at max(pool, take_rate_lower); G1/G3 at min(pool, take_rate_lower); takes->ticks via pool takes-per-station-day",
+    "gate_rate_rule": "r3 §4.5 D5 as amended by errata E-2: calibration rate_cal = take_rate_lower when pool > take_rate_lower, else max(pool, take_rate_lower); G1/G3 at min(pool, take_rate_lower); max(pool, take_rate_lower) calibration reported as a non-binding sensitivity row; takes->ticks via pool takes-per-station-day",
     "t_unit": "settled_station_day",
     "pnl_unit": "per_contract_qty1",
     "qty_rule": "one StratumRow per unpaired (rung, side): entry_ask=ledger BE-bar, fee=0, qty=1 (§4.3)",
     "netting_rule": "paired rung = one unit, delta_net = 1 - BEbar_y - BEbar_n, zero variance, enters x_d; zero-sigma days carry to next tick (§4.1 steps 2, 8)",
     "exit_rule": "h_eff=(1-f)h+f*v, variance unexited; calibration margin = binding row S4",
     "increment_rule": "§4.1 steps 1-9 of F5-pin-request_r3",
-    "bundle_null_rule": "categorical_yes_first_shrink_v1",
+    "bundle_null_rule": "categorical_yes_first_shrink_v1 with errata E-1 residual outside mass m0 = prod(1-q) on all-YES overround days",
     "boundary_rule": "FAIL iff S_t < -c*sqrt(t) for some t in [t_min, t_at_horizon]",
-    "c": "PENDING_MC",
-    "c_mc_se": "PENDING_MC",
-    "c_binding_cell": "PENDING_MC",
-    "t_min": "PENDING_MC",
+    "c": null,
+    "c_mc_se": null,
+    "c_binding_cell": null,
+    "t_min": null,
     "measured_power": {
-      "-0.16": "PENDING_MC",
-      "-0.08": "PENDING_MC",
-      "-0.04": "PENDING_MC"
+      "-0.16": 0.2104,
+      "-0.08": 0.0863,
+      "-0.04": 0.0514
     },
-    "s6_feasible_rate": "PENDING_MC",
+    "s6_feasible_rate": null,
     "t_horizon_climate_day": "2027-01-25",
-    "reach_cutoff_epoch_start": "PENDING_MC",
+    "reach_cutoff_epoch_start": null,
     "past_horizon_rule": "fail_closed_no_pass; recalibration owner coordinator",
     "epoch_anchor_rule": "latest autonomy TransitionRow for the FQ v2 family_id entering CHAMPION from a non-sender state with a non-empty policy_ruling_id; armed_at = ts_ns; refuse if absent",
     "epoch_id_rule": "epoch_id = anchor transition_id; carried in latest.json and in the truth_sha preimage",
@@ -49,8 +49,17 @@
   "provenance": {
     "mc_module": "scripts/analysis/fq_loss_floor_mc.py",
     "core_module": "src/breezy/analysis/fq_loss_stop_core.py",
-    "mc_evidence": "PENDING_MC",
-    "mc_evidence_sha256": "PENDING_MC",
-    "mc_seed": "PENDING_COORDINATOR"
+    "mc_evidence": "docs/evidence/f5/fq_loss_floor_mc_seed20261008.json",
+    "mc_evidence_sha256": "61ddfad83fec15b1c14b46928c958517c3a08bb32e3bf4b1a5dcb4eacfb9ff36",
+    "mc_seed": 20261008,
+    "mc_git_head": "eedbb99d594dafb9aead1adf5a4288f3698de3dc",
+    "script_git_sha_kind": "git blob hash of scripts/analysis/fq_loss_floor_mc.py (not a commit)",
+    "outcome_note": "unreachable_veto: G1 passes at alpha 0.10 in every cell (no escalation); veto_cause g3_floor, failing mix M-yes G3(-0.16)=0.2104 < 2.5*0.10. Margin-limited (0.04 below the floor) but robust in direction: M-yes also fails at alpha 0.20 (0.413 < 0.50) and 0.30 (0.586 < 0.75). measured_power = min over mixes at alpha 0.10, freeze epoch. alpha_floor records the ladder start (alpha_star 0.10). Diagnostics only, not pins: c 2.05, t_min 5, s6 0.09.",
+    "e1_exercise_note": "At the binding 0.25/day thinning (~124 legs) overround_share is 0.0, so the E-1 overround shrink is essentially not exercised in this run; run 1 at lambda_pool showed 15.6% overround.",
+    "errata": [
+      "F5-pin-request_r3-errata-E1.md",
+      "F5-pin-request_r3-errata-E2.md"
+    ],
+    "peer_review": "prediction-market-reviewer FREEZE-OK 2026-10-08 (MEDIUM margin caveat recorded above)"
   }
 }
