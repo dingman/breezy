@@ -20,9 +20,11 @@ MemoryMax=128M
 TimeoutStartSec=55
 TimeoutStopSec=5
 EnvironmentFile=-%h/.config/breezy/alerts.env
-# Configuration, not a control (E-7): this host does not enforce user-unit mount sandboxing. The
-# bwrap row is the control.
-ReadWritePaths=%h/.local/share/breezy/evidence/alerts
+# No mount-namespace directives here (ReadWritePaths, ProtectHome, PrivateTmp, ...): systemd would
+# build a private mount namespace in which /usr/bin/bwrap cannot create its user namespace on this
+# host (AppArmor userns restriction): "bwrap: No permissions to create a new namespace", exit 1.
+# The bwrap row (binds evidence/alerts) is the control; user-unit sandboxing is not enforced (E-7).
+# Pinned by test_bwrap_wrapped_unit_config_has_no_mount_namespace_directive.
 ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/evidence/alerts
 ExecStart=/usr/bin/timeout -k 4 46 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-alert-redeliver /home/jon/breezy/.venv/bin/python3 -I -m breezy.runtime.alert_redeliver_cli
 StandardOutput=journal
