@@ -1,7 +1,8 @@
 """KILL power at non-positive edges. Reporting only: this changes no constant.
 
 Spec: docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F5-pin-request_r2.md §3.4.
-The r2-verification corrections add a δ = 0 harness row (p_kill ≈ 0), the realised
+The r2-verification corrections add a δ = 0 anchor row (its p_kill by
+n_max is a design property of the x_max clip, not ≈ 0), the realised
 clipped mean of Y, and the BE/ask source and take rate.
 
 The Monte Carlo alternative ``min(1, BE + δ)`` (``fq_mc_eprocess.outcome_probability``)
@@ -470,7 +471,10 @@ def build_document(
             "mc_module": "scripts/analysis/fq_mc_eprocess.py",
             "engine": "kill_first_n",
             "outcome": "Bernoulli(clamp(BE + delta, 0, 1))",
-            "delta_zero_role": "harness row; same stream as the MC null and p_kill ≈ 0",
+            "delta_zero_role": (
+                "anchor row; BE-fair outcomes have a negative clipped mean"
+                " (x_max clip), so p_kill by n_max is not ≈ 0 (design property)"
+            ),
             "edges_in_frozen_a0": [-0.04, -0.08, -0.16],
             "seed": seed,
             "role": "reporting_only_changes_no_constant",

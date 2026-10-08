@@ -107,7 +107,7 @@
     "mc_module": "scripts/analysis/fq_mc_eprocess.py",
     "engine": "kill_first_n",
     "outcome": "Bernoulli(clamp(BE + delta, 0, 1))",
-    "delta_zero_role": "harness row; same stream as the MC null and p_kill \u2248 0",
+    "delta_zero_role": "anchor row; BE-fair outcomes have a negative clipped mean (x_max clip), so p_kill by n_max is not \u2248 0 (design property)",
     "edges_in_frozen_a0": [
       -0.04,
       -0.08,
@@ -117,8 +117,8 @@
     "role": "reporting_only_changes_no_constant",
     "anchor": "docs/evidence/f5/fq_resume_n_mc_seed20261006.json clipped_mean_y -0.019 p_kill_under_null_stream 0.0025"
   },
-  "runtime_seconds": 37.673,
-  "peak_rss_mib": 1319.9,
+  "runtime_seconds": 36.309,
+  "peak_rss_mib": 1319.7,
   "chunk": 250,
   "horizon_days": 9000
 }
