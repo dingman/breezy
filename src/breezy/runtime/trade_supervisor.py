@@ -131,6 +131,7 @@ from breezy.runtime.trade_supervisor_core import (
     is_deferral,
     latch_log_facts,
     latch_midday_log_facts,
+    latest_liveness_line_ns,
     launch_time_ns,
     mark_phase_fired,
     midday_boot_retry_dispatch_due,
@@ -159,6 +160,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_boot_zero_instruments_seen,
     record_child_adopted,
     record_first_boot_permit_seen,
+    record_liveness_line_seen,
     record_midday_alert_sent,
     record_midday_cause_seen,
     record_midday_ceiling_unknown_alert_sent,
@@ -1374,6 +1376,10 @@ def _do_relaunch_check(
     # well before 17:00Z, so no later handler's read can be first to see it.
     if zero_instruments_refusal_in(log_text):
         state = record_boot_zero_instruments_seen(state, now)
+    # [SUP-RESTART-ANYTIME] Same drain-safe parity as every latch above.
+    liveness_ns = latest_liveness_line_ns(log_text, now_ns=int(now.timestamp() * 1e9))
+    if liveness_ns is not None:
+        state = record_liveness_line_seen(state, now, liveness_ns)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),

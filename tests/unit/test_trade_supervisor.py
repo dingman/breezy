@@ -5971,6 +5971,137 @@ class TestGapHandlersLatchEveryLogFact:
         assert capability is PermitCapability.NOT_REQUIRED
 
 
+_LATCH_PARITY_FIELDS = (
+    "strategy_subscribed_seen",
+    "permit_issued_seen_expires_at_ns",
+    "first_boot_permit_expires_at_ns",
+    "midday_cause_seen",
+    "orders_not_requested_seen",
+    "boot_zero_instruments_seen",
+    "liveness_line_last_ns",
+)
+
+
+def _every_latched_log_fact_text(now: dt.datetime) -> str:
+    """ONE log delta carrying every fact `latch_log_facts` latches."""
+    from breezy.runtime.trade_supervisor_core import (
+        LIVENESS_POSITIVE_MARKER,
+        STRATEGY_SUBSCRIBED_MARKER,
+    )
+
+    stamp = (now - dt.timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
+    return (
+        f"{stamp} [INFO] {STRATEGY_SUBSCRIBED_MARKER}\n"
+        + _CHILD2_PERMIT_ISSUED_LINE
+        + PERMIT_NOT_REQUESTED_MARKER
+        + "\n"
+        + _TRADING_NODE_FAILED_LINE
+        + f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} 2026-09-27 (SFO=0){ZERO_INSTRUMENTS_REFUSAL_SUFFIX}\n"
+        + f"{stamp} [INFO] X: {LIVENESS_POSITIVE_MARKER}{{'k': 1}}\n"
+    )
+
+
+def _latch_snapshot(state: DaySchedulerState) -> dict[str, Any]:
+    return {name: getattr(state, name) for name in _LATCH_PARITY_FIELDS}
+
+
+class TestEveryLogDrainingHandlerLatchesWhatLatchLogFactsLatches:
+    """Parity guard: every handler that drains the shared, offset-advancing
+    `IncrementalLogReader` must latch inline the same facts as
+    `latch_log_facts` would from the identical text, because the drained
+    delta is never seen again (FU-1/FU-17 class of gap)."""
+
+    @staticmethod
+    def _reference(now: dt.datetime, text: str) -> dict[str, Any]:
+        from breezy.runtime.trade_supervisor_core import latch_log_facts
+
+        ref = _latch_snapshot(latch_log_facts(initial_scheduler_state(_DAY), now, text))
+        # Guard against a vacuous comparison: every field must be populated.
+        assert all(v not in (None, False) for v in ref.values()), ref
+        return ref
+
+    def _ports(self, tmp_path: Path, text: str) -> tuple[Path, SupervisorPorts]:
+        node_log = tmp_path / "node.log"
+        node_log.write_text(text)
+        reader = IncrementalLogReader()
+        return node_log, _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+
+    def test_relaunch_check_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(16, 55)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _p, _l, state = _do_relaunch_check(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=now,
+            tracked_pid=1001,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_midday_watch_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(20, 0)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _p, _l, state = _do_midday_watch(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=now,
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_self_check_matches_latch_log_facts(self, tmp_path: Path) -> None:
+        now = _utc(17, 5)
+        text = _every_latched_log_fact_text(now)
+        node_log, ports = self._ports(tmp_path, text)
+        _a, _b, state = _do_self_check(
+            ports=ports,
+            now=now,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=1001,
+            node_log=node_log,
+            state=initial_scheduler_state(_DAY),
+        )
+        assert state is not None
+        assert _latch_snapshot(state) == self._reference(now, text)
+
+    def test_boot_retry_poll_latches_its_declared_subset(self) -> None:
+        """`_poll_boot_retry_child` latches strategy-subscribed and zero-
+        instruments (read facts), then cause + not-requested marker (no-permit
+        facts). The permit itself is latched by `_boot_retry_hand_off_to_midday`
+        (not here), and liveness is deliberately NOT latched: boot-retry only
+        runs for a child that has not yet reached ready-adoption."""
+        from breezy.runtime.trade_supervisor import (
+            _latch_boot_retry_no_permit_facts,
+            _latch_boot_retry_read_facts,
+        )
+
+        now = _utc(16, 55)
+        text = _every_latched_log_fact_text(now)
+        state = initial_scheduler_state(_DAY)
+        state, _expiry = _latch_boot_retry_read_facts(state, now, text)
+        state, _cause = _latch_boot_retry_no_permit_facts(state, now, text)
+        reference = self._reference(now, text)
+        subset = (
+            "strategy_subscribed_seen",
+            "midday_cause_seen",
+            "orders_not_requested_seen",
+            "boot_zero_instruments_seen",
+        )
+        assert {k: v for k, v in _latch_snapshot(state).items() if k in subset} == {
+            k: reference[k] for k in subset
+        }
+        assert state.liveness_line_last_ns is None
+
+
 # ===========================================================================
 # [2026-09-15] Plan §4 step 7: `_run_forever`'s dispatch must route
 # `Phase.MIDDAY_WATCH` into `_do_midday_watch`, never fall through the bare

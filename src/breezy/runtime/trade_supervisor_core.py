@@ -1990,6 +1990,9 @@ def derive_self_check_facts(
         state = record_orders_not_requested_seen(state, now)
     if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
         state = record_boot_zero_instruments_seen(state, now)
+    liveness_ns = latest_liveness_line_ns(log_text, now_ns=now_ns)
+    if liveness_ns is not None:
+        state = record_liveness_line_seen(state, now, liveness_ns)
     latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
     permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
     if latched_permit_expiry_ns is not None:
@@ -2152,6 +2155,11 @@ def latch_midday_log_facts(
         state = record_midday_cause_seen(state, now, live_cause)
     if PERMIT_NOT_REQUESTED_MARKER in log_text:
         state = record_orders_not_requested_seen(state, now)
+    if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
+        state = record_boot_zero_instruments_seen(state, now)
+    liveness_ns = latest_liveness_line_ns(log_text, now_ns=int(now.timestamp() * 1e9))
+    if liveness_ns is not None:
+        state = record_liveness_line_seen(state, now, liveness_ns)
     return state, live_cause
 
 

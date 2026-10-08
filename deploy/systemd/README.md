@@ -1389,7 +1389,12 @@ What a restart inside [17:10Z, 01:00Z) shows in the supervisor journal:
   `ready_adoption_terminal verdict=not_required pid=<node pid>` (once per
   child, in the same poll as or after the B1 line). Nothing else: no
   `restart_adopted_ready_node`, no `ready_adoption_deferred`, no MIDDAY_WATCH
-  dispatch, no spawn or signal.
+  dispatch, no spawn or signal. On such an orders-off node the 17:05Z
+  self-check still reports `FAIL_SHADOW_MODE_NO_PERMIT`
+  (`derive_self_check_facts` ignores `orders_not_requested_seen`) and pages
+  CRITICAL `TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED`; this is expected while
+  orders are deliberately off and is tracked as backlog item
+  SELF-CHECK-ORDERS-OFF (self-check semantics are unchanged).
 - Armed, healthy FQ node: `permit_watch_adopted_live_node`, then
   `restart_adopted_ready_node pid=... liveness_age_s=...` within two polls,
   then a MIDDAY_WATCH dispatch (the deferred acceptance proof).
