@@ -630,7 +630,7 @@ def test_critical_alerts_use_delivery_proof(
 def test_detector_and_failure_mode_alerts_use_delivery_proof() -> None:
     import breezy.persistence.autonomy.detector_catalog as catalog
 
-    assert not hasattr(catalog, "CATALOG")
+    assert hasattr(catalog, "CATALOG")  # WP5 lands the catalogue (WP1 pinned its absence)
     critical = {
         event for event, severity in CAPTURE_ALERT_SEVERITIES.items() if severity == "CRITICAL"
     }
