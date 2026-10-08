@@ -63,3 +63,47 @@ Both reviewers verified r2. The architect marked every one of M1–M11 FIXED. Th
   2. Anchor: (a), the ledger row; refuse if absent.
   3. If G1 fails at 0.10: the smallest α in {0.20, 0.30} with margin; otherwise `unreachable_veto`.
   4. Tripwire freeze: yes, subject to the G3 floor.
+
+## r3 verification (2026-10-08, prediction-market-reviewer)
+
+**Verdict: SOUND-WITH-CAVEATS.** Phase 2 steps 2–4 (the core, checker R5 for A1, and the floor MC script) are **READY TO BUILD**. D6 is PARTIAL; its defects (n2–n4, n6) bind F6b (step 9), not steps 2–4.
+
+**Build conditions (binding on steps 2–4):**
+- **n1.** `_exit_record` returns TOTAL proceeds (`reconcile.py:681-694`). The core divides by the sold quantity to get the per-contract v. `InvalidExitFill` maps to a refusal.
+- **n5.** H1 δ = −0.16 is infeasible for a leg with BE < 0.16. Clamp p ≥ 0 and report the share of clamped legs.
+- **n8.** R5 for A1 must also enforce:
+  - `power_class` consistent with `measured_power` (edge_capable ⇒ ≥ 0.8);
+  - `s6_feasible_rate ≤ alpha_floor + 3·c_mc_se`, with `c_mc_se` finite and > 0;
+  - Decimal comparisons;
+  - `_check_payload` receives the draft flag, so that `--draft` accepts PENDING_* only in draft mode.
+- **n9.** A named epsilon `SIGMA_EPS` defines "zero-σ". Refuse if a σ² of −ε or below appears (a numerical defect). Guard 0 < BE̅ < 1 before building a row.
+- **§10 rulings:**
+  1. `κ_exit = max(pool median half-spread, 0.02)`; p_exit 0.10 and ρ_bind 0.25 are accepted.
+  2. The G1 margin ⌊0.8·T_low⌋ is accepted.
+  3. The Wilson rule requires n ≥ 74 windows, or A2 is "indeterminate" and stops. Use a cluster-aware interval.
+  4. The zero-σ carry is accepted. The MC carries the carry and reports max|carry/σ_next|.
+
+**F6b-binding (step 9):**
+- **n2.** The latch is keyed by an `epoch_id` read from the registry, which is circular. Persist a `current_epoch` pointer, or treat any latch as FAIL while the registry is unreadable.
+- **n3.** The `from_state ∉ senders` rule excludes RESUME (HALTED→CHAMPION). A RESUME with a ruling after a latch must start a new epoch. Filter on `venue` and verify the `transition_hash` chain.
+- **n4.** `epoch_id` in `truth_sha` is audit-only at runtime, because the probe never recomputes `truth_sha`. Say so.
+- **n6.** Dedupe refusal records. Treat EEXIST on the latch as already latched. Create subdirectories with mode 0700.
+
+The analysis also expects A1 to land as `unreachable_veto`: an all-lose YES longshot gives Z ≈ −0.33/tick, so it needs about 53 ticks to cross, against about 27 available.
+
+## M10 result and ruling (2026-10-08)
+
+Evidence: `docs/evidence/f5/fq_kill_power_negative_edge_seed20261008.json` (seed 20261008, 2000 replicates, n_max 2000, about 24 takes by 2027-01-25). The script was domain-reviewed and is CORRECT.
+
+| δ | p_kill by kill date | p_kill by n_max | median n | clipped mean Y |
+|---|---|---|---|---|
+| 0 | 0 | 0.29 | — | −0.0065 |
+| −0.04 | 0 | 0.9995 | 539 | −0.018 |
+| −0.08 | 0 | 1.0 | 286 | −0.029 |
+| −0.16 | 0 | 1.0 | 160 | −0.050 |
+
+**Rulings:**
+- **KILL cannot protect capital before 2027-01-25.** About 24 takes are available, and the first look is at 20. Even at δ = −0.16, the median kill needs about 160 takes (≈ 640 days). No pre-January decision may cite KILL as loss protection.
+- **Pre-January loss control.** The only pre-January loss controls are the F6 floor (expected `unreachable_veto`) and the two operator caps. Every arming record must therefore state the worst-case loss as the daily budget × the days armed. The value is the operator's; the statement of it is mandatory.
+- **The δ = 0 result of 0.29 is a design property.** It is not a defect. The x_max = 4 clip binds when BE < 0.2, so BE-fair outcomes have a negative clipped mean, and the F7B-R22 premise E[Y_clipped] ≥ 0 does not hold. The frozen KILL will eventually kill a family that is exactly break-even at low BE. That is a late, conservative failure, not a safety failure.
+- **The r2-verification prediction was wrong.** It said "δ = 0 reproduces p_kill ≈ 0". The script's docstrings that repeat it are corrected in the M10 merge.
