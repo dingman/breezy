@@ -4333,7 +4333,7 @@ class TestSupervisorLoggingConfiguration:
         assert len(file_handlers) == 1
         assert Path(file_handlers[0].baseFilename) == supervisor_log_path(tmp_path / "logs-b")
 
-    def test_configure_supervisor_logging_pins_httpx_logger_to_warning(self, tmp_path):
+    def test_configure_supervisor_logging_pins_httpx_logger_to_warning(self, tmp_path: Path) -> None:
         """httpx logs request URLs at INFO; webhook URLs are secrets, so the
         library logger must stay silent even if a root handler appears."""
         httpx_logger = logging.getLogger("httpx")
@@ -5855,7 +5855,7 @@ class TestGapHandlersLatchEveryLogFact:
         )
         assert capability is PermitCapability.NOT_REQUIRED
 
-    def test_relaunch_check_latches_the_not_requested_marker_from_its_own_read(self, tmp_path):
+    def test_relaunch_check_latches_the_not_requested_marker_from_its_own_read(self, tmp_path: Path) -> None:
         """Live evidence 2026-10-08: an orders-off node prints the marker on
         log line 2; the RELAUNCH_CHECK poll drains it first. If that handler
         does not latch it, every later B1 poll reports a false ABSENT."""
