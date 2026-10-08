@@ -204,7 +204,15 @@ if [ "$resolve_rc" -eq 2 ]; then
   # AUT-6 WP3 S1: a by-design skip says WHY in a closed-vocabulary marker so
   # portfolio-roi-run.sh reports NO_INPUT (exit 0) instead of failing on a
   # missing success marker. The success marker itself is NOT written.
-  printf 'reason=composition_kind_has_no_scorer\n' > "$SKIP_MARKER"
+  # Atomic (tmp then mv -T) and CHECKED: a marker that cannot land is a real
+  # failure, never an exit 0 that leaves the downstream wrapper guessing.
+  SKIP_TMP="$SKIP_MARKER.tmp.$$"
+  if ! { printf 'reason=composition_kind_has_no_scorer\n' > "$SKIP_TMP" \
+         && mv -T "$SKIP_TMP" "$SKIP_MARKER"; } 2>>"$LOG"; then
+    rm -f "$SKIP_TMP"
+    say "SCORE LIVE TRIALS FAILED -- cannot write the skip marker $SKIP_MARKER"
+    exit 1
+  fi
   exit 0
 fi
 if [ "$resolve_rc" -ne 0 ]; then

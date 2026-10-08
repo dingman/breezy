@@ -21,6 +21,7 @@ them to tell an expected skip from a failure:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,46 @@ _BENIGN_SKIP = re.compile(
     r"SKIPPED -- another study holds|SKIPPED-LOCK|composition_kind=|NO_INPUT -- upstream skipped"
 )
 _LOOKAHEAD = 3
+_RETURN = re.compile(r"\breturn\s+(\d+)\b")
+
+
+@dataclass(frozen=True)
+class _CarveOut:
+    """A benign skip whose ``say`` is NOT followed by an ``exit`` and so cannot
+    be read off the lines around it. Each entry names the documented path that
+    turns it into exit 0; the rule verifies both the shape after the say and
+    that the caller/tail path is really present in the file."""
+
+    wrapper: str
+    message: re.Pattern[str]
+    ret: int | None  # `return N` the next statement must be; None = fall through
+    path: re.Pattern[str]  # must match the wrapper text: the path that exits 0
+    reason: str
+
+
+_CARVE_OUTS: tuple[_CarveOut, ...] = (
+    _CarveOut(
+        "replay-daily-run.sh",
+        re.compile(r"composition_kind=forecast_quantile_ladder"),
+        3,
+        re.compile(r'"\$resolve_rc" -eq 3 \]; then\s*\n\s*(?:[^\n]*\n\s*)*?exit 0'),
+        "resolve_family_manifest returns 3; the caller maps rc 3 to exit 0",
+    ),
+    _CarveOut(
+        "score-live-trials-run.sh",
+        re.compile(r"composition_kind=forecast_quantile_ladder"),
+        2,
+        re.compile(r'"\$resolve_rc" -eq 2 \]; then\s*\n(?:[^\n]*\n)*?\s*exit 0'),
+        "resolve_sending_family_manifest returns 2; caller writes .skipped, exits 0",
+    ),
+    _CarveOut(
+        "asos-refresh-run.sh",
+        re.compile(r"SKIPPED-LOCK"),
+        None,
+        re.compile(r"^exit \$\(\( FAILED \? 1 : 0 \)\)\s*$", re.MULTILINE),
+        "contention does not exit early; the tail exits 0 unless a fetch step FAILED",
+    ),
+)
 
 
 def _statements(text: str) -> list[tuple[int, str]]:
@@ -60,12 +101,36 @@ def _first_exit_after(lines: list[tuple[int, str]], index: int) -> int | None:
     return None
 
 
+def _carve_out_problem(
+    name: str, text: str, lines: list[tuple[int, str]], index: int, message: str
+) -> str | None:
+    """None when a benign skip with no ``exit`` is an allowlisted, verified
+    carve-out; otherwise why it is not."""
+    entry = next((c for c in _CARVE_OUTS if c.wrapper == name and c.message.search(message)), None)
+    if entry is None:
+        return "benign skip has no exit and no documented carve-out"
+    following = lines[index + 1][1] if index + 1 < len(lines) else ""
+    returned = _RETURN.search(lines[index][1]) or _RETURN.search(following)
+    if entry.ret is None:
+        if returned:
+            return f"carve-out expects fall-through but found return {returned.group(1)}"
+    elif not returned or int(returned.group(1)) != entry.ret:
+        return f"carve-out expects `return {entry.ret}` right after the say"
+    if not entry.path.search(text):
+        return f"carve-out path to exit 0 not found ({entry.reason})"
+    return None
+
+
 def _offenders(name: str, text: str) -> list[str]:
     lines = _statements(text)
     offenders: list[str] = []
     for index, (number, line) in enumerate(lines):
         for message in _SAY.findall(line):
             code = _first_exit_after(lines, index)
+            if _BENIGN_SKIP.search(message) and code is None:
+                problem = _carve_out_problem(name, text, lines, index, message)
+                if problem:
+                    offenders.append(f"{name}:{number} {problem}: {message}")
             if _BENIGN_SKIP.search(message) and code not in (None, 0):
                 offenders.append(f"{name}:{number} benign skip exits {code}: {message}")
             if _INFRA_LABEL in message and code not in (None, _INFRA_EXIT):
@@ -135,3 +200,50 @@ def test_the_rule_accepts_the_sanctioned_shapes() -> None:
         "exit 75\n"
     )
     assert _offenders("fixture.sh", fixture) == []
+
+
+def test_a_benign_skip_without_an_exit_or_carve_out_is_flagged() -> None:
+    fixture = 'say "SKIPPED -- another study holds the studies lock"\ncontinue\n'
+    assert len(_offenders("fixture.sh", fixture)) == 1
+
+
+def test_a_carve_out_whose_caller_path_is_gone_is_flagged() -> None:
+    fixture = (
+        'f() {\n  say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder x"\n'
+        "  return 3\n}\nf\nexit 1\n"
+    )
+    assert len(_offenders("replay-daily-run.sh", fixture)) == 1
+
+
+def test_a_carve_out_with_the_wrong_return_code_is_flagged() -> None:
+    fixture = (
+        'say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder x"\nreturn 1\n'
+    )
+    assert len(_offenders("replay-daily-run.sh", fixture)) == 1
+
+
+@pytest.mark.parametrize("entry", _CARVE_OUTS, ids=lambda c: c.wrapper)
+def test_every_carve_out_is_live_and_documented(entry: _CarveOut) -> None:
+    """Non-vacuous: a stale allowlist row (wrapper renamed, message reworded)
+    fails here instead of silently excusing nothing."""
+    text = (_SYSTEMD_DIR / entry.wrapper).read_text()
+    lines = _statements(text)
+    hits = [
+        i
+        for i, (_, line) in enumerate(lines)
+        if any(entry.message.search(m) and _BENIGN_SKIP.search(m) for m in _SAY.findall(line))
+    ]
+    assert hits, f"{entry.wrapper}: no benign say matches the carve-out"
+    assert entry.reason.strip()
+    assert _offenders(entry.wrapper, text) == []
+
+
+def test_portfolio_roi_no_input_says_resolve_to_exit_zero() -> None:
+    text = (_SYSTEMD_DIR / "portfolio-roi-run.sh").read_text()
+    lines = _statements(text)
+    codes = [
+        _first_exit_after(lines, index)
+        for index, (_, line) in enumerate(lines)
+        if any("NO_INPUT -- upstream skipped" in m for m in _SAY.findall(line))
+    ]
+    assert codes == [0]

@@ -88,6 +88,16 @@ report_skip() {
   return "$rc"
 }
 
+reset_skip_state_file() {
+  "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
+    --reset-skip-state --skip-state-path "$SKIP_STATE_PATH" >>"$LOG" 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "skip state reset FAILED (exit $rc)"
+  fi
+  return "$rc"
+}
+
 # Host-wide mutual exclusion, same convention as every sibling study
 # wrapper (SP-1.rev4.md). Skip-not-kill.
 unset POSIXLY_CORRECT
@@ -169,7 +179,13 @@ if [ "$resolve_rc" -eq 2 ]; then
   # skip means "we know nothing is armed"; this means we DON'T know.
   exit 1
 elif [ "$resolve_rc" -eq 3 ]; then
-  exit 0
+  # A composition skip is a HEALTHY by-design skip: clear any prior skip
+  # streak (a stale LOCK_CONTENTION count must not re-page STALLED on the
+  # next collision). A failed reset is a real failure, like a failed record.
+  if reset_skip_state_file; then
+    exit 0
+  fi
+  exit 1
 elif [ "$resolve_rc" -ne 0 ]; then
   if report_skip NO_ARMED_FAMILY; then
     exit 0

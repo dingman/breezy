@@ -83,3 +83,23 @@ def test_absent_sending_family_id_is_a_failure_with_no_skip_marker(tmp_path: Pat
 
     assert result.returncode != 0
     assert not _skip_marker(tmp_path).exists()
+
+
+def test_unwritable_skip_marker_exits_one_with_a_clear_line_and_no_marker(
+    tmp_path: Path,
+) -> None:
+    """The marker is written tmp-then-mv and the write is checked: if it cannot
+    land, the wrapper must fail loudly (exit 1) rather than exit 0 with no
+    marker (which would make portfolio-roi report a misleading missing-success
+    failure far downstream). The marker path is pre-occupied by a non-empty
+    directory so ``rm -f`` leaves it and ``mv -T`` cannot replace it."""
+    blocker = _skip_marker(tmp_path)
+    (blocker / "keep").mkdir(parents=True)
+
+    result = _run(tmp_path, f"Environment=BREEZY_SENDING_FAMILY_ID={_FQ_FAMILY}")
+
+    assert result.returncode == 1, result.stderr
+    assert not blocker.is_file()
+    log_text = (tmp_path / "derived" / "score_live_trials.log").read_text()
+    assert "SCORE LIVE TRIALS FAILED -- cannot write the skip marker" in log_text
+    assert not list((tmp_path / "derived").glob("*.skip.tmp*"))
