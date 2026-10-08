@@ -301,8 +301,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     variances=variances,
                 )
             )
-    bound_min, bound_se = bound_min_with_se(rows)
-    cutoff, decision = d1_decision(bound_min, e_proj=E_PROJ, se=bound_se)
+    bound_min, bound_se, bound_upper = bound_min_with_se(rows)
+    cutoff, decision = d1_decision(bound_upper, e_proj=E_PROJ)
     point = d1_point_decision(bound_min, e_proj=E_PROJ)[1]
     document: dict[str, Any] = {
         "seed": args.seed,
@@ -325,6 +325,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "rows": rows,
         "bound_min": bound_min,
         "bound_min_se": bound_se,
+        "bound_upper_min": bound_upper,
         "np_reach_cutoff_e": cutoff,
         "d1": decision,
         "d1_point": point,

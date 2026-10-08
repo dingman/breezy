@@ -560,10 +560,13 @@ def d1_decision(
 ) -> tuple[str | None, str]:
     """PASS iff ``np_reach_cutoff_e`` is not null and ≥ ``e_proj``.
 
-    Reach at epoch ``e`` means ``bound_min(e) + 2·SE(e) ≥ 0.30``. ``SE`` is the
-    standard error of the minimising cell. Omitted SE is zero, which is the
-    point rule. The screen is a necessary condition, so a near-miss proceeds
-    to A1b's own gate rather than being killed by replicate noise.
+    Reach at epoch ``e`` means ``value(e) + 2·SE(e) ≥ 0.30``. The Stage 0 screen
+    passes ``bound_upper_min`` and omits ``SE``: that series is already the
+    minimum of each mix's own ``np_bound_alpha_eff + 2·np_bound_alpha_eff_se``.
+    Adding the minimising cell's SE on top would let one noisy mix cover a
+    quieter shortfall. Omitted SE is zero. A supplied SE is only for a series
+    that is not already an upper limit. The screen is a necessary condition, so
+    a near-miss on a cell's own limit proceeds to A1b's gate.
     """
     errors = {} if se is None else se
     passing: list[str] = []
@@ -578,13 +581,19 @@ def d1_decision(
 
 def bound_min_with_se(
     rows: Sequence[Mapping[str, object]],
-) -> tuple[dict[str, float], dict[str, float]]:
-    """Raw ``min np_bound_alpha_eff`` and the SE of the minimising cell.
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """Raw minimum, the SE of that cell, and ``bound_upper_min``.
 
-    Ties take the larger SE. A quieter tied cell must not hide a near-miss.
+    ``bound_min`` is ``min np_bound_alpha_eff``. Ties keep the larger SE, so
+    ``bound_min_se`` does not drop a noisier twin. That SE is not the D1 input.
+
+    ``bound_upper_min(e)`` is the minimum over the epoch's cells of
+    ``np_bound_alpha_eff + 2·np_bound_alpha_eff_se``. Reach is that value
+    ``≥ 0.30``, so every mix has to clear the floor on its own upper limit.
     """
     bounds: dict[str, float] = {}
     errors: dict[str, float] = {}
+    uppers: dict[str, float] = {}
     for row in rows:
         epoch = row["epoch"]
         if not isinstance(epoch, str):
@@ -593,13 +602,17 @@ def bound_min_with_se(
         error = _real(row["np_bound_alpha_eff_se"], "np_bound_alpha_eff_se")
         if error < 0.0:
             raise ValueError(f"SE for {epoch} must be non-negative, got {error!r}")
+        limit = bound + 2.0 * error
         current = bounds.get(epoch)
         if current is None or bound < current:
             bounds[epoch] = bound
             errors[epoch] = error
         elif bound == current:
             errors[epoch] = max(errors[epoch], error)
-    return bounds, errors
+        best_limit = uppers.get(epoch)
+        if best_limit is None or limit < best_limit:
+            uppers[epoch] = limit
+    return bounds, errors, uppers
 
 
 def _real(value: object, label: str) -> float:

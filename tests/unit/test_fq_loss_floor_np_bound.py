@@ -237,8 +237,51 @@ def test_constant_randomized_weight_reports_zero_standard_error() -> None:
     assert report.se == 0.0
 
 
+def test_d1_reach_is_the_minimum_upper_limit_across_mixes() -> None:
+    """Every mix must clear 0.30. The noisiest low cell must not cover a quieter one.
+
+    A = 0.28 ± 0.015 has limit 0.31. B = 0.29 ± 0.001 has limit 0.292.
+    The point minimum is A, and feeding A's SE to D1 passes. B's limit does not,
+    so the epoch fails. ``d1_point`` stays on the raw minimum.
+    """
+    rows = (
+        {
+            "epoch": "2026-11-01",
+            "mix": "M-pool",
+            "np_bound_alpha_eff": 0.28,
+            "np_bound_alpha_eff_se": 0.015,
+        },
+        {
+            "epoch": "2026-11-01",
+            "mix": "M-yes",
+            "np_bound_alpha_eff": 0.29,
+            "np_bound_alpha_eff_se": 0.001,
+        },
+    )
+    bound, se, upper = bound_min_with_se(rows)
+    assert bound == {"2026-11-01": 0.28}
+    assert se == {"2026-11-01": 0.015}
+    assert math.isclose(upper["2026-11-01"], 0.29 + 2.0 * 0.001)
+    assert upper["2026-11-01"] < 0.30
+    cutoff, status = d1_decision(upper, e_proj=E_PROJ)
+    assert cutoff is None
+    assert status == "FAIL"
+    point_cutoff, point = d1_point_decision(bound, e_proj=E_PROJ)
+    assert point_cutoff is None
+    assert point == "FAIL"
+    # The screen this replaces: A's SE lifts the point minimum over 0.30.
+    covered, covered_status = d1_decision(bound, e_proj=E_PROJ, se=se)
+    assert covered == "2026-11-01"
+    assert covered_status == "PASS"
+
+
 def test_d1_reach_adds_two_standard_errors_of_the_minimising_cell() -> None:
-    """A near-miss proceeds. The point rule, without the SE term, still fails it."""
+    """``bound_min_se`` keeps a tie's larger SE. D1 uses the min upper limit.
+
+    Two cells tie at 0.27. The noisier limit is 0.31, but the quieter twin's
+    limit is 0.29, so the epoch does not reach. The point rule also fails it.
+    A single series still reaches when its own ``bound + 2·SE`` clears 0.30.
+    """
     rows = (
         {
             "epoch": "2026-11-01",
@@ -265,13 +308,15 @@ def test_d1_reach_adds_two_standard_errors_of_the_minimising_cell() -> None:
             "np_bound_alpha_eff_se": 0.01,
         },
     )
-    bound, se = bound_min_with_se(rows)
+    bound, se, upper = bound_min_with_se(rows)
     assert bound == {"2026-11-01": 0.27, "2026-12-01": 0.25}
-    # The two minimizers tie; the screen uses the larger of their SEs, not M-no's.
+    # The two minimizers tie; bound_min_se keeps the larger SE, not M-no's.
     assert se == {"2026-11-01": 0.02, "2026-12-01": 0.01}
-    cutoff, status = d1_decision(bound, e_proj=E_PROJ, se=se)
-    assert cutoff == "2026-11-01"
-    assert status == "PASS"
+    assert math.isclose(upper["2026-11-01"], 0.27 + 2.0 * 0.01)
+    assert math.isclose(upper["2026-12-01"], 0.25 + 2.0 * 0.01)
+    cutoff, status = d1_decision(upper, e_proj=E_PROJ)
+    assert cutoff is None
+    assert status == "FAIL"
     point_cutoff, point = d1_point_decision(bound, e_proj=E_PROJ)
     assert point_cutoff is None
     assert point == "FAIL"
