@@ -178,3 +178,123 @@ def test_left_truncation_offsets_are_recorded_per_source(tmp_path: Path) -> None
 def test_live_and_left_truncation_keys_match_c1_lag_sources() -> None:
     assert set(c1._LIVE) == set(C1_LAG_SOURCES)
     assert set(c1._LEFT_TRUNCATION_NS) == set(C1_LAG_SOURCES)
+
+
+def _stamped(
+    run: int,
+    *,
+    fetched_at_ns: int,
+    first_seen_ns: int,
+    station: str = "KNYC",
+    late: bool = False,
+    kind: str = "seen",
+) -> dict[str, Any]:
+    """A ledger row carrying ``fetched_at_ns``, the poll time every real row has."""
+    return {
+        "kind": kind,
+        "station": station,
+        "run_ts_ns": run,
+        "available_ts_ns": run,
+        "first_seen_ns": first_seen_ns,
+        "fetched_at_ns": fetched_at_ns,
+        "late": late,
+    }
+
+
+def test_poll_gap_censors_seen_row_three_hours_after_previous_ledger_row(tmp_path: Path) -> None:
+    """3 h after the previous ledger row, lag 2.5 h: censored_poll_gap, out of samples and p99."""
+    previous_at = _T0
+    kept = _stamped(_T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN)
+    recovery_at = previous_at + 3 * 60 * _MIN
+    lag = int(2.5 * 60 * _MIN)
+    recovery = _stamped(
+        recovery_at - lag,
+        fetched_at_ns=recovery_at,
+        first_seen_ns=recovery_at,
+        station="KSFO",
+    )
+    _write(tmp_path, "us-pfm-afos", [kept, recovery])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 1
+    assert ev["censored"]["pfm"] == 0
+    assert set(ev["censored_poll_gap"]) == set(C1_LAG_SOURCES)
+    assert ev["lag_samples_ns"]["pfm"] == [10 * _MIN]
+    assert lag not in ev["lag_samples_ns"]["pfm"]
+    assert ev["stats"]["pfm"]["p99_min"] == 10
+    assert ev["schema"] == "c1_lag_evidence/v1"
+
+
+def test_seen_row_fifty_five_minutes_after_previous_ledger_row_is_kept(tmp_path: Path) -> None:
+    previous_at = _T0
+    first = _stamped(_T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN)
+    seen_at = previous_at + 55 * _MIN
+    lag = 12 * _MIN
+    second = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KSFO")
+    _write(tmp_path, "us-pfm-afos", [first, second])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 0
+    assert ev["censored"]["pfm"] == 0
+    assert sorted(ev["lag_samples_ns"]["pfm"]) == [10 * _MIN, lag]
+
+
+def test_poll_gap_uses_the_previous_ledger_row_not_the_previous_seen_sample(
+    tmp_path: Path,
+) -> None:
+    """A miss 20 min earlier keeps the sample, even if the previous ``seen`` was 3 h ago."""
+    previous_at = _T0
+    first = _stamped(_T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN)
+    miss_at = previous_at + 160 * _MIN
+    miss = _stamped(_T0, fetched_at_ns=miss_at, first_seen_ns=miss_at, station="KNYC", kind="miss")
+    seen_at = miss_at + 20 * _MIN
+    lag = int(2.5 * 60 * _MIN)
+    second = _stamped(seen_at - lag, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KSFO")
+    _write(tmp_path, "us-pfm-afos", [first, miss, second])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 0
+    assert sorted(ev["lag_samples_ns"]["pfm"]) == [10 * _MIN, lag]
+
+
+def test_poll_gap_censors_every_station_written_in_the_recovery_firing(tmp_path: Path) -> None:
+    """Sibling stations 4 s apart share the firing's predecessor, not each other."""
+    previous_at = _T0
+    previous = _stamped(
+        _T0, fetched_at_ns=previous_at, first_seen_ns=previous_at + 10 * _MIN, station="KNYC"
+    )
+    recovery_at = previous_at + 3 * 60 * _MIN
+    lag = int(2.5 * 60 * _MIN)
+    first = _stamped(
+        recovery_at - lag, fetched_at_ns=recovery_at, first_seen_ns=recovery_at, station="KLAX"
+    )
+    second_at = recovery_at + 4 * 10**9
+    second = _stamped(
+        second_at - lag, fetched_at_ns=second_at, first_seen_ns=second_at, station="KSFO"
+    )
+    _write(tmp_path, "us-pfm-afos", [previous, first, second])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 2
+    assert ev["censored"]["pfm"] == 0
+    assert ev["lag_samples_ns"]["pfm"] == [10 * _MIN]
+    assert lag not in ev["lag_samples_ns"]["pfm"]
+
+
+def test_first_ledger_row_has_no_predecessor_and_is_kept(tmp_path: Path) -> None:
+    lag = int(2.5 * 60 * _MIN)
+    seen_at = _T0 + lag
+    only = _stamped(_T0, fetched_at_ns=seen_at, first_seen_ns=seen_at, station="KNYC")
+    _write(tmp_path, "us-pfm-afos", [only])
+    ev = c1.build_evidence(tmp_path)
+    assert ev["censored_poll_gap"]["pfm"] == 0
+    assert ev["lag_samples_ns"]["pfm"] == [lag]
+
+
+def test_max_poll_gap_keys_equal_c1_lag_sources() -> None:
+    """Parity: the cadence table is keyed by the pin sources, pfm max gap is 95 min."""
+    assert set(c1.MAX_POLL_GAP_NS) == set(C1_LAG_SOURCES)
+    expected_min = {
+        "lamp-mdl": 104,  # 15:31Z → 17:10Z = 99 min, plus 5
+        "lav-iem": 55,  # 16:20Z → 17:10Z = 50 min, plus 5
+        "pfm": 95,  # 15:40Z → 17:10Z = 90 min, plus 5
+        "mos-gfs": 65,  # 16:15Z → 17:15Z = 60 min, plus 5
+        "obs": 55,  # 16:20Z → 17:10Z = 50 min, plus 5
+    }
+    assert {key: value // _MIN for key, value in c1.MAX_POLL_GAP_NS.items()} == expected_min

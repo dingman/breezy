@@ -103,3 +103,9 @@ Status: **frozen intent.** Every value and every derivation rule below is fixed 
 - **C1-R4. Key unification.**
   - The runner's `_check_c1` counts by `LEVEL_SOURCES` (`lamp`, `pfm`, `mos`), while the pins use the five lag keys. `_check_c1` must count and require by the five pin keys.
   - The evidence file is produced only by `c1_lag_evidence.py`, using schema `c1_lag_evidence/v1`.
+
+- **C1-R5. Collector lock contention (coordinator, 2026-10-08).** A long PFM history backfill holds the `us-pfm-afos` store lock. The pfm collector tried the lock once and logged `skipped_locked` for hours, writing no ledger row. The next free poll then stamped a late first-seen, and 2–3 h lock-recovery lags passed the 3 h `late` censor into the p99: 10 of 15 pfm samples above 2 h. Two fixes:
+  - **Collector.** On a busy lock, retry with bounded backoff for up to `COLLECTOR_LOCK_WAIT_S` = 120 s. The wait CONSUMES the cycle's work budget, with a 30 s margin, and is never added on top of it. The launch window is rechecked after the wait.
+  - **Evidence.** `c1_lag_evidence` censors a `seen` sample as `censored_poll_gap` when its first-seen is more than `MAX_POLL_GAP_NS` (the scheduled gap + 5 min, per source) after the previous firing. This honours C1-R3: a lag is accepted only when it is bounded by poll cadence.
+  - On the 10-08 live ledger, pfm went from measured_days 3 / uncensored 53 to 2 / 35, with 18 samples censored for poll gap. p99 went from 160.22 to 160.21 min. The remaining maximum is a refusal-driven KSFO firing, not a lock recovery.
+  - **Consequence.** A PFM backfill costs pfm measured days. Run PFM backfills outside the days needed to reach the 14-day C1 minimum, or accept the later freeze date.

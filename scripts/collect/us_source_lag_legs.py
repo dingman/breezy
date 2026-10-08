@@ -222,10 +222,18 @@ def pending_runs(leg: IemLeg, now_ns: int) -> Iterator[int]:
 
 
 def _over_budget(col: Any, cli: str, start_ns: int) -> bool:
+    """True when a fetch must not start: the shared work deadline, or the launch window.
+
+    ``work_deadline_ns`` is fixed before the lock wait (start + budget). Without it (a direct
+    call) the budget is measured from ``start_ns``, the previous per-cycle clock.
+    """
     now = col.ctx.clock()
-    return guards.worked_seconds_outside_window(start_ns, now) > guards.MAX_WORK_SECONDS[
-        cli
-    ] or not guards.attempt_allowed(now)
+    deadline = getattr(col, "work_deadline_ns", None)
+    if deadline is None:
+        over = guards.worked_seconds_outside_window(start_ns, now) > guards.MAX_WORK_SECONDS[cli]
+    else:
+        over = now >= deadline
+    return over or not guards.attempt_allowed(now)
 
 
 def iem_cycle(col: Any, leg: IemLeg, fetch: Callable[[str, int], FetchedPayload]) -> LegOutcome:
