@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Sibling checker for F5 prereg amendments (A0 KILL now; A1 and A2 later).
+"""Sibling checker for F5 prereg amendments (A0 KILL and A1 floor; A2 later).
 
     prereg_amendment_check.py [--draft] <amendment.json>
 
 Exit codes match the parent checker: 0 OK, 1 defects, 2 usage or load error.
 ``--draft`` replaces the freeze rule with ``frozen_sha == UNFROZEN`` and exits 0
-only for an unfrozen file. It never reports a draft as frozen.
+only for an unfrozen file. It never reports a draft as frozen. On A1 it also
+accepts ``PENDING_*`` strings; the key set stays exact. Without ``--draft``
+those strings are refused.
 
 The rules import ``validate_defects``, ``check_frozen_blob`` and
 ``check_not_refrozen``. Nothing those functions do is re-implemented. Run this
@@ -16,9 +18,12 @@ and ``check_not_refrozen`` then refuses it.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
@@ -28,6 +33,11 @@ for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
         sys.path.insert(0, _entry)
 
 from breezy.analysis.autonomy import confidence_sequence as cs
+from breezy.analysis.fq_loss_stop_core import (
+    ALPHA_FLOOR_GRID,
+    G3_FLOOR_MULTIPLIER,
+    T_MIN_GRID,
+)
 from scripts.analysis import fq_mc_eprocess as mc
 from scripts.analysis.multisource_blend_pin_guards import UNFROZEN, check_not_refrozen
 from scripts.analysis.multisource_blend_refusal import Refusal
@@ -43,6 +53,7 @@ _GIT_TIMEOUT_S: Final[int] = 20  # same bound as the parent checker; not a KILL 
 _ENVELOPE: Final = frozenset({"frozen_sha", "amendment_id", "amends", "provenance"})
 _AMENDS_KEYS: Final = frozenset({"path", "frozen_sha"})
 _A0_ID: Final = "F5_prereg_v2_A0_kill"
+_A1_ID: Final = "F5_prereg_v2_A1_floor"
 _PAYLOADS: Final[dict[str, frozenset[str]]] = {
     _A0_ID: frozenset({"kill"}),
     "F5_prereg_v2_A1_floor": frozenset({"loss_stop_floor"}),
@@ -81,6 +92,50 @@ _RULE_FIELDS: Final = (
     "kill_betting_rule",
     "kill_bar_rule",
 )
+# r3 §4.9. Child keys of loss_stop_floor, including the two nested objects.
+_FLOOR_KEYS: Final = frozenset(
+    {
+        "floor_mode",
+        "power_class",
+        "alpha_floor",
+        "alpha_selection_rule",
+        "g3_floor_multiplier",
+        "gate_rate_rule",
+        "t_unit",
+        "pnl_unit",
+        "qty_rule",
+        "netting_rule",
+        "exit_rule",
+        "increment_rule",
+        "bundle_null_rule",
+        "boundary_rule",
+        "c",
+        "c_mc_se",
+        "c_binding_cell",
+        "t_min",
+        "measured_power",
+        "s6_feasible_rate",
+        "t_horizon_climate_day",
+        "reach_cutoff_epoch_start",
+        "past_horizon_rule",
+        "epoch_anchor_rule",
+        "epoch_id_rule",
+        "fail_latch_rule",
+        "refusal_rule",
+        "restart_rule",
+        "inputs",
+    }
+)
+_MEASURED_POWER_KEYS: Final = frozenset({"-0.16", "-0.08", "-0.04"})
+_INPUT_KEYS: Final = frozenset(
+    {"sign_rule", "fill_rule", "fee_rule", "void_rule", "truth_sha_rule"}
+)
+_FLOOR_MODES: Final = frozenset({"sqrt_boundary", "unreachable_veto"})
+_SQRT_POWER_CLASSES: Final = frozenset({"edge_capable", "gross_loss_tripwire"})
+_HORIZON_CLIMATE_DAY: Final = "2027-01-25"
+# §4.6 power target, already imported with the KILL constants. Not retyped.
+_EDGE_POWER: Final = Decimal(str(mc.POWER_TARGET))
+_POWER_AT: Final = "-0.16"
 _USAGE: Final = (
     "usage: prereg_amendment_check.py [--draft] <amendment.json>\n"
     "Run in a full (non-shallow) clone. A shallow clone cannot prove a single freeze."
@@ -308,10 +363,249 @@ def _check_kill(kill: Any) -> list[Defect]:
     return defects
 
 
-def _check_payload(amendment: Mapping[str, Any]) -> list[Defect]:
+def _is_pending(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("PENDING_")
+
+
+def _pending_values(node: Any) -> list[str]:
+    if isinstance(node, str):
+        return [node] if _is_pending(node) else []
+    if isinstance(node, Mapping):
+        found: list[str] = []
+        for child in node.values():
+            found.extend(_pending_values(child))
+        return found
+    if isinstance(node, Sequence):
+        found = []
+        for child in node:
+            found.extend(_pending_values(child))
+        return found
+    return []
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    """Finite int/float as ``Decimal(str(x))``. Bool and non-finite values are not numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return Decimal(str(value))
+
+
+def _matches_imported(value: Any, expected: Any) -> bool:
+    # `==` alone accepts True for 1. The pin must match the constant's type.
+    return type(value) is type(expected) and value == expected
+
+
+def _on_imported_grid(value: Any, grid: Sequence[Any]) -> bool:
+    return any(_matches_imported(value, item) for item in grid)
+
+
+def _bad_floor_keys(value: Any, expected: frozenset[str], kind: str) -> Defect:
+    actual = set(value) if isinstance(value, Mapping) else set()
+    got = sorted(actual) if isinstance(value, Mapping) else value
+    return Defect(
+        "BAD_FLOOR_KEYS",
+        f"{kind} keys must be exactly {sorted(expected)}, "
+        f"extra={sorted(actual - expected)}, missing={sorted(expected - actual)}, got={got!r}",
+    )
+
+
+def _floor_value(message: str) -> Defect:
+    return Defect("BAD_FLOOR_VALUE", message)
+
+
+def _is_iso_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.isoformat() == value
+
+
+def _check_floor_common(floor: Mapping[str, Any]) -> list[Defect]:
+    defects: list[Defect] = []
+    alpha = floor["alpha_floor"]
+    if not _is_pending(alpha) and not _on_imported_grid(alpha, ALPHA_FLOOR_GRID):
+        defects.append(
+            _floor_value(f"alpha_floor must be one of {list(ALPHA_FLOOR_GRID)}, got {alpha!r}")
+        )
+    multiplier = floor["g3_floor_multiplier"]
+    if not _is_pending(multiplier) and not _matches_imported(multiplier, G3_FLOOR_MULTIPLIER):
+        defects.append(
+            _floor_value(
+                "g3_floor_multiplier must equal the imported "
+                f"G3_FLOOR_MULTIPLIER ({G3_FLOOR_MULTIPLIER!r}), got {multiplier!r}"
+            )
+        )
+    horizon = floor["t_horizon_climate_day"]
+    if not _is_pending(horizon) and horizon != _HORIZON_CLIMATE_DAY:
+        defects.append(
+            _floor_value(
+                f"t_horizon_climate_day must be the ISO date {_HORIZON_CLIMATE_DAY}, "
+                f"got {horizon!r}"
+            )
+        )
+    return defects
+
+
+def _check_sqrt_boundary(floor: Mapping[str, Any]) -> list[Defect]:
+    defects: list[Defect] = []
+    boundary = floor["c"]
+    boundary_d = None if _is_pending(boundary) else _as_decimal(boundary)
+    if not _is_pending(boundary) and (boundary_d is None or boundary_d <= 0):
+        defects.append(_floor_value(f"c must be finite and > 0, got {boundary!r}"))
+    standard_error = floor["c_mc_se"]
+    error_d = None if _is_pending(standard_error) else _as_decimal(standard_error)
+    if not _is_pending(standard_error) and (error_d is None or error_d <= 0):
+        defects.append(_floor_value(f"c_mc_se must be finite and > 0, got {standard_error!r}"))
+    t_min = floor["t_min"]
+    if not _is_pending(t_min) and not _on_imported_grid(t_min, T_MIN_GRID):
+        defects.append(_floor_value(f"t_min must be an int in {list(T_MIN_GRID)}, got {t_min!r}"))
+    defects.extend(_check_measured_power(floor, error_d))
+    reach = floor["reach_cutoff_epoch_start"]
+    if not _is_pending(reach) and not _is_iso_date(reach):
+        defects.append(_floor_value(f"reach_cutoff_epoch_start must be an ISO date, got {reach!r}"))
+    return defects
+
+
+def _check_measured_power(floor: Mapping[str, Any], error_d: Decimal | None) -> list[Defect]:
+    """G3, the power-class split at the imported power target, and the S6 bound."""
+    defects: list[Defect] = []
+    measured = floor["measured_power"]
+    assert isinstance(measured, Mapping)
+    power = measured[_POWER_AT]
+    power_d = None if _is_pending(power) else _as_decimal(power)
+    if not _is_pending(power) and power_d is None:
+        defects.append(
+            _floor_value(f"measured_power[{_POWER_AT!r}] must be a finite number, got {power!r}")
+        )
+    alpha = floor["alpha_floor"]
+    multiplier = floor["g3_floor_multiplier"]
+    alpha_d = None if _is_pending(alpha) else _as_decimal(alpha)
+    multiplier_d = None if _is_pending(multiplier) else _as_decimal(multiplier)
+    if (
+        power_d is not None
+        and alpha_d is not None
+        and multiplier_d is not None
+        and power_d < multiplier_d * alpha_d
+    ):
+        defects.append(
+            Defect(
+                "FLOOR_POWER_BELOW_G3",
+                f"measured_power[{_POWER_AT!r}] {power_d} < "
+                f"g3_floor_multiplier {multiplier_d} * alpha_floor {alpha_d}",
+            )
+        )
+    power_class = floor["power_class"]
+    if not _is_pending(power_class):
+        if power_class not in _SQRT_POWER_CLASSES:
+            defects.append(
+                _floor_value(
+                    f"power_class must be edge_capable or gross_loss_tripwire, got {power_class!r}"
+                )
+            )
+        elif power_d is not None and not _power_class_consistent(power_class, power_d):
+            defects.append(
+                Defect(
+                    "FLOOR_CLASS_INCONSISTENT",
+                    f"power_class {power_class!r} disagrees with "
+                    f"measured_power[{_POWER_AT!r}] {power_d} "
+                    f"(edge_capable requires >= {_EDGE_POWER})",
+                )
+            )
+    defects.extend(_check_s6(floor, alpha_d, error_d))
+    return defects
+
+
+def _power_class_consistent(power_class: object, power: Decimal) -> bool:
+    at_edge = power >= _EDGE_POWER
+    if power_class == "edge_capable":
+        return at_edge
+    return not at_edge
+
+
+def _check_s6(
+    floor: Mapping[str, Any], alpha_d: Decimal | None, error_d: Decimal | None
+) -> list[Defect]:
+    # The bound is defined only when α and c_mc_se are usable. A bad se is its own defect.
+    rate = floor["s6_feasible_rate"]
+    if _is_pending(rate):
+        return []
+    rate_d = _as_decimal(rate)
+    if rate_d is None:
+        return [_floor_value(f"s6_feasible_rate must be a finite number, got {rate!r}")]
+    if alpha_d is None or error_d is None or error_d <= 0:
+        return []
+    bound = alpha_d + Decimal(3) * error_d
+    if rate_d > bound:
+        return [
+            Defect(
+                "FLOOR_S6_FAILED",
+                f"s6_feasible_rate {rate_d} > alpha_floor + 3*c_mc_se ({bound})",
+            )
+        ]
+    return []
+
+
+def _check_unreachable_veto(floor: Mapping[str, Any]) -> list[Defect]:
+    defects: list[Defect] = []
+    boundary = floor["c"]
+    if not _is_pending(boundary) and boundary is not None:
+        defects.append(_floor_value(f"unreachable_veto requires c null, got {boundary!r}"))
+    power_class = floor["power_class"]
+    if not _is_pending(power_class) and power_class != "none":
+        defects.append(
+            _floor_value(f"unreachable_veto requires power_class 'none', got {power_class!r}")
+        )
+    return defects
+
+
+def _check_floor(floor: Any, *, draft: bool) -> list[Defect]:
+    if not isinstance(floor, Mapping) or set(floor) != _FLOOR_KEYS:
+        return [_bad_floor_keys(floor, _FLOOR_KEYS, "loss_stop_floor")]
+    defects: list[Defect] = []
+    measured = floor["measured_power"]
+    inputs = floor["inputs"]
+    if not isinstance(measured, Mapping) or set(measured) != _MEASURED_POWER_KEYS:
+        defects.append(_bad_floor_keys(measured, _MEASURED_POWER_KEYS, "measured_power"))
+    if not isinstance(inputs, Mapping) or set(inputs) != _INPUT_KEYS:
+        defects.append(_bad_floor_keys(inputs, _INPUT_KEYS, "inputs"))
+    if defects:
+        return defects
+    if not draft:
+        pending = _pending_values(floor)
+        if pending:
+            defects.append(
+                Defect(
+                    "FLOOR_PENDING",
+                    "PENDING_* values are refused outside --draft "
+                    f"({len(pending)} found, first {pending[0]!r})",
+                )
+            )
+    defects.extend(_check_floor_common(floor))
+    mode = floor["floor_mode"]
+    if _is_pending(mode):
+        return defects
+    if mode == "sqrt_boundary":
+        defects.extend(_check_sqrt_boundary(floor))
+    elif mode == "unreachable_veto":
+        defects.extend(_check_unreachable_veto(floor))
+    else:
+        defects.append(
+            _floor_value(f"floor_mode must be one of {sorted(_FLOOR_MODES)}, got {mode!r}")
+        )
+    return defects
+
+
+def _check_payload(amendment: Mapping[str, Any], *, draft: bool = False) -> list[Defect]:
     amendment_id = amendment.get("amendment_id")
     if amendment_id == _A0_ID:
         return _check_kill(amendment.get("kill"))
+    if amendment_id == _A1_ID:
+        return _check_floor(amendment.get("loss_stop_floor"), draft=draft)
     if isinstance(amendment_id, str) and amendment_id in _PAYLOADS:
         return [
             Defect(
@@ -346,7 +640,7 @@ def _collect(path: Path, amendment: Mapping[str, Any], *, draft: bool) -> list[D
         *_check_amendment_filename(path, amendment),
         *_check_additive(path, amendment, parent),
         *_check_freeze(path, amendment, draft=draft),
-        *_check_payload(amendment),
+        *_check_payload(amendment, draft=draft),
     ]
 
 
