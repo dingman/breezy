@@ -1,0 +1,34 @@
+# AUT-6 WP2 (plan r15 section 3.7, 3.10; E-7a, E-9, E-15): the alert canary. Delivers one INFO alert
+# through the delivery proof and writes the write-once armed marker after the first delivery.
+# Under the shared bwrap wrapper, row breezy-autonomy-canary (binds evidence/alerts only, egress
+# declared for delivery). The webhook URL arrives only through EnvironmentFile=; it is never an
+# Environment= line. The lock file evidence/alerts/.canary.lock is created empty (0600) by the
+# coordinator at activation and opened O_RDONLY by the CLI; a missing lock is an INTEGRITY exit 3.
+#
+# Bounds (E-9): TimeoutStartSec re-arms per command. Pre line T + K = 4 + 1 = 5 s; ExecStart
+# K + T = 4 + 46 = 50 s; TimeoutStopSec=5. With the timer's AccuracySec=1s the worst end is
+# slot + 1 + 5 + 50 + 5 = slot + 61 s, so the 16:30Z and 16:45Z firings end by 16:31:01Z and
+# 16:46:01Z and the 17:10Z firing by 17:11:01Z.
+# OnFailure target: X-3 ships the line before the notifier unit exists (WP4/WP7).
+[Unit]
+Description=Breezy AUT-6 alert canary (hourly :45, 16:30Z and 17:10Z, sandboxed)
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+MemoryMax=128M
+TimeoutStartSec=55
+TimeoutStopSec=5
+EnvironmentFile=-%h/.config/breezy/alerts.env
+# No mount-namespace directives here (ReadWritePaths, ProtectHome, PrivateTmp, ...): systemd would
+# build a private mount namespace in which /usr/bin/bwrap cannot create its user namespace on this
+# host (AppArmor userns restriction): "bwrap: No permissions to create a new namespace", exit 1.
+# The bwrap row (binds evidence/alerts) is the control; user-unit sandboxing is not enforced (E-7).
+# Pinned by test_bwrap_wrapped_unit_config_has_no_mount_namespace_directive.
+ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/evidence/alerts
+ExecStart=/usr/bin/timeout -k 4 46 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-canary /home/jon/breezy/.venv/bin/python3 -I -m breezy.runtime.autonomy_canary_cli
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-autonomy-canary

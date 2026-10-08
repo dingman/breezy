@@ -16,7 +16,7 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 from breezy.registry.health_model import AlertPayload
 
@@ -30,6 +30,10 @@ _FILE_MODE: Final[int] = 0o600
 _DIR_MODE: Final[int] = 0o700
 _WRITER_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9_]{1,64}\Z")
 _EVENT_SAFE: Final[re.Pattern[str]] = re.compile(r"[^A-Za-z0-9_]")
+_ARMED_NAME: Final[str] = "armed.json"
+_ARMED_SCHEMA: Final[str] = "alerts_armed/v1"
+_ARMED_MODE: Final[int] = 0o444
+_ARMED_MAX_BYTES: Final[int] = 4096
 _ATTEMPTS: Final[frozenset[str]] = frozenset({"alert", "retry", "canary", "drain"})
 
 
@@ -69,7 +73,9 @@ def _mkdir(directory: Path) -> None:
     os.chmod(directory, _DIR_MODE)
 
 
-def _publish(directory: Path, name: str, body: dict[str, object]) -> Path:
+def _publish(
+    directory: Path, name: str, body: dict[str, object], *, mode: int = _FILE_MODE
+) -> Path:
     """mkstemp, fsync, ``os.link`` onto ``name``. ``FileExistsError`` if ``name`` is taken."""
     _mkdir(directory)
     fd, tmp_name = tempfile.mkstemp(prefix=".", suffix=".partial", dir=directory)
@@ -77,7 +83,7 @@ def _publish(directory: Path, name: str, body: dict[str, object]) -> Path:
     dest = directory / name
     try:
         try:
-            os.fchmod(fd, _FILE_MODE)
+            os.fchmod(fd, mode)
             data = memoryview(json.dumps(body, sort_keys=True).encode())
             while data:
                 data = data[os.write(fd, data) :]
@@ -85,7 +91,6 @@ def _publish(directory: Path, name: str, body: dict[str, object]) -> Path:
         finally:
             os.close(fd)
         os.link(tmp, dest)
-        os.chmod(dest, _FILE_MODE)
     finally:
         # the temp name never outlives the call, on success or on any failure
         with contextlib.suppress(FileNotFoundError):
@@ -268,3 +273,55 @@ class DeliveryRecordWriter:
                 return _publish(directory, f"{stamp}_{writer}_{suffix}.json", body)
             except FileExistsError:
                 stamp += 1
+
+
+class ArmedMarker(NamedTuple):
+    """The write-once arming marker: the first delivered canary record's basename and instant."""
+
+    ts_ns: int
+    record: str
+
+
+def write_armed_marker(root: Path, *, record: str, ts_ns: int) -> bool:
+    """Publish ``<root>/armed.json`` (0444) once. ``True`` if written, ``False`` if it existed.
+
+    ``os.link`` is the ``O_EXCL`` step: ``EEXIST`` means an earlier canary armed the detector and
+    is success. Nothing in this module rewrites or removes the marker.
+    """
+    body: dict[str, object] = {"schema": _ARMED_SCHEMA, "ts_ns": ts_ns, "record": record}
+    try:
+        _publish(root, _ARMED_NAME, body, mode=_ARMED_MODE)
+    except FileExistsError:
+        return False
+    return True
+
+
+def read_armed_marker(root: Path) -> ArmedMarker | None:
+    """The marker, or ``None`` when it does not exist (ENOENT: unarmed).
+
+    Any other failure raises: ``OSError`` for an unreadable or non-regular file, ``ValueError``
+    for content that is not a valid ``alerts_armed/v1`` body.
+    """
+    path = root / _ARMED_NAME
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("armed marker is not a regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        raw = os.read(fd, _ARMED_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _ARMED_MAX_BYTES:
+        raise ValueError("armed marker too large")
+    body = json.loads(raw)
+    if (
+        not isinstance(body, dict)
+        or body.get("schema") != _ARMED_SCHEMA
+        or type(body.get("ts_ns")) is not int
+        or not isinstance(body.get("record"), str)
+    ):
+        raise ValueError("armed marker is not alerts_armed/v1")
+    return ArmedMarker(body["ts_ns"], body["record"])

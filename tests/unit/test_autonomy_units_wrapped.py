@@ -152,7 +152,11 @@ def test_good_units_lint_clean(tmp_path: Path) -> None:
 
 # X-3 recorded gap (AUT-6 WP1): the redeliver unit names OnFailure=breezy-autonomy-failed@ before
 # the notifier row exists (WP4/WP7). It is the ONE lint error the real tree may carry.
-X3_GAP = [("breezy-autonomy-alert-redeliver.service", "onfailure_scope")]
+# AUT-6 WP2 widens the gap by exactly one reviewed row: the canary unit names the same notifier.
+X3_GAP = [
+    ("breezy-autonomy-alert-redeliver.service", "onfailure_scope"),
+    ("breezy-autonomy-canary.service", "onfailure_scope"),
+]
 
 
 def _real_tree_errors() -> list[tuple[str, str]]:

@@ -1873,6 +1873,16 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--skip-state-path", type=Path, default=DEFAULT_SKIP_STATE_PATH)
     parser.add_argument(
+        "--reset-skip-state",
+        action="store_true",
+        help=(
+            "AUT-6 WP3 S1: the wrapper's healthy composition skip "
+            "(forecast_quantile_ladder has no replay) clears any prior skip "
+            "streak, so a stale LOCK_CONTENTION count never re-pages STALLED. "
+            "Resets --skip-state-path and exits; run_once never starts."
+        ),
+    )
+    parser.add_argument(
         "--quarantine-legacy-fee-void",
         action="store_true",
         help=(
@@ -1918,7 +1928,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
-    if args.report_skip is None and not args.quarantine_legacy_fee_void:
+    if (
+        args.report_skip is None
+        and not args.reset_skip_state
+        and not args.quarantine_legacy_fee_void
+    ):
         missing = [
             flag
             for flag, value in (
@@ -1942,6 +1956,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.report_skip is not None:
         record_skip(skip_state_path=args.skip_state_path, reason=args.report_skip)
+        return 0
+    if args.reset_skip_state:
+        reset_skip_state(args.skip_state_path)
         return 0
     if args.quarantine_legacy_fee_void:
         reports = quarantine_legacy_fee_void(
