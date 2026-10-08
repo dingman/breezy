@@ -36,3 +36,10 @@ EXIT_CONVERSION_FAILED = 3
 #: see `quote_tape_ingest_cli.run` and its module docstring's
 #: exit-precedence note.
 EXIT_DEFERRAL_STALLED = 4
+
+#: DEFER-STREAK-LOAD: with work pending, the deferral-stall streak was lost
+#: (unreadable, corrupt, or invalid state file) or could not be persisted, so
+#: stall detection is blind for this run. Lower precedence than
+#: :data:`EXIT_DEFERRAL_STALLED` (a real stall is the more specific signal).
+#: Distinct from 4 so the notifier can name it; see `quote_tape_ingest_cli`.
+EXIT_DEFERRAL_STREAK_RESET = 5

@@ -21,7 +21,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 import pytest
 
@@ -37,6 +37,7 @@ from breezy.runtime.study_failure_notifier import (
     STUDY_FAILED_ALERT_EVENT,
     STUDY_FAILED_ALERT_SEVERITY,
     STUDY_FAILED_ALERT_SITE,
+    SinkFactory,
     StudyFailedDetail,
     notify_study_failed,
 )
@@ -326,6 +327,47 @@ def test_cause_lookup_names_the_exit_code_for_the_quote_tape_ingest_unit(
     assert any(
         f"cause=exit-code exit={EXIT_DEFERRAL_STALLED} (DEFERRAL_STALLED)" in record.getMessage()
         for record in caplog.records
+    )
+
+
+def test_cause_lookup_names_the_deferral_streak_reset_exit_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """DEFER-STREAK-LOAD r2 (T18): exit 5 is named, not confused with exit 4."""
+    payloads, sink_factory = _recording_sink_factory()
+
+    def _fake_cause_reader(unit: str) -> str:
+        assert unit == _QUOTE_TAPE_INGEST_UNIT
+        return "ExecMainStatus=5\nResult=exit-code\n"
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.study_failure_notifier"):
+        exit_code = notify_study_failed(
+            ["--unit", _QUOTE_TAPE_INGEST_UNIT],
+            sink_factory=cast(SinkFactory, sink_factory),
+            cause_reader=_fake_cause_reader,
+        )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("exit=5 (DEFERRAL_STREAK_RESET)" in m for m in messages)
+    assert not any("DEFERRAL_STALLED" in m for m in messages)
+    assert payloads[0].detail == StudyFailedDetail.STUDY_UNIT_REACHED_FAILED_STATE.value
+
+
+def test_every_quote_tape_exit_constant_has_a_matching_notifier_name() -> None:
+    """Parity: each ``EXIT_*`` int in the leaf module is named ``<suffix>``."""
+    from breezy.runtime import quote_tape_exit_codes
+    from breezy.runtime.study_failure_notifier import _QUOTE_TAPE_INGEST_EXIT_NAMES
+
+    constants = {
+        name: value
+        for name, value in vars(quote_tape_exit_codes).items()
+        if name.startswith("EXIT_") and isinstance(value, int)
+    }
+    assert constants, "expected EXIT_* constants"
+    assert {value: name.removeprefix("EXIT_") for name, value in constants.items()} == dict(
+        _QUOTE_TAPE_INGEST_EXIT_NAMES
     )
 
 
