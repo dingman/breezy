@@ -1,4 +1,4 @@
-# AUT-6 WP2 verify-first STOP: Path B ruling (2026-10-08, coordinator; r2 after security and architect review: READY)
+# AUT-6 WP2 verify-first STOP: Path B ruling (2026-10-08; r3: the heartbeat re-arm is WITHDRAWN after the live check failed)
 
 **Binding inputs:**
 - plan r15 §AUT-6.WP2 (l.1162), §3.7.1 (l.917) and R-9 (l.1557);
@@ -112,4 +112,32 @@ These come in addition to the plan's criteria:
 - The suppression drill, on its pre-registered date, shows the 16:15Z page.
 - The coordinator reads the page timestamp in a one-off poll of the topic's JSON feed. The URL is never printed. The timestamp is recorded as a text attestation, and its hash goes into C4 `HEALTH`. No bot read path is added.
 
-**Status:** READY. Both reviewers' items are addressed above.
+**Status:** superseded by r3 below.
+
+---
+## r3 (BINDING, 2026-10-08): V-a failed, so the sender-armed dead-man is withdrawn
+
+**Evidence.** `docs/evidence/aut6/WP2_verify_first_2026-10-08.md` (commit 8dce1fe9 on `backlog/aut6wp2-2026-10-08`). Three live runs on fresh scratch topics on anonymous ntfy.sh tried `At:`, `In:`, the path sequence id, the `X-Sequence-ID` header, and DELETE. In every run, a same-id publish did **not** replace the pending message, and DELETE (HTTP 200) did **not** cancel it. Every scheduled message was delivered. The vendor documentation does not match the live server.
+
+**Consequence.** A sender-armed dead-man on anonymous ntfy.sh would page every day whatever the canary's health. A1, A2, A4 (heartbeat file), A5, A6, A8 V-a and A10 (first and second bullets) are therefore **withdrawn**. The A3 hygiene rules stay in force for any future sender: only a 2xx counts, the exception type is the only thing logged, and the httpx loggers are pinned to WARNING.
+
+**Ruling.**
+1. **The canary is built now, without a heartbeat.** WP2 delivers:
+   - the canary CLI, the retry gate, the suppression drill and the armed marker;
+   - `alerts_undeliverable` (#5);
+   - the unit, timer and bwrap row.
+
+   This is plan l.1162-1169 minus the absence rule. `schedule_deadman` is **not** built.
+2. **The absence rule is BLOCKED-EXTERNAL.** It needs an off-host dead-man endpoint whose absence check runs on the receiver (Path A): for example a healthchecks.io-style ping URL, or a self-hosted ntfy whose replace semantics have been verified. Only the operator can provision an account or host. When one exists:
+   - it goes in a separate env file, `~/.config/breezy/deadman.env`, under the key `BREEZY_DEADMAN_PING_URL`;
+   - it is a reviewed alert-egress change: the new host is added to the egress test by one row (ARCH §4.6);
+   - the canary pings it on each delivered 15:45Z canary.
+
+   This is recorded as residue for the operator, not as a question.
+3. **Interim coverage, stated honestly.**
+   - **What exists:**
+     - The 15:45Z, 16:30Z and 16:45Z canary messages arrive daily on the operator's device, so a missing daily canary is visible to a human.
+     - The `alerts_undeliverable` veto stops autonomy promotion when delivery fails.
+     - The AUT-6 health checks (#23, applying the X-8 rule) flag undelivered scheduled canary slots.
+   - **What is not covered:** a whole-host death pages nobody automatically.
+4. **Suppression drill.** The drill's live proof of the absence rule (the 16:15Z page) is deferred with item 2. The drill code is built, but no drill date is registered until the endpoint exists.
