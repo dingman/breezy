@@ -59,17 +59,22 @@ from scripts.analysis.fq_loss_floor_np_stat import (
     ALPHA_NOMINAL,
     DELTA_H1,
     E_PROJ,
+    POWER_SE_FORMULA,
+    TIES_EXACT,
     InformationReport,
+    bound_min_with_se,
     conditional_variance_table,
     count_summary,
     d1_decision,
-    discrete_critical_value,
+    d1_point_decision,
+    identity_at_recorded_carries,
+    identity_evidence,
     information_identity,
     json_float,
     log_lr_totals,
     mean_conditional_information,
+    np_power_report,
     realised_tick_counts,
-    rejection_rate,
     sqrt_boundary_rate,
 )
 from scripts.analysis.fq_mc_livedata import UnreachableTakeRate
@@ -81,9 +86,10 @@ _EVIDENCE = _REPO / "docs/evidence/f5/fq_loss_floor_mc_seed20261008.json"
 _STAT = Path(__file__).resolve().parent / "fq_loss_floor_np_stat.py"
 _BENCH = (8, 32)
 _TIES = (
-    "Discrete statistic: reject only when the log-likelihood ratio is strictly "
-    "above the critical value, so ties do not reject and the bound is conservative. "
-    "A +inf ratio always rejects."
+    f"{TIES_EXACT}. "
+    "c is the smallest H0 value with P0(L > c) ≤ α. "
+    "γ = (α·n0 − #{L0 > c}) / #{L0 == c}, clipped to [0, 1]. "
+    "Power = P1(L > c) + γ·P1(L == c). A +inf ratio always rejects."
 )
 _MIXSET = ("M-pool", "M-yes", "M-no")
 
@@ -223,8 +229,8 @@ def _score_row(
     alpha_eff = sqrt_boundary_rate(
         h0.paths, h0.cuts, n_days=n_days, t_k=t_k, c=c_binding, t_min=t_min
     )
-    crit_nominal = discrete_critical_value(h0_lr, ALPHA_NOMINAL)
-    crit_eff = discrete_critical_value(h0_lr, alpha_eff)
+    nominal = np_power_report(h0_lr, h1_lr, ALPHA_NOMINAL)
+    effective = np_power_report(h0_lr, h1_lr, alpha_eff)
     row: dict[str, Any] = {
         "epoch": epoch.isoformat(),
         "mix": mix,
@@ -233,11 +239,17 @@ def _score_row(
         "t_K": t_k,
         "N_e": count_summary(realised_tick_counts(h0.cuts, n_days)),
         "alpha_eff": alpha_eff,
-        "crit_alpha010": json_float(crit_nominal),
-        "crit_alpha_eff": json_float(crit_eff),
-        "np_bound_alpha010": rejection_rate(h1_lr, crit_nominal),
-        "np_bound_alpha_eff": rejection_rate(h1_lr, crit_eff),
-        "ties_conservative": True,
+        "crit_alpha010": json_float(nominal.c),
+        "crit_alpha_eff": json_float(effective.c),
+        "gamma_alpha010": nominal.gamma,
+        "gamma_alpha_eff": effective.gamma,
+        "h0_tail_alpha010": nominal.h0_tail,
+        "h0_tail_alpha_eff": effective.h0_tail,
+        "np_bound_alpha010": nominal.power,
+        "np_bound_alpha010_se": nominal.se,
+        "np_bound_alpha_eff": effective.power,
+        "np_bound_alpha_eff_se": effective.se,
+        "ties_conservative": TIES_EXACT,
     }
     if variances is not None:
         row["I_t"] = mean_conditional_information(
@@ -250,10 +262,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     prepared = _prepare(args)
     c_binding, t_min = _diagnostics(_EVIDENCE)
     amendment, _parent = _load_pins()
-    variances = None
-    if not prepared.identity["information_identity_holds"]:
-        preps = [prep for groups in prepared.pooled.values() for group in groups for prep in group]
-        variances = conditional_variance_table(preps)
     h0 = {
         mix: _family(prepared, mix, replicates=args.replicates, seed=args.seed, row="H0")
         for mix in MIXES
@@ -262,6 +270,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         mix: _family(prepared, mix, replicates=args.replicates, seed=args.seed, row="H1")
         for mix in MIXES
     }
+    carried = identity_at_recorded_carries(
+        tuple(path for family in (h0, h1) for mix in MIXES for path in family[mix].draws)
+    )
+    evidence = identity_evidence(prepared.identity, carried)
+    variances = None
+    if not evidence["information_identity_holds"]:
+        preps = [prep for groups in prepared.pooled.values() for group in groups for prep in group]
+        variances = conditional_variance_table(preps)
     rows: list[dict[str, Any]] = []
     config = prepared.config
     for epoch in epoch_grid(DEFAULT_FREEZE):
@@ -285,12 +301,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     variances=variances,
                 )
             )
-    bound_min = {
-        epoch: min(row["np_bound_alpha_eff"] for row in rows if row["epoch"] == epoch)
-        for epoch in dict.fromkeys(row["epoch"] for row in rows)
-    }
-    cutoff, decision = d1_decision(bound_min, e_proj=E_PROJ)
-    identity = prepared.identity
+    bound_min, bound_se = bound_min_with_se(rows)
+    cutoff, decision = d1_decision(bound_min, e_proj=E_PROJ, se=bound_se)
+    point = d1_point_decision(bound_min, e_proj=E_PROJ)[1]
     document: dict[str, Any] = {
         "seed": args.seed,
         "replicates": args.replicates,
@@ -307,16 +320,15 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "rate_gate": prepared.gate_rate,
         "p_gate": prepared.p_gate,
         "ties_note": _TIES,
-        "information_identity_holds": identity["information_identity_holds"],
-        "max_abs_mean_z": identity["max_abs_mean_z"],
-        "max_abs_second_moment_gap": identity["max_abs_second_moment_gap"],
+        "power_se_formula": POWER_SE_FORMULA,
+        **evidence,
         "rows": rows,
         "bound_min": bound_min,
+        "bound_min_se": bound_se,
         "np_reach_cutoff_e": cutoff,
         "d1": decision,
+        "d1_point": point,
     }
-    if "I_t" in identity:
-        document["I_t"] = identity["I_t"]
     return document
 
 

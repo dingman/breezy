@@ -1,26 +1,38 @@
 """Neyman–Pearson upper bound on G3 power (FQ-R8-2 Stage 0).
 
-The critical value is the H0 quantile. Ties are not rejected, so a finite-sample
-bound is conservative. A +inf likelihood ratio always rejects.
+The critical value c is the smallest H0 replicate with P0(L > c) ≤ α.
+The test is randomized on that atom, so the power is exact there rather than
+a lower bound. A +inf likelihood ratio always rejects.
 """
 
 from __future__ import annotations
 
 import math
 
-from scripts.analysis.fq_loss_floor_mc_draw import prepare_day
-from scripts.analysis.fq_loss_floor_mc_rows import StationDay, make_leg
+from scripts.analysis.fq_loss_floor_mc_draw import TickDraw, prepare_day
+from scripts.analysis.fq_loss_floor_mc_rows import StationDay, make_leg, make_station_day
+from scripts.analysis.fq_loss_floor_mc_sim import simulate_family
 from scripts.analysis.fq_loss_floor_np_stat import (
     DELTA_H1,
     E_PROJ,
+    POWER_SE_FORMULA,
+    TIES_EXACT,
+    bound_min_with_se,
     d1_decision,
+    d1_point_decision,
+    day_moments,
     discrete_critical_value,
+    identity_at_recorded_carries,
+    identity_evidence,
     information_identity,
     information_prefix,
     linear_s_threshold_power,
+    log_lr_totals,
     np_bound_power,
+    np_power_report,
     np_rejects,
     outcome_log_lr,
+    rejection_rate,
 )
 
 
@@ -88,8 +100,9 @@ def test_np_bound_is_at_least_the_linear_threshold_power() -> None:
     linear = linear_s_threshold_power(h0_s, h1_s, alpha)
     assert np_power >= linear
     assert np_power == 0.55
-    assert linear == 0.0
-    # The H0 quantile leaves the tie mass on the boundary unrejected.
+    # −S puts half the H0 mass on the atom and γ = 1/2, so linear power is 0.10.
+    assert math.isclose(linear, 0.1)
+    # The LR atom has γ = 0, so that tie stays unrejected.
     assert discrete_critical_value(h0_lr, alpha) == 0.0
 
 
@@ -135,3 +148,199 @@ def test_information_prefix_stops_at_min_t_k_and_realised_n() -> None:
     assert information_prefix(path, cuts, n_days=1, t_k=3) == (0, 1, 2)
     assert information_prefix(path, cuts, n_days=1, t_k=100) == (0, 1, 2, 3)
     assert information_prefix(path, cuts, n_days=2, t_k=6) == (0, 1, 2, 3, 4, 5)
+
+
+def test_atom_heavy_statistic_returns_the_randomized_power() -> None:
+    """Strict exceedance drops the atom. The randomized test adds γ·P1(L = c)."""
+    h0 = [0.0] * 80 + [1.0] * 15 + [2.0] * 5
+    h1 = [0.0] * 10 + [1.0] * 30 + [2.0] * 60
+    alpha = 0.10
+    # c = 1, #{L0 > 1} = 5, #{L0 = 1} = 15, γ = (10 − 5) / 15 = 1/3.
+    strict = rejection_rate(h1, discrete_critical_value(h0, alpha))
+    randomized = np_bound_power(h0, h1, alpha)
+    assert math.isclose(strict, 0.60)
+    assert randomized > strict
+    assert math.isclose(randomized, 0.70)
+    report = np_power_report(h0, h1, alpha)
+    assert math.isclose(report.c, 1.0)
+    assert math.isclose(report.gamma, 1.0 / 3.0)
+    assert report.h0_tail == 5
+    assert report.power == randomized
+    assert TIES_EXACT == "randomized NP test; exact at the atom"
+
+
+def test_tiny_alpha_with_an_empty_strict_tail_still_randomizes() -> None:
+    """floor(α·n) = 0 used to require a strict exceedance of the maximum."""
+    h0 = [0.0] * 19 + [3.0]
+    h1 = [3.0] * 20
+    alpha = 0.04
+    assert math.floor(alpha * len(h0)) == 0
+    # c = 3, nothing sits above it, γ = α·n / 1 = 0.8, and every H1 draw lands on c.
+    assert math.isclose(np_bound_power(h0, h1, alpha), 0.8)
+    report = np_power_report(h0, h1, alpha)
+    assert math.isclose(report.c, 3.0)
+    assert report.h0_tail == 0
+    assert math.isclose(report.gamma, 0.8)
+    assert math.isclose(report.power, 0.8)
+    assert rejection_rate(h1, report.c) == 0.0
+
+
+def test_all_zero_likelihood_paths_have_power_equal_to_alpha() -> None:
+    """N = 0 leaves L = 0 on every replicate. Randomization on that atom has power α."""
+    totals = log_lr_totals(
+        draws=((), (), (), ()),
+        cuts=((0,), (0,), (0,), (0,)),
+        n_days=1,
+        t_k=5,
+        delta=DELTA_H1,
+    )
+    assert totals == [0.0, 0.0, 0.0, 0.0]
+    assert math.isclose(np_bound_power(totals, totals, 0.10), 0.10)
+    report = np_power_report(totals, totals, 0.10)
+    assert report.h0_tail == 0
+    assert math.isclose(report.c, 0.0)
+    assert math.isclose(report.gamma, 0.10)
+    assert math.isclose(report.power, 0.10)
+    assert math.isclose(np_bound_power(totals, totals, 0.10), 0.10)
+
+
+def test_randomized_power_se_is_the_multinomial_delta_method() -> None:
+    """Conditional on (c, γ), SE = sqrt((mean(W²) − power²) / n1). +inf would weigh 1."""
+    h0 = [0.0] * 80 + [1.0] * 15 + [2.0] * 5
+    h1 = [0.0] * 10 + [1.0] * 30 + [2.0] * 60
+    gamma = (0.10 * 100 - 5) / 15
+    weights = [0.0] * 10 + [gamma] * 30 + [1.0] * 60
+    power = math.fsum(weights) / len(weights)
+    second = math.fsum(weight * weight for weight in weights) / len(weights)
+    se = math.sqrt((second - power * power) / len(weights))
+    report = np_power_report(h0, h1, 0.10)
+    assert math.isclose(report.power, power)
+    assert math.isclose(report.se, se)
+    assert "mean(W" in POWER_SE_FORMULA
+    assert "n1" in POWER_SE_FORMULA
+    # γ = 0 collapses W to a Bernoulli, so the SE is the binomial SE.
+    # c = 0, #{L0 > 0} = 5 = α·n, so the atom is not randomized.
+    certain = np_power_report([0.0] * 95 + [1.0] * 5, [0.0] * 10 + [1.0] * 40, 0.05)
+    binomial = math.sqrt(certain.power * (1.0 - certain.power) / 50)
+    assert math.isclose(certain.gamma, 0.0)
+    assert math.isclose(certain.power, 0.8)
+    assert math.isclose(certain.se, binomial)
+
+
+def test_constant_randomized_weight_reports_zero_standard_error() -> None:
+    """A constant W has variance 0. At n1 = 50_000 a naive sum goes past the 1e-12 clamp."""
+    n1 = 50_000
+    alpha = 0.9985
+    report = np_power_report((0.0,) * 8, (0.0,) * n1, alpha)
+    assert math.isclose(report.gamma, alpha)
+    assert math.isclose(report.power, alpha)
+    assert report.se == 0.0
+
+
+def test_d1_reach_adds_two_standard_errors_of_the_minimising_cell() -> None:
+    """A near-miss proceeds. The point rule, without the SE term, still fails it."""
+    rows = (
+        {
+            "epoch": "2026-11-01",
+            "mix": "M-pool",
+            "np_bound_alpha_eff": 0.27,
+            "np_bound_alpha_eff_se": 0.01,
+        },
+        {
+            "epoch": "2026-11-01",
+            "mix": "M-yes",
+            "np_bound_alpha_eff": 0.27,
+            "np_bound_alpha_eff_se": 0.02,
+        },
+        {
+            "epoch": "2026-11-01",
+            "mix": "M-no",
+            "np_bound_alpha_eff": 0.50,
+            "np_bound_alpha_eff_se": 0.20,
+        },
+        {
+            "epoch": "2026-12-01",
+            "mix": "M-pool",
+            "np_bound_alpha_eff": 0.25,
+            "np_bound_alpha_eff_se": 0.01,
+        },
+    )
+    bound, se = bound_min_with_se(rows)
+    assert bound == {"2026-11-01": 0.27, "2026-12-01": 0.25}
+    # The two minimizers tie; the screen uses the larger of their SEs, not M-no's.
+    assert se == {"2026-11-01": 0.02, "2026-12-01": 0.01}
+    cutoff, status = d1_decision(bound, e_proj=E_PROJ, se=se)
+    assert cutoff == "2026-11-01"
+    assert status == "PASS"
+    point_cutoff, point = d1_point_decision(bound, e_proj=E_PROJ)
+    assert point_cutoff is None
+    assert point == "FAIL"
+
+    # 0.27 + 2·0.01 = 0.29, still short of 0.30.
+    missed, missed_status = d1_decision(
+        {"2026-11-01": 0.27},
+        e_proj=E_PROJ,
+        se={"2026-11-01": 0.01},
+    )
+    assert missed is None
+    assert missed_status == "FAIL"
+
+    # Reaches only on an epoch before e_proj, so the cutoff is not a pass.
+    early, early_status = d1_decision(
+        {"2026-10-08": 0.28, "2026-11-01": 0.20},
+        e_proj=E_PROJ,
+        se={"2026-10-08": 0.02, "2026-11-01": 0.0},
+    )
+    assert early == "2026-10-08"
+    assert early_status == "FAIL"
+
+    # Equality at 0.30 after the two-SE lift is a reach.
+    exact, exact_status = d1_decision(
+        {"2026-11-01": 0.29},
+        e_proj=E_PROJ,
+        se={"2026-11-01": 0.005},
+    )
+    assert exact == "2026-11-01"
+    assert exact_status == "PASS"
+
+
+def test_nonzero_incoming_carry_fails_the_identity_and_the_check_detects_it() -> None:
+    """A quiet day's netting is the next tick's carry. Σ m z and Σ m z² move with it."""
+    quiet = prepare_day(make_station_day("KPHL", (), extra_netting=-0.3))
+    loud = prepare_day(_yes_day(0.50))
+    sim = simulate_family(
+        ((quiet, loud),),
+        replicates=1,
+        n_days=1,
+        p_keep=1.0,
+        seed=0,
+        row="H0",
+        record_draws=True,
+    )
+    assert len(sim.draws) == 1
+    assert len(sim.draws[0]) == 1
+    recorded = sim.draws[0][0]
+    assert isinstance(recorded, TickDraw)
+    assert recorded.prep.day == loud.day
+    assert math.isclose(recorded.carry, -0.3)
+
+    moments = day_moments(loud, carry=-0.3)
+    assert moments is not None
+    mean, second, _conditional = moments
+    carried = identity_at_recorded_carries(sim.draws)
+    assert carried["information_identity_holds"] is False
+    assert math.isclose(carried["max_abs_mean_z"], abs(mean))
+    assert math.isclose(carried["max_abs_var_minus_1"], abs(second - 1.0))
+    assert abs(mean) > 1e-9
+    assert abs(second - 1.0) > 1e-9
+
+    carry0 = information_identity([loud])
+    assert carry0["information_identity_holds"] is True
+    payload = identity_evidence(carry0, carried)
+    assert payload["identity_figures"] == "The figures pool the preps of all three mixes."
+    assert payload["information_identity_holds"] is False
+    assert payload["max_abs_mean_z"] == carried["max_abs_mean_z"]
+    assert payload["max_abs_var_minus_1"] == carried["max_abs_var_minus_1"]
+    assert payload["max_abs_mean_z_carry0"] <= 1e-9
+    assert payload["max_abs_var_minus_1_carry0"] <= 1e-9
+    assert "I_t" in payload

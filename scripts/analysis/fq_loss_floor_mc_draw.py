@@ -180,11 +180,16 @@ def invert_cdf(masses: Sequence[float], u: float) -> int:
 
 @dataclass(frozen=True, slots=True)
 class TickDraw:
-    """One ticking station-day's outcome. ``hs`` is set only for a Bernoulli draw."""
+    """One ticking station-day's outcome. ``hs`` is set only for a Bernoulli draw.
+
+    ``carry`` is the incoming carry ``step_clock`` saw. It is stored only when a
+    draw sink is attached, so leaving the sink off does not touch the RNG stream.
+    """
 
     prep: PreparedDay
     index: int | None
     hs: tuple[float, ...] | None
+    carry: float = 0.0
 
 
 def advance_prepared(
@@ -242,7 +247,7 @@ def advance_prepared(
                 shift -= pnl_scale * fraction * cost
     step = step_clock(_normalised(day.station, x_rand, shift, prep.variance), carry)
     if draw_sink is not None and step.is_tick and step.z is not None:
-        draw_sink.append(TickDraw(prep, drawn_index, drawn_hs))
+        draw_sink.append(TickDraw(prep, drawn_index, drawn_hs, carry))
     return step, carry, h1_fallback
 
 
