@@ -80,6 +80,10 @@ Offline and inert build stages proceed. Each row's exact live-stage boundary is 
 
 **Plan facts cited (step 9):** F-2 (no PASS under the veto), F-3 to F-5 (§R8-2 retirement unreachable; drawdown `halt_inert`), F-7 (KILL cannot fire before 2027-01-25), F-9 (the E-2 G3 figures) and F-12 (G3 is measured at realised N), all from plan r2 §Facts. Stage −1 and Stage 0 evidence are cited above.
 
+## Not built under this ruling
+
+- **F5 A2 (the calibration guard, r3 §5) is not built.** It only gates FQ v2's PASS path and its forward-shadow registration, and this ruling forecloses both. If a trigger re-opens FQ v2 or a successor, any guard is planned under that family's own prereg.
+
 ## What stays in force
 
 - The F6 composed veto and the F6 contract tests.
