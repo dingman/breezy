@@ -12,11 +12,17 @@ from scripts.analysis.fq_loss_floor_mc_gate import POOL_EXIT_FRACTION_SOURCE, ra
 from scripts.analysis.fq_mc_livedata import DayTemplate, PoolDay
 
 __all__ = [
+    "BISECTION_REL_TOL",
     "LAMBDA_POOL_DEFINITION",
     "POOL_EXIT_FRACTION_SOURCE",
     "PlannedRates",
+    "bisection_tolerance",
     "plan_floor_rates",
+    "split_p_keep_cap",
 ]
+
+#: ``calibrate_take_rate`` stops when ``|rate − target| < 0.02 * max(target, 0.1)``.
+BISECTION_REL_TOL = 0.02
 
 LAMBDA_POOL_DEFINITION = (
     "mean takes per climate day of build_templates at the model view's default "
@@ -42,6 +48,31 @@ def _ratios(templates: Sequence[DayTemplate]) -> tuple[float, float]:
 
 def _keep_raw(rate: float, r_sd: float, lambda_sd: float) -> float:
     return (rate / r_sd) / lambda_sd
+
+
+def bisection_tolerance(target: float = 1.0) -> float:
+    """Absolute tolerance of the take-rate bisection at ``target``."""
+    return BISECTION_REL_TOL * max(target, 0.1)
+
+
+def split_p_keep_cap(raw_cal: float, raw_gate: float) -> tuple[list[str], list[str]]:
+    """``(warnings, notes)``. A cap inside the bisection tolerance is only a note."""
+    tolerance = bisection_tolerance(1.0)
+    notes: list[str] = []
+    beyond = False
+    for raw in (raw_cal, raw_gate):
+        if raw <= 1.0:
+            continue
+        if abs(raw - 1.0) <= tolerance:
+            notes.append(f"achieved rate within bisection tolerance (raw={raw:.6f})")
+        else:
+            beyond = True
+    warnings: list[str] = []
+    if beyond:
+        warnings.append(
+            f"p_keep capped at 1; raw keep probability cal={raw_cal:.6f} gate={raw_gate:.6f}"
+        )
+    return warnings, notes
 
 
 @dataclass(frozen=True, slots=True)

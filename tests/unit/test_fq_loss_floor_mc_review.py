@@ -116,10 +116,9 @@ def test_lambda_pool_is_measured_before_either_calibration(monkeypatch: pytest.M
     )
     assert seen[0] == pytest.approx(DEFAULT_PI_FAV)
     assert planned.lambda_pool == pytest.approx(0.5)
-    assert planned.rate_cal == pytest.approx(0.5)
+    assert planned.rate_cal == pytest.approx(0.25)
     assert planned.rate_gate == pytest.approx(0.25)
-    assert planned.rate_cal != planned.rate_gate
-    assert planned.achieved_rate_cal == pytest.approx(0.5)
+    assert planned.achieved_rate_cal == pytest.approx(0.25)
     assert planned.achieved_rate_gate == pytest.approx(0.25)
     assert planned.definition == LAMBDA_POOL_DEFINITION
     assert 1.0 in seen  # the bisection starts at π = 1 only after the natural rate
@@ -147,7 +146,8 @@ def test_run_floor_emits_the_rate_fields_and_the_exit_source() -> None:
     ):
         assert key in document
     assert document["lambda_pool"] == pytest.approx(0.40)
-    assert document["rate_cal"] == pytest.approx(0.40)
+    assert document["rate_cal"] == pytest.approx(0.25)
+    assert document["rate_cal_rule"] == "E2"
     assert document["rate_gate"] == pytest.approx(0.25)
     assert document["lambda_pool_definition"] == LAMBDA_POOL_DEFINITION
     assert document["pool_exit_fraction_source"] == POOL_EXIT_FRACTION_SOURCE

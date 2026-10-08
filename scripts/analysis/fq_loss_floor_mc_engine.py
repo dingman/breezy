@@ -15,18 +15,21 @@ import numpy as np
 
 from breezy.analysis.fq_loss_stop_core import ALPHA_FLOOR_GRID
 from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, day_pool, prepare_day
+from scripts.analysis.fq_loss_floor_mc_e2 import blank_document, finish_e2, refused_names
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
+    RATE_CAL_RULE,
     FloorConfig,
-    FloorOutcome,
     epoch_grid,
     inclusive_days,
     keep_probability,
     rate_cal,
+    rate_cal_max,
     rate_gate,
     select_alpha,
 )
 from scripts.analysis.fq_loss_floor_mc_outer import apply_outer_se
+from scripts.analysis.fq_loss_floor_mc_rates import split_p_keep_cap
 from scripts.analysis.fq_loss_floor_mc_report import (
     evaluate_alpha,
     finish_document,
@@ -153,47 +156,6 @@ def _run(
     )
 
 
-def _refused_names(refused: Sequence[RefusedTemplate]) -> list[dict[str, object]]:
-    return [
-        {
-            "station": item.station,
-            "rungs": list(item.rungs),
-            "reason": item.reason,
-            "detail": item.detail,
-        }
-        for item in refused
-    ]
-
-
-def _blank(refused: Sequence[RefusedTemplate], *, seed: int, replicates: int) -> dict[str, object]:
-    detail = f"{len(refused)} station-day template(s) refused"
-    if not refused:
-        detail = "no admitted station-day remains after the template partition"
-    outcome = FloorOutcome(
-        None,
-        "none",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        freeze_blocked={"reason": "refused_templates", "detail": detail},
-    )
-    return {
-        "seed": seed,
-        "replicates": replicates,
-        "outcome": outcome.as_dict(),
-        "rows": [],
-        "gates": [],
-        "refused_count": len(refused),
-        "refused_templates": _refused_names(refused),
-        "max_abs_carry_over_sigma_next": 0.0,
-        "binding_cell": None,
-    }
-
-
 def run_floor(
     groups: Sequence[Sequence[StationDay]],
     *,
@@ -239,16 +201,13 @@ def run_floor(
         h1: Mapping[str, Mapping[str, float]],
         components: Mapping[str, Mapping[str, object]],
     ) -> dict[str, object]:
-        warnings = h1_warning_lines(h1)
-        if raw_cal > 1.0 or raw_gate > 1.0:
-            warnings.append(
-                f"p_keep capped at 1; raw keep probability cal={raw_cal:.6f} gate={raw_gate:.6f}"
-            )
+        cap_warnings, cap_notes = split_p_keep_cap(raw_cal, raw_gate)
+        warnings = [*h1_warning_lines(h1), *cap_warnings]
         document["script_git_sha"] = script_git_sha
         document["parent_sha"] = parent_sha
         document["a0_sha"] = a0_sha
         document["git_head"] = git_head
-        return stamp_run(
+        stamped = stamp_run(
             document,
             config=config,
             p_keep_cal=p_cal,
@@ -263,9 +222,12 @@ def run_floor(
             outer_replicates=outer_replicates,
             c_components=components,
         )
+        stamped["rate_cal_rule"] = RATE_CAL_RULE
+        stamped["p_keep_notes"] = cap_notes
+        return stamped
 
     if not admitted or not gate_admitted:
-        return _emit(_blank(refused, seed=seed, replicates=replicates), {}, {})
+        return _emit(blank_document(refused, seed=seed, replicates=replicates), {}, {})
     n_cal = inclusive_days(config.freeze, config.horizon)
     lengths = {
         day.isoformat(): inclusive_days(day, config.horizon) for day in epoch_grid(config.freeze)
@@ -359,19 +321,37 @@ def run_floor(
         c_template_sd=component.c_template_sd,
         c_template_quantiles=component.c_template_quantiles,
     )
-    if refused:
-        outcome = replace(
-            outcome,
-            floor_mode=None,
-            power_class="none",
-            c=None,
-            c_mc_se=None,
-            reach_cutoff_epoch_start=None,
-            freeze_blocked={
-                "reason": "refused_templates",
-                "detail": f"{len(refused)} station-day template(s) refused",
-            },
+    max_rate = rate_cal_max(config.lambda_pool, config.take_rate_lower)
+    sens_keep = keep_probability(max_rate, r_sd=r_cal, lambda_sd=l_cal)
+
+    def _drawn(row: str, mode: str, mix: str, t_min: int) -> np.ndarray:
+        sim = _run(
+            day_pool(row, mix, pooled=pooled, feasible=feasible),
+            replicates=replicates,
+            n_days=n_cal,
+            p_keep=sens_keep,
+            seed=_seed(seed, f"sens|{row}|{mode}|{mix}|{t_min}"),
+            row=row,
+            config=config,
+            rho=_rho(mode, config),
+            netting=True,
         )
+        return crit(sim, n_cal, t_min)
+
+    outcome = finish_e2(
+        outcome,
+        rows=rows,
+        adjusted=adjusted,
+        gates=gates,
+        freeze=config.freeze,
+        grid_last=grid[-1],
+        max_rate=max_rate,
+        cal_rate=cal_rate,
+        refused=bool(refused),
+        refused_detail=f"{len(refused)} station-day template(s) refused",
+        mixes=MIXES,
+        run_at=_drawn,
+    )
     carry = cal_sims[("H0", "none", "M-pool")]
     binding_cell: list[str] | None = None
     if outcome.c is not None and outcome.alpha_star is not None:
@@ -385,7 +365,7 @@ def run_floor(
             rows=rows,
             gates=gates,
             refused_count=len(refused),
-            refused_templates=_refused_names(refused),
+            refused_templates=refused_names(refused),
             binding_cell=binding_cell,
             carry_ratio=carry.max_abs_carry_over_sigma,
             mean_carry=carry.mean_carry,

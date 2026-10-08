@@ -83,7 +83,7 @@ def test_g3_floor_tracks_the_multiplier() -> None:
 
 
 def test_rates_and_keep_probability() -> None:
-    assert rate_cal(0.40, 0.25) == pytest.approx(0.40)
+    assert rate_cal(0.40, 0.25) == pytest.approx(0.25)
     assert rate_gate(0.40, 0.25) == pytest.approx(0.25)
     assert rate_cal(0.10, 0.25) == pytest.approx(0.25)
     assert rate_gate(0.10, 0.25) == pytest.approx(0.10)

@@ -26,6 +26,7 @@ __all__ = [
     "DELTAS",
     "HORIZON",
     "POOL_EXIT_FRACTION_SOURCE",
+    "RATE_CAL_RULE",
     "AlphaEval",
     "FloorConfig",
     "FloorOutcome",
@@ -39,6 +40,7 @@ __all__ = [
     "keep_probability",
     "margin_limit",
     "rate_cal",
+    "rate_cal_max",
     "rate_gate",
     "reach_cutoff",
     "repeated_crossing",
@@ -49,6 +51,8 @@ __all__ = [
 POOL_EXIT_FRACTION_SOURCE: Final = "unavailable; floor 0.10 binds"
 _FLOOR_MODES: Final = frozenset({"sqrt_boundary", "unreachable_veto"})
 _POWER_CLASSES: Final = frozenset({"edge_capable", "gross_loss_tripwire", "none"})
+_VETO_CAUSES: Final = frozenset({"g1_unreachable", "g3_floor"})
+RATE_CAL_RULE: Final = "E2"
 
 DEFAULT_FREEZE: Final = date(2026, 10, 8)
 HORIZON: Final = date(2027, 1, 25)
@@ -103,7 +107,17 @@ def fully_lost_fraction(z: float, *, c: float, t_low: int) -> float:
 
 
 def rate_cal(lambda_pool: float, take_rate_lower: float) -> float:
-    """``max(λ_pool, take_rate_lower)`` — more ticks, larger c (D5)."""
+    """D5-E2. The floor when λ_pool exceeds it; the max rule otherwise.
+
+    Both branches equal ``take_rate_lower``. The pre-E2 max is the sensitivity.
+    """
+    if lambda_pool > take_rate_lower:
+        return take_rate_lower
+    return max(lambda_pool, take_rate_lower)
+
+
+def rate_cal_max(lambda_pool: float, take_rate_lower: float) -> float:
+    """Non-binding row: ``max(λ_pool, take_rate_lower)``."""
     return max(lambda_pool, take_rate_lower)
 
 
@@ -195,6 +209,9 @@ class FloorOutcome:
     c_replicate_se: float | None = None
     c_template_sd: float | None = None
     c_template_quantiles: dict[str, float] | None = None
+    veto_cause: str | None = None
+    failing_mix: str | None = None
+    diagnostics: dict[str, float | int] | None = None
 
     def __post_init__(self) -> None:
         if self.power_class not in _POWER_CLASSES:
@@ -206,6 +223,12 @@ class FloorOutcome:
             raise ValueError(f"floor_mode {self.floor_mode!r} is not a spec mode")
         elif self.freeze_blocked is not None:
             raise ValueError("freeze_blocked requires floor_mode null")
+        if self.veto_cause is not None and self.veto_cause not in _VETO_CAUSES:
+            raise ValueError(f"veto_cause {self.veto_cause!r} is not a spec cause")
+        if self.floor_mode == "unreachable_veto" and self.veto_cause is None:
+            raise ValueError("unreachable_veto requires veto_cause")
+        if self.veto_cause is not None and self.floor_mode != "unreachable_veto":
+            raise ValueError("veto_cause requires unreachable_veto")
         if self.freeze_blocked is not None:
             reason, detail = self.freeze_blocked.get("reason"), self.freeze_blocked.get("detail")
             if not reason or not detail:
@@ -227,6 +250,9 @@ class FloorOutcome:
             "c_replicate_se": self.c_replicate_se,
             "c_template_sd": self.c_template_sd,
             "c_template_quantiles": self.c_template_quantiles,
+            "veto_cause": self.veto_cause,
+            "failing_mix": self.failing_mix,
+            "diagnostics": self.diagnostics,
         }
 
 
@@ -262,6 +288,7 @@ def select_alpha(evals: Sequence[AlphaEval]) -> FloorOutcome:
             measured_power=None,
             s6_feasible_rate=None,
             reach_cutoff_epoch_start=None,
+            veto_cause="g1_unreachable",
         )
     powers = dict(chosen.measured_power)
     if not rate_within_alpha(chosen.s6_rate, alpha=chosen.alpha, se=chosen.c_se):
@@ -301,6 +328,7 @@ def select_alpha(evals: Sequence[AlphaEval]) -> FloorOutcome:
         measured_power=powers,
         s6_feasible_rate=chosen.s6_rate,
         reach_cutoff_epoch_start=cutoff,
+        veto_cause="g3_floor" if mode == "unreachable_veto" else None,
     )
 
 
