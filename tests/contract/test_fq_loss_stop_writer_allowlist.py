@@ -63,6 +63,8 @@ _SHALLOW_SKIP: Final[str] = (
     "a shallow clone cannot prove the amendment was frozen only once"
 )
 
+pytestmark = pytest.mark.contract
+
 
 def _is_shallow_repository() -> bool:
     done = subprocess.run(
