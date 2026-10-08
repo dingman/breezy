@@ -178,3 +178,54 @@ def test_initial_trigger_found_unchanged_on_replayed_10_02_fixture(tmp_path: Pat
     active = module._replay_node_active_slugs(trigger.source, up_to_ns=trigger.ts_ns)
     assert len(active) == 60
     assert active[0] == "tc-temp-laxhigh-2026-10-02-gte85lt86f"
+
+
+# ---------------------------------------------------------------------------
+# Reader edge cases: chunk boundaries, CRLF, multi-byte characters across polls
+# ---------------------------------------------------------------------------
+
+_MULTIBYTE = "café € \U0001f600 done"
+
+
+def _edge_payload() -> bytes:
+    lines = [
+        _line("2026-10-03T16:50:48.000000000", _OTHER, "noise"),
+        _line("2026-10-03T16:50:49.000000000", _DATA_CLIENT, _MULTIBYTE),
+        _line("2026-10-03T16:50:50.000000000", _DATA_CLIENT, "second record"),
+    ]
+    crlf = [item.replace("\n", "\r\n") for item in lines]
+    return "".join(lines[:1] + crlf[1:2] + lines[2:]).encode("utf-8")
+
+
+def _summarise(state: FollowState, records: Any) -> tuple[Any, ...]:
+    cursors = {p.name: (c.offset, c.tail) for p, c in state.cursors.items()}
+    return cursors, [(r.ts_ns, r.component, r.message) for r in records]
+
+
+def test_chunked_read_equals_one_shot_read_for_straddling_crlf_and_multibyte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "breezy-trade-20261003T165045Z.log"
+    path.write_bytes(_edge_payload())
+    state, records, _ = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+    expected = _summarise(state, records)
+    assert [r.message for r in records] == [_MULTIBYTE, "second record"]
+
+    for size in (1, 2, 3, 5, 7, 16):
+        monkeypatch.setattr(module, "READ_CHUNK_BYTES", size)
+        state, records, _ = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+        assert _summarise(state, records) == expected, size
+
+
+def test_multibyte_char_split_across_two_polls_is_not_corrupted(tmp_path: Path) -> None:
+    path = tmp_path / "breezy-trade-20261003T165045Z.log"
+    payload = _edge_payload()
+    cut = payload.index("€".encode()) + 1  # mid-way through the 3-byte euro sign
+    path.write_bytes(payload[:cut])
+    state, first, _ = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+    with open(path, "ab") as fh:
+        fh.write(payload[cut:])
+
+    state, second, _ = poll_node_logs_once(tmp_path, state, since_ns=_SINCE_NS)
+
+    assert [r.message for r in (*first, *second)] == [_MULTIBYTE, "second record"]

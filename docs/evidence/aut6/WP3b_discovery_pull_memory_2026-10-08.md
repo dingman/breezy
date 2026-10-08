@@ -60,3 +60,8 @@ pushed into swap; the new ceilings sit above the measured peak.
 - The script's own deadline is still `RELAUNCH_DEADLINE` 17:12Z, so a 17:12 start succeeds only because the node's
   initial summary has been in its log since the ~16:50Z spawn (the first poll finds it); a node that has not launched by
   17:12 yields the existing exit-0 NO-PULL day.
+
+## Venue phase (unmeasured by the fresh-child runs)
+
+The venue pages the pull records were measured on disk at about 194 KB (`data/evidence/discovery_set_equality/2026-10-0{5,6,7}_pages.json`),
+so the unmeasured venue phase is negligible against the 460M/512M ceilings. Capped-run MemorySwapPeak is still owed at activation.

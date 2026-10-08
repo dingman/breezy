@@ -183,21 +183,23 @@ def _record_from_line(path: Path, raw_line: str) -> NodeLogRecord | None:
     )
 
 
-def _read_new_lines(path: Path, offset: int, carry: str) -> tuple[list[NodeLogRecord], int, str]:
+def _read_new_lines(path: Path, offset: int) -> tuple[list[NodeLogRecord], int]:
     """Read ``path`` from ``offset`` in :data:`READ_CHUNK_BYTES` chunks and
-    return ``(kept records, new offset, unconsumed partial-line text)``.
+    return ``(kept records, new offset)``.
 
     Peak memory is one chunk plus the longest line, never the file (G12).
-    Chunks are split on the newline BYTE so a multi-byte character cut by a
-    chunk edge is decoded whole.
+    Chunks are split on the newline BYTE and only complete lines are decoded;
+    the new offset stops just after the last newline, so a trailing partial
+    line (and any multi-byte character cut by it) is re-read from disk whole
+    on the next poll -- nothing is decoded lossily and no tail is carried.
     """
     records: list[NodeLogRecord] = []
-    pending = carry.encode("utf-8")
-    consumed = 0
+    pending = b""
+    read_total = 0
     with open(path, "rb") as fh:
         fh.seek(offset)
         while chunk := fh.read(READ_CHUNK_BYTES):
-            consumed += len(chunk)
+            read_total += len(chunk)
             pending += chunk
             *lines, pending = pending.split(b"\n")
             for raw in lines:
@@ -205,7 +207,7 @@ def _read_new_lines(path: Path, offset: int, carry: str) -> tuple[list[NodeLogRe
                     record = _record_from_line(path, raw_line)
                     if record is not None:
                         records.append(record)
-    return records, offset + consumed, pending.decode("utf-8", errors="replace")
+    return records, offset + read_total - len(pending)
 
 
 def poll_node_logs_once(
@@ -214,9 +216,9 @@ def poll_node_logs_once(
     """One poll: read newly appended, COMPLETE lines from every
     ``NODE_LOG_GLOB`` file under ``log_dir``.
 
-    F2: a line split across two polls is buffered whole (the byte offset
-    still advances past it -- only the in-memory ``tail`` carries the
-    unconsumed partial text -- so nothing is re-read from disk). A file
+    F2: a line split across two polls is never consumed: the offset stops
+    after the last newline and the partial line is re-read whole next poll
+    (``FileCursor.tail`` is therefore always empty). A file
     whose size shrank since the last poll is TRUNCATED: its cursor resets to
     a fresh read from byte 0 and the path is reported in the third element.
 
@@ -241,14 +243,12 @@ def poll_node_logs_once(
             new_cursors[path] = FileCursor(offset=size, tail="")
             continue
         offset = prior.offset if prior is not None else 0
-        carry = prior.tail if prior is not None else ""
         if size < offset:
             truncated.add(path)
             offset = 0
-            carry = ""
-        kept, new_offset, tail = _read_new_lines(path, offset, carry)
+        kept, new_offset = _read_new_lines(path, offset)
         records.extend(kept)
-        new_cursors[path] = FileCursor(offset=new_offset, tail=tail)
+        new_cursors[path] = FileCursor(offset=new_offset, tail="")
     return FollowState(cursors=new_cursors), tuple(records), frozenset(truncated)
 
 
