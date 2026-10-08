@@ -812,19 +812,35 @@ def _select_depth_frames(
     return catalog_frames, "catalog"
 
 
-def _quote_tape_bucket_by_instrument(catalog_root: Path) -> dict[str, WeatherBucketFacts]:
+def _quote_tape_bucket_by_instrument(
+    catalog_root: Path, instrument_ids: Sequence[str],
+) -> dict[str, WeatherBucketFacts]:
     """Fallback instrument-definition source: the FLAT quote-tape catalog
     the live trading node itself writes to. Measured 2026-09-16: the
     per-station settlement catalog (``_read_bucket_facts_by_instrument_id``'s
     normal source) holds zero instrument definitions in this environment --
     only the quote-tape catalog carries them. Reuses ``read_weather_bucket
-    _facts`` (never re-derives the rung math) over the SAME unfiltered
-    ``catalog.instruments()`` read ``_read_bucket_facts_by_instrument_id``
-    itself uses, for the identical BinaryOption-identifier-filter reason
-    (score_live_trials.py's own docstring, review item 7)."""
+    _facts`` (never re-derives the rung math), for the identical
+    BinaryOption-identifier-filter reason ``_read_bucket_facts_by_instrument_id``
+    uses (score_live_trials.py's own docstring, review item 7).
+
+    EXITSTUDY-MEM (2026-10-08): loads ONLY ``instrument_ids`` through
+    ``ParquetDataCatalog.instruments(instrument_ids=...)``. The unfiltered
+    read materialised every instrument in the catalog (~131k, +120 files a
+    day; 1.57 GB RSS) and stalled the 1G-capped unit in memory reclaim. The
+    only consumer is ``_resolved_trial``'s lookup by ``trial.instrument_id``,
+    so the output for the ids asked for is unchanged. An empty request
+    reads nothing.
+    """
+    wanted = frozenset(instrument_ids)
+    if not wanted:
+        return {}
     catalog = ParquetDataCatalog(str(catalog_root))
     facts: dict[str, WeatherBucketFacts] = {}
-    for instrument in catalog.instruments():
+    for instrument in catalog.instruments(instrument_ids=sorted(wanted)):
+        key = str(instrument.id)
+        if key not in wanted:
+            continue
         try:
             resolved = read_weather_bucket_facts(instrument.info)
         except Exception as exc:  # noqa: BLE001 -- a non-weather instrument is skipped, not fatal
@@ -832,7 +848,7 @@ def _quote_tape_bucket_by_instrument(catalog_root: Path) -> dict[str, WeatherBuc
                 "skipping non-weather instrument %s: %s", instrument.id, exc,
             )
             continue
-        facts.setdefault(str(instrument.id), resolved)
+        facts.setdefault(key, resolved)
     return facts
 
 
@@ -1031,9 +1047,6 @@ def run_exit_window_study(
     scored_by_trial_id = {
         trial.trial_id: trial for trial in read_scored_trials_pooled(scored_trials_dir).rows
     }
-    #: Built once, shared across every city (module docstring's fallback note).
-    quote_tape_bucket_by_instrument = _quote_tape_bucket_by_instrument(catalog_root)
-
     rows: list[PositionExitRow] = []
     missing: list[str] = []
     #: Stations whose ASOS text loaded (cache hit or a successful fetch) versus
@@ -1093,6 +1106,12 @@ def run_exit_window_study(
             #: empty) per-station settlement catalog never received.
             settlement_catalog_bucket_by_instrument = _read_bucket_facts_by_instrument_id(
                 DEFAULT_SETTLEMENT_CATALOG, venue=_VENUE, city=city,
+            )
+            #: Built per city from ONLY this city's unresolved trial ids
+            #: (module docstring's fallback note; EXITSTUDY-MEM).
+            quote_tape_bucket_by_instrument = _quote_tape_bucket_by_instrument(
+                catalog_root,
+                [t.instrument_id for t in trials if t.bucket is None],
             )
             bucket_by_instrument = {
                 **quote_tape_bucket_by_instrument,
