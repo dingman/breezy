@@ -48,6 +48,11 @@ _PAYLOADS: Final[dict[str, frozenset[str]]] = {
     "F5_prereg_v2_A1_floor": frozenset({"loss_stop_floor"}),
     "F5_prereg_v2_A2_guard": frozenset({"guard", "guard_basis"}),
 }
+_AMENDMENT_FILENAME: Final[dict[str, str]] = {
+    _A0_ID: "F5_prereg_v2_amendment_A0.json",
+    "F5_prereg_v2_A1_floor": "F5_prereg_v2_amendment_A1.json",
+    "F5_prereg_v2_A2_guard": "F5_prereg_v2_amendment_A2.json",
+}
 _EARLIER: Final[dict[str, tuple[str, ...]]] = {
     _A0_ID: (),
     "F5_prereg_v2_A1_floor": ("F5_prereg_v2_amendment_A0.json",),
@@ -217,7 +222,8 @@ def _check_additive(
     defects: list[Defect] = []
     occupied = _occupied(amendment)
     if parent is not None:
-        overlap = occupied & set(parent)
+        # Top-level keys, plus one level of nested keys (for example haircut.ticks).
+        overlap = occupied & (set(parent) | _occupied(parent))
         if overlap:
             defects.append(
                 Defect("KEY_OVERLAP", f"payload keys overlap the parent: {sorted(overlap)}")
@@ -244,7 +250,8 @@ def _check_freeze(path: Path, amendment: Mapping[str, Any], *, draft: bool) -> l
 
 
 def _mismatch(name: str, value: Any, expected: Sequence[Any]) -> Defect | None:
-    if all(value == item for item in expected):
+    # `==` alone accepts True for 1 and 5.0 for 5; each pin must match the constant's type.
+    if all(type(value) is type(item) and value == item for item in expected):
         return None
     return Defect(
         "KILL_MISMATCH", f"{name} must equal the imported KILL constant(s), got {value!r}"
@@ -315,11 +322,28 @@ def _check_payload(amendment: Mapping[str, Any]) -> list[Defect]:
     return []
 
 
+def _check_amendment_filename(path: Path, amendment: Mapping[str, Any]) -> list[Defect]:
+    """The basename is ``F5_prereg_v2_amendment_{A0|A1|A2}.json`` for a known id."""
+    amendment_id = amendment.get("amendment_id")
+    if not isinstance(amendment_id, str):
+        return []
+    expected = _AMENDMENT_FILENAME.get(amendment_id)
+    if expected is None or path.name == expected:
+        return []
+    return [
+        Defect(
+            "BAD_AMENDMENT_FILENAME",
+            f"file name must be {expected} for amendment_id {amendment_id!r}, got {path.name!r}",
+        )
+    ]
+
+
 def _collect(path: Path, amendment: Mapping[str, Any], *, draft: bool) -> list[Defect]:
     parent_defects, parent = _check_parent(path, amendment)
     return [
         *parent_defects,
         *_check_envelope(amendment),
+        *_check_amendment_filename(path, amendment),
         *_check_additive(path, amendment, parent),
         *_check_freeze(path, amendment, draft=draft),
         *_check_payload(amendment),

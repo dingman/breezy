@@ -30,6 +30,12 @@ _PLAN = REPO_ROOT / "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04"
 _PARENT = _PLAN / "F5_prereg_v2_design.json"
 _A0 = _PLAN / "F5_prereg_v2_amendment_A0.json"
 _A0_ID = "F5_prereg_v2_A0_kill"
+_A0_NAME = "F5_prereg_v2_amendment_A0.json"
+_A1_NAME = "F5_prereg_v2_amendment_A1.json"
+_SHALLOW_SKIP = (
+    "git rev-parse --is-shallow-repository returned true; "
+    "a shallow clone cannot prove the amendment was frozen only once"
+)
 _ENVELOPE = frozenset({"frozen_sha", "amendment_id", "amends", "provenance"})
 _KILL_KEYS = frozenset(
     {
@@ -119,7 +125,18 @@ def _a0_body(parent_rel: str, parent_sha: str, **kill_overrides: Any) -> dict[st
     }
 
 
-def _frozen_pair(tmp: Path, *, amendment_rel: str = "amendment.json") -> tuple[Path, Path]:
+def _is_shallow_repository() -> bool:
+    done = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.stdout.strip() == "true"
+
+
+def _frozen_pair(tmp: Path, *, amendment_rel: str = _A0_NAME) -> tuple[Path, Path]:
     repo = tmp / "repo"
     _init(repo)
     _, parent_sha = _freeze(repo, "design.json", _parent_body())
@@ -132,7 +149,7 @@ def _ready_draft(tmp: Path) -> tuple[Path, Path, dict[str, Any]]:
     _init(repo)
     _, parent_sha = _freeze(repo, "design.json", _parent_body())
     payload = {**_a0_body("design.json", parent_sha), "frozen_sha": UNFROZEN}
-    path = repo / "amendment.json"
+    path = repo / _A0_NAME
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return repo, path, payload
 
@@ -154,7 +171,7 @@ def test_unfrozen_amendment_is_refused_by_loader(tmp_path: Path) -> None:
 def test_amendment_exits_0_when_frozen_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _repo, path = _frozen_pair(tmp_path, amendment_rel="nested/amendment.json")
+    _repo, path = _frozen_pair(tmp_path, amendment_rel=f"nested/{_A0_NAME}")
     chk = _chk()
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -201,10 +218,10 @@ def test_amendment_refrozen_is_refused(tmp_path: Path) -> None:
     body = json.loads(path.read_text(encoding="utf-8"))
     body["provenance"] = {"note": "second freeze"}
     body["frozen_sha"] = _git(repo, "rev-parse", "HEAD")
-    _commit_json(repo, "amendment.json", body)
+    _commit_json(repo, _A0_NAME, body)
 
     defects = _chk().validate_amendment(path)
-    assert any(d.code == "REFROZEN" and "amendment.json" in d.message for d in defects)
+    assert any(d.code == "REFROZEN" and _A0_NAME in d.message for d in defects)
 
 
 def test_edit_after_the_stamp_is_refused(tmp_path: Path) -> None:
@@ -214,7 +231,7 @@ def test_edit_after_the_stamp_is_refused(tmp_path: Path) -> None:
     _commit_json(repo, path.relative_to(repo).as_posix(), body)
 
     defects = _chk().validate_amendment(path)
-    assert any(d.code == "REFROZEN" and "amendment.json" in d.message for d in defects)
+    assert any(d.code == "REFROZEN" and _A0_NAME in d.message for d in defects)
 
 
 def test_shallow_clone_is_refused(tmp_path: Path) -> None:
@@ -267,7 +284,7 @@ def test_payload_key_equal_to_an_a0_key_inside_a1_is_refused(tmp_path: Path) -> 
         "loss_stop_floor": {"kill_grid_points": cs.KILL_GRID_POINTS},
         "provenance": {},
     }
-    path = repo / "a1.json"
+    path = repo / _A1_NAME
     _write(path, a1)
 
     defects = _chk().validate_amendment(path, draft=True)
@@ -361,8 +378,135 @@ def test_F5_prereg_v2_A0_kill_content_digest_pinned() -> None:
     assert content_digest(amendment) == _A0_CONTENT_DIGEST
 
 
+@pytest.mark.skipif(_is_shallow_repository(), reason=_SHALLOW_SKIP)
 @pytest.mark.xfail(strict=True, reason="stamped at freeze")
 def test_a0_loads_through_load_verified_amendment() -> None:
     loaded = _chk().load_verified_amendment(_A0, _A0_ID)
     assert loaded["amendment_id"] == _A0_ID
     assert loaded["frozen_sha"] != UNFROZEN
+
+
+def _copied_a0_kill() -> dict[str, Any]:
+    """Detached copy of the on-disk A0 kill object. The file itself is never written."""
+    kill = json.loads(_A0.read_text(encoding="utf-8"))["kill"]
+    assert isinstance(kill, dict)
+    return dict(kill)
+
+
+_KILL_MUTATIONS = (
+    ("kill_grid_points", cs.KILL_GRID_POINTS + 1),
+    ("kill_lambda_max", cs.KILL_MAX_LAMBDA / 2),
+    ("kill_prior_pseudo_days", cs.PRIOR_PSEUDO_DAYS + 1),
+    ("kill_prior_second_moment", cs.PRIOR_SECOND_MOMENT / 2),
+    ("kill_min_range", cs._MIN_RANGE / 2),
+    ("kill_var_floor", cs._VAR_FLOOR * 10),
+)
+
+
+@pytest.mark.parametrize(("field", "bad"), _KILL_MUTATIONS)
+def test_mutated_kill_constant_is_kill_mismatch(field: str, bad: Any) -> None:
+    kill = _copied_a0_kill()
+    kill[field] = bad
+    defects = _chk()._check_kill(kill)
+    assert [d.code for d in defects] == ["KILL_MISMATCH"]
+
+
+def test_added_kill_key_is_bad_kill() -> None:
+    kill = _copied_a0_kill()
+    kill["not_a_kill_field"] = 1
+    assert [d.code for d in _chk()._check_kill(kill)] == ["BAD_KILL"]
+
+
+def test_removed_kill_key_is_bad_kill() -> None:
+    kill = _copied_a0_kill()
+    del kill["kill_bar_rule"]
+    assert [d.code for d in _chk()._check_kill(kill)] == ["BAD_KILL"]
+
+
+def test_blank_kill_rule_is_bad_kill_rule() -> None:
+    kill = _copied_a0_kill()
+    kill["kill_betting_rule"] = ""
+    assert [d.code for d in _chk()._check_kill(kill)] == ["BAD_KILL_RULE"]
+
+
+def test_bool_kill_prior_pseudo_days_is_kill_mismatch() -> None:
+    kill = _copied_a0_kill()
+    kill["kill_prior_pseudo_days"] = True
+    assert [d.code for d in _chk()._check_kill(kill)] == ["KILL_MISMATCH"]
+
+
+def test_float_kill_grid_points_is_kill_mismatch() -> None:
+    kill = _copied_a0_kill()
+    kill["kill_grid_points"] = 5.0
+    assert [d.code for d in _chk()._check_kill(kill)] == ["KILL_MISMATCH"]
+
+
+def test_unknown_amendment_id_is_bad_amendment_id(tmp_path: Path) -> None:
+    _repo, path, payload = _ready_draft(tmp_path)
+    payload["amendment_id"] = "not-a-real-amendment"
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert [d.code for d in defects] == ["BAD_AMENDMENT_ID"]
+
+
+def test_parent_sha_mismatch_is_refused(tmp_path: Path) -> None:
+    _repo, path, payload = _ready_draft(tmp_path)
+    payload["amends"] = {**payload["amends"], "frozen_sha": "0" * 40}
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert [d.code for d in defects] == ["PARENT_SHA_MISMATCH"]
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("/etc/passwd", id="absolute"),
+        pytest.param("../outside.json", id="dotdot"),
+        pytest.param(1, id="non-string"),
+    ],
+)
+def test_bad_amends_path_is_refused(tmp_path: Path, rel: Any) -> None:
+    _repo, path, payload = _ready_draft(tmp_path)
+    payload["amends"] = {**payload["amends"], "path": rel}
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert [d.code for d in defects] == ["BAD_AMENDS"]
+
+
+def test_amends_symlink_escape_is_bad_amends(tmp_path: Path) -> None:
+    repo, path, payload = _ready_draft(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}\n", encoding="utf-8")
+    (repo / "escape.json").symlink_to(outside)
+    payload["amends"] = {**payload["amends"], "path": "escape.json"}
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert [d.code for d in defects] == ["BAD_AMENDS"]
+
+
+def test_missing_parent_is_parent_unreadable(tmp_path: Path) -> None:
+    _repo, path, payload = _ready_draft(tmp_path)
+    payload["amends"] = {**payload["amends"], "path": "missing-parent.json"}
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert [d.code for d in defects] == ["PARENT_UNREADABLE"]
+
+
+def test_filename_must_match_amendment_id(tmp_path: Path) -> None:
+    from scripts.analysis.multisource_blend_refusal import Refusal
+
+    _repo, path = _frozen_pair(tmp_path, amendment_rel="amendment.json")
+    chk = _chk()
+    defects = chk.validate_amendment(path)
+    assert [d.code for d in defects] == ["BAD_AMENDMENT_FILENAME"]
+    assert chk.main([str(path)]) == 1
+    with pytest.raises(Refusal, match=r"\[BAD_AMENDMENT_FILENAME\]"):
+        chk.load_verified_amendment(path, _A0_ID)
+
+
+def test_payload_key_equal_to_nested_parent_key_is_refused(tmp_path: Path) -> None:
+    _repo, path, payload = _ready_draft(tmp_path)
+    payload["kill"] = _kill(ticks=1)
+    _write(path, payload)
+    defects = _chk().validate_amendment(path, draft=True)
+    assert any(d.code == "KEY_OVERLAP" and "ticks" in d.message for d in defects)
