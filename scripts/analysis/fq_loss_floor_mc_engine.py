@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 import numpy as np
 
 from breezy.analysis.fq_loss_stop_core import ALPHA_FLOOR_GRID
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, prepare_day
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, prepare_day
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
     FloorConfig,
@@ -25,7 +26,16 @@ from scripts.analysis.fq_loss_floor_mc_gate import (
     rate_gate,
     select_alpha,
 )
-from scripts.analysis.fq_loss_floor_mc_report import evaluate_alpha, finish_document
+from scripts.analysis.fq_loss_floor_mc_outer import apply_outer_se
+from scripts.analysis.fq_loss_floor_mc_report import (
+    evaluate_alpha,
+    finish_document,
+    h1_fallback_table,
+    h1_warning_lines,
+    kappa_fallback_share,
+    stamp_run,
+    ticking_share,
+)
 from scripts.analysis.fq_loss_floor_mc_rows import (
     RefusedTemplate,
     StationDay,
@@ -77,7 +87,6 @@ def _partition(
 def prepare_mix_groups(
     groups: Sequence[Sequence[StationDay]], mix: str, *, s6: bool
 ) -> list[list[PreparedDay]]:
-    """Mix filter, then one :func:`prepare_day`. S6 drops overround and netting."""
     prepared: list[list[PreparedDay]] = []
     for group in groups:
         preps: list[PreparedDay] = []
@@ -89,7 +98,8 @@ def prepare_mix_groups(
                 mixed = StationDay(mixed.station, mixed.legs, 0.0)
             elif not mixed.legs and mixed.netting == 0.0:
                 continue
-            preps.append(prepare_day(mixed, deltas=DELTAS))
+            if clock_block(mixed) is None:
+                preps.append(prepare_day(mixed, deltas=DELTAS))
         prepared.append(preps)
     return prepared
 
@@ -155,7 +165,21 @@ def _refused_names(refused: Sequence[RefusedTemplate]) -> list[dict[str, object]
 
 
 def _blank(refused: Sequence[RefusedTemplate], *, seed: int, replicates: int) -> dict[str, object]:
-    outcome = FloorOutcome("refused_templates", "none", None, None, None, None, None, None, None)
+    detail = f"{len(refused)} station-day template(s) refused"
+    if not refused:
+        detail = "no admitted station-day remains after the template partition"
+    outcome = FloorOutcome(
+        None,
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        freeze_blocked={"reason": "refused_templates", "detail": detail},
+    )
     return {
         "seed": seed,
         "replicates": replicates,
@@ -180,8 +204,10 @@ def run_floor(
     parent_sha: str | None = None,
     a0_sha: str | None = None,
     git_head: str | None = None,
+    gate_groups: Sequence[Sequence[StationDay]] | None = None,
+    outer_resamples: int = 0,
+    outer_replicates: int = 2000,
 ) -> dict[str, object]:
-    """Every row, every gate row, and the §4.6 outcome. Refusals are not dropped."""
     if replicates < 1:
         raise ValueError(f"replicates must be positive, got {replicates}")
     grid = tuple(alphas) if alphas is not None else ALPHA_FLOOR_GRID
@@ -189,18 +215,56 @@ def run_floor(
         if not any(math.isclose(alpha, item, abs_tol=1e-9) for item in ALPHA_FLOOR_GRID):
             raise ValueError(f"alpha {alpha} is not on {ALPHA_FLOOR_GRID}")
     cleaned, refused = _partition(groups)
+    if gate_groups is None:
+        gate_cleaned: tuple[tuple[StationDay, ...], ...] = cleaned
+    else:
+        gate_cleaned, gate_refused = _partition(gate_groups)
+        refused = (*refused, *gate_refused)
     admitted = [day for group in cleaned for day in group]
-    if not admitted:
-        document = _blank(refused, seed=seed, replicates=replicates)
+    gate_admitted = [day for group in gate_cleaned for day in group]
+    r_cal = config.r_sd if config.r_sd_cal is None else config.r_sd_cal
+    l_cal = config.lambda_sd if config.lambda_sd_cal is None else config.lambda_sd_cal
+    cal_rate = rate_cal(config.lambda_pool, config.take_rate_lower)
+    gate_rate = rate_gate(config.lambda_pool, config.take_rate_lower)
+    p_cal = keep_probability(cal_rate, r_sd=r_cal, lambda_sd=l_cal)
+    p_gate = keep_probability(gate_rate, r_sd=config.r_sd, lambda_sd=config.lambda_sd)
+    raw_cal = (cal_rate / r_cal) / l_cal
+    raw_gate = (gate_rate / config.r_sd) / config.lambda_sd
+    tick_share = ticking_share(gate_cleaned)
+    kappa_share = kappa_fallback_share(admitted)
+
+    def _emit(
+        document: dict[str, object],
+        h1: Mapping[str, Mapping[str, float]],
+        components: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        warnings = h1_warning_lines(h1)
+        if raw_cal > 1.0 or raw_gate > 1.0:
+            warnings.append(
+                f"p_keep capped at 1; raw keep probability cal={raw_cal:.6f} gate={raw_gate:.6f}"
+            )
         document["script_git_sha"] = script_git_sha
         document["parent_sha"] = parent_sha
         document["a0_sha"] = a0_sha
         document["git_head"] = git_head
-        return document
-    cal_rate = rate_cal(config.lambda_pool, config.take_rate_lower)
-    gate_rate = rate_gate(config.lambda_pool, config.take_rate_lower)
-    p_cal = keep_probability(cal_rate, r_sd=config.r_sd, lambda_sd=config.lambda_sd)
-    p_gate = keep_probability(gate_rate, r_sd=config.r_sd, lambda_sd=config.lambda_sd)
+        return stamp_run(
+            document,
+            config=config,
+            p_keep_cal=p_cal,
+            p_keep_gate=p_gate,
+            p_keep_cal_raw=raw_cal,
+            p_keep_gate_raw=raw_gate,
+            kappa_share=kappa_share,
+            tick_share=tick_share,
+            h1_by_delta=h1,
+            warnings=warnings,
+            outer_resamples=outer_resamples,
+            outer_replicates=outer_replicates,
+            c_components=components,
+        )
+
+    if not admitted or not gate_admitted:
+        return _emit(_blank(refused, seed=seed, replicates=replicates), {}, {})
     n_cal = inclusive_days(config.freeze, config.horizon)
     lengths = {
         day.isoformat(): inclusive_days(day, config.horizon) for day in epoch_grid(config.freeze)
@@ -208,6 +272,7 @@ def run_floor(
     n_gate = max(lengths.values(), default=0)
     pooled = {mix: prepare_mix_groups(cleaned, mix, s6=False) for mix in MIXES}
     feasible = {mix: prepare_mix_groups(cleaned, mix, s6=True) for mix in MIXES}
+    gate_pooled = {mix: prepare_mix_groups(gate_cleaned, mix, s6=False) for mix in MIXES}
     cal_sims: dict[tuple[str, str, str], Simulation] = {}
     for row, mode in _CAL:
         for mix in MIXES:
@@ -225,7 +290,7 @@ def run_floor(
             )
     gate_sims = {
         (delta, mix): _run(
-            pooled[mix],
+            gate_pooled[mix],
             replicates=replicates,
             n_days=n_gate,
             p_keep=p_gate,
@@ -265,45 +330,70 @@ def run_floor(
             config=config,
             lengths=lengths,
             p_gate=p_gate,
-            cleaned=cleaned,
+            cleaned=gate_cleaned,
             feasible=feasible,
             seed=seed,
             rows=rows,
             gates=gates,
+            tick_share=tick_share,
         )
         evals.append(evaluation)
         solved_cell[alpha] = cell
-    outcome = select_alpha(evals)
+    adjusted, components = apply_outer_se(
+        evals,
+        groups=cleaned,
+        resamples=outer_resamples,
+        replicates=outer_replicates,
+        n_days=n_cal,
+        p_keep=p_cal,
+        seed_for=lambda label: _seed(seed, label),
+        config=config,
+    )
+    outcome = select_alpha(adjusted)
+    chosen_alpha = outcome.alpha_star if outcome.alpha_star is not None else adjusted[0].alpha
+    component = components[f"{chosen_alpha:.2f}"]
+    outcome = replace(
+        outcome,
+        c_replicate_se=component.c_replicate_se,
+        c_template_sd=component.c_template_sd,
+        c_template_quantiles=component.c_template_quantiles,
+    )
     if refused:
-        outcome = FloorOutcome(
-            floor_mode="refused_templates",
+        outcome = replace(
+            outcome,
+            floor_mode=None,
             power_class="none",
-            alpha_star=outcome.alpha_star,
             c=None,
             c_mc_se=None,
-            t_min=outcome.t_min,
-            measured_power=outcome.measured_power,
-            s6_feasible_rate=outcome.s6_feasible_rate,
             reach_cutoff_epoch_start=None,
+            freeze_blocked={
+                "reason": "refused_templates",
+                "detail": f"{len(refused)} station-day template(s) refused",
+            },
         )
     carry = cal_sims[("H0", "none", "M-pool")]
     binding_cell: list[str] | None = None
     if outcome.c is not None and outcome.alpha_star is not None:
         binding_cell = list(solved_cell[outcome.alpha_star])
-    return finish_document(
-        seed=seed,
-        replicates=replicates,
-        outcome=outcome,
-        rows=rows,
-        gates=gates,
-        refused_count=len(refused),
-        refused_templates=_refused_names(refused),
-        binding_cell=binding_cell,
-        carry_ratio=carry.max_abs_carry_over_sigma,
-        mean_carry=carry.mean_carry,
-        admitted=admitted,
-        script_git_sha=script_git_sha,
-        parent_sha=parent_sha,
-        a0_sha=a0_sha,
-        git_head=git_head,
+    h1 = h1_fallback_table(gate_sims)
+    return _emit(
+        finish_document(
+            seed=seed,
+            replicates=replicates,
+            outcome=outcome,
+            rows=rows,
+            gates=gates,
+            refused_count=len(refused),
+            refused_templates=_refused_names(refused),
+            binding_cell=binding_cell,
+            carry_ratio=carry.max_abs_carry_over_sigma,
+            mean_carry=carry.mean_carry,
+            admitted=admitted,
+            script_git_sha=None,
+            parent_sha=None,
+            a0_sha=None,
+            git_head=None,
+        ),
+        h1,
+        {key: item.as_dict() for key, item in components.items()},
     )

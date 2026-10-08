@@ -178,7 +178,7 @@ def test_epoch_grid_and_horizon() -> None:
         ),
         (
             (_eval(0.10, g1=True, margin=True, g3=0.90, s6_rate=0.50, s6_se=0.01),),
-            "s6_stop",
+            None,
             "none",
             0.10,
             True,
@@ -208,7 +208,7 @@ def test_epoch_grid_and_horizon() -> None:
 )
 def test_freeze_table_and_ladder_never_escalates_on_g3(
     evals: tuple[AlphaEval, ...],
-    mode: str,
+    mode: str | None,
     power_class: str,
     alpha: float | None,
     c_is_none: bool,
@@ -217,6 +217,11 @@ def test_freeze_table_and_ladder_never_escalates_on_g3(
     assert outcome.escalated_on_g3 is False
     assert outcome.floor_mode == mode
     assert outcome.power_class == power_class
+    if mode is None:
+        assert outcome.freeze_blocked is not None
+        assert outcome.freeze_blocked["reason"] == "s6_failed"
+    else:
+        assert outcome.freeze_blocked is None
     if alpha is None:
         assert outcome.alpha_star is None
     else:

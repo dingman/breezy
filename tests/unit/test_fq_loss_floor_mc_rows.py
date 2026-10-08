@@ -133,7 +133,10 @@ def test_run_floor_reports_a_refused_template_and_does_not_freeze() -> None:
     document = _obj_dict(run_floor(((bad, good),), replicates=4, seed=2, config=config))
     assert document["refused_count"] == 1
     assert document["refused_templates"][0]["reason"] == "sigma_no_exceeds_one"
-    assert document["outcome"]["floor_mode"] == "refused_templates"
+    assert document["outcome"]["floor_mode"] is None
+    blocked = document["outcome"]["freeze_blocked"]
+    assert isinstance(blocked, dict)
+    assert blocked["reason"] == "refused_templates"
     assert document["outcome"]["c"] is None
 
 
@@ -166,7 +169,7 @@ def test_run_floor_outcome_has_the_pinned_fields() -> None:
     ):
         assert key in outcome
     assert outcome["escalated_on_g3"] is False
-    assert outcome["floor_mode"] in {"sqrt_boundary", "unreachable_veto", "s6_stop"}
+    assert outcome["floor_mode"] in {"sqrt_boundary", "unreachable_veto", None}
     if outcome["floor_mode"] == "sqrt_boundary":
         assert outcome["c"] is not None and outcome["c"] > 0.0
         assert math.isfinite(outcome["c_mc_se"])

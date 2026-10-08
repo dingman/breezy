@@ -7,13 +7,19 @@ P&L is scaled here; σ is not.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
 import numpy as np
 
-from breezy.analysis.fq_loss_stop_core import ClockStep, FqLossStopRefusal, step_clock
+from breezy.analysis.fq_loss_stop_core import (
+    VARIANCE_EPS,
+    ClockStep,
+    FqLossStopRefusal,
+    step_clock,
+)
 from breezy.analysis.fq_loss_stop_shrink import shrunk_joint
 from breezy.settlement.current_rung_hold_v2 import StratumRow
 from scripts.analysis.fq_loss_floor_mc_rows import (
@@ -36,6 +42,7 @@ __all__ = [
     "advance_prepared",
     "critical_values",
     "prepare_day",
+    "resolved_half_spread",
 ]
 
 _ZERO = Decimal(0)
@@ -114,6 +121,34 @@ def prepare_day(day: StationDay, *, deltas: Sequence[float] = ()) -> PreparedDay
     return PreparedDay(day, production_variance(day), masses, proportional, xs, h1)
 
 
+def clock_block(day: StationDay) -> str | None:
+    """Reason the clock would refuse this day, or None when every positive-mass x is legal."""
+    if not day.legs:
+        return None
+    try:
+        prep = prepare_day(day)
+    except FqLossStopRefusal as exc:
+        return exc.reason.value
+    if prep.variance > VARIANCE_EPS:
+        return None
+    weights = list(prep.masses)
+    if len(prep.xs) == len(weights) + 1:
+        weights.append(max(0.0, 1.0 - float(sum(prep.masses))))
+    for outcome, weight in zip(prep.xs, weights, strict=False):
+        if weight > 0.0 and outcome != 0.0:
+            return "zero_variance_realised"
+    return None
+
+
+def resolved_half_spread(
+    leg_spread: float | None, pool_median: float | None
+) -> tuple[float | None, bool]:
+    """Leg tape first. The pool median is only the fallback, and it is reported."""
+    if leg_spread is not None and math.isfinite(leg_spread):
+        return leg_spread, False
+    return pool_median, True
+
+
 def invert_cdf(masses: Sequence[float], u: float) -> int:
     cum = 0.0
     for index, mass in enumerate(masses):
@@ -136,12 +171,11 @@ def advance_prepared(
     p_exit: float,
     half_spread: float | None,
     theta: float,
-) -> tuple[ClockStep, float]:
-    """One station-day through ``step_clock``. The second value is the incoming carry."""
+) -> tuple[ClockStep, float, bool]:
+    """One station-day through ``step_clock``. Carry in, then the H1 Bernoulli fallback flag."""
     day = prep.day
-    independent = row == "S1" or (
-        delta is not None and prep.h1.get(delta) is None and bool(day.legs)
-    )
+    h1_fallback = bool(delta is not None and prep.h1.get(delta) is None and day.legs)
+    independent = row == "S1" or h1_fallback
     if independent:
         ps = [
             leg.be if delta is None else h1_win_probability(leg.be, delta=delta) for leg in day.legs
@@ -163,10 +197,11 @@ def advance_prepared(
         for leg in day.legs:
             if float(rng.random()) < p_exit:
                 fraction = float(rng.random())
-                cost = exit_coefficient(half_spread, price=leg.price, theta=theta)
+                spread, _fell_back = resolved_half_spread(leg.half_spread, half_spread)
+                cost = exit_coefficient(spread, price=leg.price, theta=theta)
                 shift -= pnl_scale * fraction * cost
     step = step_clock(_normalised(day.station, x_rand, shift, prep.variance), carry)
-    return step, carry
+    return step, carry, h1_fallback
 
 
 def critical_values(
@@ -197,7 +232,7 @@ def critical_values(
             prep = preps[int(rng.integers(0, len(preps)))]
             if drop_overround and sum_cell_q(prep.day) > 1.0:
                 continue
-            step, _incoming = advance_prepared(
+            step, _incoming, _h1_fallback = advance_prepared(
                 prep,
                 u=float(rng.random()),
                 rng=rng,

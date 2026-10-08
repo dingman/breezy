@@ -25,6 +25,7 @@ __all__ = [
     "DEFAULT_FREEZE",
     "DELTAS",
     "HORIZON",
+    "POOL_EXIT_FRACTION_SOURCE",
     "AlphaEval",
     "FloorConfig",
     "FloorOutcome",
@@ -44,6 +45,10 @@ __all__ = [
     "select_alpha",
     "t_low_count",
 ]
+
+POOL_EXIT_FRACTION_SOURCE: Final = "unavailable; floor 0.10 binds"
+_FLOOR_MODES: Final = frozenset({"sqrt_boundary", "unreachable_veto"})
+_POWER_CLASSES: Final = frozenset({"edge_capable", "gross_loss_tripwire", "none"})
 
 DEFAULT_FREEZE: Final = date(2026, 10, 8)
 HORIZON: Final = date(2027, 1, 25)
@@ -114,11 +119,13 @@ def keep_probability(rate: float, *, r_sd: float, lambda_sd: float) -> float:
     return min(1.0, (rate / r_sd) / lambda_sd)
 
 
-def t_low_count(n_days: int, lambda_sd: float, p_keep: float) -> int:
-    """Tick count by the horizon at ``rate_gate``, rounded down."""
+def t_low_count(n_days: int, lambda_sd: float, p_keep: float, *, tick_share: float = 1.0) -> int:
+    """Expected ticking station-days by the horizon at ``rate_gate``, rounded down."""
     if n_days < 0:
         raise ValueError(f"n_days must be non-negative, got {n_days}")
-    return math.floor(n_days * lambda_sd * p_keep)
+    if not 0.0 <= tick_share <= 1.0 or not math.isfinite(tick_share):
+        raise ValueError(f"tick_share must be in [0, 1], got {tick_share!r}")
+    return math.floor(n_days * lambda_sd * p_keep * tick_share)
 
 
 def inclusive_days(start: date, end: date) -> int:
@@ -174,7 +181,7 @@ class AlphaEval:
 
 @dataclass(frozen=True, slots=True)
 class FloorOutcome:
-    floor_mode: str
+    floor_mode: str | None
     power_class: str
     alpha_star: float | None
     c: float | None
@@ -184,6 +191,25 @@ class FloorOutcome:
     s6_feasible_rate: float | None
     reach_cutoff_epoch_start: str | None
     escalated_on_g3: bool = False
+    freeze_blocked: dict[str, str] | None = None
+    c_replicate_se: float | None = None
+    c_template_sd: float | None = None
+    c_template_quantiles: dict[str, float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.power_class not in _POWER_CLASSES:
+            raise ValueError(f"power_class {self.power_class!r} is not a spec class")
+        if self.floor_mode is None:
+            if self.freeze_blocked is None:
+                raise ValueError("floor_mode null requires freeze_blocked")
+        elif self.floor_mode not in _FLOOR_MODES:
+            raise ValueError(f"floor_mode {self.floor_mode!r} is not a spec mode")
+        elif self.freeze_blocked is not None:
+            raise ValueError("freeze_blocked requires floor_mode null")
+        if self.freeze_blocked is not None:
+            reason, detail = self.freeze_blocked.get("reason"), self.freeze_blocked.get("detail")
+            if not reason or not detail:
+                raise ValueError("freeze_blocked needs reason and detail")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -197,6 +223,10 @@ class FloorOutcome:
             "s6_feasible_rate": self.s6_feasible_rate,
             "reach_cutoff_epoch_start": self.reach_cutoff_epoch_start,
             "escalated_on_g3": self.escalated_on_g3,
+            "freeze_blocked": self.freeze_blocked,
+            "c_replicate_se": self.c_replicate_se,
+            "c_template_sd": self.c_template_sd,
+            "c_template_quantiles": self.c_template_quantiles,
         }
 
 
@@ -234,9 +264,9 @@ def select_alpha(evals: Sequence[AlphaEval]) -> FloorOutcome:
             reach_cutoff_epoch_start=None,
         )
     powers = dict(chosen.measured_power)
-    if not rate_within_alpha(chosen.s6_rate, alpha=chosen.alpha, se=chosen.s6_se):
+    if not rate_within_alpha(chosen.s6_rate, alpha=chosen.alpha, se=chosen.c_se):
         return FloorOutcome(
-            floor_mode="s6_stop",
+            floor_mode=None,
             power_class="none",
             alpha_star=chosen.alpha,
             c=None,
@@ -245,6 +275,13 @@ def select_alpha(evals: Sequence[AlphaEval]) -> FloorOutcome:
             measured_power=powers,
             s6_feasible_rate=chosen.s6_rate,
             reach_cutoff_epoch_start=None,
+            freeze_blocked={
+                "reason": "s6_failed",
+                "detail": (
+                    f"s6_feasible_rate {chosen.s6_rate} exceeds alpha {chosen.alpha}"
+                    f" + 3*c_mc_se {chosen.c_se}"
+                ),
+            },
         )
     g3 = chosen.g3_at_m016
     if g3 >= POWER_TARGET:
@@ -281,3 +318,8 @@ class FloorConfig:
     rho_hat: float | None
     freeze: date = DEFAULT_FREEZE
     horizon: date = HORIZON
+    achieved_rate_cal: float | None = None
+    achieved_rate_gate: float | None = None
+    pool_exit_fraction_source: str = POOL_EXIT_FRACTION_SOURCE
+    r_sd_cal: float | None = None
+    lambda_sd_cal: float | None = None

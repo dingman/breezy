@@ -249,6 +249,7 @@ class TakeRecord:
     be: float  # haircut ask + fee: the e-process break-even
     p_side: float  # the model's probability of the side bought
     ev_net: float
+    half_spread: float | None = None  # quoted (ask-bid)/2 when the tape has both
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,9 +279,16 @@ class _Draw:
 
 ModelView = dict[tuple[str, str], _Draw]
 
+#: Natural favourite-π of the model view. λ_pool is measured here, before any bisection.
+DEFAULT_PI_FAV: Final = 0.5
+
+
+class UnreachableTakeRate(RuntimeError):
+    """The best take rate at π = 1 is still below the requested target."""
+
 
 def draw_model_view(
-    day: PoolDay, *, pi_fav: float, seed: int, cfg: LoopConfig | None = None
+    day: PoolDay, *, pi_fav: float = DEFAULT_PI_FAV, seed: int, cfg: LoopConfig | None = None
 ) -> ModelView:
     """One draw per (station, rung); same seed -> same uniforms, ``fav`` monotone in pi_fav."""
     cfg = cfg or LoopConfig()
@@ -332,10 +340,28 @@ def _model_p_hat(rung: PoolRung, draw: _Draw, cfg: LoopConfig, margin: float) ->
     return min(1.0, max(0.0, rung.yes_ask + 0.01 * draw.noise))
 
 
-def _record(take: Take, ask: float, cfg: LoopConfig) -> TakeRecord:
+def _quoted_half_spread(rung: PoolRung) -> float | None:
+    bid = rung.yes_bid
+    if bid is None or not math.isfinite(bid) or not math.isfinite(rung.yes_ask):
+        return None
+    if rung.yes_ask <= bid:
+        return None
+    return (rung.yes_ask - bid) / 2.0
+
+
+def _record(
+    take: Take, ask: float, cfg: LoopConfig, *, half_spread: float | None = None
+) -> TakeRecord:
     p_side = take.p_hat if take.side == "yes" else 1.0 - take.p_hat
     return TakeRecord(
-        take.station, take.rung_id, take.side, ask, _break_even(ask, cfg), p_side, take.ev_net
+        take.station,
+        take.rung_id,
+        take.side,
+        ask,
+        _break_even(ask, cfg),
+        p_side,
+        take.ev_net,
+        half_spread,
     )
 
 
@@ -370,12 +396,18 @@ def replay_live_day(day: PoolDay, view: ModelView, cfg: LoopConfig) -> list[Take
                     latch=latch,
                 )
                 if isinstance(decision, Take):
-                    takes.append(_record(decision, price, cfg))
+                    takes.append(
+                        _record(decision, price, cfg, half_spread=_quoted_half_spread(rung))
+                    )
     return order_takes(takes)
 
 
 def build_templates(
-    days: Sequence[PoolDay], *, pi_fav: float, seed: int, cfg: LoopConfig | None = None
+    days: Sequence[PoolDay],
+    *,
+    pi_fav: float = DEFAULT_PI_FAV,
+    seed: int,
+    cfg: LoopConfig | None = None,
 ) -> list[DayTemplate]:
     cfg = cfg or LoopConfig()
     return [
@@ -398,12 +430,18 @@ def calibrate_take_rate(
     seed: int,
     cfg: LoopConfig | None = None,
     iterations: int = 14,
+    require_reachable: bool = False,
 ) -> tuple[float, list[DayTemplate]]:
     """Bisect pi_fav so the mean takes per climate day hits ``target_rate`` (fixed draws)."""
     lo, hi = 0.0, 1.0
     best = build_templates(days, pi_fav=hi, seed=seed, cfg=cfg)
-    best_rate = float(np.mean([t.n for t in best]))
+    best_rate = float(np.mean([t.n for t in best])) if best else 0.0
     if best_rate <= target_rate:
+        if require_reachable and best_rate < target_rate:
+            raise UnreachableTakeRate(
+                f"take-rate target {target_rate} is unreachable at pi_fav=1"
+                f" (best achievable {best_rate})"
+            )
         return hi, best
     best_pi = hi
     for _ in range(iterations):

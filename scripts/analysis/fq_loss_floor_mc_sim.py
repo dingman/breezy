@@ -24,6 +24,8 @@ class Simulation:
     max_abs_carry_over_sigma: float
     mean_carry: float
     multi_tick_share: float
+    h1_fallback_uses: int = 0
+    h1_draws: int = 0
 
 
 def _phi(x: float) -> float:
@@ -74,6 +76,8 @@ def simulate_family(
     ratios: list[float] = []
     absorbed: list[float] = []
     multi = 0
+    h1_uses = 0
+    h1_draws = 0
     slots = replicates * n_days
     for _rep in range(replicates):
         increments: list[float] = []
@@ -87,7 +91,7 @@ def simulate_family(
                 if p_keep < 1.0 and float(rng.random()) >= p_keep:
                     continue
                 u = float(rng.random()) if rho is None else _copula_u(rng, rho, factor)
-                step, incoming = advance_prepared(
+                step, incoming, h1_fallback = advance_prepared(
                     prep,
                     u=u,
                     rng=rng,
@@ -101,6 +105,9 @@ def simulate_family(
                     theta=theta,
                 )
                 carry = step.carry_out
+                if delta is not None:
+                    h1_draws += 1
+                    h1_uses += int(h1_fallback)
                 if not step.is_tick or step.z is None:
                     continue
                 increments.append(step.z)
@@ -116,4 +123,4 @@ def simulate_family(
     mean = float(sum(absorbed) / len(absorbed)) if absorbed else 0.0
     worst = max(ratios) if ratios else 0.0
     share = multi / slots if slots else 0.0
-    return Simulation(tuple(paths), tuple(cuts), worst, mean, share)
+    return Simulation(tuple(paths), tuple(cuts), worst, mean, share, h1_uses, h1_draws)

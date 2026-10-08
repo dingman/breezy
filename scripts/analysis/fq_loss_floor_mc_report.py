@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
@@ -19,9 +20,12 @@ from scripts.analysis.fq_loss_floor_mc_gate import (
     epoch_holds,
     fully_lost_fraction,
     g1_holds,
+    rate_cal,
+    rate_gate,
     repeated_crossing,
     t_low_count,
 )
+from scripts.analysis.fq_loss_floor_mc_rates import LAMBDA_POOL_DEFINITION
 from scripts.analysis.fq_loss_floor_mc_rows import (
     StationDay,
     all_lose_z,
@@ -41,7 +45,25 @@ from scripts.analysis.fq_loss_floor_mc_solve import (
     smallest_grid_c,
 )
 
-__all__ = ["append_rows", "evaluate_alpha", "finish_document"]
+__all__ = [
+    "append_rows",
+    "evaluate_alpha",
+    "finish_document",
+    "h1_fallback_table",
+    "h1_warning_lines",
+    "kappa_fallback_share",
+    "stamp_run",
+    "ticking_share",
+]
+
+T_LOW_DEFINITION = (
+    "expected station-days whose production variance exceeds VARIANCE_EPS, "
+    "at rate_gate (not every station-day)"
+)
+C_TEMPLATE_RESAMPLE = (
+    "bootstrap resamples of calendar-day templates with replacement; "
+    "station-days stay inside their sampled template"
+)
 
 Power = Callable[[float, str, int, int, float], float]
 MIXES: tuple[str, ...] = ("M-pool", "M-yes", "M-no")
@@ -141,6 +163,7 @@ def evaluate_alpha(
     seed: int,
     rows: list[dict[str, object]],
     gates: list[dict[str, object]],
+    tick_share: float = 1.0,
 ) -> tuple[AlphaEval, tuple[str, str]]:
     """Solve ``c`` and the epoch gates for one α. Appends to ``rows`` and ``gates``."""
     by_t: dict[int, tuple[float, tuple[str, str]]] = {}
@@ -183,7 +206,7 @@ def evaluate_alpha(
     g1_pass = False
     g1_margin = False
     for epoch, n_days in lengths.items():
-        t_low = t_low_count(n_days, config.lambda_sd, p_gate)
+        t_low = t_low_count(n_days, config.lambda_sd, p_gate, tick_share=tick_share)
         passes: list[bool] = []
         margins: list[bool] = []
         g3_epoch: list[float] = []
@@ -287,3 +310,89 @@ def finish_document(
         "a0_sha": a0_sha,
         "git_head": git_head,
     }
+
+
+def ticking_share(groups: Sequence[Sequence[StationDay]]) -> float:
+    days = [day for group in groups for day in group]
+    if not days:
+        return 0.0
+    ticking = sum(1 for day in days if production_variance(day) > VARIANCE_EPS)
+    return ticking / len(days)
+
+
+def kappa_fallback_share(days: Sequence[StationDay]) -> float:
+    legs = [leg for day in days for leg in day.legs]
+    if not legs:
+        return 0.0
+    missing = 0
+    for leg in legs:
+        spread = leg.half_spread
+        if spread is None or not math.isfinite(spread):
+            missing += 1
+    return missing / len(legs)
+
+
+def h1_fallback_table(
+    sims: Mapping[tuple[float, str], Simulation],
+) -> dict[str, dict[str, float]]:
+    table: dict[str, dict[str, float]] = {}
+    for delta in DELTAS:
+        uses = sum(sims[(delta, mix)].h1_fallback_uses for mix in MIXES)
+        draws = sum(sims[(delta, mix)].h1_draws for mix in MIXES)
+        table[delta_key(delta)] = {
+            "uses": float(uses),
+            "draws": float(draws),
+            "share": (uses / draws) if draws else 0.0,
+        }
+    return table
+
+
+def h1_warning_lines(by_delta: Mapping[str, Mapping[str, float]]) -> list[str]:
+    lines: list[str] = []
+    for delta, stats in by_delta.items():
+        share = float(stats.get("share", 0.0))
+        if share > 0.0:
+            lines.append(
+                f"H1 independent-Bernoulli fallback used at delta {delta}: share={share:.6f}"
+            )
+    return lines
+
+
+def stamp_run(
+    document: dict[str, object],
+    *,
+    config: FloorConfig,
+    p_keep_cal: float,
+    p_keep_gate: float,
+    p_keep_cal_raw: float,
+    p_keep_gate_raw: float,
+    kappa_share: float,
+    tick_share: float,
+    h1_by_delta: Mapping[str, Mapping[str, float]],
+    warnings: Sequence[str],
+    outer_resamples: int,
+    outer_replicates: int,
+    c_components: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    document["lambda_pool"] = config.lambda_pool
+    document["lambda_pool_definition"] = LAMBDA_POOL_DEFINITION
+    document["rate_cal"] = rate_cal(config.lambda_pool, config.take_rate_lower)
+    document["rate_gate"] = rate_gate(config.lambda_pool, config.take_rate_lower)
+    document["p_keep_cal"] = p_keep_cal
+    document["p_keep_gate"] = p_keep_gate
+    document["p_keep_cal_raw"] = p_keep_cal_raw
+    document["p_keep_gate_raw"] = p_keep_gate_raw
+    document["achieved_rate_cal"] = config.achieved_rate_cal
+    document["achieved_rate_gate"] = config.achieved_rate_gate
+    document["pool_exit_fraction"] = config.pool_exit_fraction
+    document["pool_exit_fraction_source"] = config.pool_exit_fraction_source
+    document["kappa_exit_fallback_share"] = kappa_share
+    document["tick_share"] = tick_share
+    document["t_low_definition"] = T_LOW_DEFINITION
+    document["h1_bernoulli_fallback"] = {key: dict(value) for key, value in h1_by_delta.items()}
+    document["warnings"] = list(warnings)
+    document["outer_resamples"] = outer_resamples
+    document["outer_replicates"] = outer_replicates
+    document["c_template_resample"] = C_TEMPLATE_RESAMPLE
+    document["c_components"] = {key: dict(value) for key, value in c_components.items()}
+    return document

@@ -1,9 +1,4 @@
-"""Station-day templates and one-tick draws for the floor MC (r3 §4.5).
-
-Variance, the shrink, and the √t clock come from the production core.
-This module does not re-implement them. A Σ_NO q > 1 template is returned
-as a refusal, never dropped.
-"""
+"""Station-day templates for the floor MC. Variance and the clock stay in the core."""
 
 from __future__ import annotations
 
@@ -75,9 +70,17 @@ class Leg:
     side: Side
     be: float
     price: float
+    half_spread: float | None = None
 
 
-def make_leg(rung: str, side: Side, be: float, *, price: float | None = None) -> Leg:
+def make_leg(
+    rung: str,
+    side: Side,
+    be: float,
+    *,
+    price: float | None = None,
+    half_spread: float | None = None,
+) -> Leg:
     if side not in ("yes", "no"):
         raise ValueError(f"side must be yes or no, got {side!r}")
     if not math.isfinite(be) or not 0.0 < be < 1.0:
@@ -85,7 +88,7 @@ def make_leg(rung: str, side: Side, be: float, *, price: float | None = None) ->
     quoted = be if price is None else price
     if not math.isfinite(quoted) or not 0.0 <= quoted <= 1.0:
         raise ValueError(f"price {quoted!r} is not in [0, 1]")
-    return Leg(rung, side, be, quoted)
+    return Leg(rung, side, be, quoted, half_spread)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,15 +108,16 @@ def _mean(values: Sequence[float]) -> float:
 
 
 def _collapse(rung: str, side: Side, legs: Sequence[Leg]) -> Leg:
-    return make_leg(
-        rung, side, _mean([leg.be for leg in legs]), price=_mean([leg.price for leg in legs])
-    )
+    spreads = [leg.half_spread for leg in legs]
+    finite = [item for item in spreads if item is not None and math.isfinite(item)]
+    spread = _mean(finite) if len(finite) == len(spreads) else None
+    be, price = _mean([leg.be for leg in legs]), _mean([leg.price for leg in legs])
+    return make_leg(rung, side, be, price=price, half_spread=spread)
 
 
 def make_station_day(
     station: str, legs: Sequence[Leg], *, extra_netting: float = 0.0
 ) -> StationDay:
-    """Pair a same-rung YES+NO into one δ_net. Qty ≡ 1, so the pair leaves no remainder."""
     grouped: dict[str, dict[str, list[Leg]]] = {}
     order: list[str] = []
     for leg in legs:
@@ -138,7 +142,6 @@ def make_station_day(
 
 
 def cell_q(leg: Leg) -> float:
-    """H0 mass ``q = BE`` (YES) or ``1 − BE`` (NO), via :func:`break_even_row`."""
     be = float(break_even_row(Decimal(str(leg.be)), _ZERO))
     return be if leg.side == "yes" else 1.0 - be
 
@@ -168,8 +171,13 @@ def production_variance(day: StationDay) -> float:
     return bundle_variance(stratum_rows(day))
 
 
+def _clock_block(day: StationDay) -> str | None:
+    from scripts.analysis.fq_loss_floor_mc_draw import clock_block
+
+    return clock_block(day)
+
+
 def x_piece(h: float, be: Decimal) -> float:
-    """Same split as the core: float subtraction on a 0/1 outcome, else Decimal."""
     if h == 0.0 or h == 1.0:
         return float(Decimal(int(h))) - float(be)
     return float(Decimal(str(h)) - be)
@@ -192,7 +200,6 @@ class RefusedTemplate:
 def partition_station_days(
     days: Sequence[StationDay],
 ) -> tuple[tuple[StationDay, ...], tuple[RefusedTemplate, ...]]:
-    """Admit days the production variance accepts. Refusals are returned, not dropped."""
     admitted: list[StationDay] = []
     refused: list[RefusedTemplate] = []
     for day in days:
@@ -205,6 +212,17 @@ def partition_station_days(
             refused.append(
                 RefusedTemplate(
                     day.station, tuple(leg.rung for leg in day.legs), exc.reason.value, exc.detail
+                )
+            )
+            continue
+        blocked = _clock_block(day)
+        if blocked is not None:
+            refused.append(
+                RefusedTemplate(
+                    day.station,
+                    tuple(leg.rung for leg in day.legs),
+                    blocked,
+                    "zero-variance day realises nonzero x",
                 )
             )
             continue
@@ -239,7 +257,6 @@ def apply_mix(day: StationDay, mix: str) -> StationDay:
 
 
 def s6_station_days(days: Sequence[StationDay]) -> tuple[StationDay, ...]:
-    """Feasible days only (Σq ≤ 1), exact marginals, netting removed."""
     kept: list[StationDay] = []
     for day in days:
         if not day.legs or sum_cell_q(day) > 1.0:
@@ -249,7 +266,6 @@ def s6_station_days(days: Sequence[StationDay]) -> tuple[StationDay, ...]:
 
 
 def kappa_exit(half_spread: float | None) -> float:
-    """``κ_exit = max(pool median half-spread, 0.02)``. Missing spread uses the floor."""
     spread = 0.0
     if half_spread is not None and math.isfinite(half_spread):
         spread = max(0.0, half_spread)
@@ -257,7 +273,6 @@ def kappa_exit(half_spread: float | None) -> float:
 
 
 def exit_coefficient(half_spread: float | None, *, price: float, theta: float) -> float:
-    """κ_exit plus the venue fee at the leg price under the parent's θ."""
     fee = venue_fee_prob(executable_price=price, fee_coefficient=theta)
     return kappa_exit(half_spread) + fee
 
@@ -275,7 +290,6 @@ def rho_bind(rho_hat: float | None) -> float:
 
 
 def estimate_rho(days: Sequence[Sequence[float]]) -> float | None:
-    """Pearson correlation of within-day PIT pairs. ``None`` when unidentified."""
     xs: list[float] = []
     ys: list[float] = []
     for pits in days:
@@ -294,7 +308,6 @@ def estimate_rho(days: Sequence[Sequence[float]]) -> float | None:
 
 
 def h1_win_probability(be: float, *, delta: float) -> float:
-    """Clamp ``p ≥ 0`` (n5). YES and NO both lose ``|δ|`` off BE."""
     return max(0.0, be - abs(delta))
 
 
@@ -311,7 +324,6 @@ def _pnl(day: StationDay, hs: Sequence[float], pnl_scale: float) -> float:
 
 
 def all_lose_z(day: StationDay) -> float | None:
-    """All-lose standardised increment. ``None`` when the day does not tick."""
     if not day.legs:
         return None
     variance = production_variance(day)
@@ -334,7 +346,6 @@ def walk_fixed(
     *,
     drop_carry: bool = False,
 ) -> WalkReport:
-    """Replay an explicit outcome path. The carry is the core's, unless dropped."""
     carry = 0.0
     increments: list[float] = []
     ratios: list[float] = []
@@ -372,7 +383,6 @@ def critical_values(
     pnl_scale: float = 1.0,
     return_paths: bool = False,
 ) -> np.ndarray | list[list[float]]:
-    """Iid ticks. The draw lives in ``fq_loss_floor_mc_draw`` so this file stays short."""
     from scripts.analysis.fq_loss_floor_mc_draw import critical_values as _draw
 
     return _draw(
