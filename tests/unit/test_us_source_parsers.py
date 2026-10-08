@@ -731,6 +731,22 @@ def test_pfm_refuses_a_date_label_far_from_the_issuance() -> None:
             )
 
 
+def test_pfm_refuses_a_repeated_max_date_inside_one_table() -> None:
+    """Two MAX columns on one local date are `duplicate_day`, not last-write-wins.
+
+    Local 18 is UTC 23 (CDT MAX hour) and local 19 is UTC 00 (ordinary MAX hour). The
+    local hour does not wrap, so both columns take 2026-12-31.
+    """
+    hours = [18, 19]
+    raw = _pfm_synthetic("FOUS51 KOKX 311901", "12/31/26", hours, {}, {0: 46, 1: 50})
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(
+            raw, station="KNYC", reference_time=dt.datetime(2026, 12, 31, 19, 30, tzinfo=UTC)
+        )
+    assert err.value.reason == "duplicate_day"
+    assert err.value.detail == "2026-12-31"
+
+
 def test_pfm_refuses_oversize_raw_before_decoding() -> None:
     limit = pfm_parse.MAX_RAW_BYTES
     raw = _pfm_real("KNYC") + b" " * (limit + 1 - len(_pfm_real("KNYC")))
