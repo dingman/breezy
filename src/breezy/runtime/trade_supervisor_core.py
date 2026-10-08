@@ -328,6 +328,12 @@ class AlertDetail(str, Enum):
     BOOT_RETRY_FIRST_ATTEMPT = "boot_retry_first_attempt"
     BOOT_RETRY_CHILD_NOT_READY = "boot_retry_child_not_ready"
     BOOT_RETRY_WINDOW_CLOSED_NEVER_READY = "boot_retry_window_closed_never_ready"
+    #: [SUP-RESTART-ANYTIME] Ready-adoption deferral alerts -- WARN at
+    #: :data:`READY_ADOPTION_WARN_POLLS`, CRITICAL at
+    #: :data:`READY_ADOPTION_CRITICAL_POLLS` (re-fired), see
+    #: :func:`decide_ready_adoption_alert`.
+    READY_ADOPTION_DEFERRED = "ready_adoption_deferred"
+    READY_ADOPTION_UNPROVEN = "ready_adoption_unproven"
 
 
 class StopPriorAction(str, Enum):
@@ -1048,6 +1054,23 @@ class DaySchedulerState:
     #: ``_ADOPTION_LOG_UNREADABLE_MAX_POLLS`` until either a read succeeds or
     #: the day rolls over.
     adoption_log_unreadable_polls: int = 0
+    #: [SUP-RESTART-ANYTIME] Per-child ready-adoption evidence and alert
+    #: latches. All five are cleared by :func:`record_child_adopted` (a new
+    #: child) and by :func:`_for_day` (rollover).
+    #: Newest accepted ``SHADOW_DECISION`` line timestamp (epoch ns), max-wins.
+    liveness_line_last_ns: int | None = None
+    #: Consecutive non-terminal ready-adoption deferrals.
+    ready_adoption_deferral_polls: int = 0
+    #: One-shot WARN latch, per child.
+    ready_adoption_warn_sent: bool = False
+    #: ``ready_adoption_deferral_polls`` at the last CRITICAL sent (re-fire
+    #: anchor); ``None`` = none sent yet.
+    ready_adoption_critical_last_poll: int | None = None
+    #: One ``ready_adoption_terminal`` evidence line per child. The first
+    #: terminal verdict is the one logged; a later, different terminal
+    #: verdict for the same child is silent. That can only follow child
+    #: turnover, which clears this field.
+    ready_adoption_terminal_logged: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -1193,6 +1216,11 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
         orders_not_requested_seen=False,
         boot_retry_not_ready_alert_sent=False,
         adoption_log_unreadable_polls=0,
+        liveness_line_last_ns=None,
+        ready_adoption_deferral_polls=0,
+        ready_adoption_warn_sent=False,
+        ready_adoption_critical_last_poll=None,
+        ready_adoption_terminal_logged=False,
     )
 
 
@@ -1769,6 +1797,10 @@ def latch_log_facts(
     # log-read site, not just `_do_relaunch_check`'s.
     if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
         state = record_boot_zero_instruments_seen(state, now_utc)
+    # [SUP-RESTART-ANYTIME] One additive, order-independent projection.
+    liveness_ns = latest_liveness_line_ns(log_text, now_ns=int(now_utc.timestamp() * 1e9))
+    if liveness_ns is not None:
+        state = record_liveness_line_seen(state, now_utc, liveness_ns)
     return state
 
 
@@ -2199,3 +2231,282 @@ def decide_midday_dead_child(
     if decision.reason == MIDDAY_BUDGET_EXHAUSTED_REASON:
         return MiddayDeadDecision(MiddayDeadAction.EXHAUSTED, decision.reason)
     return MiddayDeadDecision(MiddayDeadAction.DECLINED, decision.reason)
+
+
+# ===========================================================================
+# [SUP-RESTART-ANYTIME] Ready-adoption: a restarted supervisor re-derives
+# ``launch_done`` + ``readiness_observed`` for a proven-ready adopted node.
+# ===========================================================================
+
+#: The exact shape ``node_log_path`` produces, plus ONE capture group around
+#: the stamp (a capture group cannot change what matches). Public so a
+#: bwrap-wrapped consumer can import it without importing the shell
+#: (AUT-6 WP6 closure intent); ``trade_supervisor`` binds it as
+#: ``_NODE_LOG_NAME_RE``. ``find_adopted_node_log`` must match ONLY this: the
+#: supervisor's own ``breezy-trade-supervisor*.log`` variants never qualify.
+NODE_LOG_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^breezy-trade-(\d{8}T\d{6}Z)\.log$")
+
+#: Breezy-owned line emitted ONLY when the FQ strategy evaluated a live venue
+#: snapshot (``_emit_shadow_decision``, reached only from
+#: ``on_order_book_depth`` / ``on_quote_tick``). Pinned against its emitter
+#: by a contract test. A string literal here: core never imports the strategy.
+LIVENESS_POSITIVE_MARKER: Final[str] = "SHADOW_DECISION "
+LIVENESS_MAX_AGE_NS: Final[int] = 600 * 1_000_000_000
+LIVENESS_SCAN_MAX_OCCURRENCES: Final[int] = 64
+#: A line stamped later than ``now + 60 s`` is treated as unparseable so a
+#: future-stamped line can never pin "fresh" through the max-wins latch.
+LIVENESS_MAX_FUTURE_SKEW_NS: Final[int] = 60 * 1_000_000_000
+
+READY_ADOPTION_WARN_POLLS: Final[int] = 5
+READY_ADOPTION_CRITICAL_POLLS: Final[int] = 12
+READY_ADOPTION_CRITICAL_REFIRE_POLLS: Final[int] = 60
+READY_ADOPTION_ALERT_EVENT: Final[str] = "TRADE_SUPERVISOR_READY_ADOPTION_DEFERRED"
+
+_ANSI_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*m")
+_NAUTILUS_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.(\d{9})Z\b"
+)
+_NS_PER_S: Final[int] = 1_000_000_000
+
+
+def _nautilus_prefix_ns(prefix: str) -> int | None:
+    """Epoch ns of a Nautilus ``YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`` line prefix
+    (ANSI colour codes ignored); ``None`` if it is not one (e.g. a line cut
+    off mid-way by a delta boundary) or names an impossible instant."""
+    match = _NAUTILUS_PREFIX_RE.match(_ANSI_ESCAPE_RE.sub("", prefix))
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, nanos = (int(g) for g in match.groups())
+    try:
+        stamp = dt.datetime(year, month, day, hour, minute, second, tzinfo=dt.UTC)
+    except ValueError:
+        return None
+    return int(stamp.timestamp()) * _NS_PER_S + nanos
+
+
+def latest_liveness_line_ns(log_text: str, *, now_ns: int) -> int | None:
+    """Timestamp (epoch ns) of the last PARSEABLE :data:`LIVENESS_POSITIVE_MARKER`
+    line in ``log_text``, scanning backwards over at most
+    :data:`LIVENESS_SCAN_MAX_OCCURRENCES` occurrences; ``None`` (fail closed)
+    when none of them parses. A delta can begin mid-line, so the last
+    occurrence may be headless while an earlier one is good. A stamp later
+    than ``now_ns + LIVENESS_MAX_FUTURE_SKEW_NS`` counts as unparseable."""
+    end = len(log_text)
+    for _ in range(LIVENESS_SCAN_MAX_OCCURRENCES):
+        marker_at = log_text.rfind(LIVENESS_POSITIVE_MARKER, 0, end)
+        if marker_at < 0:
+            return None
+        end = marker_at
+        line_start = log_text.rfind("\n", 0, marker_at) + 1
+        stamp_ns = _nautilus_prefix_ns(log_text[line_start:marker_at])
+        if stamp_ns is not None and stamp_ns <= now_ns + LIVENESS_MAX_FUTURE_SKEW_NS:
+            return stamp_ns
+    return None
+
+
+def node_log_spawned_at(name: str) -> dt.datetime | None:
+    """Spawn instant stamped into a node log name; ``None`` for any other
+    shape (supervisor logs, wrong digits) or an impossible date."""
+    match = NODE_LOG_NAME_RE.match(name)
+    if match is None:
+        return None
+    try:
+        return dt.datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
+
+
+class ReadyAdoptionVerdict(str, Enum):
+    """Outcome of :func:`decide_ready_adoption`. ``MARK`` restores the day's
+    ``launch_done``/``readiness_observed``; the terminal members are owned or
+    paged elsewhere; the rest are counted deferrals (:func:`is_deferral`)."""
+
+    MARK = "mark"
+    NOT_IN_WINDOW = "not_in_window"
+    ALREADY_READY = "already_ready"
+    NO_CHILD = "no_child"
+    PERMIT_EXPIRED = "permit_expired"
+    NOT_REQUIRED = "not_required"
+    HOLDER_UNPROVEN = "holder_unproven"
+    PERMIT_ABSENT = "permit_absent"
+    NOT_SUBSCRIBED = "not_subscribed"
+    ANCHOR_UNKNOWN = "anchor_unknown"
+    LOG_UNKNOWN = "log_unknown"
+    LOG_NOT_CURRENT_DAY = "log_not_current_day"
+    NO_FRESH_ACTIVITY = "no_fresh_activity"
+    IO_ERROR = "io_error"
+
+
+_READY_ADOPTION_DEFERRALS: Final[frozenset[ReadyAdoptionVerdict]] = frozenset(
+    {
+        ReadyAdoptionVerdict.HOLDER_UNPROVEN,
+        ReadyAdoptionVerdict.PERMIT_ABSENT,
+        ReadyAdoptionVerdict.NOT_SUBSCRIBED,
+        ReadyAdoptionVerdict.ANCHOR_UNKNOWN,
+        ReadyAdoptionVerdict.LOG_UNKNOWN,
+        ReadyAdoptionVerdict.LOG_NOT_CURRENT_DAY,
+        ReadyAdoptionVerdict.NO_FRESH_ACTIVITY,
+        ReadyAdoptionVerdict.IO_ERROR,
+    }
+)
+
+#: Terminal verdicts that get the one-per-child ``ready_adoption_terminal``
+#: evidence line (the step evaluated and decided not to act).
+READY_ADOPTION_EVIDENCE_TERMINALS: Final[frozenset[ReadyAdoptionVerdict]] = frozenset(
+    {
+        ReadyAdoptionVerdict.NO_CHILD,
+        ReadyAdoptionVerdict.PERMIT_EXPIRED,
+        ReadyAdoptionVerdict.NOT_REQUIRED,
+    }
+)
+
+
+def is_deferral(verdict: ReadyAdoptionVerdict) -> bool:
+    """True for the eight counted (non-terminal) verdicts."""
+    return verdict in _READY_ADOPTION_DEFERRALS
+
+
+def decide_ready_adoption(
+    *,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    now_ns: int,
+    child_alive: bool,
+    holder_is_tracked: bool,
+    log_spawned_at: dt.datetime | None,
+) -> ReadyAdoptionVerdict:
+    """Pure: may a restarted supervisor mark the adopted node ready? Checks
+    run in order; the first failing check wins. ``MARK`` needs every proof on
+    THIS poll (``now``/``now_ns`` are one clock reading), including a fresh
+    flock-holder match, so a ``None`` probe is a deferral, never a mark."""
+    window_open, window_close = permit_watch_window(state.day)
+    if not window_open <= now < window_close:
+        return ReadyAdoptionVerdict.NOT_IN_WINDOW
+    # Keyed on readiness, NOT launch_done: a lock-held refusal can set
+    # launch_done without readiness and that day must stay recoverable.
+    if state.readiness_observed:
+        return ReadyAdoptionVerdict.ALREADY_READY
+    if not child_alive:
+        return ReadyAdoptionVerdict.NO_CHILD
+    if not holder_is_tracked:
+        return ReadyAdoptionVerdict.HOLDER_UNPROVEN
+    expiry_ns = state.permit_issued_seen_expires_at_ns
+    # Same order as permit_capability_valid: a latched permit wins over the
+    # not-requested latch, so this step and B1 never disagree (SM2).
+    if expiry_ns is None:
+        if state.orders_not_requested_seen:
+            return ReadyAdoptionVerdict.NOT_REQUIRED
+        return ReadyAdoptionVerdict.PERMIT_ABSENT
+    if expiry_ns <= now_ns:
+        return ReadyAdoptionVerdict.PERMIT_EXPIRED
+    if not state.strategy_subscribed_seen:
+        return ReadyAdoptionVerdict.NOT_SUBSCRIBED
+    # holder + permit + subscribed == readiness_observed(...)'s conjunction.
+    if state.first_boot_permit_expires_at_ns is None:
+        return ReadyAdoptionVerdict.ANCHOR_UNKNOWN
+    if log_spawned_at is None:
+        return ReadyAdoptionVerdict.LOG_UNKNOWN
+    if log_spawned_at < _at(state.day, STOP_PRIOR_UTC):
+        return ReadyAdoptionVerdict.LOG_NOT_CURRENT_DAY
+    liveness_ns = state.liveness_line_last_ns
+    if liveness_ns is None or now_ns - liveness_ns > LIVENESS_MAX_AGE_NS:
+        return ReadyAdoptionVerdict.NO_FRESH_ACTIVITY
+    # Cheap guard, vacuous by construction (the real post-boot guarantee is
+    # the pid->log binding): a line older than the log's own spawn stamp.
+    if liveness_ns < int(log_spawned_at.timestamp()) * _NS_PER_S:
+        return ReadyAdoptionVerdict.NO_FRESH_ACTIVITY
+    return ReadyAdoptionVerdict.MARK
+
+
+def record_liveness_line_seen(
+    state: DaySchedulerState, now_utc: dt.datetime, line_ns: int
+) -> DaySchedulerState:
+    """Max-wins latch for the newest accepted liveness line timestamp."""
+    effective = _for_day(state, _trading_day(now_utc))
+    previous = effective.liveness_line_last_ns
+    if previous is not None and previous >= line_ns:
+        return effective
+    return replace(effective, liveness_line_last_ns=line_ns)
+
+
+def record_ready_adoption_deferral(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    effective = _for_day(state, _trading_day(now_utc))
+    return replace(
+        effective, ready_adoption_deferral_polls=effective.ready_adoption_deferral_polls + 1
+    )
+
+
+def reset_ready_adoption_deferral(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """Zero the counter and clear the CRITICAL re-fire anchor (so the
+    re-fire arithmetic cannot go negative after a terminal interlude).
+    ``ready_adoption_warn_sent`` stays per child."""
+    effective = _for_day(state, _trading_day(now_utc))
+    return replace(
+        effective, ready_adoption_deferral_polls=0, ready_adoption_critical_last_poll=None
+    )
+
+
+def record_ready_adoption(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """MARK: the same two writers every other readiness path composes."""
+    marked = record_readiness_observed(mark_phase_fired(state, Phase.LAUNCH, now_utc), now_utc)
+    return reset_ready_adoption_deferral(marked, now_utc)
+
+
+def record_ready_adoption_terminal_logged(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.ready_adoption_terminal_logged:
+        return effective
+    return replace(effective, ready_adoption_terminal_logged=True)
+
+
+def record_ready_adoption_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime, *, critical: bool
+) -> DaySchedulerState:
+    """WARN latches ``warn_sent``; CRITICAL latches the re-fire anchor and
+    the WARN with it (at most one alert per poll, the CRITICAL wins)."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if critical:
+        return replace(
+            effective,
+            ready_adoption_warn_sent=True,
+            ready_adoption_critical_last_poll=effective.ready_adoption_deferral_polls,
+        )
+    return replace(effective, ready_adoption_warn_sent=True)
+
+
+def decide_ready_adoption_alert(state: DaySchedulerState) -> AlertSpec | None:
+    """Pure deferral-alert decision, called after every counted deferral.
+
+    WARN once per child at :data:`READY_ADOPTION_WARN_POLLS`; CRITICAL at
+    :data:`READY_ADOPTION_CRITICAL_POLLS`, re-fired every
+    :data:`READY_ADOPTION_CRITICAL_REFIRE_POLLS` further polls while the
+    deferral persists (a reminder: the outbox owns webhook retry). At most
+    one alert per poll; the CRITICAL wins.
+
+    Bound on CRITICALs: the window is 470 min and a poll is >= 60 s, so one
+    uninterrupted deferral sends at polls 12, 72, ..., 432 -- at most 8 per
+    child per night. Assumptions: (a) the deferral is CONSECUTIVE (a MARK or
+    terminal verdict resets the count); (b) the sink does not raise (a
+    raising sink leaves the CRITICAL unlatched, so it is retried every
+    poll); (c) no terminal flapping -- were a terminal verdict to interleave
+    every 13th poll the worst case is floor(470 / 13) = 36. Flapping needs
+    child turnover, which B1 and MIDDAY_WATCH already page and which resets
+    the budget by design, so no minimum gap field is added (YAGNI)."""
+    polls = state.ready_adoption_deferral_polls
+    last_critical = state.ready_adoption_critical_last_poll
+    critical_due = (polls >= READY_ADOPTION_CRITICAL_POLLS and last_critical is None) or (
+        last_critical is not None and polls - last_critical >= READY_ADOPTION_CRITICAL_REFIRE_POLLS
+    )
+    if critical_due:
+        return AlertSpec(
+            READY_ADOPTION_ALERT_EVENT, "CRITICAL", AlertDetail.READY_ADOPTION_UNPROVEN
+        )
+    if polls >= READY_ADOPTION_WARN_POLLS and not state.ready_adoption_warn_sent:
+        return AlertSpec(READY_ADOPTION_ALERT_EVENT, "WARN", AlertDetail.READY_ADOPTION_DEFERRED)
+    return None
