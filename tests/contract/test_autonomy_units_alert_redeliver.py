@@ -134,7 +134,10 @@ def test_redeliver_config_names_the_autonomy_failed_notifier_and_resolves_dns() 
 def test_redeliver_config_loads_alerts_env_and_lists_the_delivery_journal() -> None:
     unit = _unit(SERVICE)
     assert "EnvironmentFile=-%h/.config/breezy/alerts.env" in SERVICE.read_text()
-    assert unit.values("Service", "ReadWritePaths") == [JOURNAL_PATH]
+    # Reviewed row change: ReadWritePaths= used to be pinned to [JOURNAL_PATH]. That line made
+    # systemd build a private mount namespace in which bwrap cannot create its user namespace
+    # (AppArmor userns restriction), so the unit never ran. The bwrap row is the control.
+    assert unit.values("Service", "ReadWritePaths") == []
 
 
 def test_redeliver_timer_config_is_slot_critical_and_never_persistent() -> None:
@@ -169,6 +172,55 @@ def test_alerting_sandboxed_unit_config_without_the_journal_path_fails(tmp_path:
         f"[Service]\n{ALERTS_ENV}\nProtectSystem=strict\nReadWritePaths={JOURNAL_PATH}\n"
     )
     assert _journal_gaps(tmp_path) == {"x.service"}
+
+
+#: Directives that make systemd build a mount namespace; bwrap cannot create its user namespace
+#: inside one on this host (AppArmor userns restriction): "No permissions to create a namespace".
+_MOUNT_NAMESPACE_DIRECTIVES: Final = (
+    "ReadWritePaths",
+    "ReadOnlyPaths",
+    "InaccessiblePaths",
+    "ProtectSystem",
+    "ProtectHome",
+    "PrivateTmp",
+    "PrivateDevices",
+    "PrivateMounts",
+    "BindPaths",
+    "BindReadOnlyPaths",
+    "TemporaryFileSystem",
+)
+
+
+def _bwrap_wrapped(directory: Path) -> dict[str, UnitFile]:
+    found: dict[str, UnitFile] = {}
+    for path in sorted(directory.glob("*.service")):
+        unit = _unit(path)
+        if any(Path(WRAPPER_PATH).name in v for v in unit.values("Service", "ExecStart")):
+            found[path.name] = unit
+    return found
+
+
+def _mount_namespace_findings(units: Mapping[str, UnitFile]) -> list[str]:
+    return [
+        f"{name}: {key}"
+        for name, unit in units.items()
+        for key in _MOUNT_NAMESPACE_DIRECTIVES
+        if unit.values("Service", key)
+    ]
+
+
+def test_bwrap_wrapped_unit_config_has_no_mount_namespace_directive() -> None:
+    wrapped = _bwrap_wrapped(DEPLOY_SYSTEMD_DIR)
+    assert wrapped, "the scan must judge at least one bwrap-wrapped unit"
+    assert _mount_namespace_findings(wrapped) == []
+
+
+def test_mount_namespace_directive_scan_config_flags_a_wrapped_unit(tmp_path: Path) -> None:
+    (tmp_path / "x.service").write_text(
+        f"[Service]\nExecStart={WRAPPER_PATH} row /bin/true\nPrivateTmp=yes\n"
+    )
+    wrapped = _bwrap_wrapped(tmp_path)
+    assert _mount_namespace_findings(wrapped) == ["x.service: PrivateTmp"]
 
 
 def _timers(directory: Path) -> dict[str, UnitFile]:
