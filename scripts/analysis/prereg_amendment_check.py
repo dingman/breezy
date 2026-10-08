@@ -156,7 +156,7 @@ _USAGE: Final = (
     "Run in a full (non-shallow) clone. A shallow clone cannot prove a single freeze."
 )
 
-__all__ = ["Defect", "load_verified_amendment", "main", "validate_amendment"]
+__all__ = ["Defect", "load_verified_amendment", "main", "reachable_floor", "validate_amendment"]
 
 
 def _git_toplevel(start: Path) -> Path | None:
@@ -837,6 +837,26 @@ def load_verified_amendment(path: Path, amendment_id: str) -> Mapping[str, Any]:
     if defects:
         raise Refusal("; ".join(f"[{item.code}] {item.message}" for item in defects))
     return amendment
+
+
+def reachable_floor(plan_dir: Path) -> bool:
+    """True iff A1 in ``plan_dir`` loads frozen with ``floor_mode == "sqrt_boundary"``.
+
+    Reads only. A :class:`Refusal`, ``OSError``, ``ValueError``, ``KeyError``,
+    ``TypeError``, or ``AttributeError`` (absent file, draft ``UNFROZEN``,
+    unreadable JSON, a validation defect, or a broken loader) is False.
+    Callers must not re-derive the rule.
+    """
+    # The A1b branch (unreachable_veto A1 plus a frozen reachable A1b) lands with A1b.
+    try:
+        path = Path(plan_dir) / _AMENDMENT_FILENAME[_A1_ID]
+        amendment = load_verified_amendment(path, _A1_ID)
+        floor = amendment.get("loss_stop_floor")
+        if not isinstance(floor, Mapping):
+            return False
+        return floor.get("floor_mode") == "sqrt_boundary"
+    except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def main(argv: Sequence[str] | None = None) -> int:

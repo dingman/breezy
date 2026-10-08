@@ -941,3 +941,63 @@ def test_a1_filled_provenance_binds_the_e2_evidence() -> None:
     floor = body["loss_stop_floor"]
     assert floor["floor_mode"] == "unreachable_veto"
     assert floor["power_class"] == "none"
+
+
+def _frozen_sqrt_boundary_plan(tmp: Path) -> Path:
+    """Temp git repo whose frozen A1 is ``sqrt_boundary``. The directory is the plan dir."""
+    repo = tmp / "repo"
+    _init(repo)
+    _, parent_sha = _freeze(repo, "design.json", _parent_body())
+    (repo / _A0_NAME).write_text("{}\n", encoding="utf-8")
+    body: dict[str, Any] = {
+        "amendment_id": _A1_ID,
+        "amends": {"path": "design.json", "frozen_sha": parent_sha},
+        "loss_stop_floor": _sqrt_floor(),
+        "provenance": _valid_provenance(repo),
+    }
+    _freeze(repo, _A1_NAME, body)
+    return repo
+
+
+@pytest.mark.skipif(_is_shallow_repository(), reason=_SHALLOW_SKIP)
+def test_reachable_floor_is_false_for_the_frozen_unreachable_veto_a1() -> None:
+    loaded = _chk().load_verified_amendment(_A1_FILE, _A1_ID)
+    assert loaded["loss_stop_floor"]["floor_mode"] == "unreachable_veto"
+    assert _chk().reachable_floor(_PLAN) is False
+
+
+def test_reachable_floor_is_false_when_a1_is_absent(tmp_path: Path) -> None:
+    assert _chk().reachable_floor(tmp_path) is False
+
+
+def test_reachable_floor_is_false_for_a_draft(tmp_path: Path) -> None:
+    draft = tmp_path / _A1_NAME
+    _write(draft, {"frozen_sha": UNFROZEN, "amendment_id": _A1_ID})
+    assert _chk().reachable_floor(tmp_path) is False
+
+
+def test_reachable_floor_is_false_for_an_unloadable_file(tmp_path: Path) -> None:
+    (tmp_path / _A1_NAME).write_text("{not json", encoding="utf-8")
+    assert _chk().reachable_floor(tmp_path) is False
+
+
+def test_reachable_floor_is_false_when_loader_raises_key_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise_key_error(_path: Path, _amendment_id: str) -> None:
+        raise KeyError("loss_stop_floor")
+
+    monkeypatch.setattr(_chk(), "load_verified_amendment", _raise_key_error)
+    assert _chk().reachable_floor(tmp_path) is False
+
+
+def test_reachable_floor_is_true_for_a_frozen_sqrt_boundary_fixture(tmp_path: Path) -> None:
+    plan_dir = _frozen_sqrt_boundary_plan(tmp_path)
+    assert _chk().reachable_floor(plan_dir) is True
+
+
+def test_a2_earlier_does_not_name_a1b_while_the_a1b_file_is_absent() -> None:
+    # C-3: A2's earlier-amendment row gains A1b only in the commit that adds the file.
+    earlier = _chk()._EARLIER["F5_prereg_v2_A2_guard"]
+    assert "F5_prereg_v2_amendment_A1b.json" not in earlier
+    assert not (_PLAN / "F5_prereg_v2_amendment_A1b.json").is_file()
