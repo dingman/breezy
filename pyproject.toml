@@ -304,6 +304,7 @@ source_modules = [
     "breezy.persistence.autonomy.sample_size",
     "breezy.persistence.autonomy.elond",
     "breezy.persistence.autonomy.canary_store",
+    "breezy.persistence.autonomy.detector_catalog",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -352,6 +353,7 @@ source_modules = [
     "breezy.persistence.autonomy.sample_size",
     "breezy.persistence.autonomy.elond",
     "breezy.persistence.autonomy.canary_store",
+    "breezy.persistence.autonomy.detector_catalog",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false
@@ -574,6 +576,9 @@ breezy-check-alerts = "breezy.runtime.check_alerts_cli:main"
 # store, one alert, exits 0 unconditionally. See
 # `breezy.runtime.study_failure_notifier`.
 breezy-study-failed = "breezy.runtime.study_failure_notifier:main"
+# AUT-6 WP1: drains the durable alert outbox. Run by breezy-autonomy-alert-redeliver.service under
+# the shared bwrap wrapper; see `breezy.runtime.alert_redeliver_cli`.
+breezy-autonomy-alert-redeliver = "breezy.runtime.alert_redeliver_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

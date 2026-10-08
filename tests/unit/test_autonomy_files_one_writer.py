@@ -311,7 +311,17 @@ def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None
     # 23: AUT-2 WP5 adds the position-compare, lock-skip and CRITICAL-dedup journal rows.
     # 26: AUT-2 WP8 adds the canary fills, canary labels and live-proof artefact rows.
     # 29: AUT-2 WP6 adds the run marker, the label-hold journal and the measured-peak artefact.
-    assert len(paths) == len(set(paths)) == 29
+    # 31: AUT-6 WP1 adds the delivery-journal and the durable-outbox rows (evidence/alerts/**).
+    assert len(paths) == len(set(paths)) == 31
+
+
+def test_the_aut6_alert_rows_name_the_outbox_and_record_writers() -> None:
+    rows = {row.path: row for row in AUTONOMY_FILE_WRITERS}
+    records = rows["evidence/alerts/<YYYY-MM-DD>/<ts_ns>_<writer>_<d|f>.json"]
+    outbox = rows["evidence/alerts/outbox/*.json"]
+    assert records.mechanism == outbox.mechanism == "write_once"
+    assert "DeliveryRecordWriter" in records.writers and "legacy_<component>" in records.writers
+    assert "rename" in outbox.writers and "current claimant only" in outbox.writers
 
 
 def test_exemptions_are_narrow_and_unique() -> None:

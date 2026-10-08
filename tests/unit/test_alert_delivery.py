@@ -6,7 +6,6 @@ WP1 list (l.1131–1140); the systemd names live in the contract module.
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import os
@@ -104,6 +103,10 @@ def _proof(
         attempt_kind=attempt_kind,  # type: ignore[arg-type]
         outbox=outbox if outbox is not None else AlertOutbox(root),
     )
+
+
+def _at(ns: int) -> Callable[[], int]:
+    return lambda: ns
 
 
 def _records(root: Path) -> list[Path]:
@@ -293,7 +296,7 @@ def test_attempt_kind_enum_is_alert_retry_canary_drain(alerts_root: Path) -> Non
             writer="health",
             records=DeliveryRecordWriter(alerts_root),
             attempt_kind=kind,  # type: ignore[arg-type]
-            now_ns=lambda kind=kind: 1_700_000_000_000_000_000 + _ATTEMPT_KINDS.index(kind),
+            now_ns=_at(1_700_000_000_000_000_000 + _ATTEMPT_KINDS.index(kind)),
         )
     kinds = {
         json.loads(path.read_text(encoding="utf-8"))["attempt_kind"]
@@ -341,7 +344,7 @@ def test_outbox_entry_written_fsynced_before_http_attempt(alerts_root: Path) -> 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
         seen.append(sorted(path.name for path in (alerts_root / "outbox").rglob("*.json")))
-        raise httpx.ReadTimeout("stalled", request=None)  # type: ignore[arg-type]
+        raise httpx.ReadTimeout("stalled", request=None)
 
     proof = _proof(
         _tee(httpx.Client(transport=httpx.MockTransport(handler))),
@@ -357,10 +360,10 @@ def test_outbox_entry_written_fsynced_before_http_attempt(alerts_root: Path) -> 
 def test_outbox_claim_stamps_utime_before_rename(
     alerts_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import breezy.runtime.alert_delivery as delivery
+    import breezy.runtime.alert_outbox as outbox_module
 
     recorder = _RecordingOs(os)
-    monkeypatch.setattr(delivery, "os", recorder)
+    monkeypatch.setattr(outbox_module, "os", recorder)
     outbox = AlertOutbox(alerts_root)
     entry = outbox.write_entry(_payload(), writer="health", drill=False, ts_ns=10)
     recorder.ops.clear()
@@ -371,8 +374,12 @@ def test_outbox_claim_stamps_utime_before_rename(
     assert utime_at < rename_at
     assert not any(op[0] == "rename" for op in recorder.ops[:utime_at])
     rename = next(op for op in recorder.ops if op[0] == "rename")
-    assert "claimed" in rename[2].parts and rename[2].parent.name == "redeliver"
-    assert any(op[0] == "open" and int(op[2]) & os.O_DIRECTORY for op in recorder.ops[rename_at:])
+    target = Path(str(rename[2]))
+    assert "claimed" in target.parts and target.parent.name == "redeliver"
+    assert any(
+        op[0] == "open" and isinstance(op[2], int) and op[2] & os.O_DIRECTORY
+        for op in recorder.ops[rename_at:]
+    )
     assert any(op[0] == "fsync" for op in recorder.ops[rename_at:])
 
 
@@ -413,10 +420,10 @@ def test_crash_between_utime_and_rename_leaves_entry_drainable(
     def _boom(src: object, dst: object) -> None:
         raise OSError("killed between utime and rename")
 
-    monkeypatch.setattr(delivery.os, "rename", _boom)
+    monkeypatch.setattr(os, "rename", _boom)
     with pytest.raises(OSError, match="killed"):
         outbox.claim(entry, "redeliver")
-    monkeypatch.setattr(delivery.os, "rename", real_rename)
+    monkeypatch.setattr(os, "rename", real_rename)
     assert entry.is_file()
     posts: list[str] = []
 
@@ -549,7 +556,7 @@ def test_critical_survives_sigkill(alerts_root: Path) -> None:
     ):
         outbox.write_entry(_payload(event=name), writer="node", drill=False, ts_ns=ts)
     script = textwrap.dedent(
-        f"""
+        """
         import os, sys, time
         from breezy.runtime.alert_delivery import AlertOutbox
         root = sys.argv[1]
@@ -613,7 +620,7 @@ def test_critical_alerts_use_delivery_proof(
     try:
         emit_alert(sink, _payload())
     finally:
-        sink.close()
+        sink.close()  # type: ignore[attr-defined]
     _path, body = _one_record(alerts_root)
     assert body["delivered"] is True
     assert body["event"] == "CAPTURE_PUBLISH_FAILED"
@@ -671,7 +678,7 @@ def test_resolve_alert_sink_webhook_branch_records_and_queues_proof_bearing(
         assert LoggingAlertSink in branch_types
         emit_alert(sink, _payload())
     finally:
-        sink.close()
+        sink.close()  # type: ignore[attr-defined]
     assert seen == [1]
     _path, body = _one_record(alerts_root)
     assert body["delivered"] is True
@@ -702,7 +709,7 @@ def test_outbox_reserves_16_slots_for_critical(alerts_root: Path) -> None:
     outbox = AlertOutbox(alerts_root)
     warn = _proof(
         _tee(_client(204)),
-        _payload(event="WARN_STORM", severity="WARN"),
+        _payload(event="CAPTURE_REFUSED", severity="WARN"),
         alerts_root,
         outbox=outbox,
     )
@@ -759,12 +766,12 @@ def test_tee_containment_unchanged_with_journaling_branch(
     sink = resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _URL})
     try:
         emit_alert(sink, _payload())
+        assert any("breezy alert" in rec.message for rec in caplog.records)
+        hook = next(branch for branch in sink.sinks if isinstance(branch, WebhookAlertSink))  # type: ignore[attr-defined]
+        with pytest.raises(AlertNotDeliveredError):
+            hook.emit(_payload(event="DIRECT"))
     finally:
-        sink.close()
-    assert any("breezy alert" in rec.message for rec in caplog.records)
-    hook = next(branch for branch in sink.sinks if isinstance(branch, WebhookAlertSink))  # type: ignore[attr-defined]
-    with pytest.raises(AlertNotDeliveredError):
-        hook.emit(_payload(event="DIRECT"))
+        sink.close()  # type: ignore[attr-defined]
 
 
 def test_enqueue_alert_writes_no_failure_record_and_does_not_post(alerts_root: Path) -> None:
@@ -782,7 +789,6 @@ def test_enqueue_alert_writes_no_failure_record_and_does_not_post(alerts_root: P
 
 def test_delivery_record_matches_capture_aut6_contract(alerts_root: Path) -> None:
     """The one AUT-1 reader contract: name regex plus schema, and no URL field."""
-    path, body = None, None
     deliver_with_proof(
         _tee(_client(200)),
         _payload(),
@@ -792,18 +798,64 @@ def test_delivery_record_matches_capture_aut6_contract(alerts_root: Path) -> Non
         outbox=AlertOutbox(alerts_root),
     )
     path, body = _one_record(alerts_root)
-    assert path is not None and body is not None
     assert DELIVERY_RECORD_NAME_RE.fullmatch(path.name)
     assert body["schema"] == DELIVERY_SCHEMA
-    tree = ast.dump(ast.parse(Path(delivery_source()).read_text(encoding="utf-8"))) if False else ""
-    del tree
     assert "://" not in json.dumps(body)
 
 
-def delivery_source() -> str:
-    return str(
-        Path(__file__).resolve().parents[2] / "src" / "breezy" / "runtime" / "alert_delivery.py"
+def test_non_proof_bearing_alert_is_still_posted_when_the_outbox_is_full(
+    alerts_root: Path,
+) -> None:
+    out = alerts_root / "outbox"
+    out.mkdir(parents=True)
+    os.chmod(out, 0o700)
+    for index in range(ALERT_OUTBOX_MAX):
+        (out / f"{index}_FULL.json").write_text("{}", encoding="utf-8")
+    proof = _proof(
+        _tee(_client(204)), _payload(event="FEE_SCHEDULE_STALE", severity="WARN"), alerts_root
     )
+    assert proof.delivered is True
+    assert proof.status_class == "2xx"
+
+
+def test_reclaim_tolerates_a_claim_vanishing_before_its_stat(
+    alerts_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = AlertOutbox(alerts_root)
+    entry = outbox.write_entry(_payload(), writer="health", drill=False, ts_ns=5)
+    held = outbox.claim(entry, "other")
+    assert held is not None
+    real_stat = Path.stat
+
+    def _gone(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if self.name == held.name:
+            raise FileNotFoundError(self.name)
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", _gone)
+    assert outbox.reclaim_stale("redeliver") == []
+
+
+def test_drain_attempts_a_reclaimed_claim_even_when_younger_than_min_age(
+    alerts_root: Path,
+) -> None:
+    from breezy.runtime import alert_delivery as delivery
+
+    outbox = AlertOutbox(alerts_root)
+    entry = outbox.write_entry(_payload(), writer="health", drill=False, ts_ns=time.time_ns())
+    held = outbox.claim(entry, "stalled")
+    assert held is not None
+    stale_at = time.time() - (ALERT_CLAIM_STALE_S + 1)
+    os.utime(held, (stale_at, stale_at))
+    summary = delivery.drain_outbox(
+        drainer="deadman",
+        outbox=outbox,
+        sink=_tee(_client(204)),
+        records=DeliveryRecordWriter(alerts_root),
+        min_age_s=300,
+    )
+    assert summary.reclaims == 1
+    assert summary.delivered == 1
 
 
 def test_journaling_sink_is_a_webhook_alert_sink_instance() -> None:

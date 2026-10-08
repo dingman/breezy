@@ -127,7 +127,13 @@ def test_label_unit_lints_clean_against_a_standin_notifier_row() -> None:
 def test_label_unit_fails_lint_only_on_aut6_onfailure_scope() -> None:
     errors = lint_units(FIXTURES, AUTONOMY_BWRAP_TABLE)
 
-    assert [(e.unit, e.rule) for e in errors] == [(f"{LABEL}.service", "onfailure_scope")]
+    # AUT-6 WP1 (X-3) lists ``breezy-autonomy-failed@`` in the redeliver row, so the OnFailure
+    # target is in lint scope and the scope error is gone. Promotion still waits for the notifier
+    # unit itself (AUT-6 WP4/WP7), which the lint cannot see.
+    assert [(e.unit, e.rule) for e in errors] == []
+    assert (
+        "breezy-autonomy-failed@" in AUTONOMY_BWRAP_TABLE["breezy-autonomy-alert-redeliver"].units
+    )
 
 
 def test_the_unit_text_already_carries_the_autonomy_failed_onfailure() -> None:

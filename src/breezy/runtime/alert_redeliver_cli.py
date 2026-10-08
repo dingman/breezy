@@ -15,6 +15,7 @@ from collections.abc import Sequence
 
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.alert_delivery import (
+    COUNTERS,
     REDELIVER_MIN_AGE_S,
     AlertOutbox,
     DeliveryRecordWriter,
@@ -57,7 +58,7 @@ def _integrity_attempt() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Drain once. Exit 0 when the lock is held elsewhere or the drain finishes; 3 if it is missing."""
+    """Drain once. Exit 0 if the lock is held elsewhere or the drain ends; 3 if it is missing."""
     del argv
     root = default_alerts_root()
     lock_path = root / _LOCK_NAME
@@ -92,7 +93,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         _close(sink)
         os.close(fd)
-    print(f"AUTONOMY_REDELIVER delivered={summary.delivered}")
+    print(
+        f"AUTONOMY_REDELIVER delivered={summary.delivered} attempted={summary.attempted} "
+        f"reclaims={summary.reclaims} failures={summary.failures} "
+        f"abandoned={len(summary.abandoned)} "
+        f"journal_write_failures={COUNTERS.journal_write_failures} "
+        f"outbox_write_failures={COUNTERS.outbox_write_failures}"
+    )
+    for name in summary.abandoned:
+        print(f"AUTONOMY_REDELIVER abandoned_entry={name}")
     return 0
 
 

@@ -223,8 +223,12 @@ def test_capture_units_fail_lint_only_on_aut6_scope() -> None:
     """Against the real table the only error is the missing AUT-6 notifier row
     (``onfailure_scope``), one per service: promotion waits for AUT-6 (design F3)."""
     errors = lint_units(FIXTURES, AUTONOMY_BWRAP_TABLE)
-    assert sorted((e.unit, e.rule) for e in errors) == sorted(
-        (f"{name}.service", "onfailure_scope") for name in SERVICES
+    # AUT-6 WP1 (X-3) lists ``breezy-autonomy-failed@`` in the redeliver row, so the OnFailure
+    # target is in lint scope and the scope error is gone. Promotion still waits for the notifier
+    # unit itself (AUT-6 WP4/WP7), which the lint cannot see.
+    assert sorted((e.unit, e.rule) for e in errors) == []
+    assert (
+        "breezy-autonomy-failed@" in AUTONOMY_BWRAP_TABLE["breezy-autonomy-alert-redeliver"].units
     )
 
 

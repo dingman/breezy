@@ -139,6 +139,10 @@ def test_write_on_change_alert_resent_after_failed_delivery(root: Path) -> None:
 def test_redeliver_runs_the_production_default_once(
     root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    from breezy.runtime.alert_delivery import COUNTERS
+
+    monkeypatch.setattr(COUNTERS, "journal_write_failures", 0)
+    monkeypatch.setattr(COUNTERS, "outbox_write_failures", 0)
     lock = root / ".redeliver.lock"
     lock.write_text("", encoding="utf-8")
     calls: list[dict[str, object]] = []
@@ -161,6 +165,10 @@ def test_redeliver_runs_the_production_default_once(
     text = capsys.readouterr().out
     assert "AUTONOMY_REDELIVER" in text
     assert "delivered=0" in text
+    # plan r15 §3.6.2-3.6.3: the unit summary line carries both process counters
+    assert "journal_write_failures=0" in text
+    assert "outbox_write_failures=0" in text
+    assert "abandoned=0" in text
 
 
 def test_drain_outbox_deadman_call_runs_the_production_default_once(
@@ -196,9 +204,7 @@ def test_redeliver_missing_lock_is_integrity_and_exit_3(
     assert "INTEGRITY lock_file_missing" in text
 
 
-def test_redeliver_lock_held_skips(
-    root: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_redeliver_lock_held_skips(root: Path, capsys: pytest.CaptureFixture[str]) -> None:
     import fcntl
 
     lock = root / ".redeliver.lock"
@@ -212,3 +218,17 @@ def test_redeliver_lock_held_skips(
     text = capsys.readouterr().out + capsys.readouterr().err
     assert code == 0
     assert "SKIPPED lock_held" in text
+
+
+def test_redeliver_names_an_abandoned_entry_on_its_summary_output(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (root / ".redeliver.lock").write_text("", encoding="utf-8")
+    path = _entry(AlertOutbox(root), "ABANDONED_EVENT", 24 * 3600 + 5)
+    monkeypatch.setattr(
+        "breezy.runtime.alert_redeliver_cli.resolve_alert_sink", lambda env=None: LoggingAlertSink()
+    )
+    assert main([]) == 0
+    text = capsys.readouterr().out
+    assert f"abandoned_entry={path.name}" in text
+    assert "abandoned=1" in text

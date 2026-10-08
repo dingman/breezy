@@ -65,7 +65,7 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             with lock:
@@ -81,7 +81,7 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     script = textwrap.dedent(
-        f"""
+        """
         import os, sys
         import httpx
         from pathlib import Path
@@ -93,7 +93,7 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
         port = sys.argv[3]
 
         def handler(request: httpx.Request) -> httpx.Response:
-            httpx.post(f"http://127.0.0.1:{{port}}/count", content=request.content)
+            httpx.post(f"http://127.0.0.1:{port}/count", content=request.content)
             return httpx.Response(204)
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -123,7 +123,7 @@ def test_concurrent_drainers_send_at_most_once_per_claim_window(tmp_path: Path) 
         assert proc.wait(timeout=60) == 0, proc.returncode
     server.shutdown()
     events = [json.loads(body.decode())["event"] for body in posts]
-    assert sorted(events) == [f"RACE_{index}" for index in range(50)]
+    assert sorted(events) == sorted(f"RACE_{index}" for index in range(50))
     delivered = [path.name for path in root.rglob("*_d.json")]
     assert len(delivered) == 50
 

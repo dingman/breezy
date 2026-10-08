@@ -226,18 +226,25 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         "test_drawdown_producer_handshake_with_labels",
         "test_detectors_and_drawdown_include_drill_fills[drawdown]",
     ),
+    # AUT-6 WP1 delivered deliver_with_proof and its five ARCH-named tests (test_alert_delivery.py,
+    # test_alert_outbox_concurrency.py); the rows below stay for the work packages that own them.
     *_group(
         "AUT-6",
-        "breezy.runtime.alert_delivery:deliver_with_proof",
+        "breezy.runtime.alert_delivery:OffLoopAlertSink",
         [],
-        "test_deliver_with_proof_reports_non_2xx_through_tee",
-        "test_critical_alerts_use_delivery_proof",
-        "test_detector_and_failure_mode_alerts_use_delivery_proof",
-        "test_critical_survives_sigkill",
-        "test_concurrent_drainers_send_at_most_once_per_claim_window",
         "test_try_submit_latency_independent_of_webhook_latency",
+    ),
+    *_group(
+        "AUT-6",
+        "breezy.runtime.autonomy_canary_cli:main",
+        [],
         "test_alerts_undeliverable_veto",
         "test_alerts_undeliverable_reads_two_days",
+    ),
+    *_group(
+        "AUT-6",
+        "breezy.runtime.autonomy_producer_intraday_cli:main",
+        [],
         "test_fee_schedule_verdict_feeds_fee_verified_checks",
     ),
     *_group(

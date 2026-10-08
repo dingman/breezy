@@ -320,6 +320,28 @@ _LABEL_OUTCOMES_ROW: Final = BwrapRow(
 )
 
 
+#: AUT-6 WP1 (plan r15 section 3.1.1, E-15): the alert outbox redeliver. It binds only
+#: ``evidence/alerts`` (outbox, claims, records and its pre-created lock), keeps the host network
+#: for the webhook POST, and carries no credential: the URL arrives through ``EnvironmentFile=``
+#: before the wrapper starts, and the wrapper hides ``~/.config``.
+#:
+#: X-3 scope shim: the unit ships ``OnFailure=breezy-autonomy-failed@%n.service`` before the
+#: notifier exists (WP4/WP7), and the unit lint refuses an ``OnFailure=`` target that is in no row.
+#: The notifier's row shape (bind ``evidence/alerts``, egress) is identical, so ``units`` lists the
+#: template too. WP4/WP7 moves it into its own row and unit file and removes it from here. The
+#: redeliver unit is deliberately not in ``AUTONOMY_OWNED_UNITS``: a row-listed unit is already in
+#: lint scope, and an owned unit must have a file in every fixture directory the lint tests scan.
+_ALERT_REDELIVER_ROW: Final = BwrapRow(
+    name="breezy-autonomy-alert-redeliver",
+    owner_plan="AUT-6",
+    units=frozenset({"breezy-autonomy-alert-redeliver.service", "breezy-autonomy-failed@"}),
+    binds=("evidence/alerts",),
+    entry_modules=("breezy.runtime.alert_redeliver_cli",),
+    resolves_dns=True,
+    network="egress",
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -375,6 +397,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             ),
             *_CAPTURE_ROWS,
             _LABEL_OUTCOMES_ROW,
+            _ALERT_REDELIVER_ROW,
         )
     }
 )

@@ -72,6 +72,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "breezy.app.trade",
     "breezy.runtime.quote_tape_ingest_cli",
     "breezy.runtime.clear_submit_intent_cli",
+    "breezy.runtime.alert_redeliver_cli",
     "breezy.runtime.mark_no_side_position_captured_cli",
     "breezy.runtime.trade_supervisor",
     "breezy.runtime.check_alerts_cli",
@@ -187,6 +188,7 @@ def test_entry_module_list_covers_every_entry_point() -> None:
         "the tuple, or, if deliberately untested, to "
         f"STAGE0_EXCLUDED_ENTRY_MODULES with a comment explaining why: {sorted(missing)}"
     )
+
 
 #: Prepended to every T2/T3 child script (D-3). Installs a `find_spec`
 #: finder -- `find_module` no longer exists on Python 3.13

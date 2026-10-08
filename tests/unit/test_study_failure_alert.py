@@ -48,6 +48,13 @@ _DEPLOY_DIR: Final[Path] = _REPO_ROOT / "deploy" / "systemd"
 
 _NOTIFIER_TEMPLATE_UNIT: Final[str] = "breezy-study-failed@.service"
 _ONFAILURE_LINE: Final[str] = "OnFailure=breezy-study-failed@%n.service"
+#: Autonomy units are wrapped and notify through ``breezy-autonomy-failed@`` instead: the unit lint
+#: refuses ``breezy-study-failed@`` on them by name (E-7a). Widened by exactly one reviewed unit,
+#: AUT-6 WP1's alert redeliver; each must carry the autonomy line.
+_AUTONOMY_ONFAILURE_LINE: Final[str] = "OnFailure=breezy-autonomy-failed@%n.service"
+_AUTONOMY_NOTIFIED_UNITS: Final[frozenset[str]] = frozenset(
+    {"breezy-autonomy-alert-redeliver.service"}
+)
 
 #: AUD-15 amendment (2026-09-22): the ONE alert env file a study-adjacent
 #: unit may declare -- never `breezy-trade.env`/`polymarket.env`/
@@ -81,9 +88,18 @@ def test_every_study_unit_declares_an_onfailure_handler() -> None:
         path.name
         for path in services
         if path.name != _NOTIFIER_TEMPLATE_UNIT
+        and path.name not in _AUTONOMY_NOTIFIED_UNITS
         and _ONFAILURE_LINE not in path.read_text().splitlines()
     ]
     assert missing == [], f"units missing {_ONFAILURE_LINE!r}: {missing}"
+    autonomy = [
+        path.name
+        for path in services
+        if path.name in _AUTONOMY_NOTIFIED_UNITS
+        and _AUTONOMY_ONFAILURE_LINE not in path.read_text().splitlines()
+    ]
+    assert autonomy == [], f"units missing {_AUTONOMY_ONFAILURE_LINE!r}: {autonomy}"
+    assert _AUTONOMY_NOTIFIED_UNITS <= {path.name for path in services}
 
 
 def _directive_lines(text: str) -> list[str]:
@@ -183,9 +199,7 @@ def test_notify_study_failed_logs_alert_egress_status_before_resolving_the_sink(
         exit_code = notify_study_failed(["--unit", "breezy-k1-daily.service"], env={})
 
     assert exit_code == 0
-    assert any(
-        "NO alert egress is configured" in record.getMessage() for record in caplog.records
-    )
+    assert any("NO alert egress is configured" in record.getMessage() for record in caplog.records)
 
 
 def test_the_notifier_alert_detail_is_a_fixed_enum_and_carries_no_unit_text() -> None:
