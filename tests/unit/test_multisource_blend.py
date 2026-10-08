@@ -29,7 +29,11 @@ _HOUR_NS = 3600 * _NS
 _OFFSET = -5.0  # NYC local standard time
 _NBP_MODULE = REPO_ROOT / "src" / "breezy" / "analysis" / "nbp_calibration.py"
 #: sha256 of src/breezy/analysis/nbp_calibration.py at the F13 Phase A start (HEAD 6d1eb4f3).
-_NBP_MODULE_SHA256 = "e126e1b49217467cbef0c4c767a48e8ae8a317e4f7abd2ca733ed4cbed7033a0"
+#: Reviewed row (AUT-6 WP5, plan r15 §3.1.2 M3 / §0.1 (21)): the ONLY change is repointing the three
+#: imports from breezy.strategy.ladder_ev.{location_correction,quantile_density} to the moved
+#: breezy.domain.* modules. Imports-only; behaviour unchanged (identity test below). Previous value:
+#: e126e1b49217467cbef0c4c767a48e8ae8a317e4f7abd2ca733ed4cbed7033a0
+_NBP_MODULE_SHA256 = "5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6"
 
 
 # ------------------------------------------------------------------ helpers
@@ -222,6 +226,23 @@ def test_nbp_calibration_module_is_byte_unchanged() -> None:
         "src/breezy/analysis/nbp_calibration.py is the champion: it must stay byte-unchanged "
         "by F13 Phase A (plan: M0 = fit_calibration, untouched)"
     )
+
+
+def test_nbp_calibration_domain_imports_are_the_strategy_path_objects() -> None:
+    """The M3 repoint is behaviour-neutral: both import paths resolve to the same objects."""
+    from breezy.domain import location_correction as dom_lc
+    from breezy.domain import quantile_density as dom_qd
+    from breezy.strategy.ladder_ev import location_correction as strat_lc
+    from breezy.strategy.ladder_ev import quantile_density as strat_qd
+
+    for name in ("CorrectionForm", "correction_prediction_f", "emos_params_from_draw_entry"):
+        assert getattr(dom_lc, name) is getattr(strat_lc, name)
+        assert getattr(calib, "_" + name if name == "emos_params_from_draw_entry" else name) is (
+            getattr(dom_lc, name)
+        )
+    for name in ("CdfMethod", "EmosParams", "Percentiles"):
+        assert getattr(dom_qd, name) is getattr(strat_qd, name)
+        assert getattr(calib, name) is getattr(dom_qd, name)
 
 
 def test_open_holdout_is_never_called(monkeypatch: pytest.MonkeyPatch) -> None:
