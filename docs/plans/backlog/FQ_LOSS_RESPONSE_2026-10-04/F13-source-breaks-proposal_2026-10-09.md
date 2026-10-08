@@ -27,3 +27,7 @@ A read-only simulation of the builder over the full window gives observed ⊆ pr
 5. **NBM dates come from provenance only.** Never take them from the code table `VERSION_BREAKS` (`nbp_lag_census.py:60`): its dates are cycle dates, and five cycles disagree with it.
 6. **Same-day flips** (2024-05-15, 2026-03-30) are artefacts of availability or gaps. They create 1–2-day segments, which `build_folds` excludes.
 7. **Coverage gap: there is no GFS MOS archive for 2026-01..06.** The GFS leg backfills complete years only (`_last_complete_year`). The builder counts the gap as `mos_coverage_gap_days`. Decide before the freeze whether to backfill 2026 H1 (a monthly leg) or accept the gap.
+
+**Update to item 7 (2026-10-09 ~00:05Z):**
+- Done: GFS MOS 2026-01-01..2026-07-01 (end exclusive) was fetched into the iem-mos cache via `iem_mos_backfill.py --start/--end`. That is 5 stations × 15,204 rows, rc 0. Report: `quarantine/run-reports-2026-10-08/gfs_mos_2026h1_1009.json`.
+- Still to check: whether the builder reads partial-range keys. The `--draft-scratch` build's `mos_coverage_gap_days` will show it.
