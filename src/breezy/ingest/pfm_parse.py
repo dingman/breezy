@@ -294,12 +294,17 @@ def _hour_rows(table: list[str]) -> tuple[str, str] | None:
 
 
 def _is_extrema_column(column: _Column, accepted: frozenset[tuple[int, int | None]]) -> bool:
+    """Whether `column` is an accepted extrema hour in `accepted`.
+
+    The CDT-era 06-18 local window: the LOT (CDT) layout puts the daytime extrema under
+    UTC 23Z (MAX, local 18) and 11Z (MIN, local 06). b805364f made the parser accept it.
+    """
     return (column.utc_hour, None) in accepted or (column.utc_hour, column.local_hour) in accepted
 
 
 def _table_max(
     table: list[str], anchor: dt.date, issued_at: dt.datetime, previous: _Column | None
-) -> tuple[dict[dt.date, int], _Column, int]:
+) -> tuple[list[tuple[dt.date, int]], _Column, int]:
     hour_rows = _hour_rows(table)
     if hour_rows is None:
         raise PfmParseError("table_header", table[0][:40])
@@ -311,7 +316,7 @@ def _table_max(
     columns = {c.end: c for c in ordered}
     if extrema[0][:_LABEL_WIDTH].strip().upper() not in _EXTREMA_LABELS:
         raise PfmParseError("extrema_label")
-    found: dict[dt.date, int] = {}
+    found: list[tuple[dt.date, int]] = []
     skipped = 0
     for count, m in enumerate(re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]), start=1):
         if count > MAX_FIELDS_PER_ROW:
@@ -327,7 +332,7 @@ def _table_max(
             raise PfmParseError("extrema_out_of_range", m.group())
         column = columns[end]
         if _is_extrema_column(column, _MAX_COLUMNS):
-            found[column.local_date] = value
+            found.append((column.local_date, value))
         elif not _is_extrema_column(column, _MIN_COLUMNS):
             raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
     return found, ordered[-1], skipped
@@ -343,7 +348,7 @@ def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date,
     for begin, end in zip(starts, [*starts[1:], len(body)], strict=True):
         found, last, skipped = _table_max(body[begin:end], issued_at.date(), issued_at, last)
         skipped_mm += skipped
-        for date, value in found.items():
+        for date, value in found:
             if date in merged:
                 raise PfmParseError("duplicate_day", date.isoformat())
             merged[date] = value
