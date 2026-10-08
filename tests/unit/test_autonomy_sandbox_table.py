@@ -671,7 +671,7 @@ def test_unwrapped_residual_units_disjoint_and_cited() -> None:
 
 def test_module_exposes_no_state_changing_bus_verbs() -> None:
     allowed = table_module.BUS_READ_VERBS
-    assert allowed == frozenset({"show", "list-units", "list-timers"})
+    assert allowed == frozenset({"show", "list-units", "list-timers", "list-unit-files"})
 
 
 # ------------------------------------------------------- wrapper-line-only units

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import textwrap
 import time
@@ -24,7 +23,13 @@ import pytest
 
 from breezy.runtime.autonomy_sandbox.bus_handoff import write_bus_snapshot
 from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE, SandboxRoots
-from tests.support.bwrap_harness import CHILD_ROOTS_PRELUDE, make_roots, roots_json, run_in_row
+from tests.support.bwrap_harness import (
+    CHILD_ROOTS_PRELUDE,
+    make_roots,
+    roots_json,
+    run_host_read,
+    run_in_row,
+)
 
 pytestmark = pytest.mark.bwrap_host
 
@@ -205,13 +210,8 @@ def test_health_reads_systemd_and_journal_inside_its_bwrap_row(roots: SandboxRoo
     )
     assert status == 0
     until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time() - 30))
-    outside = subprocess.run(
-        ["journalctl", "--user", "-o", "json", "-n", "5", "--until", until, "--no-pager"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+    outside = run_host_read(
+        ["journalctl", "--user", "-o", "json", "-n", "5", "--until", until, "--no-pager"]
     )
     command = [
         sys.executable,

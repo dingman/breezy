@@ -259,6 +259,12 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         [],
         "test_health_memory_sum_within_memavailable",
         "test_oneshot_units_use_timeout_start_sec_not_runtime_max_sec",
+    ),
+    # Watchdog checks moved to AUT-6 WP4 (slice plan): keyed on WP4's own CLI, not the health CLI.
+    *_group(
+        "AUT-6",
+        "breezy.runtime.autonomy_watchdog_cli:main",
+        [],
         "test_watchdog_units_are_literal_and_exclude_trade_supervisor_engine",
         "test_watchdog_unit_config_declares_notify_watchdog_restart_startlimit_and_notifyaccess_all",
         "test_watchdog_kill_paged_once_via_notifier_marker_else_fallback_critical",

@@ -89,7 +89,9 @@ CONFIG_RO_ALLOWLIST: Final[frozenset[str]] = frozenset({".config/systemd/user"})
 SYSTEMCTL: Final = "/usr/bin/systemctl"
 #: The read verbs of the bus-snapshot grammar. ``kill``/``start``/``stop``/
 #: ``restart``/``try-restart`` and ``systemd-run`` are structurally absent.
-BUS_READ_VERBS: Final[frozenset[str]] = frozenset({"show", "list-units", "list-timers"})
+BUS_READ_VERBS: Final[frozenset[str]] = frozenset(
+    {"show", "list-units", "list-timers", "list-unit-files"}
+)
 #: The one and only ``run-*`` bus read (M40: ``'run-*.service'`` matches exactly
 #: the failed transient, where ``'run-*'`` also matches mounts).
 RUN_TRANSIENT_SHOW_ARGV: Final[tuple[str, ...]] = (
@@ -123,9 +125,11 @@ _PROPERTY_RE: Final = re.compile(r"[A-Za-z,]+")
 _PROPERTY_OPTION_RE: Final = re.compile(r"--property=[A-Za-z,]+")
 _STATE_OPTION_RE: Final = re.compile(r"--state=[a-z]+")
 _TYPE_OPTION_RE: Final = re.compile(r"--type=[a-z]+")
-_UNIT_TOKEN_RE: Final = re.compile(r"breezy-[a-z0-9@._*-]+")
+#: ``breezy-*`` units, plus the instances of the one non-``breezy-`` timer template the health
+#: pass reads (``us-source-collector@``); no other prefix is in the grammar.
+_UNIT_TOKEN_RE: Final = re.compile(r"breezy-[a-z0-9@._*-]+|us-source-collector@[a-z0-9._*-]*")
 _BARE_OPTIONS: Final[frozenset[str]] = frozenset(
-    {"--all", "--plain", "--no-legend", "--no-pager", "--failed", "--value"}
+    {"--all", "--plain", "--no-legend", "--no-pager", "--failed", "--value", "--full"}
 )
 _SERVICE_SUFFIX: Final = ".service"
 _RESIDUAL_CITATION_MARKER: Final = "E-7a"
@@ -366,24 +370,66 @@ _CANARY_ROW: Final = BwrapRow(
 #: the bus snapshot in ``cache/aut6_health_bus``; an in-row ``systemctl`` is expected to fail
 #: (V-6). ``journalctl --user -o json`` is the one in-row read that works. ``host_proc`` is the
 #: named ``E7A_R2_PROC`` exception: the pass reads ``/proc/<pid>/status`` of the node and the
-#: supervisor for the section 3.9 resident-memory add-back, so the row has no ``--unshare-pid``.
+#: supervisor for the section 3.9 resident-memory add-back. The row KEEPS ``--unshare-pid`` like
+#: every row and omits only the fresh ``--proc``: the read-only root's host procfs stays (V-6).
 #: The pass makes no state-changing call. Unit properties are a fixed set: no ``Environment`` or
 #: ``Credential`` property can be named (B6-R3). ``show -- 'breezy-*'`` also lists timers and
 #: slices, so the consumer filters on ``Id`` ending ``.service``.
 _HEALTH_SHOW_PROPERTIES: Final = (
     "Id,ActiveState,SubState,Result,InvocationID,NRestarts,ExecMainStatus,ExecMainCode,"
     "ExecMainStartTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,MemoryCurrent,MemoryPeak,"
-    "MemorySwapPeak,MemoryHigh,MemoryMax,Type,Restart,TimeoutStartUSec,LastTriggerUSec,"
+    "MemorySwapPeak,MemoryHigh,MemoryMax,Type,Restart,MainPID,UnitFileState,LoadState,TimeoutStartUSec,LastTriggerUSec,"
     "NextElapseUSecRealtime,NextElapseUSecMonotonic,Unit,FragmentPath,DropInPaths"
 )
 _HEALTH_BUS_BIND: Final = "cache/aut6_health_bus"
 _HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
     BusRead(
-        "units_show", (SYSTEMCTL, "--user", "show", "-p", _HEALTH_SHOW_PROPERTIES, "--", "breezy-*")
+        "units_show",
+        (
+            SYSTEMCTL,
+            "--user",
+            "show",
+            "-p",
+            _HEALTH_SHOW_PROPERTIES,
+            "--",
+            "breezy-*",
+            "us-source-collector@*",
+        ),
     ),
     BusRead(
         "failed_list",
         (SYSTEMCTL, "--user", "list-units", "--failed", "--all", "--plain", "--no-legend"),
+    ),
+    # Ruling R-S2-1: inventory completeness. The loaded inventory (load/active/sub of every loaded
+    # unit, inactive ones included) and the on-disk inventory (UnitFileState, not-loaded units).
+    BusRead(
+        "units_inventory",
+        (
+            SYSTEMCTL,
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--full",
+            "--",
+            "breezy-*",
+            "us-source-collector@*",
+        ),
+    ),
+    BusRead(
+        "unit_files_inventory",
+        (
+            SYSTEMCTL,
+            "--user",
+            "list-unit-files",
+            "--plain",
+            "--no-legend",
+            "--full",
+            "--",
+            "breezy-*",
+            "us-source-collector@*",
+        ),
     ),
     BusRead("timers_list", (SYSTEMCTL, "--user", "list-timers", "--all", "--plain", "--no-legend")),
     BusRead("run_transient", RUN_TRANSIENT_SHOW_ARGV),

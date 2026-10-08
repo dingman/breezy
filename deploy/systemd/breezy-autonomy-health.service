@@ -25,6 +25,7 @@ Type=oneshot
 WorkingDirectory=/home/jon/breezy
 UMask=0077
 MemoryMax=256M
+MemorySwapMax=0
 TimeoutStartSec=115
 TimeoutStopSec=5
 # No mount-namespace directives here (ReadWritePaths, ProtectHome, PrivateTmp, ...): systemd would

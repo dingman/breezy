@@ -73,3 +73,105 @@ Result: **PASS, no mismatch.**
 
 Caveat: the failed-unit list and the `run-*` transient read were both empty at probe time, so their equality
 is true but trivial; the handoff mechanics for non-empty output are pinned by the ARCH bus-handoff tests.
+
+## V-6 re-run with the final argv and a positive control (review S2), ~21:40Z 2026-10-08
+
+Final `units_show` argv (shipped row): `show -p <25 properties incl. MainPID,UnitFileState,LoadState> -- 'breezy-*' 'us-source-collector@*'`.
+Two scratch failing units were created: `systemd-run --user --unit=claude-aut6-v6-fail /bin/false`
+(InvocationID `eef3b89a14554e52b69214ba39bb3d26`) and an unnamed `systemd-run --user /bin/false`
+(`run-p2307185-i44246311.service`, InvocationID `6c50741a17fb41e99638246fa039b529`); both `Result=exit-code`
+(F2 second sample: InvocationID is non-empty on a failed unit and on a failed `run-*` transient).
+
+```
+snapshot_writer_rc 0
+node/supervisor pids [274295, 1037914]
+child rc 0
+
+INSIDE systemctl: [1, '', 'Failed to connect to user scope bus via local transport: No such file or directory\n']
+read units_show: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=20239 bytes_in=20239
+read failed_list: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=269 bytes_in=269
+read timers_list: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=4719 bytes_in=4719
+read run_transient: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=341 bytes_in=341
+journal --until parsed-equal (key order is randomised per process): True rc 0 0 lines 5
+journal last-5 (live, may drift) parsed-equal: True lines 5 5
+proc 274295 ['Name:\tbreezy-trade-su', 'Umask:\t0077', 'State:\tS (sleeping)'] True
+proc 1037914 ['Name:\tbreezy-trade', 'Umask:\t0077', 'State:\tS (sleeping)'] True
+failed units outside: claude-aut6-v6-fail.service     loaded failed failed [systemd-run] /bin/false
+run-p2307185-i44246311.service  loaded failed failed [systemd-run] /bin/false
+us-source-collector@mos.service loaded failed failed Breezy F13-C1 US-source collector, one cycle for source mos
+run_transient outside rc 0 inside rc 0
+COUNTS Id= blocks in units_show (outside)= 38  inside= 38  list-units --all rows= 91
+failed_list inside:
+claude-aut6-v6-fail.service     loaded failed failed [systemd-run] /bin/false
+run-p2307185-i44246311.service  loaded failed failed [systemd-run] /bin/false
+us-source-collector@mos.service loaded failed failed Breezy F13-C1 US-source collector, one cycle for source mos
+
+run_transient inside:
+Id=run-p2307185-i44246311.service
+Description=[systemd-run] /bin/false
+Transient=yes
+InvocationID=6c50741a17fb41e99638246fa039b529
+Result=exit-code
+ExecStart={ path=/bin/false ; argv[]=/bin/false ; ignore_errors=no ; start_time=[Thu 2026-10-08 21:40:01 UTC] ; stop_time=[Thu 2026-10-08 21:40:01 UTC] ; pid=2307187 ; code=exited ; status=1 }
+```
+
+Equality: PASS. With both scratch units present, the snapshot equals the outside reads for all four reads
+(`failed_list` 269 bytes, `run_transient` 341 bytes carrying the transient's InvocationID), in-row
+`systemctl` fails, journalctl and `/proc/<pid>/status` work.
+
+**Count check: MISMATCH.** `Id=` blocks in `units_show`: 38 (36 distinct units; the snapshot and the outside
+read agree). `systemctl --user list-units --all 'breezy-*' 'us-source-collector@*'`: 91 rows (55 services more).
+The 36 equal exactly `list-units` WITHOUT `--all` (active/activating/failed); `show -- <glob>` does not return
+loaded-but-inactive (dead) units, e.g. `breezy-asos-refresh.service` (LoadState=loaded, inactive/dead). Failed units
+ARE included (`us-source-collector@mos.service` appears twice, `claude-aut6-v6-fail` is outside the glob by name).
+Per the S2 review rule a mismatch stops the slice: the glob read does not see inactive oneshots' last
+`Result`/`ExecMainStatus`/`NRestarts`. Not resolved here.
+
+Cleanup: `systemctl --user reset-failed claude-aut6-v6-fail.service run-p2307185-i44246311.service` (rc 0, journaled
+via logger tag `claude-aut6`). Only those two; `us-source-collector@mos.service` (pre-existing failure) and every
+`breezy-*` unit were not touched.
+
+### Coordinator ruling R-S2-1
+
+The `show` glob intentionally covers loaded active/activating/failed units (property detail: Result, ExecMainStatus, InvocationID, NRestarts, MainPID, MemoryPeak…) — that is what the pass needs detail for (a failed oneshot stays failed and is included; fail-then-succeed between passes is caught by the journal cursor per plan). Inventory completeness comes from TWO added fixed reads in the health row's bus_reads: (1) `list-units --all --plain --no-legend --full 'breezy-*' 'us-source-collector@*'` (load/active/sub for all loaded units → 91 today); (2) `list-unit-files --plain --no-legend --full 'breezy-*' 'us-source-collector@*'` (UnitFileState incl. not-loaded units → enablement for #28 and X-8 not-found/broken-link). Keep the read budget at 15 s total; measure the snapshot wall time and record it. Then re-run V-6: snapshot == outside for all six reads; positive control again with the two failing scratch units present (they must appear in the failed read and in list-units --all); count check now = `list-units --all` rows in snapshot vs outside (must be equal; mismatch = STOP). Reset-failed only the scratch units.
+
+### V-6 re-run, six reads, ~22:00Z 2026-10-08
+
+Both inventory argvs carry `--` before the patterns (the table grammar requires it); the grammar widened by the
+verb `list-unit-files` and the bare option `--full`, one row each. Scratch failing units: `claude-aut6-v6-fail`
+(InvocationID 91ff289781434ddbb89d26eca5dd3217) and `run-p2328651-i44270474` (2b7beb97166749a2bd7b8f69f01de60e).
+
+```
+snapshot_writer_rc 0 WALL_S 0.094
+node/supervisor pids [274295, 1037914]
+child rc 0
+
+INSIDE systemctl: [1, '', 'Failed to connect to user scope bus via local transport: No such file or directory\n']
+read units_show: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=18353 bytes_in=18353
+read failed_list: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=154 bytes_in=154
+read units_inventory: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=15463 bytes_in=15463
+read unit_files_inventory: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=3691 bytes_in=3691
+read timers_list: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=4719 bytes_in=4719
+read run_transient: outside_rc=0 inside_rc=0 equal_normalised=True bytes_out=341 bytes_in=341
+journal --until parsed-equal (key order is randomised per process): True rc 0 0 lines 5
+journal last-5 (live, may drift) parsed-equal: True lines 5 5
+proc 274295 ['Name:\tbreezy-trade-su', 'Umask:\t0077', 'State:\tS (sleeping)'] True
+proc 1037914 ['Name:\tbreezy-trade', 'Umask:\t0077', 'State:\tS (sleeping)'] True
+failed units outside: claude-aut6-v6-fail.service    loaded failed failed [systemd-run] /bin/false
+run-p2328651-i44270474.service loaded failed failed [systemd-run] /bin/false
+run_transient outside rc 0 inside rc 0
+COUNTS list-units --all rows snapshot= 90  outside= 90  | list-unit-files rows snapshot= 61  outside= 61  | units_show Id= blocks= 35
+scratch claude-aut6-v6-fail in failed_list: True in units_inventory: False
+scratch run-p in failed_list: True in units_inventory: False
+rc per read inside: {'units_show': 0, 'failed_list': 0, 'units_inventory': 0, 'unit_files_inventory': 0, 'timers_list': 0, 'run_transient': 0}
+```
+
+Result: **PASS.** Snapshot == outside for all six reads (rc 0 each); in-row `systemctl` fails; journalctl and
+`/proc/<pid>/status` work. Count check: `list-units --all` rows snapshot 90 = outside 90 (91 a little earlier;
+`us-source-collector@mos.service`'s failure was reset by someone else in between); `list-unit-files` rows 61 = 61;
+`units_show` 35 `Id=` blocks (active/activating/failed only, as ruled). **Snapshot wall time: 0.094 s** for all six
+reads (budget 15 s).
+Both scratch units appear in the failed read. They do NOT appear in the two inventory reads: those are patterned
+to `breezy-*` and `us-source-collector@*` by design and the scratch names (`claude-*`, `run-*`) match neither;
+the transient is carried by the `run_transient` read instead.
+Cleanup: `reset-failed` of those two scratch units only (rc 0, logger tag `claude-aut6`).

@@ -8,7 +8,7 @@ Description=Every-10-minutes (:01) trigger for the Breezy AUT-6 unit health pass
 
 [Timer]
 Unit=breezy-autonomy-health.service
-OnCalendar=*:01/10
+OnCalendar=*:01/10 UTC
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=false

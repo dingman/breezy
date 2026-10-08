@@ -53,8 +53,13 @@ _ONFAILURE_LINE: Final[str] = "OnFailure=breezy-study-failed@%n.service"
 #: refuses ``breezy-study-failed@`` on them by name (E-7a). Widened by exactly one reviewed unit,
 #: AUT-6 WP1's alert redeliver; each must carry the autonomy line.
 _AUTONOMY_ONFAILURE_LINE: Final[str] = "OnFailure=breezy-autonomy-failed@%n.service"
+#: AUT-6 WP3 S2 adds the health pass (and the WP2 canary, present on this base, was missing).
 _AUTONOMY_NOTIFIED_UNITS: Final[frozenset[str]] = frozenset(
-    {"breezy-autonomy-alert-redeliver.service"}
+    {
+        "breezy-autonomy-alert-redeliver.service",
+        "breezy-autonomy-canary.service",
+        "breezy-autonomy-health.service",
+    }
 )
 
 #: AUD-15 amendment (2026-09-22): the ONE alert env file a study-adjacent

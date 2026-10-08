@@ -283,6 +283,7 @@ def test_health_config_limits_and_names_the_autonomy_failed_notifier() -> None:
     assert unit.values("Service", "TimeoutStartSec") == ["115"]
     assert unit.values("Service", "TimeoutStopSec") == ["5"]
     assert unit.values("Service", "MemoryMax") == ["256M"]
+    assert unit.values("Service", "MemorySwapMax") == ["0"]
     assert unit.values("Service", "RuntimeMaxSec") == []
     assert unit.values("Unit", "OnFailure") == ["breezy-autonomy-failed@%n.service"]  # X-3
 
@@ -317,7 +318,7 @@ def test_health_config_names_no_secret_and_no_mount_namespace_directive() -> Non
 
 def test_health_timer_config_is_slot_critical_every_ten_minutes_at_01() -> None:
     unit = _unit(TIMER)
-    assert unit.values("Timer", "OnCalendar") == ["*:01/10"]
+    assert unit.values("Timer", "OnCalendar") == ["*:01/10 UTC"]
     assert parse_on_calendar("*:01/10")[:3] == [hms("00:01"), hms("00:11"), hms("00:21")]
     assert unit.values("Timer", "AccuracySec") == ["1s"]
     assert unit.values("Timer", "RandomizedDelaySec") in ([], ["0"])
@@ -325,3 +326,49 @@ def test_health_timer_config_is_slot_critical_every_ten_minutes_at_01() -> None:
     assert unit.values("Timer", "Unit") in ([], [f"{UNIT}.service"])
     start = dt.timedelta(seconds=hms("00:01"))
     assert start == dt.timedelta(minutes=1)
+
+
+def test_health_row_show_read_names_the_review_properties_and_both_unit_patterns() -> None:
+    """Review S2: MainPID/UnitFileState/LoadState, and the second timer template's instances."""
+    (show,) = [r for r in AUTONOMY_BWRAP_TABLE[UNIT].bus_reads if r.name == "units_show"]
+    argv = show.argv
+    properties = set(argv[argv.index("-p") + 1].split(","))
+    assert {"MainPID", "UnitFileState", "LoadState"} <= properties
+    assert argv[argv.index("--") + 1 :] == ("breezy-*", "us-source-collector@*")
+    assert not any("Environment" in p or "Credential" in p for p in properties)
+
+
+def test_health_skeleton_exits_ex_config_with_a_not_implemented_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An early enable of the timer must fail loudly, not report a healthy pass."""
+    from breezy.runtime import autonomy_health_cli
+
+    assert autonomy_health_cli.run_skeleton([]) == 78
+    assert "NOT_IMPLEMENTED" in capsys.readouterr().out
+
+
+def test_health_entry_must_join_the_closure_lint_before_main_exists() -> None:
+    """Tripwire: defining ``main`` without the closure-lint rows (S3-S6 work) fails here."""
+    from breezy.persistence.autonomy.detector_catalog import AUT6_LINT_MIN_JUDGED_SITES
+    from breezy.runtime import autonomy_health_cli
+    from tests.unit.test_autonomy_readonly_closure import AUT6_ENTRY_MODULES
+
+    if hasattr(autonomy_health_cli, "main"):
+        assert UNIT in AUT6_ENTRY_MODULES, "add the health entry to AUT6_ENTRY_MODULES"
+        assert UNIT in AUT6_LINT_MIN_JUDGED_SITES, "add the health floor to the min-sites literal"
+
+
+def test_health_row_has_the_two_inventory_reads_inside_the_15_second_budget() -> None:
+    """R-S2-1: the loaded and the on-disk inventory are fixed reads next to the detail read."""
+    row = AUTONOMY_BWRAP_TABLE[UNIT]
+    reads = {r.name: r.argv for r in row.bus_reads}
+    patterns = ("--", "breezy-*", "us-source-collector@*")
+    assert reads["units_inventory"][2:] == (
+        "list-units", "--all", "--plain", "--no-legend", "--full", *patterns,
+    )  # fmt: skip
+    assert reads["unit_files_inventory"][2:] == (
+        "list-unit-files", "--plain", "--no-legend", "--full", *patterns,
+    )  # fmt: skip
+    assert len(row.bus_reads) == 6 and row.bus_snapshot_budget_s == 15
+    assert 2 + 1.5 * len(row.bus_reads) <= 15
