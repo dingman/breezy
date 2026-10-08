@@ -444,8 +444,18 @@ def test_service_carries_a_modest_memory_ceiling_below_the_heavy_studies() -> No
     max_bytes = _bytes(max_match)
     heavy_floor_bytes = 12 * multipliers["G"]  # k1/mb/offer-gate MemoryHigh
     assert 0 < high_bytes < max_bytes
-    assert max_bytes == 2 * multipliers["G"]
+    # EXITSTUDY-MEM 2026-10-08: reviewed 2G -> 3G (see the unit comment).
+    assert high_bytes == 2 * multipliers["G"]
+    assert max_bytes == 3 * multipliers["G"]
     assert max_bytes < heavy_floor_bytes
+
+
+def test_service_fails_fast_on_a_stall() -> None:
+    """EXITSTUDY-MEM 2026-10-08: a reclaim stall must fail in 10 minutes
+    (healthy run ~15 s), not the former 30."""
+    match = re.search(r"^TimeoutStartSec=(\d+)$", _SERVICE.read_text(), re.MULTILINE)
+    assert match is not None
+    assert int(match.group(1)) == 600
 
 
 def test_timer_does_not_clash_with_any_sibling_hour_minute_tick() -> None:

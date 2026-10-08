@@ -9,7 +9,7 @@ contract's existing meaning: `step()` decides only whether a run's pending
 work has crossed a STALL threshold, entirely independent of that run's own
 exit code (AC-6f-4/C-5) -- the caller (`quote_tape_ingest_cli.run()`)
 combines `alert_due` with the pre-existing failure check under an explicit
-precedence (2 > 3 > 4 > 0).
+precedence (2 > 3 > 4 > 5 > 0).
 
 Deliberately stateful and deliberately minimal, mirroring
 `breezy.runtime.ingest_deadline`'s own stance: this module imports nothing
@@ -43,8 +43,9 @@ the streak just like a clean run does.
 
 Corrupt or unknown-version state file: fail SAFE, not stuck
 --------------------------------------------------------------
-`load_state` treats a missing, unparseable, or unknown-version file as a
-FRESH streak (`INITIAL_STATE`), logging one WARNING. This is a deliberate
+`load_state_checked` treats a missing, unreadable, unparseable,
+unknown-version, or field-invalid file as a FRESH streak (`INITIAL_STATE`),
+logging one value-free WARNING and returning the reason. This is a deliberate
 choice between two failure directions:
 
 * Treating corruption as "still stalled" would need an invented count and
@@ -58,21 +59,31 @@ choice between two failure directions:
 
 Losing history is preferred because it can never SUPPRESS an alert
 forever; only delay one by, at most, one stall window.
+
+That bound holds only for well-formed values, so every field is validated by
+exact type and range (never by truthiness or coercion) before `step()` may
+consume it. A reset, or a failed save, on a run that has pending work is not
+left as a log line: the caller prints ``DEFERRAL_STREAK_RESET reason=<enum>``
+and exits 5 so ``OnFailure=`` delivers it (DEFER-STREAK-LOAD). The unit's
+``OnFailure=`` leg is journalled and durably queued by the alert sink
+(AUT-6 WP1), so the page is delivered or redeliverable, not merely logged.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-#: Bumped only on an incompatible on-disk shape change. `load_state` treats
-#: any other value (including a missing key) as corrupt -- see the module
+#: Bumped only on an incompatible on-disk shape change. `load_state_checked`
+#: treats any other value (including a missing key) as corrupt -- see the module
 #: docstring.
 STATE_VERSION = 1
 
@@ -173,34 +184,119 @@ def step(
     )
 
 
-def load_state(path: Path) -> DeferralStreakState:
+class StreakResetReason(StrEnum):
+    """Why a streak was reset to a fresh start (closed set; value-free).
+
+    ``SAVE_FAILED`` is never returned by :func:`load_state_checked`; the
+    caller uses it when persisting the new state fails.
+    """
+
+    IO_ERROR = "io_error"
+    UNPARSEABLE = "unparseable"
+    UNSUPPORTED_VERSION = "unsupported_version"
+    MISSING_FIELD = "missing_field"
+    BAD_FIELD = "bad_field"
+    SAVE_FAILED = "save_failed"
+
+
+class _FieldError(ValueError):
+    """A persisted field failed validation. Carries only the field name."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__(field)
+        self.field = field
+
+
+class _UnsupportedVersionError(ValueError):
+    """Not a dict, or ``version`` is not :data:`STATE_VERSION`."""
+
+
+def _require_int_in_range(raw: dict[str, object], field: str, *, lo: int, hi: int | None) -> int:
+    value = raw[field]  # KeyError -> MISSING_FIELD
+    if type(value) is not int or value < lo or (hi is not None and value >= hi):
+        raise _FieldError(field)
+    return value
+
+
+def _require_aware_iso_or_none(raw: dict[str, object], field: str) -> str | None:
+    value = raw[field]  # KeyError -> MISSING_FIELD
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise _FieldError(field)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _FieldError(field) from None
+    if parsed.utcoffset() is None:
+        raise _FieldError(field)
+    return value
+
+
+def _parse_state(raw: object) -> DeferralStreakState:
+    if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
+        raise _UnsupportedVersionError
+    consecutive_runs = _require_int_in_range(raw, "consecutive_runs", lo=0, hi=None)
+    first_deferred_utc = _require_aware_iso_or_none(raw, "first_deferred_utc")
+    runs_since_alert = _require_int_in_range(
+        raw, "runs_since_alert", lo=_NEVER_STALLED, hi=REALERT_EVERY_RUNS
+    )
+    # Holds for every state `step` emits; closes the "null with runs > 0"
+    # silent age-reset path.
+    if (consecutive_runs == 0) != (first_deferred_utc is None):
+        raise _FieldError("first_deferred_utc")
+    return DeferralStreakState(
+        version=STATE_VERSION,
+        consecutive_runs=consecutive_runs,
+        first_deferred_utc=first_deferred_utc,
+        runs_since_alert=runs_since_alert,
+    )
+
+
+def load_state_checked(path: Path) -> tuple[DeferralStreakState, StreakResetReason | None]:
     """Read the persisted streak state, failing SAFE on anything unexpected.
 
-    A missing file is an ordinary fresh start (no WARN). A present-but-
-    corrupt or unknown-version file WARNs once and is treated identically
-    to a missing one -- see the module docstring's "fail SAFE, not stuck".
+    Returns ``(state, None)`` for a valid or missing file (a missing file is
+    an ordinary fresh start, no WARN), else ``(INITIAL_STATE, reason)`` after
+    exactly one WARNING that names the reason and field, never the value.
     """
-    if not path.is_file():
-        return INITIAL_STATE
+    field = "-"
     try:
-        raw = json.loads(path.read_text())
-        if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
-            found = raw.get("version") if isinstance(raw, dict) else raw
-            raise ValueError(f"unsupported version {found!r}")
-        return DeferralStreakState(
-            version=STATE_VERSION,
-            consecutive_runs=int(raw["consecutive_runs"]),
-            first_deferred_utc=raw["first_deferred_utc"],
-            runs_since_alert=int(raw["runs_since_alert"]),
-        )
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        logger.warning(
-            "%s is missing, corrupt, or an unknown version (%s); resetting the "
-            "ingest deferral-stall streak to a fresh start",
-            path,
-            exc,
-        )
-        return INITIAL_STATE
+        if not path.is_file():
+            return INITIAL_STATE, None
+        return _parse_state(json.loads(path.read_text(encoding="utf-8"))), None
+    except OSError:
+        reason = StreakResetReason.IO_ERROR
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        reason = StreakResetReason.UNPARSEABLE
+    except _UnsupportedVersionError:
+        reason = StreakResetReason.UNSUPPORTED_VERSION
+    except KeyError:
+        reason = StreakResetReason.MISSING_FIELD
+    except _FieldError as exc:
+        reason = StreakResetReason.BAD_FIELD
+        field = exc.field
+    except ValueError:
+        # Plain ValueError from json.loads (e.g. an integer literal over the
+        # 4300-digit limit). Last: the specific ValueError subclasses above win.
+        reason = StreakResetReason.UNPARSEABLE
+    logger.warning(
+        "%s is corrupt or unreadable (reason=%s field=%s); resetting the "
+        "ingest deferral-stall streak to a fresh start",
+        path,
+        reason.value,
+        field,
+    )
+    return INITIAL_STATE, reason
+
+
+def load_state(path: Path) -> DeferralStreakState:
+    """:func:`load_state_checked` without the reason.
+
+    Retained for compatibility: the ingest run uses the checked variant, but
+    tests and external callers use this signature.
+    """
+    return load_state_checked(path)[0]
 
 
 def save_state(path: Path, state: DeferralStreakState) -> None:
@@ -221,8 +317,13 @@ def save_state(path: Path, state: DeferralStreakState) -> None:
         sort_keys=True,
     )
     tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, path)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise

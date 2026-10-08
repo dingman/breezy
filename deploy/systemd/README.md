@@ -668,11 +668,20 @@ conversion path (never earning the blanket `.converted-<type>` marker --
 see the 6b memo section above, and the three known 09-27 instances) would
 count as pending on every single run and alert forever.
 
-A missing, corrupt, or unknown-version streak file resets to a fresh
-streak with one WARNING, never a fabricated "already stalled" state: losing
-history only delays a real stall's next alert by at most one stall window,
-while treating garbage as "already alerted" could suppress every future
-alert instead. A `--dry-run` never reads or writes the streak file.
+A missing streak file starts a fresh streak silently. An unreadable,
+corrupt, unknown-version, or field-invalid streak file also resets to a
+fresh streak (one value-free WARNING), never a fabricated "already stalled"
+state: losing history only delays a real stall's next alert by at most one
+stall window, while treating garbage as "already alerted" could suppress
+every future alert instead. If that reset (or a failed save of the streak
+file) happens on a run with work pending, the run also prints
+`DEFERRAL_STREAK_RESET reason=<io_error|unparseable|unsupported_version|missing_field|bad_field|save_failed>`
+and exits 5 so `OnFailure=` delivers it (exit 3/4 outrank 5; their lines
+still print). With nothing pending it is the WARNING only. The off-box
+payload is the same closed-enum `study_unit_failed` for every exit; the
+name `DEFERRAL_STREAK_RESET` appears in the notifier's journal line, and
+delivery of the payload itself is journalled and durably queued by the alert
+sink (AUT-6 WP1). A `--dry-run` never reads or writes the streak file.
 
 ---
 
@@ -1436,13 +1445,14 @@ avoids.
 each is <=1 GB / <=60 s, well under the exemption threshold, and none is
 retimed or wrapped by this item.
 
-**AUD-02 WP-D1 addition (2026-09-26).** `breezy-discovery-pull` (16:52Z)
-joins this exemption: MemoryHigh=128M/MemoryMax=256M, no
+**AUD-02 WP-D1 addition (2026-09-26).** `breezy-discovery-pull` (17:12Z since AUT-6 WP3b)
+joins this exemption: MemoryHigh=460M/MemoryMax=512M (set from the measured
+working set, `docs/evidence/aut6/WP3b_discovery_pull_memory_2026-10-08.md`), no
 `breezy-studies.slice`, no flock. Unlike the three units above, its WALL
 CLOCK can run considerably longer than 60s -- it polls the trade node's own
 log file every 10s for the node's initial discovery summary, up to a 17:12Z
 deadline, before making a single bounded round of venue GETs
-(`TimeoutStartSec=1800` covers this). Its MEMORY footprint stays in the same
+(`TimeoutStartSec=900`, `TimeoutStopSec=5` cover this). Its MEMORY footprint stays in the same
 light band as its siblings; only its wall-clock budget differs, because it
 is a wait-for-trigger job, not a fixed-cost read. It takes no studies flock
 and shares no state with the node (r2.1 Blocker A).

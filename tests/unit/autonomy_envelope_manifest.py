@@ -227,7 +227,6 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_registry_validate_store.py::test_child_d0_and_trial_prefix_pinned[store]",
         "tests/unit/test_launch_window_table.py::test_launch_path_units_end_before_next_fixed_point[existing_units]",
         "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[existing_units]",
-        "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[known_overlap_breezy-discovery-pull]",
     }
 )
 
