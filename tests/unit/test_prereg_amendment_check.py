@@ -7,11 +7,13 @@ loader success path are pinned to the frozen A0 (stamped 2026-10-08).
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -21,6 +23,11 @@ for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
         sys.path.insert(0, _entry)
 
 from breezy.analysis.autonomy import confidence_sequence as cs
+from breezy.analysis.fq_loss_stop_core import (
+    ALPHA_FLOOR_GRID,
+    G3_FLOOR_MULTIPLIER,
+    T_MIN_GRID,
+)
 from scripts.analysis import fq_mc_eprocess as mc
 from scripts.analysis.multisource_blend_pin_guards import UNFROZEN
 from scripts.analysis.multisource_blend_skill import content_digest
@@ -289,7 +296,7 @@ def test_payload_key_equal_to_an_a0_key_inside_a1_is_refused(tmp_path: Path) -> 
 
     defects = _chk().validate_amendment(path, draft=True)
     assert any(d.code == "KEY_OVERLAP" and "kill_grid_points" in d.message for d in defects)
-    assert any(d.code == "PAYLOAD_NOT_YET_DEFINED" for d in defects)
+    assert any(d.code == "BAD_FLOOR_KEYS" for d in defects)
 
 
 def test_amends_with_an_extra_key_is_refused(tmp_path: Path) -> None:
@@ -508,3 +515,403 @@ def test_payload_key_equal_to_nested_parent_key_is_refused(tmp_path: Path) -> No
     _write(path, payload)
     defects = _chk().validate_amendment(path, draft=True)
     assert any(d.code == "KEY_OVERLAP" and "ticks" in d.message for d in defects)
+
+
+_A1_ID = "F5_prereg_v2_A1_floor"
+_A1_FILE = _PLAN / "F5_prereg_v2_amendment_A1.json"
+_INPUT_KEYS = frozenset({"sign_rule", "fill_rule", "fee_rule", "void_rule", "truth_sha_rule"})
+_MEASURED_POWER_KEYS = frozenset({"-0.16", "-0.08", "-0.04"})
+
+
+def _floor_defects(floor: Any, *, draft: bool = False) -> list[Any]:
+    amendment = {"amendment_id": _A1_ID, "loss_stop_floor": floor}
+    return cast(list[Any], _chk()._check_payload(amendment, draft=draft))
+
+
+def _codes(floor: Any, *, draft: bool = False) -> list[str]:
+    return [d.code for d in _floor_defects(floor, draft=draft)]
+
+
+def _sqrt_floor(**overrides: Any) -> dict[str, Any]:
+    """Synthetic sqrt_boundary payload. s6 sits on α + 3·SE, which must pass."""
+    alpha = ALPHA_FLOOR_GRID[0]
+    se = 0.01
+    limit = Decimal(str(alpha)) + Decimal(3) * Decimal(str(se))
+    floor: dict[str, Any] = {
+        "floor_mode": "sqrt_boundary",
+        "power_class": "edge_capable",
+        "alpha_floor": alpha,
+        "alpha_selection_rule": "pinned",
+        "g3_floor_multiplier": G3_FLOOR_MULTIPLIER,
+        "gate_rate_rule": "pinned",
+        "t_unit": "settled_station_day",
+        "pnl_unit": "per_contract_qty1",
+        "qty_rule": "pinned",
+        "netting_rule": "pinned",
+        "exit_rule": "pinned",
+        "increment_rule": "pinned",
+        "bundle_null_rule": "pinned",
+        "boundary_rule": "pinned",
+        "c": 2.4,
+        "c_mc_se": se,
+        "c_binding_cell": "H0/M-pool",
+        "t_min": T_MIN_GRID[0],
+        "measured_power": {"-0.16": 0.9, "-0.08": 0.5, "-0.04": 0.2},
+        "s6_feasible_rate": float(limit),
+        "t_horizon_climate_day": "2027-01-25",
+        "reach_cutoff_epoch_start": "2026-11-01",
+        "past_horizon_rule": "pinned",
+        "epoch_anchor_rule": "pinned",
+        "epoch_id_rule": "pinned",
+        "fail_latch_rule": "pinned",
+        "refusal_rule": "pinned",
+        "restart_rule": "pinned",
+        "inputs": {key: "pinned" for key in sorted(_INPUT_KEYS)},
+    }
+    floor.update(overrides)
+    return floor
+
+
+def _with_power(floor: dict[str, Any], power: float, power_class: str) -> dict[str, Any]:
+    measured = dict(floor["measured_power"])
+    measured["-0.16"] = power
+    return {**floor, "power_class": power_class, "measured_power": measured}
+
+
+def _pending_floor() -> dict[str, Any]:
+    """r3 §4.9 draft values: PENDING_* where the gate has not run, pins elsewhere."""
+    floor = _sqrt_floor()
+    floor["floor_mode"] = "PENDING_GATE (sqrt_boundary | unreachable_veto)"
+    floor["power_class"] = "PENDING_GATE (edge_capable | gross_loss_tripwire | none)"
+    floor["alpha_floor"] = "PENDING_GATE (0.10 | 0.20 | 0.30)"
+    floor["c"] = "PENDING_MC"
+    floor["c_mc_se"] = "PENDING_MC"
+    floor["c_binding_cell"] = "PENDING_MC"
+    floor["t_min"] = "PENDING_MC"
+    floor["measured_power"] = {key: "PENDING_MC" for key in _MEASURED_POWER_KEYS}
+    floor["s6_feasible_rate"] = "PENDING_MC"
+    floor["reach_cutoff_epoch_start"] = "PENDING_MC"
+    return floor
+
+
+def _veto_floor() -> dict[str, Any]:
+    """unreachable_veto. Sqrt-only fields are null; measured power is still reported."""
+    floor = _sqrt_floor()
+    floor["floor_mode"] = "unreachable_veto"
+    floor["power_class"] = "none"
+    floor["c"] = None
+    floor["c_mc_se"] = None
+    floor["c_binding_cell"] = None
+    floor["t_min"] = None
+    floor["measured_power"] = {"-0.16": 0.0, "-0.08": 1, "-0.04": 0.5}
+    floor["s6_feasible_rate"] = None
+    floor["reach_cutoff_epoch_start"] = None
+    return floor
+
+
+def test_sqrt_boundary_floor_passes() -> None:
+    alpha = ALPHA_FLOOR_GRID[0]
+    at_floor = float(Decimal(str(G3_FLOOR_MULTIPLIER)) * Decimal(str(alpha)))
+    at_edge = float(Decimal(str(mc.POWER_TARGET)))
+    assert at_floor < at_edge
+    cases = (
+        (at_edge, "edge_capable"),
+        (0.9, "edge_capable"),
+        (at_floor, "gross_loss_tripwire"),
+    )
+    for power, power_class in cases:
+        assert _codes(_with_power(_sqrt_floor(), power, power_class)) == []
+
+
+def test_unreachable_veto_floor_passes() -> None:
+    assert _codes(_veto_floor()) == []
+
+
+def test_floor_power_below_g3() -> None:
+    alpha = ALPHA_FLOOR_GRID[0]
+    at_floor = Decimal(str(G3_FLOOR_MULTIPLIER)) * Decimal(str(alpha))
+    below = float(at_floor - Decimal("0.01"))
+    floor = _with_power(_sqrt_floor(), below, "gross_loss_tripwire")
+    assert _codes(floor) == ["FLOOR_POWER_BELOW_G3"]
+
+
+@pytest.mark.parametrize(
+    ("power", "power_class"),
+    [
+        (0.9, "gross_loss_tripwire"),
+        (0.5, "edge_capable"),
+        (0.8, "gross_loss_tripwire"),
+    ],
+)
+def test_floor_class_inconsistent(power: float, power_class: str) -> None:
+    assert _codes(_with_power(_sqrt_floor(), power, power_class)) == ["FLOOR_CLASS_INCONSISTENT"]
+
+
+def test_floor_s6_failed() -> None:
+    floor = _sqrt_floor()
+    limit = Decimal(str(floor["alpha_floor"])) + Decimal(3) * Decimal(str(floor["c_mc_se"]))
+    floor["s6_feasible_rate"] = float(limit + Decimal("0.01"))
+    assert _codes(floor) == ["FLOOR_S6_FAILED"]
+
+
+def test_floor_pending_refused_outside_draft() -> None:
+    assert _codes(_pending_floor(), draft=False) == ["FLOOR_PENDING"]
+
+
+def test_draft_mode_accepts_pending_floor() -> None:
+    assert _codes(_pending_floor(), draft=True) == []
+
+
+def test_draft_mode_still_checks_non_pending_floor_values() -> None:
+    floor = _pending_floor()
+    floor["g3_floor_multiplier"] = 2.0
+    assert _codes(floor, draft=True) == ["BAD_FLOOR_VALUE"]
+    assert _codes(_sqrt_floor(alpha_floor=0.15), draft=True) == ["BAD_FLOOR_VALUE"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"alpha_floor": 0.15},
+        {"g3_floor_multiplier": 2.0},
+        {"t_min": True},
+        {"t_min": 4},
+        {"c": 0},
+        {"c": True},
+        {"c": float("nan")},
+        {"c_mc_se": 0},
+        {"c_mc_se": True},
+        {"t_horizon_climate_day": "2027-01-26"},
+        {"reach_cutoff_epoch_start": "not-a-date"},
+        {"floor_mode": "nope"},
+        {"power_class": "none"},
+        {"s6_feasible_rate": True},
+        {"measured_power": {"-0.16": True, "-0.08": 0.5, "-0.04": 0.2}},
+    ],
+)
+def test_bad_floor_value(overrides: dict[str, Any]) -> None:
+    assert _codes(_sqrt_floor(**overrides)) == ["BAD_FLOOR_VALUE"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"measured_power": {"-0.16": 0.9, "-0.08": 0.5, "-0.04": "0.2"}},
+        {"measured_power": {"-0.16": 0.9, "-0.08": None, "-0.04": 0.2}},
+        {"measured_power": {"-0.16": -1, "-0.08": 0.5, "-0.04": 0.2}},
+        {"measured_power": {"-0.16": 0.9, "-0.08": 1.5, "-0.04": 0.2}},
+        {"s6_feasible_rate": "0.1"},
+        {"s6_feasible_rate": None},
+        {"s6_feasible_rate": -1},
+        {"s6_feasible_rate": 1.5},
+    ],
+)
+def test_sqrt_measured_power_and_s6_must_be_unit_interval(overrides: dict[str, Any]) -> None:
+    assert _codes(_sqrt_floor(**overrides)) == ["BAD_FLOOR_VALUE"]
+
+
+def test_check_measured_power_non_mapping_returns_defect() -> None:
+    floor = _sqrt_floor()
+    floor["measured_power"] = None
+    defects = _chk()._check_measured_power(floor, None)
+    assert [d.code for d in defects] == ["BAD_FLOOR_KEYS"]
+
+
+def test_unreachable_veto_with_c_is_bad_floor_value() -> None:
+    floor = _veto_floor()
+    floor["c"] = 1.5
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+def test_unreachable_veto_with_power_class_is_bad_floor_value() -> None:
+    floor = _veto_floor()
+    floor["power_class"] = "edge_capable"
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+_VETO_NULL_FIELDS = (
+    "c",
+    "c_mc_se",
+    "t_min",
+    "s6_feasible_rate",
+    "reach_cutoff_epoch_start",
+    "c_binding_cell",
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("c", 1.5),
+        ("c_mc_se", 0),
+        ("t_min", 4),
+        ("s6_feasible_rate", 1),
+        ("reach_cutoff_epoch_start", "2026-11-01"),
+        ("c_binding_cell", "H0/M-pool"),
+    ],
+)
+def test_unreachable_veto_non_null_field_is_bad_floor_value(field: str, value: Any) -> None:
+    floor = _veto_floor()
+    floor[field] = value
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+def test_unreachable_veto_draft_accepts_pending_null_fields_and_power() -> None:
+    floor = _veto_floor()
+    for field in _VETO_NULL_FIELDS:
+        floor[field] = "PENDING_MC"
+    floor["measured_power"] = {key: "PENDING_MC" for key in _MEASURED_POWER_KEYS}
+    assert _codes(floor, draft=True) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("-0.16", "0.5"),
+        ("-0.08", None),
+        ("-0.04", -1),
+        ("-0.16", 1.5),
+    ],
+)
+def test_unreachable_veto_measured_power_must_be_unit_interval(key: str, value: Any) -> None:
+    floor = _veto_floor()
+    floor["measured_power"] = {"-0.16": 0.0, "-0.08": 0.0, "-0.04": 0.0, key: value}
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda floor: floor.update({"extra": 1}),
+        lambda floor: floor.pop("inputs"),
+        lambda floor: floor["measured_power"].pop("-0.04"),
+        lambda floor: floor["measured_power"].update({"0": 1}),
+        lambda floor: floor["inputs"].pop("void_rule"),
+        lambda floor: floor.__setitem__("inputs", ["sign_rule"]),
+        lambda floor: floor.__setitem__("measured_power", "PENDING_MC"),
+    ],
+)
+def test_bad_floor_keys(mutate: Any) -> None:
+    floor = _sqrt_floor()
+    mutate(floor)
+    assert _codes(floor) == ["BAD_FLOOR_KEYS"]
+
+
+def test_a2_payload_remains_undefined() -> None:
+    chk = _chk()
+    for draft in (False, True):
+        defects = chk._check_payload({"amendment_id": "F5_prereg_v2_A2_guard"}, draft=draft)
+        assert [d.code for d in defects] == ["PAYLOAD_NOT_YET_DEFINED"]
+
+
+def test_a1_draft_file_matches_r3_and_passes_only_as_draft() -> None:
+    body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
+    assert body["frozen_sha"] == UNFROZEN
+    assert body["amendment_id"] == _A1_ID
+    inputs = body["loss_stop_floor"]["inputs"]
+    assert set(inputs) == _INPUT_KEYS
+    for value in inputs.values():
+        assert isinstance(value, str)
+        assert "..." not in value
+        assert "§4.1" in value
+    if _is_shallow_repository():
+        pytest.skip(_SHALLOW_SKIP)
+    chk = _chk()
+    assert chk.validate_amendment(_A1_FILE, draft=True) == []
+    assert chk.main(["--draft", str(_A1_FILE)]) == 0
+    assert chk.main([str(_A1_FILE)]) == 1
+
+
+def _provenance_defects(provenance: Any, *, draft: bool, root: Path | None = None) -> list[Any]:
+    return cast(
+        list[Any],
+        _chk()._check_a1_provenance(provenance, draft=draft, root=root or REPO_ROOT),
+    )
+
+
+def _valid_provenance(root: Path, **overrides: Any) -> dict[str, Any]:
+    """A non-draft provenance whose evidence file really lives under ``root``."""
+    folder = root / "docs" / "evidence" / "f5"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / "floor.json"
+    payload = b'{"gate":"floor"}\n'
+    target.write_bytes(payload)
+    body: dict[str, Any] = {
+        "mc_module": "scripts/analysis/fq_loss_floor_mc.py",
+        "core_module": "src/breezy/analysis/fq_loss_stop_core.py",
+        "mc_evidence": "docs/evidence/f5/floor.json",
+        "mc_evidence_sha256": hashlib.sha256(payload).hexdigest(),
+        "mc_seed": 20261008,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_floor_provenance_mc_seed_must_be_int(tmp_path: Path) -> None:
+    root = tmp_path
+    assert _provenance_defects(_valid_provenance(root), draft=False, root=root) == []
+    for bad in (True, False, "PENDING_COORDINATOR", 1.0):
+        defects = _provenance_defects(_valid_provenance(root, mc_seed=bad), draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert "mc_seed" in defects[0].message
+
+
+def test_floor_provenance_mc_evidence_must_be_existing_f5_file(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    outside = root / "docs" / "evidence" / "other.json"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"nope\n")
+    for bad in (
+        "PENDING_MC",
+        "/etc/passwd",
+        "docs/evidence/other.json",
+        "docs/evidence/f5/missing.json",
+        "docs/evidence/f5/../../docs/evidence/f5/floor.json",
+        "docs/evidence/f5",
+    ):
+        defects = _provenance_defects({**good, "mc_evidence": bad}, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"], bad
+        assert "mc_evidence" in defects[0].message
+
+
+def test_floor_provenance_mc_evidence_sha256_matches_file(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    assert _provenance_defects(good, draft=False, root=root) == []
+    missing = {key: value for key, value in good.items() if key != "mc_evidence_sha256"}
+    wrong = {**good, "mc_evidence_sha256": "0" * 64}
+    for body in (missing, wrong):
+        defects = _provenance_defects(body, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert "mc_evidence_sha256" in defects[0].message
+
+
+def test_floor_provenance_requires_mc_module_and_core_module(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    for key in ("mc_module", "core_module"):
+        dropped = {name: value for name, value in good.items() if name != key}
+        defects = _provenance_defects(dropped, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert key in defects[0].message
+        blank = {**good, key: ""}
+        defects = _provenance_defects(blank, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert key in defects[0].message
+
+
+def test_draft_accepts_pending_floor_provenance() -> None:
+    body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
+    assert body["provenance"]["mc_evidence_sha256"] == "PENDING_MC"
+    assert body["provenance"]["mc_seed"] == "PENDING_COORDINATOR"
+    assert _provenance_defects(body["provenance"], draft=True) == []
+    refused = _provenance_defects(body["provenance"], draft=False)
+    assert refused
+    assert {d.code for d in refused} == {"BAD_FLOOR_PROVENANCE"}
+    if _is_shallow_repository():
+        pytest.skip(_SHALLOW_SKIP)
+    chk = _chk()
+    assert chk.validate_amendment(_A1_FILE, draft=True) == []
+    frozen = chk.validate_amendment(_A1_FILE, draft=False)
+    assert any(d.code == "BAD_FLOOR_PROVENANCE" for d in frozen)

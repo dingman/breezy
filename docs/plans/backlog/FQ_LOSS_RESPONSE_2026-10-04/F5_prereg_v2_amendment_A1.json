@@ -1,0 +1,56 @@
+{
+  "frozen_sha": "UNFROZEN",
+  "amendment_id": "F5_prereg_v2_A1_floor",
+  "amends": {
+    "path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F5_prereg_v2_design.json",
+    "frozen_sha": "072ab026cdc790dd6e9a51d62d8164766b85fd82"
+  },
+  "loss_stop_floor": {
+    "floor_mode": "PENDING_GATE (sqrt_boundary | unreachable_veto)",
+    "power_class": "PENDING_GATE (edge_capable | gross_loss_tripwire | none)",
+    "alpha_floor": "PENDING_GATE (0.10 | 0.20 | 0.30)",
+    "alpha_selection_rule": "§4.6 of F5-pin-request_r3: 0.10 if G1 passes; else smallest of {0.20,0.30} with G1 margin t_cross <= floor(0.8*T_low(e)); else unreachable_veto; never escalate on G3",
+    "g3_floor_multiplier": 2.5,
+    "gate_rate_rule": "calibration at max(pool, take_rate_lower); G1/G3 at min(pool, take_rate_lower); takes->ticks via pool takes-per-station-day",
+    "t_unit": "settled_station_day",
+    "pnl_unit": "per_contract_qty1",
+    "qty_rule": "one StratumRow per unpaired (rung, side): entry_ask=ledger BE-bar, fee=0, qty=1 (§4.3)",
+    "netting_rule": "paired rung = one unit, delta_net = 1 - BEbar_y - BEbar_n, zero variance, enters x_d; zero-sigma days carry to next tick (§4.1 steps 2, 8)",
+    "exit_rule": "h_eff=(1-f)h+f*v, variance unexited; calibration margin = binding row S4",
+    "increment_rule": "§4.1 steps 1-9 of F5-pin-request_r3",
+    "bundle_null_rule": "categorical_yes_first_shrink_v1",
+    "boundary_rule": "FAIL iff S_t < -c*sqrt(t) for some t in [t_min, t_at_horizon]",
+    "c": "PENDING_MC",
+    "c_mc_se": "PENDING_MC",
+    "c_binding_cell": "PENDING_MC",
+    "t_min": "PENDING_MC",
+    "measured_power": {
+      "-0.16": "PENDING_MC",
+      "-0.08": "PENDING_MC",
+      "-0.04": "PENDING_MC"
+    },
+    "s6_feasible_rate": "PENDING_MC",
+    "t_horizon_climate_day": "2027-01-25",
+    "reach_cutoff_epoch_start": "PENDING_MC",
+    "past_horizon_rule": "fail_closed_no_pass; recalibration owner coordinator",
+    "epoch_anchor_rule": "latest autonomy TransitionRow for the FQ v2 family_id entering CHAMPION from a non-sender state with a non-empty policy_ruling_id; armed_at = ts_ns; refuse if absent",
+    "epoch_id_rule": "epoch_id = anchor transition_id; carried in latest.json and in the truth_sha preimage",
+    "fail_latch_rule": "fail_latch/<epoch_id>.json written O_EXCL+fsync before the first FAIL; checked before any input; never deleted; latch beats refusal",
+    "refusal_rule": "durable refusals/<as_of>.json (fsync file+dir), then unlink latest.json; on record-write failure unlink anyway and exit non-zero",
+    "restart_rule": "FAIL terminal within epoch; a new epoch needs a new qualifying arming row; S_t restarts at 0",
+    "inputs": {
+      "sign_rule": "r3 §4.1 step 1: the leg comes from the instrument; a NO buy is BUY on the NO-leg instrument at the NO price, and the wire price is never used.",
+      "fill_rule": "r3 §4.1 steps 1 and 3: open lots are the instrument BUY fills after exits; one StratumRow per unpaired (rung, side) with qty 1.",
+      "fee_rule": "r3 §4.1 step 3: entry_ask is the ledger BE-bar (cumulative cost + fee) / cumulative qty, StratumRow.fee is 0, and fee_reconciled false or a missing fee refuses.",
+      "void_rule": "r3 §4.1 step 7: a voided leg contributes 0 to x_d and 0 to the variance.",
+      "truth_sha_rule": "r3 §4.1 steps 5 and 8 produce the consumed records; §4.4.2 sets truth_sha to sha256 of the canonical JSON of epoch_id plus those C2 identities."
+    }
+  },
+  "provenance": {
+    "mc_module": "scripts/analysis/fq_loss_floor_mc.py",
+    "core_module": "src/breezy/analysis/fq_loss_stop_core.py",
+    "mc_evidence": "PENDING_MC",
+    "mc_evidence_sha256": "PENDING_MC",
+    "mc_seed": "PENDING_COORDINATOR"
+  }
+}
