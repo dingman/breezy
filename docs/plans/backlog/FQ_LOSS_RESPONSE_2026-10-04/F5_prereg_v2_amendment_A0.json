@@ -1,0 +1,32 @@
+{
+  "frozen_sha": "43cc3e0f08bab20eab71792643ed5b40bb60eb7e",
+  "amendment_id": "F5_prereg_v2_A0_kill",
+  "amends": {
+    "path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F5_prereg_v2_design.json",
+    "frozen_sha": "072ab026cdc790dd6e9a51d62d8164766b85fd82"
+  },
+  "kill": {
+    "kill_grid_points": 5,
+    "kill_grid_span": "m_j = x_max * j / (kill_grid_points - 1) for j = 0..kill_grid_points-1 (numpy linspace(0, x_max, kill_grid_points)); x_max is the parent's",
+    "kill_lambda_max": 0.5,
+    "kill_min_range": 0.5,
+    "kill_var_floor": 1e-06,
+    "kill_prior_pseudo_days": 1,
+    "kill_prior_second_moment": 0.25,
+    "kill_lambda_cap_rule": "cap(m) = min(kill_lambda_max, 0.5 / max(x_max - m, kill_min_range))",
+    "kill_betting_rule": "minus-side agrapa at day d and grid point m: n = d + kill_prior_pseudo_days; mu = sum_y / n; m2 = (sum_y2 + kill_prior_pseudo_days * kill_prior_second_moment) / n; var = max(m2 - mu^2, kill_var_floor); lam = clip((m - mu) / (var + (m - mu)^2), 0, cap(m)); sum_y and sum_y2 run over every covered calendar day strictly before d, including zero-take days with y = 0; log-capital increment = log1p(-lam * (y_d - m)); y_d is the clipped, haircut-BE Y_d on the parent's m_cap denominator",
+    "kill_bar_rule": "bar = log(2 / alpha_kill) with the parent's alpha_kill (hedge weight 1/2); KILL iff every grid log-capital >= bar at a look with n_cum >= the parent's earliest_look_n; a same-day PASS and KILL is FAIL"
+  },
+  "provenance": {
+    "production_module": "src/breezy/analysis/autonomy/confidence_sequence.py",
+    "mc_module": "scripts/analysis/fq_mc_eprocess.py",
+    "mc_evidence": "docs/evidence/f5/fq_resume_n_mc_seed20261006.json",
+    "mc_seed": 20261006,
+    "kill_power_report": {
+      "path": "docs/evidence/f5/fq_kill_power_negative_edge_seed20261008.json",
+      "seed": 20261008,
+      "edges": [-0.04, -0.08, -0.16],
+      "role": "reporting_only_changes_no_constant"
+    }
+  }
+}
