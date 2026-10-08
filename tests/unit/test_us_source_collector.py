@@ -8,6 +8,7 @@ test can stand at 16:29:59 or 17:10:00 without waiting.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
@@ -15,7 +16,8 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar, Self
@@ -37,6 +39,7 @@ from breezy.persistence.us_source_revision_store import (
     AppendOutcome,
     RevisionPayloadRefusedError,
     RevisionResult,
+    RevisionStoreBusyError,
     RevisionStoreIntegrityError,
     UsSourceRevisionStore,
 )
@@ -468,6 +471,194 @@ def test_overlapping_run_skipped_by_flock(tmp_path: Path) -> None:
     assert rec.calls == []
 
 
+def _busy_lock(attempts: dict[str, int], *, busy_for: int) -> Any:
+    real = col._cycle_lock
+
+    @contextlib.contextmanager
+    def lock(store: Any, root: Path, source_key: str) -> Iterator[None]:
+        attempts["n"] += 1
+        if attempts["n"] <= busy_for:
+            raise RevisionStoreBusyError("busy")
+        with real(store, root, source_key):
+            yield
+
+    return lock
+
+
+def test_lock_busy_for_two_retries_then_collects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two busy acquisitions, then the lock is free: the cycle collects. No real sleep."""
+    clock = FakeClock(RUN_2330 + 6 * MIN)
+    rec = Recorder()
+    feed = LampFeed(clock, rec)
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        assert 0 < seconds <= 5
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+
+    monkeypatch.setattr(col, "_cycle_lock", _busy_lock(attempts, busy_for=2))
+    ctx = make_ctx(tmp_path, clock, rec, lamp=feed, sleep=sleep)
+    started = time.monotonic()
+    report = col.run_cycle("lamp", ctx)
+    assert time.monotonic() - started < 2
+    assert attempts["n"] == 3
+    assert sleeps[:2] == [5.0, 5.0]
+    assert report.status is col.CycleStatus.COLLECTED
+    assert report.exit_code == 0
+    err = capsys.readouterr().err
+    assert "lock acquired after waiting 10.000s" in err
+    assert [e for e in _events(tmp_path, LAMP_SOURCE) if e.get("kind") == "skipped"] == []
+
+
+def test_lock_busy_beyond_wait_budget_is_skipped_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Still busy after COLLECTOR_LOCK_WAIT_S: skipped_locked, exit unchanged, no real sleep."""
+    assert col.COLLECTOR_LOCK_WAIT_S == 120
+    clock = FakeClock(RUN_2330 + 6 * MIN)
+    rec = Recorder()
+    feed = LampFeed(clock, rec)
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        assert 0 < seconds <= 5
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+
+    monkeypatch.setattr(col, "_cycle_lock", _busy_lock(attempts, busy_for=10_000))
+    ctx = make_ctx(tmp_path, clock, rec, lamp=feed, sleep=sleep)
+    started = time.monotonic()
+    report = col.run_cycle("lamp", ctx)
+    assert time.monotonic() - started < 2
+    assert report.status is col.CycleStatus.SKIPPED_LOCKED
+    assert report.exit_code == 0
+    assert rec.calls == []
+    assert sum(sleeps) == col.COLLECTOR_LOCK_WAIT_S
+    assert all(step <= 5 for step in sleeps)
+    err = capsys.readouterr().err
+    assert "after waiting 120.000s" in err
+    assert "skipping this cycle" in err
+    # Written without the unit lock: the lock was busy for every attempt.
+    skipped = [e for e in _events(tmp_path, LAMP_SOURCE) if e.get("kind") == "skipped"]
+    assert skipped == [{"fetched_at_ns": clock(), "kind": "skipped", "reason": "locked"}]
+
+
+def _busy_obs_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, busy_for: int, lock_wait_s: int
+) -> tuple[Any, list[float], FakeClock, int]:
+    """Obs (240 s work budget) with an injected clock. ``lock_wait_s`` replaces the 120 s cap."""
+    monkeypatch.setattr(col, "COLLECTOR_LOCK_WAIT_S", lock_wait_s)
+    start = ts(2026, 10, 6, 7, 58)
+    clock = FakeClock(start)
+    rec = Recorder()
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        assert 0 < seconds <= 5
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+
+    monkeypatch.setattr(col, "_cycle_lock", _busy_lock({"n": 0}, busy_for=busy_for))
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=_no_fetch, sleep=sleep)
+    started = time.monotonic()
+    report = col.run_cycle("obs", ctx)
+    assert time.monotonic() - started < 2
+    return report, sleeps, clock, start
+
+
+def test_lock_wait_for_a_240s_work_budget_is_capped_at_210s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait is min(lock cap, budget − margin). 240 s budget → 210 s, not the raw lock cap."""
+    assert guards.MAX_WORK_SECONDS["obs"] == 240
+    assert col._LOCK_WAIT_MARGIN_S == 30
+    report, sleeps, clock, start = _busy_obs_wait(
+        tmp_path, monkeypatch, busy_for=10_000, lock_wait_s=1_000
+    )
+    assert sum(sleeps) == 210
+    assert clock() == start + 210 * NS
+    assert report.status is col.CycleStatus.SKIPPED_LOCKED
+    skipped = [e for e in _events(tmp_path, col.SOURCE_KEYS["obs"]) if e.get("kind") == "skipped"]
+    assert skipped == [{"fetched_at_ns": clock(), "kind": "skipped", "reason": "locked"}]
+
+
+def test_lock_wait_that_uses_up_the_work_budget_is_skipped_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the wait leaves the 30 s margin or less, do not wait and do not fetch."""
+    report, sleeps, _clock, _start = _busy_obs_wait(
+        tmp_path, monkeypatch, busy_for=10_000, lock_wait_s=1_000
+    )
+    assert report.status is col.CycleStatus.SKIPPED_LOCKED
+    assert report.exit_code == 0
+    assert sleeps  # a wait did run
+    assert sum(sleeps) == guards.MAX_WORK_SECONDS["obs"] - col._LOCK_WAIT_MARGIN_S
+
+
+def test_successful_lock_wait_leaves_the_fetch_deadline_at_start_plus_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait that acquires the lock does not move the fetch deadline (start + budget)."""
+    start = ts(2026, 10, 6, 7, 58)
+    budget_s = guards.MAX_WORK_SECONDS["obs"]
+    deadline = start + budget_s * NS
+    clock = FakeClock(start)
+    rec = Recorder()
+    sleeps: list[float] = []
+    seen: list[int | None] = []
+    legs = sys.modules["us_source_lag_legs"]
+    real_over = legs._over_budget
+
+    def over_budget(collector: Any, cli: str, start_ns: int) -> bool:
+        seen.append(getattr(collector, "work_deadline_ns", None))
+        return bool(real_over(collector, cli, start_ns))
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+
+    def fetch(station: str) -> Any:
+        rec.calls.append(("obs", station, clock()))
+        clock.now = deadline  # exactly start + budget; a shifted deadline would still allow fetches
+        return col.FetchedPayload(b'{"features": []}', clock(), None, "nws")
+
+    monkeypatch.setattr(col, "_cycle_lock", _busy_lock({"n": 0}, busy_for=2))
+    monkeypatch.setattr(legs, "_over_budget", over_budget)
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=fetch, sleep=sleep)
+    started = time.monotonic()
+    report = col.run_cycle("obs", ctx)
+    assert time.monotonic() - started < 2
+    assert sleeps == [5.0, 5.0]
+    assert seen and set(seen) == {deadline}
+    assert rec.calls == [("obs", "KLAX", start + 10 * NS)]
+    assert clock() == deadline
+    assert report.status is col.CycleStatus.DEADLINE
+
+
+def test_lock_wait_rechecks_the_launch_window_on_a_fresh_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait that crosses 16:30Z is skipped_window on the post-wait clock, with no fetch."""
+    clock = FakeClock(ts(2026, 10, 6, 16, 29, 50))
+    rec = Recorder()
+    feed = LampFeed(clock, rec)
+
+    def sleep(seconds: float) -> None:
+        clock.now = ts(2026, 10, 6, 16, 30, 1)
+
+    monkeypatch.setattr(col, "_cycle_lock", _busy_lock({"n": 0}, busy_for=1))
+    ctx = make_ctx(tmp_path, clock, rec, lamp=feed, sleep=sleep)
+    report = col.run_cycle("lamp", ctx)
+    assert report.status is col.CycleStatus.SKIPPED_WINDOW
+    assert report.exit_code == 0
+    assert rec.calls == []
+
+
 # ----------------------------------------------------------------------------- PFM
 
 
@@ -884,6 +1075,24 @@ def _run_script(
         env=env,
         timeout=120,
         check=False,
+    )
+
+
+def test_poll_ledger_kind_set_is_widened_by_skipped_only() -> None:
+    """L-12: the closed kind set gains ``skipped`` and keeps every kind already written."""
+    assert ledger_mod.LEDGER_KINDS == frozenset(
+        {
+            "backoff",
+            "first_poll",
+            "miss",
+            "refused",
+            "refused_alert",
+            "seen",
+            "skipped",
+            "stale_alert",
+            "transport_fail",
+            "transport_ok",
+        }
     )
 
 

@@ -3,7 +3,12 @@
 Sources: ``lamp`` (hourly HH30 ``lavtxt`` + ``lavtxt_ext`` from NOMADS), ``pfm`` (AFOS, the
 latest forecast per closed WFO) and ``nbp`` (availability only; C1 never writes NBP rows).
 
-Per cycle the driver, under the source's unit lock:
+Per cycle the driver, under the source's unit lock. The work-budget clock starts before
+the lock wait, and the wait consumes that budget (it is never added on top of it): at most
+``min(COLLECTOR_LOCK_WAIT_S, remaining budget − _LOCK_WAIT_MARGIN_S)``. With the margin or
+less left the cycle is ``skipped_locked`` and does not wait. After the wait the launch
+window is checked again on a fresh clock, and every fetch keeps the same deadline
+(start + budget). Then:
 
 1. refuses a firing that STARTS inside [16:30Z, 17:10Z) (the 17:10Z firing reruns it, rows
    flagged ``late``), then the disk guard and the clock-offset bound;
@@ -98,6 +103,7 @@ from breezy.persistence.us_source_revision_store import (
 )
 
 __all__ = [
+    "COLLECTOR_LOCK_WAIT_S",
     "COLLECTOR_USER_AGENT",
     "NBP_STATIONS",
     "SOURCE_KEYS",
@@ -168,6 +174,12 @@ _DEFAULT_NTP_BOUND_MS: Final[int] = 1000  # provisional; frozen in the prereg af
 _DEFAULT_MIN_FREE_GIB: Final[int] = 10
 _EXIT_REFUSED: Final[int] = 2
 _EXIT_ERROR: Final[int] = 1
+#: A backfill append holds the unit lock for one write. Wait, in <= 5 s steps, before skipping.
+COLLECTOR_LOCK_WAIT_S: Final[int] = 120
+_LOCK_RETRY_STEP_S: Final[float] = 5.0
+#: Seconds of the work budget the lock wait must leave. The wait is
+#: ``min(COLLECTOR_LOCK_WAIT_S, remaining − margin)``; at or under it, do not wait.
+_LOCK_WAIT_MARGIN_S: Final[int] = 30
 
 #: Sanity floors, never lag estimates (R29). The collector always observes, so the
 #: ``nominal_plus_conservative_lag`` fallback is never taken; the table only satisfies
@@ -336,6 +348,8 @@ class _Collector:
         self.writer = norm.NormWriter(ctx.root, clock)
         self.ledger = ledger_mod.PollLedger(ctx.root)
         self.ntp_offset: int | None = None
+        #: Set before the lock wait. Fetches stop at this instant (start + work budget).
+        self.work_deadline_ns: int | None = None
 
     # -- availability and the ledger --------------------------------------------------
 
@@ -547,22 +561,23 @@ def _poll(
     pending: list[_Job],
     *,
     deadline_ns: int,
+    work_deadline_ns: int,
     interval_s: float,
     step: Callable[[_Job], bool | None],
 ) -> tuple[list[_Job], CycleStatus | None]:
-    """Run ``step`` over ``pending`` until each is done, the window ends or the deadline hits.
+    """Run ``step`` over ``pending`` until each is done, the window ends or a deadline hits.
 
-    ``step`` returns True when the job is finished, False when it must be polled again, and
-    None after a transport error (polled again, remembered for the status).
+    ``work_deadline_ns`` is the cycle deadline (start + ``MAX_WORK_SECONDS``, started before
+    the lock wait) and is shared with every later fetch. ``deadline_ns`` is the publication
+    window. ``step`` returns True when the job is finished, False when it must be polled
+    again, and None after a transport error (polled again, remembered for the status).
     """
-    start = ctx.clock()
+    if cli_source not in guards.MAX_WORK_SECONDS:
+        raise ValueError(f"unknown source {cli_source!r}")
     errored = False
     while pending:
         now = ctx.clock()
-        over_budget = (
-            guards.worked_seconds_outside_window(start, now) > guards.MAX_WORK_SECONDS[cli_source]
-        )
-        if over_budget or not guards.attempt_allowed(now):
+        if now >= work_deadline_ns or not guards.attempt_allowed(now):
             return pending, CycleStatus.DEADLINE
         if now > deadline_ns:
             return pending, CycleStatus.ERROR if errored else CycleStatus.NOT_PUBLISHED
@@ -666,6 +681,7 @@ def _lamp_cycle(col: _Collector, now_ns: int) -> CycleReport:
         "lamp",
         pending,
         deadline_ns=deadline,
+        work_deadline_ns=_work_deadline_ns(col),
         interval_s=ctx.poll_interval_s,
         step=step,
     )
@@ -690,9 +706,10 @@ def _pfm_cycle(col: _Collector, _now_ns: int) -> CycleReport:
     ctx = col.ctx
     results: list[CycleStatus] = []
     refused = 0
+    work_deadline_ns = _work_deadline_ns(col)
     for station, point in PFM_POINTS.items():
         attempt = ctx.clock()
-        if not guards.attempt_allowed(attempt):
+        if attempt >= work_deadline_ns or not guards.attempt_allowed(attempt):
             results.append(CycleStatus.DEADLINE)
             break
         try:
@@ -767,6 +784,7 @@ def _nbp_cycle(col: _Collector, now_ns: int) -> CycleReport:
         "nbp",
         [_Job(LAMP_ALL, False)],
         deadline_ns=deadline,
+        work_deadline_ns=_work_deadline_ns(col),
         interval_s=ctx.nbp_poll_interval_s,
         step=step,
     )
@@ -841,13 +859,78 @@ def run_cycle(source: str, ctx: CycleContext) -> CycleReport:
         return CycleReport(key, CycleStatus.REFUSED_GUARD, notes=(str(exc),))
     collector = _Collector(ctx, source)
     collector.ntp_offset = offset
-    try:
-        with _cycle_lock(collector.store, ctx.root, key):
-            collector.check_stale(now)
-            return _CYCLES[source](collector, now)
-    except RevisionStoreBusyError:
-        _log(f"{key} is locked by another run; skipping this cycle")
-        return CycleReport(key, CycleStatus.SKIPPED_LOCKED)
+    return _run_locked(collector, ctx, key, source, now)
+
+
+def _work_deadline_ns(col: _Collector) -> int:
+    """The cycle deadline fixed before the lock wait (start + the source work budget)."""
+    deadline = col.work_deadline_ns
+    if deadline is None:
+        raise RuntimeError("the work deadline is set before a cycle runs")
+    return deadline
+
+
+def _lock_wait_step_s(deadline_ns: int, now_ns: int, waited_s: float) -> float:
+    """Seconds to sleep before the next lock try, charged against ``deadline_ns``.
+
+    ``0`` means do not wait: the lock cap is spent, or the work budget has the margin
+    (``_LOCK_WAIT_MARGIN_S``) or less left. The wait is never added on top of the budget.
+    """
+    if now_ns >= deadline_ns:
+        return 0.0
+    remaining_s = (deadline_ns - now_ns) // _NS
+    if remaining_s <= _LOCK_WAIT_MARGIN_S:
+        return 0.0
+    additional = min(COLLECTOR_LOCK_WAIT_S - waited_s, remaining_s - _LOCK_WAIT_MARGIN_S)
+    if additional <= 0:
+        return 0.0
+    return float(min(_LOCK_RETRY_STEP_S, additional))
+
+
+def _run_locked(
+    collector: _Collector, ctx: CycleContext, key: str, source: str, now: int
+) -> CycleReport:
+    """Take the unit lock. The wait consumes the work budget that starts here."""
+    started_ns = ctx.clock()
+    deadline_ns = started_ns + guards.MAX_WORK_SECONDS[source] * _NS
+    collector.work_deadline_ns = deadline_ns
+    waited_s = 0.0
+    while True:
+        try:
+            with _cycle_lock(collector.store, ctx.root, key):
+                fresh = ctx.clock()
+                if guards.firing_decision(fresh) is guards.FiringDecision.SKIP_WINDOW:
+                    _log(
+                        "firing inside the launch window after the lock wait; "
+                        "the 17:10Z firing reruns it (rows flagged late)"
+                    )
+                    return CycleReport(key, CycleStatus.SKIPPED_WINDOW)
+                if waited_s > 0:
+                    _log(f"{key} lock acquired after waiting {waited_s:.3f}s")
+                collector.check_stale(now)
+                return _CYCLES[source](collector, now)
+        except RevisionStoreBusyError:
+            fresh = ctx.clock()
+            if guards.firing_decision(fresh) is guards.FiringDecision.SKIP_WINDOW:
+                _log(
+                    "lock wait reached the launch window; "
+                    "the 17:10Z firing reruns it (rows flagged late)"
+                )
+                return CycleReport(key, CycleStatus.SKIPPED_WINDOW)
+            step_s = _lock_wait_step_s(deadline_ns, fresh, waited_s)
+            if step_s <= 0:
+                _log(
+                    f"{key} is locked by another run after waiting {waited_s:.3f}s; "
+                    "skipping this cycle"
+                )
+                # Append-only poll ledger: no revision-store lock (the unit lock is still busy).
+                collector.ledger.record(
+                    key,
+                    {"kind": "skipped", "fetched_at_ns": fresh, "reason": "locked"},
+                )
+                return CycleReport(key, CycleStatus.SKIPPED_LOCKED)
+            ctx.sleep(step_s)
+            waited_s += step_s
 
 
 def lag_samples(ledger: ledger_mod.PollLedger, source_key: str) -> list[LagSample]:
