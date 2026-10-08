@@ -1,0 +1,330 @@
+2026-10-02 16:50:40,786 [INFO] breezy.app.trade.boot: boot_family_declared id=pm_us_crh_fq_v1
+2026-10-02 16:50:40,787 [INFO] breezy.app.trade.boot: live-trading permit issued issued_at_ns=1790959840786860859 expires_at_ns=1790995840786860859 ttl_s=36000
+2026-10-02 16:50:40,788 [INFO] breezy.app.trade.boot: boot_family id=pm_us_crh_fq_v1 composition_kind=forecast_quantile_ladder status=REGISTERED manifest_sha256=8e1217fd2037ca4ea070c3f15a081168c591ad450ab347ed7319ede2f524b9d0
+2026-10-02 16:50:40,789 [INFO] breezy.app.trade.boot: family_halt_state family_id=pm_us_crh_fq_v1 halted=False source=none legacy=attributable_to_v4
+2026-10-02 16:50:40,789 [INFO] breezy.app.trade.boot: fq_live_orders enabled=True family_id=pm_us_crh_fq_v1 ruling=RULING_operator_fq_live_real_orders_2026-10-01 reason=ok ruling_sha256=11c69d132a70d8e328d3720314336aa6f2cf176d52fd25d5f2e20a7189711c1f calibration_sha256=9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e
+2026-10-02 16:50:43,367 [INFO] breezy.app.trade.boot: composed stations LAX,MDW,MIA,SFO from family_id=pm_us_crh_fq_v1
+[1m2026-10-02T16:50:43.368622468Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368629064Z[0m [36m[INFO] BREEZY-L001.TradingNode:  NAUTILUS TRADER - Automated Algorithmic Trading Platform[0m
+[1m2026-10-02T16:50:43.368629252Z[0m [36m[INFO] BREEZY-L001.TradingNode:  by Nautech Systems Pty Ltd.[0m
+[1m2026-10-02T16:50:43.368629570Z[0m [36m[INFO] BREEZY-L001.TradingNode:  Copyright (C) 2015-2026. All rights reserved.[0m
+[1m2026-10-02T16:50:43.368629673Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368629784Z[0m [INFO] BREEZY-L001.TradingNode: [0m
+[1m2026-10-02T16:50:43.368629995Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣴⣶⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368630101Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣾⣿⣿⣿⠀⢸⣿⣿⣿⣿⣶⣶⣤⣀⠀⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368630257Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⠀⢀⣴⡇⢀⣾⣿⣿⣿⣿⣿⠀⣾⣿⣿⣿⣿⣿⣿⣿⠿⠓⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368630413Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⣰⣿⣿⡀⢸⣿⣿⣿⣿⣿⣿⠀⣿⣿⣿⣿⣿⣿⠟⠁⣠⣄⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368630610Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⢠⣿⣿⣿⣇⠀⢿⣿⣿⣿⣿⣿⠀⢻⣿⣿⣿⡿⢃⣠⣾⣿⣿⣧⡀⠀⠀[0m
+[1m2026-10-02T16:50:43.368630726Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠠⣾⣿⣿⣿⣿⣿⣧⠈⠋⢀⣴⣧⠀⣿⡏⢠⡀⢸⣿⣿⣿⣿⣿⣿⣿⡇⠀[0m
+[1m2026-10-02T16:50:43.368630823Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⣀⠙⢿⣿⣿⣿⣿⣿⠇⢠⣿⣿⣿⡄⠹⠃⠼⠃⠈⠉⠛⠛⠛⠛⠛⠻⠇⠀[0m
+[1m2026-10-02T16:50:43.368630955Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⢸⡟⢠⣤⠉⠛⠿⢿⣿⠀⢸⣿⡿⠋⣠⣤⣄⠀⣾⣿⣿⣶⣶⣶⣦⡄⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368631226Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠸⠀⣾⠏⣸⣷⠂⣠⣤⠀⠘⢁⣴⣾⣿⣿⣿⡆⠘⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368631363Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠛⠀⣿⡟⠀⢻⣿⡄⠸⣿⣿⣿⣿⣿⣿⣿⡀⠘⣿⣿⣿⣿⠟⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368631515Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⠀⣿⠇⠀⠀⢻⡿⠀⠈⠻⣿⣿⣿⣿⣿⡇⠀⢹⣿⠿⠋⠀⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368631623Z[0m [INFO] BREEZY-L001.TradingNode: ⠀⠀⠀⠀⠀⠀⠋⠀⠀⠀⡘⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠀⠀⠀[0m
+[1m2026-10-02T16:50:43.368631768Z[0m [INFO] BREEZY-L001.TradingNode: [0m
+[1m2026-10-02T16:50:43.368631872Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368632086Z[0m [36m[INFO] BREEZY-L001.TradingNode:  SYSTEM SPECIFICATION[0m
+[1m2026-10-02T16:50:43.368632180Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368632616Z[0m [INFO] BREEZY-L001.TradingNode: CPU architecture: 11th Gen Intel(R) Core(TM) i7-11700K @ 3.60GHz[0m
+[1m2026-10-02T16:50:43.368632972Z[0m [INFO] BREEZY-L001.TradingNode: CPU(s): 16 @ 4856 MHz[0m
+[1m2026-10-02T16:50:43.368633270Z[0m [INFO] BREEZY-L001.TradingNode: OS: kernel-7.0.0-34-generic Linux (Ubuntu 26.04)[0m
+[1m2026-10-02T16:50:43.368660996Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368661201Z[0m [36m[INFO] BREEZY-L001.TradingNode:  MEMORY USAGE[0m
+[1m2026-10-02T16:50:43.368661436Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368662906Z[0m [INFO] BREEZY-L001.TradingNode: RAM-Total: 30.67 GiB[0m
+[1m2026-10-02T16:50:43.368663318Z[0m [INFO] BREEZY-L001.TradingNode: RAM-Used: 10.44 GiB (34.05%)[0m
+[1m2026-10-02T16:50:43.368663629Z[0m [INFO] BREEZY-L001.TradingNode: RAM-Avail: 20.23 GiB (65.95%)[0m
+[1m2026-10-02T16:50:43.368664052Z[0m [INFO] BREEZY-L001.TradingNode: Swap-Total: 8.00 GiB[0m
+[1m2026-10-02T16:50:43.368664457Z[0m [INFO] BREEZY-L001.TradingNode: Swap-Used: 4.01 GiB (50.14%)[0m
+[1m2026-10-02T16:50:43.368664755Z[0m [INFO] BREEZY-L001.TradingNode: Swap-Avail: 3.99 GiB (49.86%)[0m
+[1m2026-10-02T16:50:43.368665222Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368665464Z[0m [36m[INFO] BREEZY-L001.TradingNode:  IDENTIFIERS[0m
+[1m2026-10-02T16:50:43.368665654Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368666552Z[0m [INFO] BREEZY-L001.TradingNode: trader_id: BREEZY-L001[0m
+[1m2026-10-02T16:50:43.368666817Z[0m [INFO] BREEZY-L001.TradingNode: machine_id: wookiebuntu[0m
+[1m2026-10-02T16:50:43.368667443Z[0m [INFO] BREEZY-L001.TradingNode: instance_id: b289c2c0-31a9-428d-871e-ca83c15b5f2d[0m
+[1m2026-10-02T16:50:43.368667765Z[0m [INFO] BREEZY-L001.TradingNode: PID: 523283[0m
+[1m2026-10-02T16:50:43.368667907Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368668083Z[0m [36m[INFO] BREEZY-L001.TradingNode:  VERSIONING[0m
+[1m2026-10-02T16:50:43.368668238Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368677892Z[0m [INFO] BREEZY-L001.TradingNode: nautilus_trader: 1.231.0[0m
+[1m2026-10-02T16:50:43.368681378Z[0m [INFO] BREEZY-L001.TradingNode: python: 3.13.13[0m
+[1m2026-10-02T16:50:43.368684252Z[0m [INFO] BREEZY-L001.TradingNode: numpy: 2.5.2[0m
+[1m2026-10-02T16:50:43.368685946Z[0m [INFO] BREEZY-L001.TradingNode: pandas: 3.0.5[0m
+[1m2026-10-02T16:50:43.368687057Z[0m [INFO] BREEZY-L001.TradingNode: msgspec: 0.21.1[0m
+[1m2026-10-02T16:50:43.368688561Z[0m [INFO] BREEZY-L001.TradingNode: pyarrow: 25.0.1[0m
+[1m2026-10-02T16:50:43.368690769Z[0m [INFO] BREEZY-L001.TradingNode: pytz: 2026.3.post1[0m
+[1m2026-10-02T16:50:43.368691699Z[0m [INFO] BREEZY-L001.TradingNode: uvloop: 0.22.1[0m
+[1m2026-10-02T16:50:43.368691855Z[0m [36m[INFO] BREEZY-L001.TradingNode: =================================================================[0m
+[1m2026-10-02T16:50:43.368698878Z[0m [INFO] BREEZY-L001.TradingNode: Building system kernel[0m
+[1m2026-10-02T16:50:43.368933877Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.database=None[0m
+[1m2026-10-02T16:50:43.368937358Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.encoding='json'[0m
+[1m2026-10-02T16:50:43.368937972Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.timestamps_as_iso8601=False[0m
+[1m2026-10-02T16:50:43.368938425Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.buffer_interval_ms=None[0m
+[1m2026-10-02T16:50:43.368938823Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.autotrim_mins=None[0m
+[1m2026-10-02T16:50:43.368939274Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.use_trader_prefix=True[0m
+[1m2026-10-02T16:50:43.368939625Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.use_trader_id=True[0m
+[1m2026-10-02T16:50:43.368939988Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.use_instance_id=False[0m
+[1m2026-10-02T16:50:43.368940888Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.streams_prefix='stream'[0m
+[1m2026-10-02T16:50:43.368941290Z[0m [94m[INFO] BREEZY-L001.MessageBus: config.types_filter=None[0m
+[1m2026-10-02T16:50:43.368969589Z[0m [INFO] BREEZY-L001.Cache: READY[0m
+[1m2026-10-02T16:50:43.369326110Z[0m [INFO] BREEZY-L001.DataEngine: READY[0m
+[1m2026-10-02T16:50:43.369394034Z[0m [94m[INFO] BREEZY-L001.DataEngine: config.graceful_shutdown_on_exception=False[0m
+[1m2026-10-02T16:50:43.369418172Z[0m [INFO] BREEZY-L001.RiskEngine: READY[0m
+[1m2026-10-02T16:50:43.369444987Z[0m [94m[INFO] BREEZY-L001.RiskEngine: TradingState is ACTIVE[0m
+[1m2026-10-02T16:50:43.369519409Z[0m [INFO] BREEZY-L001.Throttler-ORDER_SUBMIT_THROTTLER: READY[0m
+[1m2026-10-02T16:50:43.369530757Z[0m [94m[INFO] BREEZY-L001.RiskEngine: Set MAX_ORDER_SUBMIT_RATE: 5/00:00:01[0m
+[1m2026-10-02T16:50:43.369545482Z[0m [INFO] BREEZY-L001.Throttler-ORDER_MODIFY_THROTTLER: READY[0m
+[1m2026-10-02T16:50:43.369551286Z[0m [94m[INFO] BREEZY-L001.RiskEngine: Set MAX_ORDER_MODIFY_RATE: 100/00:00:01[0m
+[1m2026-10-02T16:50:43.369570296Z[0m [94m[INFO] BREEZY-L001.RiskEngine: config.graceful_shutdown_on_exception=False[0m
+[1m2026-10-02T16:50:43.369599623Z[0m [INFO] BREEZY-L001.ExecEngine: READY[0m
+[1m2026-10-02T16:50:43.369620057Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.snapshot_orders=False[0m
+[1m2026-10-02T16:50:43.369621305Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.snapshot_positions=False[0m
+[1m2026-10-02T16:50:43.369621783Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.snapshot_positions_interval_secs=None[0m
+[1m2026-10-02T16:50:43.369622392Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.allow_overfills=False[0m
+[1m2026-10-02T16:50:43.369643096Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.reconciliation=True[0m
+[1m2026-10-02T16:50:43.369644316Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.reconciliation_lookback_mins=None[0m
+[1m2026-10-02T16:50:43.369644663Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.reconciliation_instrument_ids=None[0m
+[1m2026-10-02T16:50:43.369645025Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.filter_unclaimed_external_orders=False[0m
+[1m2026-10-02T16:50:43.369645379Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.filter_position_reports=False[0m
+[1m2026-10-02T16:50:43.369645662Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.filtered_client_order_ids=None[0m
+[1m2026-10-02T16:50:43.369646117Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.inflight_check_interval_ms=0[0m
+[1m2026-10-02T16:50:43.369646486Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.inflight_check_threshold_ms=5000[0m
+[1m2026-10-02T16:50:43.369647064Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.inflight_check_retries=5[0m
+[1m2026-10-02T16:50:43.369647474Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.own_books_audit_interval_secs=None[0m
+[1m2026-10-02T16:50:43.369647746Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.open_check_interval_secs=None[0m
+[1m2026-10-02T16:50:43.369648032Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.open_check_open_only=True[0m
+[1m2026-10-02T16:50:43.369648358Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.open_check_lookback_mins=60[0m
+[1m2026-10-02T16:50:43.369648794Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.open_check_threshold_ms=5000[0m
+[1m2026-10-02T16:50:43.369649467Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.open_check_missing_retries=5[0m
+[1m2026-10-02T16:50:43.369649968Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.max_single_order_queries_per_cycle=10[0m
+[1m2026-10-02T16:50:43.369650292Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.single_order_query_delay_ms=100[0m
+[1m2026-10-02T16:50:43.369650625Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.position_check_interval_secs=None[0m
+[1m2026-10-02T16:50:43.369651228Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.position_check_lookback_mins=60[0m
+[1m2026-10-02T16:50:43.369651637Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.position_check_threshold_ms=5000[0m
+[1m2026-10-02T16:50:43.369652002Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.position_check_retries=3[0m
+[1m2026-10-02T16:50:43.369653110Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.reconciliation_startup_delay_secs=10.0[0m
+[1m2026-10-02T16:50:43.369653461Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_closed_orders_interval_mins=None[0m
+[1m2026-10-02T16:50:43.369653712Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_closed_orders_buffer_mins=None[0m
+[1m2026-10-02T16:50:43.369653965Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_closed_positions_interval_mins=None[0m
+[1m2026-10-02T16:50:43.369654247Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_closed_positions_buffer_mins=None[0m
+[1m2026-10-02T16:50:43.369654508Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_account_events_interval_mins=None[0m
+[1m2026-10-02T16:50:43.369654788Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_account_events_lookback_mins=None[0m
+[1m2026-10-02T16:50:43.369655062Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.purge_from_database=False[0m
+[1m2026-10-02T16:50:43.369655456Z[0m [94m[INFO] BREEZY-L001.ExecEngine: config.graceful_shutdown_on_exception=False[0m
+[1m2026-10-02T16:50:43.369682449Z[0m [INFO] BREEZY-L001.Cache: Cached 0 general objects from database[0m
+[1m2026-10-02T16:50:43.369685236Z[0m [INFO] BREEZY-L001.Cache: Cached 0 currencies from database[0m
+[1m2026-10-02T16:50:43.369686644Z[0m [INFO] BREEZY-L001.Cache: Cached 0 instruments from database[0m
+[1m2026-10-02T16:50:43.369690739Z[0m [INFO] BREEZY-L001.Cache: Cached 0 accounts from database[0m
+[1m2026-10-02T16:50:43.369693288Z[0m [INFO] BREEZY-L001.Cache: Cached 0 orders from database[0m
+[1m2026-10-02T16:50:43.369694783Z[0m [INFO] BREEZY-L001.Cache: Cached 0 order lists from database[0m
+[1m2026-10-02T16:50:43.369695975Z[0m [INFO] BREEZY-L001.Cache: Cached 0 positions from database[0m
+[1m2026-10-02T16:50:43.369701639Z[0m [INFO] BREEZY-L001.Cache: Checking data integrity[0m
+[1m2026-10-02T16:50:43.369708293Z[0m [92m[INFO] BREEZY-L001.Cache: Integrity check passed in 5μs[0m
+[1m2026-10-02T16:50:43.369715719Z[0m [INFO] BREEZY-L001.ExecEngine: Loaded cache in 0ms[0m
+[1m2026-10-02T16:50:43.369735409Z[0m [INFO] BREEZY-L001.OrderEmulator: READY[0m
+[1m2026-10-02T16:50:43.369764566Z[0m [INFO] BREEZY-L001.BREEZY-L001: READY[0m
+[1m2026-10-02T16:50:43.369779717Z[0m [INFO] BREEZY-L001.TradingNode: Initialized in 1ms[0m
+[1m2026-10-02T16:50:43.369792022Z[0m [94m[INFO] BREEZY-L001.TradingNode: has_cache_backing=False[0m
+[1m2026-10-02T16:50:43.369793240Z[0m [94m[INFO] BREEZY-L001.TradingNode: has_msgbus_backing=False[0m
+[1m2026-10-02T16:50:43.369821835Z[0m [INFO] BREEZY-L001.NwsObservationActor-KSFO: READY[0m
+[1m2026-10-02T16:50:43.369832791Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component NwsObservationActor-KSFO[0m
+[1m2026-10-02T16:50:43.369839314Z[0m [INFO] BREEZY-L001.NwsObservationActor-KMIA: READY[0m
+[1m2026-10-02T16:50:43.369846149Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component NwsObservationActor-KMIA[0m
+[1m2026-10-02T16:50:43.369850395Z[0m [INFO] BREEZY-L001.NwsObservationActor-KMDW: READY[0m
+[1m2026-10-02T16:50:43.369856557Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component NwsObservationActor-KMDW[0m
+[1m2026-10-02T16:50:43.369860238Z[0m [INFO] BREEZY-L001.NwsObservationActor-KLAX: READY[0m
+[1m2026-10-02T16:50:43.369865200Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component NwsObservationActor-KLAX[0m
+[1m2026-10-02T16:50:43.369870303Z[0m [INFO] BREEZY-L001.ForecastQuantileStateActor: READY[0m
+[1m2026-10-02T16:50:43.369875433Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component ForecastQuantileStateActor[0m
+[1m2026-10-02T16:50:43.369880148Z[0m [INFO] BREEZY-L001.NbmQuantileActor: READY[0m
+[1m2026-10-02T16:50:43.369885585Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component NbmQuantileActor[0m
+[1m2026-10-02T16:50:43.369889792Z[0m [INFO] BREEZY-L001.FqDecisionFunnelActor: READY[0m
+[1m2026-10-02T16:50:43.369894912Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component FqDecisionFunnelActor[0m
+[1m2026-10-02T16:50:43.369898574Z[0m [INFO] BREEZY-L001.FeeDriftProbeActor: READY[0m
+[1m2026-10-02T16:50:43.369903505Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Component FeeDriftProbeActor[0m
+[1m2026-10-02T16:50:43.369916444Z[0m [INFO] BREEZY-L001.FORECAST-QUANTILE-LADDER: READY[0m
+[1m2026-10-02T16:50:43.369945136Z[0m [INFO] BREEZY-L001.ExecEngine: Registered OMS.UNSPECIFIED for Strategy FORECAST-QUANTILE-LADDER-LAX[0m
+[1m2026-10-02T16:50:43.369947590Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Strategy FORECAST-QUANTILE-LADDER-LAX[0m
+[1m2026-10-02T16:50:43.369955174Z[0m [INFO] BREEZY-L001.FORECAST-QUANTILE-LADDER: READY[0m
+[1m2026-10-02T16:50:43.369973595Z[0m [INFO] BREEZY-L001.ExecEngine: Registered OMS.UNSPECIFIED for Strategy FORECAST-QUANTILE-LADDER-MDW[0m
+[1m2026-10-02T16:50:43.369975746Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Strategy FORECAST-QUANTILE-LADDER-MDW[0m
+[1m2026-10-02T16:50:43.369980701Z[0m [INFO] BREEZY-L001.FORECAST-QUANTILE-LADDER: READY[0m
+[1m2026-10-02T16:50:43.369996225Z[0m [INFO] BREEZY-L001.ExecEngine: Registered OMS.UNSPECIFIED for Strategy FORECAST-QUANTILE-LADDER-MIA[0m
+[1m2026-10-02T16:50:43.369997974Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Strategy FORECAST-QUANTILE-LADDER-MIA[0m
+[1m2026-10-02T16:50:43.370002627Z[0m [INFO] BREEZY-L001.FORECAST-QUANTILE-LADDER: READY[0m
+[1m2026-10-02T16:50:43.370016385Z[0m [INFO] BREEZY-L001.ExecEngine: Registered OMS.UNSPECIFIED for Strategy FORECAST-QUANTILE-LADDER-SFO[0m
+[1m2026-10-02T16:50:43.370017837Z[0m [INFO] BREEZY-L001.BREEZY-L001: Registered Strategy FORECAST-QUANTILE-LADDER-SFO[0m
+[1m2026-10-02T16:50:43.370021111Z[0m [INFO] BREEZY-L001.TradingNode: Building data client for POLYMARKET_US[0m
+[1m2026-10-02T16:50:43.372947998Z[0m [INFO] BREEZY-L001.PolymarketUSInstrumentProvider: READY[0m
+[1m2026-10-02T16:50:43.372991895Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: READY[0m
+[1m2026-10-02T16:50:43.373029002Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: subscriptions per slug=1 slugs per shard=10 shards=1 trade_shard_halving=False[0m
+[1m2026-10-02T16:50:43.373055593Z[0m [94m[INFO] BREEZY-L001.DataClient-POLYMARKET_US: Wired PolymarketUSDataClient as POLYMARKET_US for POLYMARKET_US[0m
+[1m2026-10-02T16:50:43.373060320Z[0m [INFO] BREEZY-L001.DataEngine: Registered POLYMARKET_US[0m
+[1m2026-10-02T16:50:43.373065121Z[0m [INFO] BREEZY-L001.TradingNode: Building execution client for POLYMARKET_US[0m
+[1m2026-10-02T16:50:43.373131276Z[0m [INFO] BREEZY-L001.ExecClient-POLYMARKET_US: READY[0m
+[1m2026-10-02T16:50:43.373160567Z[0m [INFO] BREEZY-L001.ExecEngine: Registered ExecutionClient-POLYMARKET_US[0m
+[1m2026-10-02T16:50:43.374800222Z[0m [INFO] BREEZY-L001.breezy: refusal re-poll timer armed name=breezy-refusal-repoll interval_s=60[0m
+[1m2026-10-02T16:50:43.374908996Z[0m [INFO] BREEZY-L001.TradingNode: STARTING[0m
+[1m2026-10-02T16:50:43.374995837Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: RUNNING[0m
+[1m2026-10-02T16:50:43.375024662Z[0m [INFO] BREEZY-L001.DataEngine: RUNNING[0m
+[1m2026-10-02T16:50:43.375042540Z[0m [INFO] BREEZY-L001.RiskEngine: RUNNING[0m
+[1m2026-10-02T16:50:43.375054572Z[0m [INFO] BREEZY-L001.ExecClient-POLYMARKET_US: RUNNING[0m
+[1m2026-10-02T16:50:43.375070487Z[0m [INFO] BREEZY-L001.ExecEngine: RUNNING[0m
+[1m2026-10-02T16:50:43.375076433Z[0m [INFO] BREEZY-L001.DataEngine: Connecting all clients...[0m
+[1m2026-10-02T16:50:43.375078740Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Connecting...[0m
+[1m2026-10-02T16:50:43.375086817Z[0m [INFO] BREEZY-L001.ExecEngine: Connecting all clients...[0m
+[1m2026-10-02T16:50:43.375088673Z[0m [INFO] BREEZY-L001.ExecClient-POLYMARKET_US: Connecting...[0m
+[1m2026-10-02T16:50:43.375096337Z[0m [94m[INFO] BREEZY-L001.TradingNode: Awaiting engine connections and initializations (60.0s timeout)...[0m
+[1m2026-10-02T16:50:43.375185217Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Initializing instruments...[0m
+[1m2026-10-02T16:50:43.375192367Z[0m [INFO] BREEZY-L001.PolymarketUSInstrumentProvider: Initializing instruments...[0m
+[1m2026-10-02T16:50:43.384105172Z[0m [INFO] BREEZY-L001.breezy: state store certified durable: probe key=durability:probe round-tripped through two independent handles[0m
+[1m2026-10-02T16:50:43.628552849Z[0m [INFO] BREEZY-L001.POLYMARKET_US-http: GET https://gateway.polymarket.us/v1/markets?active=REDACTED&archived=REDACTED&categories=REDACTED&closed=REDACTED&limit=REDACTED&offset=REDACTED&orderBy=REDACTED&orderDirection=REDACTED status=200 quota_key=discovery rate_limit_headers={'date': 'Fri, 02 Oct 2026 16:50:43 GMT'}[0m
+[1m2026-10-02T16:50:43.637374525Z[0m [INFO] BREEZY-L001.POLYMARKET_US-discovery: Polymarket.us discovery cycle loaded 60 active market(s), observed 0 resolved market(s), discovered 60 total[0m
+[1m2026-10-02T16:50:43.637416088Z[0m [INFO] BREEZY-L001.PolymarketUSInstrumentProvider: Loaded 120 instruments[0m
+[1m2026-10-02T16:50:43.637417699Z[0m [INFO] BREEZY-L001.PolymarketUSInstrumentProvider: Initialized instruments[0m
+[1m2026-10-02T16:50:43.771025964Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-lt81f (new)[0m
+[1m2026-10-02T16:50:43.771191365Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=981c7a635db44f4793e2ce3d76a8ce44 slugs=1 [tc-temp-nychigh-2026-10-02-lt81f][0m
+[1m2026-10-02T16:50:43.771198656Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-gte81lt82f (new)[0m
+[1m2026-10-02T16:50:43.771799870Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=156644947eee4694ac5e78f7e6b30f82 slugs=1 [tc-temp-nychigh-2026-10-02-gte81lt82f][0m
+[1m2026-10-02T16:50:43.771804714Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-gte83lt84f (new)[0m
+[1m2026-10-02T16:50:43.771943068Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=07e7314bcb8c47db888f58abef970374 slugs=1 [tc-temp-nychigh-2026-10-02-gte83lt84f][0m
+[1m2026-10-02T16:50:43.771947256Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-gte85lt86f (new)[0m
+[1m2026-10-02T16:50:43.779980266Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=316473df76fd41b0953da72b4019b293 slugs=1 [tc-temp-nychigh-2026-10-02-gte85lt86f][0m
+[1m2026-10-02T16:50:43.779985362Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-gte87lt88f (new)[0m
+[1m2026-10-02T16:50:43.781487079Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=94fd2d345e1b4867bac1834922afa3e8 slugs=1 [tc-temp-nychigh-2026-10-02-gte87lt88f][0m
+[1m2026-10-02T16:50:43.781491493Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-02-gte89f (new)[0m
+[1m2026-10-02T16:50:43.830805207Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=109c9af4fd394a9aad1429561124167c slugs=1 [tc-temp-nychigh-2026-10-02-gte89f][0m
+[1m2026-10-02T16:50:43.830811421Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-lt85f (new)[0m
+[1m2026-10-02T16:50:43.830908656Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=b18072f34f014f56bf97ded2d651a7c0 slugs=1 [tc-temp-miahigh-2026-10-02-lt85f][0m
+[1m2026-10-02T16:50:43.830912634Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-gte85lt86f (new)[0m
+[1m2026-10-02T16:50:43.831390902Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=5a43d585a98e4bbd8ea1733874bf300a slugs=1 [tc-temp-miahigh-2026-10-02-gte85lt86f][0m
+[1m2026-10-02T16:50:43.831396287Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-gte87lt88f (new)[0m
+[1m2026-10-02T16:50:43.833839726Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=a116c19928aa434daeeb642b70f60bd0 slugs=1 [tc-temp-miahigh-2026-10-02-gte87lt88f][0m
+[1m2026-10-02T16:50:43.833844279Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-gte89lt90f (new)[0m
+[1m2026-10-02T16:50:43.837535404Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-0) sent MARKET_DATA subscribe: request_id=d39bef92cba44853bb2b47da6f431ea6 slugs=1 [tc-temp-miahigh-2026-10-02-gte89lt90f][0m
+[1m2026-10-02T16:50:43.837541242Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-gte91lt92f (new)[0m
+[1m2026-10-02T16:50:43.864889788Z[0m [INFO] BREEZY-L001.ExecClient-POLYMARKET_US: resolver: zero-fill corroboration=activities_v1 min_age_s=120 legs=yes,no[0m
+[1m2026-10-02T16:50:43.865112820Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-nychigh-2026-10-02-gte87lt88f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 1 refusal(s) across 1 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:43.865354963Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-nychigh-2026-10-02-gte89f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 2 refusal(s) across 2 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:43.879338970Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-miahigh-2026-10-02-lt85f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 3 refusal(s) across 3 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:43.885817730Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-miahigh-2026-10-02-gte85lt86f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 4 refusal(s) across 4 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:43.933832438Z[0m [INFO] BREEZY-L001.breezy: account balances response: 2 balance field(s) carried non-exact precision and were quantized down to the instrument precision[0m
+[1m2026-10-02T16:50:43.933929863Z[0m [INFO] BREEZY-L001.Portfolio: Updated AccountState(account_id=POLYMARKET_US-MAIN, account_type=CASH, base_currency=USD, is_reported=True, balances=[AccountBalance(total=136.36 USD, locked=0.00 USD, free=136.36 USD)], margins=[], event_id=0e6ff816-f105-44fe-b862-589d497f39ff)[0m
+[1m2026-10-02T16:50:43.933966249Z[0m [92m[INFO] BREEZY-L001.ExecClient-POLYMARKET_US: Account POLYMARKET_US-MAIN registered in cache[0m
+[1m2026-10-02T16:50:43.986904739Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: opened shard-1; shards=2 slugs per shard=10[0m
+[1m2026-10-02T16:50:43.988097103Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=42dcedb55cf34814b90f7c5358cfe2ff slugs=1 [tc-temp-miahigh-2026-10-02-gte91lt92f][0m
+[1m2026-10-02T16:50:43.988104373Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-02-gte93f (new)[0m
+[1m2026-10-02T16:50:43.988161436Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=d8c7500fe8a74ba3ab507f2743c02ebd slugs=1 [tc-temp-miahigh-2026-10-02-gte93f][0m
+[1m2026-10-02T16:50:43.988165438Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-lt61f (new)[0m
+[1m2026-10-02T16:50:43.988829695Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=d80315265077484e83ba34caf4bfe610 slugs=1 [tc-temp-mdwhigh-2026-10-02-lt61f][0m
+[1m2026-10-02T16:50:43.988833515Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-gte61lt62f (new)[0m
+[1m2026-10-02T16:50:43.988882282Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=755e5b9728fe40d2bfcc49c776451a9e slugs=1 [tc-temp-mdwhigh-2026-10-02-gte61lt62f][0m
+[1m2026-10-02T16:50:43.988886007Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-gte63lt64f (new)[0m
+[1m2026-10-02T16:50:44.103198211Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=9557a46861e04bf9844d410607867281 slugs=1 [tc-temp-mdwhigh-2026-10-02-gte63lt64f][0m
+[1m2026-10-02T16:50:44.103207145Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-gte65lt66f (new)[0m
+[1m2026-10-02T16:50:44.103443941Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-miahigh-2026-10-02-gte93f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 5 refusal(s) across 5 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:44.103643509Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-mdwhigh-2026-10-02-lt61f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 6 refusal(s) across 6 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:44.103843284Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-mdwhigh-2026-10-02-gte61lt62f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 7 refusal(s) across 7 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:44.104321862Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=cb9fb64a24bb412380496529632e1348 slugs=1 [tc-temp-mdwhigh-2026-10-02-gte65lt66f][0m
+[1m2026-10-02T16:50:44.104327874Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-gte67lt68f (new)[0m
+[1m2026-10-02T16:50:44.107444249Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=cbb3d7f733c049309b1e50ea94881d7a slugs=1 [tc-temp-mdwhigh-2026-10-02-gte67lt68f][0m
+[1m2026-10-02T16:50:44.107449603Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-02-gte69f (new)[0m
+[1m2026-10-02T16:50:44.114521388Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=d2fd30dbb0fc477c9225236003339e57 slugs=1 [tc-temp-mdwhigh-2026-10-02-gte69f][0m
+[1m2026-10-02T16:50:44.114527014Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-lt85f (new)[0m
+[1m2026-10-02T16:50:44.150421667Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=8728eb27d294417e95587fee7e27217d slugs=1 [tc-temp-laxhigh-2026-10-02-lt85f][0m
+[1m2026-10-02T16:50:44.150427385Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-gte85lt86f (new)[0m
+[1m2026-10-02T16:50:44.151718117Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-1) sent MARKET_DATA subscribe: request_id=f00976d0ab414adcb03e9fc5137dee3f slugs=1 [tc-temp-laxhigh-2026-10-02-gte85lt86f][0m
+[1m2026-10-02T16:50:44.151723535Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-gte87lt88f (new)[0m
+[1m2026-10-02T16:50:44.174690789Z[0m [92m[INFO] BREEZY-L001.ExecClient-POLYMARKET_US: Connected[0m
+[1m2026-10-02T16:50:44.279446301Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: opened shard-2; shards=3 slugs per shard=10[0m
+[1m2026-10-02T16:50:44.292344821Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=d4ddc38d4d1149858aec5586295af0e0 slugs=1 [tc-temp-laxhigh-2026-10-02-gte87lt88f][0m
+[1m2026-10-02T16:50:44.292354275Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-gte89lt90f (new)[0m
+[1m2026-10-02T16:50:44.292818746Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=f9eb754a967344428898b499597b0eea slugs=1 [tc-temp-laxhigh-2026-10-02-gte89lt90f][0m
+[1m2026-10-02T16:50:44.292823531Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-gte91lt92f (new)[0m
+[1m2026-10-02T16:50:44.292917124Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=9008ad1cc0fe465d89dd2579fe4babce slugs=1 [tc-temp-laxhigh-2026-10-02-gte91lt92f][0m
+[1m2026-10-02T16:50:44.292921054Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-02-gte93f (new)[0m
+[1m2026-10-02T16:50:44.300671069Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=1a7c1d394a174aa5b312ad0f9192d3da slugs=1 [tc-temp-laxhigh-2026-10-02-gte93f][0m
+[1m2026-10-02T16:50:44.300675817Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-lt77f (new)[0m
+[1m2026-10-02T16:50:44.309459905Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=42dede2cdee64136b51c26c04eecf2ee slugs=1 [tc-temp-sfohigh-2026-10-02-lt77f][0m
+[1m2026-10-02T16:50:44.309465042Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-gte77lt78f (new)[0m
+[1m2026-10-02T16:50:44.309527219Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=25c2ad66f71f4f87ae2ddb0e32f9d33e slugs=1 [tc-temp-sfohigh-2026-10-02-gte77lt78f][0m
+[1m2026-10-02T16:50:44.309531505Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-gte79lt80f (new)[0m
+[1m2026-10-02T16:50:44.309604194Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=022a66d51f8e49f7a9c6f4f11161c1c2 slugs=1 [tc-temp-sfohigh-2026-10-02-gte79lt80f][0m
+[1m2026-10-02T16:50:44.309608140Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-gte81lt82f (new)[0m
+[1m2026-10-02T16:50:44.309647530Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=220019db96b648efbf91dd01b00c3c9c slugs=1 [tc-temp-sfohigh-2026-10-02-gte81lt82f][0m
+[1m2026-10-02T16:50:44.309650806Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-gte83lt84f (new)[0m
+[1m2026-10-02T16:50:44.309814665Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=8b582ee478d940d086e2eacde46148e2 slugs=1 [tc-temp-sfohigh-2026-10-02-gte83lt84f][0m
+[1m2026-10-02T16:50:44.309817948Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-02-gte85f (new)[0m
+[1m2026-10-02T16:50:44.309857104Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-2) sent MARKET_DATA subscribe: request_id=96320ebf3a794aff8c0bf03bfe68ff09 slugs=1 [tc-temp-sfohigh-2026-10-02-gte85f][0m
+[1m2026-10-02T16:50:44.309860343Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-lt68f (new)[0m
+[1m2026-10-02T16:50:44.409024654Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: opened shard-3; shards=4 slugs per shard=10[0m
+[1m2026-10-02T16:50:44.413671162Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=161f6b657f2949739c57bd387be69ac2 slugs=1 [tc-temp-nychigh-2026-10-03-lt68f][0m
+[1m2026-10-02T16:50:44.413678884Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-gte68lt69f (new)[0m
+[1m2026-10-02T16:50:44.415179254Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=856b92bc29354f9fa754b7d880dda19e slugs=1 [tc-temp-nychigh-2026-10-03-gte68lt69f][0m
+[1m2026-10-02T16:50:44.415183518Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-gte70lt71f (new)[0m
+[1m2026-10-02T16:50:44.418838470Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=05dfaff08d5d4c2eaa9669a5fe01f6b9 slugs=1 [tc-temp-nychigh-2026-10-03-gte70lt71f][0m
+[1m2026-10-02T16:50:44.418843845Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-gte72lt73f (new)[0m
+[1m2026-10-02T16:50:44.421254224Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=53c9a37435c9451985f5efb5f03ebdad slugs=1 [tc-temp-nychigh-2026-10-03-gte72lt73f][0m
+[1m2026-10-02T16:50:44.421258596Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-gte74lt75f (new)[0m
+[1m2026-10-02T16:50:44.421640707Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=5479dbfbde4846e480d114dd84da7a54 slugs=1 [tc-temp-nychigh-2026-10-03-gte74lt75f][0m
+[1m2026-10-02T16:50:44.421645825Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-nychigh-2026-10-03-gte76f (new)[0m
+[1m2026-10-02T16:50:44.421763137Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=999c2b436cf0450cb87f1e01813a7a5b slugs=1 [tc-temp-nychigh-2026-10-03-gte76f][0m
+[1m2026-10-02T16:50:44.421767415Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-lt86f (new)[0m
+[1m2026-10-02T16:50:44.437491394Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=b0d0499debfb41cd8000c36c27757151 slugs=1 [tc-temp-miahigh-2026-10-03-lt86f][0m
+[1m2026-10-02T16:50:44.437495907Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-gte86lt87f (new)[0m
+[1m2026-10-02T16:50:44.437597064Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=15718f22248941d18b5cb18df3666386 slugs=1 [tc-temp-miahigh-2026-10-03-gte86lt87f][0m
+[1m2026-10-02T16:50:44.437613188Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-gte88lt89f (new)[0m
+[1m2026-10-02T16:50:44.453027913Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=2fe2d52bd70043abaaf520673d0528f2 slugs=1 [tc-temp-miahigh-2026-10-03-gte88lt89f][0m
+[1m2026-10-02T16:50:44.453031667Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-gte90lt91f (new)[0m
+[1m2026-10-02T16:50:44.453122462Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-3) sent MARKET_DATA subscribe: request_id=9576f768b4ea4cbba413bd8c92cbeecd slugs=1 [tc-temp-miahigh-2026-10-03-gte90lt91f][0m
+[1m2026-10-02T16:50:44.453126505Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-gte92lt93f (new)[0m
+[1m2026-10-02T16:50:44.523715774Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Order book for tc-temp-nychigh-2026-10-03-gte76f.POLYMARKET_US has an empty 'bids' side, so no two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated side IS still being recorded as depth, along with the venue state, mark price and settlement provenance. Reported once per instrument -- 8 refusal(s) across 8 instrument(s) so far. A payload malformed for any other reason is a different condition and is still reported at ERROR.[0m
+[1m2026-10-02T16:50:44.579966875Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: opened shard-4; shards=5 slugs per shard=10[0m
+[1m2026-10-02T16:50:44.580125853Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=e937d196059e4ae8aaf5103cdf4ae2b9 slugs=1 [tc-temp-miahigh-2026-10-03-gte92lt93f][0m
+[1m2026-10-02T16:50:44.580132506Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-miahigh-2026-10-03-gte94f (new)[0m
+[1m2026-10-02T16:50:44.591773552Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=7db132df38944904bb45fd17738164dc slugs=1 [tc-temp-miahigh-2026-10-03-gte94f][0m
+[1m2026-10-02T16:50:44.591778801Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-lt64f (new)[0m
+[1m2026-10-02T16:50:44.591897472Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=c949c737f10b46149f314cfa9587c5c2 slugs=1 [tc-temp-mdwhigh-2026-10-03-lt64f][0m
+[1m2026-10-02T16:50:44.591901903Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-gte64lt65f (new)[0m
+[1m2026-10-02T16:50:44.605282380Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=f980db8dc85e4ac79cccc04a3e111c6d slugs=1 [tc-temp-mdwhigh-2026-10-03-gte64lt65f][0m
+[1m2026-10-02T16:50:44.605287110Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-gte66lt67f (new)[0m
+[1m2026-10-02T16:50:44.605348046Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=ebab9b32aa5f49a0894d4d2b94af7ae5 slugs=1 [tc-temp-mdwhigh-2026-10-03-gte66lt67f][0m
+[1m2026-10-02T16:50:44.605351542Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-gte68lt69f (new)[0m
+[1m2026-10-02T16:50:44.607519750Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=297987a4a07441a0ac8dc7498ebbe794 slugs=1 [tc-temp-mdwhigh-2026-10-03-gte68lt69f][0m
+[1m2026-10-02T16:50:44.607523240Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-gte70lt71f (new)[0m
+[1m2026-10-02T16:50:44.612698357Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=c24ae75fde3d497786d204ce53a9d35b slugs=1 [tc-temp-mdwhigh-2026-10-03-gte70lt71f][0m
+[1m2026-10-02T16:50:44.612701595Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-mdwhigh-2026-10-03-gte72f (new)[0m
+[1m2026-10-02T16:50:44.617279051Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=50de3bdd87c8484f9302731791ea39c1 slugs=1 [tc-temp-mdwhigh-2026-10-03-gte72f][0m
+[1m2026-10-02T16:50:44.617282385Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-lt91f (new)[0m
+[1m2026-10-02T16:50:44.626504512Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=f2feacc613fa4cfc818606198bd11b75 slugs=1 [tc-temp-laxhigh-2026-10-03-lt91f][0m
+[1m2026-10-02T16:50:44.626510408Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-gte91lt92f (new)[0m
+[1m2026-10-02T16:50:44.634070193Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-4) sent MARKET_DATA subscribe: request_id=0911b99a6f6f4cb88eaee5d53be6898b slugs=1 [tc-temp-laxhigh-2026-10-03-gte91lt92f][0m
+[1m2026-10-02T16:50:44.634075954Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-gte93lt94f (new)[0m
+[1m2026-10-02T16:50:44.785376272Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket pool: opened shard-5; shards=6 slugs per shard=10[0m
+[1m2026-10-02T16:50:44.785511462Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=3655eda522774f67834ae3c4f2e9dadd slugs=1 [tc-temp-laxhigh-2026-10-03-gte93lt94f][0m
+[1m2026-10-02T16:50:44.785518089Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-gte95lt96f (new)[0m
+[1m2026-10-02T16:50:44.785609004Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=edff9d92edae406bb26636382a754230 slugs=1 [tc-temp-laxhigh-2026-10-03-gte95lt96f][0m
+[1m2026-10-02T16:50:44.785613607Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-gte97lt98f (new)[0m
+[1m2026-10-02T16:50:44.818921802Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=a8501de888284b1e8cace0fe1c5362bd slugs=1 [tc-temp-laxhigh-2026-10-03-gte97lt98f][0m
+[1m2026-10-02T16:50:44.818928445Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-laxhigh-2026-10-03-gte99f (new)[0m
+[1m2026-10-02T16:50:44.843821708Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=4351a920d308470dbfd165c4920fd8c4 slugs=1 [tc-temp-laxhigh-2026-10-03-gte99f][0m
+[1m2026-10-02T16:50:44.843842807Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-lt83f (new)[0m
+[1m2026-10-02T16:50:44.845582766Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=a398c01a6e8148fb93e131e3e0e382cd slugs=1 [tc-temp-sfohigh-2026-10-03-lt83f][0m
+[1m2026-10-02T16:50:44.845588712Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-gte83lt84f (new)[0m
+[1m2026-10-02T16:50:44.884204099Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=a3c87aec5bf64f51aad56960053d56b4 slugs=1 [tc-temp-sfohigh-2026-10-03-gte83lt84f][0m
+[1m2026-10-02T16:50:44.884213134Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-gte85lt86f (new)[0m
+[1m2026-10-02T16:50:44.885040136Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=85dd225634de4f788c44296fdb312bf4 slugs=1 [tc-temp-sfohigh-2026-10-03-gte85lt86f][0m
+[1m2026-10-02T16:50:44.885045690Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-gte87lt88f (new)[0m
+[1m2026-10-02T16:50:44.886812145Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=290377512b2e4760bd2ad42a17a5b188 slugs=1 [tc-temp-sfohigh-2026-10-03-gte87lt88f][0m
+[1m2026-10-02T16:50:44.886816786Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-gte89lt90f (new)[0m
+[1m2026-10-02T16:50:44.886907907Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=eb6649d388b4497e8927efde37c8331b slugs=1 [tc-temp-sfohigh-2026-10-03-gte89lt90f][0m
+[1m2026-10-02T16:50:44.886911432Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribing tc-temp-sfohigh-2026-10-03-gte91f (new)[0m
+[1m2026-10-02T16:50:44.888814041Z[0m [INFO] BREEZY-L001.POLYMARKET_US-ws: Polymarket.us markets websocket (shard-5) sent MARKET_DATA subscribe: request_id=3189f48435f74036b4a923922601bdef slugs=1 [tc-temp-sfohigh-2026-10-03-gte91f][0m
+[1m2026-10-02T16:50:44.888827148Z[0m [INFO] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery cycle initial: subscribed=('tc-temp-nychigh-2026-10-02-lt81f', 'tc-temp-nychigh-2026-10-02-gte81lt82f', 'tc-temp-nychigh-2026-10-02-gte83lt84f', 'tc-temp-nychigh-2026-10-02-gte85lt86f', 'tc-temp-nychigh-2026-10-02-gte87lt88f', 'tc-temp-nychigh-2026-10-02-gte89f', 'tc-temp-miahigh-2026-10-02-lt85f', 'tc-temp-miahigh-2026-10-02-gte85lt86f', 'tc-temp-miahigh-2026-10-02-gte87lt88f', 'tc-temp-miahigh-2026-10-02-gte89lt90f', 'tc-temp-miahigh-2026-10-02-gte91lt92f', 'tc-temp-miahigh-2026-10-02-gte93f', 'tc-temp-mdwhigh-2026-10-02-lt61f', 'tc-temp-mdwhigh-2026-10-02-gte61lt62f', 'tc-temp-mdwhigh-2026-10-02-gte63lt64f', 'tc-temp-mdwhigh-2026-10-02-gte65lt66f', 'tc-temp-mdwhigh-2026-10-02-gte67lt68f', 'tc-temp-mdwhigh-2026-10-02-gte69f', 'tc-temp-laxhigh-2026-10-02-lt85f', 'tc-temp-laxhigh-2026-10-02-gte85lt86f', 'tc-temp-laxhigh-2026-10-02-gte87lt88f', 'tc-temp-laxhigh-2026-10-02-gte89lt90f', 'tc-temp-laxhigh-2026-10-02-gte91lt92f', 'tc-temp-laxhigh-2026-10-02-gte93f', 'tc-temp-sfohigh-2026-10-02-lt77f', 'tc-temp-sfohigh-2026-10-02-gte77lt78f', 'tc-temp-sfohigh-2026-10-02-gte79lt80f', 'tc-temp-sfohigh-2026-10-02-gte81lt82f', 'tc-temp-sfohigh-2026-10-02-gte83lt84f', 'tc-temp-sfohigh-2026-10-02-gte85f', 'tc-temp-nychigh-2026-10-03-lt68f', 'tc-temp-nychigh-2026-10-03-gte68lt69f', 'tc-temp-nychigh-2026-10-03-gte70lt71f', 'tc-temp-nychigh-2026-10-03-gte72lt73f', 'tc-temp-nychigh-2026-10-03-gte74lt75f', 'tc-temp-nychigh-2026-10-03-gte76f', 'tc-temp-miahigh-2026-10-03-lt86f', 'tc-temp-miahigh-2026-10-03-gte86lt87f', 'tc-temp-miahigh-2026-10-03-gte88lt89f', 'tc-temp-miahigh-2026-10-03-gte90lt91f', 'tc-temp-miahigh-2026-10-03-gte92lt93f', 'tc-temp-miahigh-2026-10-03-gte94f', 'tc-temp-mdwhigh-2026-10-03-lt64f', 'tc-temp-mdwhigh-2026-10-03-gte64lt65f', 'tc-temp-mdwhigh-2026-10-03-gte66lt67f', 'tc-temp-mdwhigh-2026-10-03-gte68lt69f', 'tc-temp-mdwhigh-2026-10-03-gte70lt71f', 'tc-temp-mdwhigh-2026-10-03-gte72f', 'tc-temp-laxhigh-2026-10-03-lt91f', 'tc-temp-laxhigh-2026-10-03-gte91lt92f', 'tc-temp-laxhigh-2026-10-03-gte93lt94f', 'tc-temp-laxhigh-2026-10-03-gte95lt96f', 'tc-temp-laxhigh-2026-10-03-gte97lt98f', 'tc-temp-laxhigh-2026-10-03-gte99f', 'tc-temp-sfohigh-2026-10-03-lt83f', 'tc-temp-sfohigh-2026-10-03-gte83lt84f', 'tc-temp-sfohigh-2026-10-03-gte85lt86f', 'tc-temp-sfohigh-2026-10-03-gte87lt88f', 'tc-temp-sfohigh-2026-10-03-gte89lt90f', 'tc-temp-sfohigh-2026-10-03-gte91f') unsubscribed=() blocked_missing_cache=()[0m
+[1m2026-10-02T16:50:44.888936518Z[0m [1;33m[WARN] BREEZY-L001.DataClient-POLYMARKET_US: Polymarket.us discovery reload cadence clamped to the ceiling of 21600s; soonest upcoming venue boundary was 1791018000000000000 against clock 1790959844888933798. A stale or malformed market payload is the usual cause.[0m
+[1m2026-10-02T16:50:44.888962293Z[0m [92m[INFO] BREEZY-L001.DataClient-POLYMARKET_US: Connected[0m
+[1m2026-10-02T16:50:44.888982424Z[0m [94m[INFO] BREEZY-L001.TradingNode: Awaiting execution state reconciliation (30.0s timeout)...[0m
+[1m2026-10-02T16:50:44.956434700Z[0m [INFO] BREEZY-L001.ExecClient-POLYMARKET_US: durable reconciliation: order_reports=5 fill_reports=5 records_considered=5 gated_out=0 instrument_absent=0 refusals=0 refusals_positions_read_failed=0 refusals_record_venue_disagreement=0 refusals_fee_coefficient_ambiguous=0 refusals_durable_reports_build_failed=0[0m
+[1m2026-10-02T16:50:44.959323520Z[0m [94m[INFO] BREEZY-L001.ExecEngine: Reconciling ExecutionMassStatus for POLYMARKET_US[0m

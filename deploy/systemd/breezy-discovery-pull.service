@@ -28,8 +28,16 @@ WorkingDirectory=/home/jon/breezy
 # catalog/tape read. Deliberately NOT breezy-studies.slice and NOT
 # serialized behind breezy-studies.lock -- see deploy/systemd/README.md's
 # "Light-job exemption" paragraph, which this unit is added to.
-MemoryHigh=128M
-MemoryMax=256M
+#
+# AUT-6 WP3b (plan r15 section 3.8.1, G12): ceilings are SET FROM THE MEASURED
+# working set, never raised to fit a bad read. The redesigned read is bounded
+# (today's spawn only, 1 MiB chunks, DataClient-POLYMARKET_US records only):
+# measured peak process RSS 314,596 KiB (307 MiB; the nautilus/breezy imports
+# are ~299 MiB of it, the log read adds ~7.5 MiB), MemorySwapPeak owed at
+# activation. 1.5x = 460M -> MemoryHigh; 2x = 614M exceeds the 512M cap, so
+# MemoryMax is the cap. Evidence: docs/evidence/aut6/WP3b_discovery_pull_memory_2026-10-08.md
+MemoryHigh=460M
+MemoryMax=512M
 Nice=10
 UMask=0077
 
@@ -68,10 +76,15 @@ EnvironmentFile=-%h/.config/breezy/alerts.env
 # package, which is importable regardless of invocation style.
 ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.discovery_venue_pull --node-log-dir %h/.local/share/breezy/logs --out-dir /home/jon/breezy/data/evidence/discovery_set_equality --user-agent "${BREEZY_USER_AGENT}"
 
-# r2.1 Blocker B: the oneshot default of 90s would kill the up-to-~20-minute
-# poll (16:52Z start, 17:12Z deadline, plus pull wall time). 1800s (30 min)
-# covers the worst case with headroom.
-TimeoutStartSec=1800
+# r2.1 Blocker B / AUT-6 WP3b: the oneshot default of 90s is too short for
+# the poll plus the bounded round of venue GETs. The timer now fires AT the
+# 17:12Z deadline (the node's initial summary has been in its log since the
+# ~16:50Z spawn, so the first poll finds it), and 900s (15 min) covers the
+# pull wall time with headroom. TimeoutStopSec=5: nothing here needs a long
+# graceful stop (LOW-r11-9); worst end 17:12 + 60s accuracy + 900s + 5s =
+# 17:28:05Z. Not autonomy-owned, so the unit stays unwrapped (E-7a).
+TimeoutStartSec=900
+TimeoutStopSec=5
 
 # No Restart=. A missed run is not an incident on its own -- tomorrow's run
 # is a fresh day's evidence regardless. The timer's Persistent=true recovers

@@ -13,9 +13,9 @@ Two contracts:
   and that bound is strictly before the next supervisor fixed point (STOP 16:40, pre-launch
   16:45, LAUNCH 16:50, window close 17:00, release 17:10).
 
-One deployed timer overlaps today (``KNOWN_OVERLAP_TIMERS``). It is carried as a strict-xfail
-parameter owned by AUT-6 O-1, not exempted: ``[existing_units]`` still checks every other timer,
-and the carried parameter fails strict the moment its timer stops overlapping. Drop-ins under
+No deployed timer overlaps today: ``KNOWN_OVERLAP_TIMERS`` is empty since AUT-6 WP3b moved
+``breezy-discovery-pull`` to 17:12Z with ``TimeoutStartSec=900`` (its strict-xfail carry, owner
+AUT-6 O-1, was removed in that commit as its XPASS required). Drop-ins under
 ``<unit>.service.d`` and ``<unit>.timer.d`` are applied; an unparseable drop-in fails closed.
 
 The OnCalendar parser understands only the forms the repo uses (``*-*-* HH[,HH]:MM[:SS] UTC`` and
@@ -397,13 +397,13 @@ def deployed_launch_path_violations(directory: Path, units: frozenset[str]) -> l
 #: parameter asserts the timer does not overlap, so it XPASSes, fails strict, and forces its row and
 #: parameter out in the commit that fixes the deploy unit. It is a finding for the coordinator.
 #:
-#: * ``breezy-discovery-pull`` fires at 16:52 by design under its own "light-job exemption", but
-#:   ``TimeoutStartSec=1800`` runs it to about 17:22 and ARCH section 5.2 lists no such row.
+#: ``breezy-discovery-pull`` left this set when AUT-6 WP3b retimed it to 17:12Z
+#: (``TimeoutStartSec=900``, ``TimeoutStopSec=5``; worst end 17:28:05Z), clear of the window.
 #:
 #: ``breezy-quote-tape-ingest-frequent`` left this set when the O-1 deploy change (72eddbf6) removed
 #: its 16:30, 16:45 and 17:00 firings and bounded ``TimeoutStartSec`` to 780; it is now checked by
 #: ``[existing_units]`` like every other timer.
-KNOWN_OVERLAP_TIMERS: Final[tuple[str, ...]] = ("breezy-discovery-pull",)
+KNOWN_OVERLAP_TIMERS: Final[tuple[str, ...]] = ()
 KNOWN_OVERLAP_PARAM_PREFIX: Final = "known_overlap_"
 
 
@@ -416,13 +416,6 @@ KNOWN_OVERLAP_PARAM_PREFIX: Final = "known_overlap_"
     "unit_set",
     [
         "existing_units",
-        pytest.param(
-            "known_overlap_breezy-discovery-pull",
-            id="known_overlap_breezy-discovery-pull",
-            marks=pytest.mark.xfail(
-                strict=True, raises=OwnerPending, reason="AUT-6:O-1; blocks none"
-            ),
-        ),
     ],
 )
 def test_no_unit_overlaps_launch_window(unit_set: str) -> None:

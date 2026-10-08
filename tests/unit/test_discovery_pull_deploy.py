@@ -35,9 +35,10 @@ def test_unit_is_oneshot() -> None:
     assert "Type=oneshot" in lines
 
 
-def test_memory_max_is_at_most_256m() -> None:
+def test_memory_max_is_at_most_512m() -> None:
+    # AUT-6 WP3b: set from the measured working set; 512M is the plan's hard cap.
     lines = _directive(_SERVICE.read_text(), "MemoryMax")
-    assert lines == ["MemoryMax=256M"]
+    assert lines == ["MemoryMax=512M"]
 
 
 def test_never_takes_the_studies_flock_or_slice() -> None:
@@ -50,9 +51,9 @@ def test_never_takes_the_studies_flock_or_slice() -> None:
     assert "studies" not in exec_start[0]
 
 
-def test_timeout_start_sec_is_1800() -> None:
+def test_timeout_start_sec_is_900() -> None:
     lines = _directive(_SERVICE.read_text(), "TimeoutStartSec")
-    assert lines == ["TimeoutStartSec=1800"]
+    assert lines == ["TimeoutStartSec=900"]
 
 
 def test_protect_home_read_only_with_matching_read_write_path() -> None:
@@ -102,7 +103,7 @@ def test_unit_file_contains_no_email_address_on_any_line() -> None:
     assert offending == [], f"unit file hardcodes an email address: {offending!r}"
 
 
-def test_timer_fires_at_1652_utc_and_is_persistent() -> None:
+def test_timer_fires_at_1712_utc_and_is_persistent() -> None:
     lines = _directive_lines(_TIMER.read_text())
-    assert "OnCalendar=*-*-* 16:52:00 UTC" in lines
+    assert "OnCalendar=*-*-* 17:12:00 UTC" in lines
     assert "Persistent=true" in lines
