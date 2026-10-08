@@ -228,6 +228,7 @@ def test_successful_leg_records_zero_drops(tmp_path: Path) -> None:
     assert report.coverage_flushed == report.appended == 1
     assert report.coverage_dropped == 0
     assert report.to_dict()["coverage_stranded_sources"] == []
+    assert report.to_dict()["coverage_torn_journal_lines"] == 0
 
 
 def test_missing_coverage_batch_warns_once_per_run(caplog: pytest.LogCaptureFixture) -> None:
@@ -241,6 +242,65 @@ def test_missing_coverage_batch_warns_once_per_run(caplog: pytest.LogCaptureFixt
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "batch" in warnings[0].message.lower()
+
+
+def test_reingest_flush_failure_still_writes_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flush that raises on the way out must still leave the report and its counters."""
+    from breezy.persistence.us_source_revision_store import (
+        CoverageDrop,
+        RevisionStoreIntegrityError,
+        _BatchedCoverageCache,
+    )
+
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    (quarantine / "refusals.jsonl").write_text(
+        json.dumps(
+            {
+                "issued": None,
+                "raw_file": "ab.raw",
+                "reason": "unparsed",
+                "sha256": "ab",
+                "station": "KNYC",
+                "wfo": "OKX",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def boom(self: _BatchedCoverageCache) -> None:
+        self._batch_flushed = 2
+        self._batch_dropped.append(CoverageDrop("k" * 64, "csv_missing"))
+        self._batch_stranded.append(US_PFM_AFOS_SOURCE)
+        self._batch_torn = 1
+        raise RevisionStoreIntegrityError("injected flush failure")
+
+    monkeypatch.setattr(_BatchedCoverageCache, "flush_coverage", boom)
+    report_path = tmp_path / "report.json"
+    rc = bf.main(
+        [
+            "--archive-root",
+            str(tmp_path / "archive"),
+            "--reingest-quarantine",
+            str(quarantine),
+            "--apply",
+            "--report-json",
+            str(report_path),
+        ]
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert report["complete"] is False
+    assert report["error"] == "RevisionStoreIntegrityError: injected flush failure"
+    assert report["coverage_flushed"] == 2
+    assert report["coverage_dropped"] == 1
+    assert report["coverage_stranded_sources"] == [US_PFM_AFOS_SOURCE]
+    assert report["coverage_torn_journal_lines"] == 1
+    assert report["skipped"] == {"no_issuance": 1}
 
 
 def test_reingest_report_counts_a_stranded_journal_drop(tmp_path: Path) -> None:

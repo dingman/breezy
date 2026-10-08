@@ -17,6 +17,7 @@ import pytest
 from breezy.persistence import us_source_revision_store as store_module
 from breezy.persistence.archive_cache import MANIFEST_VERSION, ArchiveCache, CoverageEntry
 from breezy.persistence.us_source_request import (
+    US_LAV_IEM_SOURCE,
     lamp_live_request,
     normalised_request,
     pfm_afos_request,
@@ -839,3 +840,47 @@ def test_flush_result_counts_cadence_flushes_and_the_exit_flush(
     assert result.flushed == 5
     assert result.dropped == []
     assert result.stranded == []
+
+
+def test_corrupt_journal_does_not_fail_an_append_to_another_source(tmp_path: Path) -> None:
+    """Depth 0 replays only the source being opened. Source A's tear must not block B."""
+    store = _store(tmp_path)
+    corrupt = tmp_path / SOURCE
+    corrupt.mkdir()
+    (corrupt / "coverage.pending.jsonl").write_text("{not-json}\n{still-bad}\n", encoding="utf-8")
+    other = tmp_path / US_LAV_IEM_SOURCE
+    other.mkdir()
+    (other / "coverage.pending.jsonl").write_text("", encoding="utf-8")
+
+    result = store.append_if_new(
+        source=US_LAV_IEM_SOURCE,
+        station="KSFO",
+        run_ts_ns=RUN_TS,
+        model="LAV",
+        payload=V0,
+    )
+
+    assert result.outcome is AppendOutcome.APPENDED
+    assert (corrupt / "coverage.pending.jsonl").is_file()
+    with pytest.raises(store_module.RevisionStoreIntegrityError, match="corrupt"):
+        _append(store, V1)
+
+
+def test_torn_tail_then_append_parses_as_torn_plus_valid(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    journal = tmp_path / SOURCE / "coverage.pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_bytes(b'{"torn"')
+
+    with store.coverage_batch() as result:
+        assert _append_product(store, 0).outcome is AppendOutcome.APPENDED
+        entries, bad = store._cache._read_journal(SOURCE)
+        lines = journal.read_text(encoding="utf-8").splitlines()
+
+    assert bad == 1
+    assert len(entries) == 1
+    assert lines[0] == '{"torn"'
+    assert json.loads(lines[-1])["cache_key"] == next(iter(entries))
+    assert result.torn_journal_lines == 1
+    manifest = json.loads((tmp_path / SOURCE / "coverage.json").read_text(encoding="utf-8"))
+    assert next(iter(entries)) in manifest["entries"]

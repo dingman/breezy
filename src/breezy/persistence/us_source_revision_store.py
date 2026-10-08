@@ -74,6 +74,10 @@ COVERAGE_FLUSH_EVERY: Final[int] = 200
 #: Keys committed in a batch but not yet folded into coverage.json. Append-only,
 #: so another process can see them before this one releases collector.lock.
 _JOURNAL_NAME: Final[str] = "coverage.pending.jsonl"
+#: Marks the preceding journal line as a crash tear that was terminated so the
+#: next record would not be glued onto it. A bad line with a later line and no
+#: mark is still on-disk corruption.
+_TORN_MARK: Final[str] = "#coverage-torn"
 _SYMLINKED_LOCK_ERRNOS: Final[frozenset[int]] = frozenset({errno.ELOOP, errno.EMLINK})
 #: Non-blocking coverage-lock attempts before a flush leaves the journal in place.
 _COVERAGE_LOCK_ATTEMPTS: Final[int] = 10
@@ -144,6 +148,30 @@ class CoverageFlushResult:
     flushed: int = 0
     dropped: list[CoverageDrop] = field(default_factory=list)
     stranded: list[str] = field(default_factory=list)
+    torn_journal_lines: int = 0
+
+
+def _isolate_torn_tail(path: Path, fd: int) -> None:
+    """Terminate a crash-torn last line before the next record is appended.
+
+    The fragment stays its own line. The mark tells a later reader it is a tear,
+    not a corrupt line sitting in the middle of the journal. ``fd`` is write-only
+    (``O_APPEND``), so the last byte is read through ``path``.
+    """
+    end = path.stat().st_size
+    if end <= 0:
+        return
+    with path.open("rb") as handle:
+        handle.seek(end - 1)
+        if handle.read(1) == b"\n":
+            return
+    view = b"\n" + _TORN_MARK.encode("ascii") + b"\n"
+    while view:
+        wrote = os.write(fd, view)
+        if wrote <= 0:
+            raise OSError("short write isolating a torn coverage journal tail")
+        view = view[wrote:]
+    os.fsync(fd)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -183,6 +211,7 @@ class _BatchedCoverageCache(ArchiveCache):
         self._batch_flushed = 0
         self._batch_dropped: list[CoverageDrop] = []
         self._batch_stranded: list[str] = []
+        self._batch_torn = 0
 
     @contextlib.contextmanager
     def coverage_batch(self) -> Iterator[CoverageFlushResult]:
@@ -203,6 +232,7 @@ class _BatchedCoverageCache(ArchiveCache):
             self._batch_flushed = 0
             self._batch_dropped = []
             self._batch_stranded = []
+            self._batch_torn = 0
         outcome = CoverageFlushResult()
         pending: BaseException | None = None
         try:
@@ -225,6 +255,7 @@ class _BatchedCoverageCache(ArchiveCache):
                     outcome.flushed = self._batch_flushed
                     outcome.dropped = list(self._batch_dropped)
                     outcome.stranded = list(self._batch_stranded)
+                    outcome.torn_journal_lines = self._batch_torn
                 self._batch_depth -= 1
 
     def flush_coverage(self) -> CoverageFlushResult:
@@ -238,42 +269,61 @@ class _BatchedCoverageCache(ArchiveCache):
         total = CoverageFlushResult()
         hard: Exception | None = None
         for source in self._pending_sources():
-            fd: int | None = None
             try:
-                fd = self._acquire_coverage_lock(source)
-            except ArchiveCacheConcurrentWriterError:
-                logger.error(
-                    "coverage flush for %s gave up after %d attempts; journal left for replay",
-                    source,
-                    _COVERAGE_LOCK_ATTEMPTS,
-                )
-                total.stranded.append(source)
-                continue
-            try:
-                part = self._flush_source(source)
+                part = self._flush_locked(source)
             except Exception as exc:
                 logger.exception("coverage flush failed for %s; journal left for replay", source)
                 total.stranded.append(source)
                 if hard is None:
                     hard = exc
                 continue
-            else:
-                total.flushed += part.flushed
-                total.dropped.extend(part.dropped)
-            finally:
-                if fd is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
+            total.flushed += part.flushed
+            total.dropped.extend(part.dropped)
+            total.stranded.extend(part.stranded)
+            total.torn_journal_lines += part.torn_journal_lines
         self._tally(total)
         if hard is not None:
             raise hard
         return total
+
+    def _flush_locked(self, source: str) -> CoverageFlushResult:
+        """Replay one source. Lock exhaustion strands it and does not raise.
+
+        Any other error propagates with the coverage lock already released.
+        Acquire failures other than lock exhaustion propagate immediately.
+        """
+        try:
+            fd = self._acquire_coverage_lock(source)
+        except ArchiveCacheConcurrentWriterError:
+            logger.error(
+                "coverage flush for %s gave up after %d attempts; journal left for replay",
+                source,
+                _COVERAGE_LOCK_ATTEMPTS,
+            )
+            return CoverageFlushResult(stranded=[source])
+        try:
+            return self._flush_source(source)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _replay_journal(self, source: str) -> None:
+        """Depth 0: fold only ``source``. A sibling's journal is not this open's problem."""
+        if self._batch_depth != 0 or not self._has_journal(source):
+            return
+        try:
+            part = self._flush_locked(source)
+        except Exception:
+            logger.exception("coverage flush failed for %s; journal left for replay", source)
+            raise
+        self._tally(part)
 
     def _tally(self, part: CoverageFlushResult) -> None:
         if self._batch_depth <= 0:
             return
         self._batch_flushed += part.flushed
         self._batch_dropped.extend(part.dropped)
+        self._batch_torn += part.torn_journal_lines
         for source in part.stranded:
             if source not in self._batch_stranded:
                 self._batch_stranded.append(source)
@@ -294,9 +344,9 @@ class _BatchedCoverageCache(ArchiveCache):
 
     def _load_source(self, source: str) -> dict[str, CoverageEntry]:
         # A journal left by a crashed run is replayed before this source is trusted.
+        # Only this source: a corrupt sibling must not fail every collector.
         # An open batch owns its journal; flushing here would take the lock we hold.
-        if self._batch_depth == 0 and self._has_journal(source):
-            self.flush_coverage()
+        self._replay_journal(source)
         path = self._manifest_path(source)
         journal = self._journal_path(source)
         stamp = _manifest_stamp(path)
@@ -324,8 +374,7 @@ class _BatchedCoverageCache(ArchiveCache):
 
     def _commit_miss(self, request: ArchiveRequest, body: bytes) -> None:
         if self._batch_depth == 0:
-            if self._has_journal(request.source):
-                self.flush_coverage()
+            self._replay_journal(request.source)
             super()._commit_miss(request, body)
             self._stamp[request.source] = _manifest_stamp(self._manifest_path(request.source))
             self._journal_stamp[request.source] = _manifest_stamp(
@@ -396,10 +445,13 @@ class _BatchedCoverageCache(ArchiveCache):
         return entry
 
     def _read_journal(self, source: str) -> tuple[dict[str, CoverageEntry], int]:
-        """Journal entries plus the count of bad lines.
+        """Journal entries plus the count of torn lines.
 
         A bad trailing line (a crash tore the last append) is logged and counted.
-        A bad line with a later non-empty line is on-disk corruption and raises.
+        A bad line immediately followed by ``#coverage-torn`` was terminated on
+        purpose so the next record would not be glued to it; it is counted and
+        kept out of the corrupt-line path. Any other bad line with a later
+        non-empty line is on-disk corruption and raises.
         """
         path = self._journal_path(source)
         if not path.is_file() or path.is_symlink():
@@ -407,23 +459,42 @@ class _BatchedCoverageCache(ArchiveCache):
         lines = path.read_text(encoding="utf-8").splitlines()
         found: dict[str, CoverageEntry] = {}
         bad = 0
+        pending: int | None = None
         for index, line in enumerate(lines):
             if not line:
                 continue
-            entry = self._parse_journal_entry(line)
-            if entry is not None:
-                found[entry.cache_key] = entry
-                continue
-            bad += 1
-            if all(not later for later in lines[index + 1 :]):
+            if line == _TORN_MARK:
+                if pending is None:
+                    raise RevisionStoreIntegrityError(
+                        f"coverage journal tear mark without a torn line for {source}"
+                    )
+                bad += 1
                 logger.warning(
-                    "coverage journal %s: torn trailing line tolerated (bad_lines=%d)",
+                    "coverage journal %s: torn line isolated (bad_lines=%d)",
                     source,
                     bad,
                 )
+                pending = None
                 continue
-            raise RevisionStoreIntegrityError(
-                f"corrupt coverage journal line {index + 1} for {source}"
+            entry = self._parse_journal_entry(line)
+            if entry is not None:
+                if pending is not None:
+                    raise RevisionStoreIntegrityError(
+                        f"corrupt coverage journal line {pending + 1} for {source}"
+                    )
+                found[entry.cache_key] = entry
+                continue
+            if pending is not None:
+                raise RevisionStoreIntegrityError(
+                    f"corrupt coverage journal line {pending + 1} for {source}"
+                )
+            pending = index
+        if pending is not None:
+            bad += 1
+            logger.warning(
+                "coverage journal %s: torn trailing line tolerated (bad_lines=%d)",
+                source,
+                bad,
             )
         return found, bad
 
@@ -447,6 +518,7 @@ class _BatchedCoverageCache(ArchiveCache):
             + b"\n"
         )
         try:
+            _isolate_torn_tail(path, fd)
             view = line
             while view:
                 wrote = os.write(fd, view)
@@ -489,8 +561,8 @@ class _BatchedCoverageCache(ArchiveCache):
         dropped, not published, when the csv is missing or its digest differs.
         The journal is removed only when every parsed key was published or dropped.
         """
-        pending, _bad = self._read_journal(source)
-        result = CoverageFlushResult()
+        pending, bad = self._read_journal(source)
+        result = CoverageFlushResult(torn_journal_lines=bad)
         path = self._manifest_path(source)
         base = self._read_manifest(path)
         published = dict(base)

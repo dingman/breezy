@@ -282,6 +282,7 @@ class LegReport:
     coverage_flushed: int = 0
     coverage_dropped: int = 0
     coverage_stranded_sources: tuple[str, ...] = ()
+    coverage_torn_journal_lines: int = 0
 
     @property
     def refused_total(self) -> int:
@@ -305,6 +306,7 @@ class LegReport:
             "coverage_flushed": self.coverage_flushed,
             "coverage_dropped": self.coverage_dropped,
             "coverage_stranded_sources": list(self.coverage_stranded_sources),
+            "coverage_torn_journal_lines": self.coverage_torn_journal_lines,
         }
 
 
@@ -654,6 +656,7 @@ def _record_coverage(report: LegReport, outcome: Any) -> None:
     report.coverage_flushed = int(outcome.flushed)
     report.coverage_dropped = len(outcome.dropped)
     report.coverage_stranded_sources = tuple(outcome.stranded)
+    report.coverage_torn_journal_lines = int(outcome.torn_journal_lines)
     uncovered = report.coverage_dropped or report.coverage_stranded_sources
     if report.status == "complete" and uncovered:
         report.status = "coverage_incomplete"
