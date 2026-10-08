@@ -33,8 +33,12 @@ _UNIT_RE = re.compile(r"^Unit=(.+)$")
 #: Timers that are periodic by design with no sibling timer of their unit: AUT-6 WP1's alert
 #: redeliver fires at minutes 3, 8, ..., 58 (`OnCalendar=*:03/5`, plan r15 section 3.10). Its
 #: launch-window behaviour is judged by `test_launch_window_table.py`, not by the HH:MM model.
-#: Widened by exactly this one reviewed name.
-_SLOT_PERIODIC_TIMERS = frozenset({"breezy-autonomy-alert-redeliver.timer"})
+#: AUT-6 WP2's canary fires hourly at :45 plus 16:30Z and 17:10Z (plan r15 sections 3.7 and 3.10);
+#: its 17:10Z firing is the plan's, and shares that tick with the US-source collector's 17:10Z
+#: firing of a different service. Widened by exactly these two reviewed names.
+_SLOT_PERIODIC_TIMERS = frozenset(
+    {"breezy-autonomy-alert-redeliver.timer", "breezy-autonomy-canary.timer"}
+)
 
 
 def _timer_unit(timer_path: Path) -> str | None:

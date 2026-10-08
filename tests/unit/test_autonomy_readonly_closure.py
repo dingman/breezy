@@ -46,6 +46,7 @@ _OUTBOX_WRITE_SCOPES: Final[tuple[str, ...]] = (
     "AlertOutbox.restamp",
     "AlertOutbox.complete",
     "AlertOutbox.quarantine",
+    "write_armed_marker",  # AUT-6 WP2: the write-once arming marker (via _publish)
 )
 
 #: The WP1 modules the closure lint judges, with the minimum call sites each must hold.
@@ -55,6 +56,7 @@ AUT6_WP1_ROWS: Final[tuple[AuthorityRow, ...]] = (
     AuthorityRow("breezy.runtime.alert_drain", min_calls=32),
     AuthorityRow("breezy.runtime.alert_delivery", min_calls=12),
     AuthorityRow("breezy.runtime.alert_redeliver_cli", min_calls=22),
+    AuthorityRow("breezy.runtime.autonomy_canary_cli", min_calls=70),
     AuthorityRow("breezy.runtime.check_alerts_cli", min_calls=24),
     AuthorityRow("breezy.persistence.autonomy.detector_catalog", min_calls=8),
 )
@@ -65,6 +67,12 @@ AUT6_ENTRY_MODULES: Final[dict[str, tuple[str, ...]]] = {
         "breezy.runtime.alert_redeliver_cli",
         "breezy.runtime.alert_delivery",
         "breezy.runtime.alert_drain",
+        "breezy.runtime.alert_proof",
+        _OUTBOX,
+    ),
+    "breezy-autonomy-canary": (
+        "breezy.runtime.autonomy_canary_cli",
+        "breezy.runtime.alert_delivery",
         "breezy.runtime.alert_proof",
         _OUTBOX,
     ),
@@ -250,6 +258,7 @@ _NON_WRITER_FILES: Final[tuple[str, ...]] = (
     "breezy.runtime.alert_drain",
     "breezy.runtime.alert_delivery",
     "breezy.runtime.alert_redeliver_cli",
+    "breezy.runtime.autonomy_canary_cli",
     "breezy.runtime.check_alerts_cli",
     "breezy.persistence.autonomy.detector_catalog",
 )

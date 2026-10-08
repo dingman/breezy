@@ -24,7 +24,7 @@ from tests.support.bwrap_harness import CHILD_ROOTS_PRELUDE, make_roots, roots_j
 
 pytestmark = pytest.mark.bwrap_host
 
-AUT6_ROWS: Final[tuple[str, ...]] = ("breezy-autonomy-alert-redeliver",)
+AUT6_ROWS: Final[tuple[str, ...]] = ("breezy-autonomy-alert-redeliver", "breezy-autonomy-canary")
 PRIVATE: Final = 0o700
 PROBE_DIR: Final = ".bwrap_probe"
 

@@ -228,6 +228,14 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "after its delivered record was written",
         "write_once",
     ),
+    # AUT-6 WP2 (plan r15 section 3.7.1, F1): the write-once arming marker. Published by
+    # alert_outbox.write_armed_marker (mkstemp, fsync, os.link at 0444; EEXIST is success).
+    FileWriter(
+        "evidence/alerts/armed.json",
+        "breezy-autonomy-canary only, after its first delivered canary record, through "
+        "alert_outbox.write_armed_marker; never rewritten and never deleted by any code",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "

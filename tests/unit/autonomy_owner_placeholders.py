@@ -234,13 +234,8 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         [],
         "test_try_submit_latency_independent_of_webhook_latency",
     ),
-    *_group(
-        "AUT-6",
-        "breezy.runtime.autonomy_canary_cli:main",
-        [],
-        "test_alerts_undeliverable_veto",
-        "test_alerts_undeliverable_reads_two_days",
-    ),
+    # AUT-6 WP2 delivered the canary CLI and ``AlertsUndeliverableDetector``; its two ARCH-named
+    # tests now live in ``test_autonomy_node_detectors.py``.
     *_group(
         "AUT-6",
         "breezy.runtime.autonomy_producer_intraday_cli:main",

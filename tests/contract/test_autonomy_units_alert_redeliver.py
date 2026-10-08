@@ -153,7 +153,11 @@ def test_deploy_units_config_lint_reports_only_the_x3_gap() -> None:
     """X-3: the notifier row does not exist yet, so its scope error is the one recorded gap."""
     assert SERVICE.is_file() and TIMER.is_file()
     errors = lint_units(DEPLOY_SYSTEMD_DIR, AUTONOMY_BWRAP_TABLE)
-    assert [(e.unit, e.rule) for e in errors] == [(f"{UNIT}.service", "onfailure_scope")]
+    # AUT-6 WP2 widens the recorded gap by exactly one reviewed row: the canary unit.
+    assert [(e.unit, e.rule) for e in errors] == [
+        (f"{UNIT}.service", "onfailure_scope"),
+        ("breezy-autonomy-canary.service", "onfailure_scope"),
+    ]
 
 
 # -- the rules AUT-6 holds over every unit it owns ------------------------------------------------

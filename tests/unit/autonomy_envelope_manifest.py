@@ -42,8 +42,8 @@ E11_RENAMES: Final[Mapping[str, str]] = MappingProxyType(
 
 ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
     {
-        "tests/unit/test_autonomy_cross_area.py::test_alerts_undeliverable_reads_two_days",
-        "tests/unit/test_autonomy_cross_area.py::test_alerts_undeliverable_veto",
+        "tests/unit/test_autonomy_node_detectors.py::test_alerts_undeliverable_reads_two_days",
+        "tests/unit/test_autonomy_node_detectors.py::test_alerts_undeliverable_veto",
         "tests/unit/test_autonomy_cross_area.py::test_alpha_index_never_resets",
         "tests/unit/test_autonomy_cross_area.py::test_ambiguous_intent_cancels_swap_not_incumbent_launch",
         "tests/unit/test_autonomy_cross_area.py::test_attest_expiry_and_chain_staleness_veto_entries",

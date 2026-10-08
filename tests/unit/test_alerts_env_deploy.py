@@ -68,6 +68,7 @@ _ALERTS_IN_PROCESS = frozenset(
         "breezy-family-tally@.service",
         "breezy-hypothesis-triage.service",
         "breezy-autonomy-alert-redeliver.service",
+        "breezy-autonomy-canary.service",
     }
 )
 

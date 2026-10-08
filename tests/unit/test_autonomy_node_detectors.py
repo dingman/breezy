@@ -1,4 +1,5 @@
 """AUT-6 WP5: ``PermitLapsedDetector`` (NODE_LOCAL #4; plan r15 sections 3.2 and 3.3.2).
+AUT-6 WP2 adds ``AlertsUndeliverableDetector`` (NODE_LOCAL #5; sections 3.2 and 3.7.1) below.
 
 The detector is handed an integer expiry (``read_expiry_ns``) at composition. It judges
 ``now_ns > expiry`` and never holds, reads or constructs the permit object that authorises orders.
@@ -18,7 +19,8 @@ from breezy.persistence.autonomy.pins import WATCH_TICK_STALE_S
 from breezy.persistence.autonomy.plugin import Detector, DetectorKind, PluginRefused
 from breezy.persistence.autonomy.veto import VetoReason
 from breezy.runtime import autonomy_node_detectors
-from breezy.runtime.autonomy_node_detectors import PermitLapsedDetector
+from breezy.runtime.alert_outbox import DeliveryRecordWriter, write_armed_marker
+from breezy.runtime.autonomy_node_detectors import AlertsUndeliverableDetector, PermitLapsedDetector
 
 _NS: Final = 1_000_000_000
 
@@ -257,3 +259,234 @@ def test_persistent_unknown_pages_once_recovers_then_repages_once() -> None:
         "aut6_detector_unknown_persistent",
     )
     assert detector.observe(t0 + 900 * _NS).page_event is None
+
+
+# ---------------------------------------------------------------------------------------------
+# AUT-6 WP2: AlertsUndeliverableDetector (NODE_LOCAL #5)
+# ---------------------------------------------------------------------------------------------
+
+_HOUR: Final = 3600 * _NS
+_NOW: Final = _ns(2026, 10, 9, 18, 0)
+
+
+def _record(
+    root: Path,
+    at_ns: int,
+    *,
+    delivered: bool = True,
+    kind: str = "canary",
+    severity: str = "INFO",
+    drill: bool = False,
+    writer: str = "canary",
+) -> None:
+    DeliveryRecordWriter(root).write(
+        event="autonomy_canary",
+        ts_ns=at_ns,
+        writer=writer,
+        delivered=delivered,
+        status_class="2xx" if delivered else "5xx",
+        severity=severity,
+        attempt_kind=kind,
+        drill=drill,
+        site="global",
+        outbox_entry="",
+    )
+
+
+def _arm(root: Path, at_ns: int = _NOW - 40 * _HOUR) -> None:
+    write_armed_marker(root, record="x_canary_d.json", ts_ns=at_ns)
+
+
+def test_alerts_undeliverable_veto(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    assert detector.id == "alerts_undeliverable"
+    assert detector.kind is DetectorKind.NODE_LOCAL
+    _record(tmp_path, _NOW - 27 * _HOUR)
+    stale = detector.observe(_NOW)
+    assert (stale.state, stale.veto, stale.page_event) == (
+        "DISAGREE",
+        VetoReason.ALERTS_UNDELIVERABLE,
+        "alerts_undeliverable",
+    )
+    assert detector.evaluate(_NOW) is VetoReason.ALERTS_UNDELIVERABLE
+    fresh = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    _record(tmp_path, _NOW - 2 * _HOUR)
+    assert fresh.observe(_NOW).veto is None
+    assert fresh.evaluate(_NOW) is None
+
+
+def test_alerts_undeliverable_reads_two_days(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    # yesterday's directory is read
+    _record(tmp_path, _ns(2026, 10, 8, 19, 0))
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is None
+    # two days back is not
+    other = tmp_path / "other"
+    other.mkdir()
+    _arm(other)
+    _record(other, _ns(2026, 10, 7, 23, 0))
+    assert AlertsUndeliverableDetector(alerts_root=other).evaluate(_NOW) is (
+        VetoReason.ALERTS_UNDELIVERABLE
+    )
+
+
+def test_alerts_undeliverable_counts_canary_or_critical_only(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    _record(tmp_path, _NOW - 3 * _HOUR, kind="alert", severity="INFO")
+    _record(tmp_path, _NOW - 2 * _HOUR, kind="canary", delivered=False)
+    _record(tmp_path, _NOW - 1 * _HOUR, kind="retry", severity="WARN")
+    stale_only = _NOW - 30 * _HOUR
+    _record(tmp_path, stale_only, kind="canary")
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is (
+        VetoReason.ALERTS_UNDELIVERABLE
+    )
+    _record(tmp_path, _NOW - 4 * _HOUR, kind="alert", severity="CRITICAL")
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is None
+
+
+def test_alerts_undeliverable_ignores_warn_and_info_records(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    for kind in ("alert", "retry", "drain"):
+        _record(tmp_path, _NOW - 1 * _HOUR, kind=kind, severity="WARN")
+        _record(tmp_path, _NOW - 1 * _HOUR, kind=kind, severity="INFO")
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is (
+        VetoReason.ALERTS_UNDELIVERABLE
+    )
+
+
+def test_alerts_undeliverable_counts_delivered_drill_critical(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    _record(tmp_path, _NOW - 1 * _HOUR, kind="alert", severity="CRITICAL", drill=True)
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is None
+    other = tmp_path / "o"
+    other.mkdir()
+    _arm(other)
+    _record(other, _NOW - 1 * _HOUR, kind="canary", drill=True)
+    assert AlertsUndeliverableDetector(alerts_root=other).evaluate(_NOW) is None
+
+
+def test_one_failed_canary_does_not_veto_next_window(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    _record(tmp_path, _ns(2026, 10, 9, 15, 45), delivered=True)
+    _record(tmp_path, _ns(2026, 10, 9, 16, 45), delivered=False)
+    for hour in (17, 20, 23):
+        assert (
+            AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_ns(2026, 10, 9, hour, 10))
+            is None
+        )
+
+
+def test_veto_arithmetic_worst_case_lands_1845z_inside_window(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    _record(tmp_path, _ns(2026, 10, 8, 16, 45))  # D-1 16:45 is the newest delivered record
+    window_start = _ns(2026, 10, 9, 17, 10)
+    just_before = _ns(2026, 10, 9, 18, 44, 59)
+    at_limit = _ns(2026, 10, 9, 18, 45)
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(window_start) is None
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(just_before) is None
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(at_limit) is (
+        VetoReason.ALERTS_UNDELIVERABLE
+    )
+    assert window_start < at_limit < _ns(2026, 10, 10, 1, 0)
+
+
+def test_alerts_undeliverable_unarmed_before_first_delivery(tmp_path: Path) -> None:
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    assert (detector.observe(_NOW).state, detector.observe(_NOW).veto) == ("AGREE", None)
+    _record(tmp_path, _NOW - 40 * _HOUR)  # a stale record but no marker: still unarmed
+    unarmed = AlertsUndeliverableDetector(alerts_root=tmp_path).observe(_NOW)
+    assert (unarmed.state, unarmed.detail, unarmed.veto, unarmed.page_event) == (
+        "AGREE",
+        "unarmed",
+        None,
+        None,
+    )
+
+
+def test_armed_marker_survives_three_day_gap_and_vetoes(tmp_path: Path) -> None:
+    _arm(tmp_path, _NOW - 100 * _HOUR)
+    assert not list(tmp_path.glob("????-??-??"))  # no dated directory at all
+    gap = AlertsUndeliverableDetector(alerts_root=tmp_path).observe(_NOW)
+    assert (gap.state, gap.veto) == ("DISAGREE", VetoReason.ALERTS_UNDELIVERABLE)
+
+
+def test_armed_marker_enoent_unarmed_other_error_unknown(tmp_path: Path) -> None:
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    assert detector.observe(_NOW).detail == "unarmed"
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "armed.json").mkdir()  # not a regular file: a read error, not ENOENT
+    bad = AlertsUndeliverableDetector(alerts_root=broken)
+    first = bad.observe(_NOW)
+    assert (first.state, first.veto, first.page_event) == ("UNKNOWN", None, None)
+    assert bad.observe(_NOW + WATCH_TICK_STALE_S * _NS).veto is None
+    persistent = bad.observe(_NOW + WATCH_TICK_STALE_S * _NS + 1)
+    assert (persistent.state, persistent.veto, persistent.page_event) == (
+        "UNKNOWN",
+        VetoReason.ALERTS_UNDELIVERABLE,
+        "aut6_detector_unknown_persistent",
+    )
+    (broken / "armed.json").rmdir()
+    (broken / "armed.json").write_text("not json")  # garbage content is also not ENOENT
+    garbage = AlertsUndeliverableDetector(alerts_root=broken).observe(_NOW)
+    assert garbage.state == "UNKNOWN"
+
+
+def test_node_local_unknown_vetoes_after_watch_tick_stale(tmp_path: Path) -> None:
+    (tmp_path / "armed.json").write_text("{")
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    assert detector.observe(_NOW).veto is None
+    assert detector.observe(_NOW + 181 * _NS).veto is VetoReason.ALERTS_UNDELIVERABLE
+
+
+def test_alerts_undeliverable_clears_on_next_2xx(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    assert detector.observe(_NOW).veto is VetoReason.ALERTS_UNDELIVERABLE
+    assert detector.observe(_NOW + 60 * _NS).page_event is None  # one page per transition
+    _record(tmp_path, _NOW + 100 * _NS, kind="canary")
+    # the listing is cached for 600 s, so the new record is not seen yet
+    assert detector.observe(_NOW + 300 * _NS).veto is VetoReason.ALERTS_UNDELIVERABLE
+    cleared = detector.observe(_NOW + 601 * _NS)
+    assert (cleared.state, cleared.veto) == ("AGREE", None)
+
+
+def test_alerts_undeliverable_ignores_non_record_files(tmp_path: Path) -> None:
+    _arm(tmp_path)
+    day = tmp_path / "2026-10-09"
+    day.mkdir()
+    (day / f"{_NOW - _HOUR}_canary_d.json.partial").write_text("{}")
+    (day / f"heartbeat_{_NOW}.json").write_text('{"delivered": true, "attempt_kind": "canary"}')
+    (day / "notes.txt").write_text("x")
+    (day / f"{_NOW - _HOUR}_canary_d.json").symlink_to(tmp_path / "armed.json")
+    assert AlertsUndeliverableDetector(alerts_root=tmp_path).evaluate(_NOW) is (
+        VetoReason.ALERTS_UNDELIVERABLE
+    )
+
+
+def test_detector_never_raises(tmp_path: Path) -> None:
+    """L-16: garbage records, a missing root and a file for a directory are observations."""
+    _arm(tmp_path)
+    day = tmp_path / "2026-10-09"
+    day.mkdir()
+    (day / f"{_NOW - _HOUR}_canary_d.json").write_text("not json")
+    (day / f"{_NOW - _HOUR + 1}_canary_d.json").write_text("[1, 2]")
+    (day / f"{_NOW - _HOUR + 2}_canary_d.json").write_bytes(b"{" + b" " * 100_000 + b"}")
+    (tmp_path / "2026-10-08").write_text("a file, not a directory")
+    detector = AlertsUndeliverableDetector(alerts_root=tmp_path)
+    observation = detector.observe(_NOW)
+    assert observation.veto is VetoReason.ALERTS_UNDELIVERABLE
+    missing = AlertsUndeliverableDetector(alerts_root=tmp_path / "nope")
+    assert missing.observe(_NOW).state == "AGREE"
+    file_root = tmp_path / "afile"
+    file_root.write_text("x")
+    assert AlertsUndeliverableDetector(alerts_root=file_root).observe(_NOW).state in {
+        "AGREE",
+        "UNKNOWN",
+    }
+
+
+def test_alerts_undeliverable_detector_satisfies_the_c6_detector_protocol() -> None:
+    detector: Detector = AlertsUndeliverableDetector(alerts_root=Path("/nonexistent"))
+    assert detector.id == "alerts_undeliverable" and detector.kind is DetectorKind.NODE_LOCAL

@@ -51,6 +51,11 @@ AUT6_SELF_PROBE_PATHS: Final[MappingProxyType[str, SelfProbe]] = MappingProxyTyp
             negative=("state", "registry", "evidence"),
             positive=("evidence/alerts/.bwrap_probe",),
         ),
+        # AUT-6 WP2: the canary row binds the same single directory as the redeliver row.
+        "breezy-autonomy-canary": SelfProbe(
+            negative=("state", "registry", "evidence"),
+            positive=("evidence/alerts/.bwrap_probe",),
+        ),
     }
 )
 
@@ -75,9 +80,11 @@ AUT6_WRITE_AUTHORITY: Final[MappingProxyType[str, AuthorityRow]] = MappingProxyT
         # the shared self-probe code: only the probe files named in AUT6_SELF_PROBE_PATHS
         "bwrap-self-probe": AuthorityRow(
             tuple(
-                rel + "/" + _PROBE_FILE
-                for probe in AUT6_SELF_PROBE_PATHS.values()
-                for rel in (*probe.negative, *probe.positive)
+                dict.fromkeys(  # rows share their negatives: one authority entry per path
+                    rel + "/" + _PROBE_FILE
+                    for probe in AUT6_SELF_PROBE_PATHS.values()
+                    for rel in (*probe.negative, *probe.positive)
+                )
             )
         ),
         "breezy-autonomy-failed@": AuthorityRow((_ALERTS,)),
@@ -89,6 +96,7 @@ AUT6_WRITE_AUTHORITY: Final[MappingProxyType[str, AuthorityRow]] = MappingProxyT
 AUT6_LINT_MIN_JUDGED_SITES: Final[MappingProxyType[str, int]] = MappingProxyType(
     {
         "breezy-autonomy-alert-redeliver": 170,
+        "breezy-autonomy-canary": 180,
         "breezy-check-alerts": 140,
         "node-sinks": 110,
     }
