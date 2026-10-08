@@ -1,11 +1,15 @@
-"""YES-first shrunk variance for an overround station-day (r2 §4.2, r3 §4.2).
+"""YES-first shrunk variance for an overround station-day (r2 §4.2, errata E-1).
 
 Feasible days (Σ q ≤ 1) do not use this arithmetic: ``bundle_variance``
 calls ``combine_station_day`` and returns that variance unchanged.
+
+An all-YES overround day reserves m0 = Π(1 − q_i) for the outcome outside
+every touched rung. Mixed overround days keep outside mass 0.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, NoReturn
@@ -22,12 +26,13 @@ Side = Literal["yes", "no"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ShrunkJoint:
-    """YES-first shrink of an overround day (r2 §4.2)."""
+    """YES-first shrink of an overround day. ``residual_mass`` is the outside outcome."""
 
     kappa: float
     masses: tuple[float, ...]
     variance: float
     drifts: tuple[float, ...]
+    residual_mass: float
 
 
 def shrunk_joint(rows: Sequence[StratumRow]) -> ShrunkJoint:
@@ -44,12 +49,37 @@ def shrunk_joint(rows: Sequence[StratumRow]) -> ShrunkJoint:
         raise ValueError("shrunk joint is only defined when sum q > 1")
     # ΣNO ≤ 1 (refused above) and Σq > 1 imply ΣYES = Σq − ΣNO > 0, so a
     # "no YES mass" refusal is unreachable and is not a branch here.
-    kappa = (1.0 - sum_no) / sum_yes
+    # All-YES overround reserves m0 for the outside rung. Mixed days do not.
+    if sum_no == 0.0:
+        residual = math.prod(1.0 - q for q in parts.qs)
+        kappa = (1.0 - residual) / sum_yes
+    else:
+        residual = 0.0
+        kappa = (1.0 - sum_no) / sum_yes
     masses = tuple(
         kappa * q if side == "yes" else q for q, side in zip(parts.qs, parts.sides, strict=True)
     )
     variance, drifts = _enumerate(parts.bes, parts.sides, masses)
-    return ShrunkJoint(kappa=kappa, masses=masses, variance=variance, drifts=drifts)
+    return ShrunkJoint(
+        kappa=kappa,
+        masses=masses,
+        variance=variance,
+        drifts=drifts,
+        residual_mass=residual,
+    )
+
+
+def mixed_overround_kappa(qs: Sequence[float], sides: Sequence[str]) -> float | None:
+    """κ' for a mixed overround day (S7). None when the day is not that case.
+
+    A negative value means Σ_NO + m0' > 1, and the S7 row skips the day.
+    """
+    sum_no = sum(q for q, side in zip(qs, sides, strict=True) if side == "no")
+    sum_yes = sum(q for q, side in zip(qs, sides, strict=True) if side == "yes")
+    if sum_no <= 0.0 or sum_yes <= 0.0 or sum_no + sum_yes <= 1.0:
+        return None
+    outside = max(0.0, math.prod(1.0 - q for q in qs))
+    return (1.0 - sum_no - outside) / sum_yes
 
 
 def bundle_variance(rows: Sequence[StratumRow]) -> float:
