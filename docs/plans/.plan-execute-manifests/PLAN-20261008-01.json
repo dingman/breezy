@@ -9,19 +9,119 @@
     "LESSONS.md >30 KB volume gate not acted on: binding-rule consolidation is out of scope for a resume run"
   ],
   "items": [
-    {"id": "PLAN-20261008-01-01", "title": "LOT PFM offline re-ingest (dry-run then apply)", "source_anchor": "3-data-jobs-at-halt", "depends_on": [], "status": "in_progress"},
-    {"id": "PLAN-20261008-01-02", "title": "PFM history resume until every WFO complete", "source_anchor": "3-data-jobs-at-halt", "depends_on": ["PLAN-20261008-01-01"], "status": "in_progress"},
-    {"id": "PLAN-20261008-01-03", "title": "GFS MOS archive incl. KNYC (after PFM history)", "source_anchor": "3-data-jobs-at-halt", "depends_on": ["PLAN-20261008-01-02"], "status": "backlog"},
-    {"id": "PLAN-20261008-01-04", "title": "C1-R4: _check_c1 counts by the five pin keys", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "in_progress"},
-    {"id": "PLAN-20261008-01-05", "title": "Full-history --draft-scratch smoke build on nbp5", "source_anchor": "4-next-work-in-priority-order", "depends_on": ["PLAN-20261008-01-03", "PLAN-20261008-01-04"], "status": "backlog"},
-    {"id": "PLAN-20261008-01-06", "title": "Derive source_breaks from archive + provenance (PIN-R7)", "source_anchor": "4-next-work-in-priority-order", "depends_on": ["PLAN-20261008-01-03"], "status": "backlog"},
-    {"id": "PLAN-20261008-01-07", "title": "C1 lag evidence + source_lags_ns + freeze commit (>= 2026-10-21)", "source_anchor": "4-next-work-in-priority-order", "depends_on": ["PLAN-20261008-01-04", "PLAN-20261008-01-06"], "status": "gated_date"},
-    {"id": "PLAN-20261008-01-08", "title": "Scored primary pair + lag twin, stages A-C (after freeze)", "source_anchor": "4-next-work-in-priority-order", "depends_on": ["PLAN-20261008-01-07"], "status": "gated"},
-    {"id": "PLAN-20261008-01-09", "title": "PFM: duplicate MAX date in a table raises duplicate_day; CDT docstring", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "in_progress"},
-    {"id": "PLAN-20261008-01-10", "title": "Spot-check LOT 2021-24 MAX vs CLI highs", "source_anchor": "4-next-work-in-priority-order", "depends_on": ["PLAN-20261008-01-01"], "status": "backlog"},
-    {"id": "PLAN-20261008-01-11", "title": "F6b loss-stop producer", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "blocked_f5_floor_and_aut6"},
-    {"id": "PLAN-20261008-01-12", "title": "F5 pin request via prereg amendment + peer review", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "backlog"},
-    {"id": "PLAN-20261008-01-13", "title": "AUT-6 activation", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "backlog_autonomy_queue"},
-    {"id": "PLAN-20261008-01-14", "title": "M1-v3 single read", "source_anchor": "4-next-work-in-priority-order", "depends_on": [], "status": "gated_date_2026-12-07"}
+    {
+      "id": "PLAN-20261008-01-01",
+      "title": "LOT PFM offline re-ingest (dry-run then apply)",
+      "source_anchor": "3-data-jobs-at-halt",
+      "depends_on": [],
+      "status": "done (LOT re-ingest applied; spot-check OK 98ef56c6)"
+    },
+    {
+      "id": "PLAN-20261008-01-02",
+      "title": "PFM history resume until every WFO complete",
+      "source_anchor": "3-data-jobs-at-halt",
+      "depends_on": [
+        "PLAN-20261008-01-01"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "PLAN-20261008-01-03",
+      "title": "GFS MOS archive incl. KNYC (after PFM history)",
+      "source_anchor": "3-data-jobs-at-halt",
+      "depends_on": [
+        "PLAN-20261008-01-02"
+      ],
+      "status": "backlog"
+    },
+    {
+      "id": "PLAN-20261008-01-04",
+      "title": "C1-R4: _check_c1 counts by the five pin keys",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "done (6acf4eee + 35334029)"
+    },
+    {
+      "id": "PLAN-20261008-01-05",
+      "title": "Full-history --draft-scratch smoke build on nbp5",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [
+        "PLAN-20261008-01-03",
+        "PLAN-20261008-01-04"
+      ],
+      "status": "backlog"
+    },
+    {
+      "id": "PLAN-20261008-01-06",
+      "title": "Derive source_breaks from archive + provenance (PIN-R7)",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [
+        "PLAN-20261008-01-03"
+      ],
+      "status": "backlog"
+    },
+    {
+      "id": "PLAN-20261008-01-07",
+      "title": "C1 lag evidence + source_lags_ns + freeze commit (>= 2026-10-21)",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [
+        "PLAN-20261008-01-04",
+        "PLAN-20261008-01-06"
+      ],
+      "status": "gated_date"
+    },
+    {
+      "id": "PLAN-20261008-01-08",
+      "title": "Scored primary pair + lag twin, stages A-C (after freeze)",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [
+        "PLAN-20261008-01-07"
+      ],
+      "status": "gated"
+    },
+    {
+      "id": "PLAN-20261008-01-09",
+      "title": "PFM: duplicate MAX date in a table raises duplicate_day; CDT docstring",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "done (bd974d3b)"
+    },
+    {
+      "id": "PLAN-20261008-01-10",
+      "title": "Spot-check LOT 2021-24 MAX vs CLI highs",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [
+        "PLAN-20261008-01-01"
+      ],
+      "status": "done (98ef56c6)"
+    },
+    {
+      "id": "PLAN-20261008-01-11",
+      "title": "F6b loss-stop producer",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "cancelled (F6b CANCELLED: A1 frozen unreachable_veto 8756dcc4; RULING_FQ-v2-NO-TRADE_2026-10-08)"
+    },
+    {
+      "id": "PLAN-20261008-01-12",
+      "title": "F5 pin request via prereg amendment + peer review",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "done (A0 frozen 43cc3e0f; A1 frozen 8756dcc4 unreachable_veto; A2 not built per ruling)"
+    },
+    {
+      "id": "PLAN-20261008-01-13",
+      "title": "AUT-6 activation",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "in_progress (row 6 split 6a/6b; WP1 building)"
+    },
+    {
+      "id": "PLAN-20261008-01-14",
+      "title": "M1-v3 single read",
+      "source_anchor": "4-next-work-in-priority-order",
+      "depends_on": [],
+      "status": "gated_date_2026-12-07"
+    }
   ]
 }
