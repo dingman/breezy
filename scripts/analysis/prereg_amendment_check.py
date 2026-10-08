@@ -7,7 +7,10 @@ Exit codes match the parent checker: 0 OK, 1 defects, 2 usage or load error.
 ``--draft`` replaces the freeze rule with ``frozen_sha == UNFROZEN`` and exits 0
 only for an unfrozen file. It never reports a draft as frozen. On A1 it also
 accepts ``PENDING_*`` strings; the key set stays exact. Without ``--draft``
-those strings are refused.
+those strings are refused. Non-draft A1 provenance must name an int ``mc_seed``
+(not a bool), ``mc_module`` and ``core_module``, and ``mc_evidence`` as an
+existing file under ``docs/evidence/f5/`` whose bytes hash to
+``mc_evidence_sha256``.
 
 The rules import ``validate_defects``, ``check_frozen_blob`` and
 ``check_not_refrozen``. Nothing those functions do is re-implemented. Run this
@@ -17,6 +20,7 @@ and ``check_not_refrozen`` then refuses it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import subprocess
@@ -140,6 +144,8 @@ _INPUT_KEYS: Final = frozenset(
     {"sign_rule", "fill_rule", "fee_rule", "void_rule", "truth_sha_rule"}
 )
 _FLOOR_MODES: Final = frozenset({"sqrt_boundary", "unreachable_veto"})
+_F5_EVIDENCE: Final = Path("docs/evidence/f5")
+_PROVENANCE_MODULES: Final = ("mc_module", "core_module")
 _SQRT_POWER_CLASSES: Final = frozenset({"edge_capable", "gross_loss_tripwire"})
 _HORIZON_CLIMATE_DAY: Final = "2027-01-25"
 # §4.6 power target, already imported with the KILL constants. Not retyped.
@@ -633,12 +639,141 @@ def _check_floor(floor: Any, *, draft: bool) -> list[Defect]:
     return defects
 
 
-def _check_payload(amendment: Mapping[str, Any], *, draft: bool = False) -> list[Defect]:
+def _floor_provenance(message: str) -> Defect:
+    return Defect("BAD_FLOOR_PROVENANCE", message)
+
+
+def _pending_allowed(value: Any, *, draft: bool) -> bool:
+    return draft and _is_pending(value)
+
+
+def _check_provenance_module(
+    provenance: Mapping[str, Any], key: str, *, draft: bool
+) -> list[Defect]:
+    if key not in provenance:
+        return [_floor_provenance(f"provenance.{key} is missing")]
+    value = provenance[key]
+    if _pending_allowed(value, draft=draft):
+        return []
+    if isinstance(value, str) and value.strip() and not _is_pending(value):
+        return []
+    return [_floor_provenance(f"provenance.{key} must name a module, got {value!r}")]
+
+
+def _mc_evidence_file(value: Any, root: Path) -> Path | str:
+    """Existing file under ``docs/evidence/f5/``, or a defect message."""
+    message = (
+        f"provenance.mc_evidence must be an existing file under docs/evidence/f5/, got {value!r}"
+    )
+    if not isinstance(value, str) or not value or Path(value).is_absolute():
+        return message
+    rel = Path(value)
+    if any(part == ".." for part in rel.parts):
+        return message
+    parts = [part for part in rel.parts if part != "."]
+    normalized = Path(*parts) if parts else Path()
+    try:
+        normalized.relative_to(_F5_EVIDENCE)
+    except ValueError:
+        return message
+    if normalized == _F5_EVIDENCE:
+        return message
+    candidate = (root / normalized).resolve()
+    try:
+        candidate.relative_to((root / _F5_EVIDENCE).resolve())
+    except ValueError:
+        return message
+    if not candidate.is_file():
+        return message
+    return candidate
+
+
+def _resolve_mc_evidence(
+    provenance: Mapping[str, Any], *, draft: bool, root: Path
+) -> tuple[Path | None, list[Defect]]:
+    if "mc_evidence" not in provenance:
+        return None, [_floor_provenance("provenance.mc_evidence is missing")]
+    value = provenance["mc_evidence"]
+    if _pending_allowed(value, draft=draft):
+        return None, []
+    found = _mc_evidence_file(value, root)
+    if isinstance(found, str):
+        return None, [_floor_provenance(found)]
+    return found, []
+
+
+def _check_mc_evidence_sha(
+    provenance: Mapping[str, Any], *, draft: bool, evidence: Path | None
+) -> list[Defect]:
+    if "mc_evidence_sha256" not in provenance:
+        return [_floor_provenance("provenance.mc_evidence_sha256 is missing")]
+    value = provenance["mc_evidence_sha256"]
+    if _pending_allowed(value, draft=draft):
+        return []
+    if _is_pending(value) or not isinstance(value, str):
+        return [
+            _floor_provenance(
+                f"provenance.mc_evidence_sha256 must be the sha256 of mc_evidence, got {value!r}"
+            )
+        ]
+    if evidence is None:
+        return []
+    try:
+        digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    except OSError as exc:
+        return [_floor_provenance(f"provenance.mc_evidence is not readable: {exc}")]
+    if value != digest:
+        return [
+            _floor_provenance(
+                "provenance.mc_evidence_sha256 must equal "
+                f"sha256(mc_evidence) {digest}, got {value!r}"
+            )
+        ]
+    return []
+
+
+def _check_mc_seed(provenance: Mapping[str, Any], *, draft: bool) -> list[Defect]:
+    if "mc_seed" not in provenance:
+        return [_floor_provenance("provenance.mc_seed is missing")]
+    value = provenance["mc_seed"]
+    if _pending_allowed(value, draft=draft):
+        return []
+    if isinstance(value, int) and not isinstance(value, bool):
+        return []
+    return [_floor_provenance(f"provenance.mc_seed must be an int, got {value!r}")]
+
+
+def _check_a1_provenance(provenance: Any, *, draft: bool, root: Path) -> list[Defect]:
+    """A1 provenance. ``PENDING_*`` is accepted only when ``draft`` is set."""
+    if not isinstance(provenance, Mapping):
+        return [_floor_provenance(f"provenance must be an object, got {provenance!r}")]
+    defects: list[Defect] = []
+    for key in _PROVENANCE_MODULES:
+        defects.extend(_check_provenance_module(provenance, key, draft=draft))
+    evidence, evidence_defects = _resolve_mc_evidence(provenance, draft=draft, root=root)
+    defects.extend(evidence_defects)
+    defects.extend(_check_mc_evidence_sha(provenance, draft=draft, evidence=evidence))
+    defects.extend(_check_mc_seed(provenance, draft=draft))
+    return defects
+
+
+def _check_payload(
+    amendment: Mapping[str, Any], *, draft: bool = False, root: Path | None = None
+) -> list[Defect]:
     amendment_id = amendment.get("amendment_id")
     if amendment_id == _A0_ID:
         return _check_kill(amendment.get("kill"))
     if amendment_id == _A1_ID:
-        return _check_floor(amendment.get("loss_stop_floor"), draft=draft)
+        defects = _check_floor(amendment.get("loss_stop_floor"), draft=draft)
+        if "provenance" in amendment:
+            defects.extend(
+                _check_a1_provenance(
+                    amendment["provenance"],
+                    draft=draft,
+                    root=_REPO_ROOT if root is None else root,
+                )
+            )
+        return defects
     if isinstance(amendment_id, str) and amendment_id in _PAYLOADS:
         return [
             Defect(
@@ -673,7 +808,7 @@ def _collect(path: Path, amendment: Mapping[str, Any], *, draft: bool) -> list[D
         *_check_amendment_filename(path, amendment),
         *_check_additive(path, amendment, parent),
         *_check_freeze(path, amendment, draft=draft),
-        *_check_payload(amendment, draft=draft),
+        *_check_payload(amendment, draft=draft, root=_git_toplevel(path) or _REPO_ROOT),
     ]
 
 

@@ -50,6 +50,7 @@
     "mc_module": "scripts/analysis/fq_loss_floor_mc.py",
     "core_module": "src/breezy/analysis/fq_loss_stop_core.py",
     "mc_evidence": "PENDING_MC",
+    "mc_evidence_sha256": "PENDING_MC",
     "mc_seed": "PENDING_COORDINATOR"
   }
 }

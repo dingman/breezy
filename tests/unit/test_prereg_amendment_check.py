@@ -7,6 +7,7 @@ loader success path are pinned to the frozen A0 (stamped 2026-10-08).
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import subprocess
 import sys
@@ -819,3 +820,98 @@ def test_a1_draft_file_matches_r3_and_passes_only_as_draft() -> None:
     assert chk.validate_amendment(_A1_FILE, draft=True) == []
     assert chk.main(["--draft", str(_A1_FILE)]) == 0
     assert chk.main([str(_A1_FILE)]) == 1
+
+
+def _provenance_defects(provenance: Any, *, draft: bool, root: Path | None = None) -> list[Any]:
+    return cast(
+        list[Any],
+        _chk()._check_a1_provenance(provenance, draft=draft, root=root or REPO_ROOT),
+    )
+
+
+def _valid_provenance(root: Path, **overrides: Any) -> dict[str, Any]:
+    """A non-draft provenance whose evidence file really lives under ``root``."""
+    folder = root / "docs" / "evidence" / "f5"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / "floor.json"
+    payload = b'{"gate":"floor"}\n'
+    target.write_bytes(payload)
+    body: dict[str, Any] = {
+        "mc_module": "scripts/analysis/fq_loss_floor_mc.py",
+        "core_module": "src/breezy/analysis/fq_loss_stop_core.py",
+        "mc_evidence": "docs/evidence/f5/floor.json",
+        "mc_evidence_sha256": hashlib.sha256(payload).hexdigest(),
+        "mc_seed": 20261008,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_floor_provenance_mc_seed_must_be_int(tmp_path: Path) -> None:
+    root = tmp_path
+    assert _provenance_defects(_valid_provenance(root), draft=False, root=root) == []
+    for bad in (True, False, "PENDING_COORDINATOR", 1.0):
+        defects = _provenance_defects(_valid_provenance(root, mc_seed=bad), draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert "mc_seed" in defects[0].message
+
+
+def test_floor_provenance_mc_evidence_must_be_existing_f5_file(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    outside = root / "docs" / "evidence" / "other.json"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"nope\n")
+    for bad in (
+        "PENDING_MC",
+        "/etc/passwd",
+        "docs/evidence/other.json",
+        "docs/evidence/f5/missing.json",
+        "docs/evidence/f5/../../docs/evidence/f5/floor.json",
+        "docs/evidence/f5",
+    ):
+        defects = _provenance_defects({**good, "mc_evidence": bad}, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"], bad
+        assert "mc_evidence" in defects[0].message
+
+
+def test_floor_provenance_mc_evidence_sha256_matches_file(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    assert _provenance_defects(good, draft=False, root=root) == []
+    missing = {key: value for key, value in good.items() if key != "mc_evidence_sha256"}
+    wrong = {**good, "mc_evidence_sha256": "0" * 64}
+    for body in (missing, wrong):
+        defects = _provenance_defects(body, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert "mc_evidence_sha256" in defects[0].message
+
+
+def test_floor_provenance_requires_mc_module_and_core_module(tmp_path: Path) -> None:
+    root = tmp_path
+    good = _valid_provenance(root)
+    for key in ("mc_module", "core_module"):
+        dropped = {name: value for name, value in good.items() if name != key}
+        defects = _provenance_defects(dropped, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert key in defects[0].message
+        blank = {**good, key: ""}
+        defects = _provenance_defects(blank, draft=False, root=root)
+        assert [d.code for d in defects] == ["BAD_FLOOR_PROVENANCE"]
+        assert key in defects[0].message
+
+
+def test_draft_accepts_pending_floor_provenance() -> None:
+    body = json.loads(_A1_FILE.read_text(encoding="utf-8"))
+    assert body["provenance"]["mc_evidence_sha256"] == "PENDING_MC"
+    assert body["provenance"]["mc_seed"] == "PENDING_COORDINATOR"
+    assert _provenance_defects(body["provenance"], draft=True) == []
+    refused = _provenance_defects(body["provenance"], draft=False)
+    assert refused
+    assert {d.code for d in refused} == {"BAD_FLOOR_PROVENANCE"}
+    if _is_shallow_repository():
+        pytest.skip(_SHALLOW_SKIP)
+    chk = _chk()
+    assert chk.validate_amendment(_A1_FILE, draft=True) == []
+    frozen = chk.validate_amendment(_A1_FILE, draft=False)
+    assert any(d.code == "BAD_FLOOR_PROVENANCE" for d in frozen)
