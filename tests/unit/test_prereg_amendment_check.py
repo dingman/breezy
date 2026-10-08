@@ -594,16 +594,17 @@ def _pending_floor() -> dict[str, Any]:
 
 
 def _veto_floor() -> dict[str, Any]:
-    """unreachable_veto. The sqrt-only fields are hostile so they must not be checked."""
+    """unreachable_veto. Sqrt-only fields are null; measured power is still reported."""
     floor = _sqrt_floor()
     floor["floor_mode"] = "unreachable_veto"
     floor["power_class"] = "none"
     floor["c"] = None
-    floor["c_mc_se"] = 0
-    floor["t_min"] = 4
-    floor["measured_power"] = {key: 0.0 for key in _MEASURED_POWER_KEYS}
-    floor["s6_feasible_rate"] = 1
-    floor["reach_cutoff_epoch_start"] = "not-a-date"
+    floor["c_mc_se"] = None
+    floor["c_binding_cell"] = None
+    floor["t_min"] = None
+    floor["measured_power"] = {"-0.16": 0.0, "-0.08": 1, "-0.04": 0.5}
+    floor["s6_feasible_rate"] = None
+    floor["reach_cutoff_epoch_start"] = None
     return floor
 
 
@@ -691,6 +692,30 @@ def test_bad_floor_value(overrides: dict[str, Any]) -> None:
     assert _codes(_sqrt_floor(**overrides)) == ["BAD_FLOOR_VALUE"]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"measured_power": {"-0.16": 0.9, "-0.08": 0.5, "-0.04": "0.2"}},
+        {"measured_power": {"-0.16": 0.9, "-0.08": None, "-0.04": 0.2}},
+        {"measured_power": {"-0.16": -1, "-0.08": 0.5, "-0.04": 0.2}},
+        {"measured_power": {"-0.16": 0.9, "-0.08": 1.5, "-0.04": 0.2}},
+        {"s6_feasible_rate": "0.1"},
+        {"s6_feasible_rate": None},
+        {"s6_feasible_rate": -1},
+        {"s6_feasible_rate": 1.5},
+    ],
+)
+def test_sqrt_measured_power_and_s6_must_be_unit_interval(overrides: dict[str, Any]) -> None:
+    assert _codes(_sqrt_floor(**overrides)) == ["BAD_FLOOR_VALUE"]
+
+
+def test_check_measured_power_non_mapping_returns_defect() -> None:
+    floor = _sqrt_floor()
+    floor["measured_power"] = None
+    defects = _chk()._check_measured_power(floor, None)
+    assert [d.code for d in defects] == ["BAD_FLOOR_KEYS"]
+
+
 def test_unreachable_veto_with_c_is_bad_floor_value() -> None:
     floor = _veto_floor()
     floor["c"] = 1.5
@@ -700,6 +725,56 @@ def test_unreachable_veto_with_c_is_bad_floor_value() -> None:
 def test_unreachable_veto_with_power_class_is_bad_floor_value() -> None:
     floor = _veto_floor()
     floor["power_class"] = "edge_capable"
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+_VETO_NULL_FIELDS = (
+    "c",
+    "c_mc_se",
+    "t_min",
+    "s6_feasible_rate",
+    "reach_cutoff_epoch_start",
+    "c_binding_cell",
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("c", 1.5),
+        ("c_mc_se", 0),
+        ("t_min", 4),
+        ("s6_feasible_rate", 1),
+        ("reach_cutoff_epoch_start", "2026-11-01"),
+        ("c_binding_cell", "H0/M-pool"),
+    ],
+)
+def test_unreachable_veto_non_null_field_is_bad_floor_value(field: str, value: Any) -> None:
+    floor = _veto_floor()
+    floor[field] = value
+    assert _codes(floor) == ["BAD_FLOOR_VALUE"]
+
+
+def test_unreachable_veto_draft_accepts_pending_null_fields_and_power() -> None:
+    floor = _veto_floor()
+    for field in _VETO_NULL_FIELDS:
+        floor[field] = "PENDING_MC"
+    floor["measured_power"] = {key: "PENDING_MC" for key in _MEASURED_POWER_KEYS}
+    assert _codes(floor, draft=True) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("-0.16", "0.5"),
+        ("-0.08", None),
+        ("-0.04", -1),
+        ("-0.16", 1.5),
+    ],
+)
+def test_unreachable_veto_measured_power_must_be_unit_interval(key: str, value: Any) -> None:
+    floor = _veto_floor()
+    floor["measured_power"] = {"-0.16": 0.0, "-0.08": 0.0, "-0.04": 0.0, key: value}
     assert _codes(floor) == ["BAD_FLOOR_VALUE"]
 
 

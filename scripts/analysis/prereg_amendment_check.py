@@ -127,6 +127,15 @@ _FLOOR_KEYS: Final = frozenset(
     }
 )
 _MEASURED_POWER_KEYS: Final = frozenset({"-0.16", "-0.08", "-0.04"})
+# Under unreachable_veto these are null (or PENDING_* in draft). Measured power stays.
+_VETO_NULL_FIELDS: Final = (
+    "c",
+    "c_mc_se",
+    "t_min",
+    "s6_feasible_rate",
+    "reach_cutoff_epoch_start",
+    "c_binding_cell",
+)
 _INPUT_KEYS: Final = frozenset(
     {"sign_rule", "fill_rule", "fee_rule", "void_rule", "truth_sha_rule"}
 )
@@ -392,6 +401,26 @@ def _as_decimal(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _in_unit_interval(value: Any) -> bool:
+    number = _as_decimal(value)
+    return number is not None and Decimal(0) <= number <= Decimal(1)
+
+
+def _measured_power_defects(measured: Mapping[str, Any], *, allow_pending: bool) -> list[Defect]:
+    defects: list[Defect] = []
+    for key in sorted(_MEASURED_POWER_KEYS):
+        value = measured[key]
+        if allow_pending and _is_pending(value):
+            continue
+        if not _in_unit_interval(value):
+            defects.append(
+                _floor_value(
+                    f"measured_power[{key!r}] must be a finite number in [0, 1], got {value!r}"
+                )
+            )
+    return defects
+
+
 def _matches_imported(value: Any, expected: Any) -> bool:
     # `==` alone accepts True for 1. The pin must match the constant's type.
     return type(value) is type(expected) and value == expected
@@ -473,15 +502,13 @@ def _check_sqrt_boundary(floor: Mapping[str, Any]) -> list[Defect]:
 
 def _check_measured_power(floor: Mapping[str, Any], error_d: Decimal | None) -> list[Defect]:
     """G3, the power-class split at the imported power target, and the S6 bound."""
-    defects: list[Defect] = []
     measured = floor["measured_power"]
-    assert isinstance(measured, Mapping)
+    if not isinstance(measured, Mapping):
+        return [_bad_floor_keys(measured, _MEASURED_POWER_KEYS, "measured_power")]
+    defects = _measured_power_defects(measured, allow_pending=False)
     power = measured[_POWER_AT]
-    power_d = None if _is_pending(power) else _as_decimal(power)
-    if not _is_pending(power) and power_d is None:
-        defects.append(
-            _floor_value(f"measured_power[{_POWER_AT!r}] must be a finite number, got {power!r}")
-        )
+    # Out of range is already a defect. Do not also score G3 or the class split on it.
+    power_d = _as_decimal(power) if _in_unit_interval(power) else None
     alpha = floor["alpha_floor"]
     multiplier = floor["g3_floor_multiplier"]
     alpha_d = None if _is_pending(alpha) else _as_decimal(alpha)
@@ -535,8 +562,8 @@ def _check_s6(
     if _is_pending(rate):
         return []
     rate_d = _as_decimal(rate)
-    if rate_d is None:
-        return [_floor_value(f"s6_feasible_rate must be a finite number, got {rate!r}")]
+    if rate_d is None or not _in_unit_interval(rate):
+        return [_floor_value(f"s6_feasible_rate must be a finite number in [0, 1], got {rate!r}")]
     if alpha_d is None or error_d is None or error_d <= 0:
         return []
     bound = alpha_d + Decimal(3) * error_d
@@ -552,14 +579,20 @@ def _check_s6(
 
 def _check_unreachable_veto(floor: Mapping[str, Any]) -> list[Defect]:
     defects: list[Defect] = []
-    boundary = floor["c"]
-    if not _is_pending(boundary) and boundary is not None:
-        defects.append(_floor_value(f"unreachable_veto requires c null, got {boundary!r}"))
+    for name in _VETO_NULL_FIELDS:
+        value = floor[name]
+        if not _is_pending(value) and value is not None:
+            defects.append(_floor_value(f"unreachable_veto requires {name} null, got {value!r}"))
     power_class = floor["power_class"]
     if not _is_pending(power_class) and power_class != "none":
         defects.append(
             _floor_value(f"unreachable_veto requires power_class 'none', got {power_class!r}")
         )
+    measured = floor["measured_power"]
+    if not isinstance(measured, Mapping):
+        defects.append(_bad_floor_keys(measured, _MEASURED_POWER_KEYS, "measured_power"))
+        return defects
+    defects.extend(_measured_power_defects(measured, allow_pending=True))
     return defects
 
 
