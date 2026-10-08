@@ -37,7 +37,10 @@ from tests.unit.autonomy_owner_placeholders import CROSS_AREA_FILE, OWNER_PLACEH
 #: AUT-6 WP1 delivered five (the deliver_with_proof, critical-alert, detector, SIGKILL and
 #: concurrent-drainer tests, now in ``test_alert_delivery.py`` and
 #: ``test_alert_outbox_concurrency.py``), so 149 - 5.
-EXPECTED_CROSS_AREA_STUBS: Final = 144
+#: AUT-6 WP2 delivered two (``test_alerts_undeliverable_veto`` and
+#: ``test_alerts_undeliverable_reads_two_days``, now in ``test_autonomy_node_detectors.py``), so
+#: 144 - 2.
+EXPECTED_CROSS_AREA_STUBS: Final = 142
 R5_AUT_5A_STUBS: Final = (
     "test_l1_cutover_lock_acquired_at_164454_aborts",
     "test_l1_cutover_late_write_completion_aborts",
@@ -872,16 +875,6 @@ def test_detectors_and_drawdown_include_drill_fills(case: str) -> None:
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
 def test_try_submit_latency_independent_of_webhook_latency() -> None:
     await_owner("test_try_submit_latency_independent_of_webhook_latency")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_alerts_undeliverable_veto() -> None:
-    await_owner("test_alerts_undeliverable_veto")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_alerts_undeliverable_reads_two_days() -> None:
-    await_owner("test_alerts_undeliverable_reads_two_days")
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")

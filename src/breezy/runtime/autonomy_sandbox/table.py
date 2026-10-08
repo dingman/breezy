@@ -344,6 +344,22 @@ _ALERT_REDELIVER_ROW: Final = BwrapRow(
 )
 
 
+#: AUT-6 WP2 (plan r15 sections 3.1.1 and 3.7; A9): the alert canary. Same shape as the redeliver
+#: row: it binds only ``evidence/alerts`` (records, outbox, ``armed.json`` and its pre-created
+#: ``.canary.lock``), carries no credential, and ``network="egress"`` is the unfiltered host network
+#: for the delivery POST (never ``--unshare-net``). Its closure holds no venue, adapter or
+#: execution module. It carries the same X-3 ``OnFailure`` gap as the redeliver unit.
+_CANARY_ROW: Final = BwrapRow(
+    name="breezy-autonomy-canary",
+    owner_plan="AUT-6",
+    units=frozenset({"breezy-autonomy-canary.service"}),
+    binds=("evidence/alerts",),
+    entry_modules=("breezy.runtime.autonomy_canary_cli",),
+    resolves_dns=True,
+    network="egress",
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -400,6 +416,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             *_CAPTURE_ROWS,
             _LABEL_OUTCOMES_ROW,
             _ALERT_REDELIVER_ROW,
+            _CANARY_ROW,
         )
     }
 )

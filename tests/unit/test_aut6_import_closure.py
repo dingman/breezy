@@ -24,7 +24,10 @@ FORBIDDEN_PREFIXES: Final[tuple[str, ...]] = (
 )
 
 #: Entry modules judged so far. Append only; each work package adds its own.
-ENTRY_MODULES: Final[tuple[str, ...]] = ("breezy.analysis.nbp_drift",)
+ENTRY_MODULES: Final[tuple[str, ...]] = (
+    "breezy.analysis.nbp_drift",
+    "breezy.runtime.autonomy_canary_cli",
+)
 
 
 def _source_path(module: str, roots: tuple[Path, ...] = (SRC_DIR,)) -> Path | None:

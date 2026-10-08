@@ -1,0 +1,18 @@
+# AUT-6 WP2 (plan r15 sections 3.7 and 3.10, R-e): slot-critical, so AccuracySec=1s and no
+# RandomizedDelaySec. Hourly at :45 (15:45Z is the primary canary; 16:45Z is the second in-window
+# slot), plus 16:30Z and 17:10Z. Never Persistent: a missed run is recovered by the next firing.
+# Enabled by the coordinator, not by the build.
+[Unit]
+Description=Hourly :45, 16:30Z and 17:10Z trigger for the Breezy AUT-6 alert canary
+
+[Timer]
+Unit=breezy-autonomy-canary.service
+OnCalendar=*:45:00 UTC
+OnCalendar=*-*-* 16:30:00 UTC
+OnCalendar=*-*-* 17:10:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

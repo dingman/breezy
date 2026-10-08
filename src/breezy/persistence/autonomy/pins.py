@@ -67,6 +67,12 @@ ALERT_OUTBOX_STALE_S: Final = 300  # <= 300
 ALERT_CLAIM_STALE_S: Final = 30  # >= 3 x 10
 HALT_MIRROR_MAX_AGE_S: Final = 180  # :932 <= 180
 CANARY_RETRY_PERIOD_MIN: Final = 60  # :933 <= 60
+# Pre-registered suppression-drill dates (UTC ISO dates, plan r15 section 3.7.1). EMPTY on purpose:
+# ruling r3 item 4 (AUT-6-WP2-pathB-ruling_2026-10-08.md) withdrew the sender-armed dead-man after
+# the live ntfy.sh check failed, so the drill has no receiver-side absence rule to prove and no
+# date is registered until the off-host endpoint exists. The drill code is built and inert while
+# this set is empty. Adding a date is a reviewed pins change made before that date, never on it.
+CANARY_SUPPRESSION_DRILL_DATES: Final[frozenset[str]] = frozenset()
 ENGINE_HEARTBEAT_STALE_S: Final = 3600  # :934 <= 3600
 WATCH_TICK_STALE_S: Final = 180  # :935 <= 180 (3 x the 60 s tick)
 ALERT_CANARY_MAX_AGE_H: Final = 26  # :936 <= 26

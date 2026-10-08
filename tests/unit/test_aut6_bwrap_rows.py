@@ -22,7 +22,11 @@ from tests.support.entry_points import DEPLOY_SYSTEMD_DIR, SRC_DIR
 ROW: Final = "breezy-autonomy-alert-redeliver"
 #: AUT-6 rows and their exact bind sets (§3.1.1). Rows with ``host_proc`` are the named
 #: ``--unshare-pid`` exceptions; WP1 has none.
-AUT6_ROWS: Final[dict[str, tuple[str, ...]]] = {ROW: ("evidence/alerts",)}
+CANARY_ROW: Final = "breezy-autonomy-canary"  # AUT-6 WP2
+AUT6_ROWS: Final[dict[str, tuple[str, ...]]] = {
+    ROW: ("evidence/alerts",),
+    CANARY_ROW: ("evidence/alerts",),
+}
 AUT6_PROC_EXCEPTION_ROWS: Final[frozenset[str]] = frozenset()
 ROOTS: Final = SandboxRoots(
     home=Path("/home/u"),
@@ -34,6 +38,7 @@ ROOTS: Final = SandboxRoots(
 )
 _CLOSURE: Final = (
     "runtime/alert_redeliver_cli",
+    "runtime/autonomy_canary_cli",
     "runtime/alert_delivery",
     "runtime/alert_drain",
     "runtime/alert_proof",
