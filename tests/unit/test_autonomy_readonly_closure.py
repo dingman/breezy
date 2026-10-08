@@ -197,10 +197,7 @@ def test_aut6_real_files_resolve_to_their_module_names() -> None:
 # -- the self-probe constants, derived from the bwrap table (AE3) ----------------------------
 
 
-def _derived_probe(row_name: str) -> detector_catalog.SelfProbe:
-    from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE
-
-    binds = AUTONOMY_BWRAP_TABLE[row_name].binds
+def _derived_probe(binds: tuple[str, ...]) -> detector_catalog.SelfProbe:
     bound = set(binds)
     parents = []
     for bind in binds:
@@ -211,9 +208,15 @@ def _derived_probe(row_name: str) -> detector_catalog.SelfProbe:
     return detector_catalog.SelfProbe(("state", "registry", *parents), positives)
 
 
+def _table_binds(row_name: str) -> tuple[str, ...]:
+    from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE
+
+    return AUTONOMY_BWRAP_TABLE[row_name].binds
+
+
 def test_aut6_self_probe_paths_are_constants_derived_from_bwrap_table() -> None:
     for row, probe in AUT6_SELF_PROBE_PATHS.items():
-        assert probe == _derived_probe(row), row
+        assert probe == _derived_probe(_table_binds(row)), row
     assert "breezy-autonomy-alert-redeliver" in AUT6_SELF_PROBE_PATHS
     writes = AUT6_WRITE_AUTHORITY["bwrap-self-probe"].writes
     assert writes and all(path.endswith("/.aut6_bwrap_probe_*") for path in writes)
@@ -229,7 +232,9 @@ def test_aut6_widened_bind_fails_the_self_probe_derivation() -> None:
 
     row = AUTONOMY_BWRAP_TABLE["breezy-autonomy-alert-redeliver"]
     widened = dataclasses.replace(row, binds=("evidence/alerts", "cache/extra"))
-    assert len(widened.binds) == 2 and _derived_probe(row.name) == AUT6_SELF_PROBE_PATHS[row.name]
+    assert len(widened.binds) == 2
+    assert _derived_probe(row.binds) == AUT6_SELF_PROBE_PATHS[row.name]
+    assert _derived_probe(widened.binds) != AUT6_SELF_PROBE_PATHS[row.name]
 
 
 def test_aut6_authority_rows_carry_no_in_sandbox_systemctl_call() -> None:
@@ -313,40 +318,52 @@ def test_aut6_closure_forbids_extended_write_and_dynamic_code_constructs(case: s
     assert found and {f.rule for f in found} == {"aut6_off_allowlist"}, case
 
 
-def test_aut6_write_rows_are_path_literal_or_constant() -> None:
-    """The authority literals are plain strings (or one named constant), never computed paths."""
-    tree = ast.parse(Path(detector_catalog.__file__).read_text(encoding="utf-8"))
-    constants = {
-        t.id
-        for n in tree.body
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
-        for t in n.targets
-        if isinstance(t, ast.Name)
-    }
-    constants |= {
-        n.target.id
-        for n in tree.body
-        if isinstance(n, ast.AnnAssign)
-        and isinstance(n.target, ast.Name)
-        and isinstance(n.value, ast.Constant)
-    }
-    rows = [
+def _constants(tree: ast.Module) -> set[str]:
+    """Module-level names bound to a string constant (the only names a write row may use)."""
+    found: set[str] = set()
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant):
+            found.update(t.id for t in n.targets if isinstance(t, ast.Name))
+        elif (
+            isinstance(n, ast.AnnAssign)
+            and isinstance(n.target, ast.Name)
+            and isinstance(n.value, ast.Constant)
+        ):
+            found.add(n.target.id)
+    return found
+
+
+def _authority_rows(tree: ast.AST) -> list[ast.Call]:
+    return [
         n
         for n in ast.walk(tree)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "AuthorityRow"
     ]
+
+
+def _row_is_literal_or_constant(row: ast.Call, constants: set[str]) -> bool:
+    """True when the row's write tuple holds only string literals or named string constants.
+
+    A row whose first argument is not a tuple is computed elsewhere (the self-probe row, derived
+    from ``AUT6_SELF_PROBE_PATHS`` and tested separately) and is accepted here.
+    """
+    writes = row.args[0] if row.args else None
+    if not isinstance(writes, ast.Tuple):
+        return not isinstance(writes, ast.BinOp)
+    return all(
+        isinstance(e, ast.Constant) or (isinstance(e, ast.Name) and e.id in constants)
+        for e in writes.elts
+    )
+
+
+def test_aut6_write_rows_are_path_literal_or_constant() -> None:
+    """The authority literals are plain strings (or one named constant), never computed paths."""
+    tree = ast.parse(Path(detector_catalog.__file__).read_text(encoding="utf-8"))
+    rows = _authority_rows(tree)
     assert len(rows) >= len(AUT6_WRITE_AUTHORITY) - 1
-    for row in rows:
-        writes = row.args[0] if row.args else None
-        if not isinstance(writes, ast.Tuple):
-            continue  # the self-probe row is computed from AUT6_SELF_PROBE_PATHS (tested above)
-        for element in writes.elts:
-            assert isinstance(element, ast.Constant) or (
-                isinstance(element, ast.Name) and element.id in constants
-            ), ast.dump(element)
-    # a planted computed path is not literal-or-constant
-    planted = ast.parse("AuthorityRow((base + '/x',))").body[0]
-    assert isinstance(planted, ast.Expr)
+    assert all(_row_is_literal_or_constant(row, _constants(tree)) for row in rows)
+    planted = ast.parse("AuthorityRow((base + '/x',))")
+    assert not _row_is_literal_or_constant(_authority_rows(planted)[0], set())
 
 
 def test_aut6_closure_scope_is_aut6_globs_and_every_module_classified() -> None:
