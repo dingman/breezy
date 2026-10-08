@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import math
@@ -639,10 +640,15 @@ def run_pfm_leg(
     truncated: list[dt.date] = []
     cursor = [dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC)]  # mutable: error path
     try:
-        _page_loop(
-            report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
-            sleep, page_limit, quarantine,
-        )  # fmt: skip
+        # One manifest rewrite for the leg (and every COVERAGE_FLUSH_EVERY products),
+        # including when the leg raises or the process is SIGTERM'd. Doubles that
+        # only implement append_if_new must not become AttributeError -> error.
+        batch = getattr(store, "coverage_batch", None)
+        with batch() if callable(batch) else contextlib.nullcontext():
+            _page_loop(
+                report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
+                sleep, page_limit, quarantine,
+            )  # fmt: skip
     except Exception as exc:  # noqa: BLE001 - the station boundary: record, never crash the run
         report.status = "error"
         report.error = f"{type(exc).__name__}: {exc}"

@@ -131,6 +131,58 @@ def _leg(
 # ------------------------------------------------------------ pure helpers
 
 
+def test_pfm_leg_opens_one_coverage_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    entered: list[int] = []
+    real = UsSourceRevisionStore.coverage_batch
+
+    def spy(self: UsSourceRevisionStore) -> Any:
+        entered.append(1)
+        return real(self)
+
+    monkeypatch.setattr(UsSourceRevisionStore, "coverage_batch", spy)
+    report = _leg(tmp_path, lambda _wfo, _sdate, _limit: "")
+
+    assert entered == [1]
+    assert report.products_seen == 0
+
+
+def test_reingest_apply_opens_one_coverage_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from us_source_pfm_reingest import reingest_quarantine  # type: ignore[import-not-found]
+
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    (quarantine / "refusals.jsonl").write_text(
+        json.dumps(
+            {
+                "issued": None,
+                "raw_file": "ab.raw",
+                "reason": "unparsed",
+                "sha256": "ab",
+                "station": "KNYC",
+                "wfo": "OKX",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    entered: list[int] = []
+    real = UsSourceRevisionStore.coverage_batch
+
+    def spy(self: UsSourceRevisionStore) -> Any:
+        entered.append(1)
+        return real(self)
+
+    monkeypatch.setattr(UsSourceRevisionStore, "coverage_batch", spy)
+    store = UsSourceRevisionStore(tmp_path / "archive", _Clock(_utc(9, 12)))
+    report = reingest_quarantine(quarantine, store, sleep=lambda _seconds: None)
+
+    assert entered == [1]
+    assert report["mode"] == "apply"
+    assert report["skipped"] == {"no_issuance": 1}
+
+
 def test_split_products_splits_on_soh_strips_etx_and_drops_empties() -> None:
     text = "\x01\nA header\nbody\n\x03\x01\nB header\nbody2\n\x03"
 

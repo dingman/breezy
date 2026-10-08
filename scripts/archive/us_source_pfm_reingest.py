@@ -13,6 +13,7 @@ the store.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 from collections import Counter
@@ -55,48 +56,54 @@ def reingest_quarantine(
     skipped: Counter[str] = Counter()
     still_refused: Counter[str] = Counter()
     would_accept: Counter[str] = Counter()
-    for entry in _lines(quarantine_dir):
-        if only_reasons is not None and entry["reason"] not in only_reasons:
-            skipped["reason_filter"] += 1
-            continue
-        key = (entry["station"], entry["sha256"])
-        if key in seen:
-            skipped["duplicate_line"] += 1
-            continue
-        seen.add(key)
-        if not entry.get("issued"):
-            skipped["no_issuance"] += 1
-            continue
-        raw_path = quarantine_dir / entry["raw_file"]
-        if not raw_path.is_file():
-            skipped["raw_missing"] += 1
-            continue
-        raw = raw_path.read_bytes()
-        issued = dt.datetime.fromisoformat(entry["issued"])
-        station, wfo = entry["station"], entry["wfo"]
-        report = legs.setdefault(station, LegReport(station=station, wfo=wfo))
-        report.products_seen += 1
-        try:
-            parse_pfm_product(raw, station=station, reference_time=issued + dt.timedelta(seconds=1))
-        except PfmParseError as exc:
-            reason = exc.reason or _FALLBACK_REASON
-            report.refused[reason] = report.refused.get(reason, 0) + 1
-            still_refused[f"{station}:{reason}"] += 1
-            continue
-        would_accept[station] += 1
-        if store is None:
-            continue
-        if not _append(
-            store,
-            report,
-            sleep,
-            station=station,
-            run_ts_ns=int(issued.timestamp()) * _NS,
-            wfo=wfo,
-            payload=raw,
-        ):
-            report.status = "store_busy"
-            break
+    # One batch for the run: payloads stay durable, coverage.json is rewritten
+    # every COVERAGE_FLUSH_EVERY products and again when the run exits.
+    batch = contextlib.nullcontext() if store is None else store.coverage_batch()
+    with batch:
+        for entry in _lines(quarantine_dir):
+            if only_reasons is not None and entry["reason"] not in only_reasons:
+                skipped["reason_filter"] += 1
+                continue
+            key = (entry["station"], entry["sha256"])
+            if key in seen:
+                skipped["duplicate_line"] += 1
+                continue
+            seen.add(key)
+            if not entry.get("issued"):
+                skipped["no_issuance"] += 1
+                continue
+            raw_path = quarantine_dir / entry["raw_file"]
+            if not raw_path.is_file():
+                skipped["raw_missing"] += 1
+                continue
+            raw = raw_path.read_bytes()
+            issued = dt.datetime.fromisoformat(entry["issued"])
+            station, wfo = entry["station"], entry["wfo"]
+            report = legs.setdefault(station, LegReport(station=station, wfo=wfo))
+            report.products_seen += 1
+            try:
+                parse_pfm_product(
+                    raw, station=station, reference_time=issued + dt.timedelta(seconds=1)
+                )
+            except PfmParseError as exc:
+                reason = exc.reason or _FALLBACK_REASON
+                report.refused[reason] = report.refused.get(reason, 0) + 1
+                still_refused[f"{station}:{reason}"] += 1
+                continue
+            would_accept[station] += 1
+            if store is None:
+                continue
+            if not _append(
+                store,
+                report,
+                sleep,
+                station=station,
+                run_ts_ns=int(issued.timestamp()) * _NS,
+                wfo=wfo,
+                payload=raw,
+            ):
+                report.status = "store_busy"
+                break
     return {
         "mode": "dry_run" if store is None else "apply",
         "quarantine_dir": str(quarantine_dir),

@@ -8,7 +8,10 @@ digests of every stored raw revision for ``(source, station, run_ts, base)``.
 * A new digest is written as ``<base>-r<N>`` with ``N = 1 + max`` (``-r0`` is
   the first-seen revision and stays the timing anchor), through
   ``ArchiveCache(fetch=<closure returning the already-fetched bytes>)
-  .get_or_fetch`` on a key verified ``missing()``.
+  .get_or_fetch`` on a key verified ``missing()``. A run that appends many
+  products opens :meth:`coverage_batch` (a subclass in this module — the
+  ``archive_cache`` module stays byte-frozen) so ``coverage.json`` is not
+  rewritten on every product; the per-product write is still ``get_or_fetch``.
 * Digest set, ``N`` and the write all run under the source's unit lock
   ``<root>/<source>/collector.lock`` -- never ``coverage.json.lock``, which the
   cache takes non-blocking for its own commit.
@@ -27,6 +30,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -34,7 +38,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from breezy.persistence.archive_cache import ArchiveCache, ArchiveRequest, count_rows
+from breezy.persistence.archive_cache import (
+    MANIFEST_VERSION,
+    ArchiveCache,
+    ArchiveRequest,
+    CoverageEntry,
+    _atomic_write,
+    count_rows,
+)
 from breezy.persistence.us_source_request import (
     US_SOURCE_PRODUCTS,
     revision_product_pattern,
@@ -53,6 +64,12 @@ __all__ = [
 
 LOCK_NAME: Final[str] = "collector.lock"
 QUARANTINE_NAME: Final[str] = "quarantine.jsonl"
+#: New payloads one coverage batch may commit before rewriting coverage.json.
+#: One rewrite is O(entries); doing it on every product is O(n^2).
+COVERAGE_FLUSH_EVERY: Final[int] = 200
+#: Keys committed in a batch but not yet folded into coverage.json. Append-only,
+#: so another process can see them before this one releases collector.lock.
+_JOURNAL_NAME: Final[str] = "coverage.pending.jsonl"
 _SYMLINKED_LOCK_ERRNOS: Final[frozenset[int]] = frozenset({errno.ELOOP, errno.EMLINK})
 
 _LEDGER_FIELDS: Final[dict[str, type]] = {
@@ -102,6 +119,282 @@ class RevisionResult:
     request: ArchiveRequest | None
 
 
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _manifest_stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _arm_sigterm() -> Callable[[], None] | None:
+    """Turn SIGTERM into SystemExit so a batch ``finally`` can flush.
+
+    The default action kills the process before ``finally`` runs. Ignored
+    SIGTERM stays ignored. Only the main thread can install a handler.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous == signal.SIG_IGN:
+        return None
+
+    def _handler(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+
+    def _restore() -> None:
+        signal.signal(signal.SIGTERM, previous)
+
+    return _restore
+
+
+class _BatchedCoverageCache(ArchiveCache):
+    """``ArchiveCache`` that can defer ``coverage.json`` rewrites.
+
+    ``archive_cache.py`` is byte-frozen. Batching lives here and is used only by
+    :class:`UsSourceRevisionStore`. Outside a batch every miss still rewrites the
+    manifest immediately, via :meth:`ArchiveCache._commit_miss`.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        fetch: Callable[[ArchiveRequest], bytes],
+        clock: _NanosecondClock,
+    ) -> None:
+        super().__init__(root, fetch, clock)
+        self._stamp: dict[str, tuple[int, int] | None] = {}
+        self._journal_stamp: dict[str, tuple[int, int] | None] = {}
+        self._dirty: dict[str, dict[str, CoverageEntry]] = {}
+        self._batch_depth = 0
+
+    @contextlib.contextmanager
+    def coverage_batch(self) -> Iterator[None]:
+        """Write each payload now; rewrite the manifest on a cadence and on the way out.
+
+        Each new key is appended to ``coverage.pending.jsonl`` before the unit
+        lock is released, so another process dedupes against it. The manifest is
+        rewritten every ``COVERAGE_FLUSH_EVERY`` new keys, when this context
+        exits, and when it is left by an exception or by SIGTERM (delivered as
+        ``SystemExit`` so this ``finally`` runs). A flush drops any pending key
+        whose file is missing or whose digest does not match, then removes the
+        journal. A crash before that rewrite never leaves ``coverage.json``
+        claiming bytes that are not on disk.
+        """
+        self._batch_depth += 1
+        restore_sigterm = _arm_sigterm() if self._batch_depth == 1 else None
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            try:
+                if self._batch_depth == 0:
+                    self.flush_coverage()
+            finally:
+                if restore_sigterm is not None:
+                    restore_sigterm()
+
+    def flush_coverage(self) -> None:
+        """Fold pending journals into ``coverage.json``. No-op if nothing is pending."""
+        for source in self._pending_sources():
+            fd = self._acquire_lock(self._lock_path(source))
+            try:
+                self._flush_source(source)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+    def _load_source(self, source: str) -> dict[str, CoverageEntry]:
+        path = self._manifest_path(source)
+        journal = self._journal_path(source)
+        stamp = _manifest_stamp(path)
+        journal_stamp = _manifest_stamp(journal)
+        cached = self._loaded.get(source)
+        # Outside a batch with no journal, the manifest file is truth on every
+        # read. A journal (or an open batch) is ahead of that file.
+        if (
+            cached is not None
+            and self._stamp.get(source) == stamp
+            and self._journal_stamp.get(source) == journal_stamp
+            and (self._batch_depth > 0 or journal_stamp is not None)
+        ):
+            return cached
+        entries = self._read_manifest(path)
+        for key, entry in self._read_journal(source).items():
+            entries.setdefault(key, entry)
+        self._loaded[source] = entries
+        self._stamp[source] = stamp
+        self._journal_stamp[source] = journal_stamp
+        return entries
+
+    def _commit_miss(self, request: ArchiveRequest, body: bytes) -> None:
+        if self._batch_depth == 0:
+            journal = self._journal_path(request.source)
+            if journal.is_file() and not journal.is_symlink():
+                fd = self._acquire_lock(self._lock_path(request.source))
+                try:
+                    self._flush_source(request.source)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+            super()._commit_miss(request, body)
+            self._dirty.pop(request.source, None)
+            self._stamp[request.source] = _manifest_stamp(self._manifest_path(request.source))
+            self._journal_stamp[request.source] = _manifest_stamp(
+                self._journal_path(request.source)
+            )
+            return
+        fd = self._acquire_lock(self._lock_path(request.source))
+        try:
+            self._commit_batched(request, body)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _new_entry(self, request: ArchiveRequest, body: bytes) -> CoverageEntry:
+        return CoverageEntry(
+            cache_key=request.cache_key(),
+            station=request.station,
+            product=request.product,
+            window_start=request.window_start,
+            window_end=request.window_end,
+            rows=count_rows(body),
+            bytes=len(body),
+            sha256=hashlib.sha256(body).hexdigest(),
+            fetched_at_ns=self._clock.timestamp_ns(),
+            model=request.model,
+            manifest_version=MANIFEST_VERSION,
+        )
+
+    def _journal_path(self, source: str) -> Path:
+        return self._root / source / _JOURNAL_NAME
+
+    def _pending_sources(self) -> list[str]:
+        found = {source for source, dirty in self._dirty.items() if dirty}
+        root = self._root
+        if root.is_dir() and not root.is_symlink():
+            for child in root.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                journal = child / _JOURNAL_NAME
+                if journal.is_file() and not journal.is_symlink():
+                    found.add(child.name)
+        return sorted(found)
+
+    def _read_journal(self, source: str) -> dict[str, CoverageEntry]:
+        path = self._journal_path(source)
+        if not path.is_file() or path.is_symlink():
+            return {}
+        found: dict[str, CoverageEntry] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+                entry = CoverageEntry.from_dict(raw) if isinstance(raw, dict) else None
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+            if entry is not None and entry.cache_key:
+                found[entry.cache_key] = entry
+        return found
+
+    def _append_journal_line(self, source: str, entry: CoverageEntry) -> None:
+        """Durably record one key before the caller releases the unit lock."""
+        path = self._journal_path(source)
+        if path.is_symlink():
+            raise RevisionStoreIntegrityError(f"refusing a symlinked coverage journal at {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        created = not path.exists()
+        try:
+            fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+        except OSError as exc:
+            if exc.errno in _SYMLINKED_LOCK_ERRNOS:
+                raise RevisionStoreIntegrityError(
+                    f"refusing a symlinked coverage journal at {path}"
+                ) from exc
+            raise
+        line = (
+            json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        try:
+            view = line
+            while view:
+                wrote = os.write(fd, view)
+                if wrote <= 0:
+                    raise OSError(f"short write to coverage journal {path}")
+                view = view[wrote:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if created:
+            _fsync_dir(path.parent)
+        self._journal_stamp[source] = _manifest_stamp(path)
+
+    def _unlink_journal(self, source: str) -> None:
+        path = self._journal_path(source)
+        if path.is_symlink():
+            raise RevisionStoreIntegrityError(f"refusing a symlinked coverage journal at {path}")
+        path.unlink(missing_ok=True)
+
+    def _payload_matches(self, source: str, entry: CoverageEntry) -> bool:
+        path = self._root / source / f"{entry.cache_key}.csv"
+        if not path.is_file() or path.is_symlink():
+            return False
+        return hashlib.sha256(path.read_bytes()).hexdigest() == entry.sha256
+
+    def _flush_source(self, source: str) -> None:
+        """Publish pending keys whose files match. Caller holds the coverage lock.
+
+        The on-disk manifest wins when it already has a key. A pending entry is
+        dropped, not published, when the csv is missing or its digest differs.
+        """
+        pending = self._read_journal(source)
+        pending.update(self._dirty.get(source) or {})
+        path = self._manifest_path(source)
+        base = self._read_manifest(path)
+        published = dict(base)
+        for key, entry in pending.items():
+            if key in base:
+                continue
+            if self._payload_matches(source, entry):
+                published[key] = entry
+        if len(published) != len(base):
+            _atomic_write(path, self._encode_manifest(published))
+        self._unlink_journal(source)
+        self._loaded[source] = published
+        self._stamp[source] = _manifest_stamp(path)
+        self._journal_stamp[source] = None
+        self._dirty[source] = {}
+
+    def _commit_batched(self, request: ArchiveRequest, body: bytes) -> None:
+        """Payload and journal now, manifest later. Caller holds the coverage lock."""
+        entries = self._load_source(request.source)
+        existing = entries.get(request.cache_key())
+        if existing is not None:
+            self._require_matching_window(request, existing)
+            return
+        _atomic_write(self._payload_path(request), body)
+        entry = self._new_entry(request, body)
+        entries[request.cache_key()] = entry
+        self._loaded[request.source] = entries
+        dirty = self._dirty.setdefault(request.source, {})
+        dirty[entry.cache_key] = entry
+        self._append_journal_line(request.source, entry)
+        if len(dirty) >= COVERAGE_FLUSH_EVERY:
+            self._flush_source(request.source)
+
+
 class UsSourceRevisionStore:
     def __init__(
         self,
@@ -124,7 +417,7 @@ class UsSourceRevisionStore:
         self._outlier_probe = outlier_probe
         self._outlier_threshold_f = outlier_threshold_f
         self._payload: bytes = b""
-        self._cache = ArchiveCache(self._root, fetch=self._fetch_closure, clock=clock)
+        self._cache = _BatchedCoverageCache(self._root, fetch=self._fetch_closure, clock=clock)
         self._held: dict[str, tuple[int, int]] = {}  # source -> (owner thread, depth)
 
     def _fetch_closure(self, _request: ArchiveRequest) -> bytes:
@@ -217,6 +510,16 @@ class UsSourceRevisionStore:
         )
 
     # -- the append --------------------------------------------------------
+
+    @contextlib.contextmanager
+    def coverage_batch(self) -> Iterator[None]:
+        """Defer this store's ``coverage.json`` rewrite until the batch ends.
+
+        Append, quarantine, refusal and dedupe semantics are unchanged. See
+        :meth:`_BatchedCoverageCache.coverage_batch`.
+        """
+        with self._cache.coverage_batch():
+            yield
 
     def append_if_new(
         self,
