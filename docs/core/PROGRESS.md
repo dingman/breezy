@@ -58,17 +58,17 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 
 ### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
-Resume point: docs/plans/backlog/HALT_POINT_2026-10-06.md.
+Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
 | Row | Status |
 |---|---|
 | F2 truth fetch | LIVE (timers 11:40Z/12:40Z) |
 | F4 labels | build-now DONE (WP0-3,5,6,8 + plugins); promote waits AUT-6; see F4-open-items_2026-10-06.md |
-| F5 prereg MC | DONE: STARVED; design frozen 072ab026 (RULING_FQ-PREREG-v2-AMENDMENT) |
-| F6 bridge | veto merged; refuses FQ until F6b producer |
+| F5 prereg | design 072ab026; A0 KILL frozen; A1 floor frozen 8756dcc4 = unreachable_veto |
+| F6 bridge | permanent veto on FQ v2; F6b CANCELLED; next FQ-R8-2-UNDER-VETO_plan_r2 |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
 | F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
 | F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07 |
-Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B).
+Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B); owes HALT_INERT retirement test (R8-2f).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
