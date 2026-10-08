@@ -4333,6 +4333,18 @@ class TestSupervisorLoggingConfiguration:
         assert len(file_handlers) == 1
         assert Path(file_handlers[0].baseFilename) == supervisor_log_path(tmp_path / "logs-b")
 
+    def test_configure_supervisor_logging_pins_httpx_logger_to_warning(self, tmp_path):
+        """httpx logs request URLs at INFO; webhook URLs are secrets, so the
+        library logger must stay silent even if a root handler appears."""
+        httpx_logger = logging.getLogger("httpx")
+        previous = httpx_logger.level
+        httpx_logger.setLevel(logging.NOTSET)
+        try:
+            configure_supervisor_logging(tmp_path / "logs")
+            assert httpx_logger.level == logging.WARNING
+        finally:
+            httpx_logger.setLevel(previous)
+
     def test_configured_logger_actually_emits_at_info_level(self, tmp_path):
         log_dir = tmp_path / "logs"
         configure_supervisor_logging(log_dir)
@@ -5840,6 +5852,42 @@ class TestGapHandlersLatchEveryLogFact:
         now_ns = int(now.timestamp() * 1e9)
         capability = permit_capability_valid(
             state, now_ns, child_alive=True, log_available=True, midday_budget_live=True
+        )
+        assert capability is PermitCapability.NOT_REQUIRED
+
+    def test_relaunch_check_latches_the_not_requested_marker_from_its_own_read(self, tmp_path):
+        """Live evidence 2026-10-08: an orders-off node prints the marker on
+        log line 2; the RELAUNCH_CHECK poll drains it first. If that handler
+        does not latch it, every later B1 poll reports a false ABSENT."""
+        from breezy.runtime.trade_supervisor_core import (
+            PermitCapability,
+            permit_capability_valid,
+        )
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("boot\n" + PERMIT_NOT_REQUESTED_MARKER + "\n")
+        reader = IncrementalLogReader()
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+
+        _pid, _log, state = _do_relaunch_check(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=_utc(16, 55),
+            tracked_pid=1001,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+
+        assert state.orders_not_requested_seen is True
+        capability = permit_capability_valid(
+            state,
+            int(_utc(18, 5).timestamp() * 1e9),
+            child_alive=True,
+            log_available=True,
+            midday_budget_live=False,
         )
         assert capability is PermitCapability.NOT_REQUIRED
 

@@ -1399,6 +1399,14 @@ What a restart inside [17:10Z, 01:00Z) shows in the supervisor journal:
   `SHADOW_DECISION` lines) or a D-1 node. Read the `ready_adoption_deferred`
   decision line's `reason=`.
 
+Alert semantics: the deferral count is consecutive. A terminal verdict
+(`not_required`, `permit_expired`, `no_child`) or a MARK resets the count and
+the CRITICAL re-fire anchor, so a node whose verdict alternates between
+terminal and deferral can restart the WARN/CRITICAL budget; this is bounded
+(at most floor(470 / 13) = 36 CRITICALs per night, see
+`decide_ready_adoption_alert`) and needs child turnover that B1 and
+MIDDAY_WATCH already page.
+
 Alerts: CRITICALs are queued in the alert outbox and redelivered by
 `breezy-autonomy-alert-redeliver.timer`; WARNs are best effort. Check the
 supervisor log, not only the webhook receiver. Before any restart confirm

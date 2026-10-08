@@ -2404,15 +2404,18 @@ def decide_ready_adoption(
     # holder + permit + subscribed == readiness_observed(...)'s conjunction.
     if state.first_boot_permit_expires_at_ns is None:
         return ReadyAdoptionVerdict.ANCHOR_UNKNOWN
-    if log_spawned_at is None:
+    # A spawn stamp after ``now`` is impossible for a real log: treat it as
+    # unknown rather than let a clock/name anomaly reach a MARK.
+    if log_spawned_at is None or log_spawned_at > now:
         return ReadyAdoptionVerdict.LOG_UNKNOWN
     if log_spawned_at < _at(state.day, STOP_PRIOR_UTC):
         return ReadyAdoptionVerdict.LOG_NOT_CURRENT_DAY
     liveness_ns = state.liveness_line_last_ns
     if liveness_ns is None or now_ns - liveness_ns > LIVENESS_MAX_AGE_NS:
         return ReadyAdoptionVerdict.NO_FRESH_ACTIVITY
-    # Cheap guard, vacuous by construction (the real post-boot guarantee is
-    # the pid->log binding): a line older than the log's own spawn stamp.
+    # Cheap guard, vacuous by construction (the post-boot binding is only
+    # ``find_adopted_node_log``'s mtime >= process-start heuristic, not a
+    # proof): a line older than the log's own spawn stamp.
     if liveness_ns < int(log_spawned_at.timestamp()) * _NS_PER_S:
         return ReadyAdoptionVerdict.NO_FRESH_ACTIVITY
     return ReadyAdoptionVerdict.MARK

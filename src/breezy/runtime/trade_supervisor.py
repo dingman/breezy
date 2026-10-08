@@ -1064,6 +1064,9 @@ def configure_supervisor_logging(log_dir: Path) -> None:
     logger.addHandler(stream_handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    # httpx logs request URLs at INFO and webhook URLs are secrets: keep the
+    # library silent even if a root handler is ever added.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -1340,6 +1343,11 @@ def _do_relaunch_check(
     # shared reader's offset past it.
     if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now)
+    # [SUP-RESTART-ANYTIME ops review, 2026-10-08] An orders-off node prints
+    # this on log line 2, so this first drain is the only one that sees it;
+    # unlatched, every later B1 poll reported a false ABSENT CRITICAL.
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
         state = record_permit_issued_seen(state, now, permit_expiry_ns)
@@ -2217,6 +2225,18 @@ def _ready_adoption_step(
             state = record_ready_adoption_terminal_logged(state, now)
         return state
 
+    return _ready_adoption_defer(ports=ports, state=state, now=now, verdict=verdict)
+
+
+def _ready_adoption_defer(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    verdict: ReadyAdoptionVerdict,
+) -> DaySchedulerState:
+    """Count one deferral, log it (first poll and every alert), and send the
+    WARN/CRITICAL when due; an unsent alert is retried next poll (A2)."""
     state = record_ready_adoption_deferral(state, now)
     spec = decide_ready_adoption_alert(state)
     polls = state.ready_adoption_deferral_polls

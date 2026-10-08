@@ -821,6 +821,13 @@ class TestDecideReadyAdoption:
         state = _proven_state(liveness_line_last_ns=_NOW_NS - 30 * _NS)
         assert _decide(state, log_spawned_at=_utc(19, 59, 45)) is _V.NO_FRESH_ACTIVITY
 
+    def test_log_spawn_stamp_in_the_future_is_a_deferral_never_a_mark(self) -> None:
+        state = _proven_state(liveness_line_last_ns=_NOW_NS)
+        assert _decide(state, log_spawned_at=_NOW) is _V.MARK  # equal to now: allowed
+        future = _NOW + dt.timedelta(seconds=1)
+        assert _decide(state, log_spawned_at=future) is _V.LOG_UNKNOWN
+        assert is_deferral(_V.LOG_UNKNOWN)
+
     def test_is_deferral_is_exactly_the_eight_counted_members(self) -> None:
         counted = {
             _V.HOLDER_UNPROVEN,
