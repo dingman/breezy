@@ -144,3 +144,79 @@ Replaces §5 steps 2–3, §5.1 P1/S1–S5, §5.2, §5.4 positive proof, §2.10 
 NOT-READY until peer-reviewed. After review, the build is gated on SUP-RESTART-ANYTIME being merged and activated.
 - **Required reviewers:** trading-bot-architect and security-reviewer.
 - **python-reviewer:** required at the build stage.
+
+---
+## Peer-review amendments (BINDING), 2026-10-08
+
+Two reviews, both verdict SOUND-WITH-CHANGES: trading-bot-architect (T) and security-reviewer (S). The coordinator merged them. They do not contradict each other. Where both touch the same point, the stricter text wins.
+
+### X1 pin and closure count
+- **R1 (S1). Drop the `test_trade_cli.py` X1 row.**
+  - T12 asserts the literal reason string, as T17–T19 do.
+  - Parity with `submit_chain.AMBIGUOUS_REASON` is pinned once, inside `test_ambig_latch_resume.py`, which already has a row.
+  - Phase B therefore adds exactly **2** X1 rows. PR wording: "Two X1 rows added (named); one V-15 closure count 34→35."
+- **R2 (S2). Verify the closure delta before editing.**
+  - Before editing `test_aut1_wp0_closure_premises.py:52`, run `static_module_closure('breezy.runtime.trade_supervisor')` at the Phase B tip.
+  - Record that the only added module is `breezy.adapters.polymarket_us.no_id_attribution`. Any other new element is a STOP.
+  - The `:52` comment names the module.
+
+### T42 literals and F4 sign-off
+- **R3 (S3). Capture T42 literals from the base commit.**
+  - Capture them from `git show <PHASE_B_BASE>:tests/unit/test_execution_egress_firewall_guard.py`, before Phase B touches the guard.
+  - T42 asserts `current == base_literal | declared_delta`, with the delta spelled out (+16 callees, +4 scanned names, +2 coroutine names, 0 egress).
+  - Never snapshot the working tree.
+- **R4 (S4). Bind F4 to the exact tip.** B0 merge precondition: security-reviewer F4 written sign-off, covering the no-id predicate, against the exact Phase B tip SHA. Any later commit voids it.
+
+### Proving retirement opens no order path
+- **R5 (S5). Phase B test in `test_ambig_no_id_resolver.py`.**
+  - Setup: retire an OPEN intent via the no-id path with `BREEZY_ORDERS_ENABLED=0` and no permit.
+  - Assert: `_submit_order` still refuses, and `arm` is never reached.
+  - Cite the gate ordering (permit check before `arm`) by symbol.
+  - M4 adds: "no submit/arm line after retirement".
+- **R6 (S6). M4 adds a venue-write check.** No POST or PUT to the venue appears in the node log during the boot window. Resolver account-activity GETs are read-only and already allowlisted.
+
+### Phase split and naming
+- **R7 (S7, T5). Re-check the phase split.**
+  - The T46 table row reads "(i)–(iv); (v) moved to T46b".
+  - Hard step in D6: build the Phase A branch from its base with no Phase B file present, then run every Phase A test there (T43–T47, the AlertDetail tests, ct08, ct14).
+  - Any failure that depends on `node_config`, `client` or `no_id_retire_admitted` moves to Phase B.
+  - Explicitly check T50, T45 (if it touches `component_health_watch`) and T47's planted-member mutation, which must not be vacuous in Phase A.
+- **R8 (T6). Import the prefix from the domain module.**
+  - `trade_supervisor.py` binds the public `RESOLVER_CONTEXT_KEY_PREFIX` only via `from breezy.domain.exec_intent import …`.
+  - Update every use, including the base's `_RESOLVER_CONTEXT_KEY_PREFIX` and the T44(vi) wording.
+  - Assert by AST that `test_trade_supervisor.py` has no `exec/` import.
+  - Run V-15 (must stay 34) and `lint-imports` in Phase A. That module is in the domain layer, not adapters.
+
+### Merge timing, gating and U2
+- **R9 (T1). Phase B merge timing** (replaces "Merge, preferably before 16:40Z").
+  - Merge Phase B after the 16:40Z STOP_PRIOR has disposed of the node (systemctl/journal evidence) and before 16:48Z.
+  - Reason: a merge changes the shared tree immediately, and a running old node could lazily import a changed `account_activity`/`config`/`component_health_watch`/`trade_cli` against its old `client.py`.
+  - If a merge before STOP_PRIOR is unavoidable, record evidence from the AUT-1 import closure that the old node does no post-boot imports of the changed modules.
+- **R10 (T2). Re-arm gate.**
+  - No re-arm ruling, permit mint or enablement change takes effect until M2/M3 are recorded green.
+  - The PROGRESS row for this item is listed as an open risk in any re-arm ruling.
+  - This adds a build-side precondition only. It sets no operator value.
+- **R11 (T3). The OPEN probe is binding** (replaces "information only").
+  - If the probe reads OPEN with shape NO_ID, NO_CONTEXT or UNKNOWN, Phase B must merge before the 16:50Z LAUNCH. Otherwise Phase A spawns an old node and pages a CRITICAL `LAUNCH_TO_RESOLVE_NO_ID` for a day.
+  - If CLEAR, any merge inside the R9 window is acceptable.
+  - If OPEN, M3 also records that the resolver ran, or `resolver_no_id_retire_blocked` and why.
+- **R12 (T4). U2 voiding and the node-down path.**
+  - Any supervisor restart after U2 and before the 16:50Z launch voids U2. Re-run U2 against the new MainPID.
+  - If the marker is absent or its pid is stale at node boot, `no_id_retire_admitted` is False and the intent stays AMBIGUOUS and pages. This is safe. Record it as an M3 failure, not a rollback trigger.
+  - If the node is down at U1, U2 check 3 is N/A. In that case check 3 passes only if `launch_adopted_live_node` or a spawn under the new MainPID is logged.
+
+### Ordering with other work
+- **R13 (T7). Concurrency and separate restarts.**
+  - Phase B and AUT-5a row 7a must not be in flight at the same time. Whichever merges second rebases and re-runs the client byte-pin, X1 and V-15 tests, then re-reviews.
+  - SUP-RESTART activation and the Phase A U1 restart are separate events, with separate SHAs and separate post-checks. They may share one restart only if both check sets are recorded.
+
+### Acceptance and rollback
+- **R14 (T8). Acceptance wording is honest.**
+  - Replace "machinery proven" with "loaded and gated; resolver behaviour verified by T25/T41(vii)/T51 on tracked real-data fixtures only".
+  - M4 is labelled "vacuous unless the probe read OPEN".
+  - r6 goal 8 (automated stuck-latch recovery) is NOT demonstrated live until DEFERRED-LIVE closes.
+  - PROGRESS closure trigger: the first AMBIGUOUS after a re-arm, with a resolver log line and `is_latched()` False.
+- **R15 (T9). Rollback after a retirement.** After any `RESOLVER_NO_ID_NO_FILL` retirement, rollback keeps C0 and Phase A. The supervisor, not the node, must decode the RETIRED row. This is why Phase A is never reverted.
+
+### Verdict after amendments
+READY to build. The build is gated on SUP-RESTART-ANYTIME being merged and activated (supervisor restart in 01:00–16:40Z). Phase A then branches from feat after that merge.
