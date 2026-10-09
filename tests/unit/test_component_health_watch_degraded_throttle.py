@@ -110,10 +110,10 @@ def test_a_repeat_episode_after_the_window_re_alerts_and_the_boundary_is_inclusi
 def test_the_default_window_is_one_hour() -> None:
     assert watch.DEGRADED_ALERT_RENOTIFY_AFTER_NS == HOUR_NS
     world = _World()
-    world.episode(0, ("reason A",))
-    world.episode(HOUR_NS - 1, ("reason A",))
+    world.episode(10, ("reason A",))
+    world.episode(HOUR_NS + 9, ("reason A",))
     assert len(world.sink.payloads) == 1
-    world.episode(2 * HOUR_NS, ("reason A",))
+    world.episode(2 * HOUR_NS + 10, ("reason A",))
     assert len(world.sink.payloads) == 2
 
 
