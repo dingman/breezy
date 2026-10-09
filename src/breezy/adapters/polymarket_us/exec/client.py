@@ -1141,10 +1141,32 @@ class AmbiguousResolverContext:
     #: absence decodes to ``"none"`` -- exactly what an untouched intent's
     #: kind always was.
     last_failure_kind: str = "none"
+    #: AMBIG-LATCH-RESUME (no-id resolver, plan r6 section 2.8.3): the exact wire
+    #: fields the venue echoes on its own order objects. A no-id submit has no
+    #: venue order id, so these (written BEFORE the POST) are the attribution
+    #: join key. Same AR-N6 trailing-optional shape: an OLD blob has no keys and
+    #: decodes ``None`` (the resolver then uses window-only rules).
+    wire_market_slug: str | None = None
+    wire_price: str | None = None
+    wire_outcome_side: str | None = None
+    wire_action: str | None = None
+    #: The pre-POST holding snapshot (DM4): the slug's signed venue net, this
+    #: instrument's durable net, and the evidence time they were read at. All
+    #: three are ``None`` together (no baseline: the absolute rule applies).
+    baseline_venue_net: str | None = None
+    baseline_durable_net: str | None = None
+    baseline_ts_ns: int | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
             {
+                "wireMarketSlug": self.wire_market_slug,
+                "wirePrice": self.wire_price,
+                "wireOutcomeSide": self.wire_outcome_side,
+                "wireAction": self.wire_action,
+                "baselineVenueNet": self.baseline_venue_net,
+                "baselineDurableNet": self.baseline_durable_net,
+                "baselineTsNs": self.baseline_ts_ns,
                 "intentId": self.intent_id,
                 "venueOrderId": self.venue_order_id,
                 "instrumentId": self.instrument_id,
@@ -1203,6 +1225,17 @@ class AmbiguousResolverContext:
         # kind always was.
         raw_last_failure_kind = payload.get("lastFailureKind")
         last_failure_kind = "none" if raw_last_failure_kind is None else str(raw_last_failure_kind)
+        # AMBIG-LATCH-RESUME: same trailing-optional shape for the wire echo
+        # fields and the pre-POST holding baseline.
+        def _optional_text(key: str) -> str | None:
+            value = payload.get(key)
+            return None if value is None else str(value)
+
+        raw_baseline_ts = payload.get("baselineTsNs")
+        try:
+            baseline_ts_ns = None if raw_baseline_ts is None else int(raw_baseline_ts)
+        except (TypeError, ValueError):
+            baseline_ts_ns = None
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -1222,11 +1255,29 @@ class AmbiguousResolverContext:
                 order_side=order_side,
                 create_fill_evidence=create_fill_evidence,
                 last_failure_kind=last_failure_kind,
+                wire_market_slug=_optional_text("wireMarketSlug"),
+                wire_price=_optional_text("wirePrice"),
+                wire_outcome_side=_optional_text("wireOutcomeSide"),
+                wire_action=_optional_text("wireAction"),
+                baseline_venue_net=_optional_text("baselineVenueNet"),
+                baseline_durable_net=_optional_text("baselineDurableNet"),
+                baseline_ts_ns=baseline_ts_ns,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
                 f"a durable resolver context is malformed: {type(exc).__name__}: {exc}"
             ) from None
+
+
+@dataclass(frozen=True, slots=True)
+class HoldingBaseline:
+    """The pre-POST holding snapshot a no-id submit is later checked against:
+    the slug's signed venue net, this instrument's durable net (both as the
+    strings the context stores) and the evidence time they were read at."""
+
+    venue_net: str
+    durable_net: str
+    ts_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1515,6 +1566,34 @@ _RESOLVER_ACTIVITY_SORT_ORDER: Final[str] = "SORT_ORDER_DESCENDING"
 #: import-linter layer contract, so this module names the same number
 #: independently rather than importing it.
 _RESOLVER_ZERO_FILL_MIN_AGE_NS: Final[int] = 120 * 1_000_000_000
+
+#: AMBIG-LATCH-RESUME (no-id resolver, plan r6 section 2.8.4): the earliest age
+#: at which the no-id branch may read the venue. The venue's acceptance
+#: deadline is about ``created + 30 s`` plus a <= 30 s clock offset plus the
+#: 5 s ``maxBlockTime``, which fixes the order's fate by about ``created +
+#: 65 s``; the rest is eventual-consistency margin for the activities and
+#: positions feeds (about 2x the with-id 120 s floor that gates the same read).
+_RESOLVER_NO_ID_MIN_AGE_NS: Final[int] = 300 * 1_000_000_000
+#: P-c: 30 s venue timestamp tolerance + 30 s clock offset + 5 s maxBlockTime.
+_NO_ID_FATE_FIXED_NS: Final[int] = 65 * 1_000_000_000
+#: A CHOICE, not a derivation: chosen only so the forward bound equals the
+#: back-skew (a window symmetric about ``created_ns``). It has to absorb the
+#: sign-to-POST gap, venue queueing (no documented bound) and ``createTime``
+#: granularity; the measured total is 0.075-0.215 s (n = 9).
+_NO_ID_WINDOW_FORWARD_SKEW_NS: Final[int] = 55 * 1_000_000_000
+_NO_ID_WINDOW_FORWARD_NS: Final[int] = _NO_ID_FATE_FIXED_NS + _NO_ID_WINDOW_FORWARD_SKEW_NS
+#: 4x the venue's 30 s timestamp window, so a skewed ``createTime`` cannot fall
+#: before the attribution window.
+_NO_ID_WINDOW_BACKSKEW_NS: Final[int] = 120 * 1_000_000_000
+#: A pre-POST holding snapshot is only a baseline if no Breezy fill on the
+#: instrument landed within this long before it (it might not reflect it yet).
+_NO_ID_BASELINE_QUIET_NS: Final[int] = 300 * 1_000_000_000
+#: After a CONTRADICTION or INCOMPLETE verdict the no-id branch makes no
+#: further reads for that intent until this long has passed.
+_NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
+#: A manual trade this close to the baseline snapshot may or may not be in it
+#: (the venue's 30 s timestamp tolerance), so it cannot be reconciled.
+_NO_ID_MANUAL_STRADDLE_NS: Final[int] = 30 * 1_000_000_000
 
 #: AC4(b): the two `createFillEvidence` tokens that BLOCK a resolver
 #: zero-fill and raise `resolver_evidence_contradiction` if the GET still
@@ -5304,6 +5383,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         create_detail: str | None = None,
         fill_parse_error: str | None = None,
         create_fill_evidence: str = submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN,
+        wire_market_slug: str | None = None,
+        wire_price: str | None = None,
+        wire_outcome_side: str | None = None,
+        wire_action: str | None = None,
+        register_booking: bool = True,
+        capture_holding_baseline: bool = False,
     ) -> None:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
@@ -5326,7 +5411,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         EDGE-2 slice A (AC3): ``create_fill_evidence`` is the caller's
         already-computed ``submit_chain.create_fill_evidence(response.body)
         .token`` -- a closed-set name, never a price, quantity, or id.
+
+        AMBIG-LATCH-RESUME: the four ``wire_*`` values are the echo fields a
+        no-id attribution joins on. ``register_booking=False`` writes the
+        context but holds no in-memory booking (the PRE-POST call: a take that
+        ends non-AMBIGUOUS must leave no entry). ``capture_holding_baseline``
+        (pre-POST only) adds the DM4 holding snapshot read from LOCAL durable
+        evidence; a raise there yields no baseline, never a denied take.
         """
+        baseline: HoldingBaseline | None = None
+        if capture_holding_baseline and wire_market_slug is not None:
+            try:
+                baseline = self._holding_baseline(order.instrument_id, wire_market_slug, now_ns)
+            except Exception:  # noqa: BLE001 - no baseline is the safe direction
+                baseline = None
         context = AmbiguousResolverContext(
             intent_id=intent_id,
             venue_order_id=venue_order_id,
@@ -5340,9 +5438,59 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             fill_parse_error=fill_parse_error,
             order_side=order.side.name,
             create_fill_evidence=create_fill_evidence,
+            wire_market_slug=wire_market_slug,
+            wire_price=wire_price,
+            wire_outcome_side=wire_outcome_side,
+            wire_action=wire_action,
+            baseline_venue_net=None if baseline is None else baseline.venue_net,
+            baseline_durable_net=None if baseline is None else baseline.durable_net,
+            baseline_ts_ns=None if baseline is None else baseline.ts_ns,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
-        self._ambiguous_bookings[intent_id] = booking
+        if register_booking:
+            self._ambiguous_bookings[intent_id] = booking
+
+    def _holding_baseline(
+        self, instrument_id: InstrumentId, slug: str, now_ns: int
+    ) -> HoldingBaseline | None:
+        """The pre-POST holding snapshot from LOCAL durable evidence, or ``None``.
+
+        No venue read is possible before the POST, so the snapshot is the
+        startup-evidence record the resolver refreshes about every 60 s. ``None``
+        (the resolver then uses the absolute rule) when the evidence is absent,
+        refused or not eof-complete; the slug's net is unknown; the durable net
+        is undeterminable; the evidence is older than the attribution back-skew
+        (the activities scan must cover every manual trade after the snapshot);
+        or a durable fill on this instrument landed within
+        :data:`_NO_ID_BASELINE_QUIET_NS` before the snapshot (it may not yet
+        reflect it). Sync, local reads only; never called from a resolver body.
+        """
+        evidence = self.read_startup_position_evidence()
+        if evidence is None or evidence.position_read_refused or not evidence.eof_complete:
+            return None
+        if now_ns - evidence.ts_ns > _NO_ID_WINDOW_BACKSKEW_NS:
+            return None
+        venue_net = "0"
+        for snapshot in evidence.positions:
+            if snapshot.slug == slug:
+                if snapshot.net_position is None:
+                    return None
+                venue_net = snapshot.net_position
+        indexed = self._read_fill_index(f"{FILL_INDEX_KEY_PREFIX}{instrument_id}")
+        if indexed is None:
+            return None
+        durable_net = Decimal(0)
+        for venue_order_id in indexed:
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            if raw is None:
+                return None
+            record = DurableFillRecord.from_bytes(raw)
+            if record.order_side not in _RECORD_SIGNS:
+                return None
+            if record.ts_event > evidence.ts_ns - _NO_ID_BASELINE_QUIET_NS:
+                return None
+            durable_net += _RECORD_SIGNS[record.order_side] * record.cumulative_qty
+        return HoldingBaseline(venue_net, str(durable_net), evidence.ts_ns)
 
     def _set_resolver_last_failure_kind(
         self,
@@ -5582,6 +5730,30 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if submit_chain.is_latch_arm_refusal(exc):
                 return self._deny(order, submit_chain.LATCH_ARM_REFUSED_REASON, now_ns)
             return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
+        # AMBIG-LATCH-RESUME: the durable context BEFORE the POST, with no
+        # `await` between `arm` and this write, so the resolver (same loop) can
+        # never observe an armed intent without it. It carries the wire echo a
+        # no-id resolution joins on. A write failure never POSTs.
+        try:
+            self._note_ambiguous_open(
+                intent_id=intent.intent_id,
+                venue_order_id=submit_chain.NO_VENUE_ORDER_ID,
+                order=order,
+                notional_usd=order_notional,
+                booking=booking,
+                now_ns=now_ns,
+                register_booking=False,
+                capture_holding_baseline=True,
+                wire_market_slug=body["marketSlug"],
+                wire_price=body["price"]["value"],
+                wire_outcome_side=body["outcomeSide"],
+                wire_action=body["action"],
+            )
+        except Exception:  # noqa: BLE001 - fail closed: never POST without a durable context
+            if booking is not None:
+                self._ledger.release_booking(booking, now_ns=now_ns)
+            return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
+        self._post_in_flight_intent_id = intent.intent_id
         headers = self._write_signer.sign_headers(
             write_transport._WRITE_METHOD,
             write_transport.ORDERS_PATH,
@@ -5604,9 +5776,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"exc_type={exc.__class__.__name__} "
                 f"client_order_id={order.client_order_id.value}"
             )
+            self._ambiguous_bookings[intent.intent_id] = booking
             if submit_chain.is_cancelled(exc):
                 raise
             return
+        finally:
+            self._post_in_flight_intent_id = None
         outcome = submit_chain.classify_create_order_outcome(
             response,
             instrument=instrument,
@@ -5863,9 +6038,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if outcome.generate_submitted:
             self._generate_submitted(order, now_ns)
         if outcome.venue_order_id is not None:
-            # L-36 / Resolution A2: with-id only. A no-id AMBIGUOUS has
-            # nothing a GET could ever resolve and stays operator-only
-            # (`clear_submit_intent`, untouched).
+            # L-36 / Resolution A2: the with-id write below OVERWRITES the
+            # pre-POST context for this intent (same key) with the venue id,
+            # keeping the wire echo fields. A no-id AMBIGUOUS (the `else:`)
+            # is resolved by the automated no-id resolver on complete reads
+            # only (2026-10-03, coordinator ruling CH1); `clear_submit_intent`
+            # stays available and is never invoked by code.
             #
             # EDGE-2 slice A (AC3): closed-set create-time fill evidence,
             # parsed independently of `outcome` (option F1 -- a second
@@ -5892,7 +6070,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 create_detail=outcome.detail,
                 fill_parse_error=outcome.fill_parse_error,
                 create_fill_evidence=evidence.token,
+                wire_market_slug=body["marketSlug"],
+                wire_price=body["price"]["value"],
+                wire_outcome_side=body["outcomeSide"],
+                wire_action=body["action"],
             )
+        else:
+            self._ambiguous_bookings[intent.intent_id] = booking
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Refuse. There is nothing to cancel: nothing can be sent."""
