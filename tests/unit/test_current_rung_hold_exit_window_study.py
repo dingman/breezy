@@ -113,7 +113,7 @@ def _position(*, leg: str = "YES", fill_px: Decimal = Decimal("0.40"),
         climate_day=_CLIMATE_DAY.isoformat(),
         season=_SEASON,
         instrument_id=_INSTRUMENT_ID,
-        leg=leg,  # type: ignore[arg-type]
+        leg=leg,
         rung=_RUNG,
         fill_px=fill_px,
         fee=Decimal("0.02"),
@@ -1534,7 +1534,7 @@ def test_run_exit_window_study_reads_scored_trials_via_the_pooled_reader(
         calls.append(base_dir)
         return original(base_dir)
 
-    monkeypatch.setattr(study_mod, "read_scored_trials_pooled", _spy)  # type: ignore[attr-defined]
+    monkeypatch.setattr(study_mod, "read_scored_trials_pooled", _spy)
 
     scored_dir = tmp_path / "scored"
     empty_catalog = tmp_path / "catalog"
@@ -1682,7 +1682,7 @@ def _install_offline_study_fakes(monkeypatch: pytest.MonkeyPatch, client: object
         return (_synthetic_trial(city),), (), {}, {}
 
     # httpx is imported by the study module and is not part of its public surface.
-    httpx_in_study = study_mod.httpx  # type: ignore[attr-defined]
+    httpx_in_study = study_mod.httpx
     monkeypatch.setattr(httpx_in_study, "Client", lambda **kwargs: client)
     monkeypatch.setattr(study_mod, "read_filled_trials_state_db", _trials)
     monkeypatch.setattr(

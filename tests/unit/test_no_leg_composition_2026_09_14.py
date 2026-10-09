@@ -196,8 +196,8 @@ def test_continuous_on_start_ladder_has_no_duplicate_rung_when_the_cache_holds_b
         clock=clock,
     )
     subscribed: list[InstrumentId] = []
-    strategy.subscribe_quote_ticks = subscribed.append  # type: ignore[method-assign]
-    strategy.subscribe_order_book_depth = lambda *_a, **_kw: None  # type: ignore[method-assign]
+    strategy.subscribe_quote_ticks = subscribed.append
+    strategy.subscribe_order_book_depth = lambda *_a, **_kw: None
     strategy.start()
 
     assert subscribed == [yes_id]

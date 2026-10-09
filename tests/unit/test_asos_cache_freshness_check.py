@@ -36,10 +36,10 @@ from asos_cache_freshness_check import (
 from settlement_alignment_study import SiteSpec
 
 _SITE: Final[SiteSpec] = SiteSpec(
-    city="Testville", site=object(), std_utc_offset_hours=-6.0, iem_asos_id="TST"  # type: ignore[arg-type]
+    city="Testville", site=object(), std_utc_offset_hours=-6.0, iem_asos_id="TST"
 )
 _OTHER_SITE: Final[SiteSpec] = SiteSpec(
-    city="Otherville", site=object(), std_utc_offset_hours=-5.0, iem_asos_id="OTR"  # type: ignore[arg-type]
+    city="Otherville", site=object(), std_utc_offset_hours=-5.0, iem_asos_id="OTR"
 )
 _FETCH_START: Final[dt.date] = dt.date(2026, 8, 30)
 _FETCH_END: Final[dt.date] = dt.date(2026, 9, 22)

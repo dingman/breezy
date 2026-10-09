@@ -454,7 +454,7 @@ def _evidence(probe: ModuleType, **overrides: object):
         "any_non_2xx": False,
     }
     defaults.update(overrides)
-    return probe.Step0Evidence(**defaults)  # type: ignore[arg-type]
+    return probe.Step0Evidence(**defaults)
 
 
 class TestClassifyVerdict:

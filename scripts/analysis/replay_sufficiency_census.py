@@ -85,7 +85,7 @@ from cli_basis_offer_gate_scan import (
     classify_instance,
     station_days_only_on_corrupt_tape,
 )
-from current_rung_hold_paper_replay import (  # type: ignore[attr-defined]
+from current_rung_hold_paper_replay import (
     _convert_live_capture,
 )
 from nautilus_trader.model.data import OrderBookDepth10, QuoteTick

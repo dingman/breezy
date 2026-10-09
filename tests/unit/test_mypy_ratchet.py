@@ -393,16 +393,20 @@ CLEAN: Final[tuple[str, ...]] = (
 
 #: Per-package error ceilings, measured at HEAD. Falling below one fails with
 #: "lower the ceiling to N" so a ceiling can never go stale.
+#: CF-12 Wave 2 (CF-12-STAGE r1.1, 2026-10-09, base 5ef21be6): 185 unused
+#: `type: ignore` comments removed -- src/breezy/analysis 13->3 (-10),
+#: scripts/analysis 359->351 (-8), tests/contract 11->7 (-4),
+#: tests/unit 1451->1288 (-163).
 CEILINGS: Final[dict[str, int]] = {
-    "src/breezy/analysis": 13,
-    "scripts/analysis": 359,
+    "src/breezy/analysis": 3,
+    "scripts/analysis": 351,
     "scripts/archive": 8,
     "scripts/venue": 23,
-    "tests/contract": 11,
+    "tests/contract": 7,
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1451,
+    "tests/unit": 1288,
 }
 
 

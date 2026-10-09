@@ -437,7 +437,7 @@ def test_the_reconciliation_refusal_reader_reads_the_exec_client_surface() -> No
     client = SimpleNamespace(reconciliation_refusals=(refusal,))
     clients: dict[object, object] = {}
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
-    read = trade_cli._exec_client_reconciliation_refusal_reader(node)  # type: ignore[arg-type]
+    read = trade_cli._exec_client_reconciliation_refusal_reader(node)
 
     assert read() == ()
     clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
@@ -461,7 +461,7 @@ def test_the_resolver_contradiction_reader_reads_the_exec_client_surface() -> No
     client = SimpleNamespace(resolver_evidence_contradictions=(contradiction,))
     clients: dict[object, object] = {}
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
-    read = trade_cli._exec_client_resolver_contradiction_reader(node)  # type: ignore[arg-type]
+    read = trade_cli._exec_client_resolver_contradiction_reader(node)
 
     assert read() == ()
     clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
@@ -1448,7 +1448,7 @@ class _DisposeSnapshotMixin:
     `dispose()` runs, before delegating to the real fake's own bookkeeping."""
 
     def dispose(self) -> None:
-        self.timer_names_at_dispose: tuple[str, ...] = tuple(  # type: ignore[attr-defined]
+        self.timer_names_at_dispose: tuple[str, ...] = tuple(
             self.kernel.clock.timer_names  # type: ignore[attr-defined]
         )
         super().dispose()  # type: ignore[misc]

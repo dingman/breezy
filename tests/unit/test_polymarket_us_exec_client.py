@@ -2800,12 +2800,12 @@ def _build_manual_client(
         api_base_url="https://api.polymarket.us",
         retirement_reasons=RetirementReason,
     )
-    client._instrument_for_test = instrument  # type: ignore[attr-defined]
+    client._instrument_for_test = instrument
     # Kept alive on the client for the rig's lifetime -- see
     # `_AcceptFillRig`'s identical note: dropping this reference finalises
     # the generator-CM via `GeneratorExit` and silently releases the flock
     # mid-test.
-    client._latch_cm_for_test = latch_cm  # type: ignore[attr-defined]
+    client._latch_cm_for_test = latch_cm
     return client, order_events, store_path, clock
 
 
@@ -2849,7 +2849,7 @@ async def test_a_session_order_count_exhaustion_writes_no_marker(
     client1, events1, _store_path1, clock1 = _build_manual_client(
         tmp_path, name="a", permit=permit, sender=sender1,
     )
-    slug = _slug(client1._instrument_for_test)  # type: ignore[attr-defined]
+    slug = _slug(client1._instrument_for_test)
     sender1.response = VenueResponse(status=200, headers={}, body=_accept_fill_body(slug))
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
@@ -4904,7 +4904,7 @@ async def test_read_open_orders_issues_one_bare_path_get_and_maps_the_rows(
     """One GET on the declared path -- no query string, so the proven
     path-only signing contract (`PrivateRead.__call__(path)`) is untouched."""
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")
 
     records = await rig.client._read_open_orders()
 
@@ -4919,7 +4919,7 @@ async def test_read_open_orders_filters_by_slug_client_side(tmp_path: Path) -> N
     query is not sent (bare path only), so an unfiltered enumeration is what
     the boot gate sees and a caller's filter cannot hide a foreign order."""
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")
 
     records = await rig.client._read_open_orders(slugs=("slug-b",))
 
@@ -4940,7 +4940,7 @@ async def test_read_open_orders_propagates_a_read_refusal(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_read_open_orders_refuses_a_malformed_body(tmp_path: Path) -> None:
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}
     with pytest.raises(ExecutionReportMappingError):
         await rig.client._read_open_orders()
 
@@ -4956,7 +4956,7 @@ async def test_generate_order_status_reports_still_returns_empty_when_an_order_r
     ``client_order_id=None`` would make native reconciliation adopt the
     order as EXTERNAL -- the opposite of fail-closed."""
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")
     await rig.client._connect()
     reports = await rig.client.generate_order_status_reports(
         GenerateOrderStatusReports(
@@ -4982,7 +4982,7 @@ async def test_a_terminal_zero_rewrite_carries_the_last_open_order_read_forward(
     rig = _build_rig(tmp_path)
     assert rig.client._open_orders_read_refused is True
     assert rig.client._open_orders == ()
-    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")
     await rig.client._connect()
     assert rig.client._open_orders_read_refused is False
     rig.client._write_startup_position_evidence(

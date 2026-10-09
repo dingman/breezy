@@ -167,7 +167,7 @@ def test_rung_geometry_reads_facts_and_never_mutates_the_facts_mapping() -> None
 def test_fee_coefficient_for_reads_the_guarded_fee_via_the_strategys_own_method() -> None:
     instrument = object()
     cache = _StrictCache(instrument=instrument)
-    callables = build_monitor_callables(  # type: ignore[arg-type]
+    callables = build_monitor_callables(
         _strategy(cache=cache, _fee=Decimal("0.06")),
     )
 
@@ -271,7 +271,7 @@ def test_a_foreign_venue_or_malformed_no_leg_id_resolves_to_none() -> None:
 
 def test_hour_lst_for_matches_the_shared_local_hour_derivation() -> None:
     offsets = {STATION: -8.0}
-    callables = build_monitor_callables(  # type: ignore[arg-type]
+    callables = build_monitor_callables(
         _strategy(_std_utc_offset_hours_by_station=offsets),
     )
 
