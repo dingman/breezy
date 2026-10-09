@@ -52,3 +52,16 @@ A read-only simulation of the builder over the full window gives observed ⊆ pr
 - mos_coverage_gap_days: 15 (benign; see above)
 
 **Observed is now a subset of the recommended list.** The only proposed date the build does not observe is 2022-08-11, which is the manual PFM break. Open items 1 and 7 are closed. What remains for the freeze (on or after 10-21): the peer review of this list, then the freeze procedure.
+
+**Peer review (trading-bot-architect, 2026-10-09): READY 90/100.**
+
+The list is correct and complete under PIN-R7 (`F13-phaseA-pin-proposals_r3.md:47`).
+
+**Guard behaviour.** `check_breaks_pinned` (`multisource_blend_pin_guards.py:116-127`) refuses only when a date is observed but not pinned (`observed - pinned`). A date that is pinned but not observed, such as 2022-08-11, is therefore accepted.
+
+**Fold behaviour.** `build_folds` (`multisource_blend_folds.py:93-111`) moves the 1-day cluster segments (05-15/16 and 03-29..31) to `excluded`. It does not crash on them.
+
+**Freeze-commit conditions:**
+1. Record 2022-08-11 as a manual known-break, citing its ILZ104 provenance.
+2. Re-run `--draft-scratch` at the freeze if any code or archive has changed since c34f1417. The run must give EXIT=0 and `observed ⊆ pinned`.
+3. Holdout boundary: checked by the coordinator. `DEFAULT_SPLITS.holdout_start` is 2026-07-01 (`nbp_calibration.py:277`), the day after the build window ends on 2026-06-30. No pre-holdout days are left uncovered.
