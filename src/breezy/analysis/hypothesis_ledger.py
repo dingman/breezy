@@ -699,14 +699,10 @@ class HypothesisRecord:
             else ()
         )
         horizon_days = (
-            payload["horizon_days"]  # type: ignore[assignment]
-            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
-            else None
+            payload["horizon_days"] if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3 else None
         )
         re_arm_gating = (
-            payload["re_arm_gating"]  # type: ignore[assignment]
-            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
-            else None
+            payload["re_arm_gating"] if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3 else None
         )
         return cls(
             schema_version=payload["schema_version"],  # type: ignore[arg-type]

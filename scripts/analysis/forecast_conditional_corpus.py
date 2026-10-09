@@ -223,7 +223,7 @@ class CorpusRow:
         return cls(
             station=str(values["station"]),
             climate_day=dt.date.fromisoformat(str(values["climate_day"])),
-            settled_tmax_f=int(values["settled_tmax_f"]),  # type: ignore[arg-type]
+            settled_tmax_f=int(values["settled_tmax_f"]),
             forecast_txn_f_by_lead={
                 int(k): float(v)
                 for k, v in dict(values["forecast_txn_f_by_lead"]).items()  # type: ignore[call-overload]
@@ -233,7 +233,7 @@ class CorpusRow:
                 int(k): float(v)
                 for k, v in dict(values["running_max_f_by_local_hour"]).items()  # type: ignore[call-overload]
             },
-            obs_cadence_seconds=int(values["obs_cadence_seconds"]),  # type: ignore[arg-type]
+            obs_cadence_seconds=int(values["obs_cadence_seconds"]),
         )
 
 

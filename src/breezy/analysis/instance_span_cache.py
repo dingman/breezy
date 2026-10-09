@@ -455,8 +455,7 @@ def read_instance_span_cache_with_stats(path: Path) -> InstanceSpanCacheReadResu
         if not isinstance(files_payload, list):
             raise InstanceSpanCacheCorruptError(f"{path}:{line_number}: 'files' must be a list")
         files = tuple(
-            _file_from_row(file, path=path, line_number=line_number)  # type: ignore[arg-type]
-            for file in files_payload
+            _file_from_row(file, path=path, line_number=line_number) for file in files_payload
         )
         if "spans" not in payload:
             raise InstanceSpanCacheCorruptError(
@@ -472,10 +471,10 @@ def read_instance_span_cache_with_stats(path: Path) -> InstanceSpanCacheReadResu
             key, span = _row_to_span(row, instance_id=instance_id)  # type: ignore[arg-type]
             spans[key] = span
         cache_key = (
-            instance_id,  # type: ignore[arg-type]
-            fingerprint,  # type: ignore[arg-type]
-            algo_version,  # type: ignore[arg-type]
-            classifier_version,  # type: ignore[arg-type]
+            instance_id,
+            fingerprint,
+            algo_version,
+            classifier_version,
         )
         typed[cache_key] = CachedInstanceSpans(
             spans=spans,

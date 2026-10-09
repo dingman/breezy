@@ -1071,6 +1071,11 @@ class DaySchedulerState:
     #: per day -- day-level, checked before ``boot_retry_attempts`` is
     #: bumped for the very first eligible attempt.
     boot_retry_first_attempt_alert_sent: bool = False
+    #: [AMBIG-LATCH-RESUME Phase A] Consecutive polls whose launch-to-resolve
+    #: spawn was deferred because the no-id CRITICAL page was not durable.
+    #: Bounded by ``LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS`` (then fail open); reset on
+    #: a durable page or a spawn. Never consumes launch budget.
+    launch_to_resolve_page_defers: int = 0
     #: [FU-17] Per-child latch: a boot-retry child that stays alive without
     #: ever producing a permit-issued line for longer than
     #: ``BOOT_RETRY_READINESS_TIMEOUT`` gets exactly one WARN. Cleared by
@@ -1498,6 +1503,16 @@ def record_boot_retry_nontransient_alert_sent(
     if effective.boot_retry_nontransient_alert_sent:
         return effective
     return replace(effective, boot_retry_nontransient_alert_sent=True)
+
+
+def record_launch_to_resolve_page_defers(
+    state: DaySchedulerState, now_utc: dt.datetime, count: int
+) -> DaySchedulerState:
+    """[AMBIG-LATCH-RESUME Phase A] Set the consecutive non-durable-page defer count."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.launch_to_resolve_page_defers == count:
+        return effective
+    return replace(effective, launch_to_resolve_page_defers=count)
 
 
 def record_boot_retry_first_attempt_alert_sent(

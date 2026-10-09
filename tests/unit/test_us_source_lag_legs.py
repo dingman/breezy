@@ -398,7 +398,10 @@ def test_obs_backs_off_after_a_rate_limit_or_server_error(tmp_path: Path, failur
 
     ctx = make_ctx(tmp_path, clock, rec, fetch_obs=feed)
     report = col.run_cycle("obs", ctx)
-    assert report.status is col.CycleStatus.ERROR
+    assert report.status is (
+        col.CycleStatus.BACKED_OFF if failure == "429" else col.CycleStatus.ERROR
+    )
+    assert report.exit_code == (0 if failure == "429" else 1)
     assert len(rec.calls) == 2  # the pass stopped at the failing station
     assert [a[0] for a in rec.alerts] == ["rate_limited"]
     assert any(e["kind"] == "backoff" for e in _events(tmp_path, OBS_SOURCE))

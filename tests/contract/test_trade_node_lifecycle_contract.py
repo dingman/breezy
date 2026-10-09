@@ -95,7 +95,7 @@ class _SilentDataClient(LiveMarketDataClient):
 
 class _SilentDataClientFactory(LiveDataClientFactory):
     @staticmethod
-    def create(  # type: ignore[override]
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: LiveDataClientConfig,

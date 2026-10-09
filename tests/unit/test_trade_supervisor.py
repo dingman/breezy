@@ -8934,3 +8934,139 @@ class TestDurableAlertSend:
     def test_default_ports_wire_the_real_durable_send(self) -> None:
         ports = _ts_module.default_ports(alert_sink=_RecordingAlertSink())
         assert ports.send_alert_durable is _ts_module.durable_alert_send
+
+
+class TestBoundedLaunchToResolvePageDefer:
+    """Review fix (HIGH/MEDIUM): the durable-page gate defers at most
+    LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS consecutive polls, and not inside the last two
+    polls of its window, then FAILS OPEN (ERROR line + spawn)."""
+
+    _OVERFLOW = "launch_to_resolve_spawning_without_durable_page"
+
+    @staticmethod
+    def _ports(*, durable: Callable[..., bool] = lambda _s, _p: False) -> tuple[Any, Any, Any]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: False,
+            send_alert_durable=durable,
+        )
+        return spawner, sink, ports
+
+    def test_persistent_non_durable_pages_defer_exactly_three_polls_then_spawn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = kwargs["state"]
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            for _ in range(3):
+                pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+                assert (pid, done) == (None, False)
+                assert state.relaunch_attempts == 0
+            assert spawner.calls == []
+            pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert state.launch_to_resolve_page_defers == 0
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert messages.count(self._OVERFLOW) == 1
+
+    def test_a_defer_inside_two_polls_of_the_window_end_spawns_immediately(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        kwargs = {**_launch_kwargs(tmp_path), "now": _utc(16, 58, 30)}
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, _log, _state, done = _do_launch(ports=ports, **kwargs)
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert self._OVERFLOW in [r.getMessage() for r in caplog.records]
+
+    def test_a_durable_page_resets_the_defer_counter(self, tmp_path: Path) -> None:
+        outcomes = iter([False, False, True])
+        _spawner, _sink, ports = self._ports(durable=lambda _s, _p: next(outcomes))
+        kwargs = _launch_kwargs(tmp_path)
+        state = kwargs["state"]
+        for _ in range(2):
+            state = _do_launch(ports=ports, **{**kwargs, "state": state})[2]
+        assert state.launch_to_resolve_page_defers == 2
+        pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert pid is not None and done is True
+        assert state.launch_to_resolve_page_defers == 0
+
+    def test_the_with_id_path_never_defers(self, tmp_path: Path) -> None:
+        _spawner, _sink, ports = self._ports()
+        ports = replace(ports, probe_open_intent_with_id=lambda *a, **kw: True)
+        pid, _log, state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert pid is not None and done is True
+        assert state.launch_to_resolve_page_defers == 0
+
+    def test_boot_retry_defers_three_polls_then_spawns_with_the_error_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        common = _midday_watch_common_kwargs(tmp_path)
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            for _ in range(3):
+                _pid, _log, state = _do_boot_retry(
+                    ports=ports,
+                    state=state,
+                    now=_utc(17, 10),
+                    tracked_pid=None,
+                    node_log=None,
+                    **common,
+                )
+                assert spawner.calls == []
+                assert state.boot_retry_attempts == 0
+            pid, _log, state = _do_boot_retry(
+                ports=ports,
+                state=state,
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **common,
+            )
+        assert pid is not None
+        assert len(spawner.calls) == 1
+        assert state.launch_to_resolve_page_defers == 0
+        assert [r.getMessage() for r in caplog.records].count(self._OVERFLOW) == 1
+
+    def test_boot_retry_defer_late_in_its_window_spawns_immediately(self, tmp_path: Path) -> None:
+        spawner, _sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        now = dt.datetime.combine(_DAY + dt.timedelta(days=1), dt.time(0, 59, 30), tzinfo=dt.UTC)
+        pid, _log, _state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert pid is not None and len(spawner.calls) == 1
+
+    def test_two_deferred_boot_retry_polls_send_the_first_attempt_warn_once(
+        self, tmp_path: Path
+    ) -> None:
+        _spawner, sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        common = _midday_watch_common_kwargs(tmp_path)
+        for _ in range(2):
+            _pid, _log, state = _do_boot_retry(
+                ports=ports,
+                state=state,
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **common,
+            )
+        warns = [p for p in sink.payloads if p.detail == AlertDetail.BOOT_RETRY_FIRST_ATTEMPT.value]
+        assert len(warns) == 1
+        assert state.boot_retry_first_attempt_alert_sent is True
