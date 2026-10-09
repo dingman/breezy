@@ -74,6 +74,7 @@ from breezy.analysis.multisource_blend_features import (
     assemble_feature_row,
 )
 from breezy.persistence.archive_cache import ArchiveCache
+from breezy.persistence.archive_cache_readonly import ReadOnlyArchiveCache
 from breezy.persistence.us_source_request import (
     US_LAMP_MDL_SOURCE,
     US_LAV_IEM_SOURCE,
@@ -171,18 +172,9 @@ _REFUSALS: Final[tuple[type[Exception], ...]] = (
 _CAUGHT: Final[tuple[type[Exception], ...]] = (BuildRefusal, *_REFUSALS)
 
 
-class _NoClock:
-    def timestamp_ns(self) -> int:
-        return 0
-
-
-def _refuse_fetch(_request: object) -> bytes:
-    raise RuntimeError("the feature builder never fetches; every payload must already be on disk")
-
-
 def read_only_cache(root: Path) -> ArchiveCache:
-    """An ``ArchiveCache`` that can only read: any miss would call a fetcher that always refuses."""
-    return ArchiveCache(root, fetch=_refuse_fetch, clock=_NoClock())
+    """A snapshot-memoized ``ArchiveCache`` that can only read (each manifest parsed once)."""
+    return ReadOnlyArchiveCache(root)
 
 
 # ------------------------------------------------------------------ configuration and path guards
