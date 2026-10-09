@@ -31,3 +31,16 @@ A read-only simulation of the builder over the full window gives observed ⊆ pr
 **Update to item 7 (2026-10-09 ~00:05Z):**
 - Done: GFS MOS 2026-01-01..2026-07-01 (end exclusive) was fetched into the iem-mos cache via `iem_mos_backfill.py --start/--end`. That is 5 stations × 15,204 rows, rc 0. Report: `quarantine/run-reports-2026-10-08/gfs_mos_2026h1_1009.json`.
 - Still to check: whether the builder reads partial-range keys. The `--draft-scratch` build's `mos_coverage_gap_days` will show it.
+
+## Correction after the draft build (2026-10-09 evening; mle-reviewer, read-only)
+
+**The claim "observed ⊆ proposed" was false.** The full `--draft-scratch` build (5 stations, 2021-01-01..2026-06-30, EXIT=0) also observed an NBP break on **2026-01-01**. That break is a **builder bug**, not an NBM change:
+- `nbp_version_breaks` (`multisource_blend_inputs_report.py:69-76`) compares each row with the station's previous row, across gaps.
+- KNYC has no 2025 rows (`obs_excluded_station_years`). Its v4.2 row on 2024-12-31 is therefore followed directly by a v4.3 row on 2026-01-01.
+- A fix is in progress (TDD): breaks are counted only between consecutive climate days. **Re-run the draft build after the fix merges, before the freeze.**
+
+**`mos_coverage_gap_days` = 15** is 5 stations × 2020-12-29..31. The MOS runtime lookback reaches 3 days before the window, but the archive starts on 2021-01-01. This is benign: it touches only the first rows of 2021. It is **accepted, not backfilled.** The 2026 H1 backfill is confirmed read.
+
+**2022-08-11 (PFM LOT layout).** The builder detects only LAMP and NBP breaks, so this break is unobservable by design. Keep it, labelled a **manual known-break** with its ILZ104 provenance. Pinning it is conservative, because fold splitting only gets finer.
+
+**Recommended list (unchanged):** `["2022-08-11","2023-01-18","2024-05-15","2024-05-16","2025-05-28","2026-03-29","2026-03-30","2026-03-31","2026-05-06"]`. Do not add 2026-01-01.
