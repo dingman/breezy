@@ -139,7 +139,10 @@ def test_iem_leg_backs_off_on_rate_limit_or_server_error(
     feeds: dict[str, Any] = {f"fetch_{source}": feed}
     ctx = make_ctx(tmp_path, clock, rec, **feeds)
     report = col.run_cycle(source, ctx)
-    assert report.status is col.CycleStatus.ERROR
+    rate_limited = failure in {"429", "ratelimited"}
+    # a 429 back-off is expected, alerted and self-healing: BACKED_OFF, exit 0 (5xx/403 stay errors)
+    assert report.status is (col.CycleStatus.BACKED_OFF if rate_limited else col.CycleStatus.ERROR)
+    assert report.exit_code == (0 if rate_limited else 1)
     assert len(calls) == 2  # the pass stopped at the failing station
     assert [a[0] for a in rec.alerts] == ["rate_limited"]
     assert any(e["kind"] == "backoff" for e in _events(tmp_path, SOURCES[source]))
@@ -218,3 +221,59 @@ def test_obs_successful_firing_resets_the_transport_failure_streak(tmp_path: Pat
         clock.now = DAY + (7 + index) * HOUR + 58 * MIN
         col.run_cycle("obs", ctx)
     assert not [a for a in rec.alerts if a[0] == "rate_limited"]
+
+
+# ----------------------------------------------------------------- 5. 429 back-off exits 0
+
+
+@pytest.mark.parametrize("source", ["lav", "mos"])
+def test_a_pure_429_backoff_exits_zero_with_backed_off_status_alert_and_ledger_record(
+    tmp_path: Path, source: str
+) -> None:
+    clock, rec = FakeClock(DAY + 8 * HOUR + 20 * MIN), Recorder()
+
+    def feed(_station: str, _run: int) -> Any:
+        raise RateLimitedError("429", retry_after=None)
+
+    feeds: dict[str, Any] = {f"fetch_{source}": feed}
+    ctx = make_ctx(tmp_path, clock, rec, **feeds)
+    report = col.run_cycle(source, ctx)
+    assert report.status is col.CycleStatus.BACKED_OFF
+    assert report.exit_code == 0
+    assert [a[0] for a in rec.alerts] == ["rate_limited"]
+    assert [e for e in _events(tmp_path, SOURCES[source]) if e["kind"] == "backoff"]
+
+
+def test_a_429_on_one_station_and_a_transport_error_on_another_still_exits_one(
+    tmp_path: Path,
+) -> None:
+    clock, rec = FakeClock(DAY + 8 * HOUR + 20 * MIN), Recorder()
+    calls: list[str] = []
+
+    def feed(station: str, _run: int) -> Any:
+        calls.append(station)
+        if len(calls) == 1:
+            raise OSError("timed out")
+        raise RateLimitedError("429", retry_after=None)
+
+    report = col.run_cycle("lav", make_ctx(tmp_path, clock, rec, fetch_lav=feed))
+    assert report.status is col.CycleStatus.ERROR
+    assert report.exit_code == 1
+    assert [a[0] for a in rec.alerts] == ["rate_limited"]
+
+
+def test_a_429_after_collected_rows_reports_backed_off_not_collected(tmp_path: Path) -> None:
+    from tests.unit.test_us_source_lag_legs import _csv
+
+    clock, rec = FakeClock(DAY + 8 * HOUR + 20 * MIN), Recorder()
+    calls: list[str] = []
+
+    def feed(station: str, run: int) -> Any:
+        calls.append(station)
+        if len(calls) == 1:
+            return col.FetchedPayload(_csv(station, run, "LAV"), clock(), None, "iem")
+        raise RateLimitedError("429", retry_after=None)
+
+    report = col.run_cycle("lav", make_ctx(tmp_path, clock, rec, fetch_lav=feed))
+    assert report.status is col.CycleStatus.BACKED_OFF
+    assert report.exit_code == 0
