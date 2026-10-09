@@ -253,6 +253,14 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "written last",
         "replace_atomic",
     ),
+    # AUT-6 WP3 S4 (plan r15 section 3.9, LOW-2): the one operator-run writer in the health tree.
+    FileWriter(
+        "evidence/unit_health/buildside_restart/<YYYY-MM-DD>/<ts_ns>_<unit>.json",
+        "the build-side implementer only, by `breezy-autonomy-health --mark-buildside-restart` "
+        "immediately before a daemon restart (unit_health_daemons.write_buildside_marker: "
+        "write_once, 0444; never rewritten or deleted, no autonomy code path writes it)",
+        "write_once",
+    ),
     FileWriter(
         "evidence/unit_health/memavail_<YYYY-MM-DD>.jsonl",
         "the breezy-autonomy-health pass only, under .health.lock (one fsynced O_APPEND line per "

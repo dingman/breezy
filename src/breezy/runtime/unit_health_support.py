@@ -10,9 +10,10 @@ from typing import Final
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, default_alerts_root
 from breezy.runtime.alert_proof import enqueue_alert
+from breezy.runtime.unit_health_daemon_support import PAGED_FINDING_EVENTS
 from breezy.runtime.unit_health_journal import run_bounded
 from breezy.runtime.unit_health_model import WorktreesUnavailable, is_explained
-from breezy.runtime.unit_health_store import HealthStore
+from breezy.runtime.unit_health_store import HealthStore, safe_key
 
 HEALTH_WRITER: Final = "health"
 #: Row #24: WARN until this date, CRITICAL from it (``detector_catalog``).
@@ -75,7 +76,8 @@ def unexplained_for_day(
     store: HealthStore, day: str, delivered: Callable[[str, str], bool]
 ) -> tuple[str, ...]:
     """``<unit>__<key>`` of every failure of ``day`` lacking a class and a proven action, plus
-    every ``journal_blind`` finding (the journal cannot show that failure: never explained)."""
+    every ``journal_blind`` finding (the journal cannot show that failure: never explained) and
+    every daemon or intraday-stage finding whose alert is not proven delivered (S4)."""
     names: list[str] = []
     for body in store.class_records_on(day):
         unit, invocation = str(body.get("unit")), str(body.get("invocation_id"))
@@ -83,6 +85,11 @@ def unexplained_for_day(
             names.append(f"{unit}__{invocation}")
     for body in store.finding_records_on(day, EVENT_JOURNAL_BLIND):
         names.append(f"{body.get('unit')}__{body.get('key')}")
+    for event in PAGED_FINDING_EVENTS:
+        for body in store.finding_records_on(day, event):
+            unit, key = str(body.get("unit")), str(body.get("key"))
+            if not is_explained(body, store.read_action(unit, safe_key(key)), delivered):
+                names.append(f"{unit}__{key}")
     return tuple(sorted(names))
 
 

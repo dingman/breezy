@@ -314,7 +314,8 @@ def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None
     # 31: AUT-6 WP1 adds the delivery-journal and the durable-outbox rows (evidence/alerts/**).
     # 32: AUT-6 WP2 adds the write-once armed marker row (evidence/alerts/armed.json).
     # 35: AUT-6 WP3 S3 adds the unit health rows (records, replaced state, MemAvailable samples).
-    assert len(paths) == len(set(paths)) == 35
+    # 36: AUT-6 WP3 S4 adds the build-side restart marker row (the --mark-buildside-restart CLI).
+    assert len(paths) == len(set(paths)) == 36
 
 
 def test_the_aut6_alert_rows_name_the_outbox_and_record_writers() -> None:

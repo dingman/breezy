@@ -28,5 +28,17 @@ def run_skeleton(argv: Sequence[str] | None = None) -> int:
     return EX_CONFIG
 
 
+def run_mark_buildside(argv: Sequence[str]) -> int:
+    """``--mark-buildside-restart <unit> --reason <text> --commit <sha>`` (plan section 3.9,
+    LOW-2): the write-once marker, run by the build-side implementer before a daemon restart.
+
+    The writer lives in ``unit_health_daemons`` (imported lazily so the skeleton stays inert);
+    S6 routes the real ``main`` to this subcommand.
+    """
+    from breezy.runtime.unit_health_daemons import run_mark_buildside_restart
+
+    return run_mark_buildside_restart(argv)
+
+
 if __name__ == "__main__":
     raise SystemExit(run_skeleton())

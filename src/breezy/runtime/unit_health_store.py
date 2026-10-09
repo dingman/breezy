@@ -45,6 +45,17 @@ _FILE_MODE: Final = 0o600
 _ALERT_RECORD_RE: Final = re.compile(r"\d+_[a-z0-9_]{1,64}_d\.json")
 _DELIVERY_SCHEMA: Final = "alert_delivery/v1"
 _ALERT_DAYS: Final = 3
+_KEY_UNSAFE: Final = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def safe_key(key: str) -> str:
+    """The file-name form of a finding key (the class and action records are named by it)."""
+    return _KEY_UNSAFE.sub("_", key)
+
+
+def finding_site(kind: str, unit: str, key: str) -> str:
+    """The alert ``site`` of a finding: the delivered-record lookup keys on ``(kind, site)``."""
+    return f"{kind}:{unit}:{safe_key(key)}"
 
 
 def day_of_ns(ts_ns: int) -> str:

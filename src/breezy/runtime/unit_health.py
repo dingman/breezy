@@ -50,6 +50,8 @@ from breezy.runtime.autonomy_sandbox.bus_handoff import (
     BusSnapshotError,
     read_bus_snapshot,
 )
+from breezy.runtime.unit_health_daemon_support import DaemonWiring, SubprocessDaemonJournal
+from breezy.runtime.unit_health_daemons import run_daemon_rules
 from breezy.runtime.unit_health_journal import (
     MIN_CALL_S,
     PER_CALL_CAP_S,
@@ -85,7 +87,9 @@ from breezy.runtime.unit_health_store import (
     alerts_delivered,
     day_of_ns,
     day_start_s,
+    finding_site,
     previous_day,
+    safe_key,
 )
 from breezy.runtime.unit_health_support import (
     DRIFT_CRITICAL_FROM,
@@ -139,7 +143,6 @@ MEMORY_ADDBACK_UNITS: Final = frozenset(
 #: ``systemctl show`` prints an unset ``MemoryCurrent`` as 2**64 - 1.
 _MEMORY_UNSET_FROM: Final = 2**63
 _INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
-_KEY_SAFE: Final = re.compile(r"[^A-Za-z0-9_.-]")
 _HOST: Final = "_host"
 _LOST_CURSOR_DAYS: Final = 2
 _DAY_S: Final = 86_400
@@ -159,6 +162,7 @@ def production_env(
         alert=enqueue_health_alert(alerts),
         delivered=alerts_delivered(alerts),
         invocation_id=env_map.get("INVOCATION_ID", ""),
+        daemons=DaemonWiring(SubprocessDaemonJournal(), alerts_root=alerts),
     )
 
 
@@ -200,6 +204,8 @@ class _Scan:
     drift: tuple[DriftFinding, ...] = ()
     reasons: list[str] = field(default_factory=list)
     blocking: bool = False
+    #: Replaced-state fields of ``seen/<unit>.json`` the S4 rules stage for the commit step.
+    daemon_seen: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _site(unit: str, invocation: str) -> str:
@@ -415,28 +421,70 @@ class _Pass:
         if invocation not in recent:
             recent.append(invocation)
 
-    def commit_finding(self, kind: str, unit: str, key: str, severity: str, detail: str) -> None:
-        """One class record and one enqueued alert per ``(unit, key)``, ever."""
-        safe = _KEY_SAFE.sub("_", key)
+    def commit_finding(
+        self,
+        kind: str,
+        unit: str,
+        key: str,
+        severity: str,
+        detail: str,
+        extra: Mapping[str, object] | None = None,
+        *,
+        page: bool = True,
+    ) -> None:
+        """One class record and one enqueued alert per ``(unit, key)``, ever.
+
+        ``extra`` adds fields to the class record (``metrics``, ids). ``page=False`` records the
+        finding without an alert or action: for a cause the failing stage already paged itself.
+        """
+        safe = safe_key(key)
         self.scan.days.add(self.today)
         self.store.write_class(
-            self.today,
-            unit,
-            safe,
-            {
-                "schema": "unit_health_class/v1",
-                "kind": "finding",
-                "finding": kind,
-                "unit": unit,
-                "key": key,
-                "severity": severity,
-                "day": self.today,
-            },
+            self.today, unit, safe, self.finding_body(kind, unit, key, severity, extra)
         )
-        if self.store.has_action(unit, safe):
+        if not page or self.store.has_action(unit, safe):
             return
-        site = f"{kind}:{unit}:{safe}"
+        site = finding_site(kind, unit, key)
         self.enqueue(AlertPayload(severity, kind, site, detail))
+        self.write_finding_action(unit, safe, kind, site, severity)
+        self.scan.new_findings += 1
+
+    def commit_cited_finding(
+        self,
+        kind: str,
+        unit: str,
+        key: str,
+        severity: str,
+        cite_event: str,
+        cite_site: str,
+        extra: Mapping[str, object] | None = None,
+    ) -> None:
+        """A class record whose action record cites an alert already delivered for the episode."""
+        safe = safe_key(key)
+        self.scan.days.add(self.today)
+        self.store.write_class(
+            self.today, unit, safe, self.finding_body(kind, unit, key, severity, extra)
+        )
+        if not self.store.has_action(unit, safe):
+            self.write_finding_action(unit, safe, cite_event, cite_site, severity)
+
+    def finding_body(
+        self, kind: str, unit: str, key: str, severity: str, extra: Mapping[str, object] | None
+    ) -> dict[str, Any]:
+        return {
+            **(extra or {}),
+            "schema": "unit_health_class/v1",
+            "kind": "finding",
+            "finding": kind,
+            "unit": unit,
+            "key": key,
+            "severity": severity,
+            "day": self.today,
+        }
+
+    def write_finding_action(
+        self, unit: str, safe: str, event: str, site: str, severity: str
+    ) -> None:
         self.store.write_action(
             self.today,
             unit,
@@ -446,14 +494,13 @@ class _Pass:
                 "kind": "finding",
                 "unit": unit,
                 "invocation_id": safe,
-                "event": kind,
+                "event": event,
                 "site": site,
                 "severity": severity,
                 "action": "ALERT",
                 "enqueued_ns": self.env.now_ns(),
             },
         )
-        self.scan.new_findings += 1
 
     # ---- reconciliation (F2)
 
@@ -537,17 +584,26 @@ class _Pass:
                 self.commit_finding(
                     EVENT_CONFIG_DRIFT, finding.unit, key, finding.severity, finding.detail
                 )
+        if observation is not None:
+            run_daemon_rules(self, observation)
 
     def commit_state(self) -> None:
         batch = self.scan.batch
         if batch is None:
             return
-        for unit, invocations in sorted(self.scan.touched.items()):
+        for unit in sorted(set(self.scan.touched) | set(self.scan.daemon_seen)):
             previous = self.store.read_seen(unit) or {}
-            recent = [*previous.get("invocations", []), *invocations]
+            recent = [*previous.get("invocations", []), *self.scan.touched.get(unit, [])]
             deduped = list(dict.fromkeys(recent))[-RECENT_INVOCATIONS_KEPT:]
             self.store.write_seen(
-                unit, {"schema": "unit_health_seen/v1", "unit": unit, "invocations": deduped}
+                unit,
+                {
+                    **previous,
+                    **self.scan.daemon_seen.get(unit, {}),
+                    "schema": "unit_health_seen/v1",
+                    "unit": unit,
+                    "invocations": deduped,
+                },
             )
         end = batch.end_cursor or (batch.entries[-1].cursor if batch.entries else None)
         if end is not None:

@@ -9,6 +9,7 @@ from typing import Final
 
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.autonomy_sandbox.bus_handoff import BusSnapshot
+from breezy.runtime.unit_health_daemon_support import DaemonWiring
 from breezy.runtime.unit_health_journal import JournalSource
 from breezy.runtime.unit_health_store import HealthStore
 from breezy.runtime.unit_health_support import DriftFinding, default_worktrees, read_meminfo
@@ -71,3 +72,5 @@ class PassEnv:
     #: ``None`` skips the drift check (no committed baseline was readable): inconclusive.
     committed_dropins: Mapping[str, frozenset[str]] | None = None
     invocation_id: str = ""
+    #: The daemon and intraday-stage rules' seams (S4); ``None`` skips them.
+    daemons: DaemonWiring | None = None
