@@ -67,12 +67,17 @@ def truth_concordance(f2: Path | None, truth: Mapping[tuple[str, dt.date], Any])
 
 
 def nbp_version_breaks(rows: Sequence[msb.FeatureRow]) -> list[str]:
-    last: dict[str, str] = {}
+    """Days where a station's NBM version differs from its previous consecutive climate day.
+
+    A change across a station-day gap (e.g. KNYC has no 2025 rows) is not an observed break.
+    """
+    last: dict[str, tuple[dt.date, str]] = {}
     breaks: set[str] = set()
     for row in sorted(rows, key=lambda r: (r.station, r.climate_day)):
-        if row.station in last and last[row.station] != row.version:
+        prev = last.get(row.station)
+        if prev is not None and prev[1] != row.version and (row.climate_day - prev[0]).days <= 1:
             breaks.add(row.climate_day.isoformat())
-        last[row.station] = row.version
+        last[row.station] = (row.climate_day, row.version)
     return sorted(breaks)
 
 
