@@ -8425,7 +8425,6 @@ class TestDoLaunchOverAnOpenIntent:
     def test_resolvable_with_id_spawns_once_with_a_warn_and_no_refusal_alert(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        from breezy.runtime.trade_supervisor_core import OpenIntentShape
 
         spawner = FakeSpawner()
         sink = _RecordingAlertSink()
@@ -8434,7 +8433,7 @@ class TestDoLaunchOverAnOpenIntent:
             alert_sink=sink,
             probe_open_intent_state=lambda *a, **kw: True,
             probe_open_intent_resolvable=lambda *a, **kw: True,
-            probe_open_intent_shape=lambda *a, **kw: OpenIntentShape.WITH_ID,
+            probe_open_intent_with_id=lambda *a, **kw: True,
         )
         with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
             pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
@@ -8456,7 +8455,6 @@ class TestDoLaunchOverAnOpenIntent:
     def test_resolvable_no_id_shapes_each_spawn_once_with_one_critical(
         self, tmp_path: Path, shape_name: str
     ) -> None:
-        from breezy.runtime.trade_supervisor_core import OpenIntentShape
 
         spawner = FakeSpawner()
         sink = _RecordingAlertSink()
@@ -8465,7 +8463,7 @@ class TestDoLaunchOverAnOpenIntent:
             alert_sink=sink,
             probe_open_intent_state=lambda *a, **kw: True,
             probe_open_intent_resolvable=lambda *a, **kw: True,
-            probe_open_intent_shape=lambda *a, **kw: OpenIntentShape[shape_name],
+            probe_open_intent_with_id=lambda *a, **kw: False,
         )
         _do_launch(ports=ports, **_launch_kwargs(tmp_path))
         assert len(spawner.calls) == 1
@@ -8490,7 +8488,7 @@ class TestDoLaunchOverAnOpenIntent:
             alert_sink=sink,
             probe_open_intent_state=lambda *a, **kw: True,
             probe_open_intent_resolvable=lambda *a, **kw: True,
-            probe_open_intent_shape=_boom,
+            probe_open_intent_with_id=_boom,
         )
         _do_launch(ports=ports, **_launch_kwargs(tmp_path))
         assert len(spawner.calls) == 1
@@ -8538,10 +8536,8 @@ class TestDoLaunchOverAnOpenIntent:
 
 class TestBootRetryOverAnOpenIntent:
     def _run(
-        self, tmp_path: Path, *, resolvable: bool, shape: Any = None
+        self, tmp_path: Path, *, resolvable: bool, with_id: bool = True
     ) -> tuple[FakeSpawner, _RecordingAlertSink]:
-        from breezy.runtime.trade_supervisor_core import OpenIntentShape
-
         spawner = FakeSpawner()
         sink = _RecordingAlertSink()
         ports = _make_ports(
@@ -8550,7 +8546,7 @@ class TestBootRetryOverAnOpenIntent:
             intent_lock_free=lambda _p: True,
             probe_open_intent_state=lambda *a, **kw: True,
             probe_open_intent_resolvable=lambda *a, **kw: resolvable,
-            probe_open_intent_shape=lambda *a, **kw: shape or OpenIntentShape.WITH_ID,
+            probe_open_intent_with_id=lambda *a, **kw: with_id,
         )
         _do_boot_retry(
             ports=ports,
@@ -8573,9 +8569,8 @@ class TestBootRetryOverAnOpenIntent:
         assert AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE.value in [p.detail for p in sink.payloads]
 
     def test_no_id_shape_pages_critical_at_the_boot_retry_launch_too(self, tmp_path: Path) -> None:
-        from breezy.runtime.trade_supervisor_core import OpenIntentShape
 
-        spawner, sink = self._run(tmp_path, resolvable=True, shape=OpenIntentShape.NO_ID)
+        spawner, sink = self._run(tmp_path, resolvable=True, with_id=False)
         assert len(spawner.calls) == 1
         assert (
             "TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID",
@@ -8611,15 +8606,14 @@ class TestExistingIntentOpenPinsHoldWithDefaultPorts:
         assert spawner.calls == []
 
     def test_default_shape_probe_fails_toward_the_louder_alert(self) -> None:
-        from breezy.runtime.trade_supervisor_core import OpenIntentShape
 
         ports = _make_ports()
-        assert ports.probe_open_intent_shape("p", node_pid=None) is OpenIntentShape.UNKNOWN
+        assert ports.probe_open_intent_with_id("p", node_pid=None) is False
 
     def test_default_ports_wires_the_real_probes(self) -> None:
         ports = _ts_module.default_ports(alert_sink=_RecordingAlertSink())
         assert ports.probe_open_intent_resolvable is _ts_module.probe_open_intent_resolvable
-        assert ports.probe_open_intent_shape is _ts_module.probe_open_intent_shape
+        assert ports.probe_open_intent_with_id is _ts_module.probe_open_intent_is_with_id
 
     def test_no_supervisor_alert_detail_says_operator(self) -> None:
         values = [member.value for member in AlertDetail]

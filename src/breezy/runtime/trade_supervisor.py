@@ -1147,9 +1147,9 @@ class SupervisorPorts:
     #: set refusing on an OPEN intent exactly as before (resolvable False)
     #: and fail toward the louder alert (shape UNKNOWN).
     probe_open_intent_resolvable: Callable[..., bool] = field(default=lambda *a, **kw: False)
-    probe_open_intent_shape: Callable[..., OpenIntentShape] = field(
-        default=lambda *a, **kw: OpenIntentShape.UNKNOWN
-    )
+    #: ``True`` iff the OPEN intent is a with-id shape (the only shape whose
+    #: alert is a WARN). Default ``False`` fails toward the louder CRITICAL.
+    probe_open_intent_with_id: Callable[..., bool] = field(default=lambda *a, **kw: False)
 
 
 def _boot_alert_sink() -> AlertSink:
@@ -1183,7 +1183,7 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         resolve_sending_family_id=resolve_sending_family_id,
         read_continuous_family_store_state=read_continuous_family_store_state,
         probe_open_intent_resolvable=probe_open_intent_resolvable,
-        probe_open_intent_shape=probe_open_intent_shape,
+        probe_open_intent_with_id=probe_open_intent_is_with_id,
     )
 
 
@@ -1255,6 +1255,12 @@ def _do_stop_prior(
     return None
 
 
+def probe_open_intent_is_with_id(store_path: Path, *, node_pid: int | None) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A, DH1] ``True`` iff
+    :func:`probe_open_intent_shape` classifies the OPEN intent ``WITH_ID``."""
+    return probe_open_intent_shape(store_path, node_pid=node_pid) is OpenIntentShape.WITH_ID
+
+
 def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> None:
     """[AMBIG-LATCH-RESUME Phase A, CM1/DH1] Log the decision and alert by the
     OPEN intent's shape before the launch proceeds over it.
@@ -1265,11 +1271,11 @@ def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> 
     names no operator). A shape probe that raises is ``UNKNOWN``.
     """
     try:
-        shape = ports.probe_open_intent_shape(store_path, node_pid=None)
+        with_id = bool(ports.probe_open_intent_with_id(store_path, node_pid=None))
     except Exception:  # noqa: BLE001 -- deliberate: fail toward the louder alert.
-        shape = OpenIntentShape.UNKNOWN
-    log_decision("launch_to_resolve_open_intent", shape=shape.value)
-    if shape is OpenIntentShape.WITH_ID:
+        with_id = False
+    log_decision("launch_to_resolve_open_intent", shape="with_id" if with_id else "not_with_id")
+    if with_id:
         alert(
             ports.alert_sink,
             event="TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE",
