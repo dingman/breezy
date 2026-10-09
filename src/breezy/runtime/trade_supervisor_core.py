@@ -334,6 +334,18 @@ class AlertDetail(str, Enum):
     #: :func:`decide_ready_adoption_alert`.
     READY_ADOPTION_DEFERRED = "ready_adoption_deferred"
     READY_ADOPTION_UNPROVEN = "ready_adoption_unproven"
+    #: [AMBIG-LATCH-RESUME Phase A, CM1/DH1] The launch went ahead over a
+    #: decodable OPEN submit intent so the node's resolver can retire it
+    #: (instead of the L-48 refuse-and-strand). The first is the with-id case
+    #: (the existing GET resolver handles it); the second is a no-id,
+    #: no-context or unknown shape, whose automated next step is the node's
+    #: no-id resolver. Neither names an operator.
+    INTENT_OPEN_LAUNCH_TO_RESOLVE = "intent_open_launch_to_resolve"
+    INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID = "intent_open_launch_to_resolve_no_id"
+    #: [AMBIG-LATCH-RESUME Phase A review] The supervisor could not write its
+    #: decode marker; any stale marker was discarded, so a node fails closed on
+    #: the new retirement reason until the next supervisor start.
+    DECODE_MARKER_WRITE_FAILED = "decode_marker_write_failed"
 
 
 class StopPriorAction(str, Enum):
@@ -350,6 +362,22 @@ class LaunchAction(str, Enum):
     LAUNCH = "launch"
     REFUSE_INTENT_OPEN = "refuse_intent_open"
     REFUSE_LOCK_HELD = "refuse_lock_held"
+    #: [AMBIG-LATCH-RESUME Phase A, CM1] An OPEN intent that DECODES: launch
+    #: the node anyway so its resolver can retire the intent. Never returned
+    #: for a corrupt singleton (the resolver treats corrupt as OPEN-unknown).
+    LAUNCH_TO_RESOLVE = "launch_to_resolve"
+
+
+class OpenIntentShape(str, Enum):
+    """[AMBIG-LATCH-RESUME Phase A, DH1] What the supervisor can tell about an
+    OPEN submit intent from the durable resolver context alone. Selects the
+    alert severity at ``LAUNCH_TO_RESOLVE``; ``UNKNOWN`` is the fail-loud
+    default."""
+
+    WITH_ID = "with_id"
+    NO_ID = "no_id"
+    NO_CONTEXT = "no_context"
+    UNKNOWN = "unknown"
 
 
 class RelaunchCause(str, Enum):
@@ -535,15 +563,28 @@ def decide_stop_prior_action(
     return StopPriorAction.REFUSE_ALERT
 
 
-def decide_launch_action(*, lock_free: bool, open_intent_detected: bool) -> LaunchAction:
+def decide_launch_action(
+    *,
+    lock_free: bool,
+    open_intent_detected: bool,
+    open_intent_resolvable: bool = False,
+) -> LaunchAction:
     """[R6/B1] Launch only when the intent flock is free and no OPEN intent
     blocks ``arm`` -- lock state is checked first: an OPEN-intent probe must
     never run while a node may still hold the store open (see
     :func:`assert_no_live_node_before_intent_probe`), and a free flock is the
-    caller's evidence that no node is running."""
+    caller's evidence that no node is running.
+
+    [AMBIG-LATCH-RESUME Phase A, CM1] An OPEN intent that is ``resolvable``
+    (the singleton decodes) launches to resolve instead of refusing: only a
+    running node's resolver can retire it, so refusing strands it (L-48). The
+    default ``open_intent_resolvable=False`` keeps every pre-existing caller's
+    refusal unchanged."""
     if not lock_free:
         return LaunchAction.REFUSE_LOCK_HELD
     if open_intent_detected:
+        if open_intent_resolvable:
+            return LaunchAction.LAUNCH_TO_RESOLVE
         return LaunchAction.REFUSE_INTENT_OPEN
     return LaunchAction.LAUNCH
 
