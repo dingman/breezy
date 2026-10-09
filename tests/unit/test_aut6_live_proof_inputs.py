@@ -32,6 +32,21 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def _decision(ts: str, kind: str, reason: str | None, *, ansi: bool = False) -> str:
+    """A real node-log line: Nautilus grammar, ``SHADOW_DECISION`` and the strategy's dict repr."""
+    fields = (
+        "{'now_ns': 1793570410000000000, 'station': 'KSFO', "
+        "'climate_day': datetime.date(2026, 11, 1), 'rung_id': 'r1', 'side': 'no', "
+        "'instrument_id': 'KSFO-R1.POLYMARKET_US', 'kind': '" + kind + "'"
+    )
+    if kind == "Take":
+        fields += ", 'qty': 1, 'ev_net': 0.1, 'p_hat': 0.5, 'p_lower': 0.4, 'p_upper': 0.6}"
+    else:
+        fields += f", 'reason': '{reason}'}}"
+    pre, post = ("\x1b[1m", "\x1b[0m") if ansi else ("", "")
+    return f"{pre}{ts}{post} [INFO] TradingNode.Strat: SHADOW_DECISION {fields}\n"
+
+
 def _seed(root: Path) -> None:
     day = ASOF - dt.timedelta(days=1)
     end = int(dt.datetime.combine(ASOF, dt.time(), dt.UTC).timestamp()) * NS
@@ -66,7 +81,9 @@ def _seed(root: Path) -> None:
     log.write_text(
         f"2026-11-01 14:00:00,000 [INFO] breezy.app.trade.boot: live-trading permit issued "
         f"issued_at_ns=1 expires_at_ns={expiry} ttl_s=36000\n"
-        "2026-11-01T22:00:10.000000000Z [INFO] x: entry_veto reason=permit_lapsed\n",
+        + _decision("2026-11-01T22:00:10.000000000Z", "TrySubmit", "permit_lapsed", ansi=True)
+        + _decision("2026-11-01T22:00:11.000000000Z", "TrySubmit", "submitted")
+        + _decision("2026-11-01T22:00:12.000000000Z", "Take", None),
         encoding="utf-8",
     )
 
@@ -82,6 +99,7 @@ def test_loader_builds_report_from_evidence_and_writes_nothing(tmp_path: Path) -
     assert report["verdict"] == "NOT_YET"
     assert "aut5b_ruling_not_filed" in report["blockers"]
     assert report["citations"]["rollups"] == [(ASOF - dt.timedelta(days=1)).isoformat()]
+    assert report["citations"]["veto_lines"] == ["breezy-trade-20261101T000000Z.log:2"]
     assert report["citations"]["node_logs"] == ["breezy-trade-20261101T000000Z.log"]
 
 
@@ -120,3 +138,38 @@ def test_main_writes_the_artefact_and_prints_the_verdict(tmp_path: Path) -> None
     assert code == 0
     assert len(list((out / "aut6").glob("live_proof_*.json"))) == 1
     assert sorted(os.listdir(root)) == ["evidence", "logs"]
+
+
+def test_heal_restart_time_is_detected_ns(tmp_path: Path) -> None:
+    from breezy.analysis.aut6_live_proof_inputs import load_inputs
+
+    root = tmp_path / "data"
+    day = ASOF - dt.timedelta(days=1)
+    detected = int(dt.datetime.combine(day, dt.time(10), dt.UTC).timestamp()) * NS
+    _put(
+        root,
+        f"evidence/capture/heal/{day}/h.json",
+        {
+            "decided_by": "systemd_watchdog",
+            "invocation_id": "a" * 32,
+            "unit_result": "watchdog",
+            "detected_ns": detected,
+            "healed_ns": detected + 30 * NS,
+            "observation_sha256": "b" * 64,
+        },
+    )
+    _put(
+        root,
+        f"derived/verdicts/_host/{day}/v.json",
+        {"verdict_id": "c" * 64, "detector": "aut6.unit_health", "metrics": {"x": "a" * 32}},
+    )
+    inputs, _ = load_inputs(root, ASOF)
+    assert [r.ts_ns for r in inputs.restarts] == [detected]
+    assert inputs.restarts[0].verdict_basis == "unverifiable_substring"
+    _put(
+        root,
+        f"derived/verdicts/_host/{day}/v2.json",
+        {"verdict_id": "d" * 64, "detector": "aut6.unit_health", "invocation_id": "a" * 32},
+    )
+    inputs, _ = load_inputs(root, ASOF)
+    assert (inputs.restarts[0].verdict_id, inputs.restarts[0].verdict_basis) == ("d" * 64, "field")

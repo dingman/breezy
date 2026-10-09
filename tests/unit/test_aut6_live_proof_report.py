@@ -166,6 +166,13 @@ def test_missing_or_stale_rollup_fails_the_day() -> None:
     early = _ns(stale, 12)  # produced mid-day: before the day ended
     rollups = {d.isoformat(): _rollup(d) for d in days}
     rollups[stale.isoformat()] = _rollup(stale, produced_at_ns=early)
+    boundary = _rollup(stale, produced_at_ns=_ns(stale + dt.timedelta(days=1), 0) - 601 * NS)
+    rollups[stale.isoformat()] = boundary
+    assert _report(rollups=rollups)["window"]["breaks"][0]["reasons"] == ["rollup_stale"]
+    fine = _rollup(stale, produced_at_ns=_ns(stale + dt.timedelta(days=1), 0) - 600 * NS)
+    rollups[stale.isoformat()] = fine
+    assert _report(rollups=rollups)["window"]["breaks"] == []
+    rollups[stale.isoformat()] = _rollup(stale, produced_at_ns=early)
     old = _report(rollups=rollups)["window"]
     assert old["breaks"][0]["day"] == stale.isoformat()
     assert old["breaks"][0]["reasons"] == ["rollup_stale"]

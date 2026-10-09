@@ -8,10 +8,18 @@ It never pages, never writes a store, registry or outbox, and imports no adapter
 
 Choices the plan leaves open:
 
-* **C1 EntryVeto and permit lines** are read from the node log (``entry_veto reason=<r>`` and the
-  boot's ``live-trading permit issued ... expires_at_ns=<ns>``), not decoded from the Arrow
-  capture streams: that decode loads Nautilus, past this unit's memory bound.
-* **A #21 verdict** is the ``aut6.unit_health`` verdict whose text names the ended invocation.
+* **C1 EntryVeto and permit lines** are read from the node log, not decoded from the Arrow capture
+  streams (that decode loads Nautilus, past this unit's memory bound). Deviation from plan
+  L1531/L1540, which quote ``entry_veto reason=<r>``: no producer emits that line. The strategy
+  logs ``SHADOW_DECISION {repr}`` and a refusal is a ``kind='TrySubmit'`` line whose ``reason`` is a
+  ``VetoReason`` (``capture_audit_replay._follow_up_kind`` reads it the same way). So the vetoes
+  are the ``TrySubmit`` lines ``capture_node_log_decisions.classify_line`` returns with such a
+  reason; no parser is duplicated. The boot line ``live-trading permit issued ...
+  expires_at_ns=<ns>`` gives the expiry.
+* **A #21 verdict** is the ``aut6.unit_health`` verdict with an explicit ``invocation_id`` (body or
+  metrics) equal to the ended invocation. TODO(WP4): #21's verdict shape is not written yet; until
+  it is, a verdict whose body merely contains the id matches and is marked
+  ``verdict_basis=unverifiable_substring`` in the report.
 * **Per-kill page**: the notifier marker, else a delivered record naming the invocation.
 * **Unreadable evidence is absence**: it can only fail a day or leave a class unproven.
 """
@@ -45,7 +53,9 @@ from breezy.analysis.capture_aut6_contract import (
     read_notifier_proofs,
 )
 from breezy.analysis.capture_live_proof import newest_audit_by_day
+from breezy.analysis.capture_node_log_decisions import DecisionLine, classify_line
 from breezy.persistence.autonomy.single_read import ReadPolicy, SingleReadRefused
+from breezy.persistence.autonomy.veto import VetoReason
 from breezy.runtime.capture_recorder_hook_cli import UNIT as RECORDER_UNIT
 
 __all__ = ["artefact_name", "build_report", "load_inputs", "main", "write_artefact"]
@@ -63,8 +73,6 @@ WATCHDOG_DECIDER: Final = "systemd_watchdog"
 _ROLLUP_RE: Final = re.compile(r"\Aday_(\d{4}-\d\d-\d\d)\.json\Z")
 _EXPORT_RE: Final = re.compile(r"\Aregistry_[a-z0-9_]{1,32}_\d{4}-\d\d-\d\d(?:_hwm\d+)?\.jsonl\Z")
 _PERMIT_RE: Final = re.compile(r"live-trading permit issued .*?expires_at_ns=(\d+)")
-_VETO_RE: Final = re.compile(r"entry_veto\b.*?reason=([a-z_]+)")
-_TS_RE: Final = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)(?:[.,](\d{1,9}))?")
 _LOG_NAME_RE: Final = re.compile(r"\Abreezy-trade-.*\.log(?:\.[A-Za-z0-9]+)?\Z")
 
 
@@ -184,6 +192,23 @@ def _transitions(data_root: Path) -> tuple[Mapping[str, Any], ...]:
     return tuple(rows.values())
 
 
+def _verdict_for(inv: str, health: Sequence[tuple[str, dict[str, Any]]]) -> tuple[str, str]:
+    """``(verdict_id, basis)`` of the #21 verdict of ``inv``: an explicit invocation id first."""
+    if not inv:
+        return "", "field"
+    for _ref, body in health:
+        metrics = body.get("metrics")
+        held = [body.get("invocation_id")] + (
+            [metrics.get("invocation_id")] if isinstance(metrics, dict) else []
+        )
+        if inv in held:
+            return str(body.get("verdict_id") or ""), "field"
+    for _ref, body in health:  # TODO(WP4): drop once #21's verdict carries an invocation id
+        if inv in json.dumps(body):
+            return str(body.get("verdict_id") or ""), "unverifiable_substring"
+    return "", "field"
+
+
 def _restarts(
     data_root: Path,
     days: Sequence[dt.date],
@@ -199,9 +224,7 @@ def _restarts(
             if body is None or body.get("decided_by") != WATCHDOG_DECIDER:
                 continue
             inv = str(body.get("invocation_id", ""))
-            verdict = next(
-                (b.get("verdict_id") for _r, b in health if inv and inv in json.dumps(b)), ""
-            )
+            verdict, basis = _verdict_for(inv, health)
             paged = any(
                 inv
                 and inv in f"{d.body.get('event', '')} {d.body.get('site', '')}"
@@ -211,7 +234,7 @@ def _restarts(
             marker = any(
                 p.unit == RECORDER_UNIT and p.invocation_id == inv and p.delivered for p in proofs
             )
-            ts = body.get("ts_ns")
+            ts = body.get("detected_ns")
             facts.append(
                 RestartFact(
                     RECORDER_UNIT,
@@ -224,6 +247,7 @@ def _restarts(
                     ts
                     if isinstance(ts, int)
                     else int(dt.datetime.combine(day, dt.time(), dt.UTC).timestamp()) * NS,
+                    basis,
                 )
             )
     return tuple(facts)
@@ -232,13 +256,17 @@ def _restarts(
 # -- node log -----------------------------------------------------------------------------------
 
 
-def _line_ns(line: str) -> int | None:
-    match = _TS_RE.match(line)
-    if match is None:
+_VETO_REASONS: Final = frozenset(r.value for r in VetoReason)
+
+
+def _veto_of(raw: bytes, ref: str) -> VetoFact | None:
+    """The ``EntryVeto`` a logged ``TrySubmit`` line stands for, else ``None``."""
+    event = classify_line(raw.rstrip(b"\r\n"), 0)
+    if not isinstance(event, DecisionLine) or event.kind != "TrySubmit":
         return None
-    y, mo, d, h, mi, s, frac = match.groups()
-    base = dt.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s), tzinfo=dt.UTC)
-    return int(base.timestamp()) * NS + int((frac or "0").ljust(9, "0"))
+    if event.reason not in _VETO_REASONS:
+        return None
+    return VetoFact(event.now_ns, event.reason, ref)
 
 
 def _scan_logs(
@@ -260,15 +288,13 @@ def _scan_logs(
         scanned.append(path.name)
         with path.open("rb") as handle:
             for number, raw in enumerate(handle, 1):
-                if b"permit issued" not in raw and b"entry_veto" not in raw:
-                    continue
-                line = raw.decode("utf-8", "replace")
-                if (m := _PERMIT_RE.search(line)) is not None:
-                    expiries.append(int(m[1]))
-                elif (v := _VETO_RE.search(line)) is not None and (
-                    ts := _line_ns(line)
-                ) is not None:
-                    vetos.append(VetoFact(ts, v[1], f"{path.name}:{number}"))
+                if b"permit issued" in raw:
+                    if (m := _PERMIT_RE.search(raw.decode("utf-8", "replace"))) is not None:
+                        expiries.append(int(m[1]))
+                elif b"SHADOW_DECISION" in raw:
+                    veto = _veto_of(raw, f"{path.name}:{number}")
+                    if veto is not None:
+                        vetos.append(veto)
     return tuple(expiries), tuple(vetos), scanned
 
 
@@ -316,12 +342,30 @@ def load_inputs(
         "c5_transitions": [str(t.get("transition_id")) for t in inputs.transitions],
         "c4_verdict_ids": sorted(index),
         "node_logs": logs,
+        "veto_lines": [v.ref for v in vetos],
     }
     return inputs, citations
 
 
-def build_report(data_root: Path, asof: dt.date, **kwargs: Any) -> dict[str, Any]:
-    inputs, citations = load_inputs(data_root, asof, **kwargs)
+def build_report(
+    data_root: Path,
+    asof: dt.date,
+    *,
+    aut5b_ruling_date: str | None = None,
+    ing2_amend2_landed_date: str | None = None,
+    node_log_dir: Path | None = None,
+    wp4_mechanism_proof: str | None = None,
+    new_exec_store_halt_keys: int | None = None,
+) -> dict[str, Any]:
+    inputs, citations = load_inputs(
+        data_root,
+        asof,
+        aut5b_ruling_date=aut5b_ruling_date,
+        ing2_amend2_landed_date=ing2_amend2_landed_date,
+        node_log_dir=node_log_dir,
+        wp4_mechanism_proof=wp4_mechanism_proof,
+        new_exec_store_halt_keys=new_exec_store_halt_keys,
+    )
     return {**evaluate_live_proof(inputs), "citations": citations}
 
 

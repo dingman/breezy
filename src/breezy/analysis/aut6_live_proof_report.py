@@ -10,9 +10,10 @@ Rules fixed here where the plan leaves room:
   and after the ING-2-AMEND2 landing. A failed day (section 6) restarts the run. A healthy day
   with no fill is neutral, as in AUT-1's roll-up: it neither counts nor breaks, so zero-fill days
   extend the window. A healthy day with only canary or drill fills qualifies and adds no real fill.
-* **Rollup freshness.** Passes run every 10 minutes, so a day's final rollup is written up to one
-  interval before midnight. "Produced before the day ended" therefore means older than
-  ``ROLLUP_FINAL_GRACE_S`` before the day's end: a mid-day snapshot, not the last pass.
+* **Rollup freshness (deviation from plan L1505).** The plan says a day fails if its rollup was
+  "produced before the day ended". Passes run every 10 minutes, so a day's last pass lands up to
+  one interval before midnight: "before the day ended" is read as older than exactly one pass
+  interval (``ROLLUP_FINAL_GRACE_S`` = 600 s) before the day's end, a mid-day snapshot.
 * **Missing evidence fails.** A malformed counter, an absent rollup or an unknown halt-key count
   never reads as healthy.
 * **Verdict.** ``PROVEN`` means the whole section 6 protocol is met: evidence class "machinery
@@ -46,7 +47,7 @@ MIN_PASSES_COMPLETED: Final = 130
 MAX_PASSES_UNKNOWN: Final = 6
 UNKNOWN_STREAK_PAGE_AT: Final = 3
 PERMIT_VETO_WITHIN_NS: Final = 120 * NS
-ROLLUP_FINAL_GRACE_S: Final = 1200
+ROLLUP_FINAL_GRACE_S: Final = 600
 ACTION_CLASSES: Final = ("ENTRY_VETO", "ALERT", "SELF_HEAL", "DEMOTE", "HALT")
 RECORDER_UNITS: Final = frozenset({"breezy-quote-tape", "breezy-quote-tape.service"})
 MONITOR_STALE_DETECTOR: Final = "aut6.health_monitor_stale"
@@ -94,6 +95,10 @@ class RestartFact:
     notifier_delivered: bool
     fallback_page_delivered: bool
     ts_ns: int
+    #: How the #21 verdict was tied to the invocation: ``field`` (an explicit invocation id in the
+    #: verdict) or ``unverifiable_substring`` (the id appears somewhere in the body; #21's shape
+    #: is WP4's and not yet written).
+    verdict_basis: str = "field"
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +307,7 @@ def _self_heal(inputs: ProofInputs, since: dt.date) -> dict[str, Any]:
             best.injected,
             [best.invocation_id, best.verdict_id],
             basis="restart",
+            verdict_basis=best.verdict_basis,
         )
     if restarts:
         return _unmet("restart_chain_incomplete")
