@@ -1847,9 +1847,19 @@ def _launch_boot_retry_child(
     repo_root: Path,
     node_bin: Path,
     log_dir: Path,
-) -> tuple[int, Path]:
+) -> tuple[int, Path] | None:
     new_log = node_log_path(log_dir, now)
-    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    try:
+        proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    except Exception as exc:  # noqa: BLE001 -- deliberate: ONLY the spawn is contained.
+        log_decision("boot_retry_spawn_failed", error_type=type(exc).__name__)
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+            severity="CRITICAL",
+            detail=AlertDetail.LAUNCH_SPAWN_FAILED,
+        )
+        return None
     _retain_spawned_child(proc)
     log_decision("boot_retry_launched", pid=proc.pid)
     return proc.pid, new_log
@@ -1905,19 +1915,12 @@ def _attempt_boot_retry_relaunch(
         # The page is not durable: no spawn this poll, and the attempt just
         # recorded is handed back (an undelivered-alert defer consumes no budget).
         return tracked_pid, node_log, state_before_attempt
-    try:
-        pid, new_log = _launch_boot_retry_child(
-            ports=ports, now=now, repo_root=repo_root, node_bin=node_bin, log_dir=log_dir
-        )
-    except Exception as exc:  # noqa: BLE001 -- deliberate: a spawn failure is contained.
-        log_decision("boot_retry_spawn_failed", error_type=type(exc).__name__)
-        alert(
-            ports.alert_sink,
-            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
-            severity="CRITICAL",
-            detail=AlertDetail.LAUNCH_SPAWN_FAILED,
-        )
+    launched = _launch_boot_retry_child(
+        ports=ports, now=now, repo_root=repo_root, node_bin=node_bin, log_dir=log_dir
+    )
+    if launched is None:  # spawn failed: logged and paged inside; the attempt stays consumed
         return tracked_pid, node_log, state
+    pid, new_log = launched
     return pid, new_log, state
 
 
