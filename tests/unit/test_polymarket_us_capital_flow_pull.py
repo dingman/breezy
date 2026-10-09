@@ -347,7 +347,7 @@ def test_imports_allowlist_no_sdk_no_exec(puller: ModuleType) -> None:
     # NAME the barred callees (as it does, to document that it avoids them)
     # without tripping a plain substring search.
     referenced = sorted(
-        node.id if isinstance(node, ast.Name) else node.attr  # type: ignore[union-attr]
+        node.id if isinstance(node, ast.Name) else node.attr
         for node in ast.walk(tree)
         if (isinstance(node, ast.Name) and node.id in _BARRED_PERMIT_CALLEES)
         or (isinstance(node, ast.Attribute) and node.attr in _BARRED_PERMIT_CALLEES)

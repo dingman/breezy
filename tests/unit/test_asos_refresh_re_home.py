@@ -143,7 +143,7 @@ def test_an_enabled_timer_invokes_the_since_anchored_asos_refresh_and_the_consum
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     sites = (
-        SiteSpec(  # type: ignore[arg-type]
+        SiteSpec(
             city="Testville", site=object(), std_utc_offset_hours=-6.0, iem_asos_id="TST"
         ),
     )

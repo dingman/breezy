@@ -37,11 +37,15 @@ import sys
 import time as _time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final, TextIO
+from typing import Final, Literal, TextIO
 
 import breezy
+from breezy.domain.exec_intent import RESOLVER_CONTEXT_KEY_PREFIX
+from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, default_alerts_root
+from breezy.runtime.alert_proof import COUNTERS as _ALERT_COUNTERS
+from breezy.runtime.alert_proof import deliver_with_proof
 from breezy.runtime.build_sha import (
     BUILD_REVISION_ENV_VAR,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
     _looks_like_git_sha,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
@@ -53,10 +57,12 @@ from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, res
 from breezy.runtime.health import (
     AlertPayload,
     AlertSink,
+    alert_egress_configured,
     emit_alert,
     log_alert_egress_status,
     resolve_alert_sink,
 )
+from breezy.runtime.process_lookup import find_pid_by_argv
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
@@ -66,12 +72,17 @@ from breezy.runtime.submit_intent import (
     SubmitIntentCorrupt,
     SubmitIntentState,
 )
+from breezy.runtime.supervisor_decode_marker import (
+    discard_supervisor_decode_marker,
+    write_supervisor_decode_marker,
+)
 from breezy.runtime.trade_supervisor_core import (
     _PERMIT_FAIL_SELF_CHECK_RESULTS,
     _SCHEDULE_POLL_INTERVAL_S,
     BOOT_RETRY_READINESS_TIMEOUT,
     CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
+    LAUNCH_WINDOW_END_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_READINESS_RECHECK_TIMEOUT,  # noqa: F401 - re-exported: moved/used via this module's namespace
     MIN_RELAUNCH_GAP,
@@ -97,6 +108,7 @@ from breezy.runtime.trade_supervisor_core import (
     LaunchAction,
     MiddayDeadAction,
     MiddayRecheckAction,
+    OpenIntentShape,
     PermitAlertAction,
     PermitAlertDecision,
     PermitCapability,
@@ -139,7 +151,7 @@ from breezy.runtime.trade_supervisor_core import (
     midday_handler_reads_log,
     midday_recheck_pending,
     midday_watch_idle,
-    midday_watch_window_end,  # noqa: F401 - re-exported: moved/used via this module's namespace
+    midday_watch_window_end,
     next_due,
     node_log_spawned_at,
     parse_permit_expiry_ns,
@@ -160,6 +172,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_boot_zero_instruments_seen,
     record_child_adopted,
     record_first_boot_permit_seen,
+    record_launch_to_resolve_page_defers,
     record_liveness_line_seen,
     record_midday_alert_sent,
     record_midday_cause_seen,
@@ -434,6 +447,58 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
         return record.state is SubmitIntentState.OPEN
 
 
+def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A, CM1] ``True`` iff the singleton DECODES
+    and is OPEN -- i.e. the node's resolver can retire it, so the supervisor
+    launches the node instead of stranding the intent (L-48).
+
+    A corrupt singleton is ``False`` (today's refusal stays): the node's
+    resolver treats corrupt as OPEN-unknown and never retires it. Same
+    no-live-node guard and fresh read-only connection as
+    :func:`probe_open_intent`; needs no adapter import and no context read.
+    """
+    assert_no_live_node_before_intent_probe(node_pid)
+    with SqliteStateStore(store_path) as store:
+        raw = store.get(CURRENT_INTENT_KEY)
+        if raw is None:
+            return False
+        try:
+            record = SubmitIntent.from_bytes(raw)
+        except SubmitIntentCorrupt:
+            return False
+        return record.state is SubmitIntentState.OPEN
+
+
+def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIntentShape:
+    """[AMBIG-LATCH-RESUME Phase A, DH1] Classify the OPEN intent by its
+    durable resolver context (one read-only ``get`` of
+    ``RESOLVER_CONTEXT_KEY_PREFIX + intent_id``), to pick the alert severity.
+
+    ``WITH_ID``: ``venueOrderId`` is a non-empty string. ``NO_ID``:
+    ``venueOrderId == ""``. ``NO_CONTEXT``: the key is absent. ``UNKNOWN``:
+    anything undecodable, an unreadable singleton or store, or any exception
+    -- the fail-loud direction. Same no-live-node guard as
+    :func:`probe_open_intent`.
+    """
+    assert_no_live_node_before_intent_probe(node_pid)
+    try:
+        with SqliteStateStore(store_path) as store:
+            raw_intent = store.get(CURRENT_INTENT_KEY)
+            if raw_intent is None:
+                return OpenIntentShape.UNKNOWN
+            intent = SubmitIntent.from_bytes(raw_intent)
+            raw_context = store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent.intent_id}")
+        if raw_context is None:
+            return OpenIntentShape.NO_CONTEXT
+        payload = json.loads(raw_context)
+        venue_order_id = payload.get("venueOrderId") if isinstance(payload, dict) else None
+        if not isinstance(venue_order_id, str):
+            return OpenIntentShape.UNKNOWN
+        return OpenIntentShape.WITH_ID if venue_order_id else OpenIntentShape.NO_ID
+    except Exception:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
+        return OpenIntentShape.UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # [2026-09-12] Continuous-family self-check reads -- WP-11b (2026-09-19)
 # migrated the arming source off the retired continuous-rung-hold boolean
@@ -542,26 +607,6 @@ def resolve_sending_family_id() -> str | None:
 # Process discovery and signalling. SIGTERM only -- never SIGKILL anywhere
 # in this module.
 # ---------------------------------------------------------------------------
-
-
-def find_pid_by_argv(anchor_pattern: str) -> int | None:
-    """``pgrep -f <anchor_pattern>``, anchored (trailing ``$``) by the
-    caller. Returns the first matching PID, or ``None``."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", anchor_pattern],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            return int(line)
-    return None
 
 
 def terminate(pid: int) -> None:
@@ -1107,6 +1152,18 @@ class SupervisorPorts:
             startup_evidence=None, family_halted=False
         )
     )
+    #: [AMBIG-LATCH-RESUME Phase A] Defaults keep every existing fake port
+    #: set refusing on an OPEN intent exactly as before (resolvable False)
+    #: and fail toward the louder alert (shape UNKNOWN).
+    probe_open_intent_resolvable: Callable[..., bool] = field(default=lambda *a, **kw: False)
+    #: ``True`` iff the OPEN intent is a with-id shape (the only shape whose
+    #: alert is a WARN). Default ``False`` fails toward the louder CRITICAL.
+    probe_open_intent_with_id: Callable[..., bool] = field(default=lambda *a, **kw: False)
+    #: ``(sink, payload) -> bool``: True iff the alert is durable (delivered or
+    #: queued). Default emits through ``alert_sink`` and assumes durable (fakes).
+    send_alert_durable: Callable[..., bool] = field(
+        default=lambda sink, payload: _emit_durable_assumed(sink, payload)
+    )
 
 
 def _boot_alert_sink() -> AlertSink:
@@ -1139,6 +1196,9 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         continuous_family_active=sending_family_active,
         resolve_sending_family_id=resolve_sending_family_id,
         read_continuous_family_store_state=read_continuous_family_store_state,
+        probe_open_intent_resolvable=probe_open_intent_resolvable,
+        probe_open_intent_with_id=probe_open_intent_is_with_id,
+        send_alert_durable=durable_alert_send,
     )
 
 
@@ -1210,6 +1270,150 @@ def _do_stop_prior(
     return None
 
 
+def probe_open_intent_is_with_id(store_path: Path, *, node_pid: int | None) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A, DH1] ``True`` iff
+    :func:`probe_open_intent_shape` classifies the OPEN intent ``WITH_ID``."""
+    return probe_open_intent_shape(store_path, node_pid=node_pid) is OpenIntentShape.WITH_ID
+
+
+def _open_intent_resolvable(*, ports: SupervisorPorts, store_path: Path, open_intent: bool) -> bool:
+    """``False`` unless an OPEN intent is resolvable. A raising probe is
+    ``False`` too (today's refusal stays), logged by exception TYPE only."""
+    if not open_intent:
+        return False
+    try:
+        return bool(ports.probe_open_intent_resolvable(store_path, node_pid=None))
+    except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+        log_decision("launch_resolvable_probe_failed", error_type=type(exc).__name__)
+        return False
+
+
+def _emit_durable_assumed(sink: AlertSink, payload: AlertPayload) -> bool:
+    """Default ``send_alert_durable``: emit and assume durable (test doubles)."""
+    emit_alert(sink, payload)
+    return True
+
+
+_DURABLE_WRITER: Final[str] = "legacy_runtime"
+
+
+def durable_alert_send(
+    sink: AlertSink,
+    payload: AlertPayload,
+    *,
+    alerts_root: Path | None = None,
+    egress_configured: bool | None = None,
+) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A review] Send ``payload`` and report whether it
+    is DURABLE: delivered (HTTP 2xx) or written to the alert outbox for a drainer.
+
+    ``emit_alert`` swallows every failure, so it cannot say. This uses the
+    result-returning ``deliver_with_proof`` (outbox entry written before the
+    POST). Not durable = the outbox refused (overflow) or was unwritable AND the
+    POST did not land. With no webhook configured the log line is the only
+    channel that exists, so that case is reported durable: refusing to launch
+    for want of a channel nothing can supply would recreate the L-48 strand.
+    """
+    configured = alert_egress_configured() if egress_configured is None else egress_configured
+    if not configured:
+        emit_alert(sink, payload)
+        return True
+    root = default_alerts_root() if alerts_root is None else alerts_root
+    write_failures_before = _ALERT_COUNTERS.outbox_write_failures
+    try:
+        proof = deliver_with_proof(
+            sink,
+            payload,
+            writer=_DURABLE_WRITER,
+            records=DeliveryRecordWriter(root),
+            attempt_kind="alert",
+            outbox=AlertOutbox(root),
+        )
+    except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+        log_decision("launch_alert_send_failed", error_type=type(exc).__name__)
+        return False
+    if proof.delivered:
+        return True
+    if proof.status_class == "outbox_overflow":
+        return False
+    return _ALERT_COUNTERS.outbox_write_failures == write_failures_before
+
+
+def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A, CM1/DH1] Log the decision and alert by the
+    OPEN intent's shape immediately before the launch spawns over it. Returns
+    ``False`` iff the spawn must be deferred.
+
+    A with-id intent has the existing GET resolver (WARN, unchanged). A no-id,
+    no-context or unknown shape needs the node's no-id resolver, so it pages
+    CRITICAL and the page must be DURABLE (delivered or queued) before the
+    spawn: otherwise log ``launch_to_resolve_alert_undelivered`` at ERROR and
+    return ``False`` (the caller defers to the next permitted poll without
+    consuming budget). A shape probe that raises is not-with-id.
+    """
+    try:
+        with_id = bool(ports.probe_open_intent_with_id(store_path, node_pid=None))
+    except Exception:  # noqa: BLE001 -- deliberate: fail toward the louder alert.
+        with_id = False
+    log_decision("launch_to_resolve_open_intent", shape="with_id" if with_id else "not_with_id")
+    if with_id:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE",
+            severity="WARN",
+            detail=AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE,
+        )
+        return True
+    payload = AlertPayload(
+        severity="CRITICAL",
+        event="TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID",
+        site="trade_node",
+        detail=AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value,
+    )
+    try:
+        durable = bool(ports.send_alert_durable(ports.alert_sink, payload))
+    except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+        log_decision("launch_alert_send_failed", error_type=type(exc).__name__)
+        durable = False
+    if not durable:
+        logger.error("launch_to_resolve_alert_undelivered")
+    return durable
+
+
+#: [AMBIG-LATCH-RESUME Phase A] A non-durable no-id launch-to-resolve page defers the
+#: spawn for at most this many consecutive polls, then the gate FAILS OPEN.
+LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS: Final[int] = 3
+#: ... and never inside this many scheduler polls of the window close.
+_PAGE_DEFER_MIN_POLLS_BEFORE_CLOSE: Final[int] = 2
+
+
+def _launch_to_resolve_gate(
+    *,
+    ports: SupervisorPorts,
+    store_path: Path,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    window_end: dt.datetime,
+) -> tuple[bool, DaySchedulerState]:
+    """Announce, then decide whether the spawn may proceed. A non-durable page
+    defers only while fewer than :data:`LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS`
+    consecutive defers AND at least two polls remain before ``window_end``;
+    otherwise log ERROR and fail open (spawn). The counter resets on a durable
+    page or a spawn; a defer consumes no launch budget."""
+    if _announce_launch_to_resolve(ports=ports, store_path=store_path):
+        return True, record_launch_to_resolve_page_defers(state, now, 0)
+    polls_left_ok = (
+        now + dt.timedelta(seconds=_PAGE_DEFER_MIN_POLLS_BEFORE_CLOSE * _SCHEDULE_POLL_INTERVAL_S)
+        < window_end
+    )
+    if state.launch_to_resolve_page_defers < LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS and polls_left_ok:
+        return False, record_launch_to_resolve_page_defers(
+            state, now, state.launch_to_resolve_page_defers + 1
+        )
+    logger.error("launch_to_resolve_spawning_without_durable_page")
+    return True, record_launch_to_resolve_page_defers(state, now, 0)
+
+
 def _attempt_adoption(
     *, ports: SupervisorPorts, lock_path: Path, log_dir: Path
 ) -> tuple[int, Path | None] | None:
@@ -1251,7 +1455,14 @@ def _do_launch(
         return None, None, state, True
 
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+    resolvable = _open_intent_resolvable(
+        ports=ports, store_path=store_path, open_intent=open_intent
+    )
+    action = decide_launch_action(
+        lock_free=lock_free,
+        open_intent_detected=open_intent,
+        open_intent_resolvable=resolvable,
+    )
 
     if action is LaunchAction.REFUSE_LOCK_HELD:
         # [D2] A supervisor restarted mid-window with a healthy node
@@ -1280,7 +1491,7 @@ def _do_launch(
         )
         return None, None, state, True
 
-    # action is LAUNCH. [D3] A prior spawn attempt this window may have
+    # action is LAUNCH or LAUNCH_TO_RESOLVE. [D3] A prior spawn attempt this window may have
     # raised -- gate a retry on the SAME bounded budget RELAUNCH_CHECK
     # uses (<=2 attempts, >=3 min apart, never at/after 17:00 UTC), never a
     # free-running immediate retry loop.
@@ -1305,6 +1516,19 @@ def _do_launch(
             return None, None, state, False
 
     log_path = node_log_path(log_dir, now)
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        # Once per ACTUAL spawn attempt (after the D3 gap/budget gates above). A
+        # non-durable page defers a BOUNDED number of polls (no relaunch attempt
+        # is recorded, so no budget is consumed), then fails open.
+        proceed, state = _launch_to_resolve_gate(
+            ports=ports,
+            store_path=store_path,
+            state=state,
+            now=now,
+            window_end=dt.datetime.combine(state.day, LAUNCH_WINDOW_END_UTC, tzinfo=dt.UTC),
+        )
+        if not proceed:
+            return None, None, state, False
     try:
         proc = ports.spawn(
             node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path
@@ -1597,7 +1821,7 @@ def _record_boot_retry_attempt_start(
     """[decision F] The attempt is consumed regardless of the precheck
     outcome that follows -- clears per-child latches for the incoming
     child."""
-    if state.boot_retry_attempts == 0:
+    if state.boot_retry_attempts == 0 and not state.boot_retry_first_attempt_alert_sent:
         alert(
             ports.alert_sink,
             event="TRADE_SUPERVISOR_MIDDAY_WATCH",
@@ -1617,13 +1841,23 @@ def _handle_boot_retry_precheck_refusal(
     node_log: Path | None,
     store_path: Path,
     log_dir: Path,
-) -> tuple[int | None, Path | None, DaySchedulerState] | None:
+) -> tuple[int | None, Path | None, DaySchedulerState] | Literal["launch_to_resolve"] | None:
     lock_path = intent_lock_path(store_path)
     lock_free = ports.intent_lock_free(lock_path)
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+    resolvable = _open_intent_resolvable(
+        ports=ports, store_path=store_path, open_intent=open_intent
+    )
+    action = decide_launch_action(
+        lock_free=lock_free,
+        open_intent_detected=open_intent,
+        open_intent_resolvable=resolvable,
+    )
     if action is LaunchAction.LAUNCH:
         return None
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        # The caller announces immediately before the actual child spawn.
+        return "launch_to_resolve"
     if action is LaunchAction.REFUSE_LOCK_HELD:
         adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
         if adoption is not None:
@@ -1655,9 +1889,19 @@ def _launch_boot_retry_child(
     repo_root: Path,
     node_bin: Path,
     log_dir: Path,
-) -> tuple[int, Path]:
+) -> tuple[int, Path] | None:
     new_log = node_log_path(log_dir, now)
-    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    try:
+        proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    except Exception as exc:  # noqa: BLE001 -- deliberate: ONLY the spawn is contained.
+        log_decision("boot_retry_spawn_failed", error_type=type(exc).__name__)
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+            severity="CRITICAL",
+            detail=AlertDetail.LAUNCH_SPAWN_FAILED,
+        )
+        return None
     _retain_spawned_child(proc)
     log_decision("boot_retry_launched", pid=proc.pid)
     return proc.pid, new_log
@@ -1694,6 +1938,7 @@ def _attempt_boot_retry_relaunch(
     )
     if caught_permit:
         return tracked_pid, node_log, state
+    state_before_attempt = state
     state = _record_boot_retry_attempt_start(ports=ports, state=state, now=now)
     precheck_result = _handle_boot_retry_precheck_refusal(
         ports=ports,
@@ -1704,11 +1949,36 @@ def _attempt_boot_retry_relaunch(
         store_path=store_path,
         log_dir=log_dir,
     )
-    if precheck_result is not None:
+    if precheck_result is not None and precheck_result != "launch_to_resolve":
         return precheck_result
-    pid, new_log = _launch_boot_retry_child(
+    if precheck_result == "launch_to_resolve":
+        proceed, gated = _launch_to_resolve_gate(
+            ports=ports,
+            store_path=store_path,
+            state=state,
+            now=now,
+            window_end=midday_watch_window_end(state.day),
+        )
+        if not proceed:
+            # No spawn this poll; the consumed attempt is handed back (a defer
+            # consumes no budget) but the first-attempt WARN latch and the defer
+            # counter are carried so neither resets.
+            return (
+                tracked_pid,
+                node_log,
+                replace(
+                    state_before_attempt,
+                    boot_retry_first_attempt_alert_sent=gated.boot_retry_first_attempt_alert_sent,
+                    launch_to_resolve_page_defers=gated.launch_to_resolve_page_defers,
+                ),
+            )
+        state = gated
+    launched = _launch_boot_retry_child(
         ports=ports, now=now, repo_root=repo_root, node_bin=node_bin, log_dir=log_dir
     )
+    if launched is None:  # spawn failed: logged and paged inside; the attempt stays consumed
+        return tracked_pid, node_log, state
+    pid, new_log = launched
     return pid, new_log, state
 
 
@@ -2623,6 +2893,7 @@ def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
     lock_path = supervisor_lock_path(store_path)
     try:
         with hold_supervisor_lock(lock_path):
+            revision = _resolve_build_revision(os.environ)
             log_decision(
                 "supervisor_started",
                 stop_prior_utc=str(STOP_PRIOR_UTC),
@@ -2630,8 +2901,24 @@ def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
                 self_check_utc=str(SELF_CHECK_UTC),
                 lock_path=str(lock_path),
                 log_dir=str(log_dir),
-                revision=_resolve_build_revision(os.environ),
+                revision=revision,
             )
+            # [AMBIG-LATCH-RESUME Phase A, DH1] Advertise the retirement
+            # reasons THIS process can decode. A failure never stops the
+            # supervisor: without the marker a node fails closed on the new
+            # reason (the intent stays AMBIGUOUS and pages), which is safe.
+            try:
+                write_supervisor_decode_marker(store_path, revision=revision)
+            except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+                log_decision("supervisor_decode_marker_write_failed", error_type=type(exc).__name__)
+                # No stale marker may survive a failed write, and the loss is paged.
+                discard_supervisor_decode_marker(store_path)
+                alert(
+                    resolve_alert_sink(),
+                    event="TRADE_SUPERVISOR_DECODE_MARKER_WRITE_FAILED",
+                    severity="WARN",
+                    detail=AlertDetail.DECODE_MARKER_WRITE_FAILED,
+                )
             _run_forever(
                 store_path=store_path,
                 repo_root=repo_root,

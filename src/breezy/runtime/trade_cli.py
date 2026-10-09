@@ -81,6 +81,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.trading.strategy import Strategy
 
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec_fault import (
     clear_fatal_exec_fault,
     fatal_exec_fault,
@@ -484,6 +485,50 @@ def _exec_client_resolver_contradiction_reader(
     return _read
 
 
+def _exec_client_ambiguous_clears_reader(node: Node) -> Callable[[], int]:
+    """Build the ``ambiguous_clears`` reader the degraded alert's F6 episode
+    counter requires (AMBIG-LATCH-RESUME).
+
+    Same lookup and lazy resolution as :func:`_exec_client_refusal_reader`: the
+    client is looked up at poll time, and a missing client or one without
+    ``ambiguous_refusal_clears`` reads as ``0`` rather than raising inside a
+    message-bus handler.
+    """
+
+    def _read() -> int:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return 0
+        return int(getattr(client, "ambiguous_refusal_clears", 0))
+
+    return _read
+
+
+def _exec_client_resume_handler(node: Node) -> Callable[[object], None]:
+    """Build the re-poll handler that asks the exec client to resume once its
+    refusals have cleared (AMBIG-LATCH-RESUME).
+
+    Same lookup and lazy resolution as :func:`_exec_client_refusal_reader`. The
+    call is ``resume_if_refusals_cleared()``: synchronous, no ``await``, and its
+    callees are pinned to the latch read and the native ``resume``/``degrade``
+    (whose actions are no-ops), so it changes a health indicator and can send
+    nothing. A missing client or one without the method is a no-op, and the
+    timer's ``_poll`` isolates each handler, so a raise here costs nothing else.
+    """
+
+    def _resume(event: object) -> None:
+        del event
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return
+        resume = getattr(client, "resume_if_refusals_cleared", None)
+        if resume is None:
+            return
+        resume()
+
+    return _resume
+
+
 def _run_node(
     config: TradingNodeConfig,
     node_factory: NodeFactory,
@@ -605,10 +650,12 @@ def _run_node(
             order_submission_permit=order_submission_permit,
             clock=node.kernel.clock,
         )
-        install_component_degraded_alert(
+        degraded_h = install_component_degraded_alert(
             node.kernel.msgbus,
             component_id=POLYMARKET_US_CLIENT_NAME,
             reasons=_exec_client_refusal_reader(node),
+            ambiguous_reason=submit_chain.AMBIGUOUS_REASON,
+            ambiguous_clears=_exec_client_ambiguous_clears_reader(node),
         )
         stale_h = install_stale_intent_alert(
             node.kernel.msgbus,
@@ -626,7 +673,13 @@ def _run_node(
             cancel_repoll = install_refusal_repoll_timer(
                 node.kernel.clock,
                 loop=node.kernel.loop,
-                handlers=(recon_h, stale_h, contradiction_h),
+                handlers=(
+                    recon_h,
+                    stale_h,
+                    contradiction_h,
+                    degraded_h,
+                    _exec_client_resume_handler(node),
+                ),
             )
         # Broad, deliberately: an informational re-poll timer must never
         # block boot (FU-8 r2.1 ruling; AC9). The state-change path above is

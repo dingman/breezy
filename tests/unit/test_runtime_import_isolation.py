@@ -74,6 +74,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "breezy.runtime.clear_submit_intent_cli",
     "breezy.runtime.alert_redeliver_cli",
     "breezy.runtime.autonomy_canary_cli",
+    "breezy.runtime.autonomy_health_cli",
     "breezy.runtime.mark_no_side_position_captured_cli",
     "breezy.runtime.trade_supervisor",
     "breezy.runtime.check_alerts_cli",
@@ -131,6 +132,11 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # `validate_endpoint` from `breezy.runtime.venue_positions_read`, so source
     # (c) picks it up; tracked, not excluded.
     "scripts.venue.polymarket_us_shape_capture",
+    # AMBIG-LATCH-RESUME Phase A (U2): the read-only post-restart check imports
+    # `breezy.runtime.{trade_supervisor,supervisor_decode_marker,...}`, so source
+    # (c) picks it up; tracked, not excluded (WIDENED by this one reviewed row,
+    # never relaxed).
+    "scripts.ops.ambig_latch_phase_a_check",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

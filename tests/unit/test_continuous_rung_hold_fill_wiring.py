@@ -1798,7 +1798,7 @@ def test_a_lone_yes_rung_still_arms_with_the_new_gate_in_place(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -1852,7 +1852,7 @@ def test_two_yes_rungs_on_one_station_day_both_arm_before_either_fills(
         position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -1901,7 +1901,7 @@ def test_a_yes_candidate_whose_no_sibling_already_filled_is_refused(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     no_instrument_id = sibling_instrument_id(INTERIOR_ID)
     strategy.on_order_filled(
         _fill(strategy, instrument_id=no_instrument_id, venue_order_id="ord-no-sibling"),
@@ -1949,7 +1949,7 @@ def test_a_second_yes_rung_is_refused_when_a_prior_leg_has_no_recorded_fee(
         position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_order_filled(
         _fill(
             strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
@@ -2092,7 +2092,7 @@ def test_a_reconciled_durable_fill_record_supplies_the_fee_and_admits_the_second
         cumulative_cost=Decimal("0.11"),
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_order_filled(
         _fill(
             strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
@@ -2149,7 +2149,7 @@ def test_an_unreconciled_durable_fill_record_still_refuses_the_second_rung(
         cumulative_cost=Decimal("0.11"),
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_order_filled(
         _fill(
             strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
@@ -2219,7 +2219,7 @@ def test_a_fill_committed_with_no_trial_record_yet_refuses_the_sibling_rung(
     assert other_record is None
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
 
@@ -2326,7 +2326,7 @@ def test_a_reconciled_boot_walk_adopted_fill_carries_the_fee_and_admits_the_seco
     assert walked_record.fee == Decimal("0.01")
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
 
@@ -2370,7 +2370,7 @@ def test_an_unreconciled_boot_walk_adopted_fill_still_refuses_the_second_rung(
     assert walked_record.fee is None
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
 

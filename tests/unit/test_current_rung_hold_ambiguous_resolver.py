@@ -881,7 +881,7 @@ async def test_a_stuck_prior_day_instrument_absent_from_cache_is_loaded_and_reti
             loader_calls.append(instrument_id)
             return stale_instrument if instrument_id == str(stale_instrument.id) else None
 
-        client._resolver_instrument_loader = _loader  # type: ignore[method-assign]
+        client._resolver_instrument_loader = _loader
 
         def _forbidden(*_args: Any, **_kwargs: Any) -> Any:
             raise AssertionError(
@@ -942,7 +942,7 @@ async def test_a_stuck_prior_day_instrument_unobtainable_stays_open_and_escalate
         current = client._latch.current_open()
         assert current is not None
         _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
-        client._resolver_instrument_loader = lambda _instrument_id: None  # type: ignore[method-assign]
+        client._resolver_instrument_loader = lambda _instrument_id: None
 
         await _run_resolver_passes(client, count=3)
 
@@ -1021,7 +1021,7 @@ async def test_a_load_miss_does_not_rescan_the_catalog_within_the_retry_interval
             loader_calls.append(instrument_id)
             return None
 
-        client._resolver_instrument_loader = _loader  # type: ignore[method-assign]
+        client._resolver_instrument_loader = _loader
 
         await _run_resolver_passes(client, count=1)
         assert loader_calls == [str(stale_instrument.id)], "the first pass must attempt the scan"
@@ -1070,7 +1070,7 @@ async def test_a_load_miss_engages_the_same_consecutive_failure_backoff_as_a_get
         current = client._latch.current_open()
         assert current is not None
         _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
-        client._resolver_instrument_loader = lambda _id: None  # type: ignore[method-assign]
+        client._resolver_instrument_loader = lambda _id: None
 
         assert client._resolver_consecutive_failures == 0
 
@@ -1109,7 +1109,7 @@ async def test_a_load_hit_after_the_retry_interval_retires_the_intent(
             miss_calls["n"] += 1
             return None
 
-        client._resolver_instrument_loader = _missing_loader  # type: ignore[method-assign]
+        client._resolver_instrument_loader = _missing_loader
         await _run_resolver_passes(client, count=1)
         assert miss_calls["n"] == 1
         refreshed = client._latch.current()
@@ -1131,7 +1131,7 @@ async def test_a_load_hit_after_the_retry_interval_retires_the_intent(
             "positions": {},
             "eof": True,
         }
-        client._resolver_instrument_loader = (  # type: ignore[method-assign]
+        client._resolver_instrument_loader = (
             lambda instrument_id: stale_instrument
             if instrument_id == str(stale_instrument.id)
             else None
@@ -1305,11 +1305,16 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
 
         _, remaining = live_trading_budget_remaining(client._permit)
         assert remaining == 1  # true-up to the SAME cost as booked -- no change
-        assert client.trading_refusals == refusals_before, (
+        assert submit_chain.AMBIGUOUS_REASON in refusals_before, (
+            "non-vacuity: the initial AMBIGUOUS submit's own refusal was present "
+            "before the resolver ran"
+        )
+        assert client.trading_refusals == tuple(
+            reason for reason in refusals_before if reason != submit_chain.AMBIGUOUS_REASON
+        ), (
             "fee_reconciled=False must be a durable flag on the record, "
-            "never a NEW latched trading refusal (the initial AMBIGUOUS "
-            "submit's own refusal, captured before the resolver ran, is "
-            "unrelated and expected to still be present)"
+            "never a NEW latched trading refusal; the only change is the "
+            "AMBIGUOUS refusal cleared on fill retirement (2026-10-03)"
         )
         await client._disconnect()
 
@@ -2099,7 +2104,7 @@ async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         trial_day_latch = open_trial_day_latch(
             client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
         )
-        client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
+        client._submit_veto = family_halt_submit_veto(
             trial_day_latch,
         )
         trial_day_latch.record_duplicate_fill(
@@ -2154,7 +2159,7 @@ async def test_a_policy_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         trial_day_latch = open_trial_day_latch(
             client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
         )
-        client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
+        client._submit_veto = family_halt_submit_veto(
             trial_day_latch,
         )
         trial_day_latch.record_policy_halt(
@@ -3244,7 +3249,7 @@ async def test_fu8_t1_before_the_boot_snapshot_defers_and_the_boot_pass_books_it
             avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
         )
         filled_calls: list[Any] = []
-        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)
 
         client._resolve_accept_fill(context, report, instrument, now_ns)
 
@@ -3427,7 +3432,7 @@ async def test_fu8_t2_venue_held_never_doubles_the_position_and_latches_resolver
             avg_px=Decimal("0.37"), filled_qty=Decimal(4), order_qty=Decimal(4),
         )
         filled_calls: list[Any] = []
-        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)
 
         client._resolve_accept_fill(context, report, instrument, now_ns)
 
@@ -3571,7 +3576,7 @@ async def test_fu8_no_leg_fill_never_touches_the_yes_sibling(tmp_path: Path) -> 
             avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
         )
         filled_calls: list[Any] = []
-        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)
 
         client._resolve_accept_fill(context, report, no_instrument, now_ns)
 
@@ -3600,13 +3605,13 @@ async def test_fu8_security_cache_miss_sends_no_report_and_still_retires(
         mass_status_calls: list[Any] = []
         order_status_calls: list[Any] = []
         filled_calls: list[Any] = []
-        client._send_mass_status_report = lambda *a, **kw: mass_status_calls.append(  # type: ignore[method-assign]
+        client._send_mass_status_report = lambda *a, **kw: mass_status_calls.append(
             (a, kw),
         )
-        client._send_order_status_report = lambda *a, **kw: order_status_calls.append(  # type: ignore[method-assign]
+        client._send_order_status_report = lambda *a, **kw: order_status_calls.append(
             (a, kw),
         )
-        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)
 
         intent = _fu8_arm(client)
         now_ns = client._clock.timestamp_ns()
@@ -5682,7 +5687,7 @@ async def test_no_latch_bound_makes_no_get_and_the_pass_survives(
         client, _order_events, _permit, _latch_cm = await _build_race_client(
             tmp_path, sender=sender,
         )
-        client._latch = None  # type: ignore[assignment]
+        client._latch = None
         before_paths = list(client._private_read.paths)  # type: ignore[attr-defined]
 
         client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]

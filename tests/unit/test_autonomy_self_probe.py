@@ -393,6 +393,8 @@ def test_expected_home_listing_matches_the_wrappers_home_rebinds(world: World) -
             for p in _home_rebinds(row, world.roots)
             if Path(p).is_relative_to(world.roots.home)
         }
+        # the wrapper also binds each config path (X-13: the health row binds .config/systemd)
+        derived |= {rel.split("/", 1)[0] for rel in (*row.config_ro_binds, *row.config_ro_dirs)}
         assert plan.home_listing_allowed == frozenset(derived)
 
 

@@ -196,3 +196,57 @@ def test_a_failing_sink_never_unwinds_into_the_message_bus() -> None:
     )
 
     _tick(msgbus)  # must not raise
+
+
+def test_a_no_id_contradiction_names_its_reason_and_the_automated_next_action() -> None:
+    """AMBIG-LATCH-RESUME (plan r6 2.10): a no-id entry carries no GET and no
+    zero-fill claim, so its alert must say what it is -- the closed reason
+    token and the automated ``next`` -- and must not tell anyone to review it
+    by hand."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    entry = {
+        "severity": "CRITICAL",
+        "event": "resolver_evidence_contradiction",
+        "site": "global",
+        "intent_id": "intent-9",
+        "venue_order_id": "none",
+        "no_id": "true",
+        "reason": "unexplained_holding_delta",
+        "next": "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution",
+        "manual_reconcile": "straddles_snapshot",
+    }
+    install_resolver_contradiction_alert(msgbus, contradictions=lambda: (entry,), sink=sink)
+
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 1
+    detail = sink.payloads[0].detail
+    assert "intent-9" in detail
+    assert "unexplained_holding_delta" in detail
+    assert "straddles_snapshot" in detail
+    assert "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution" in detail
+    assert "operator" not in detail.lower()
+    assert "terminal zero-fill" not in detail
+
+
+def test_the_retire_blocked_entry_is_delivered_with_its_next_action() -> None:
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    entry = {
+        "severity": "CRITICAL",
+        "event": "resolver_no_id_retire_blocked",
+        "site": "global",
+        "intent_id": "intent-9",
+        "venue_order_id": "none",
+        "no_id": "true",
+        "reason": "supervisor_decode_marker_absent",
+        "next": "next_node_boot_rereads_supervisor_marker",
+    }
+    install_resolver_contradiction_alert(msgbus, contradictions=lambda: (entry,), sink=sink)
+
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 1
+    assert "supervisor_decode_marker_absent" in sink.payloads[0].detail
+    assert "next_node_boot_rereads_supervisor_marker" in sink.payloads[0].detail

@@ -332,7 +332,7 @@ def test_fills_is_never_read_on_a_post_freeze_row() -> None:
         _sufficiency_row(climate_day=post_freeze_day),
         _sufficiency_row(climate_day=pre_freeze_day),
     ]
-    result = viability.compute_viability(results=rows, sufficiency=sufficiency)  # type: ignore[arg-type]
+    result = viability.compute_viability(results=rows, sufficiency=sufficiency)
     assert post_freeze_day not in log
     assert pre_freeze_day in log
     assert result.n == 1

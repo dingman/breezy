@@ -1260,7 +1260,7 @@ def test_retry_reinvokes_fetch_mos_csv_so_pacer_and_budget_charge_per_attempt(
         pacer_wait_count += 1
         await original_wait()
 
-    pacer.wait = spy_wait  # type: ignore[method-assign]
+    pacer.wait = spy_wait
 
     body, _sm = _drive_fetch(cli, item, transport)
 

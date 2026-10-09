@@ -59,3 +59,26 @@ Decision: exit 0 would hide a failure; `SuccessExitStatus=75` would do the same 
 - `live-tally-run.sh` (v1 PREREG tally): **open gap, not fixed in S1**: it has no FQ branch, so while FQ is the sending family it exits 1 daily with "no score-live-trials success marker". It is outside S1's file list and a real behaviour decision (retire/skip the v1 tally under FQ); flagged for the coordinator.
 
 Plan deviation: plan r15 §3.8 called for `test_every_wrapper_skip_path_exits_success` to treat `SKIPPED-INFRA` exit 75 as success. It does not: exit 75 stays a failure (see section D), and the test asserts the two labels never cross (`SKIPPED-INFRA` always 75, plain `SKIPPED` never 75). Reason: 75 means the studies-lock directory or file is unusable; exit 0 or `SuccessExitStatus=75` would hide a broken lock that lets 10-24 GB studies overlap.
+
+## Activation record, X-16 steps 1-5 (2026-10-09, feat `0d459241`)
+
+- **Failed units at the seed** (`systemctl --user list-units --failed --plain --no-legend`): empty, count 0. No owned
+  unit was failed, so the seed did not hide anything.
+- **Step 1 (install):** created under `~/.local/share/breezy/` mode 0700: `.bwrap_probe/` in `evidence/unit_health`,
+  `derived/verdicts`, `evidence/alerts` and `cache/aut6_health_bus`; `evidence/unit_health/buildside_restart/`;
+  and the empty health lock `evidence/unit_health/.health.lock` (0600). `systemctl --user link` of
+  `breezy-autonomy-health.service` and `.timer` from `/home/jon/breezy/deploy/systemd/`, then `daemon-reload`.
+  Both units: `LoadState=loaded`, `UnitFileState=linked`, `ActiveState=inactive`. The timer is NOT enabled.
+- **Step 3:** `evidence/unit_health/fold_export_seen` absent and `evidence/registry/` absent (so the fold reads
+  `not_deployed` until 2026-11-16 or the first export). sha256 of the live
+  `fq-v1-halt-orders-off.conf` equals the allowlist row (`5ff0d6a1…e09d`).
+- **Step 4:** `python -m breezy.runtime.autonomy_health_cli --seed-cursor-now` exit 0:
+  `AUTONOMY_HEALTH_SEED cursor=baseline reason=activation_baseline since_us=1791534020151869`; the journaled
+  `cursor_reset__<ts_ns>.json` carries `reason=activation_baseline`.
+- **Step 5:** one `--dry-run` in the health row's real bwrap argv: `pass_result=UNKNOWN failed_units=0
+  new_failures=0 foreign_failed=0 journal_blind=0 drift=0 allowlisted=1 cursor_reset=0
+  unknown_reasons=timer_property_missing:breezy-autonomy-health.timer:block`. Findings: none (zero CRITICAL). Listed
+  not deployed: `registry_export` and the producer-daily and producer-intraday service and timer.
+  Allowlisted: `breezy-trade-supervisor.service:fq-v1-halt-orders-off.conf`. The single UNKNOWN reason is the
+  health timer itself: a linked, inactive timer is not loaded, so the snapshot has no block for it; it clears once
+  the timer is enabled and active (step 6, not done here).

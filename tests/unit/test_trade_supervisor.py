@@ -8243,3 +8243,830 @@ class TestRealReaderReplayCapAndCarry:
         assert state.readiness_observed is False
         assert state.ready_adoption_deferral_polls == 14
         assert world.spawner.calls == []
+
+
+# ===========================================================================
+# [AMBIG-LATCH-RESUME Phase A, T44/T45] The supervisor launches over a
+# decodable OPEN intent (LAUNCH_TO_RESOLVE) so the node's resolver can retire
+# it, instead of refusing and stranding it with the node down (L-48 / CM1),
+# and reads the OPEN intent's shape for a shape-dependent alert (DH1).
+# ===========================================================================
+
+
+def _arm_open_intent(store_path: Path) -> str:
+    """Arm a real OPEN singleton in a fresh store and release the node flock."""
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+        return latch.arm("a" * 64, now_ns=1_700_000_000_000_000_000).intent_id
+
+
+def _set_resolver_context(store_path: Path, intent_id: str, raw: bytes) -> None:
+    from breezy.domain.exec_intent import RESOLVER_CONTEXT_KEY_PREFIX
+
+    with SqliteStateStore(store_path) as store:
+        store.set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", raw)
+
+
+class TestLaunchToResolveDecision:
+    def test_open_and_resolvable_launches_to_resolve(self) -> None:
+        from breezy.runtime.trade_supervisor_core import LaunchAction as LA
+
+        assert (
+            decide_launch_action(
+                lock_free=True, open_intent_detected=True, open_intent_resolvable=True
+            )
+            is LA.LAUNCH_TO_RESOLVE
+        )
+        assert LA.LAUNCH_TO_RESOLVE.value == "launch_to_resolve"
+
+    def test_open_and_not_resolvable_still_refuses(self) -> None:
+        assert (
+            decide_launch_action(
+                lock_free=True, open_intent_detected=True, open_intent_resolvable=False
+            )
+            is LaunchAction.REFUSE_INTENT_OPEN
+        )
+        # The pre-existing two-kwarg call shape (default resolvable=False) is unchanged.
+        assert (
+            decide_launch_action(lock_free=True, open_intent_detected=True)
+            is LaunchAction.REFUSE_INTENT_OPEN
+        )
+
+    def test_lock_held_dominates_and_resolvable_without_open_is_a_plain_launch(self) -> None:
+        assert (
+            decide_launch_action(
+                lock_free=False, open_intent_detected=True, open_intent_resolvable=True
+            )
+            is LaunchAction.REFUSE_LOCK_HELD
+        )
+        assert (
+            decide_launch_action(
+                lock_free=True, open_intent_detected=False, open_intent_resolvable=True
+            )
+            is LaunchAction.LAUNCH
+        )
+
+
+class TestProbeOpenIntentResolvable:
+    def test_open_intent_is_resolvable(self, tmp_path: Path) -> None:
+        store_path = tmp_path / "state" / "store.sqlite3"
+        _arm_open_intent(store_path)
+        assert _ts_module.probe_open_intent_resolvable(store_path, node_pid=None) is True
+
+    def test_corrupt_singleton_is_not_resolvable(self, tmp_path: Path) -> None:
+        from breezy.runtime.submit_intent import CURRENT_INTENT_KEY
+
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        with SqliteStateStore(store_path) as store:
+            store.set(CURRENT_INTENT_KEY, b"\xff not json")
+        assert _ts_module.probe_open_intent_resolvable(store_path, node_pid=None) is False
+
+    def test_retired_and_absent_are_not_resolvable(self, tmp_path: Path) -> None:
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        assert _ts_module.probe_open_intent_resolvable(store_path, node_pid=None) is False
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+            intent = latch.arm("b" * 64, now_ns=1_700_000_000_000_000_000)
+            latch.retire(
+                intent.intent_id,
+                RetirementReason.OPERATOR_CLEARED,
+                now_ns=1_700_000_000_000_000_001,
+            )
+        assert _ts_module.probe_open_intent_resolvable(store_path, node_pid=None) is False
+
+    def test_raises_with_a_live_node_pid(self, tmp_path: Path) -> None:
+        from breezy.runtime.trade_supervisor_core import PreLaunchProbeInvariantError
+
+        with pytest.raises(PreLaunchProbeInvariantError):
+            _ts_module.probe_open_intent_resolvable(tmp_path / "s.sqlite3", node_pid=4242)
+
+
+class TestProbeOpenIntentShape:
+    def test_each_of_the_four_shapes_on_real_store_fixtures(self, tmp_path: Path) -> None:
+        from breezy.runtime.trade_supervisor_core import OpenIntentShape
+
+        probe = _ts_module.probe_open_intent_shape
+        with_id = tmp_path / "a" / "s.sqlite3"
+        _set_resolver_context(with_id, _arm_open_intent(with_id), b'{"venueOrderId": "V-1"}')
+        assert probe(with_id, node_pid=None) is OpenIntentShape.WITH_ID
+
+        no_id = tmp_path / "b" / "s.sqlite3"
+        _set_resolver_context(no_id, _arm_open_intent(no_id), b'{"venueOrderId": ""}')
+        assert probe(no_id, node_pid=None) is OpenIntentShape.NO_ID
+
+        no_context = tmp_path / "c" / "s.sqlite3"
+        _arm_open_intent(no_context)
+        assert probe(no_context, node_pid=None) is OpenIntentShape.NO_CONTEXT
+
+        for bad in (b"\xff not json", b"[1]", b'{"venueOrderId": 7}', b"{}"):
+            unknown = tmp_path / f"u{len(bad)}{bad[:2].hex()}" / "s.sqlite3"
+            _set_resolver_context(unknown, _arm_open_intent(unknown), bad)
+            assert probe(unknown, node_pid=None) is OpenIntentShape.UNKNOWN
+
+    def test_unreadable_singleton_or_store_is_unknown(self, tmp_path: Path) -> None:
+        from breezy.runtime.submit_intent import CURRENT_INTENT_KEY
+        from breezy.runtime.trade_supervisor_core import OpenIntentShape
+
+        corrupt = tmp_path / "x" / "s.sqlite3"
+        corrupt.parent.mkdir(parents=True)
+        with SqliteStateStore(corrupt) as store:
+            store.set(CURRENT_INTENT_KEY, b"garbage")
+        assert _ts_module.probe_open_intent_shape(corrupt, node_pid=None) is OpenIntentShape.UNKNOWN
+        missing_dir = tmp_path / "nope" / "s.sqlite3"
+        assert (
+            _ts_module.probe_open_intent_shape(missing_dir, node_pid=None)
+            is OpenIntentShape.UNKNOWN
+        )
+
+    def test_raises_with_a_live_node_pid(self, tmp_path: Path) -> None:
+        from breezy.runtime.trade_supervisor_core import PreLaunchProbeInvariantError
+
+        with pytest.raises(PreLaunchProbeInvariantError):
+            _ts_module.probe_open_intent_shape(tmp_path / "s.sqlite3", node_pid=4242)
+
+    def test_the_context_key_prefix_comes_from_the_domain_module_not_exec(self) -> None:
+        import ast as _ast
+
+        from breezy.domain import exec_intent
+
+        assert (
+            vars(_ts_module)["RESOLVER_CONTEXT_KEY_PREFIX"]
+            is exec_intent.RESOLVER_CONTEXT_KEY_PREFIX
+        )
+        for path in (Path(_ts_module.__file__), Path(__file__)):
+            imported = [
+                n.module or ""
+                for n in _ast.walk(_ast.parse(path.read_text(encoding="utf-8")))
+                if isinstance(n, _ast.ImportFrom)
+            ] + [
+                a.name
+                for n in _ast.walk(_ast.parse(path.read_text(encoding="utf-8")))
+                if isinstance(n, _ast.Import)
+                for a in n.names
+            ]
+            assert not any(m.startswith("breezy.adapters.polymarket_us.exec") for m in imported), (
+                path.name
+            )
+
+
+def _launch_kwargs(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "state": initial_scheduler_state(_DAY),
+        "now": _utc(16, 50),
+        "store_path": tmp_path / "state" / "store.sqlite3",
+        "repo_root": tmp_path,
+        "node_bin": tmp_path / "node_bin",
+        "log_dir": tmp_path / "logs",
+    }
+
+
+class TestDoLaunchOverAnOpenIntent:
+    def test_resolvable_with_id_spawns_once_with_a_warn_and_no_refusal_alert(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: True,
+        )
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert len(spawner.calls) == 1
+        assert pid is not None and log is not None and done is True
+        assert [(p.event, p.severity, p.detail) for p in sink.payloads] == [
+            (
+                "TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE",
+                "WARN",
+                AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE.value,
+            )
+        ]
+        messages = [r.getMessage() for r in caplog.records]
+        assert "launch_to_resolve_open_intent shape=with_id" in messages
+        assert not any("launch_refused_intent_open" in m for m in messages)
+        assert AlertDetail.INTENT_OPEN_BLOCKS_ARM.value not in [p.detail for p in sink.payloads]
+
+    @pytest.mark.parametrize("shape_name", ["NO_ID", "NO_CONTEXT", "UNKNOWN"])
+    def test_resolvable_no_id_shapes_each_spawn_once_with_one_critical(
+        self, tmp_path: Path, shape_name: str
+    ) -> None:
+
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: False,
+        )
+        _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert len(spawner.calls) == 1
+        assert [(p.event, p.severity, p.detail) for p in sink.payloads] == [
+            (
+                "TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID",
+                "CRITICAL",
+                AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value,
+            )
+        ]
+
+    def test_a_shape_probe_that_raises_degrades_to_the_loud_unknown_alert_and_still_spawns(
+        self, tmp_path: Path
+    ) -> None:
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise RuntimeError("probe blew up")
+
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=_boom,
+        )
+        _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert len(spawner.calls) == 1
+        assert [p.severity for p in sink.payloads] == ["CRITICAL"]
+        assert sink.payloads[0].detail == AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value
+
+    def test_corrupt_singleton_is_refused_exactly_as_today_and_never_spawns(
+        self, tmp_path: Path
+    ) -> None:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: False,
+        )
+        pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert (pid, log, done) == (None, None, True)
+        assert spawner.calls == []
+        assert [(p.event, p.severity, p.detail) for p in sink.payloads] == [
+            (
+                "TRADE_SUPERVISOR_LAUNCH_REFUSED",
+                "CRITICAL",
+                AlertDetail.INTENT_OPEN_BLOCKS_ARM.value,
+            )
+        ]
+
+    def test_the_resolvable_probe_is_not_called_when_no_intent_is_open(
+        self, tmp_path: Path
+    ) -> None:
+        called: list[object] = []
+
+        def _resolvable(*_a: object, **_kw: object) -> bool:
+            called.append(1)
+            return True
+
+        ports = _make_ports(
+            probe_open_intent_state=lambda *a, **kw: False,
+            probe_open_intent_resolvable=_resolvable,
+        )
+        _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert called == []
+
+
+class TestBootRetryOverAnOpenIntent:
+    def _run(
+        self, tmp_path: Path, *, resolvable: bool, with_id: bool = True
+    ) -> tuple[FakeSpawner, _RecordingAlertSink]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: resolvable,
+            probe_open_intent_with_id=lambda *a, **kw: with_id,
+        )
+        _do_boot_retry(
+            ports=ports,
+            state=_boot_retry_ready_state(_utc(17, 0)),
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        return spawner, sink
+
+    def test_precheck_returns_none_so_the_boot_retry_launches_over_a_resolvable_intent(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink = self._run(tmp_path, resolvable=True)
+        assert len(spawner.calls) == 1
+        assert AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN.value not in [
+            p.detail for p in sink.payloads
+        ]
+        assert AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE.value in [p.detail for p in sink.payloads]
+
+    def test_no_id_shape_pages_critical_at_the_boot_retry_launch_too(self, tmp_path: Path) -> None:
+
+        spawner, sink = self._run(tmp_path, resolvable=True, with_id=False)
+        assert len(spawner.calls) == 1
+        assert (
+            "TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID",
+            "CRITICAL",
+            AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value,
+        ) in [(p.event, p.severity, p.detail) for p in sink.payloads]
+
+    def test_corrupt_singleton_still_refuses_and_spawn_is_called_zero_times(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink = self._run(tmp_path, resolvable=False)
+        assert spawner.calls == []
+        assert AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN.value in [
+            p.detail for p in sink.payloads
+        ]
+
+
+class TestExistingIntentOpenPinsHoldWithDefaultPorts:
+    """T45 (guard): a fake port set built WITHOUT the new fields gets the
+    defaults (resolvable False, shape UNKNOWN), so every pre-existing
+    OPEN-intent refusal pin stays exactly as it was."""
+
+    def test_default_ports_refuse_on_open_intent_in_both_call_sites(self, tmp_path: Path) -> None:
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+        )
+        assert ports.probe_open_intent_resolvable("p", node_pid=None) is False
+        pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert (pid, log, done) == (None, None, True)
+        assert spawner.calls == []
+
+    def test_default_shape_probe_fails_toward_the_louder_alert(self) -> None:
+
+        ports = _make_ports()
+        assert ports.probe_open_intent_with_id("p", node_pid=None) is False
+
+    def test_default_ports_wires_the_real_probes(self) -> None:
+        ports = _ts_module.default_ports(alert_sink=_RecordingAlertSink())
+        assert ports.probe_open_intent_resolvable is _ts_module.probe_open_intent_resolvable
+        assert ports.probe_open_intent_with_id is _ts_module.probe_open_intent_is_with_id
+
+    def test_no_supervisor_alert_detail_says_operator(self) -> None:
+        values = [member.value for member in AlertDetail]
+        assert AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE.value == "intent_open_launch_to_resolve"
+        assert (
+            AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value
+            == "intent_open_launch_to_resolve_no_id"
+        )
+        assert not [v for v in values if "operator" in v.lower()]
+
+
+class TestLaunchToResolveOpsSafety:
+    """Ops-safety review: a raising resolvable probe keeps today's refusal, and
+    the launch-to-resolve CRITICAL fires once per ACTUAL spawn attempt."""
+
+    @staticmethod
+    def _raising(*_a: object, **_kw: object) -> bool:
+        raise RuntimeError("probe blew up")
+
+    def test_a_raising_resolvable_probe_refuses_in_do_launch_and_logs_the_type_only(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=self._raising,
+        )
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert (pid, log, done) == (None, None, True)
+        assert spawner.calls == []
+        assert [p.detail for p in sink.payloads] == [AlertDetail.INTENT_OPEN_BLOCKS_ARM.value]
+        messages = [r.getMessage() for r in caplog.records]
+        assert "launch_resolvable_probe_failed error_type=RuntimeError" in messages
+        assert "probe blew up" not in " ".join(messages)
+
+    def test_a_raising_resolvable_probe_refuses_at_the_boot_retry_precheck(
+        self, tmp_path: Path
+    ) -> None:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=self._raising,
+        )
+        _do_boot_retry(
+            ports=ports,
+            state=_boot_retry_ready_state(_utc(17, 0)),
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN.value in [
+            p.detail for p in sink.payloads
+        ]
+
+    def _ports(self) -> tuple[FakeSpawner, _RecordingAlertSink, SupervisorPorts]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: False,
+        )
+        return spawner, sink, ports
+
+    def test_polls_inside_the_retry_gap_announce_nothing_then_one_announce_on_spawn(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = replace(kwargs["state"], relaunch_attempts=1, last_relaunch_attempt_at=_utc(16, 50))
+        for minute in (51, 52, 52):
+            _pid, _log, _st, done = _do_launch(
+                ports=ports, **{**kwargs, "state": state, "now": _utc(16, minute)}
+            )
+            assert done is False
+        assert spawner.calls == []
+        assert sink.payloads == []
+        pid, _log, _st, done = _do_launch(
+            ports=ports, **{**kwargs, "state": state, "now": _utc(16, 54)}
+        )
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value
+        ]
+
+    def test_an_exhausted_retry_budget_refuses_without_the_launch_to_resolve_announce(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = replace(
+            kwargs["state"], relaunch_attempts=99, last_relaunch_attempt_at=_utc(16, 50)
+        )
+        pid, _log, _st, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert (pid, done) == (None, True)
+        assert spawner.calls == []
+        assert [p.detail for p in sink.payloads] == [AlertDetail.LAUNCH_SPAWN_FAILED.value]
+
+
+class TestDurableLaunchToResolveAlert:
+    """Review fix 1/4: the non-with-id launch-to-resolve CRITICAL must be durable
+    (delivered or queued) BEFORE the spawn; otherwise defer, never consume budget."""
+
+    @staticmethod
+    def _ports(*, durable: Callable[..., bool], with_id: bool = False) -> tuple[Any, Any, Any]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: with_id,
+            send_alert_durable=durable,
+        )
+        return spawner, sink, ports
+
+    def test_an_undelivered_no_id_alert_defers_the_spawn_and_consumes_no_budget(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports(durable=lambda _s, _p: False)
+        kwargs = _launch_kwargs(tmp_path)
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, log, state, done = _do_launch(ports=ports, **kwargs)
+        assert (pid, log, done) == (None, None, False)
+        assert spawner.calls == []
+        assert state.relaunch_attempts == kwargs["state"].relaunch_attempts == 0
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert [r.getMessage() for r in errors] == ["launch_to_resolve_alert_undelivered"]
+
+    def test_the_next_poll_spawns_once_when_the_alert_becomes_durable(self, tmp_path: Path) -> None:
+        outcomes = iter([False, False, True])
+        sent: list[str] = []
+
+        def _send(_sink: object, payload: AlertPayload) -> bool:
+            sent.append(payload.event)
+            return next(outcomes)
+
+        spawner, _sink, ports = self._ports(durable=_send)
+        kwargs = _launch_kwargs(tmp_path)
+        for _ in range(2):
+            assert _do_launch(ports=ports, **kwargs)[3] is False
+        assert spawner.calls == []
+        pid, _log, _state, done = _do_launch(ports=ports, **kwargs)
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert sent == ["TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID"] * 3
+
+    def test_the_with_id_path_does_not_consult_the_durable_send(self, tmp_path: Path) -> None:
+        def _never(_s: object, _p: AlertPayload) -> bool:
+            raise AssertionError("with-id path must not use the durable send")
+
+        spawner, sink, ports = self._ports(durable=_never, with_id=True)
+        _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert len(spawner.calls) == 1
+        assert [p.severity for p in sink.payloads] == ["WARN"]
+
+    def test_boot_retry_defers_without_spawning_or_consuming_an_attempt(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, _sink, ports = self._ports(durable=lambda _s, _p: False)
+        start = _boot_retry_ready_state(_utc(17, 0))
+        _pid, _log, state = _do_boot_retry(
+            ports=ports,
+            state=start,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert state.boot_retry_attempts == start.boot_retry_attempts
+
+    def test_boot_retry_announces_immediately_before_the_spawn(self, tmp_path: Path) -> None:
+        seen: list[int] = []
+        sink = _RecordingAlertSink()
+
+        def _spawn(**_kw: object) -> FakePopen:
+            seen.append(len(sink.payloads))
+            return FakePopen(7001)
+
+        ports = _make_ports(
+            spawn=_spawn,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: True,
+        )
+        _do_boot_retry(
+            ports=ports,
+            state=_boot_retry_ready_state(_utc(17, 0)),
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        # first-attempt WARN + launch-to-resolve WARN were both sent before the spawn call
+        assert seen == [2]
+
+    def test_a_declined_boot_retry_neither_announces_nor_spawns(self, tmp_path: Path) -> None:
+        spawner, sink, ports = self._ports(durable=lambda _s, _p: True)
+        start = replace(_boot_retry_ready_state(_utc(17, 0)), boot_retry_attempts=99)
+        _do_boot_retry(
+            ports=ports,
+            state=start,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value not in [
+            p.detail for p in sink.payloads
+        ]
+
+    def test_a_raising_boot_retry_spawn_is_contained_and_pages_spawn_failed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sink = _RecordingAlertSink()
+
+        def _boom(**_kw: object) -> FakePopen:
+            raise OSError("exec format error secret")
+
+        ports = _make_ports(
+            spawn=_boom,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: False,
+        )
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, _log, _state = _do_boot_retry(
+                ports=ports,
+                state=_boot_retry_ready_state(_utc(17, 0)),
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+        assert pid is None
+        assert (
+            "TRADE_SUPERVISOR_MIDDAY_WATCH",
+            "CRITICAL",
+            AlertDetail.LAUNCH_SPAWN_FAILED.value,
+        ) in [(p.event, p.severity, p.detail) for p in sink.payloads]
+        messages = " | ".join(r.getMessage() for r in caplog.records)
+        assert "boot_retry_spawn_failed error_type=OSError" in messages
+        assert "secret" not in messages
+
+
+class TestDurableAlertSend:
+    """The real durable send: delivered (2xx) or queued in the alert outbox is durable."""
+
+    @staticmethod
+    def _sink(status: int) -> Any:
+        from breezy.runtime.health import WebhookAlertSink
+
+        client = httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(status)))
+        return WebhookAlertSink("https://alerts.example.invalid/hook", client=client)
+
+    @staticmethod
+    def _payload() -> AlertPayload:
+        return AlertPayload(
+            severity="CRITICAL", event="TRADE_SUPERVISOR_X", site="trade_node", detail="d"
+        )
+
+    def test_a_2xx_is_durable(self, tmp_path: Path) -> None:
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(200), self._payload(), alerts_root=tmp_path, egress_configured=True
+            )
+            is True
+        )
+
+    def test_a_failed_post_that_was_queued_in_the_outbox_is_durable(self, tmp_path: Path) -> None:
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(500), self._payload(), alerts_root=tmp_path, egress_configured=True
+            )
+            is True
+        )
+        assert list((tmp_path / "outbox").iterdir())
+
+    def test_a_failed_post_with_an_unwritable_outbox_is_not_durable(self, tmp_path: Path) -> None:
+        blocker = tmp_path / "root_is_a_file"
+        blocker.write_text("x")
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(500), self._payload(), alerts_root=blocker, egress_configured=True
+            )
+            is False
+        )
+
+    def test_an_unconfigured_egress_cannot_block_the_launch(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        assert (
+            _ts_module.durable_alert_send(
+                sink, self._payload(), alerts_root=tmp_path, egress_configured=False
+            )
+            is True
+        )
+        assert len(sink.payloads) == 1
+
+    def test_default_ports_wire_the_real_durable_send(self) -> None:
+        ports = _ts_module.default_ports(alert_sink=_RecordingAlertSink())
+        assert ports.send_alert_durable is _ts_module.durable_alert_send
+
+
+class TestBoundedLaunchToResolvePageDefer:
+    """Review fix (HIGH/MEDIUM): the durable-page gate defers at most
+    LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS consecutive polls, and not inside the last two
+    polls of its window, then FAILS OPEN (ERROR line + spawn)."""
+
+    _OVERFLOW = "launch_to_resolve_spawning_without_durable_page"
+
+    @staticmethod
+    def _ports(*, durable: Callable[..., bool] = lambda _s, _p: False) -> tuple[Any, Any, Any]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: False,
+            send_alert_durable=durable,
+        )
+        return spawner, sink, ports
+
+    def test_persistent_non_durable_pages_defer_exactly_three_polls_then_spawn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = kwargs["state"]
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            for _ in range(3):
+                pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+                assert (pid, done) == (None, False)
+                assert state.relaunch_attempts == 0
+            assert spawner.calls == []
+            pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert state.launch_to_resolve_page_defers == 0
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert messages.count(self._OVERFLOW) == 1
+
+    def test_a_defer_inside_two_polls_of_the_window_end_spawns_immediately(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        kwargs = {**_launch_kwargs(tmp_path), "now": _utc(16, 58, 30)}
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, _log, _state, done = _do_launch(ports=ports, **kwargs)
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert self._OVERFLOW in [r.getMessage() for r in caplog.records]
+
+    def test_a_durable_page_resets_the_defer_counter(self, tmp_path: Path) -> None:
+        outcomes = iter([False, False, True])
+        _spawner, _sink, ports = self._ports(durable=lambda _s, _p: next(outcomes))
+        kwargs = _launch_kwargs(tmp_path)
+        state = kwargs["state"]
+        for _ in range(2):
+            state = _do_launch(ports=ports, **{**kwargs, "state": state})[2]
+        assert state.launch_to_resolve_page_defers == 2
+        pid, _log, state, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert pid is not None and done is True
+        assert state.launch_to_resolve_page_defers == 0
+
+    def test_the_with_id_path_never_defers(self, tmp_path: Path) -> None:
+        _spawner, _sink, ports = self._ports()
+        ports = replace(ports, probe_open_intent_with_id=lambda *a, **kw: True)
+        pid, _log, state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert pid is not None and done is True
+        assert state.launch_to_resolve_page_defers == 0
+
+    def test_boot_retry_defers_three_polls_then_spawns_with_the_error_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        common = _midday_watch_common_kwargs(tmp_path)
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            for _ in range(3):
+                _pid, _log, state = _do_boot_retry(
+                    ports=ports,
+                    state=state,
+                    now=_utc(17, 10),
+                    tracked_pid=None,
+                    node_log=None,
+                    **common,
+                )
+                assert spawner.calls == []
+                assert state.boot_retry_attempts == 0
+            pid, _log, state = _do_boot_retry(
+                ports=ports,
+                state=state,
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **common,
+            )
+        assert pid is not None
+        assert len(spawner.calls) == 1
+        assert state.launch_to_resolve_page_defers == 0
+        assert [r.getMessage() for r in caplog.records].count(self._OVERFLOW) == 1
+
+    def test_boot_retry_defer_late_in_its_window_spawns_immediately(self, tmp_path: Path) -> None:
+        spawner, _sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        now = dt.datetime.combine(_DAY + dt.timedelta(days=1), dt.time(0, 59, 30), tzinfo=dt.UTC)
+        pid, _log, _state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert pid is not None and len(spawner.calls) == 1
+
+    def test_two_deferred_boot_retry_polls_send_the_first_attempt_warn_once(
+        self, tmp_path: Path
+    ) -> None:
+        _spawner, sink, ports = self._ports()
+        state = _boot_retry_ready_state(_utc(17, 0))
+        common = _midday_watch_common_kwargs(tmp_path)
+        for _ in range(2):
+            _pid, _log, state = _do_boot_retry(
+                ports=ports,
+                state=state,
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **common,
+            )
+        warns = [p for p in sink.payloads if p.detail == AlertDetail.BOOT_RETRY_FIRST_ATTEMPT.value]
+        assert len(warns) == 1
+        assert state.boot_retry_first_attempt_alert_sent is True

@@ -85,8 +85,9 @@ def test_unknown_component_is_refused(tmp_path: Path) -> None:
         closure_sha256("nope", src_root=_src(tmp_path, _FILES), modules=_MODS)
 
 
-def test_empty_manifest_refuses_every_component() -> None:
-    assert dict(closure_manifest.CLOSURE_MODULES) == {}
+def test_manifest_holds_only_the_reviewed_components_and_refuses_the_rest() -> None:
+    """One reviewed row so far: the ``aut6.health`` producer entry (WP3 S6, P6-13)."""
+    assert set(closure_manifest.CLOSURE_MODULES) == {"breezy.runtime.autonomy_health_cli"}
     with pytest.raises(ClosureUnavailable):
         closure_sha256(f"{PKG}.veto")
 

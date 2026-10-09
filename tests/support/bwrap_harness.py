@@ -73,6 +73,24 @@ def run_raw_true() -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_host_read(
+    command: Sequence[str], *, timeout: float = 30.0
+) -> subprocess.CompletedProcess[str]:
+    """Run one read-only host command (for example ``journalctl``) OUTSIDE any sandbox.
+
+    The V-6 comparison needs the host's own answer next to the in-row one. It is a plain read: the
+    caller names a fixed argv, nothing is written and no shell is involved.
+    """
+    return subprocess.run(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def make_roots(tmp_path: Path) -> SandboxRoots:
     """Scratch ``SandboxRoots`` under ``tmp_path``: a fake home holding a data root.
 

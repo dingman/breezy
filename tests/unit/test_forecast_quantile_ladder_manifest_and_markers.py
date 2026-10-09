@@ -33,7 +33,8 @@ _EXEC_CLIENT_PATH = (
     _REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "exec" / "client.py"
 )
 # re-pinned 2026-10-02: AMBIG-LATCH-CLEAR (resolver zero-fill clears AMBIGUOUS refusal), reviewer-approved  # noqa: E501
-_EXEC_CLIENT_SHA256 = "76784ce814797bfb5480487ff0dad47cbe9c0b1727aef9ad1c7461cc33aa68a4"
+# re-pinned 2026-10-09: AMBIG-LATCH-RESUME Phase B (resume method, accept-fill/no-id clears, pre-POST context, no-id resolver; hunks H1-H12 per plan r6 section 4)  # noqa: E501
+_EXEC_CLIENT_SHA256 = "5f23be3ec8228022aa8477194856ec254994057f4ee06da13fac02cc4c8e34db"
 
 
 # ---------------------------------------------------------------------------

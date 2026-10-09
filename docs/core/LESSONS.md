@@ -1335,6 +1335,8 @@ R-7 item 5 and L-32 pin the interpretation of the **create-order response body**
 ### How to apply
 The Nautilus in-flight poller stays disabled (`runtime/node_config.py:689-712`: retry exhaustion resolves FAILED, a false terminal on a venue with no client-order-id); the resolver is a firewall-scanned client coroutine off `_connect`, bounded, positions-gated on both zero and fill. Before citing any venue response shape as a design input, find a captured body or the schema line — a fixture is not evidence (L-17 is about optional fields; this is about provenance). Related: L-32, R-7 item 5, L-34.
 
+**Superseded 2026-10-03 (AMBIG-LATCH-RESUME r4, coordinator ruling CH1) for the no-id class:** an automated no-id resolver retires on complete reads only (`RESOLVER_NO_ID_NO_FILL`; attribution by the venue's echo of our own wire body inside a time window, since the venue issues no client order id; ADOPT hands a found order to the unchanged with-id path). `clear_submit_intent` stays available and is never invoked by code. Every other clause above is preserved: `classify_create_order_outcome` is byte-unchanged, fail-closed on every read failure, the in-flight poller stays disabled.
+
 ## L-37 — A swallowed venue-shape error on the create path is a silent-fill hazard (2026-09-11/12)
 
 ### What happened

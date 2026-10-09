@@ -207,6 +207,8 @@ class CycleStatus(enum.StrEnum):
     SKIPPED_WINDOW = "skipped_window"
     SKIPPED_LOCKED = "skipped_locked"
     REFUSED_GUARD = "refused_guard"
+    #: A 429 back-off was entered (alerted + ledgered); exits 0, and is not data.
+    BACKED_OFF = "backed_off"
     ERROR = "error"
 
 
@@ -799,6 +801,8 @@ def _nbp_cycle(col: _Collector, now_ns: int) -> CycleReport:
 def _leg_report(col: _Collector, out: legs.LegOutcome) -> CycleReport:
     if out.errors:
         status = CycleStatus.ERROR
+    elif out.backed_off:
+        status = CycleStatus.BACKED_OFF
     elif out.collected:
         status = CycleStatus.COLLECTED
     elif out.deadline:

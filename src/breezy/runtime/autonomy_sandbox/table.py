@@ -89,7 +89,9 @@ CONFIG_RO_ALLOWLIST: Final[frozenset[str]] = frozenset({".config/systemd/user"})
 SYSTEMCTL: Final = "/usr/bin/systemctl"
 #: The read verbs of the bus-snapshot grammar. ``kill``/``start``/``stop``/
 #: ``restart``/``try-restart`` and ``systemd-run`` are structurally absent.
-BUS_READ_VERBS: Final[frozenset[str]] = frozenset({"show", "list-units", "list-timers"})
+BUS_READ_VERBS: Final[frozenset[str]] = frozenset(
+    {"show", "list-units", "list-timers", "list-unit-files"}
+)
 #: The one and only ``run-*`` bus read (M40: ``'run-*.service'`` matches exactly
 #: the failed transient, where ``'run-*'`` also matches mounts).
 RUN_TRANSIENT_SHOW_ARGV: Final[tuple[str, ...]] = (
@@ -97,7 +99,7 @@ RUN_TRANSIENT_SHOW_ARGV: Final[tuple[str, ...]] = (
     "--user",
     "show",
     "-p",
-    "Id,Description,ExecStart,InvocationID,Result,Transient",
+    "Id,Description,ExecStart,WorkingDirectory,InvocationID,Result,Transient",
     "--",
     "run-*.service",
 )
@@ -123,9 +125,11 @@ _PROPERTY_RE: Final = re.compile(r"[A-Za-z,]+")
 _PROPERTY_OPTION_RE: Final = re.compile(r"--property=[A-Za-z,]+")
 _STATE_OPTION_RE: Final = re.compile(r"--state=[a-z]+")
 _TYPE_OPTION_RE: Final = re.compile(r"--type=[a-z]+")
-_UNIT_TOKEN_RE: Final = re.compile(r"breezy-[a-z0-9@._*-]+")
+#: ``breezy-*`` units, plus the instances of the one non-``breezy-`` timer template the health
+#: pass reads (``us-source-collector@``); no other prefix is in the grammar.
+_UNIT_TOKEN_RE: Final = re.compile(r"breezy-[a-z0-9@._*-]+|us-source-collector@[a-z0-9._*-]*")
 _BARE_OPTIONS: Final[frozenset[str]] = frozenset(
-    {"--all", "--plain", "--no-legend", "--no-pager", "--failed", "--value"}
+    {"--all", "--plain", "--no-legend", "--no-pager", "--failed", "--value", "--full"}
 )
 _SERVICE_SUFFIX: Final = ".service"
 _RESIDUAL_CITATION_MARKER: Final = "E-7a"
@@ -360,6 +364,107 @@ _CANARY_ROW: Final = BwrapRow(
 )
 
 
+#: AUT-6 WP3 S2 (plan r15 sections 3.1.1 and 3.9; E-7e(f)/(h), E-9): the unit health pass. No
+#: network and no credential (a page is enqueued to the outbox; ``redeliver`` delivers). It has NO
+#: in-row bus: its ``systemctl --user`` reads run unsandboxed in ``ExecStartPre`` and arrive through
+#: the bus snapshot in ``cache/aut6_health_bus``; an in-row ``systemctl`` is expected to fail
+#: (V-6). ``journalctl --user -o json`` is the one in-row read that works. ``host_proc`` is the
+#: named ``E7A_R2_PROC`` exception: the pass reads ``/proc/<pid>/status`` of the node and the
+#: supervisor for the section 3.9 resident-memory add-back. The row KEEPS ``--unshare-pid`` like
+#: every row and omits only the fresh ``--proc``: the read-only root's host procfs stays (V-6).
+#: The pass makes no state-changing call. Unit properties are a fixed set: no ``Environment`` or
+#: ``Credential`` property can be named (B6-R3). ``show -- 'breezy-*'`` also lists timers and
+#: slices, so the consumer filters on ``Id`` ending ``.service``.
+#: The ``Restart`` property name as the health pass reads it from the snapshot (it must be one of
+#: the names in ``_HEALTH_SHOW_PROPERTIES``; the health modules keep systemctl verbs out of their
+#: own source, and this is a property name).
+HEALTH_RESTART_PROPERTY: Final = "Restart"
+_HEALTH_SHOW_PROPERTIES: Final = (
+    "Id,ActiveState,SubState,Result,InvocationID,NRestarts,ExecMainStatus,ExecMainCode,"
+    "ExecMainStartTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,MemoryCurrent,MemoryPeak,"
+    "MemorySwapPeak,MemoryHigh,MemoryMax,Type,Restart,MainPID,UnitFileState,LoadState,TimeoutStartUSec,LastTriggerUSec,"
+    "NextElapseUSecRealtime,NextElapseUSecMonotonic,Unit,FragmentPath,DropInPaths"
+)
+#: ``show -- 'breezy-*'`` lists a loaded unit only while it is active, activating or failed, so the
+#: inactive oneshot that restarts the recorder at 09:00Z is absent from the glob and must be named
+#: (the 2026-10-09 false CRITICAL). It equals ``unit_health_daemons.ROTATE_UNIT`` (a test pins it).
+_HEALTH_ROTATE_UNIT: Final = "breezy-quote-tape-rotate.service"
+#: The same gap for the two units that carry TEMPORARY drop-ins: rule #5 reads their live
+#: ``MemoryMax``/``DropInPaths``, which the glob shows only while they run (2026-10-09).
+_HEALTH_DROPIN_UNITS: Final = ("breezy-quote-tape-ingest.service", "breezy-replay-daily.service")
+_HEALTH_BUS_BIND: Final = "cache/aut6_health_bus"
+_HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
+    BusRead(
+        "units_show",
+        (
+            SYSTEMCTL,
+            "--user",
+            "show",
+            "-p",
+            _HEALTH_SHOW_PROPERTIES,
+            "--",
+            _HEALTH_ROTATE_UNIT,
+            *_HEALTH_DROPIN_UNITS,
+            "breezy-*",
+            "us-source-collector@*",
+        ),
+    ),
+    BusRead(
+        "failed_list",
+        (SYSTEMCTL, "--user", "list-units", "--failed", "--all", "--plain", "--no-legend"),
+    ),
+    # Ruling R-S2-1: inventory completeness. The loaded inventory (load/active/sub of every loaded
+    # unit, inactive ones included) and the on-disk inventory (UnitFileState, not-loaded units).
+    BusRead(
+        "units_inventory",
+        (
+            SYSTEMCTL,
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--full",
+            "--",
+            "breezy-*",
+            "us-source-collector@*",
+        ),
+    ),
+    BusRead(
+        "unit_files_inventory",
+        (
+            SYSTEMCTL,
+            "--user",
+            "list-unit-files",
+            "--plain",
+            "--no-legend",
+            "--full",
+            "--",
+            "breezy-*",
+            "us-source-collector@*",
+        ),
+    ),
+    BusRead("timers_list", (SYSTEMCTL, "--user", "list-timers", "--all", "--plain", "--no-legend")),
+    BusRead("run_transient", RUN_TRANSIENT_SHOW_ARGV),
+)
+_AUTONOMY_HEALTH_ROW: Final = BwrapRow(
+    name="breezy-autonomy-health",
+    owner_plan="AUT-6",
+    units=frozenset({"breezy-autonomy-health.service"}),
+    binds=("evidence/unit_health", "derived/verdicts", "evidence/alerts", _HEALTH_BUS_BIND),
+    entry_modules=("breezy.runtime.autonomy_health_cli",),
+    resolves_dns=False,
+    network="none",
+    host_proc=True,
+    # X-13: the pass hashes the orders-off drop-in under ~/.config/systemd/user (read-only).
+    config_ro_dirs=(".config/systemd/user",),
+    exceptions=frozenset({"E7A_R2_PROC", "E7_CONFIG_DIR"}),
+    bus_reads=_HEALTH_BUS_READS,
+    bus_snapshot_bind=_HEALTH_BUS_BIND,
+    bus_snapshot_budget_s=15,
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -417,6 +522,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             _LABEL_OUTCOMES_ROW,
             _ALERT_REDELIVER_ROW,
             _CANARY_ROW,
+            _AUTONOMY_HEALTH_ROW,
         )
     }
 )

@@ -676,6 +676,11 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     submit_veto: Callable[[], str | None] | None = None
     exit_manifest: FamilyManifest | None = None
     resolver_instrument_loader: Callable[[str], Any] | None = None
+    #: AMBIG-LATCH-RESUME (DH1): True only when the RUNNING supervisor's decode
+    #: marker lists ``RESOLVER_NO_ID_NO_FILL`` (set at node boot, never read from
+    #: the environment). Gates only a RETIREMENT path, never an order. Fail-closed
+    #: default.
+    no_id_retire_admitted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

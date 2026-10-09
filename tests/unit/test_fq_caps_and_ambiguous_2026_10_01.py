@@ -384,7 +384,7 @@ async def test_a_non_terminal_get_neither_retires_nor_clears_the_ambiguous_refus
 
 
 @pytest.mark.asyncio
-async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
+async def test_a_fill_terminal_retirement_clears_the_ambiguous_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
@@ -416,7 +416,7 @@ async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
         assert current is not None
         assert current.retirement_reason is not None
         assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
-        assert _AMBIGUOUS_REASON in client.trading_refusals
+        assert _AMBIGUOUS_REASON not in client.trading_refusals
         await client._disconnect()
 
 
