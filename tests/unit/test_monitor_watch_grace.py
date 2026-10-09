@@ -109,3 +109,72 @@ def test_never_triggered_is_unconditional(tmp_path: Path, deploy: Path) -> None:
     never = timer_block(TIMER_A, next_s=-60, last_s=None, entered_s=-(86_400 + TIMER_GRACE_S + 60))
     result = _verdict(tmp_path, deploy, never, _service(entered_s=-100))
     assert {f.kind for f in result.findings} == {"timer_never_triggered"}
+
+
+# --------------------------------------------------------------------------- oneshot services
+
+
+def _oneshot(*, state: str = "activating", ended_s: float = -600, entered: str = "") -> str:
+    """A running oneshot as systemd reports it: ``ActiveEnterTimestamp`` is EMPTY (the unit is
+    activating until it exits and never enters ``active``); ``InactiveEnterTimestamp`` is the end
+    of the previous run. Observed on ``breezy-autonomy-health.service`` at its own 08:21Z pass."""
+    return show_block(
+        SERVICE_A,
+        ActiveState=state,
+        ActiveEnterTimestamp=entered,
+        InactiveEnterTimestamp=systemd_ts(ended_s),
+    )
+
+
+def test_a_running_oneshot_with_an_empty_active_enter_gets_the_grace(
+    tmp_path: Path, deploy: Path
+) -> None:
+    """Root cause of the 08:21Z self-page: the timer was mid-trigger (next elapse empty until its
+    service exits) and the service had no ``ActiveEnterTimestamp`` to compare."""
+    result = _verdict(tmp_path, deploy, _gone(last_s=-1), _oneshot(ended_s=-600))
+    assert result.outcome == "PASS", result.findings
+
+
+def test_a_oneshot_that_ended_since_the_trigger_gets_no_grace(tmp_path: Path, deploy: Path) -> None:
+    """It ran and finished after the last trigger, yet the timer still has no next elapse."""
+    result = _verdict(tmp_path, deploy, _gone(last_s=-300), _oneshot(ended_s=-200))
+    assert {f.kind for f in result.findings} == {"timer_no_next_elapse"}
+
+
+def test_an_idle_oneshot_gets_no_grace_even_before_its_trigger(
+    tmp_path: Path, deploy: Path
+) -> None:
+    result = _verdict(tmp_path, deploy, _gone(last_s=-1), _oneshot(state="inactive"))
+    assert {f.kind for f in result.findings} == {"timer_no_next_elapse"}
+
+
+def test_the_oneshot_grace_is_bounded_from_the_last_trigger(tmp_path: Path, deploy: Path) -> None:
+    inside = _verdict(tmp_path, deploy, _gone(last_s=-3590), _oneshot(ended_s=-9000))
+    outside = _verdict(tmp_path, deploy, _gone(last_s=-3610), _oneshot(ended_s=-9000))
+    assert inside.outcome == "PASS"
+    assert {f.kind for f in outside.findings} == {"timer_no_next_elapse"}
+
+
+def test_equality_with_the_last_trigger_counts_as_after_it(tmp_path: Path, deploy: Path) -> None:
+    """A running service that entered the same second as the trigger (or one second before)."""
+    same = _verdict(tmp_path, deploy, _gone(last_s=-100), _service(entered_s=-100))
+    one_before = _verdict(tmp_path, deploy, _gone(last_s=-100), _service(entered_s=-101))
+    two_before = _verdict(tmp_path, deploy, _gone(last_s=-100), _service(entered_s=-102))
+    assert same.outcome == one_before.outcome == "PASS"
+    assert {f.kind for f in two_before.findings} == {"timer_no_next_elapse"}
+
+
+def test_a_running_service_with_no_enter_time_and_no_activating_state_gets_no_grace(
+    tmp_path: Path, deploy: Path
+) -> None:
+    result = _verdict(tmp_path, deploy, _gone(last_s=-1), _oneshot(state="active"))
+    assert {f.kind for f in result.findings} == {"timer_no_next_elapse"}
+
+
+def test_a_stale_trigger_is_still_unconditional_for_a_running_oneshot(
+    tmp_path: Path, deploy: Path
+) -> None:
+    stale = _gone(last_s=-(86_400 + TIMER_GRACE_S + 60))
+    result = _verdict(tmp_path, deploy, stale, _oneshot())
+    # the grace window (1 h) is long over as well, so both are raised; stale is never forgiven
+    assert {f.kind for f in result.findings} == {"timer_last_trigger_stale", "timer_no_next_elapse"}
