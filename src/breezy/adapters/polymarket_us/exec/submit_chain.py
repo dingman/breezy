@@ -85,6 +85,12 @@ AMBIGUOUS_REASON: Final[str] = (
     "create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
 )
 
+#: AMBIG-LATCH-RESUME: "no venue order id yet", stored in the durable resolver
+#: context's ``venue_order_id`` by the PRE-POST write. The venue issues no
+#: client order id, so a no-id AMBIGUOUS has nothing to join on but the echo
+#: of our own wire body (see ``no_id_attribution``).
+NO_VENUE_ORDER_ID: Final[str] = ""
+
 ZERO: Final[Decimal] = Decimal(0)
 ONE: Final[Decimal] = Decimal(1)
 OPEN_PRICE_EXCLUSIVE_LOW: Final[Decimal] = Decimal("0.00")

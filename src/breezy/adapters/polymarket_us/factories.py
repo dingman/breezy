@@ -867,5 +867,6 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             submit_veto=config.submit_veto,
             exit_manifest=config.exit_manifest,
             resolver_instrument_loader=config.resolver_instrument_loader,
+            no_id_retire_admitted=config.no_id_retire_admitted,
         )
         return client

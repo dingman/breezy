@@ -111,6 +111,11 @@ DEGRADED_ALERT_SEVERITY: Final[str] = "CRITICAL"
 #: ``detail``, which is the only field free enough to carry it.
 DEGRADED_ALERT_SITE: Final[str] = "global"
 
+#: One hour. Caps a storm of NON-AMBIGUOUS repeat episodes at one identical
+#: CRITICAL per hour. AMBIGUOUS episodes are exempt (F3): each one alerts.
+#: Same units/name as health.AlertState.
+DEGRADED_ALERT_RENOTIFY_AFTER_NS: Final[int] = 60 * 60 * 1_000_000_000
+
 #: Stands in for the reasons when the reader itself fails. The alert still
 #: goes out: the fact of degradation is the operator's signal, and the reasons
 #: are already in the log stream regardless.
@@ -285,6 +290,17 @@ RESOLVER_CONTRADICTION_ALERT_SITE: Final[str] = "global"
 
 def _resolver_contradiction_detail(alert: Mapping[str, str]) -> str:
     intent_id = alert.get("intent_id", "<unknown>")
+    if alert.get("no_id") == "true":
+        # AMBIG-LATCH-RESUME (plan r6 2.10): a no-id entry has no venue order
+        # id, no GET and no zero-fill claim. It names its closed reason token
+        # and the AUTOMATED next action -- never a hand step.
+        manual = alert.get("manual_reconcile")
+        manual_part = f" manual_reconcile={manual}" if manual else ""
+        return (
+            f"intent {intent_id} (no venue order id) stays AMBIGUOUS: "
+            f"reason={alert.get('reason', '<unknown>')}{manual_part}; "
+            f"next={alert.get('next', '<unknown>')}"
+        )
     venue_order_id = alert.get("venue_order_id", "<unknown>")
     trade_count = alert.get("trade_count", "<unknown>")
     create_fill_evidence = alert.get("create_fill_evidence", "<unknown>")
@@ -631,6 +647,9 @@ def install_component_degraded_alert(
     component_id: str,
     reasons: Callable[[], Sequence[str]],
     sink: AlertSink | None = None,
+    renotify_after_ns: int = DEGRADED_ALERT_RENOTIFY_AFTER_NS,
+    ambiguous_reason: str | None = None,
+    ambiguous_clears: Callable[[], int] | None = None,
 ) -> Callable[[object], None]:
     """Subscribe one operator alert to ``component_id`` reaching ``DEGRADED``.
 
@@ -652,6 +671,18 @@ def install_component_degraded_alert(
     sink
         Defaults to :func:`~breezy.runtime.health.resolve_alert_sink`, which
         returns the logging sink unless ``BREEZY_ALERT_WEBHOOK_URL`` is set.
+    renotify_after_ns
+        The throttle window for a repeat NON-AMBIGUOUS episode whose reasons
+        are a subset of the last alert's. A ``bool``, a non-int or a value
+        <= 0 raises ``ValueError``.
+    ambiguous_reason
+        The AMBIGUOUS refusal reason; episodes carrying it are never
+        throttled (F3). Passed by the caller so this module imports nothing
+        from the venue adapter.
+    ambiguous_clears
+        Reads the count of AMBIGUOUS refusals cleared so far. With
+        ``ambiguous_reason`` it lets a re-poll tick alert an episode that
+        was added without a state transition (F6).
 
     Returns
     -------
@@ -662,32 +693,31 @@ def install_component_degraded_alert(
     -----
     ``degrade()`` publishes DEGRADING and then DEGRADED. Only the second is
     alerted on -- alerting on both would double every alert -- and only the
-    FIRST DEGRADED per component is, so a component that re-enters the state
-    cannot bury the operator under a repeat. That mirrors the dedupe the
-    execution client's own ``_refuse`` already applies to its ERROR log.
+    FIRST DEGRADED per episode is. ``RUNNING`` re-arms the component, so a
+    refusal after a resume is a new episode; a repeat episode is throttled
+    unless it is AMBIGUOUS or carries a reason the last alert did not.
     """
+    if (
+        isinstance(renotify_after_ns, bool)
+        or not isinstance(renotify_after_ns, int)
+        or renotify_after_ns <= 0
+    ):
+        raise ValueError(f"renotify_after_ns must be a positive int, got {renotify_after_ns!r}")
     active_sink = resolve_alert_sink() if sink is None else sink
     alerted: set[str] = set()
+    last_alert: list[tuple[int, frozenset[str]]] = []
+    ambiguous_alerted = [0]
 
-    def _on_component_state(event: object) -> None:
-        if not isinstance(event, ComponentStateChanged):
-            return
-        if str(event.component_id) != component_id:
-            return
-        if event.state != ComponentState.DEGRADED:
-            return
-        if component_id in alerted:
-            return
-        alerted.add(component_id)
-
+    def _read_reasons() -> Sequence[str]:
         try:
-            recorded: Sequence[str] = tuple(reasons())
+            return tuple(reasons())
         # Broad, deliberately: a broken reader must not cost the operator the
         # alert itself, which is the part that carries the signal.
         except Exception:
             logger.exception("failed to read refusal reasons for %s", component_id)
-            recorded = (REASONS_UNAVAILABLE,)
+            return (REASONS_UNAVAILABLE,)
 
+    def _emit(recorded: Sequence[str]) -> None:
         emit_alert(
             active_sink,
             AlertPayload(
@@ -697,6 +727,62 @@ def install_component_degraded_alert(
                 detail=_detail(component_id, recorded),
             ),
         )
+
+    def _episodes(recorded: Sequence[str]) -> int | None:
+        if ambiguous_reason is None or ambiguous_clears is None:
+            return None
+        try:
+            cleared = int(ambiguous_clears())
+        except Exception:
+            logger.exception("failed to read ambiguous clears for %s", component_id)
+            return None
+        return cleared + (1 if ambiguous_reason in recorded else 0)
+
+    def _on_tick() -> None:
+        recorded = _read_reasons()
+        episodes = _episodes(recorded)
+        if episodes is None or episodes <= ambiguous_alerted[0]:
+            return
+        owed = episodes - ambiguous_alerted[0]
+        ambiguous_alerted[0] = episodes
+        for _ in range(owed):
+            _emit(recorded)
+
+    def _on_degraded(ts_event: int) -> None:
+        alerted.add(component_id)
+        recorded = _read_reasons()
+        reason_set = frozenset(recorded)
+        is_ambiguous = ambiguous_reason is not None and ambiguous_reason in reason_set
+        if is_ambiguous:
+            episodes = _episodes(recorded)
+            ambiguous_alerted[0] = episodes if episodes is not None else ambiguous_alerted[0] + 1
+        elif last_alert and REASONS_UNAVAILABLE not in reason_set:
+            elapsed = ts_event - last_alert[0][0]
+            if 0 <= elapsed < renotify_after_ns and reason_set <= last_alert[0][1]:
+                logger.warning(
+                    "component_degraded alert throttled component=%s reasons=%d since_last_s=%d",
+                    component_id,
+                    len(recorded),
+                    elapsed // 1_000_000_000,
+                )
+                return
+        last_alert[:] = [(ts_event, reason_set)]
+        _emit(recorded)
+
+    def _on_component_state(event: object) -> None:
+        if not isinstance(event, ComponentStateChanged):
+            _on_tick()
+            return
+        if str(event.component_id) != component_id:
+            return
+        if event.state == ComponentState.RUNNING:
+            alerted.discard(component_id)
+            return
+        if event.state != ComponentState.DEGRADED:
+            return
+        if component_id in alerted:
+            return
+        _on_degraded(event.ts_event)
 
     msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
     return _on_component_state

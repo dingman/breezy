@@ -344,6 +344,11 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # `EXEC_RESOLVER_PERMITTED_CALLEES` exactly like
                 # `_resolve_ambiguous_intents` itself.
                 "_order_trade_activity",
+                # AMBIG-LATCH-RESUME Phase B (plan r6 2.8.7): the no-id resolver
+                # branch and its activities scan. Old(23) -> new(25); scanned by
+                # `EXEC_RESOLVER_COROUTINES`/`EXEC_RESOLVER_PERMITTED_CALLEES`.
+                "_resolve_no_id_intent",
+                "_no_id_trade_activity",
                 "__call__",
             }
         ),
