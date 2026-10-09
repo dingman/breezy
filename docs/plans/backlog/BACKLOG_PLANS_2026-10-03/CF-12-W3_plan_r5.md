@@ -2,7 +2,7 @@
 
 - Backlog row: `docs/core/PROGRESS.md:91` (CF-12-W3, LOW: "needs r5 re-plan after STAGE + WP3b").
 - Parent plan: `docs/plans/CF-12_MYPY_BURNDOWN_Rev2_2026-09-29.md`. Its execution log (`:119-121`) records the failed config-only trial and requires a separate plan with peer review. This is that plan.
-- **Status: r5**, a re-base of the APPROVED r4 (`reviews/CF-12-W3-r4-final.md`, python-reviewer 96, code-reviewer 96) onto the post-CF-12-STAGE tree. **r5 needs a fresh peer review before build**, because the rewrite scope grew about tenfold (§0, §R5 Disposition). The r1–r4 history is kept in `CF-12-W3_plan_r{1..4}.md` and is not repeated here.
+- **Status: READY r5.1** (see §R5.1). Was: r5, a re-base of the APPROVED r4 (`reviews/CF-12-W3-r4-final.md`, python-reviewer 96, code-reviewer 96) onto the post-CF-12-STAGE tree. **r5 needs a fresh peer review before build**, because the rewrite scope grew about tenfold (§0, §R5 Disposition). The r1–r4 history is kept in `CF-12-W3_plan_r{1..4}.md` and is not repeated here.
 - **Changelog r4 → r5 (2026-10-09):**
   - Re-based on HEAD `316b50c4`, after STAGE (commit A `816aec53`, commit B `66d7fe74`, merged via `1462514d`). The `scripts/analysis` post-STAGE ceiling is **351, not 352**: `8e6e77c6` (10-06, F7a WP1s) had already lowered it 360 → 359 before STAGE.
   - The qualified-import inventory went from 28 statements in 16 files to **274 statements in 83 files**. Patch strings went from 1 to 3. Ignored `import-not-found` lines went from 12 to 40.
@@ -615,3 +615,30 @@ Unchanged; see `CF-12-W3_plan_r4.md`. All r2–r4 items remain resolved, and the
   - −2: the scope grows daily, so the inventories go stale between review and build.
   - −2: the `features_build` exception relies on intra-module import order (R6-proven, but indirect).
   - −1: the rollback is a procedure that has not been rehearsed.
+
+---
+
+## §R5.1 Peer-review amendments (2026-10-09, BINDING; status → READY r5.1)
+
+Reviews:
+- code-reviewer: READY 95.
+- python-reviewer: REVISE 93, READY once amendments 1–3 are folded in.
+
+Coordinator rulings on §10, accepted by both reviewers:
+- Q1: accept the provenance divergence. Log old → new hashes; the Stage 0 verifier re-search also covers `.claude/worktrees/*` copies.
+- Q2: R6 stays separate.
+- Q3: accept the `features_build` transitive exception. Note it is doubly covered: `:82` `inputs_obs` also bootstraps archive.
+- Q4: T2/FIN are measured on a scratch copy **before any committed edit**, as a binding STOP gate. This reconciles code-reviewer M1 with python-reviewer Q4.
+
+| # | Source | Amendment |
+|---|---|---|
+| A1 | py M1 | New-key cap: if `scripts/ops` or `scripts/collect` measures **> 10** errors at T2/FIN, STOP and open a typing slice. Never pin a large set. |
+| A2 | py M2 | R6 parameters are **derived by AST**: every `scripts/analysis/*.py` with a bare sibling import of a module in the five bases. Assert the committed `W3_REWRITTEN_SCRIPTS` equals the derived set. Add one committed positive control: a `tmp_path` copy of a rewritten script with its bootstrap removed must fail the child import. |
+| A3 | py M3 | §5.0 checker gains a positive control: a bootstrap whose dir argument names the wrong directory (e.g. `venue` where `archive` is required) must fail. The G5 script stays uncommitted. |
+| A4 | py M4 + cr M1 | A ceiling-rise STOP at T2/FIN means **do not build**. Open CF-12-W3e (typing slice) first, record it in PROGRESS, and stop. `scripts/archive` (ceiling 8, 18 seams) is the likely trip. |
+| A5 | cr M2 | §8 fast path. On a live `breezy-discovery-pull` `ModuleNotFoundError`, the first response is to restore only `scripts/analysis/discovery_venue_pull.py` from the pre-W3 commit. Qualified imports resolve under `-m` with CWD on `sys.path`, and the unit is untouched. Run the full gate, merge, then do the full manual re-pin rollback as follow-up. |
+| A6 | cr M3 | R5 (a) also covers non-`test_*` top-level module basenames under `tests/**` (e.g. `featbuild_fixtures`). Stage 0 asserts none collide with a script basename. |
+| A7 | cr L5, py L5 | §5.4: the new template block goes after any existing `sys.path` loop and before the first bare sibling import. For the contract test that is after the `for _entry` loop and before the `from breezy…` imports. |
+| A8 | cr L6 | G4b's no-network property depends on the injected `now=2026-01-01` (deadline in the past), not on the time of day. Keep `now` injected. |
+| A9 | cr L7 | Add `tests/unit/test_nbp_shadow_parity_contract.py` to the §7 step 8 focused gate. |
+| A10 | cr L8 | `nbp_market_comparison.py` own-dir block: Stage 0 records a binary decision (existing bootstrap `:20-25` covers own dir: yes/no). |
