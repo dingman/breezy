@@ -14,8 +14,13 @@ no network call, and never prints a revision, pid, path or environment value.
    in the decode marker (bound to ``MainPID`` by pid + /proc start ticks) equals
    the revision of the newest ``supervisor_started`` log line, is a hex sha, and
    ``git merge-base --is-ancestor <PHASE_A_SHA> <revision>`` exits 0 -- nothing
-   else is compared. Also FAIL if the unit's Environment names
-   ``BREEZY_BUILD_REVISION`` (a declared value, not the tree HEAD).
+   else is compared. The marker must also match ``MainPID`` by pid AND /proc start
+   ticks (a reused pid cannot pass). Also FAIL if ``/proc/<MainPID>/environ``
+   (which covers ``EnvironmentFile=`` and ``set-environment``) names
+   ``BREEZY_BUILD_REVISION`` (a declared value, not the tree HEAD). Any probe
+   failure (systemctl, /proc, git, log read) is a FAIL with a one-line fixed
+   cause token, never a traceback and never a pass. A node pid of ``0`` is
+   invalid input (exit 2); use ``none`` when the node was down at U1.
 2. Decode check: ``supervisor_admits_retirement_reason(store,
    "RESOLVER_NO_ID_NO_FILL")`` is True, the marker pid equals ``MainPID``, and a
    synthetic RETIRED intent with that member round-trips in memory.
@@ -43,6 +48,7 @@ from pathlib import Path
 from typing import Final
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
+from breezy.runtime.stop_intent_marker import process_start_ticks
 from breezy.runtime.submit_intent import RetirementReason, SubmitIntent, SubmitIntentState
 from breezy.runtime.supervisor_decode_marker import (
     read_supervisor_decode_marker,
@@ -68,47 +74,91 @@ _SUBPROCESS_TIMEOUT_S: Final[float] = 15.0
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 
 
+class ProbeFailed(Exception):
+    """A read the checks depend on failed. ``cause`` is a fixed token, never data."""
+
+    def __init__(self, cause: str) -> None:
+        super().__init__(cause)
+        self.cause = cause
+
+
+CheckResult = tuple[bool, str]
+
+
 @dataclass(frozen=True)
 class Probes:
-    """Every read the checks make, injectable so the checks are unit-testable."""
+    """Every read the checks make, injectable so the checks are unit-testable.
 
-    main_pid: Callable[[], int | None]
-    unit_environment_names_revision_override: Callable[[], bool]
+    Each probe raises :class:`ProbeFailed` (a fixed cause token) on any failure;
+    a probe failure is a FAIL, never a traceback and never a pass.
+    """
+
+    main_pid: Callable[[], int]
+    main_environ_names_revision_override: Callable[[int], bool]
+    process_start_ticks: Callable[[int], int | None]
     supervisor_log_text: Callable[[], str]
     is_ancestor: Callable[[str, str], bool]
     lock_holder_pid: Callable[[], int | None]
 
 
-def _systemctl_show(prop: str) -> str:
-    result = subprocess.run(
-        ["systemctl", "--user", "show", UNIT, "-p", prop],
-        capture_output=True,
-        text=True,
-        timeout=_SUBPROCESS_TIMEOUT_S,
-        check=False,
-    )
-    return result.stdout
-
-
-def _main_pid() -> int | None:
-    match = re.search(r"^MainPID=(\d+)$", _systemctl_show("MainPID"), re.MULTILINE)
+def _systemctl_main_pid() -> int:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", UNIT, "-p", "MainPID"],
+            capture_output=True,
+            text=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise ProbeFailed("systemctl_missing") from None
+    except subprocess.TimeoutExpired:
+        raise ProbeFailed("systemctl_timeout") from None
+    except OSError:
+        raise ProbeFailed("systemctl_failed") from None
+    if result.returncode != 0:
+        raise ProbeFailed("systemctl_failed")
+    if not result.stdout.strip():
+        raise ProbeFailed("systemctl_empty")
+    match = re.search(r"^MainPID=(\d+)$", result.stdout, re.MULTILINE)
     pid = int(match.group(1)) if match else 0
-    return pid if pid > 0 else None
+    if pid <= 0:
+        raise ProbeFailed("mainpid_absent")
+    return pid
 
 
-def _environment_names_revision_override() -> bool:
-    # Presence of the KEY only; the value (and every other variable) is never kept.
-    return re.search(rf"\b{BUILD_REVISION_ENV_NAME}=", _systemctl_show("Environment")) is not None
+def _proc_environ_names_revision_override(main_pid: int) -> bool:
+    """Presence of the KEY only, read from the running process's own environment
+    (covers ``EnvironmentFile=`` and ``set-environment``); no value is retained."""
+    try:
+        raw = Path(f"/proc/{main_pid}/environ").read_bytes()
+    except OSError:
+        raise ProbeFailed("environ_unreadable") from None
+    if not raw:
+        raise ProbeFailed("environ_empty")
+    needle = BUILD_REVISION_ENV_NAME.encode() + b"="
+    return any(item.startswith(needle) for item in raw.split(b"\0"))
 
 
 def _is_ancestor(phase_a_sha: str, revision: str) -> bool:
-    result = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "merge-base", "--is-ancestor", phase_a_sha, revision],
-        capture_output=True,
-        timeout=_SUBPROCESS_TIMEOUT_S,
-        check=False,
-    )
-    return result.returncode == 0
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "merge-base", "--is-ancestor", phase_a_sha, revision],
+            capture_output=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise ProbeFailed("git_missing") from None
+    except subprocess.TimeoutExpired:
+        raise ProbeFailed("git_timeout") from None
+    except OSError:
+        raise ProbeFailed("git_failed") from None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise ProbeFailed("git_error")
 
 
 def _since_newest_started(log_text: str) -> tuple[str | None, list[str]]:
@@ -120,26 +170,48 @@ def _since_newest_started(log_text: str) -> tuple[str | None, list[str]]:
     return None, []
 
 
+def _guarded(check: Callable[[], CheckResult]) -> CheckResult:
+    try:
+        return check()
+    except ProbeFailed as exc:
+        return False, exc.cause
+    except Exception as exc:  # noqa: BLE001 -- never a traceback; the TYPE name only.
+        return False, f"probe_error_{type(exc).__name__}"
+
+
 def check_running_supervisor_descends_from_phase_a(
     store_path: Path | None, phase_a_sha: str, probes: Probes
-) -> bool:
-    if store_path is None or not _HEX_SHA.match(phase_a_sha):
-        return False
+) -> CheckResult:
+    return _guarded(lambda: _check_one(store_path, phase_a_sha, probes))
+
+
+def _check_one(store_path: Path | None, phase_a_sha: str, probes: Probes) -> CheckResult:
+    if store_path is None:
+        return False, "store_path_unresolved"
+    if not _HEX_SHA.match(phase_a_sha):
+        return False, "phase_a_sha_invalid"
     main_pid = probes.main_pid()
     marker = read_supervisor_decode_marker(store_path)
-    started, _after = _since_newest_started(probes.supervisor_log_text())
-    if main_pid is None or marker is None or started is None:
-        return False
+    if marker is None:
+        return False, "marker_absent_or_malformed"
     if marker.pid != main_pid:
-        return False
+        return False, "marker_pid_not_mainpid"
+    ticks = probes.process_start_ticks(main_pid)
+    if ticks is None or ticks != marker.start_ticks:
+        return False, "marker_start_ticks_mismatch"
+    started, _after = _since_newest_started(probes.supervisor_log_text())
+    if started is None:
+        return False, "no_supervisor_started_line"
     logged = _REVISION.search(started)
     if logged is None or logged.group(1) != marker.revision:
-        return False
+        return False, "log_revision_differs_from_marker"
     if not _HEX_SHA.match(marker.revision):  # package-version / "unknown" fallbacks FAIL
-        return False
-    if probes.unit_environment_names_revision_override():
-        return False
-    return probes.is_ancestor(phase_a_sha, marker.revision)
+        return False, "revision_not_a_sha"
+    if probes.main_environ_names_revision_override(main_pid):
+        return False, "build_revision_override_set"
+    if not probes.is_ancestor(phase_a_sha, marker.revision):
+        return False, "not_a_descendant_of_phase_a"
+    return True, ""
 
 
 def _synthetic_retired_round_trips() -> bool:
@@ -158,34 +230,55 @@ def _synthetic_retired_round_trips() -> bool:
     return decoded.retirement_reason is RetirementReason.RESOLVER_NO_ID_NO_FILL
 
 
-def check_decode_marker(store_path: Path | None, probes: Probes) -> bool:
+def check_decode_marker(store_path: Path | None, probes: Probes) -> CheckResult:
+    return _guarded(lambda: _check_two(store_path, probes))
+
+
+def _check_two(store_path: Path | None, probes: Probes) -> CheckResult:
     if store_path is None:
-        return False
+        return False, "store_path_unresolved"
     main_pid = probes.main_pid()
     marker = read_supervisor_decode_marker(store_path)
-    if main_pid is None or marker is None or marker.pid != main_pid:
-        return False
+    if marker is None:
+        return False, "marker_absent_or_malformed"
+    if marker.pid != main_pid:
+        return False, "marker_pid_not_mainpid"
     if not supervisor_admits_retirement_reason(store_path, NEW_REASON):
-        return False
-    return _synthetic_retired_round_trips()
+        return False, "marker_does_not_admit_new_member"
+    if not _synthetic_retired_round_trips():
+        return False, "synthetic_round_trip_failed"
+    return True, ""
 
 
 def check_same_pid_adoption(
     store_path: Path | None, pre_restart_node_pid: int | None, probes: Probes
-) -> bool:
+) -> CheckResult:
+    return _guarded(lambda: _check_three(store_path, pre_restart_node_pid, probes))
+
+
+def _check_three(
+    store_path: Path | None, pre_restart_node_pid: int | None, probes: Probes
+) -> CheckResult:
+    if store_path is None:
+        return False, "store_path_unresolved"
     started, after = _since_newest_started(probes.supervisor_log_text())
-    if started is None or store_path is None:
-        return False
+    if started is None:
+        return False, "no_supervisor_started_line"
     if pre_restart_node_pid is None:  # node was down at U1 (delta R12)
-        return any(_NODE_DOWN_EVIDENCE.search(line) for line in after)
+        if any(_NODE_DOWN_EVIDENCE.search(line) for line in after):
+            return True, ""
+        return False, "no_adoption_or_spawn_logged"
     adopted = [int(m.group(1)) for line in after if (m := _ADOPTED.search(line))]
-    holder = probes.lock_holder_pid()
-    return pre_restart_node_pid in adopted and holder == pre_restart_node_pid
+    if pre_restart_node_pid not in adopted:
+        return False, "no_adoption_of_pre_restart_pid"
+    if probes.lock_holder_pid() != pre_restart_node_pid:
+        return False, "lock_holder_differs"
+    return True, ""
 
 
 def run_checks(
     *, store_path: Path | None, phase_a_sha: str, pre_restart_node_pid: int | None, probes: Probes
-) -> tuple[bool, bool, bool]:
+) -> tuple[CheckResult, CheckResult, CheckResult]:
     return (
         check_running_supervisor_descends_from_phase_a(store_path, phase_a_sha, probes),
         check_decode_marker(store_path, probes),
@@ -194,11 +287,18 @@ def run_checks(
 
 
 def _parse_node_pid(raw: str) -> int | None:
-    if raw.lower() in {"none", "0", "down"}:
+    """``none``/``down`` = the node was down at U1. ``0`` and negatives are invalid
+    input (argparse exits 2), never silently read as "node down"."""
+    if raw.lower() in {"none", "down"}:
         return None
-    value = int(raw)
-    if value < 0:
-        raise argparse.ArgumentTypeError("pre-restart node pid must be >= 0 or 'none'")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "pre-restart node pid must be a positive int or 'none'"
+        ) from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("pre-restart node pid must be a positive int or 'none'")
     return value
 
 
@@ -207,14 +307,15 @@ def _build_probes(store_path: Path | None, log_dir: Path) -> Probes:
         try:
             return supervisor_log_path(log_dir).read_text(errors="replace")
         except OSError:
-            return ""
+            raise ProbeFailed("log_unreadable") from None
 
     def _holder() -> int | None:
         return None if store_path is None else resolve_lock_holder_pid(intent_lock_path(store_path))
 
     return Probes(
-        main_pid=_main_pid,
-        unit_environment_names_revision_override=_environment_names_revision_override,
+        main_pid=_systemctl_main_pid,
+        main_environ_names_revision_override=_proc_environ_names_revision_override,
+        process_start_ticks=process_start_ticks,
         supervisor_log_text=_log_text,
         is_ancestor=_is_ancestor,
         lock_holder_pid=_holder,
@@ -246,9 +347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         probes=probes,
     )
     labels = ("check1_descends_from_phase_a", "check2_decode_marker", "check3_same_pid_adoption")
-    for label, ok in zip(labels, results, strict=True):
-        print(f"{label} {'PASS' if ok else 'FAIL'}")
-    overall = all(results)
+    for label, (ok, cause) in zip(labels, results, strict=True):
+        print(f"{label} PASS" if ok else f"{label} FAIL {cause}")
+    overall = all(ok for ok, _cause in results)
     print(f"RESULT {'PASS' if overall else 'FAIL'}")
     return 0 if overall else 1
 

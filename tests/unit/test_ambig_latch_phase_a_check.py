@@ -7,6 +7,7 @@ no network). Non-vacuity: every check has a FAIL case, and an absent marker
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -20,6 +21,7 @@ sys.path.insert(0, (REPO_ROOT / "scripts" / "ops").as_posix())
 
 import ambig_latch_phase_a_check as chk  # type: ignore[import-not-found]
 
+from breezy.runtime.stop_intent_marker import process_start_ticks
 from breezy.runtime.supervisor_decode_marker import (
     supervisor_decode_marker_path,
     write_supervisor_decode_marker,
@@ -49,10 +51,15 @@ def _adopted(pid: int = NODE_PID) -> str:
     )
 
 
+def _raise_mainpid_absent() -> int:
+    raise chk.ProbeFailed("mainpid_absent")
+
+
 def _probes(**overrides: Any) -> chk.Probes:
     base: dict[str, Any] = {
         "main_pid": lambda: MAIN_PID,
-        "unit_environment_names_revision_override": lambda: False,
+        "main_environ_names_revision_override": lambda _pid: False,
+        "process_start_ticks": process_start_ticks,
         "supervisor_log_text": lambda: _log(after=(_adopted(),)),
         "is_ancestor": lambda _sha, _rev: True,
         "lock_holder_pid": lambda: NODE_PID,
@@ -76,7 +83,18 @@ def _run(
     node: int | None = NODE_PID,
     sha: str = PHASE_A_SHA,
 ) -> tuple[bool, bool, bool]:
-    results: tuple[bool, bool, bool] = chk.run_checks(
+    a, b, c = _run_full(store_path, probes, node=node, sha=sha)
+    return a[0], b[0], c[0]
+
+
+def _run_full(
+    store_path: Path | None,
+    probes: chk.Probes,
+    *,
+    node: int | None = NODE_PID,
+    sha: str = PHASE_A_SHA,
+) -> tuple[tuple[bool, str], tuple[bool, str], tuple[bool, str]]:
+    results: tuple[tuple[bool, str], tuple[bool, str], tuple[bool, str]] = chk.run_checks(
         store_path=store_path, phase_a_sha=sha, pre_restart_node_pid=node, probes=probes
     )
     return results
@@ -116,10 +134,10 @@ def test_ancestry_alone_decides_and_receives_the_marker_revision(store_path: Pat
 )
 def test_check_one_fails_closed_on_each_inconsistency(store_path: Path, mutation: str) -> None:
     probes = {
-        "env_override": _probes(unit_environment_names_revision_override=lambda: True),
+        "env_override": _probes(main_environ_names_revision_override=lambda _p: True),
         "log_revision_differs": _probes(supervisor_log_text=lambda: _log(revision="ffffffffffff")),
         "marker_pid_not_mainpid": _probes(main_pid=lambda: MAIN_PID + 1),
-        "no_mainpid": _probes(main_pid=lambda: None),
+        "no_mainpid": _probes(main_pid=_raise_mainpid_absent),
         "no_started": _probes(supervisor_log_text=lambda: "nothing here\n"),
     }[mutation]
     assert _run(store_path, probes)[0] is False
@@ -218,8 +236,141 @@ def test_main_prints_only_pass_fail_lines_and_exits_zero_iff_all_pass(
 def test_node_pid_argument_accepts_none_and_rejects_garbage() -> None:
     assert chk._parse_node_pid("none") is None
     assert chk._parse_node_pid("1234") == 1234
-    with pytest.raises(ValueError):
-        chk._parse_node_pid("abc")
+    for bad in ("abc", "0", "-5", ""):
+        with pytest.raises(argparse.ArgumentTypeError):
+            chk._parse_node_pid(bad)
+
+
+def test_node_pid_zero_is_invalid_input_with_exit_two(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        chk.main([PHASE_A_SHA, "0"])
+    assert excinfo.value.code == 2
+    capsys.readouterr()
+
+
+def test_check_one_requires_the_marker_start_ticks_to_match_mainpid(store_path: Path) -> None:
+    real = process_start_ticks(MAIN_PID)
+    assert real is not None
+    reused = _run_full(store_path, _probes(process_start_ticks=lambda _p: real + 1))
+    assert reused[0] == (False, "marker_start_ticks_mismatch")
+    unknown = _run_full(store_path, _probes(process_start_ticks=lambda _p: None))
+    assert unknown[0] == (False, "marker_start_ticks_mismatch")
+
+
+def _boom(exc: BaseException) -> Any:
+    def _raise(*_a: object, **_kw: object) -> Any:
+        raise exc
+
+    return _raise
+
+
+@pytest.mark.parametrize(
+    ("probe", "exc", "expected_cause"),
+    [
+        ("main_pid", chk.ProbeFailed("systemctl_timeout"), "systemctl_timeout"),
+        ("main_pid", FileNotFoundError("systemctl"), "probe_error_FileNotFoundError"),
+        (
+            "main_environ_names_revision_override",
+            chk.ProbeFailed("environ_unreadable"),
+            "environ_unreadable",
+        ),
+        (
+            "main_environ_names_revision_override",
+            PermissionError("x"),
+            "probe_error_PermissionError",
+        ),
+        ("is_ancestor", chk.ProbeFailed("git_timeout"), "git_timeout"),
+        ("is_ancestor", RuntimeError("secret detail"), "probe_error_RuntimeError"),
+        ("supervisor_log_text", chk.ProbeFailed("log_unreadable"), "log_unreadable"),
+    ],
+)
+def test_every_probe_failure_is_a_fail_with_a_fixed_cause_never_a_traceback_or_pass(
+    store_path: Path, probe: str, exc: BaseException, expected_cause: str
+) -> None:
+    results = _run_full(store_path, _probes(**{probe: _boom(exc)}))
+    causes = [cause for ok, cause in results if not ok]
+    assert expected_cause in causes
+    assert all("secret" not in cause for _ok, cause in results)
+
+
+def test_an_unreadable_supervisor_log_fails_checks_one_and_three_naming_the_cause(
+    store_path: Path, tmp_path: Path
+) -> None:
+    probes = chk._build_probes(store_path, tmp_path / "no_such_log_dir")
+    with pytest.raises(chk.ProbeFailed) as excinfo:
+        probes.supervisor_log_text()
+    assert excinfo.value.cause == "log_unreadable"
+
+
+def test_systemctl_probe_failures_map_to_fixed_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _run_raising(exc: BaseException) -> Any:
+        def _r(*_a: object, **_kw: object) -> Any:
+            raise exc
+
+        return _r
+
+    for exc, cause in (
+        (FileNotFoundError("systemctl"), "systemctl_missing"),
+        (subprocess.TimeoutExpired("systemctl", 1), "systemctl_timeout"),
+        (PermissionError("x"), "systemctl_failed"),
+    ):
+        monkeypatch.setattr(chk.subprocess, "run", _run_raising(exc))
+        with pytest.raises(chk.ProbeFailed) as excinfo:
+            chk._systemctl_main_pid()
+        assert excinfo.value.cause == cause
+
+    def _fake(stdout: str, code: int = 0) -> Any:
+        return lambda *_a, **_kw: subprocess.CompletedProcess([], code, stdout=stdout)
+
+    for stdout, code, cause in (
+        ("", 0, "systemctl_empty"),
+        ("MainPID=0\n", 0, "mainpid_absent"),
+        ("garbage\n", 0, "mainpid_absent"),
+        ("MainPID=5\n", 1, "systemctl_failed"),
+    ):
+        monkeypatch.setattr(chk.subprocess, "run", _fake(stdout, code))
+        with pytest.raises(chk.ProbeFailed) as excinfo:
+            chk._systemctl_main_pid()
+        assert excinfo.value.cause == cause
+    monkeypatch.setattr(chk.subprocess, "run", _fake("MainPID=77\n"))
+    assert chk._systemctl_main_pid() == 77
+
+
+def test_proc_environ_probe_reads_the_process_environment_for_the_key_only(
+    tmp_path: Path,
+) -> None:
+    script = "import os,sys,time; sys.stdout.write('ready\\n'); sys.stdout.flush(); time.sleep(30)"
+    env = {"PATH": os.environ.get("PATH", ""), "BREEZY_BUILD_REVISION": "feedface"}
+    clean = {"PATH": os.environ.get("PATH", ""), "OTHER": "1"}
+    for environ, expected in ((env, True), (clean, False)):
+        child = subprocess.Popen(
+            [sys.executable, "-c", script], env=environ, stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert child.stdout is not None
+            child.stdout.readline()
+            assert chk._proc_environ_names_revision_override(child.pid) is expected
+        finally:
+            child.terminate()
+            child.wait()
+    with pytest.raises(chk.ProbeFailed) as excinfo:
+        chk._proc_environ_names_revision_override(2**30)
+    assert excinfo.value.cause == "environ_unreadable"
+
+
+def test_main_prints_a_one_line_cause_for_each_failing_check(
+    store_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        chk,
+        "_build_probes",
+        lambda _s, _l: _probes(main_pid=_boom(chk.ProbeFailed("systemctl_timeout"))),
+    )
+    assert chk.main([PHASE_A_SHA, str(NODE_PID), "--store-path", str(store_path)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "check1_descends_from_phase_a FAIL systemctl_timeout"
+    assert lines[1] == "check2_decode_marker FAIL systemctl_timeout"
+    assert lines[-1] == "RESULT FAIL"
 
 
 def test_the_real_ancestry_probe_is_git_merge_base_is_ancestor() -> None:
@@ -230,7 +381,17 @@ def test_the_real_ancestry_probe_is_git_merge_base_is_ancestor() -> None:
         check=True,
     ).stdout.strip()
     assert chk._is_ancestor(head, head) is True
-    assert chk._is_ancestor("0" * 40, head) is False
+    # An unknown object is a git error (exit 128): a FAIL with a cause, not "False".
+    with pytest.raises(chk.ProbeFailed) as excinfo:
+        chk._is_ancestor("0" * 40, head)
+    assert excinfo.value.cause == "git_error"
+    parent = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD~1"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert chk._is_ancestor(head, parent) is False  # a child is not an ancestor of its parent
 
 
 def test_script_source_is_read_only_no_store_write_signal_or_network() -> None:
