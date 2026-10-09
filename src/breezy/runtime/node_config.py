@@ -1001,11 +1001,12 @@ def build_trade_node_config(
     # AMBIG-LATCH-RESUME (DH1): the no-id resolver may retire only if the RUNNING
     # supervisor's decode marker lists the new reason, so a supervisor that cannot
     # decode it never meets a RETIRED record it would read as corrupt (L-48).
-    # Read once, here, at node boot; the boot line is the activation proof.
+    # Read once, here, at node boot. The value rides on the exec client config;
+    # ``trade_cli._run_node`` logs the activation-proof boot line once the node
+    # (and so Nautilus logging) is live -- a record emitted here would be dropped.
     no_id_retire_admitted = supervisor_admits_retirement_reason(
         Path(state_store_path), "RESOLVER_NO_ID_NO_FILL"
     )
-    logger.info("no_id_retire_admitted=%s", no_id_retire_admitted)
     exec_client_config = msgspec_replace(
         exec_client_config,
         state_store_opener=lambda: SqliteStateStore(state_store_path),
