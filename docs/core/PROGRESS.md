@@ -49,7 +49,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 ### LIVE-PROOF owed
 | ID | Proof owed (exact) |
 |---|---|
-| ING-2-AMEND2 | Post-rotation ingest still fails daily (606–705 s, peak 4.3–9.8G) → TEMPORARY drop-in STAYS; superseded by ING-3 (plan r2 READY, `docs/plans/backlog/ING-3_2026-10-08/`): Stage 0 snapshot at 09:00Z rotation, runs after 09:30Z alone |
+| ING-3 | Stage 0 done (30804514): mem PASS, time STOP; drop-in REMOVED 10-09 20:00Z (auto-rollback watch); pin 585d8f7e; close after 10-10 09:45Z run verified |
 | FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
 | R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
 | Failed units | portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09 |
@@ -96,7 +96,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 |---|---|
 | AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
 | AUD-10b | Blocked on ING-3 |
-| F13 freeze prep | PFM history + GFS MOS 2021-25 + 2026H1 DONE 10-09; `source_breaks` PROPOSAL `F13-source-breaks-proposal_2026-10-09.md`; draft build + freeze ≥10-21 |
+| F13 freeze prep | backfills DONE; draft build clean 10-09 (observed ⊆ proposed after nbp gap fix c34f1417; ArchiveCache fix bb1ea022, 182 s); left: peer review of list → freeze ≥10-21 |
 
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
