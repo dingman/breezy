@@ -52,7 +52,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | ING-2-AMEND2 | Post-rotation ingest still fails daily (606–705 s, peak 4.3–9.8G) → TEMPORARY drop-in STAYS; superseded by ING-3 (plan r2 READY, `docs/plans/backlog/ING-3_2026-10-08/`): Stage 0 snapshot at 09:00Z rotation, runs after 09:30Z alone |
 | FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
 | R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
-| Failed units | fee-evidence-pull (check 10-09 11:10Z), portfolio-roi (WP3), stale transients reset-failed in WP3 |
+| Failed units | fee-evidence-pull 10-09 11:10Z OK (60/60); portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09; collector 429 back-off now exits 0 BACKED_OFF (1462514d) |
 
 ### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
 Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
@@ -74,7 +74,7 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
-| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1/WP3b/WP5 merged+live; WP2 canary LIVE 10-08 (absence rule BLOCKED-EXTERNAL: needs operator dead-man endpoint, ruling r3); WP3 S1 merged, S2-S3 built, S4 building, S5-S6 next; WP9 after |
+| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1/WP3b/WP5 merged+live; WP2 canary LIVE 10-08 (absence rule BLOCKED-EXTERNAL: needs operator dead-man endpoint, ruling r3); WP3 S1-S6 merged+LIVE (health timer */10, X-12..X-16; 10-09 fixes: oneshot self-grace 2e7f35d5, rotate show-read 4d02d594, timer Unit= lookup + ingest/replay named 1462514d); open: X-15 doc says two-pass, code is single-pass (erratum owed); WP9 live-proof report next |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
 | 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
@@ -87,7 +87,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| CF-12-STAGE | LOW | READY `BP/CF-12-STAGE_plan_r1.1_delta_2026-10-08.md`; build after waves 1/2 merge | CF-12 |
+| CF-12-STAGE | LOW | DONE 10-09 (merged via integration 1462514d; tests/unit mypy ceiling 1288) | CF-12 |
 | CF-12-W3 | LOW | needs r5 re-plan after STAGE + WP3b | CF-12 |
 | SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
@@ -101,7 +101,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | READY r6.1 + amendments R1–R15; build after the SUP-RESTART D2.4 proof |
+| AMBIG-LATCH-RESUME | Phase A merged be9b80da + fix-forward 43b03682 (bounded page defer), LIVE (U1 10:32Z/12:05Z, U2 EXIT=0 ×2). Phase B merged 004f306f (security APPROVE + F4 sign-off, architect SOUND, gate EXIT=0); activates at the 10-09 16:50Z launch. Owed: §5.4 boot proof (`no_id_retire_admitted=True` in the node log FILE), then positive in-service proof at the next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (~2 KB/day, LOW); boot-retry WARN latch done; malformed-webhook startup crash in marker-fail handler (LOW) |
 | SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
