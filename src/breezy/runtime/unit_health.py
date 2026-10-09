@@ -50,6 +50,9 @@ from breezy.runtime.autonomy_sandbox.bus_handoff import (
     BusSnapshotError,
     read_bus_snapshot,
 )
+from breezy.runtime.monitor_watch import production_watch
+from breezy.runtime.monitor_watch_apply import apply_watch
+from breezy.runtime.monitor_watch_memory import addback_kib, addback_units
 from breezy.runtime.unit_health_daemon_support import DaemonWiring, SubprocessDaemonJournal
 from breezy.runtime.unit_health_daemons import run_daemon_rules
 from breezy.runtime.unit_health_journal import (
@@ -165,6 +168,7 @@ def production_env(
         delivered=alerts_delivered(alerts),
         invocation_id=env_map.get("INVOCATION_ID", ""),
         daemons=DaemonWiring(SubprocessDaemonJournal(), alerts_root=alerts),
+        watch=production_watch(root),
     )
 
 
@@ -208,6 +212,8 @@ class _Scan:
     blocking: bool = False
     #: Replaced-state fields of ``seen/<unit>.json`` the S4 rules stage for the commit step.
     daemon_seen: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: Units read INCONCLUSIVE(not_deployed) by the S5 hook: listed in the day rollup (X-8).
+    not_deployed: list[str] = field(default_factory=list)
 
 
 def _site(unit: str, invocation: str) -> str:
@@ -588,6 +594,7 @@ class _Pass:
                 )
         if observation is not None:
             run_daemon_rules(self, observation)
+            apply_watch(self, observation)
 
     def commit_state(self) -> None:
         batch = self.scan.batch
@@ -618,11 +625,12 @@ class _Pass:
         if meminfo is None:
             return
         available, _total = meminfo
-        addback = 0
-        for unit in MEMORY_ADDBACK_UNITS:
-            current = observation.blocks.get(unit, {}).get("MemoryCurrent", "")
-            if current.isdigit() and int(current) < _MEMORY_UNSET_FROM:
-                addback += int(current) // 1024
+        units = (
+            addback_units(self.env.watch.deploy_dir)
+            if self.env.watch is not None
+            else MEMORY_ADDBACK_UNITS
+        )
+        addback = addback_kib(observation.blocks, units)
         self.store.append_memavail(self.env.now_ns(), available, available + addback)
 
 
@@ -679,6 +687,7 @@ def _finish(env: PassEnv, run: _Pass, unknown: bool, label: str) -> None:
                     completed=not unknown,
                     streak=beat["passes_unknown_streak"],
                     foreign=scan.foreign,
+                    not_deployed=scan.not_deployed,
                     cursor_reset=scan.cursor_reset,
                 ),
             )

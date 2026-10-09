@@ -62,6 +62,7 @@ def rollup_body(
     streak: int,
     foreign: Iterable[str],
     cursor_reset: bool,
+    not_deployed: Iterable[str] = (),
 ) -> dict[str, Any]:
     """The rollup of ``day``. Pass counters move only on the pass's own day."""
     previous = env.store.read_rollup_strict(day)
@@ -78,5 +79,6 @@ def rollup_body(
             int(previous.get("max_passes_unknown_streak", 0)), streak if own_day else 0
         ),
         "cursor_reset": bool(previous.get("cursor_reset")) or (own_day and cursor_reset),
+        "not_deployed": sorted(not_deployed) if own_day else list(previous.get("not_deployed", [])),
         "produced_at_ns": env.now_ns(),
     }

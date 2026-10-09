@@ -9,6 +9,7 @@ from typing import Final
 
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.autonomy_sandbox.bus_handoff import BusSnapshot
+from breezy.runtime.monitor_watch import WatchWiring
 from breezy.runtime.unit_health_daemon_support import DaemonWiring
 from breezy.runtime.unit_health_journal import JournalSource
 from breezy.runtime.unit_health_store import HealthStore
@@ -74,3 +75,5 @@ class PassEnv:
     invocation_id: str = ""
     #: The daemon and intraday-stage rules' seams (S4); ``None`` skips them.
     daemons: DaemonWiring | None = None
+    #: The meta-detectors' seams (WP3 S5: timers, producer, delivery, memory); ``None`` skips them.
+    watch: WatchWiring | None = None
