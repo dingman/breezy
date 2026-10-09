@@ -9,11 +9,11 @@ enabled instances) the pass reads ``UnitFileState``, ``ActiveState``, ``ActiveEn
 enabled instance; and when a retired timer is loaded and enabled. Every ``deploy/systemd`` unit
 file must also be installed or listed in the not-deployed table (the inventory completeness check).
 
-X-15 (binding activation ruling): a missing next elapse is forgiven only while the timer's service
-is ``active`` or ``activating`` and entered after the last trigger (a oneshot being run, whose timer
-re-arms when it ends), and only for ``min(interval, 1 h)`` from that entry. The stale and
-never-triggered checks stay unconditional. A service that is idle, absent from the snapshot, or
-entered before the last trigger gets no grace, so the finding is CRITICAL at once.
+X-15 (binding activation ruling): a missing next elapse is forgiven only while the timer's
+service is ``active`` or ``activating`` since the last trigger (a oneshot being run: its timer
+re-arms when it ends, and it has no ``ActiveEnterTimestamp``), and only for ``min(interval, 1 h)``.
+The stale and never-triggered checks stay unconditional. A service that is idle, absent from the
+snapshot, or running from before the last trigger gets no grace, so the finding is CRITICAL.
 """
 
 from __future__ import annotations
@@ -53,6 +53,8 @@ _NO_FUTURE_MONOTONIC: Final = frozenset({"", "0", "infinity", "n/a"})
 #: The longest a missing next elapse is forgiven while the service runs (X-15).
 ELAPSE_GRACE_CAP_S: Final = 3600
 _RUNNING: Final = frozenset({"active", "activating"})
+#: The bus stamps have second resolution: equal stamps are "at the same time".
+_STAMP_TOLERANCE_NS: Final = NS
 
 Classify = Callable[[str], Deployment]
 
@@ -66,15 +68,27 @@ def _finding(kind: str, unit: str, today: str, detail: str) -> WatchFinding:
 def _service_running_since_trigger(
     service: Mapping[str, str] | None, last: int | None, interval_s: int, now_ns: int
 ) -> bool:
-    """X-15: the service is running, entered after ``last``, and within min(interval, 1 h)."""
+    """X-15: the service is running since the last trigger, and within min(interval, 1 h).
+
+    Two ways to show it. A service that entered ``active`` at or after the last trigger (one second
+    of tolerance: the two stamps have second resolution). Or a ``Type=oneshot`` service that is
+    ``activating``: it never enters ``active`` (its ``ActiveEnterTimestamp`` stays empty), so it is
+    running since the trigger when its previous run ended no later than the trigger. A timer waits
+    for its service to exit before it re-arms, so mid-trigger it has no next elapse by design.
+    """
     if service is None or service.get("ActiveState") not in _RUNNING:
         return False
     readable, entered = timestamp_or_zero(service.get("ActiveEnterTimestamp", ""))
-    if not readable or entered is None:
+    if not readable:
         return False
-    if last is not None and entered <= last:
-        return False
-    return now_ns - entered <= min(interval_s, ELAPSE_GRACE_CAP_S) * NS
+    reference: int | None = None
+    if entered is not None and (last is None or entered >= last - _STAMP_TOLERANCE_NS):
+        reference = entered
+    elif service.get("ActiveState") == "activating" and last is not None:
+        ok_ended, ended = timestamp_or_zero(service.get("InactiveEnterTimestamp", ""))
+        if ok_ended and (ended is None or ended <= last + _STAMP_TOLERANCE_NS):
+            reference = last
+    return reference is not None and now_ns - reference <= min(interval_s, ELAPSE_GRACE_CAP_S) * NS
 
 
 def _check_block(
