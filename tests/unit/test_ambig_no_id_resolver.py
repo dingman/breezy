@@ -54,6 +54,7 @@ from tests.unit.ambig_latch_rig import (
     make_command,
     prior_process,
     read_context,
+    read_paths,
     response_sender,
     rig_slug,
     run_passes,
@@ -415,11 +416,11 @@ async def test_the_no_id_branch_skips_an_intent_whose_post_is_in_flight(
     assert current is not None
     assert client._post_in_flight_intent_id == current.intent_id
     client.advance(400)
-    paths_before = list(client._private_read.paths)
+    paths_before = read_paths(client)
 
     await run_passes(client, 1)
 
-    new_paths = client._private_read.paths[len(paths_before) :]
+    new_paths = read_paths(client)[len(paths_before) :]
     assert PORTFOLIO_ACTIVITIES_PATH not in new_paths
     assert client._latch.current_open() is not None
     gate.set()
@@ -452,13 +453,13 @@ async def test_no_id_branch_makes_no_read_below_the_min_age_and_reads_above_it(
 ) -> None:
     client, current, _cmd, _sender, _ev = await _no_id_take(tmp_path, monkeypatch)
     client.advance(290)
-    before = list(client._private_read.paths)
+    before = read_paths(client)
     await run_passes(client, 1)
-    assert PORTFOLIO_ACTIVITIES_PATH not in client._private_read.paths[len(before) :]
+    assert PORTFOLIO_ACTIVITIES_PATH not in read_paths(client)[len(before) :]
     assert client._latch.current_open() is not None
     client.advance(20)
     await run_passes(client, 1)
-    assert PORTFOLIO_ACTIVITIES_PATH in client._private_read.paths
+    assert PORTFOLIO_ACTIVITIES_PATH in read_paths(client)
     del current
     await client._disconnect()
 
@@ -476,7 +477,7 @@ async def test_after_a_contradiction_the_branch_waits_for_the_recheck_interval(
     assert current.intent_id in client._resolver_contradiction_details
 
     def _activity_reads() -> int:
-        return client._private_read.paths.count(PORTFOLIO_ACTIVITIES_PATH)
+        return read_paths(client).count(PORTFOLIO_ACTIVITIES_PATH)
 
     reads = _activity_reads()
     client.advance(50)
@@ -1067,7 +1068,9 @@ async def test_baseline_variants_a_b_c(
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
-    now_of = lambda c: c._clock.timestamp_ns()
+    def now_of(c: Any) -> int:
+        return int(c._clock.timestamp_ns())
+
     instrument = build_instrument()
 
     # (a) a durable fill within 300 s of the snapshot -> no baseline -> absolute rule

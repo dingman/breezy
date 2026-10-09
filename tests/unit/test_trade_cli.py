@@ -1553,10 +1553,15 @@ def test_run_node_boots_when_arming_fails(
 # ---------------------------------------------------------------------------
 
 
+def _record(calls: list[int]) -> bool:
+    calls.append(1)
+    return True
+
+
 def test_the_resume_handler_is_a_no_op_for_a_missing_client_or_attribute() -> None:
     clients: dict[object, object] = {}
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
-    handler = trade_cli._exec_client_resume_handler(node)  # type: ignore[arg-type]
+    handler = trade_cli._exec_client_resume_handler(node)
 
     handler(object())  # no client at all
     clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
@@ -1564,7 +1569,7 @@ def test_the_resume_handler_is_a_no_op_for_a_missing_client_or_attribute() -> No
 
     calls: list[int] = []
     clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace(
-        resume_if_refusals_cleared=lambda: calls.append(1) or True
+        resume_if_refusals_cleared=lambda: _record(calls)
     )
     handler(object())
     assert calls == [1]
@@ -1579,7 +1584,7 @@ class ResumeTickNode(RecordingNode):
     def run(self) -> None:
         self.calls.append("run")
         client = SimpleNamespace(
-            resume_if_refusals_cleared=lambda: type(self).resume_calls.append(1) or True,
+            resume_if_refusals_cleared=lambda: _record(type(self).resume_calls),
             stale_ambiguous_intent_alerts=(
                 {
                     "intent_id": "intent-1",
@@ -1632,6 +1637,6 @@ def test_degraded_alert_and_resume_handler_are_wired_into_the_repoll_tuple(
     assert handlers[3] is degraded_handler
     assert handlers[-1].__name__ == "_resume"
     kwargs = captured["degraded_kwargs"]
-    assert kwargs["ambiguous_reason"] == trade_cli.submit_chain.AMBIGUOUS_REASON
+    assert kwargs["ambiguous_reason"] == trade_cli.submit_chain.AMBIGUOUS_REASON  # type: ignore[attr-defined]
     assert callable(kwargs["ambiguous_clears"])
     assert kwargs["ambiguous_clears"]() == 0, "no client yet: a missing client reads as 0"

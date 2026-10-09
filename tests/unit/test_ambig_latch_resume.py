@@ -48,6 +48,7 @@ from tests.unit.ambig_latch_rig import (
     gate_env,  # noqa: F401 -- fixture
     make_command,
     prior_process,
+    read_paths,
     response_sender,
     rig_slug,
     run_passes,
@@ -334,7 +335,8 @@ def _callees(fn_node: ast.AST) -> set[str]:
 def _method_ast(name: str) -> ast.AST:
     member = inspect.getattr_static(PolymarketUSExecutionClient, name)
     function = member.fget if isinstance(member, property) else member
-    return ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+    source = inspect.getsource(function)  # type: ignore[arg-type]
+    return ast.parse(textwrap.dedent(source)).body[0]
 
 
 def test_resume_method_callee_set_is_exactly_pinned() -> None:
@@ -851,7 +853,7 @@ async def test_a_node_booted_over_prior_process_open_intents_retires_every_shape
     payloads[PORTFOLIO_POSITIONS_PATH] = {"positions": {}, "eof": True}
     payloads[PORTFOLIO_ACTIVITIES_PATH] = {"activities": [], "eof": True}
     await second._connect()
-    assert PORTFOLIO_ACTIVITIES_PATH not in second._private_read.paths
+    assert PORTFOLIO_ACTIVITIES_PATH not in read_paths(second)
     assert second._latch.current_open() is not None
     second.advance(295)
     await run_passes(second, 1)

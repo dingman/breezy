@@ -49,7 +49,7 @@ from tests.unit import test_current_rung_hold_ambiguous_resolver as _resolver_te
 from tests.unit import test_current_rung_hold_pre_arm_race as _race_tests
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import build_instrument
-from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+from tests.unit.test_current_rung_hold_ambiguous_resolver import (  # type: ignore[attr-defined]
     OPEN_ORDERS_PATH,
     PORTFOLIO_POSITIONS_PATH,
     RESOLVER_CONTEXT_KEY_PREFIX,
@@ -96,6 +96,7 @@ __all__ = [
     "ns_to_rfc3339",
     "prior_process",
     "read_context",
+    "read_paths",
     "reboot_client",
     "response_sender",
     "rig_slug",
@@ -156,7 +157,7 @@ class _RecordingLog:
         return getattr(self._inner, name)
 
 
-class TimedClient(PolymarketUSExecutionClient):  # type: ignore[misc]
+class TimedClient(PolymarketUSExecutionClient):
     """The real client with a Python-visible movable clock (see module doc).
 
     ``admitted`` (class attribute, set by :func:`build_client`) is forwarded as
@@ -174,26 +175,27 @@ class TimedClient(PolymarketUSExecutionClient):  # type: ignore[misc]
         super().__init__(**kwargs)
 
     @property
-    def _clock(self) -> Any:  # type: ignore[override]
+    def _clock(self) -> Any:
         wrapped = self.__dict__.get("_offset_clock")
         if wrapped is None:
-            base = PolymarketUSExecutionClient._clock.__get__(self)  # type: ignore[attr-defined]
+            base = PolymarketUSExecutionClient._clock.__get__(self)
             wrapped = _OffsetClock(base)
             self.__dict__["_offset_clock"] = wrapped
         return wrapped
 
     @property
-    def _log(self) -> Any:  # type: ignore[override]
+    def _log(self) -> Any:
         wrapped = self.__dict__.get("_recording_log")
         if wrapped is None:
-            base = PolymarketUSExecutionClient._log.__get__(self)  # type: ignore[attr-defined]
+            base = PolymarketUSExecutionClient._log.__get__(self)
             wrapped = _RecordingLog(base, self.log_records)
             self.__dict__["_recording_log"] = wrapped
         return wrapped
 
     @property
     def log_records(self) -> list[tuple[str, str]]:
-        return self.__dict__.setdefault("_log_records", [])
+        records: list[tuple[str, str]] = self.__dict__.setdefault("_log_records", [])
+        return records
 
     def log_lines(self, level: str, contains: str = "") -> list[str]:
         return [m for lv, m in self.log_records if lv == level and contains in m]
@@ -440,6 +442,12 @@ def trade_row(
     return {"type": "ACTIVITY_TYPE_TRADE", "trade": trade}
 
 
+def read_paths(client: Any) -> list[str]:
+    """The paths the client's private-read stub has served, in order."""
+    paths: list[str] = list(client._private_read.paths)
+    return paths
+
+
 def zero(value: str = "0") -> Decimal:
     return Decimal(value)
 
@@ -501,7 +509,7 @@ def arm_context(
             booking_id=1,
             created_ns=created_ns,
             order_side="SELL" if wire_action == "ORDER_ACTION_SELL" else "BUY",
-            **{
+            **{  # type: ignore[arg-type]
                 k: v
                 for k, v in {
                     "wire_market_slug": slug,
@@ -539,7 +547,7 @@ async def prior_process(
         venue_order_id="ord-amb-1" if with_context == "with_id" else "",
         with_context=with_context is not None,
         **(
-            {
+            {  # type: ignore[arg-type]
                 "wire_slug": None,
                 "wire_price": None,
                 "wire_outcome_side": None,

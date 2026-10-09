@@ -102,7 +102,9 @@ def older_row(order_id: str = "old") -> dict[str, Any]:
 
 
 def load_capture() -> dict[str, Any]:
-    return json.loads((CAPTURE_DIR / "activities_p0.json").read_text())["payload"]
+    raw: dict[str, Any] = json.loads((CAPTURE_DIR / "activities_p0.json").read_text())
+    payload: dict[str, Any] = raw["payload"]
+    return payload
 
 
 def trade_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
