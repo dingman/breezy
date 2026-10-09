@@ -176,6 +176,20 @@ def _trader_reached_running(node: Node) -> bool:
     return getattr(trader, "is_stopped", False) is True
 
 
+def _log_boot_proof_lines(config: TradingNodeConfig) -> None:
+    """Emit boot proof lines from values already fixed in ``config``.
+
+    Nautilus logging is live only once the node exists, so a stdlib record
+    logged while the config is built is dropped by the bridge's sink. The value
+    is read once at config build (AMBIG-LATCH-RESUME section 2.11); only the
+    line is emitted here, never a second read.
+    """
+    exec_config = config.exec_clients.get(POLYMARKET_US_CLIENT_NAME)
+    admitted = getattr(exec_config, "no_id_retire_admitted", None)
+    if admitted is not None:
+        logger.info("no_id_retire_admitted=%s", admitted)
+
+
 def _emit_node_assembly_failed_alert() -> None:
     """One CRITICAL for a node that raised before ``run()``. Called only
     AFTER the original error has been reported; a sink that fails, or cannot
@@ -634,6 +648,7 @@ def _run_node(
     cancel_repoll: Callable[[], None] | None = None
     try:
         node = node_factory(config)
+        _log_boot_proof_lines(config)
         node.add_data_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory)
         node.add_exec_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory)
         for actor in (*actors, *extra_actors):
