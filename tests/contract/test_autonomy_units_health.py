@@ -335,7 +335,12 @@ def test_health_row_show_read_names_the_review_properties_and_both_unit_patterns
     argv = show.argv
     properties = set(argv[argv.index("-p") + 1].split(","))
     assert {"MainPID", "UnitFileState", "LoadState"} <= properties
-    assert argv[argv.index("--") + 1 :] == ("breezy-*", "us-source-collector@*")
+    # the one reviewed widening (2026-10-09): the inactive rotate oneshot is not matched by the glob
+    assert argv[argv.index("--") + 1 :] == (
+        "breezy-quote-tape-rotate.service",
+        "breezy-*",
+        "us-source-collector@*",
+    )
     assert not any("Environment" in p or "Credential" in p for p in properties)
 
 

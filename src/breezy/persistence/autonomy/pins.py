@@ -17,7 +17,7 @@ ENGINE_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 # ``breezy.runtime.autonomy_health_cli`` (``closure_manifest``). Any change to a closure module
 # makes ``test_code_identity_pins_cover_import_closure`` fail until a reviewed commit re-pins it.
 PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
-    {"aut6.health": "8e75c77895fc440afd603d021bf181143f116fca53daccb9c80bf4add751d06e"}
+    {"aut6.health": "cdd817d549d783a9ef886bc102264dd9a547a62b76f48615b301c87dd7f00bb9"}
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 
