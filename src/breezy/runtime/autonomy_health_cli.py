@@ -1,9 +1,11 @@
 """``breezy-autonomy-health``: the AUT-6 unit health pass entry (plan r15 sections 3.9 and 3.11).
 
-``main`` routes two things:
+``main`` routes three things:
 
 * ``--mark-buildside-restart <unit> --reason <text> --commit <sha>``: the write-once marker the
   build-side implementer writes immediately before a daemon restart (``run_mark_buildside``);
+* ``--seed-cursor-now`` (X-14): the activation baseline of the journal cursor (reason
+  ``activation_baseline``); it drops journal history only and refuses when a cursor exists;
 * otherwise the pass: the bus snapshot, the journal cursor, the classification records, the
   meta-detectors, the C4 ``aut6.health`` verdicts, the heartbeat and the daily rollup. It prints
   one ``AUTONOMY_HEALTH`` summary line and exits 0 for every completed pass, including an UNKNOWN
@@ -52,6 +54,7 @@ EXIT_UNPINNED: Final = 3
 ENTRY_MODULE: Final = "breezy.runtime.autonomy_health_cli"
 _MARK_FLAG: Final = "--mark-buildside-restart"
 _DRY_FLAG: Final = "--dry-run"
+_SEED_FLAG: Final = "--seed-cursor-now"
 _DEPLOY_DIR: Final = Path(__file__).resolve().parents[3] / "deploy" / "systemd"
 _UNPINNED_PLACEHOLDER: Final = "0" * 64
 
@@ -95,7 +98,7 @@ def producer_pin_state() -> tuple[bool, str]:
 
 def _wire(env: PassEnv, root: Path, read_root: Path, code_sha: str) -> PassEnv:
     """The production seams the S3 core leaves open: fold, verdicts, committed drop-ins."""
-    subject = FoldSubject(AutonomyPaths(read_root))
+    subject = FoldSubject(AutonomyPaths(read_root), store=env.store)
     env.fold_probe = subject.probe
     env.host_verdict = HealthVerdictWriter(
         AutonomyPaths(root), env.store, code_sha=code_sha, subject=subject.subject
@@ -111,6 +114,7 @@ def _summary(result: PassResult, *, wall_s: float, dry_run: bool) -> str:
         f"AUTONOMY_HEALTH pass_result={result.pass_result} failed_units={failed} "
         f"new_failures={len(result.new_failures)} foreign_failed={len(result.foreign_failed)} "
         f"journal_blind={len(result.journal_blind)} drift={len(result.drift)} "
+        f"allowlisted={len(result.allowlisted)} "
         f"cursor_reset={int(result.cursor_reset)} unknown_reasons={reasons} "
         f"dry_run={int(dry_run)} wall_s={wall_s:.2f}"
     )
@@ -126,6 +130,11 @@ def _dry_run_report(env: PassEnv, result: PassResult, out: TextIO) -> None:
         )
     for unit in result.foreign_failed:
         print(f"AUTONOMY_HEALTH_DRYRUN_FOREIGN unit={unit}", file=out)
+    rollup = env.store.read_rollup(day_of_ns(env.now_ns())) or {}
+    for name in rollup.get("not_deployed", []):
+        print(f"AUTONOMY_HEALTH_DRYRUN_NOT_DEPLOYED name={name}", file=out)
+    for listed in result.allowlisted:
+        print(f"AUTONOMY_HEALTH_DRYRUN_ALLOWLISTED_DROPIN {listed}", file=out)
     for drift in result.drift:
         print(f"AUTONOMY_HEALTH_DRYRUN_DRIFT {drift.detail} severity={drift.severity}", file=out)
     for record in env.store.finding_records_on(day_of_ns(env.now_ns())):
@@ -179,10 +188,22 @@ def _run(
     return 0
 
 
+def run_seed_cursor_default() -> int:
+    """``--seed-cursor-now`` on the live health tree (X-14); imported lazily like the marker."""
+    from breezy.runtime.unit_health_seed import run_seed_cursor
+
+    return run_seed_cursor()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if _MARK_FLAG in args:
         return run_mark_buildside(args)
+    if _SEED_FLAG in args:
+        if args != [_SEED_FLAG]:
+            sys.stderr.write(f"usage: autonomy_health_cli {_SEED_FLAG} (no other arguments)\n")
+            return EXIT_USAGE
+        return run_seed_cursor_default()
     unknown = [a for a in args if a != _DRY_FLAG]
     if unknown:
         sys.stderr.write(f"usage: autonomy_health_cli [{_DRY_FLAG}] | {_MARK_FLAG} <unit> ...\n")

@@ -8,6 +8,12 @@ enabled instances) the pass reads ``UnitFileState``, ``ActiveState``, ``ActiveEn
 900 s`` has passed, or last triggered longer ago than ``interval + 900 s``; when a template has no
 enabled instance; and when a retired timer is loaded and enabled. Every ``deploy/systemd`` unit
 file must also be installed or listed in the not-deployed table (the inventory completeness check).
+
+X-15 (binding activation ruling): a missing next elapse is forgiven only while the timer's service
+is ``active`` or ``activating`` and entered after the last trigger (a oneshot being run, whose timer
+re-arms when it ends), and only for ``min(interval, 1 h)`` from that entry. The stale and
+never-triggered checks stay unconditional. A service that is idle, absent from the snapshot, or
+entered before the last trigger gets no grace, so the finding is CRITICAL at once.
 """
 
 from __future__ import annotations
@@ -44,6 +50,9 @@ KIND_RETIRED_ENABLED = "retired_timer_enabled"
 KIND_ORPHAN_KEY = "timer_table_key_orphan"
 KIND_INSTANCE_MISSING = "timer_instance_missing"
 _NO_FUTURE_MONOTONIC: Final = frozenset({"", "0", "infinity", "n/a"})
+#: The longest a missing next elapse is forgiven while the service runs (X-15).
+ELAPSE_GRACE_CAP_S: Final = 3600
+_RUNNING: Final = frozenset({"active", "activating"})
 
 Classify = Callable[[str], Deployment]
 
@@ -54,6 +63,20 @@ def _finding(kind: str, unit: str, today: str, detail: str) -> WatchFinding:
     )
 
 
+def _service_running_since_trigger(
+    service: Mapping[str, str] | None, last: int | None, interval_s: int, now_ns: int
+) -> bool:
+    """X-15: the service is running, entered after ``last``, and within min(interval, 1 h)."""
+    if service is None or service.get("ActiveState") not in _RUNNING:
+        return False
+    readable, entered = timestamp_or_zero(service.get("ActiveEnterTimestamp", ""))
+    if not readable or entered is None:
+        return False
+    if last is not None and entered <= last:
+        return False
+    return now_ns - entered <= min(interval_s, ELAPSE_GRACE_CAP_S) * NS
+
+
 def _check_block(
     unit: str,
     block: Mapping[str, str],
@@ -62,6 +85,7 @@ def _check_block(
     monotonic: bool,
     now_ns: int,
     today: str,
+    service: Mapping[str, str] | None = None,
 ) -> tuple[list[WatchFinding], list[str]]:
     """``(findings, unknown reasons)`` for one present timer."""
     findings: list[WatchFinding] = []
@@ -87,10 +111,14 @@ def _check_block(
         if not readable:
             unreadable.append(f"timer_property_unparseable:{unit}:NextElapseUSecRealtime")
         future = elapse is not None and elapse > now_ns
-    if not unreadable and not future:
-        findings.append(_finding(KIND_NO_NEXT_ELAPSE, unit, today, f"unit={unit} no next elapse"))
     ok_last, last = timestamp_or_zero(block["LastTriggerUSec"])
     ok_enter, entered = timestamp_or_zero(block["ActiveEnterTimestamp"])
+    if not unreadable and not future:
+        forgiven = ok_last and _service_running_since_trigger(service, last, interval_s, now_ns)
+        if not forgiven:
+            findings.append(
+                _finding(KIND_NO_NEXT_ELAPSE, unit, today, f"unit={unit} no next elapse")
+            )
     if not ok_last or not ok_enter:
         unreadable.append(f"timer_property_unparseable:{unit}:timestamps")
         return findings, unreadable
@@ -202,6 +230,7 @@ def evaluate_timers(
                 monotonic=monotonic,
                 now_ns=now_ns,
                 today=today,
+                service=inventory.blocks.get(unit.removesuffix(".timer") + ".service"),
             )
             findings.extend(found)
             unknown.extend(unreadable)

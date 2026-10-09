@@ -77,6 +77,13 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> _Wiring:
     return fake
 
 
+def _export_seen(root: Path) -> None:
+    """A stray file in ``evidence/registry/``: the export has been seen, so F4 applies (X-12)."""
+    directory = root / "evidence" / "registry"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stray.txt").write_text("x")
+
+
 def _tree(root: Path) -> dict[str, bytes]:
     return {
         str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()
@@ -141,6 +148,7 @@ def test_pass_prints_one_summary_line_and_exits_zero_even_when_unknown(
 ) -> None:
     root = tmp_path / "data"
     root.mkdir()
+    _export_seen(root)
     assert cli.run_pass(data_root=root) == 0
     (line,) = capsys.readouterr().out.splitlines()
     assert line.startswith("AUTONOMY_HEALTH pass_result=UNKNOWN failed_units=unknown ")
@@ -157,12 +165,27 @@ def test_the_fold_failure_is_paged_and_written_as_a_host_verdict(
     """F4: an unreadable fold pages directly and writes #26 FAIL under ``_host/``."""
     root = tmp_path / "data"
     root.mkdir()
+    _export_seen(root)
     cli.run_pass(data_root=root)
     assert wiring.alerts.events == ["fold_unreadable"]
     (verdict,) = sorted((root / "derived" / "verdicts" / "_host").rglob("*.json"))
     text = verdict.read_text()
     assert '"detector":"aut6.producer_stale"' in text and SHA in text
     assert '"outcome":"FAIL"' in text and '"fold_reason":"unreadable"' in text
+
+
+def test_a_deployment_with_no_registry_export_yet_is_not_a_failure(
+    wiring: _Wiring, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """X-12: before AUT-5a's export exists the fold is listed as not deployed and nothing pages."""
+    root = tmp_path / "data"
+    root.mkdir()
+    assert cli.run_pass(data_root=root) == 0
+    line = capsys.readouterr().out.strip()
+    assert "fold_unreadable" not in line and "unknown_reasons=snapshot_missing" in line
+    assert wiring.alerts.events == [] and not (root / "derived").exists()
+    rollup = HealthStore(health_root(root)).read_rollup("2026-10-08")
+    assert rollup is not None and rollup["not_deployed"] == ["registry_export"]
 
 
 def test_an_unpinned_producer_refuses_to_run_and_touches_nothing(
@@ -186,6 +209,7 @@ def test_dry_run_writes_nothing_to_the_live_root_and_removes_its_scratch(
     wiring: _Wiring, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "data"
+    _export_seen(root)
     live = HealthStore(health_root(root))
     live.write_heartbeat({"schema": "health_heartbeat/v1", "ts_ns": 5, "passes_unknown_streak": 2})
     before = _tree(root)

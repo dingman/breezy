@@ -250,8 +250,17 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "evidence/unit_health/{cursor,heartbeat}.json, day_<YYYY-MM-DD>.json, seen/<unit>.json",
         "the breezy-autonomy-health pass only, under .health.lock "
         "(unit_health_store.replace_atomic: mkstemp, fsync, os.replace, 0600); the cursor is "
-        "written last",
+        "written last, and once by `--seed-cursor-now` (unit_health_seed, X-14) under the same "
+        "lock, only when no cursor exists",
         "replace_atomic",
+    ),
+    # AUT-6 WP3 S6 (X-12): the write-once latch of the first registry export ever seen.
+    FileWriter(
+        "evidence/unit_health/fold_export_seen",
+        "the breezy-autonomy-health pass only, on the first pass that sees any file in "
+        "evidence/registry/ (unit_health_store.mark_fold_export_seen: write_once, 0444; never "
+        "rewritten or deleted)",
+        "write_once",
     ),
     # AUT-6 WP3 S4 (plan r15 section 3.9, LOW-2): the one operator-run writer in the health tree.
     FileWriter(

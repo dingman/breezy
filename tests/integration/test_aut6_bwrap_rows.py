@@ -54,6 +54,13 @@ def roots(tmp_path: Path) -> SandboxRoots:
                 if part == made.data_root.parent:
                     break
                 part.chmod(PRIVATE)
+        for rel in AUTONOMY_BWRAP_TABLE[row].config_ro_dirs:  # X-13: the health row's config bind
+            config = made.home / rel
+            config.mkdir(parents=True, exist_ok=True)
+            for part in [config, *config.parents]:
+                if part == made.home.parent:
+                    break
+                part.chmod(PRIVATE)
     return made
 
 

@@ -447,7 +447,9 @@ _AUTONOMY_HEALTH_ROW: Final = BwrapRow(
     resolves_dns=False,
     network="none",
     host_proc=True,
-    exceptions=frozenset({"E7A_R2_PROC"}),
+    # X-13: the pass hashes the orders-off drop-in under ~/.config/systemd/user (read-only).
+    config_ro_dirs=(".config/systemd/user",),
+    exceptions=frozenset({"E7A_R2_PROC", "E7_CONFIG_DIR"}),
     bus_reads=_HEALTH_BUS_READS,
     bus_snapshot_bind=_HEALTH_BUS_BIND,
     bus_snapshot_budget_s=15,

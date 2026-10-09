@@ -63,6 +63,7 @@ def rollup_body(
     foreign: Iterable[str],
     cursor_reset: bool,
     not_deployed: Iterable[str] = (),
+    allowlisted: Iterable[str] = (),
 ) -> dict[str, Any]:
     """The rollup of ``day``. Pass counters move only on the pass's own day."""
     previous = env.store.read_rollup_strict(day)
@@ -80,5 +81,8 @@ def rollup_body(
         ),
         "cursor_reset": bool(previous.get("cursor_reset")) or (own_day and cursor_reset),
         "not_deployed": sorted(not_deployed) if own_day else list(previous.get("not_deployed", [])),
+        "allowlisted_dropin": (
+            sorted(allowlisted) if own_day else list(previous.get("allowlisted_dropin", []))
+        ),
         "produced_at_ns": env.now_ns(),
     }

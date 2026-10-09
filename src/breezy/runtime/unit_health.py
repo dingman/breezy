@@ -51,6 +51,7 @@ from breezy.runtime.autonomy_sandbox.bus_handoff import (
     BusSnapshotError,
     read_bus_snapshot,
 )
+from breezy.runtime.health_dropins import classify_dropins, unit_config_drift
 from breezy.runtime.monitor_watch import production_watch
 from breezy.runtime.monitor_watch_apply import apply_watch
 from breezy.runtime.monitor_watch_memory import addback_kib, addback_units, free_addback_kib
@@ -103,10 +104,10 @@ from breezy.runtime.unit_health_support import (
     DriftFinding,
     enqueue_health_alert,
     unexplained_for_day,
-    unit_config_drift,
 )
 from breezy.runtime.unit_health_types import (
     PRODUCER_STALE_DETECTOR,
+    FoldNotDeployed,
     FoldUnreadable,
     HostVerdict,
     NewFailure,
@@ -119,6 +120,7 @@ __all__ = [
     "FOREIGN_UNIT_PREFIXES",
     "RECENT_INVOCATIONS_KEPT",
     "DriftFinding",
+    "FoldNotDeployed",
     "FoldUnreadable",
     "HostVerdict",
     "PassEnv",
@@ -210,6 +212,8 @@ class _Scan:
     batch: JournalBatch | None = None
     cursor_reset: bool = False
     drift: tuple[DriftFinding, ...] = ()
+    #: ``unit:dropin`` matches of the drop-in allowlist (X-13), listed in the day rollup.
+    allowlisted: tuple[str, ...] = ()
     reasons: list[str] = field(default_factory=list)
     blocking: bool = False
     #: Replaced-state fields of ``seen/<unit>.json`` the S4 rules stage for the commit step.
@@ -584,6 +588,9 @@ class _Pass:
         if env.fold_probe is not None:
             try:
                 env.fold_probe()
+            except FoldNotDeployed as exc:
+                if exc.artifact not in self.scan.not_deployed:
+                    self.scan.not_deployed.append(exc.artifact)
             except FoldUnreadable as exc:
                 self.scan.reasons.append("fold_unreadable")
                 self.emit_host_verdict(
@@ -599,9 +606,15 @@ class _Pass:
                     f"fold_reason={exc.reason}",
                 )
         if observation is not None and env.committed_dropins is not None:
-            self.scan.drift = unit_config_drift(
-                observation.blocks, env.committed_dropins, today=self.today
+            verdicts = classify_dropins(
+                observation.blocks,
+                env.committed_dropins,
+                today=self.today,
+                read_dropin=env.read_dropin,
+                allowlist=env.dropin_allowlist,
             )
+            self.scan.drift = verdicts.findings
+            self.scan.allowlisted = verdicts.allowlisted
             for finding in self.scan.drift:
                 key = f"{finding.dropin}-{self.today}"
                 self.commit_finding(
@@ -709,6 +722,7 @@ def _finish(env: PassEnv, run: _Pass, unknown: bool, label: str) -> None:
                     foreign=scan.foreign,
                     not_deployed=scan.not_deployed,
                     cursor_reset=scan.cursor_reset,
+                    allowlisted=scan.allowlisted,
                 ),
             )
         except StoreRecordError as exc:
@@ -761,4 +775,5 @@ def run_health_pass(env: PassEnv) -> PassResult:
             tuple(scan.blind),
             scan.cursor_reset,
             scan.drift,
+            scan.allowlisted,
         )
