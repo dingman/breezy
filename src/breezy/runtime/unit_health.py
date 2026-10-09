@@ -87,7 +87,9 @@ from breezy.runtime.unit_health_store import (
     alerts_delivered,
     day_of_ns,
     day_start_s,
+    default_data_root,
     finding_site,
+    health_root,
     previous_day,
     safe_key,
 )
@@ -153,10 +155,10 @@ def production_env(
 ) -> PassEnv:
     """The real wiring: bus snapshot, ``journalctl``, outbox enqueue. Touches nothing until run."""
     env_map: Mapping[str, str] = os.environ if environ is None else environ
-    root = data_root if data_root is not None else Path.home() / ".local" / "share" / "breezy"
+    root = data_root if data_root is not None else default_data_root()
     alerts = root / "evidence" / "alerts"
     return PassEnv(
-        store=HealthStore(root / "evidence" / "unit_health"),
+        store=HealthStore(health_root(root)),
         read_snapshot=lambda: read_bus_snapshot(HEALTH_ROW, environ=env_map),
         journal=SubprocessJournal(),
         alert=enqueue_health_alert(alerts),
@@ -205,7 +207,7 @@ class _Scan:
     reasons: list[str] = field(default_factory=list)
     blocking: bool = False
     #: Replaced-state fields of ``seen/<unit>.json`` the S4 rules stage for the commit step.
-    daemon_seen: dict[str, dict[str, Any]] = field(default_factory=dict)
+    daemon_seen: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 def _site(unit: str, invocation: str) -> str:

@@ -10,7 +10,7 @@ from typing import Final
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, default_alerts_root
 from breezy.runtime.alert_proof import enqueue_alert
-from breezy.runtime.unit_health_daemon_support import PAGED_FINDING_EVENTS
+from breezy.runtime.unit_health_daemon_support import EVENT_DEMAND_INTEGRITY, PAGED_FINDING_EVENTS
 from breezy.runtime.unit_health_journal import run_bounded
 from breezy.runtime.unit_health_model import WorktreesUnavailable, is_explained
 from breezy.runtime.unit_health_store import HealthStore, safe_key
@@ -88,7 +88,10 @@ def unexplained_for_day(
     for event in PAGED_FINDING_EVENTS:
         for body in store.finding_records_on(day, event):
             unit, key = str(body.get("unit")), str(body.get("key"))
-            if not is_explained(body, store.read_action(unit, safe_key(key)), delivered):
+            action = store.read_action(unit, safe_key(key))
+            if event == EVENT_DEMAND_INTEGRITY and action is None:
+                continue  # recorded only: the stage paged its own cause
+            if not is_explained(body, action, delivered):
                 names.append(f"{unit}__{key}")
     return tuple(sorted(names))
 

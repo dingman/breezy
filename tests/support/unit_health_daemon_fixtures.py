@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
-from breezy.runtime.unit_health_daemons import (
+from breezy.runtime.unit_health_daemon_support import (
     MSG_EXIT,
     MSG_FAILED,
     MSG_SCHEDULED_RESTART,
@@ -155,6 +155,7 @@ class FakeDaemonJournal:
         self.entries: list[UnitEntry] = list(entries)
         self.calls: list[tuple[str, str]] = []
         self.fail_with: Exception | None = None
+        self.unit_kwargs: list[dict[str, int | str | bool]] = []
 
     def add(self, *more: UnitEntry | Sequence[UnitEntry]) -> None:
         for item in more:
@@ -167,6 +168,7 @@ class FakeDaemonJournal:
         self, unit: str, *, since_us: int, until_us: int, lifecycle_only: bool, timeout_s: float
     ) -> tuple[UnitEntry, ...]:
         self.calls.append(("unit_entries", unit))
+        self.unit_kwargs.append({"unit": unit, "since_us": since_us, "until_us": until_us})
         if self.fail_with is not None:
             raise self.fail_with
         lifecycle = {MSG_STARTED, MSG_EXIT, MSG_STOPPING}

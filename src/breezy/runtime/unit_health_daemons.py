@@ -32,40 +32,43 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Final
 
 from breezy.runtime import unit_health_model
+from breezy.runtime.autonomy_sandbox.table import HEALTH_RESTART_PROPERTY
 from breezy.runtime.unit_health_daemon_support import (
     EVENT_AUTO_RESTARTED,
+    EVENT_BASELINE_CORRUPT,
     EVENT_BUILDSIDE,
     EVENT_CRASHED,
+    EVENT_PROPERTY_UNREADABLE,
     EVENT_UNEXPLAINED,
+    INVOCATION_RE,
+    JUDGED_KEPT,
     MSG_EXIT,
     MSG_FAILED,
     MSG_SCHEDULED_RESTART,
     MSG_STARTED,
     MSG_STOPPING,
-    DaemonJournal,
     DaemonWiring,
     PassHost,
-    SubprocessDaemonJournal,
     UnitEntry,
 )
 from breezy.runtime.unit_health_intraday import run_intraday_rules
-from breezy.runtime.unit_health_store import NS, day_of_ns, read_json, write_once
+from breezy.runtime.unit_health_store import (
+    NS,
+    day_of_ns,
+    health_root,
+    read_json,
+    write_once,
+)
+
+if TYPE_CHECKING:
+    from breezy.runtime.unit_health_obs import UnitObservation
 
 __all__ = [
-    "MSG_EXIT",
-    "MSG_FAILED",
-    "MSG_SCHEDULED_RESTART",
-    "MSG_STARTED",
-    "MSG_STOPPING",
-    "DaemonJournal",
-    "DaemonWiring",
     "Ending",
     "EndingVerdict",
-    "SubprocessDaemonJournal",
-    "UnitEntry",
     "classify_ending",
     "ended_invocation_ids",
     "parse_systemd_timestamp",
@@ -85,14 +88,10 @@ BUILDSIDE_WINDOW_S: Final = 300
 MARKER_DIR: Final = "buildside_restart"
 MARKER_SCHEMA: Final = "buildside_restart/v1"
 DAEMON_SEEN_KEY: Final = "daemon"
-JUDGED_KEPT: Final = 32
 EXIT_USAGE: Final = 2
-#: The journal's ``JOB_TYPE`` value of a stop job. Built, not quoted: it is a field value, and the
-#: S3 guard that no health module names a state-changing systemctl verb scans for the quoted word.
-_STOP_JOB: Final = "STOP".lower()
+_RUNNING_STATES: Final = frozenset({"active", "activating", "reloading", "deactivating"})
 _SIGTERM_STATUS: Final = frozenset({"15", "TERM", "SIGTERM"})
 _CLEAN_STOP_EXITS: Final = frozenset({"0", "143"})
-_INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
 _TIMESTAMP_RE: Final = re.compile(
     r"[A-Z][a-z]{2} (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.\d+)? UTC"
 )
@@ -100,7 +99,6 @@ _MARKER_NAME_RE: Final = re.compile(r"(\d+)_(breezy-[A-Za-z0-9@._-]+\.service)\.
 _UNIT_ARG_RE: Final = re.compile(r"breezy-[a-z0-9@._-]+\.service")
 _COMMIT_RE: Final = re.compile(r"[0-9a-f]{7,40}")
 _MAX_REASON: Final = 200
-_US: Final = 1_000_000
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -147,7 +145,7 @@ def _is_sigterm_exit(entry: UnitEntry) -> bool:
 def _stopped_by_systemd(entries: Sequence[UnitEntry]) -> int | None:
     """The ``Stopping`` timestamp of a stop from systemd, or ``None`` (the section 3.9 rule)."""
     stops = [
-        e for e in entries if e.message_id == MSG_STOPPING and e.fields.get("JOB_TYPE") == _STOP_JOB
+        e for e in entries if e.message_id == MSG_STOPPING and e.fields.get("JOB_TYPE") == "stop"
     ]
     if not stops or any(e.message_id in {MSG_SCHEDULED_RESTART, MSG_FAILED} for e in entries):
         return None
@@ -193,12 +191,12 @@ def ended_invocation_ids(
     lifecycle = {MSG_STARTED, MSG_EXIT, MSG_STOPPING}
     first: dict[str, int] = {}
     for e in entries:
-        if e.message_id in lifecycle and _INVOCATION_RE.fullmatch(e.invocation_id):
+        if e.message_id in lifecycle and INVOCATION_RE.fullmatch(e.invocation_id):
             first[e.invocation_id] = min(first.get(e.invocation_id, e.ts_us), e.ts_us)
     first.pop(current, None)
     ordered = sorted(first, key=lambda i: (first[i], i))
     out = [i for i in ordered if i != stored]
-    if stored != current and _INVOCATION_RE.fullmatch(stored):
+    if stored != current and INVOCATION_RE.fullmatch(stored):
         out.insert(0, stored)
     return tuple(out)
 
@@ -291,13 +289,9 @@ def run_mark_buildside_restart(
     if not _COMMIT_RE.fullmatch(str(args.commit)):
         problems.append("commit must be 7-40 lowercase hex digits")
     if problems:
-        sys.stderr.write("mark-buildside-restart: " + "; ".join(problems) + "\n")
+        sys.stderr.write(f"mark-buildside-restart: {'; '.join(problems)}\n")
         return EXIT_USAGE
-    target = (
-        root
-        if root is not None
-        else (Path.home() / ".local" / "share" / "breezy" / "evidence" / "unit_health")
-    )
+    target = root if root is not None else health_root()
     path = write_buildside_marker(
         target, str(args.unit), reason=reason, commit=str(args.commit), ts_ns=now_ns()
     )
@@ -306,6 +300,10 @@ def run_mark_buildside_restart(
 
 
 # --------------------------------------------------------------------------- the pass rules
+
+
+def _pairs(metrics: Mapping[str, str]) -> str:
+    return " ".join(f"{k}={v}" for k, v in metrics.items())
 
 
 def _stopped_between(lo_us: int, hi_us: int) -> Callable[[_Ended], bool]:
@@ -321,19 +319,36 @@ class _Ended:
     verdict: EndingVerdict
 
 
-def _valid_state(raw: object) -> dict[str, Any] | None:
+@dataclass(frozen=True, slots=True)
+class _State:
+    invocation_id: str
+    active_enter_ns: int | None
+    nrestarts: int
+    pass_ns: int
+    judged: tuple[str, ...]
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _parse_state(raw: object) -> _State | None:
+    """The stored daemon baseline, or ``None`` when it is not a complete valid one."""
     if not isinstance(raw, dict):
         return None
     inv, restarts, pass_ns = raw.get("invocation_id"), raw.get("nrestarts"), raw.get("pass_ns")
-    if not (isinstance(inv, str) and _INVOCATION_RE.fullmatch(inv)):
+    if not (isinstance(inv, str) and INVOCATION_RE.fullmatch(inv)):
         return None
-    if not (isinstance(restarts, int) and isinstance(pass_ns, int)):
+    restarts, pass_ns = _int_or_none(restarts), _int_or_none(pass_ns)
+    if restarts is None or pass_ns is None:
         return None
-    return raw
+    judged = raw.get("judged", [])
+    ids = tuple(i for i in judged if isinstance(i, str)) if isinstance(judged, list) else ()
+    return _State(inv, _int_or_none(raw.get("active_enter_ns")), restarts, pass_ns, ids)
 
 
 class _Daemons:
-    def __init__(self, host: PassHost, wiring: DaemonWiring, observation: Any) -> None:
+    def __init__(self, host: PassHost, wiring: DaemonWiring, observation: UnitObservation) -> None:
         self.host = host
         self.wiring = wiring
         self.blocks: Mapping[str, Mapping[str, str]] = observation.blocks
@@ -343,7 +358,10 @@ class _Daemons:
     def in_scope(self, unit: str, block: Mapping[str, str]) -> bool:
         if not unit.startswith("breezy-") or not unit.endswith(".service"):
             return False
-        return block.get("Restart") == "always" or unit in unit_health_model.WATCHDOG_DAEMON_UNITS
+        return (
+            block.get(HEALTH_RESTART_PROPERTY) == "always"
+            or unit in unit_health_model.WATCHDOG_DAEMON_UNITS
+        )
 
     def run(self) -> None:
         for unit in sorted(self.blocks):
@@ -353,25 +371,35 @@ class _Daemons:
 
     # ---- one daemon
 
+    def unit_problem(self, unit: str, event: str, detail: str) -> None:
+        """A per-unit problem: a reason (so the pass is UNKNOWN) and one finding per unit and day.
+        It never blocks the commit: the other daemons' state must still advance."""
+        host = self.host
+        host.scan.reasons.append(f"{event}:{unit}")
+        severity = "CRITICAL" if unit in DATA_PATH_DAEMONS else "WARNING"
+        host.commit_finding(event, unit, f"{event}-{host.today}", severity, f"unit={unit} {detail}")
+
     def check(self, unit: str, block: Mapping[str, str]) -> None:
         host = self.host
         invocation, restarts_text = block.get("InvocationID", ""), block.get("NRestarts", "")
-        if not (_INVOCATION_RE.fullmatch(invocation) and restarts_text.isdigit()):
-            host.scan.reasons.append("daemon_property_unreadable")
-            host.block()
+        if not invocation and block.get("ActiveState") not in _RUNNING_STATES:
+            return  # never started: no baseline, and nothing to write
+        if not (INVOCATION_RE.fullmatch(invocation) and restarts_text.isdigit()):
+            self.unit_problem(unit, EVENT_PROPERTY_UNREADABLE, "InvocationID or NRestarts")
             return
         restarts = int(restarts_text)
         active_enter = parse_systemd_timestamp(block.get("ActiveEnterTimestamp", ""))
-        prior = host.store.read_seen(unit) or {}
-        stored = _valid_state(prior.get(DAEMON_SEEN_KEY))
-        judged = [i for i in (stored or {}).get("judged", []) if isinstance(i, str)]
+        raw = (host.store.read_seen(unit) or {}).get(DAEMON_SEEN_KEY)
+        stored = _parse_state(raw)
+        if raw is not None and stored is None:
+            self.unit_problem(unit, EVENT_BASELINE_CORRUPT, "stored baseline unreadable")
         ended: list[_Ended] = []
-        if stored is not None and stored["invocation_id"] != invocation:
+        if stored is not None and stored.invocation_id != invocation:
             ended = self.read_ended(unit, stored, invocation)
         severity = "CRITICAL" if unit in DATA_PATH_DAEMONS else "WARNING"
         if stored is not None:
-            self.report(unit, block, stored, ended, invocation, active_enter, severity)
-            delta = restarts - int(stored["nrestarts"])
+            self.report(unit, stored, ended, invocation, active_enter, severity)
+            delta = restarts - stored.nrestarts
             all_watchdog = bool(ended) and all(e.verdict.ending is Ending.WATCHDOG for e in ended)
             if delta > 0 and not all_watchdog:
                 self.finding(
@@ -382,28 +410,29 @@ class _Daemons:
                     f"unit={unit} nrestarts_delta={delta}",
                     {"metrics": {"nrestarts_delta": str(delta)}},
                 )
+        judged = [*(stored.judged if stored else ()), *(e.invocation_id for e in ended)]
         host.scan.daemon_seen.setdefault(unit, {})[DAEMON_SEEN_KEY] = {
             "invocation_id": invocation,
             "active_enter_ns": active_enter,
             "nrestarts": restarts,
             "pass_ns": host.now,
-            "judged": [*judged, *(e.invocation_id for e in ended)][-JUDGED_KEPT:],
+            "judged": judged[-JUDGED_KEPT:],
         }
 
-    def read_ended(self, unit: str, stored: Mapping[str, Any], current: str) -> list[_Ended]:
+    def read_ended(self, unit: str, stored: _State, current: str) -> list[_Ended]:
         host = self.host
         journal = self.wiring.journal
         interval = journal.unit_entries(
             unit,
-            since_us=int(stored["pass_ns"]) // 1000,
+            since_us=stored.pass_ns // 1000,
             until_us=host.now // 1000,
             lifecycle_only=True,
             timeout_s=host.allowance(),
         )
-        already = set(stored.get("judged", []))
+        already = set(stored.judged)
         ids = [
             i
-            for i in ended_invocation_ids(interval, current=current, stored=stored["invocation_id"])
+            for i in ended_invocation_ids(interval, current=current, stored=stored.invocation_id)
             if i not in already
         ]
         ended: list[_Ended] = []
@@ -434,8 +463,7 @@ class _Daemons:
     def report(
         self,
         unit: str,
-        block: Mapping[str, str],
-        stored: Mapping[str, Any],
+        stored: _State,
         ended: Sequence[_Ended],
         current: str,
         active_enter: int | None,
@@ -456,8 +484,7 @@ class _Daemons:
                     EVENT_CRASHED,
                     item.invocation_id,
                     severity,
-                    f"unit={unit} ended={item.invocation_id} "
-                    + " ".join(f"{k}={v}" for k, v in metrics.items()),
+                    f"unit={unit} ended={item.invocation_id} {_pairs(metrics)}",
                     {"metrics": metrics, "ended_invocation_id": item.invocation_id},
                 )
         unexplained = [e for e in ended if e.verdict.ending is Ending.UNPROVEN]
@@ -488,7 +515,7 @@ class _Daemons:
                 f"unit={unit} invocation changed unexplained ended={len(ids)}",
                 {
                     "ended_invocations": ids,
-                    "old_invocation_id": stored["invocation_id"],
+                    "old_invocation_id": stored.invocation_id,
                     "new_invocation_id": current,
                 },
             )
@@ -498,7 +525,7 @@ class _Daemons:
     def explain(
         self,
         unit: str,
-        stored: Mapping[str, Any],
+        stored: _State,
         stopped: Sequence[_Ended],
         active_enter: int | None,
     ) -> tuple[list[_Ended], bool]:
@@ -508,12 +535,8 @@ class _Daemons:
         if rotate_us is not None:
             remaining = self.take(remaining, lambda e: (e.verdict.stopping_us or 0) >= rotate_us)
         matched_marker = False
-        stored_enter = stored.get("active_enter_ns")
-        if (
-            active_enter is not None
-            and isinstance(stored_enter, int)
-            and active_enter > stored_enter
-        ):
+        stored_enter = stored.active_enter_ns
+        if active_enter is not None and stored_enter is not None and active_enter > stored_enter:
             window = BUILDSIDE_WINDOW_S * NS
             for marker in read_buildside_markers(
                 self.marker_root, unit, active_enter - window, active_enter
@@ -532,22 +555,22 @@ class _Daemons:
                 return [*remaining[:index], *remaining[index + 1 :]]
         return remaining
 
-    def rotate_start_us(self, stored: Mapping[str, Any]) -> int | None:
+    def rotate_start_us(self, stored: _State) -> int | None:
         """The rotate run's start (us) when it can explain: inside (previous pass, this pass],
         later than the stored invocation began (LOW-1) and ``Result=success``."""
         block = self.blocks.get(ROTATE_UNIT)
         if block is None or block.get("Result") != "success":
             return None
         started = parse_systemd_timestamp(block.get("ExecMainStartTimestamp", ""))
-        stored_enter = stored.get("active_enter_ns")
-        if started is None or not isinstance(stored_enter, int):
+        stored_enter = stored.active_enter_ns
+        if started is None or stored_enter is None:
             return None
-        if not (int(stored["pass_ns"]) < started <= self.host.now and started > stored_enter):
+        if not (stored.pass_ns < started <= self.host.now and started > stored_enter):
             return None
         return started // 1000
 
 
-def run_daemon_rules(host: PassHost, observation: Any) -> None:
+def run_daemon_rules(host: PassHost, observation: UnitObservation) -> None:
     """The S4 hook of the health pass: daemon rules, then the intraday-stage rules."""
     wiring = host.env.daemons
     if wiring is None:

@@ -58,6 +58,18 @@ def finding_site(kind: str, unit: str, key: str) -> str:
     return f"{kind}:{unit}:{safe_key(key)}"
 
 
+def default_data_root() -> Path:
+    """``~/.local/share/breezy``: the data root every health writer and reader defaults to."""
+    return Path.home() / ".local" / "share" / "breezy"
+
+
+def health_root(data_root: Path | None = None) -> Path:
+    """``<data root>/evidence/unit_health``: one place for the pass and the marker CLI."""
+    return (
+        (data_root if data_root is not None else default_data_root()) / "evidence" / "unit_health"
+    )
+
+
 def day_of_ns(ts_ns: int) -> str:
     return dt.datetime.fromtimestamp(ts_ns / NS, tz=dt.UTC).date().isoformat()
 

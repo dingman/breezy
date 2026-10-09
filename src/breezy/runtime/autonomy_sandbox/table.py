@@ -375,6 +375,10 @@ _CANARY_ROW: Final = BwrapRow(
 #: The pass makes no state-changing call. Unit properties are a fixed set: no ``Environment`` or
 #: ``Credential`` property can be named (B6-R3). ``show -- 'breezy-*'`` also lists timers and
 #: slices, so the consumer filters on ``Id`` ending ``.service``.
+#: The ``Restart`` property name as the health pass reads it from the snapshot (it must be one of
+#: the names in ``_HEALTH_SHOW_PROPERTIES``; the health modules keep systemctl verbs out of their
+#: own source, and this is a property name).
+HEALTH_RESTART_PROPERTY: Final = "Restart"
 _HEALTH_SHOW_PROPERTIES: Final = (
     "Id,ActiveState,SubState,Result,InvocationID,NRestarts,ExecMainStatus,ExecMainCode,"
     "ExecMainStartTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,MemoryCurrent,MemoryPeak,"

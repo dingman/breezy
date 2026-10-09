@@ -23,9 +23,10 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from breezy.runtime.unit_health_daemon_support import (
+    DAY_S,
     EVENT_BWRAP_UNAVAILABLE,
     EVENT_DEMAND_DEADLINE,
     EVENT_DEMAND_FAILED,
@@ -34,9 +35,14 @@ from breezy.runtime.unit_health_daemon_support import (
     EVENT_EVAL_FAILED,
     EVENT_EVAL_TIMEOUT,
     EVENT_EVAL_UNRECORDED,
+    EVENT_INTRADAY_RENAMED,
+    EVENT_UNJUDGED,
+    INVOCATION_RE,
+    JUDGED_KEPT,
     MSG_EXIT,
     MSG_FAILED,
     MSG_STARTED,
+    US,
     DaemonWiring,
     PassHost,
     UnitEntry,
@@ -49,6 +55,9 @@ from breezy.runtime.unit_health_store import (
     safe_key,
 )
 
+if TYPE_CHECKING:
+    from breezy.runtime.unit_health_obs import UnitObservation
+
 INTRADAY_UNIT: Final = "breezy-autonomy-producer-intraday.service"
 #: The summed stage bounds 102 + 1 + 17 plus ``TimeoutStartSec`` slack 5 (plan section 3.10).
 INTRADAY_INVOCATION_MAX_S: Final = 125
@@ -58,7 +67,18 @@ EXIT_EVALUATE_FAILED: Final = 4
 EXIT_DEMAND_DEADLINE: Final = 5
 TIMEOUT_EXITS: Final = frozenset({124, 137})
 FIRST_LOOKBACK_S: Final = 900
-JUDGED_KEPT: Final = 64
+#: The longest span of journal one pass reads back; a stale state is clamped to it with a reason.
+MAX_LOOKBACK_S: Final = 26 * 3600
+INTRADAY_UNIT_PREFIX: Final = "breezy-autonomy-producer-intraday"
+#: Events the demand stage pages itself when its INTEGRITY check fails (plan section 3.4.2).
+STAGE_INTEGRITY_EVENTS: Final = frozenset(
+    {
+        "bwrap_self_probe_failed",
+        "o_tmpfile_unsupported",
+        "demand_listing_unreadable",
+        "integrity_demand_write_failed",
+    }
+)
 EPISODE_REPAGE_S: Final = 86_400
 EPISODE_FINDINGS: Final = (EVENT_BWRAP_UNAVAILABLE, EVENT_DEMAND_TIMEOUT, EVENT_DEMAND_DEADLINE)
 EPISODE_SCHEMA: Final = "intraday_episode/v1"
@@ -68,7 +88,6 @@ STAGE_EPISODE_FILE: Final = f"episodes/{EVENT_DEMAND_DEADLINE}.json"
 DELIVERY_SCHEMA: Final = "alert_delivery/v1"
 INTRADAY_SEEN_KEY: Final = "intraday"
 
-_US: Final = 1_000_000
 _EVAL_START: Final = "PRODUCER_INTRADAY START"
 _EVAL_PREFIX: Final = "PRODUCER_INTRADAY "
 _DEMAND_START: Final = "PRODUCER_INTRADAY_DEMAND START"
@@ -81,7 +100,6 @@ _COUNTERS: Final = (
     "journal_write_failures",
     "outbox_write_failures",
 )
-_DAY_S: Final = 86_400
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,16 +149,26 @@ def _last(entries: Sequence[UnitEntry]) -> UnitEntry | None:
     return entries[-1] if entries else None
 
 
-def _exit_status(entries: Sequence[UnitEntry]) -> tuple[int | None, int]:
-    """The status of the last ``ExecStart`` exit entry by timestamp, and how many there were."""
+@dataclass(frozen=True, slots=True)
+class _ExitInfo:
+    status: int | None
+    count: int
+    code: str
+    raw_status: str
+
+
+def _exit_status(entries: Sequence[UnitEntry]) -> _ExitInfo:
+    """The last ``ExecStart`` exit entry by timestamp: numeric status (``None`` when absent or
+    not numeric), how many there were, and the raw code and status."""
     exits = [
         e for e in entries if e.message_id == MSG_EXIT and e.fields.get("COMMAND") == "ExecStart"
     ]
     if not exits:
-        return None, 0
+        return _ExitInfo(None, 0, "", "")
     newest = max(range(len(exits)), key=lambda i: (exits[i].ts_us, i))
     raw = exits[newest].fields.get("EXIT_STATUS", "")
-    return (int(raw) if raw.isdigit() else None), len(exits)
+    code = exits[newest].fields.get("EXIT_CODE", "")
+    return _ExitInfo(int(raw) if raw.isdigit() else None, len(exits), code, raw)
 
 
 def demand_summary_counters(entries: Sequence[UnitEntry]) -> dict[str, int] | None:
@@ -166,7 +194,7 @@ def _ended(entries: Sequence[UnitEntry], now_us: int, current_activating: bool) 
     if any(e.message_id in {MSG_EXIT, MSG_FAILED, MSG_STARTED} for e in entries):
         return True
     newest = max(e.ts_us for e in entries)
-    if now_us - newest > INTRADAY_INVOCATION_MAX_S * _US:
+    if now_us - newest > INTRADAY_INVOCATION_MAX_S * US:
         return True
     return not current_activating
 
@@ -178,9 +206,10 @@ def _demand_row(
     demand_started: bool,
     bwrap: bool,
     extra: Mapping[str, str],
+    unit_failed: StageFinding | None = None,
 ) -> StageFinding | None:
     if status in {None, 0}:
-        return None
+        return unit_failed
     if status == EXIT_INTEGRITY and summary is not None:
         return StageFinding(EVENT_DEMAND_INTEGRITY, dict(extra), page=False)
     if (
@@ -225,7 +254,7 @@ def _evaluate_rule(
         return StageFinding(EVENT_EVAL_UNRECORDED, hint)
     demand_start = next((e for e in entries if e.message.startswith(_DEMAND_START)), None)
     end_us = demand_start.ts_us if demand_start is not None else max(e.ts_us for e in entries)
-    if end_us - start.ts_us >= EVALUATE_STAGE_BUDGET_S * _US:
+    if end_us - start.ts_us >= EVALUATE_STAGE_BUDGET_S * US:
         return StageFinding(EVENT_EVAL_TIMEOUT)
     return StageFinding(EVENT_EVAL_UNRECORDED)
 
@@ -238,14 +267,35 @@ def judge_invocation(
         return None
     demand_summary_entry = _last([e for e in entries if _is_demand_summary(e.message)])
     summary = _pairs(demand_summary_entry.message) if demand_summary_entry is not None else None
-    status, count = _exit_status(entries)
+    info = _exit_status(entries)
+    status = info.status
     if status is None and summary is not None and summary.get("exit", "").isdigit():
         status = int(summary["exit"])
-    extra = {"exit_entries": str(count)} if count > 1 else {}
+    extra = {"exit_entries": str(info.count)} if info.count > 1 else {}
+    # A non-numeric status, a signal ending, or a unit-failed entry the numbers do not show:
+    # the stage still failed, whatever the demand line says.
+    failure_signal = any(e.message_id == MSG_FAILED for e in entries) or (
+        info.count > 0 and info.code not in {"", "exited"}
+    )
+    unit_failed = (
+        StageFinding(
+            EVENT_DEMAND_FAILED,
+            {**extra, "exit_code": info.code, "exit_status": info.raw_status},
+        )
+        if failure_signal
+        else None
+    )
     bwrap = any(e.message.startswith("bwrap:") for e in entries)
     demand_started = any(e.message.startswith(_DEMAND_START) for e in entries)
     found = (
-        _demand_row(status, summary, demand_started=demand_started, bwrap=bwrap, extra=extra),
+        _demand_row(
+            status,
+            summary,
+            demand_started=demand_started,
+            bwrap=bwrap,
+            extra=extra,
+            unit_failed=unit_failed,
+        ),
         _evaluate_rule(entries, summary, bwrap),
     )
     return InvocationJudgment(
@@ -287,9 +337,9 @@ def find_delivered(
 ) -> DeliveredRecord | None:
     """A ``delivered=true`` record of ``entry`` (by basename) at or after ``min_ts_ns`` (AG3)."""
     name = os.path.basename(entry)
-    first, last = min_ts_ns // NS // _DAY_S, now_ns // NS // _DAY_S
+    first, last = min_ts_ns // NS // DAY_S, now_ns // NS // DAY_S
     for day_index in range(first, last + 1):
-        directory = alerts_root / day_of_ns(day_index * _DAY_S * NS)
+        directory = alerts_root / day_of_ns(day_index * DAY_S * NS)
         try:
             names = sorted(os.listdir(directory))
         except OSError:
@@ -313,6 +363,40 @@ def find_delivered(
     return None
 
 
+def _event_entries(directory: Path) -> list[dict[str, Any]]:
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    out = [read_json(directory / n) for n in names if n.endswith(".json")]
+    return [b for b in out if b is not None]
+
+
+def integrity_page_exists(alerts_root: Path, first_ns: int, now_ns: int) -> bool:
+    """A stage INTEGRITY page at or after ``first_ns``: an outbox entry (queued, claimed or not)
+    or a delivered record. Unreadable directories count as none."""
+    bodies = _event_entries(alerts_root / "outbox")
+    claimed = alerts_root / "outbox" / "claimed"
+    try:
+        holders = sorted(os.listdir(claimed))
+    except OSError:
+        holders = []
+    for holder in holders:
+        bodies += _event_entries(claimed / holder)
+    for day_index in range(first_ns // NS // DAY_S, now_ns // NS // DAY_S + 1):
+        bodies += [
+            b
+            for b in _event_entries(alerts_root / day_of_ns(day_index * DAY_S * NS))
+            if b.get("schema") == DELIVERY_SCHEMA and b.get("delivered") is True
+        ]
+    return any(
+        b.get("event") in STAGE_INTEGRITY_EVENTS
+        and (ts := _int(b.get("ts_ns"))) is not None
+        and ts >= first_ns
+        for b in bodies
+    )
+
+
 # --------------------------------------------------------------------------- the pass rules
 
 
@@ -329,8 +413,7 @@ class _Rules:
     def episode(self, finding: str) -> dict[str, Any] | None:
         if finding not in self.episodes:
             body = self.host.store.read_seen(EPISODE_PREFIX + finding)
-            ok = body is not None and body.get("schema") == EPISODE_SCHEMA
-            if body is not None and ok:
+            if body is not None and body.get("schema") == EPISODE_SCHEMA:
                 self.episodes[finding] = body
         return self.episodes.get(finding)
 
@@ -372,7 +455,7 @@ class _Rules:
         if stage is None:
             return False
         queued = int(stage["last_queued_ns"])
-        return queued >= int(ep["first_ns"]) and self.host.now - queued < _DAY_S * NS
+        return queued >= int(ep["first_ns"]) and self.host.now - queued < DAY_S * NS
 
     # ---- records
 
@@ -389,7 +472,13 @@ class _Rules:
             {"metrics": dict(metrics), "invocation_id": invocation},
         )
 
-    def page(self, finding: str, invocation: str, metrics: Mapping[str, str]) -> None:
+    def page(
+        self,
+        finding: str,
+        invocation: str,
+        metrics: Mapping[str, str],
+        severity: str = "CRITICAL",
+    ) -> None:
         key = f"{finding}-{invocation}"
         detail = f"unit={INTRADAY_UNIT} invocation={invocation} finding={finding}" + "".join(
             f" {k}={v}" for k, v in sorted(metrics.items())
@@ -398,7 +487,7 @@ class _Rules:
             finding,
             INTRADAY_UNIT,
             key,
-            "CRITICAL",
+            severity,
             detail,
             {"metrics": dict(metrics), "invocation_id": invocation},
         )
@@ -442,8 +531,16 @@ class _Rules:
 
     def end_episode(self, finding: str) -> None:
         ep = self.episode(finding)
-        if ep is not None and ep.get("state") == "active":
-            self.save(finding, {**ep, "state": "ended", "ended_ns": self.host.now})
+        if ep is None or ep.get("state") != "active":
+            return
+        if ep.get("pending"):
+            # The stage's page is still the only page; one last look before the episode closes,
+            # and if it is still undelivered the health pass pages the invocations itself.
+            self.refresh(finding, ep)
+            for item in ep["pending"]:
+                self.page(finding, item["invocation_id"], item["metrics"])
+            ep["pending"] = []
+        self.save(finding, {**ep, "state": "ended", "ended_ns": self.host.now})
 
     def already_done(self, finding: str, invocation: str) -> bool:
         if self.host.store.has_action(INTRADAY_UNIT, safe_key(f"{finding}-{invocation}")):
@@ -452,6 +549,30 @@ class _Rules:
         if ep is None:
             return False
         return any(p["invocation_id"] == invocation for p in ep.get("pending", []))
+
+    def integrity(self, f: StageFinding, verdict: InvocationJudgment) -> None:
+        """Exit 3 means the stage paged its own cause. Verify that, and page a WARNING if no
+        queued or delivered page can be found (a stage that died before it could speak)."""
+        invocation = verdict.invocation_id
+        spoke = self.stage_paged(verdict.first_us * 1000)
+        if spoke:
+            self.host.commit_finding(
+                f.finding,
+                INTRADAY_UNIT,
+                f"{f.finding}-{invocation}",
+                "CRITICAL",
+                "",
+                {"metrics": dict(f.metrics), "invocation_id": invocation},
+                page=False,
+            )
+        else:
+            self.page(f.finding, invocation, f.metrics, "WARNING")
+
+    def stage_paged(self, first_ns: int) -> bool:
+        stage = read_stage_episode(self.alerts_root)
+        if stage is not None and int(stage["last_queued_ns"]) >= first_ns:
+            return True
+        return integrity_page_exists(self.alerts_root, first_ns, self.host.now)
 
     def settle(self) -> None:
         """Bind stage pages delivered since the pass that left them pending (LOW-r12-2)."""
@@ -471,15 +592,7 @@ class _Rules:
             if f.finding in EPISODE_FINDINGS:
                 self.hit(f.finding, verdict, f.metrics)
             elif not f.page:
-                self.host.commit_finding(
-                    f.finding,
-                    INTRADAY_UNIT,
-                    f"{f.finding}-{invocation}",
-                    "CRITICAL",
-                    "",
-                    {"metrics": dict(f.metrics), "invocation_id": invocation},
-                    page=False,
-                )
+                self.integrity(f, verdict)
             else:
                 self.page(f.finding, invocation, f.metrics)
         for finding in EPISODE_FINDINGS:
@@ -495,8 +608,24 @@ def _group(entries: Sequence[UnitEntry]) -> dict[str, list[UnitEntry]]:
     return groups
 
 
-def run_intraday_rules(host: PassHost, observation: Any, wiring: DaemonWiring) -> None:
+def _renamed_units(host: PassHost, observation: UnitObservation) -> None:
+    """A producer block under any other name than the pinned one: the rules would judge nothing
+    and say nothing, so name it. Silent only when no such block exists."""
+    for name in sorted(observation.blocks):
+        if name.startswith(INTRADAY_UNIT_PREFIX) and name != INTRADAY_UNIT:
+            host.scan.reasons.append(f"{EVENT_INTRADAY_RENAMED}:{name}")
+            host.commit_finding(
+                EVENT_INTRADAY_RENAMED,
+                name,
+                f"{EVENT_INTRADAY_RENAMED}-{host.today}",
+                "CRITICAL",
+                f"unit={name} is not {INTRADAY_UNIT}; its stages are not judged",
+            )
+
+
+def run_intraday_rules(host: PassHost, observation: UnitObservation, wiring: DaemonWiring) -> None:
     """Judge the ended intraday invocations since the previous pass; nothing without the unit."""
+    _renamed_units(host, observation)
     block = observation.blocks.get(INTRADAY_UNIT)
     if block is None:
         return
@@ -509,10 +638,14 @@ def run_intraday_rules(host: PassHost, observation: Any, wiring: DaemonWiring) -
     judged = [i for i in prior.get("judged", []) if isinstance(i, str)]
     now_us = host.now // 1000
     since_us = (
-        last_pass // 1000 - INTRADAY_INVOCATION_MAX_S * _US
+        last_pass // 1000 - INTRADAY_INVOCATION_MAX_S * US
         if last_pass is not None
-        else now_us - FIRST_LOOKBACK_S * _US
+        else now_us - FIRST_LOOKBACK_S * US
     )
+    floor_us = now_us - MAX_LOOKBACK_S * US
+    if since_us < floor_us:
+        since_us = floor_us
+        host.scan.reasons.append("intraday_window_clamped")
     window = journal.unit_entries(
         INTRADAY_UNIT,
         since_us=since_us,
@@ -540,9 +673,24 @@ def run_intraday_rules(host: PassHost, observation: Any, wiring: DaemonWiring) -
             continue
         rules.apply(verdict)
         judged.append(invocation)
+    last_seen = prior.get("last_invocation_id")
+    if (
+        isinstance(last_seen, str)
+        and INVOCATION_RE.fullmatch(last_seen)
+        and last_seen != current
+        and last_seen not in judged
+    ):
+        host.commit_finding(
+            EVENT_UNJUDGED,
+            INTRADAY_UNIT,
+            f"{EVENT_UNJUDGED}-{last_seen}",
+            "WARNING",
+            f"unit={INTRADAY_UNIT} invocation={last_seen} left the unit unseen by the journal",
+        )
     host.scan.daemon_seen.setdefault(INTRADAY_UNIT, {})[INTRADAY_SEEN_KEY] = {
         "pass_ns": host.now,
         "judged": judged[-JUDGED_KEPT:],
+        "last_invocation_id": current if INVOCATION_RE.fullmatch(current) else last_seen,
     }
 
 
@@ -555,6 +703,7 @@ __all__ = [
     "StageFinding",
     "demand_summary_counters",
     "find_delivered",
+    "integrity_page_exists",
     "judge_invocation",
     "read_stage_episode",
     "run_intraday_rules",

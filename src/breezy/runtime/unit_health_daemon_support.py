@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from breezy.runtime.unit_health_journal import (
     JOURNALCTL,
@@ -24,6 +24,10 @@ from breezy.runtime.unit_health_journal import (
     run_bounded,
 )
 
+if TYPE_CHECKING:
+    from breezy.runtime.unit_health_store import HealthStore
+    from breezy.runtime.unit_health_types import PassEnv
+
 MSG_STARTED: Final = "39f53479d3a045ac8e11786248231fbf"
 MSG_EXIT: Final = "98e322203f7a4ed290d09fe03c09fe15"
 MSG_STOPPING: Final = "de5b426a63be47a7b6ac3eaac82e2f6f"
@@ -31,12 +35,23 @@ MSG_SCHEDULED_RESTART: Final = "5eb03494b6584870a536b337290809b3"
 MSG_FAILED: Final = "d9b373ed55a64feb8242e02dbe79a49c"
 LIFECYCLE_IDS: Final = (MSG_STARTED, MSG_EXIT, MSG_STOPPING)
 
+EVENT_PROPERTY_UNREADABLE: Final = "daemon_property_unreadable"
+EVENT_BASELINE_CORRUPT: Final = "daemon_baseline_corrupt"
+EVENT_UNJUDGED: Final = "daemon_invocation_unjudged"
+EVENT_INTRADAY_RENAMED: Final = "intraday_unit_renamed"
 EVENT_AUTO_RESTARTED: Final = "daemon_auto_restarted"
 EVENT_CRASHED: Final = "daemon_crashed"
 EVENT_UNEXPLAINED: Final = "daemon_invocation_changed_unexplained"
 EVENT_BUILDSIDE: Final = "daemon_restarted_buildside"
 #: Daemon findings that page (and so must be explained by a delivered alert).
-DAEMON_EVENTS: Final = (EVENT_AUTO_RESTARTED, EVENT_CRASHED, EVENT_UNEXPLAINED, EVENT_BUILDSIDE)
+DAEMON_EVENTS: Final = (
+    EVENT_AUTO_RESTARTED,
+    EVENT_CRASHED,
+    EVENT_UNEXPLAINED,
+    EVENT_BUILDSIDE,
+    EVENT_PROPERTY_UNREADABLE,
+    EVENT_BASELINE_CORRUPT,
+)
 
 EVENT_BWRAP_UNAVAILABLE: Final = "bwrap_unavailable"
 EVENT_DEMAND_TIMEOUT: Final = "demand_stage_timeout"
@@ -55,10 +70,19 @@ INTRADAY_PAGED_EVENTS: Final = (
     EVENT_EVAL_FAILED,
     EVENT_EVAL_TIMEOUT,
     EVENT_EVAL_UNRECORDED,
+    EVENT_UNJUDGED,
+    EVENT_INTRADAY_RENAMED,
+    EVENT_DEMAND_INTEGRITY,
 )
 PAGED_FINDING_EVENTS: Final = (*DAEMON_EVENTS, *INTRADAY_PAGED_EVENTS)
 
-_INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
+INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
+US: Final = 1_000_000
+DAY_S: Final = 86_400
+#: Invocation ids kept in a unit's judged ledger. 32 (the store's ``RECENT_INVOCATIONS_KEPT``): a
+#: pass re-reads at most the previous pass's 125 s plus its own interval, a handful of 5 minute
+#: intraday runs, so 32 covers every overlap with room; a longer ledger only costs file size.
+JUDGED_KEPT: Final = 32
 _UNIT_RE: Final = re.compile(r"[A-Za-z0-9@._-]+\.service")
 _FIELDS: Final = ("COMMAND", "EXIT_CODE", "EXIT_STATUS", "JOB_TYPE", "JOB_RESULT", "UNIT_RESULT")
 _US: Final = 1_000_000
@@ -96,14 +120,31 @@ class DaemonWiring:
     marker_root: Path | None = None
 
 
+class ScanState(Protocol):
+    """The part of the pass's scan the rules write."""
+
+    daemon_seen: dict[str, dict[str, object]]
+    days: set[str]
+    reasons: list[str]
+
+
 class PassHost(Protocol):
     """What the rules use of the health pass (``unit_health._Pass``)."""
 
-    env: Any
-    store: Any
-    scan: Any
-    now: int
-    today: str
+    @property
+    def env(self) -> PassEnv: ...
+
+    @property
+    def store(self) -> HealthStore: ...
+
+    @property
+    def scan(self) -> ScanState: ...
+
+    @property
+    def now(self) -> int: ...
+
+    @property
+    def today(self) -> str: ...
 
     def allowance(self) -> float: ...
 
@@ -166,11 +207,11 @@ def _parse_all(stdout: str) -> tuple[UnitEntry, ...]:
 
 
 def _seconds_floor(us: int) -> int:
-    return max(us, 0) // _US
+    return max(us, 0) // US
 
 
 def _seconds_ceil(us: int) -> int:
-    return -(-max(us, 0) // _US)
+    return -(-max(us, 0) // US)
 
 
 class SubprocessDaemonJournal:
@@ -215,7 +256,7 @@ class SubprocessDaemonJournal:
     ) -> tuple[UnitEntry, ...]:
         if not _UNIT_RE.fullmatch(unit):
             raise JournalError("unit_name")
-        if not _INVOCATION_RE.fullmatch(invocation_id):
+        if not INVOCATION_RE.fullmatch(invocation_id):
             raise JournalError("invocation_id")
         argv = [*self._base(), f"USER_UNIT={unit}", f"USER_INVOCATION_ID={invocation_id}"]
         if not lifecycle_only:

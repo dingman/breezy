@@ -7,6 +7,7 @@ journalctl, reads the permit or the orders switch, or touches the real data root
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -1251,7 +1252,8 @@ def test_unit_health_modules_read_no_permit_or_orders_state() -> None:
 
 def test_unit_health_never_calls_a_state_changing_verb() -> None:
     for path in sorted(SRC.glob("unit_health*.py")):
-        text = path.read_text(encoding="utf-8")
+        # the one journal-field comparison is allowed (and pinned by the AST guard below)
+        text = path.read_text(encoding="utf-8").replace('.get("JOB_TYPE") == "stop"', "")
         for verb in (
             '"restart"',
             '"start"',
@@ -1262,6 +1264,133 @@ def test_unit_health_never_calls_a_state_changing_verb() -> None:
             "systemd-run",
         ):
             assert verb not in text, f"{path.name} names {verb}"
+
+
+_VERBS = frozenset(
+    {
+        "restart",
+        "start",
+        "stop",
+        "reset-failed",
+        "kill",
+        "daemon-reload",
+        "systemd-run",
+        "enable",
+        "disable",
+        "mask",
+        "try-restart",
+        "reload-or-restart",
+    }
+)
+
+
+def _is_job_type_get(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "JOB_TYPE"
+    )
+
+
+def _is_str(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _fold(node: ast.AST) -> str | None:
+    """The string a constant-only expression evaluates to (``+``, f-string, ``.join``, case
+    methods), else ``None``: a verb cannot be hidden in an expression this resolves."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [_fold(v) for v in node.values]
+        return "".join(parts) if None not in parts else None  # type: ignore[arg-type]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        base = _fold(node.func.value)
+        if base is None:
+            return None
+        if node.func.attr in {"lower", "upper"}:
+            return base.lower() if node.func.attr == "lower" else base.upper()
+        if (
+            node.func.attr == "join"
+            and node.args
+            and isinstance(node.args[0], (ast.Tuple, ast.List))
+        ):
+            items = [_fold(e) for e in node.args[0].elts]
+            return base.join(items) if None not in items else None  # type: ignore[arg-type]
+    return None
+
+
+def verb_findings(source: str) -> tuple[list[str], int]:
+    """``(violations, allowed sites)`` of one module: a verb word as a string constant, or a verb
+    assembled from constants (``.lower()``, ``.upper()``, ``.join()``, ``+``, an f-string). The one
+    allowed site is a comparator of ``<x>.get("JOB_TYPE")`` (a journal field value)."""
+    tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    bad: list[str] = []
+    allowed = 0
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant) and _fold(node) is not None:
+            if str(node.value).strip().lower() not in _VERBS:
+                continue
+            parent = parents.get(node)
+            if (
+                isinstance(parent, ast.Compare)
+                and node in parent.comparators
+                and _is_job_type_get(parent.left)
+            ):
+                allowed += 1
+            else:
+                bad.append(f"{line}: verb constant")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"lower", "upper"}
+            and _is_str(node.func.value)
+        ):
+            bad.append(f"{line}: .{node.func.attr}() on a constant")
+        else:
+            folded = _fold(node)
+            if folded is not None and folded.strip().lower() in _VERBS:
+                bad.append(f"{line}: assembled verb")
+    return bad, allowed
+
+
+def test_unit_health_never_names_or_assembles_a_state_changing_verb() -> None:
+    allowed = 0
+    for path in sorted(SRC.glob("unit_health*.py")):
+        bad, ok = verb_findings(path.read_text(encoding="utf-8"))
+        assert bad == [], f"{path.name}: {bad}"
+        allowed += ok
+    assert allowed == 1  # the one JOB_TYPE comparison in unit_health_daemons
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'x = "stop"',
+        'x = "STOP".lower()',
+        'x = "".join(("st", "op"))',
+        'x = "st" + "op"',
+        'x = f"stop"',
+        'x = ["Restart "]',
+        'if e.get("OTHER") == "stop": pass',
+        'if "stop" == e.get("JOB_TYPE"): pass',
+    ],
+)
+def test_verb_guard_positive_controls(source: str) -> None:
+    bad, _ok = verb_findings(source)
+    assert bad  # every control is a violation
+
+
+def test_verb_guard_allows_only_the_job_type_comparison() -> None:
+    assert verb_findings('ok = e.fields.get("JOB_TYPE") == "stop"') == ([], 1)
 
 
 def test_store_files_are_private(tmp_path: Path) -> None:
