@@ -871,3 +871,85 @@ def test_status_report_accept_fill_terminal_retires_and_round_trips(
         assert retired.retirement_reason is reason
         round_tripped = SubmitIntent.from_bytes(retired.to_bytes())
         assert round_tripped.retirement_reason is reason
+
+
+def test_resolver_no_id_no_fill_retires_and_round_trips(store_path: Path) -> None:
+    """AMBIG-LATCH-RESUME C0 (CH1): the no-id resolver's retirement reason.
+
+    Phase A lands the member alone so every SUPERVISOR can decode a singleton
+    retired with it before any node can write it (an old supervisor would
+    raise SubmitIntentCorrupt -> read OPEN -> refuse every launch, L-48).
+    Must retire cleanly and round-trip like every other member.
+    """
+    reason = RetirementReason.RESOLVER_NO_ID_NO_FILL
+    assert reason.value == "RESOLVER_NO_ID_NO_FILL"
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+        intent = latch.arm("a" * 64, now_ns=NOW_NS)
+        retired = latch.retire(intent.intent_id, reason, now_ns=NOW_NS + 1)
+        assert retired.retirement_reason is reason
+        assert not latch.is_latched()
+        round_tripped = SubmitIntent.from_bytes(retired.to_bytes())
+        assert round_tripped.retirement_reason is reason
+
+
+#: The only src/scripts module that may enumerate ``RetirementReason``'s
+#: members: the supervisor decode marker advertises the full set it can decode
+#: (AMBIG-LATCH-RESUME §2.11). Any other enumerating consumer is a place a new
+#: member could be silently dropped or mishandled, so it must be reviewed.
+_REASON_ENUMERATING_MODULES: frozenset[str] = frozenset(
+    {"src/breezy/runtime/supervisor_decode_marker.py"}
+)
+
+
+def _reason_enumerations(tree: ast.AST) -> int:
+    """Count member-set uses of ``RetirementReason``: iteration, a
+    ``list``/``set``/``tuple``/``sorted``/``len``/``frozenset`` call over the
+    class, or ``__members__`` / ``_member_map_`` access."""
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.comprehension)):
+            it = node.iter
+            if isinstance(it, ast.Name) and it.id == "RetirementReason":
+                count += 1
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"list", "set", "tuple", "sorted", "len", "frozenset"}
+            and any(isinstance(a, ast.Name) and a.id == "RetirementReason" for a in node.args)
+        ):
+            count += 1
+        elif isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "RetirementReason"
+                and node.attr in {"__members__", "_member_map_", "_value2member_map_"}
+            ):
+                count += 1
+    return count
+
+
+def test_retirement_reason_consumers_are_only_the_known_modules() -> None:
+    root = Path(__file__).resolve().parents[2]
+    enumerating: set[str] = set()
+    for base in ("src", "scripts"):
+        for path in sorted((root / base).rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "RetirementReason" not in text:
+                continue
+            tree = ast.parse(text)
+            if _reason_enumerations(tree):
+                enumerating.add(str(path.relative_to(root)))
+    assert enumerating <= _REASON_ENUMERATING_MODULES, sorted(
+        enumerating - _REASON_ENUMERATING_MODULES
+    )
+
+
+def test_reason_enumeration_walker_is_not_vacuous() -> None:
+    planted = ast.parse(
+        "from x import RetirementReason\n"
+        "a = [m.value for m in RetirementReason]\n"
+        "b = list(RetirementReason)\n"
+        "c = RetirementReason.__members__\n"
+        "for m in RetirementReason:\n    pass\n"
+    )
+    assert _reason_enumerations(planted) == 4

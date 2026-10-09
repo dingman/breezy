@@ -91,6 +91,14 @@ class RetirementReason(str, Enum):
     #: ``avgPx`` -- distinct from ACCEPTED_WITH_DURABLE_FILL, which is set
     #: from real per-leg execution evidence in the CREATE response.
     STATUS_REPORT_ACCEPT_FILL_TERMINAL = "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+    #: AMBIG-LATCH-RESUME C0 (CH1): a NO-ID AMBIGUOUS intent (the venue
+    #: issues no client order id, so a POST that never returned a venue id
+    #: cannot be looked up by GET) retired by the node resolver on complete,
+    #: consistent negative venue evidence. Landed in Phase A, supervisor side,
+    #: BEFORE any node can write it: an older supervisor decoding it would
+    #: raise SubmitIntentCorrupt (``_optional_enum``), read the singleton as
+    #: OPEN and refuse every launch (L-48). Never reverted (plan r6 section 6).
+    RESOLVER_NO_ID_NO_FILL = "RESOLVER_NO_ID_NO_FILL"
 
 
 class SubmitIntentError(Exception):
