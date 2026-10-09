@@ -335,9 +335,12 @@ def test_health_row_show_read_names_the_review_properties_and_both_unit_patterns
     argv = show.argv
     properties = set(argv[argv.index("-p") + 1].split(","))
     assert {"MainPID", "UnitFileState", "LoadState"} <= properties
-    # the one reviewed widening (2026-10-09): the inactive rotate oneshot is not matched by the glob
+    # reviewed widenings (2026-10-09): the inactive rotate oneshot, and the two units carrying
+    # TEMPORARY drop-ins (ingest, replay-daily), are not matched by the glob while idle
     assert argv[argv.index("--") + 1 :] == (
         "breezy-quote-tape-rotate.service",
+        "breezy-quote-tape-ingest.service",
+        "breezy-replay-daily.service",
         "breezy-*",
         "us-source-collector@*",
     )

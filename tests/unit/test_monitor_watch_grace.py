@@ -178,3 +178,40 @@ def test_a_stale_trigger_is_still_unconditional_for_a_running_oneshot(
     result = _verdict(tmp_path, deploy, stale, _oneshot())
     # the grace window (1 h) is long over as well, so both are raised; stale is never forgiven
     assert {f.kind for f in result.findings} == {"timer_last_trigger_stale", "timer_no_next_elapse"}
+
+
+# ---------------------------------------------------------------- Unit= differs from name
+
+OTHER_SERVICE = "breezy-other.service"
+
+
+def _other_oneshot(*, state: str = "activating", ended_s: float = -600) -> str:
+    return show_block(
+        OTHER_SERVICE,
+        ActiveState=state,
+        ActiveEnterTimestamp="",
+        InactiveEnterTimestamp=systemd_ts(ended_s),
+    )
+
+
+def test_the_grace_follows_the_timers_unit_property_not_its_name(
+    tmp_path: Path, deploy: Path
+) -> None:
+    """09:51Z false CRITICAL: ``breezy-quote-tape-ingest-frequent.timer`` triggers
+    ``breezy-quote-tape-ingest.service``; the name swap named a service that does not exist."""
+    timer = _gone(last_s=-1, Unit=OTHER_SERVICE)
+    result = _verdict(tmp_path, deploy, timer, _other_oneshot())
+    assert result.outcome == "PASS", result.findings
+
+
+def test_a_unit_property_naming_an_absent_service_still_gets_the_finding(
+    tmp_path: Path, deploy: Path
+) -> None:
+    timer = _gone(last_s=-1, Unit=OTHER_SERVICE)
+    result = _verdict(tmp_path, deploy, timer, _oneshot())  # only the name-swapped one is present
+    assert {f.kind for f in result.findings} == {"timer_no_next_elapse"}
+
+
+def test_an_empty_unit_property_falls_back_to_the_name_swap(tmp_path: Path, deploy: Path) -> None:
+    result = _verdict(tmp_path, deploy, _gone(last_s=-1, Unit=""), _oneshot())
+    assert result.outcome == "PASS", result.findings

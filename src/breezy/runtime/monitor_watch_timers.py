@@ -91,6 +91,14 @@ def _service_running_since_trigger(
     return reference is not None and now_ns - reference <= min(interval_s, ELAPSE_GRACE_CAP_S) * NS
 
 
+def _timer_service_name(unit: str, block: Mapping[str, str]) -> str:
+    """The service a timer triggers: its ``Unit=`` property, else the same-stem name swap.
+
+    ``breezy-quote-tape-ingest-frequent.timer`` triggers ``breezy-quote-tape-ingest.service``, so
+    the name swap alone judged a service that does not exist (09:51Z false CRITICAL)."""
+    return block.get("Unit", "").strip() or unit.removesuffix(".timer") + ".service"
+
+
 def _check_block(
     unit: str,
     block: Mapping[str, str],
@@ -244,7 +252,7 @@ def evaluate_timers(
                 monotonic=monotonic,
                 now_ns=now_ns,
                 today=today,
-                service=inventory.blocks.get(unit.removesuffix(".timer") + ".service"),
+                service=inventory.blocks.get(_timer_service_name(unit, block)),
             )
             findings.extend(found)
             unknown.extend(unreadable)
