@@ -132,6 +132,8 @@ class LegOutcome:
     collected: int = 0
     misses: int = 0
     errors: int = 0
+    #: A 429 back-off entered this pass: expected, alerted and self-healing, never an error.
+    backed_off: int = 0
     refused: int = 0
     deadline: bool = False
 
@@ -360,7 +362,10 @@ def _enter_backoff(
     )
     _log(f"{cli} {station} {type(exc).__name__}: backing off until {until}")
     col.ctx.alert("rate_limited", source_key, f"{station}: {type(exc).__name__}; backing off")
-    out.errors += 1
+    if isinstance(exc, RateLimitedError):
+        out.backed_off += 1  # already alerted and self-healing: the unit must not also fail
+    else:
+        out.errors += 1  # 5xx / 403 / consecutive transport failures keep failing the unit
 
 
 def _transport_failure_streak(col: Any) -> int:

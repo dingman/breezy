@@ -105,7 +105,7 @@ def test_yes_take_sequence_is_byte_identical_to_before_this_slice(
     ``not_executable``, so this also proves the "no NO log" default case."""
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert submitted == []
@@ -127,7 +127,7 @@ def test_a_clearing_no_frame_logs_exactly_one_shadow_line_and_submits_nothing(
     """(b) NO clears -> exactly one `no_take_shadow:` line, never armed/consumed/submitted."""
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -302,7 +302,7 @@ def test_admission_breach_refuses_station_day_admission(
     assert record.fee is None
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -398,7 +398,7 @@ def test_a_fill_absent_from_todays_facts_still_contributes_to_admission(
     assert str(dropped_iid) in strategy._candidate_instrument_ids()
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
