@@ -360,7 +360,15 @@ CEILINGS: Final[dict[str, int]] = {
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1451,
+    # AMBIG-LATCH-RESUME Phase A: 1451 -> 1453 (+2, deliberate). The new
+    # `SupervisorPorts.probe_open_intent_shape: Callable[..., OpenIntentShape]`
+    # port adds ONE `**dict[str, object]` arg-type error at each of the two
+    # pre-existing untyped constructor sites (test_trade_supervisor.py
+    # `_make_ports`, test_trade_supervisor_cont_self_check.py `_make_ports`).
+    # The sibling `probe_open_intent_resolvable: Callable[..., bool]` port
+    # dedups against the existing `probe_open_intent_state` message. All new
+    # test code in this item is fully annotated (0 new errors of its own).
+    "tests/unit": 1453,
 }
 
 

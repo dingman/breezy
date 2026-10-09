@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Final, TextIO
 
 import breezy
+from breezy.domain.exec_intent import RESOLVER_CONTEXT_KEY_PREFIX
 from breezy.runtime.build_sha import (
     BUILD_REVISION_ENV_VAR,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
     _looks_like_git_sha,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
@@ -67,6 +68,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentCorrupt,
     SubmitIntentState,
 )
+from breezy.runtime.supervisor_decode_marker import write_supervisor_decode_marker
 from breezy.runtime.trade_supervisor_core import (
     _PERMIT_FAIL_SELF_CHECK_RESULTS,
     _SCHEDULE_POLL_INTERVAL_S,
@@ -98,6 +100,7 @@ from breezy.runtime.trade_supervisor_core import (
     LaunchAction,
     MiddayDeadAction,
     MiddayRecheckAction,
+    OpenIntentShape,
     PermitAlertAction,
     PermitAlertDecision,
     PermitCapability,
@@ -433,6 +436,58 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
         except SubmitIntentCorrupt:
             return True
         return record.state is SubmitIntentState.OPEN
+
+
+def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> bool:
+    """[AMBIG-LATCH-RESUME Phase A, CM1] ``True`` iff the singleton DECODES
+    and is OPEN -- i.e. the node's resolver can retire it, so the supervisor
+    launches the node instead of stranding the intent (L-48).
+
+    A corrupt singleton is ``False`` (today's refusal stays): the node's
+    resolver treats corrupt as OPEN-unknown and never retires it. Same
+    no-live-node guard and fresh read-only connection as
+    :func:`probe_open_intent`; needs no adapter import and no context read.
+    """
+    assert_no_live_node_before_intent_probe(node_pid)
+    with SqliteStateStore(store_path) as store:
+        raw = store.get(CURRENT_INTENT_KEY)
+        if raw is None:
+            return False
+        try:
+            record = SubmitIntent.from_bytes(raw)
+        except SubmitIntentCorrupt:
+            return False
+        return record.state is SubmitIntentState.OPEN
+
+
+def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIntentShape:
+    """[AMBIG-LATCH-RESUME Phase A, DH1] Classify the OPEN intent by its
+    durable resolver context (one read-only ``get`` of
+    ``RESOLVER_CONTEXT_KEY_PREFIX + intent_id``), to pick the alert severity.
+
+    ``WITH_ID``: ``venueOrderId`` is a non-empty string. ``NO_ID``:
+    ``venueOrderId == ""``. ``NO_CONTEXT``: the key is absent. ``UNKNOWN``:
+    anything undecodable, an unreadable singleton or store, or any exception
+    -- the fail-loud direction. Same no-live-node guard as
+    :func:`probe_open_intent`.
+    """
+    assert_no_live_node_before_intent_probe(node_pid)
+    try:
+        with SqliteStateStore(store_path) as store:
+            raw_intent = store.get(CURRENT_INTENT_KEY)
+            if raw_intent is None:
+                return OpenIntentShape.UNKNOWN
+            intent = SubmitIntent.from_bytes(raw_intent)
+            raw_context = store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent.intent_id}")
+        if raw_context is None:
+            return OpenIntentShape.NO_CONTEXT
+        payload = json.loads(raw_context)
+        venue_order_id = payload.get("venueOrderId") if isinstance(payload, dict) else None
+        if not isinstance(venue_order_id, str):
+            return OpenIntentShape.UNKNOWN
+        return OpenIntentShape.WITH_ID if venue_order_id else OpenIntentShape.NO_ID
+    except Exception:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
+        return OpenIntentShape.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1143,13 @@ class SupervisorPorts:
             startup_evidence=None, family_halted=False
         )
     )
+    #: [AMBIG-LATCH-RESUME Phase A] Defaults keep every existing fake port
+    #: set refusing on an OPEN intent exactly as before (resolvable False)
+    #: and fail toward the louder alert (shape UNKNOWN).
+    probe_open_intent_resolvable: Callable[..., bool] = field(default=lambda *a, **kw: False)
+    probe_open_intent_shape: Callable[..., OpenIntentShape] = field(
+        default=lambda *a, **kw: OpenIntentShape.UNKNOWN
+    )
 
 
 def _boot_alert_sink() -> AlertSink:
@@ -1120,6 +1182,8 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         continuous_family_active=sending_family_active,
         resolve_sending_family_id=resolve_sending_family_id,
         read_continuous_family_store_state=read_continuous_family_store_state,
+        probe_open_intent_resolvable=probe_open_intent_resolvable,
+        probe_open_intent_shape=probe_open_intent_shape,
     )
 
 
@@ -1191,6 +1255,36 @@ def _do_stop_prior(
     return None
 
 
+def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> None:
+    """[AMBIG-LATCH-RESUME Phase A, CM1/DH1] Log the decision and alert by the
+    OPEN intent's shape before the launch proceeds over it.
+
+    A with-id intent has the existing GET resolver (WARN). A no-id,
+    no-context or unknown shape needs the node's no-id resolver, so it pages
+    CRITICAL with ``next=node_no_id_resolver`` semantics (the detail value
+    names no operator). A shape probe that raises is ``UNKNOWN``.
+    """
+    try:
+        shape = ports.probe_open_intent_shape(store_path, node_pid=None)
+    except Exception:  # noqa: BLE001 -- deliberate: fail toward the louder alert.
+        shape = OpenIntentShape.UNKNOWN
+    log_decision("launch_to_resolve_open_intent", shape=shape.value)
+    if shape is OpenIntentShape.WITH_ID:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE",
+            severity="WARN",
+            detail=AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE,
+        )
+        return
+    alert(
+        ports.alert_sink,
+        event="TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID",
+        severity="CRITICAL",
+        detail=AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID,
+    )
+
+
 def _attempt_adoption(
     *, ports: SupervisorPorts, lock_path: Path, log_dir: Path
 ) -> tuple[int, Path | None] | None:
@@ -1232,7 +1326,14 @@ def _do_launch(
         return None, None, state, True
 
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+    resolvable = (
+        ports.probe_open_intent_resolvable(store_path, node_pid=None) if open_intent else False
+    )
+    action = decide_launch_action(
+        lock_free=lock_free,
+        open_intent_detected=open_intent,
+        open_intent_resolvable=resolvable,
+    )
 
     if action is LaunchAction.REFUSE_LOCK_HELD:
         # [D2] A supervisor restarted mid-window with a healthy node
@@ -1261,7 +1362,10 @@ def _do_launch(
         )
         return None, None, state, True
 
-    # action is LAUNCH. [D3] A prior spawn attempt this window may have
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        _announce_launch_to_resolve(ports=ports, store_path=store_path)
+
+    # action is LAUNCH or LAUNCH_TO_RESOLVE. [D3] A prior spawn attempt this window may have
     # raised -- gate a retry on the SAME bounded budget RELAUNCH_CHECK
     # uses (<=2 attempts, >=3 min apart, never at/after 17:00 UTC), never a
     # free-running immediate retry loop.
@@ -1602,8 +1706,18 @@ def _handle_boot_retry_precheck_refusal(
     lock_path = intent_lock_path(store_path)
     lock_free = ports.intent_lock_free(lock_path)
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+    resolvable = (
+        ports.probe_open_intent_resolvable(store_path, node_pid=None) if open_intent else False
+    )
+    action = decide_launch_action(
+        lock_free=lock_free,
+        open_intent_detected=open_intent,
+        open_intent_resolvable=resolvable,
+    )
     if action is LaunchAction.LAUNCH:
+        return None
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        _announce_launch_to_resolve(ports=ports, store_path=store_path)
         return None
     if action is LaunchAction.REFUSE_LOCK_HELD:
         adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
@@ -2604,6 +2718,7 @@ def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
     lock_path = supervisor_lock_path(store_path)
     try:
         with hold_supervisor_lock(lock_path):
+            revision = _resolve_build_revision(os.environ)
             log_decision(
                 "supervisor_started",
                 stop_prior_utc=str(STOP_PRIOR_UTC),
@@ -2611,8 +2726,16 @@ def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
                 self_check_utc=str(SELF_CHECK_UTC),
                 lock_path=str(lock_path),
                 log_dir=str(log_dir),
-                revision=_resolve_build_revision(os.environ),
+                revision=revision,
             )
+            # [AMBIG-LATCH-RESUME Phase A, DH1] Advertise the retirement
+            # reasons THIS process can decode. A failure never stops the
+            # supervisor: without the marker a node fails closed on the new
+            # reason (the intent stays AMBIGUOUS and pages), which is safe.
+            try:
+                write_supervisor_decode_marker(store_path, revision=revision)
+            except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+                log_decision("supervisor_decode_marker_write_failed", error_type=type(exc).__name__)
             _run_forever(
                 store_path=store_path,
                 repo_root=repo_root,
