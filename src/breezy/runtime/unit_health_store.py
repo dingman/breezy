@@ -46,6 +46,7 @@ _ALERT_RECORD_RE: Final = re.compile(r"\d+_[a-z0-9_]{1,64}_d\.json")
 _DELIVERY_SCHEMA: Final = "alert_delivery/v1"
 _ALERT_DAYS: Final = 3
 _KEY_UNSAFE: Final = re.compile(r"[^A-Za-z0-9_.-]")
+FOLD_EXPORT_MARKER: Final = "fold_export_seen"
 
 
 def safe_key(key: str) -> str:
@@ -325,6 +326,26 @@ class HealthStore:
             "ts_ns": ts_ns,
         }
         replace_atomic(self.root / "cursor.json", body)
+
+    # ------------------------------------------------------------------ fold export latch (X-12)
+
+    def fold_export_seen(self) -> bool:
+        """Has any registry export file ever been seen? An unreadable marker counts as seen."""
+        try:
+            os.lstat(self.root / FOLD_EXPORT_MARKER)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def mark_fold_export_seen(self, ts_ns: int) -> None:
+        """Write the write-once latch (0444); it is never rewritten or deleted."""
+        write_once(
+            self.root / FOLD_EXPORT_MARKER,
+            {"schema": "fold_export_seen/v1", "ts_ns": ts_ns},
+            0o444,
+        )
 
     def read_heartbeat(self) -> dict[str, Any] | None:
         return read_json(self.root / "heartbeat.json")

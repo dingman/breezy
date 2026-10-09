@@ -123,7 +123,7 @@ def apply_watch(host: WatchHost, observation: UnitObservation) -> WatchResult | 
     )
     reasons = host.scan.reasons
     reasons.extend(r for r in dict.fromkeys(result.unknown_reasons) if r not in reasons)
-    host.scan.not_deployed = list(result.not_deployed)
+    host.scan.not_deployed = sorted({*host.scan.not_deployed, *result.not_deployed})
     host.scan.resident_kib = result.resident_kib
     for timer, stamp in result.sightings.items():
         if timer not in stored:  # write-once in effect: a stored sighting is never moved

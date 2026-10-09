@@ -9,6 +9,7 @@ from typing import Final
 
 from breezy.registry.health_model import AlertPayload
 from breezy.runtime.autonomy_sandbox.bus_handoff import BusSnapshot
+from breezy.runtime.health_dropins import DROPIN_ALLOWLIST, DropinAllow, read_dropin_file
 from breezy.runtime.monitor_watch import WatchWiring
 from breezy.runtime.unit_health_daemon_support import DaemonWiring
 from breezy.runtime.unit_health_journal import JournalSource
@@ -24,6 +25,14 @@ class FoldUnreadable(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class FoldNotDeployed(Exception):
+    """The fold's registry export is a listed not-yet-deployed artifact (X-12): not a failure."""
+
+    def __init__(self, artifact: str) -> None:
+        super().__init__(artifact)
+        self.artifact = artifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +63,7 @@ class PassResult:
     journal_blind: tuple[str, ...] = ()
     cursor_reset: bool = False
     drift: tuple[DriftFinding, ...] = ()
+    allowlisted: tuple[str, ...] = ()
 
 
 @dataclass
@@ -72,6 +82,9 @@ class PassEnv:
     host_verdict: Callable[[HostVerdict], None] | None = None
     #: ``None`` skips the drift check (no committed baseline was readable): inconclusive.
     committed_dropins: Mapping[str, frozenset[str]] | None = None
+    #: ``read_dropin(path)``: the bytes of a regular, non-symlink drop-in, else ``None`` (X-13).
+    read_dropin: Callable[[str], bytes | None] = read_dropin_file
+    dropin_allowlist: Sequence[DropinAllow] = DROPIN_ALLOWLIST
     invocation_id: str = ""
     #: The daemon and intraday-stage rules' seams (S4); ``None`` skips them.
     daemons: DaemonWiring | None = None

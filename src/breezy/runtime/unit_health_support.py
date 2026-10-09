@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -94,24 +94,3 @@ def unexplained_for_day(
             if not is_explained(body, action, delivered):
                 names.append(f"{unit}__{key}")
     return tuple(sorted(names))
-
-
-def unit_config_drift(
-    blocks: Mapping[str, Mapping[str, str]],
-    committed: Mapping[str, frozenset[str]],
-    *,
-    today: str,
-    critical_from: str = DRIFT_CRITICAL_FROM,
-) -> tuple[DriftFinding, ...]:
-    """Drop-ins in a unit's ``DropInPaths`` that have no committed copy (row #24)."""
-    severity = "CRITICAL" if today >= critical_from else "WARNING"
-    found: list[DriftFinding] = []
-    for unit in sorted(blocks):
-        known = committed.get(unit, frozenset())
-        for path in blocks[unit].get("DropInPaths", "").split():
-            name = path.rsplit("/", 1)[-1]
-            if name not in known:
-                found.append(
-                    DriftFinding(unit, name, severity, f"unit={unit} dropin={name} uncommitted")
-                )
-    return tuple(found)

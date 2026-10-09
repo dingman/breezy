@@ -1421,3 +1421,93 @@ def test_store_files_are_private(tmp_path: Path) -> None:
     assert oct(record.stat().st_mode & 0o777) == "0o444"
     assert oct((h.store.root / "heartbeat.json").stat().st_mode & 0o777) == "0o600"
     assert os.path.isdir(h.store.root / "seen")
+
+
+# --------------------------------------------------------------------------- S6 activation rulings
+
+
+def test_a_not_deployed_fold_is_listed_and_never_a_failure(tmp_path: Path) -> None:
+    """X-12: INCONCLUSIVE(not_deployed): no reason, no page, no verdict, no streak."""
+
+    def probe() -> None:
+        raise unit_health.FoldNotDeployed("registry_export")
+
+    verdicts: list[Any] = []
+    h = harness(tmp_path, fold_probe=probe, host_verdict=verdicts.append)
+    result = h.run()
+    assert result.pass_result == "OK" and result.unknown_reasons == ()
+    assert verdicts == [] and h.alerts.events == []
+    beat = h.store.read_heartbeat()
+    assert beat is not None and beat["passes_unknown_streak"] == 0
+    rollup = h.store.read_rollup("2026-10-08")
+    assert rollup is not None and rollup["not_deployed"] == ["registry_export"]
+
+
+def test_seeding_the_cursor_does_not_hide_a_unit_that_is_still_failed(tmp_path: Path) -> None:
+    """X-14: the seed drops journal history only; reconcile judges the snapshot's failed list."""
+    unit = "breezy-foo.service"
+    snap = make_snapshot(
+        units=[show_block(unit, Result="exit-code", InvocationID=inv(7))], failed=[unit]
+    )
+    h = harness(tmp_path, snapshot=snap)
+    h.store.write_cursor(None, h.clock.now_ns, h.clock.now_ns // 1000)
+    result = h.run()
+    assert result.journal_blind == (unit,) and result.failed_units == 1
+    assert h.alerts.events == ["unit_health_journal_blind"]
+
+
+def _dropin_snapshot(path: str) -> BusSnapshot:
+    unit = "breezy-trade-supervisor.service"
+    return make_snapshot(units=[show_block(unit, DropInPaths=path)])
+
+
+def _allow_for(content: bytes) -> tuple[Any, ...]:
+    import hashlib
+
+    from breezy.runtime.health_dropins import DropinAllow
+
+    return (
+        DropinAllow(
+            "breezy-trade-supervisor.service",
+            "fq-v1-halt-orders-off.conf",
+            hashlib.sha256(content).hexdigest(),
+            "RULING_FQ-v2-NO-TRADE_2026-10-08",
+            "2026-12-31",
+        ),
+    )
+
+
+_SAFE = b"[Service]\nEnvironment=BREEZY_ORDERS_ENABLED=0\n"
+_PATH = "/x/breezy-trade-supervisor.service.d/fq-v1-halt-orders-off.conf"
+
+
+def test_an_allowlisted_dropin_is_listed_in_the_day_rollup_and_not_paged(tmp_path: Path) -> None:
+    h = harness(
+        tmp_path,
+        snapshot=_dropin_snapshot(_PATH),
+        committed_dropins={},
+        read_dropin=lambda path: _SAFE,
+        dropin_allowlist=_allow_for(_SAFE),
+    )
+    result = h.run()
+    assert result.drift == () and h.alerts.events == []
+    rollup = h.store.read_rollup("2026-10-08")
+    assert rollup is not None
+    assert rollup["allowlisted_dropin"] == [
+        "breezy-trade-supervisor.service:fq-v1-halt-orders-off.conf"
+    ]
+
+
+def test_a_changed_allowlisted_dropin_pages_critical(tmp_path: Path) -> None:
+    h = harness(
+        tmp_path,
+        snapshot=_dropin_snapshot(_PATH),
+        committed_dropins={},
+        read_dropin=lambda path: _SAFE + b"# edit\n",
+        dropin_allowlist=_allow_for(_SAFE),
+    )
+    result = h.run()
+    assert [d.severity for d in result.drift] == ["CRITICAL"]
+    assert h.alerts.events == ["unit_config_drift"]
+    rollup = h.store.read_rollup("2026-10-08")
+    assert rollup is not None and rollup["allowlisted_dropin"] == []

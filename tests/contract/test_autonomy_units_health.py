@@ -291,7 +291,8 @@ def test_health_config_limits_and_names_the_autonomy_failed_notifier() -> None:
 def test_health_config_row_is_networkless_with_host_proc_and_four_binds() -> None:
     row = AUTONOMY_BWRAP_TABLE[UNIT]
     assert (row.network, row.resolves_dns, row.host_proc) == ("none", False, True)
-    assert row.exceptions == frozenset({"E7A_R2_PROC"})
+    assert row.exceptions == frozenset({"E7A_R2_PROC", "E7_CONFIG_DIR"})  # X-13: config bind
+    assert row.config_ro_dirs == (".config/systemd/user",) and row.config_ro_binds == ()
     assert row.binds == (
         "evidence/unit_health",
         "derived/verdicts",
