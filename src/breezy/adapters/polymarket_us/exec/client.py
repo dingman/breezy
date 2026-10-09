@@ -3668,7 +3668,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 page = await self._private_read(PORTFOLIO_ACTIVITIES_PATH, query)
             except Exception as exc:  # noqa: BLE001 - read failure stays AMBIGUOUS
                 self._log.warning(
-                    f"resolver: no-id activities read failed ({type(exc).__name__}: {exc}); "
+                    f"resolver: no-id activities read failed ({type(exc).__name__}); "
                     "scan incomplete"
                 )
                 return None
@@ -3787,7 +3787,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._resolver_consecutive_failures += 1
             self._no_id_next_check_ns[intent_id] = recheck_ns
             self._log.warning(
-                f"resolver: no-id positions read failed ({type(exc).__name__}: {exc}); "
+                f"resolver: no-id positions read failed ({type(exc).__name__}); "
                 "stays AMBIGUOUS"
             )
             return
@@ -3798,7 +3798,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             open_orders = ()
             open_orders_ok = False
             self._log.warning(
-                f"resolver: no-id open-orders read failed ({type(exc).__name__}: {exc})"
+                f"resolver: no-id open-orders read failed ({type(exc).__name__})"
             )
         join = await self._no_id_trade_activity(window_start_ns)
         if join is None:
@@ -3840,11 +3840,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             try:
                 if echo is not None and context is not None:
                     same_day_instrument = False
+                    listed_instruments = 0
                     for candidate in self._instrument_provider.list_all():
+                        listed_instruments += 1
                         if candidate.id == instrument.id:
                             same_day_instrument = True
                             break
-                    if same_day_instrument:
+                    if listed_instruments == 0:
+                        # An empty provider proves nothing about holdings.
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "holding_unreadable"
+                    elif same_day_instrument:
                         slug = base_slug_of(instrument.id)
                         venue_leg_qty = _resolver_leg_holding_qty(
                             positions, slug, leg_of(instrument.id)
@@ -3912,7 +3918,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                             outcome_kind = "CONTRADICTION"
                             outcome_token = "unexplained_holding"
                 elif echo is None:
+                    listed_instruments = 0
                     for candidate in self._instrument_provider.list_all():
+                        listed_instruments += 1
                         venue_leg_qty = _resolver_leg_holding_qty(
                             positions, base_slug_of(candidate.id), leg_of(candidate.id)
                         )
@@ -3925,6 +3933,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                             outcome_kind = "CONTRADICTION"
                             outcome_token = "unexplained_holding"
                             break
+                    if listed_instruments == 0:
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "holding_unreadable"
             except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
                 self._note_resolver_error(intent_id, exc)
                 return
@@ -3967,6 +3978,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if outcome_kind == "ADOPT":
             if context is None:
                 return
+            self._no_id_next_check_ns[intent_id] = recheck_ns
             try:
                 self._adopt_no_id_venue_order(context, f"{verdict.order_id}")
                 cached = self._cache.order(ClientOrderId(context.client_order_id))
@@ -3983,6 +3995,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # NO_FILL with the baseline passing: the H2 analogue, set only by a
         # complete negative pass in THIS run.
         self._resolved_no_id_ts_ns[intent_id] = now_ns
+        # A blocked or failing retirement leaves the intent OPEN: re-check on
+        # the interval, never on every 5 s poll.
+        self._no_id_next_check_ns[intent_id] = recheck_ns
         try:
             self._resolve_no_order(intent_id, context, now_ns, positions)
         except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
@@ -4015,6 +4030,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         (the SAFETY H2 analogue). The AMBIGUOUS-refusal clear is the LAST step.
         """
         if not self._no_id_retire_admitted:
+            already_blocked = intent_id in self._resolver_contradiction_details
             self._resolver_contradiction_details = {
                 **self._resolver_contradiction_details,
                 intent_id: {
@@ -4028,10 +4044,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     "next": "next_node_boot_rereads_supervisor_marker",
                 },
             }
-            self._log.error(
-                f"resolver: no-id retirement of intent {intent_id} is blocked -- the running "
-                "supervisor's decode marker does not list the reason; fail-closed"
-            )
+            if not already_blocked:
+                self._log.error(
+                    f"resolver: no-id retirement of intent {intent_id} is blocked -- the "
+                    "running supervisor's decode marker does not list the reason; fail-closed"
+                )
             return
         if intent_id not in self._resolved_no_id_ts_ns:
             self._log.error(
@@ -5794,7 +5811,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._resolver_errored_intent_ids.add(intent_id)
         self._log.error(
             f"resolver: acting on intent {intent_id} raised "
-            f"{exc.__class__.__name__}: {exc}; this intent stays AMBIGUOUS and "
+            f"{exc.__class__.__name__}; this intent stays AMBIGUOUS and "
             "the resolver keeps polling"
         )
 
@@ -5963,8 +5980,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if capture_holding_baseline and wire_market_slug is not None:
             try:
                 baseline = self._holding_baseline(order.instrument_id, wire_market_slug, now_ns)
-            except Exception:  # noqa: BLE001 - no baseline is the safe direction
+            except Exception as exc:  # noqa: BLE001 - no baseline is the safe direction
                 baseline = None
+                self._log.warning(
+                    f"no-id holding baseline unavailable ({exc.__class__.__name__}); "
+                    "the absolute rule applies"
+                )
         context = AmbiguousResolverContext(
             intent_id=intent_id,
             venue_order_id=venue_order_id,
@@ -6293,11 +6314,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if booking is not None:
                 self._ledger.release_booking(booking, now_ns=now_ns)
             return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
-        self._post_in_flight_intent_id = intent.intent_id
         headers = self._write_signer.sign_headers(
             write_transport._WRITE_METHOD,
             write_transport.ORDERS_PATH,
         )
+        self._post_in_flight_intent_id = intent.intent_id
         try:
             response = await self._order_sender.post_order(
                 self._api_base_url,

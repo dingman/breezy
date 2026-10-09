@@ -1476,3 +1476,208 @@ async def test_with_no_manual_legs_route_d_equals_the_r5_behaviour(
     assert not client.log_lines("info", "manual leg(s)")
     del intent_id
     await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Review fix round: re-check cadence on every non-terminal exit, empty provider,
+# names-only logs, the in-flight flag, and the pre-POST row on a clean take
+# ---------------------------------------------------------------------------
+
+
+def _reads(client: Any) -> int:
+    return len(read_paths(client))
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_retirement_rechecks_on_the_interval_and_logs_the_guard_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    client, current, _cmd, _sender, _ev = await _no_id_take(tmp_path, monkeypatch, admitted=None)
+    client.advance(305)
+    await run_passes(client, 1)
+    assert _contradiction(client, current.intent_id)["event"] == "resolver_no_id_retire_blocked"
+    reads = _reads(client)
+
+    client.advance(10)
+    await run_passes(client, 1)
+    assert _reads(client) == reads, "inside 60 s: ZERO venue reads"
+
+    client.advance(60)
+    await run_passes(client, 1)
+    assert _reads(client) > reads, "after 60 s: re-read"
+    assert len(client.log_lines("error", "is blocked")) == 1, "the guard ERROR is deduped"
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["_resolve_no_order", "_adopt_no_id_venue_order"])
+async def test_a_raising_retire_or_adopt_rechecks_on_the_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+    failing: str,
+) -> None:
+    client, current, _cmd, _sender, _ev = await _no_id_take(
+        tmp_path, monkeypatch, mode="empty200" if failing.startswith("_adopt") else "exception"
+    )
+    if failing == "_adopt_no_id_venue_order":
+        _negative(client, activities=[_echo_leg(current.created_ns + SEC_NS, ORDER_X)])
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("store down (rig)")
+
+    monkeypatch.setattr(PolymarketUSExecutionClient, failing, _boom)
+    client.advance(305)
+    await run_passes(client, 1)
+    reads = _reads(client)
+    client.advance(10)
+    await run_passes(client, 1)
+    assert _reads(client) == reads, "inside 60 s: ZERO venue reads"
+    client.advance(60)
+    await run_passes(client, 1)
+    assert _reads(client) > reads, "after 60 s: re-read"
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attributed", [True, False], ids=["attributed", "window_only"])
+async def test_an_empty_instrument_provider_is_incomplete_not_no_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+    attributed: bool,
+) -> None:
+    client, _ev, _permit, _cm = await build_client(
+        tmp_path, monkeypatch, sender=response_sender(200, b"{}"), admitted=True
+    )
+    intent_id, _created = arm_context(client, age_s=305, with_context=attributed)
+    _negative(client)
+    monkeypatch.setattr(type(client._instrument_provider), "list_all", lambda _self: [])
+    await run_passes(client, 1)
+    assert client._latch.current_open() is not None
+    assert intent_id not in client._resolver_contradiction_details
+    assert client.log_lines("warning", "holding_unreadable")
+    await client._disconnect()
+
+
+def _leaks(client: Any, secret: str) -> list[str]:
+    """Lines the NEW no-id code (and the shared error note) wrote that carry the secret."""
+    return [
+        line
+        for _lvl, line in client.log_records
+        if secret in line and "startup-evidence" not in line
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolver_read_failure_logs_name_the_exception_type_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    secret = "SECRET-URL-https://x.invalid/?k=1"
+    client, _current, _cmd, _sender, _ev = await _no_id_take(tmp_path, monkeypatch)
+    real = client._private_read
+
+    async def _failing(path: str, query: Any = None) -> Any:
+        if path in {
+            PORTFOLIO_POSITIONS_PATH,
+            OPEN_ORDERS_PATH,
+            PORTFOLIO_ACTIVITIES_PATH,
+        }:
+            raise RuntimeError(secret)
+        return await real(path, query)
+
+    client._private_read = _failing
+    client.advance(305)
+    await run_passes(client, 1)
+    client._no_id_next_check_ns.clear()
+    assert client.log_lines("warning", "RuntimeError")
+    assert not _leaks(client, secret)
+
+    # the activities scan on its own (positions and open orders succeed)
+
+    async def _only_activities(path: str, query: Any = None) -> Any:
+        if path == PORTFOLIO_ACTIVITIES_PATH:
+            raise RuntimeError(secret)
+        return await real(path, query)
+
+    client._private_read = _only_activities
+    client.advance(61)
+    await run_passes(client, 1)
+    assert not _leaks(client, secret)
+    # `_note_resolver_error`
+    client._note_resolver_error("i-1", RuntimeError(secret))
+    assert not _leaks(client, secret)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_raising_sign_headers_does_not_strand_the_in_flight_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    sender = RaisingSender()
+    client, _ev, _permit, _cm = await build_client(
+        tmp_path, monkeypatch, sender=sender, admitted=True, start=True
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("signer down (rig)")
+
+    monkeypatch.setattr(client._write_signer, "sign_headers", _boom, raising=False)
+    with pytest.raises(RuntimeError):
+        await client._submit_order(make_command(client))
+    assert client._post_in_flight_intent_id is None
+    assert sender.calls == []
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_baseline_logs_the_type_name_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    sender = RaisingSender()
+    client, _ev, _permit, _cm = await build_client(
+        tmp_path, monkeypatch, sender=sender, admitted=True, start=True
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("SECRET-BASELINE")
+
+    monkeypatch.setattr(PolymarketUSExecutionClient, "_holding_baseline", _boom)
+    await client._submit_order(make_command(client))
+    lines = client.log_lines("warning", "holding baseline")
+    assert lines and "RuntimeError" in lines[0]
+    assert not [line for _lvl, line in client.log_records if "SECRET-BASELINE" in line]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_non_ambiguous_take_leaves_its_pre_post_context_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    """Characterisation (item 6): nothing removes the pre-POST row when a take
+    ends non-AMBIGUOUS. It is inert (the intent is RETIRED, so no pass reads it)
+    and bounded (~0.5 KB per take). Pinned here so a cleanup is a deliberate change."""
+    from tests.unit.test_polymarket_us_submit_order_chain import _status_reject_body
+
+    body = _status_reject_body()
+    client, _ev, _permit, _cm = await build_client(
+        tmp_path, monkeypatch, sender=response_sender(400, body), admitted=True, start=True
+    )
+    await client._submit_order(make_command(client))
+    assert client._latch.current_open() is None, "the take ended non-AMBIGUOUS"
+    current = client._latch.current()
+    assert current is not None
+    row = read_context(client, current.intent_id)
+    assert row is not None and row.venue_order_id == ""
+    assert current.intent_id not in client._ambiguous_bookings
+    await client._disconnect()
