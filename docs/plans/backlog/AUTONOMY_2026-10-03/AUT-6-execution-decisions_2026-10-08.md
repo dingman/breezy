@@ -57,3 +57,13 @@ The WP decomposition was done by the planner, read-only, on 2026-10-08. Only WP1
 | X-9 | WP2 verify-first | Path B. See `AUT-6-WP2-pathB-ruling_2026-10-08.md` (in peer review). |
 | X-10 | Redeliver unit `ReadWritePaths=` broke bwrap on this host | Fixed by a65ee68f/03789239, with a contract ban on mount-namespace directives in any wrapped unit. Every new AUT-6 unit inherits the ban. |
 | X-11 | `nbp_drift.py` placement | `nbp_drift.py` holds the pure predicates; `check_drift`/`check_freshness` stay in the script. This is an accepted divergence from the plan text. |
+
+## WP3 S6 activation decisions (proposed 2026-10-09, IN PEER REVIEW)
+
+| # | Decision | Ruling |
+|---|---|---|
+| X-12 | The S6 dry pass gives `fold_unreadable` CRITICAL on every pass because no registry export exists until AUT-5a. Per F4, every pass would page | The registry export becomes a `NOT_YET_DEPLOYED` artifact row, `(registry_export, AUT-5a, not_expected_until)`. While the row stands, no export file has ever existed, and the deadline has not passed, the fold reads `INCONCLUSIVE(not_deployed)`: no FAIL under host, no page. Everything else in the pass runs normally, so unit failures are still detected and paged. Once any export has existed, or after the deadline, F4 applies in full. Same tests as X-8. |
+| X-13 | `unit_config_drift` flags the live `fq-v1-halt-orders-off.conf` on `breezy-trade-supervisor.service`. It is an operator-ruled halt drop-in, not committed to `deploy/` | Add one reviewed row to a drift allowlist: `(unit, dropin name, sha256 of the current content, citing RULING_FQ-v2-NO-TRADE_2026-10-08)`. No copy of the file goes into the repo, and live enablement config is never touched. A content-hash mismatch, or any other uncommitted drop-in, still pages. |
+| X-14 | The first enabled pass has no cursor, so it would replay about 54 historical failures as new alerts | Activation seeds the cursor to the activation instant with `--seed-cursor-now`, journaled with the reason `activation_baseline`. Historical failures are covered by `DISPOSITION_failed_units_2026-10-08.md`. |
+| X-15 | `timer_no_next_elapse` CRITICAL on `us-source-collector@lamp.timer`. It was a false positive: the lamp timer is healthy (next 07:31Z), and the snapshot was taken while its service was running | A missing `NextElapse` is not a finding while the timer's service is `activating`/`active`, or within one interval of `LastTrigger`. It is a finding only when it persists across two passes with the service inactive. |
+| X-16 | Activation order | Install the units, then seed the cursor (X-14), then run one `--dry-run` showing zero CRITICAL findings, then enable the timer. LIVE means the first scheduled pass completed with `unexplained_failed_units=0`. |
