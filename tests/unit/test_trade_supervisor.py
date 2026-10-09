@@ -8990,7 +8990,7 @@ class TestBoundedLaunchToResolvePageDefer:
 
     def test_a_durable_page_resets_the_defer_counter(self, tmp_path: Path) -> None:
         outcomes = iter([False, False, True])
-        spawner, _sink, ports = self._ports(durable=lambda _s, _p: next(outcomes))
+        _spawner, _sink, ports = self._ports(durable=lambda _s, _p: next(outcomes))
         kwargs = _launch_kwargs(tmp_path)
         state = kwargs["state"]
         for _ in range(2):
@@ -9001,7 +9001,7 @@ class TestBoundedLaunchToResolvePageDefer:
         assert state.launch_to_resolve_page_defers == 0
 
     def test_the_with_id_path_never_defers(self, tmp_path: Path) -> None:
-        spawner, _sink, ports = self._ports()
+        _spawner, _sink, ports = self._ports()
         ports = replace(ports, probe_open_intent_with_id=lambda *a, **kw: True)
         pid, _log, state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
         assert pid is not None and done is True
