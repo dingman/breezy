@@ -88,7 +88,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
 | CF-12-W3 | LOW | r5.1 READY; Stage 0 10-09 STOP (tests/unit FIN 1308>1288) → blocked on W3e | CF-12 |
-| CF-12-W3e | LOW | NEEDS PLAN: typing slice for call sites W3 makes visible (tests/unit +20 net; scripts/analysis +52 unattributed); file list in W3 r5.1 Stage 0 report (scratchpad cf12w3/fin_1.out) | W3 Stage 0 |
+| CF-12-W3e | LOW | PLAN r1 drafted (`BP/CF-12-W3e_plan_r1.md`; measured FIN tests/unit 1176/1285); peer review PAUSED — ROI priority 10-09 (no trading lever) | W3 Stage 0 |
 | SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
 ### RUN / ANALYSE

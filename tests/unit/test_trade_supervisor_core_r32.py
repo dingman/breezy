@@ -21,6 +21,7 @@ from breezy.runtime.trade_supervisor_core import (
     EscalationLoadOutcome,
     MiddayDeadAction,
     MiddayRecheckAction,
+    OrdersEnv,
     Phase,
     RelaunchCause,
     SelfCheckResult,
@@ -460,3 +461,53 @@ def test_ceiling_gate_precedes_a_would_be_exhausted_budget() -> None:
         state=state, now=_MIDDAY_NOW, live_cause=RelaunchCause.TRANSIENT
     )
     assert decision.action is MiddayDeadAction.CEILING_UNKNOWN_FIRST
+
+
+def test_derive_self_check_facts_exposes_latched_orders_not_requested() -> None:
+    """The marker was drained earlier: the latch alone carries it."""
+    state = _state(orders_not_requested_seen=True)
+    facts = derive_self_check_facts(state=state, log_text=_SUBSCRIBED + "\n", now=_NOW)
+    assert PERMIT_NOT_REQUESTED_MARKER not in _SUBSCRIBED
+    assert facts.orders_not_requested_seen is True
+
+
+def test_derive_self_check_facts_stateless_reads_live_marker() -> None:
+    facts = derive_self_check_facts(
+        state=None, log_text=f"x\n{PERMIT_NOT_REQUESTED_MARKER}\n", now=_NOW
+    )
+    assert facts.state is None
+    assert facts.orders_not_requested_seen is True
+
+
+def test_derive_self_check_facts_no_marker_is_false() -> None:
+    stateless = derive_self_check_facts(state=None, log_text=_SUBSCRIBED, now=_NOW)
+    stateful = derive_self_check_facts(state=_state(), log_text=_SUBSCRIBED, now=_NOW)
+    assert stateless.orders_not_requested_seen is False
+    assert stateful.orders_not_requested_seen is False
+
+
+def test_log_fields_orders_env_and_family_halt_check() -> None:
+    fields = self_check_log_fields(
+        result=SelfCheckResult.PASS_ORDERS_NOT_REQUESTED,
+        continuous_check=ContinuousFamilyCheck(True, True, False),
+        continuous_family_halt_source="per_family",
+        load_outcome=EscalationLoadOutcome.PRESENT,
+        gap_hours=1.0,
+        orders_env=OrdersEnv.OFF,
+        family_halt_check_skipped=True,
+    )
+    assert fields["orders_env"] == "off"
+    assert fields["family_halt_check"] == "skipped"
+    assert fields["continuous_family_not_halted"] is False
+    assert fields["continuous_family_halt_source"] == "per_family"
+    checked = self_check_log_fields(
+        result=SelfCheckResult.PASS,
+        continuous_check=ContinuousFamilyCheck(True, True, True),
+        continuous_family_halt_source=None,
+        load_outcome=EscalationLoadOutcome.PRESENT,
+        gap_hours=None,
+        orders_env=OrdersEnv.UNKNOWN,
+        family_halt_check_skipped=False,
+    )
+    assert checked["orders_env"] == "unknown"
+    assert checked["family_halt_check"] == "checked"
