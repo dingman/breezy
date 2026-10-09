@@ -315,6 +315,7 @@ way, so read the output, not the status). `daemon-reload` starts nothing.
 Ensure `operator.env` holds the two caps, then:
 
 ```
+/home/jon/breezy/.venv/bin/python -m breezy.runtime.autonomy_health_cli --mark-buildside-restart breezy-trade-supervisor.service --reason "<why>" --commit <sha>
 systemctl --user restart breezy-trade-supervisor.service
 ```
 
@@ -418,6 +419,7 @@ The tracked file now carries Phase 1. To activate, reload and restart (at 16:40Z
 
 ```
 systemctl --user daemon-reload
+/home/jon/breezy/.venv/bin/python -m breezy.runtime.autonomy_health_cli --mark-buildside-restart breezy-trade-supervisor.service --reason "<why>" --commit <sha>
 systemctl --user restart breezy-trade-supervisor.service
 ```
 
@@ -474,6 +476,7 @@ If verification fails, restore from before the cut (commit 314a3ba):
 ```
 git checkout 314a3ba -- deploy/systemd/breezy-trade-supervisor.service
 systemctl --user daemon-reload
+/home/jon/breezy/.venv/bin/python -m breezy.runtime.autonomy_health_cli --mark-buildside-restart breezy-trade-supervisor.service --reason "<why>" --commit <sha>
 systemctl --user restart breezy-trade-supervisor.service
 ```
 
@@ -507,8 +510,13 @@ schedule a relaunch. Anything that must outlive the operator shell must be
 started through the host supervisor path described in L-26.
 
 The supervisor does not automatically relaunch a killed node (only crashes trigger bounded relaunch).
-A manual restart is needed: `systemctl --user restart breezy-trade-supervisor.service` at the next
-desired window, or before 17:00Z if you want to keep the day's permit active.
+A manual restart is needed, at the next desired window or before 17:00Z if you want to keep the
+day's permit active. Mark it first, so the health pass reads it as build-side:
+
+```
+/home/jon/breezy/.venv/bin/python -m breezy.runtime.autonomy_health_cli --mark-buildside-restart breezy-trade-supervisor.service --reason "<why>" --commit <sha>
+systemctl --user restart breezy-trade-supervisor.service
+```
 
 **AUD-13d note:** this manual kill switch bypasses the stop-intent marker the supervisor's own
 `stop_prior` phase writes before its SIGTERM (`breezy.runtime.stop_intent_marker`) — if it lands on a

@@ -338,18 +338,18 @@ def test_health_row_show_read_names_the_review_properties_and_both_unit_patterns
     assert not any("Environment" in p or "Credential" in p for p in properties)
 
 
-def test_health_skeleton_exits_ex_config_with_a_not_implemented_line(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """An early enable of the timer must fail loudly, not report a healthy pass."""
+def test_health_entry_defines_main_and_has_no_skeleton_left() -> None:
+    """S6: the pass replaced the S2 skeleton, so an early enable can no longer exit 78 silently."""
     from breezy.runtime import autonomy_health_cli
 
-    assert autonomy_health_cli.run_skeleton([]) == 78
-    assert "NOT_IMPLEMENTED" in capsys.readouterr().out
+    assert callable(autonomy_health_cli.main)
+    assert not hasattr(autonomy_health_cli, "run_skeleton")
+    assert not hasattr(autonomy_health_cli, "EX_CONFIG")
+    assert autonomy_health_cli.main(["--no-such-flag"]) == autonomy_health_cli.EXIT_USAGE
 
 
 def test_health_entry_must_join_the_closure_lint_before_main_exists() -> None:
-    """Tripwire: defining ``main`` without the closure-lint rows (S3-S6 work) fails here."""
+    """Tripwire: defining ``main`` without the closure-lint rows fails here (done in S6)."""
     from breezy.persistence.autonomy.detector_catalog import AUT6_LINT_MIN_JUDGED_SITES
     from breezy.runtime import autonomy_health_cli
     from tests.unit.test_autonomy_readonly_closure import AUT6_ENTRY_MODULES

@@ -27,6 +27,7 @@ FORBIDDEN_PREFIXES: Final[tuple[str, ...]] = (
 ENTRY_MODULES: Final[tuple[str, ...]] = (
     "breezy.analysis.nbp_drift",
     "breezy.runtime.autonomy_canary_cli",
+    "breezy.runtime.autonomy_health_cli",
 )
 
 

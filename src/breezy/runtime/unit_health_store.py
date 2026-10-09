@@ -261,10 +261,13 @@ class HealthStore:
                 out.append(body)
         return out
 
-    def finding_records_on(self, day: str, finding: str) -> list[dict[str, Any]]:
+    def finding_records_on(self, day: str, finding: str | None = None) -> list[dict[str, Any]]:
+        """The finding records of ``day``: all of them, or those of one finding name."""
         found = (read_json(p) for p in sorted((self.root / day).glob(f"*{CLASS_SUFFIX}")))
         return [
-            b for b in found if b and b.get("kind") == "finding" and b.get("finding") == finding
+            b
+            for b in found
+            if b and b.get("kind") == "finding" and finding in (None, b.get("finding"))
         ]
 
     def oldest_unrolled_day(self) -> str | None:

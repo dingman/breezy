@@ -39,8 +39,10 @@ from tests.unit.autonomy_owner_placeholders import CROSS_AREA_FILE, OWNER_PLACEH
 #: ``test_alert_outbox_concurrency.py``), so 149 - 5.
 #: AUT-6 WP2 delivered two (``test_alerts_undeliverable_veto`` and
 #: ``test_alerts_undeliverable_reads_two_days``, now in ``test_autonomy_node_detectors.py``), so
-#: 144 - 2.
-EXPECTED_CROSS_AREA_STUBS: Final = 142
+#: 144 - 2. AUT-6 WP3 S6 delivered ``autonomy_health_cli:main``, which retires the memory-sum and
+#: oneshot-rule stubs (the real tests are in ``test_unit_health_memory.py`` and
+#: ``test_capture_units.py``): 142 - 2.
+EXPECTED_CROSS_AREA_STUBS: Final = 140
 R5_AUT_5A_STUBS: Final = (
     "test_l1_cutover_lock_acquired_at_164454_aborts",
     "test_l1_cutover_late_write_completion_aborts",
@@ -910,16 +912,6 @@ def test_production_detector_ignores_shadow_marker() -> None:
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
 def test_shadow_probe_marker_accepted_only_under_shadow_root() -> None:
     await_owner("test_shadow_probe_marker_accepted_only_under_shadow_root")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_health_memory_sum_within_memavailable() -> None:
-    await_owner("test_health_memory_sum_within_memavailable")
-
-
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")
-def test_oneshot_units_use_timeout_start_sec_not_runtime_max_sec() -> None:
-    await_owner("test_oneshot_units_use_timeout_start_sec_not_runtime_max_sec")
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none")

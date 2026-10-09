@@ -253,13 +253,8 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         "test_production_detector_ignores_shadow_marker",
         "test_shadow_probe_marker_accepted_only_under_shadow_root",
     ),
-    *_group(
-        "AUT-6",
-        "breezy.runtime.autonomy_health_cli:main",
-        [],
-        "test_health_memory_sum_within_memavailable",
-        "test_oneshot_units_use_timeout_start_sec_not_runtime_max_sec",
-    ),
+    # AUT-6 WP3 S6 delivered ``autonomy_health_cli:main``: the memory-sum test lives in
+    # ``test_unit_health_memory.py`` and the oneshot-rule test in ``test_capture_units.py``.
     # Watchdog checks moved to AUT-6 WP4 (slice plan): keyed on WP4's own CLI, not the health CLI.
     *_group(
         "AUT-6",

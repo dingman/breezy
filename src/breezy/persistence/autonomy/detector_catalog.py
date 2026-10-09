@@ -113,6 +113,7 @@ AUT6_LINT_MIN_JUDGED_SITES: Final[MappingProxyType[str, int]] = MappingProxyType
     {
         "breezy-autonomy-alert-redeliver": 170,
         "breezy-autonomy-canary": 180,
+        "breezy-autonomy-health": 140,
         "breezy-check-alerts": 140,
         "node-sinks": 110,
     }
