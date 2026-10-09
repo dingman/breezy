@@ -37,7 +37,7 @@ import sys
 import time as _time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, Literal, TextIO
 
@@ -82,6 +82,7 @@ from breezy.runtime.trade_supervisor_core import (
     BOOT_RETRY_READINESS_TIMEOUT,
     CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
+    LAUNCH_WINDOW_END_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_READINESS_RECHECK_TIMEOUT,  # noqa: F401 - re-exported: moved/used via this module's namespace
     MIN_RELAUNCH_GAP,
@@ -189,6 +190,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_ready_adoption_alert_sent,
     record_ready_adoption_deferral,
     record_ready_adoption_terminal_logged,
+    record_launch_to_resolve_page_defers,
     record_relaunch_attempt,
     record_self_check_result,
     record_strategy_subscribed_seen,
@@ -1378,6 +1380,40 @@ def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> 
     return durable
 
 
+#: [AMBIG-LATCH-RESUME Phase A] A non-durable no-id launch-to-resolve page defers the
+#: spawn for at most this many consecutive polls, then the gate FAILS OPEN.
+LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS: Final[int] = 3
+#: ... and never inside this many scheduler polls of the window close.
+_PAGE_DEFER_MIN_POLLS_BEFORE_CLOSE: Final[int] = 2
+
+
+def _launch_to_resolve_gate(
+    *,
+    ports: SupervisorPorts,
+    store_path: Path,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    window_end: dt.datetime,
+) -> tuple[bool, DaySchedulerState]:
+    """Announce, then decide whether the spawn may proceed. A non-durable page
+    defers only while fewer than :data:`LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS`
+    consecutive defers AND at least two polls remain before ``window_end``;
+    otherwise log ERROR and fail open (spawn). The counter resets on a durable
+    page or a spawn; a defer consumes no launch budget."""
+    if _announce_launch_to_resolve(ports=ports, store_path=store_path):
+        return True, record_launch_to_resolve_page_defers(state, now, 0)
+    polls_left_ok = (
+        now + dt.timedelta(seconds=_PAGE_DEFER_MIN_POLLS_BEFORE_CLOSE * _SCHEDULE_POLL_INTERVAL_S)
+        < window_end
+    )
+    if state.launch_to_resolve_page_defers < LAUNCH_TO_RESOLVE_MAX_PAGE_DEFERS and polls_left_ok:
+        return False, record_launch_to_resolve_page_defers(
+            state, now, state.launch_to_resolve_page_defers + 1
+        )
+    logger.error("launch_to_resolve_spawning_without_durable_page")
+    return True, record_launch_to_resolve_page_defers(state, now, 0)
+
+
 def _attempt_adoption(
     *, ports: SupervisorPorts, lock_path: Path, log_dir: Path
 ) -> tuple[int, Path | None] | None:
@@ -1480,13 +1516,19 @@ def _do_launch(
             return None, None, state, False
 
     log_path = node_log_path(log_dir, now)
-    if action is LaunchAction.LAUNCH_TO_RESOLVE and not _announce_launch_to_resolve(
-        ports=ports, store_path=store_path
-    ):
-        # Once per ACTUAL spawn attempt (after the D3 gap/budget gates above), and
-        # only once the page is durable: otherwise defer to the next poll. No
-        # relaunch attempt is recorded, so no budget is consumed.
-        return None, None, state, False
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        # Once per ACTUAL spawn attempt (after the D3 gap/budget gates above). A
+        # non-durable page defers a BOUNDED number of polls (no relaunch attempt
+        # is recorded, so no budget is consumed), then fails open.
+        proceed, state = _launch_to_resolve_gate(
+            ports=ports,
+            store_path=store_path,
+            state=state,
+            now=now,
+            window_end=dt.datetime.combine(state.day, LAUNCH_WINDOW_END_UTC, tzinfo=dt.UTC),
+        )
+        if not proceed:
+            return None, None, state, False
     try:
         proc = ports.spawn(
             node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path
@@ -1779,7 +1821,7 @@ def _record_boot_retry_attempt_start(
     """[decision F] The attempt is consumed regardless of the precheck
     outcome that follows -- clears per-child latches for the incoming
     child."""
-    if state.boot_retry_attempts == 0:
+    if state.boot_retry_attempts == 0 and not state.boot_retry_first_attempt_alert_sent:
         alert(
             ports.alert_sink,
             event="TRADE_SUPERVISOR_MIDDAY_WATCH",
@@ -1909,12 +1951,28 @@ def _attempt_boot_retry_relaunch(
     )
     if precheck_result is not None and precheck_result != "launch_to_resolve":
         return precheck_result
-    if precheck_result == "launch_to_resolve" and not _announce_launch_to_resolve(
-        ports=ports, store_path=store_path
-    ):
-        # The page is not durable: no spawn this poll, and the attempt just
-        # recorded is handed back (an undelivered-alert defer consumes no budget).
-        return tracked_pid, node_log, state_before_attempt
+    if precheck_result == "launch_to_resolve":
+        proceed, gated = _launch_to_resolve_gate(
+            ports=ports,
+            store_path=store_path,
+            state=state,
+            now=now,
+            window_end=midday_watch_window_end(state.day),
+        )
+        if not proceed:
+            # No spawn this poll; the consumed attempt is handed back (a defer
+            # consumes no budget) but the first-attempt WARN latch and the defer
+            # counter are carried so neither resets.
+            return (
+                tracked_pid,
+                node_log,
+                replace(
+                    state_before_attempt,
+                    boot_retry_first_attempt_alert_sent=gated.boot_retry_first_attempt_alert_sent,
+                    launch_to_resolve_page_defers=gated.launch_to_resolve_page_defers,
+                ),
+            )
+        state = gated
     launched = _launch_boot_retry_child(
         ports=ports, now=now, repo_root=repo_root, node_bin=node_bin, log_dir=log_dir
     )
