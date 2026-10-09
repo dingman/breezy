@@ -44,3 +44,11 @@ A read-only simulation of the builder over the full window gives observed ⊆ pr
 **2022-08-11 (PFM LOT layout).** The builder detects only LAMP and NBP breaks, so this break is unobservable by design. Keep it, labelled a **manual known-break** with its ILZ104 provenance. Pinning it is conservative, because fold splitting only gets finer.
 
 **Recommended list (unchanged):** `["2022-08-11","2023-01-18","2024-05-15","2024-05-16","2025-05-28","2026-03-29","2026-03-30","2026-03-31","2026-05-06"]`. Do not add 2026-01-01.
+
+**Re-run after the fix (merge c34f1417, 2026-10-09).** The full `--draft-scratch` build ran with EXIT=0 in 182 s and finished with status complete. It observed:
+
+- lamp: 2026-03-29, 2026-03-30, 2026-03-31
+- nbp_versions: 2023-01-18, 2024-05-15, 2024-05-16, 2025-05-28, 2026-05-06
+- mos_coverage_gap_days: 15 (benign; see above)
+
+**Observed is now a subset of the recommended list.** The only proposed date the build does not observe is 2022-08-11, which is the manual PFM break. Open items 1 and 7 are closed. What remains for the freeze (on or after 10-21): the peer review of this list, then the freeze procedure.
