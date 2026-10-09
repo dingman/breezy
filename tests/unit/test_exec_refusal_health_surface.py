@@ -739,3 +739,81 @@ def test_the_watch_module_reaches_no_venue_and_no_socket() -> None:
     for banned in ("httpx", "socket", "requests", "urllib.request", "aiohttp"):
         assert banned not in imported, banned
     assert "breezy.runtime.health.WebhookAlertSink" not in imported
+
+
+# ---------------------------------------------------------------------------
+# AMBIG-LATCH-RESUME Phase B (T9, T10): the alert re-arms when the component
+# returns to RUNNING, so a refusal AFTER a resume alerts again.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_after_resume_re_alerts_exactly_once(tmp_path: Path) -> None:
+    """T9: refuse A (1 alert), clear + native resume, refuse B (2 alerts),
+    refuse C while DEGRADED (still 2). Before this item the latch was permanent
+    and the second episode never alerted."""
+    rig = _build_rig(tmp_path, instrument_loaded=False)
+    sink = _RecordingSink()
+    _install_watch(rig, sink)
+    rig.client.start()
+
+    await rig.client._connect()  # refusal A: the missing instrument
+    assert rig.client.is_degraded
+    assert len(sink.payloads) == 1
+
+    rig.client._trading_refusals = []
+    rig.client.resume()
+    assert rig.client.is_running
+
+    rig.client._refuse("refusal B")
+    assert rig.client.is_degraded
+    assert len(sink.payloads) == 2, "a refusal after a resume must alert again"
+    assert "refusal B" in sink.payloads[1].detail
+
+    rig.client._refuse("refusal C")
+    assert len(sink.payloads) == 2, "still one alert per episode"
+
+    await rig.client._disconnect()
+
+
+def test_running_re_arms_the_degraded_alert_for_the_same_component_only() -> None:
+    """T10."""
+    from nautilus_trader.common.component import LiveClock, MessageBus
+    from nautilus_trader.core.uuid import UUID4
+    from nautilus_trader.model.identifiers import ClientId, TraderId
+
+    trader_id = TraderId("BREEZY-R6C-001")
+    msgbus = MessageBus(trader_id=trader_id, clock=LiveClock())
+    sink = _RecordingSink()
+    reasons: list[str] = ["reason one"]
+    install_component_degraded_alert(
+        msgbus,
+        component_id="POLYMARKET_US",
+        reasons=lambda: tuple(reasons),
+        sink=sink,
+    )
+
+    def _publish(component: str, state: ComponentState, ts: int) -> None:
+        msgbus.publish(
+            topic=f"events.system.{component}",
+            msg=ComponentStateChanged(
+                trader_id=trader_id,
+                component_id=ClientId(component),
+                component_type="PolymarketUSExecutionClient",
+                state=state,
+                config={},
+                event_id=UUID4(),
+                ts_event=ts,
+                ts_init=ts,
+            ),
+        )
+
+    _publish("POLYMARKET_US", ComponentState.DEGRADED, 10)
+    assert len(sink.payloads) == 1
+    _publish("SOMETHING_ELSE", ComponentState.RUNNING, 20)
+    reasons[:] = ["reason two"]
+    _publish("POLYMARKET_US", ComponentState.DEGRADED, 30)
+    assert len(sink.payloads) == 1, "another component's RUNNING must not re-arm this alert"
+    _publish("POLYMARKET_US", ComponentState.RUNNING, 40)
+    _publish("POLYMARKET_US", ComponentState.DEGRADED, 50)
+    assert len(sink.payloads) == 2
