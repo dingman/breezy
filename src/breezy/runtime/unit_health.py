@@ -52,7 +52,7 @@ from breezy.runtime.autonomy_sandbox.bus_handoff import (
 )
 from breezy.runtime.monitor_watch import production_watch
 from breezy.runtime.monitor_watch_apply import apply_watch
-from breezy.runtime.monitor_watch_memory import addback_kib, addback_units
+from breezy.runtime.monitor_watch_memory import addback_kib, addback_units, free_addback_kib
 from breezy.runtime.unit_health_daemon_support import DaemonWiring, SubprocessDaemonJournal
 from breezy.runtime.unit_health_daemons import run_daemon_rules
 from breezy.runtime.unit_health_journal import (
@@ -214,6 +214,8 @@ class _Scan:
     daemon_seen: dict[str, dict[str, object]] = field(default_factory=dict)
     #: Units read INCONCLUSIVE(not_deployed) by the S5 hook: listed in the day rollup (X-8).
     not_deployed: list[str] = field(default_factory=list)
+    #: Measured ``(node, recorder)`` VmRSS KiB: the same numbers the #31 sum uses (item 6).
+    resident_kib: tuple[int, int] | None = None
 
 
 def _site(unit: str, invocation: str) -> str:
@@ -625,12 +627,17 @@ class _Pass:
         if meminfo is None:
             return
         available, _total = meminfo
-        units = (
-            addback_units(self.env.watch.deploy_dir)
-            if self.env.watch is not None
-            else MEMORY_ADDBACK_UNITS
-        )
-        addback = addback_kib(observation.blocks, units)
+        watch = self.env.watch
+        if watch is None:
+            addback = addback_kib(observation.blocks, MEMORY_ADDBACK_UNITS)
+        else:
+            node, recorder = self.scan.resident_kib or (0, 0)
+            addback = free_addback_kib(
+                observation.blocks,
+                addback_units(watch.deploy_dir),
+                node_kib=node,
+                recorder_kib=recorder,
+            )
         self.store.append_memavail(self.env.now_ns(), available, available + addback)
 
 

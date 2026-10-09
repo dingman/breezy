@@ -164,12 +164,34 @@ def test_a_failed_slot_followed_by_a_delivery_inside_the_window_is_not_pending(
     assert result.outcome == "PASS" and "canary_slot_pending" not in result.metrics
 
 
-def test_slots_before_the_canary_timer_was_enabled_were_never_due(root: Path) -> None:
+def test_a_slot_before_any_canary_evidence_is_skipped_inconclusive_with_a_metric(
+    root: Path,
+) -> None:
+    """With no record and no marker the timer's start is the only bound; the skipped slot is
+    never read as a PASS."""
     result = judge(root, at("16:00"), canary_since_ns=at("15:50"))
-    assert result.outcome == "PASS"  # 15:45 predates the timer
+    assert result.outcome == "INCONCLUSIVE" and not result.findings
+    assert result.metrics["canary_slots_skipped"] == "1545"
     assert kinds(judge(root, at("16:00"), canary_since_ns=at("09:00"))) == [
         "canary_slot_undelivered"
     ]
+
+
+def test_earliest_evidence_beats_a_restarted_timers_active_enter(root: Path) -> None:
+    """A timer restart at 15:50 must not hide the 15:45 slot once a record from before exists."""
+    put(root, at("09:00", 1), delivered=True)  # the canary ran this morning
+    result = judge(root, at("16:00"), canary_since_ns=at("15:50"))
+    assert kinds(result) == ["canary_slot_undelivered"]
+    assert "canary_slots_skipped" not in result.metrics
+
+
+def test_armed_marker_mtime_counts_as_earliest_evidence(root: Path) -> None:
+    import os
+
+    write_armed_marker(root, record="x", ts_ns=at("08:00"))
+    os.utime(root / "armed.json", ns=(at("08:00"), at("08:00")))
+    result = judge(root, at("16:00"), canary_since_ns=at("15:50"))
+    assert kinds(result) == ["canary_slot_undelivered"]
 
 
 # --------------------------------------------------------------------------- armed marker
@@ -190,12 +212,16 @@ def test_armed_marker_not_yet_24h_old_is_not_a_fail(root: Path) -> None:
     assert "armed_marker_missing" not in kinds(judge(root, at("15:50")))
 
 
-def test_an_unreadable_armed_marker_makes_the_pass_unknown(root: Path) -> None:
+def test_a_corrupt_armed_marker_is_a_finding_after_24h_and_a_metric_before(root: Path) -> None:
     put(root, at("15:45", 1, day_offset=-1))
     (root / "armed.json").write_text("not json", encoding="utf-8")
-    result = judge(root, at("15:50"))
-    assert "armed_marker_unreadable" in result.unknown_reasons
-    assert "armed_marker_missing" not in kinds(result)
+    old = judge(root, at("15:50"))
+    finding = next(f for f in old.findings if f.kind == "armed_marker_unreadable")
+    assert finding.severity == "CRITICAL" and "armed_marker_missing" not in kinds(old)
+    assert not old.unknown_reasons
+    young = judge(root, at("16:00", day_offset=-1))  # 15 min after the first delivery
+    assert "armed_marker_unreadable" not in kinds(young)
+    assert young.metrics["armed_marker_unreadable"] == "1"
 
 
 # --------------------------------------------------------------------------- the outbox
@@ -210,7 +236,8 @@ def test_alert_delivery_fails_on_abandoned_entry_or_repeated_reclaim(root: Path)
     for i in range(4):
         put(root, at("08:10") + i * NS, "redeliver", delivered=False, outbox_entry=claimed)
     result = judge(root, at("09:00"))
-    assert "outbox_repeated_reclaim" in kinds(result) and result.metrics["reclaims"] == "4"
+    assert "outbox_repeated_failed_attempts" in kinds(result)
+    assert result.metrics["failed_attempts"] == "4" and "reclaims" not in result.metrics
 
 
 def test_three_failed_reattempts_are_not_a_repeated_reclaim(root: Path) -> None:

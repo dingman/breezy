@@ -16,7 +16,7 @@ from breezy.runtime.monitor_watch import (
     journal_summary_reader,
     production_watch,
     read_node_log_tail,
-    read_unit_rss_kib,
+    read_pid_rss_kib,
 )
 from breezy.runtime.monitor_watch_producer import FileProducerSource
 from breezy.runtime.unit_health import production_env
@@ -222,22 +222,15 @@ def test_node_log_tail_reads_the_newest_log_bounded(tmp_path: Path) -> None:
         big.chmod(0o600)
 
 
-def test_unit_rss_sums_the_processes_of_one_cgroup(tmp_path: Path) -> None:
+def test_pid_rss_reads_vmrss_from_proc_status(tmp_path: Path) -> None:
     proc = tmp_path / "proc"
-    for pid, cgroup, rss in (
-        ("100", "0::/user.slice/user-1000.slice/app.slice/breezy-trade-supervisor.service", 4096),
-        ("101", "0::/user.slice/app.slice/breezy-trade-supervisor.service", 1024),
-        ("200", "0::/user.slice/app.slice/breezy-quote-tape.service", 777),
-    ):
-        (proc / pid).mkdir(parents=True)
-        (proc / pid / "cgroup").write_text(cgroup + "\n")
-        (proc / pid / "status").write_text(f"Name:\tx\nVmRSS:\t   {rss} kB\n")
-    (proc / "self").mkdir()
-    (proc / "300").mkdir()  # exited while scanning: no files
-    assert read_unit_rss_kib("breezy-trade-supervisor.service", proc) == 5120
-    assert read_unit_rss_kib("breezy-quote-tape.service", proc) == 777
-    assert read_unit_rss_kib("breezy-absent.service", proc) == 0
-    assert read_unit_rss_kib("x.service", tmp_path / "nope") is None
+    (proc / "100").mkdir(parents=True)
+    (proc / "100" / "status").write_text("Name:\tx\nVmRSS:\t   4096 kB\n")
+    (proc / "101").mkdir()
+    (proc / "101" / "status").write_text("Name:\tkthread\n")  # no VmRSS line
+    assert read_pid_rss_kib(100, proc) == 4096
+    assert read_pid_rss_kib(101, proc) is None  # unreadable, never 0
+    assert read_pid_rss_kib(999, proc) is None
 
 
 def test_the_meta_detector_class_record_is_plain_json(tmp_path: Path) -> None:

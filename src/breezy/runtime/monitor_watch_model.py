@@ -80,6 +80,10 @@ class WatchResult:
     results: tuple[DetectorResult, ...]
     #: Unit names read INCONCLUSIVE(not_deployed): listed in the day rollup, never paged.
     not_deployed: tuple[str, ...]
+    #: ``(node, recorder)`` resident KiB as measured; ``None`` when either was unreadable.
+    resident_kib: tuple[int, int] | None = None
+    #: Producer timer to the earliest instant it is known to have existed (first-seen store).
+    sightings: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def findings(self) -> tuple[WatchFinding, ...]:
@@ -170,17 +174,19 @@ def instances_of(template: str, inventory: Inventory) -> tuple[str, ...]:
 
 
 def deploy_unit_names(deploy_dir: Path) -> tuple[str, ...]:
-    """Every ``*.service`` and ``*.timer`` file name under ``deploy_dir`` (templates included)."""
-    try:
-        return tuple(
-            sorted(
-                p.name
-                for p in deploy_dir.iterdir()
-                if p.is_file() and p.name.endswith(_UNITS_SUFFIXES)
-            )
+    """Every ``*.service`` and ``*.timer`` file name under ``deploy_dir`` (templates included).
+
+    Raises ``OSError`` when the directory cannot be listed or holds no unit file: an empty tree
+    must never read as "nothing to check".
+    """
+    names = tuple(
+        sorted(
+            p.name for p in deploy_dir.iterdir() if p.is_file() and p.name.endswith(_UNITS_SUFFIXES)
         )
-    except OSError:
-        return ()
+    )
+    if not names:
+        raise OSError("no unit files under the deploy directory")
+    return names
 
 
 def _sources(deploy_dir: Path, name: str) -> list[Path]:

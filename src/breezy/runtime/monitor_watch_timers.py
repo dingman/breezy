@@ -41,6 +41,8 @@ KIND_NEVER_TRIGGERED = "timer_never_triggered"
 KIND_STALE = "timer_last_trigger_stale"
 KIND_NO_INSTANCES = "timer_template_no_instances"
 KIND_RETIRED_ENABLED = "retired_timer_enabled"
+KIND_ORPHAN_KEY = "timer_table_key_orphan"
+KIND_INSTANCE_MISSING = "timer_instance_missing"
 _NO_FUTURE_MONOTONIC: Final = frozenset({"", "0", "infinity", "n/a"})
 
 Classify = Callable[[str], Deployment]
@@ -146,14 +148,37 @@ def evaluate_timers(
     today: str,
 ) -> tuple[DetectorResult, tuple[str, ...]]:
     """``(#28 result, unit names read as not deployed)``."""
-    findings, not_deployed = inventory_findings(
-        deploy_dir, classify, today, extra_units, skip=retired
-    )
+    try:
+        deployed_names = set(deploy_unit_names(deploy_dir))
+        findings, not_deployed = inventory_findings(
+            deploy_dir, classify, today, extra_units, skip=retired
+        )
+    except OSError:
+        blind = DetectorResult(
+            DETECTOR_TIMERS, Outcome.INCONCLUSIVE, (), {}, ("deploy_dir_unreadable",)
+        )
+        return blind, ()
     unknown: list[str] = []
     judged = 0
     for key, (interval_s, _accuracy) in sorted(table.items()):
+        if key not in deployed_names and inventory.link_state(key) == "absent":
+            findings.append(
+                _finding(KIND_ORPHAN_KEY, key, today, f"table key={key} matches nothing")
+            )
+            continue
         if "@." in key:
             units = instances_of(key, inventory)
+            stem = key.partition("@")[0]
+            for instance in sorted(instance_intervals):
+                if instance.partition("@")[0] == stem and instance not in units:
+                    findings.append(
+                        _finding(
+                            KIND_INSTANCE_MISSING,
+                            instance,
+                            today,
+                            f"instance={instance} is not present and enabled",
+                        )
+                    )
             if not units:
                 findings.append(
                     _finding(KIND_NO_INSTANCES, key, today, f"template={key} no enabled instance")
@@ -184,7 +209,10 @@ def evaluate_timers(
     for unit in sorted(retired):
         block = inventory.blocks.get(unit)
         loaded = block is not None and block.get("LoadState") == "loaded"
-        if loaded and block is not None and block.get("UnitFileState", "").startswith("enabled"):
+        in_block = (
+            loaded and block is not None and block.get("UnitFileState", "").startswith("enabled")
+        )
+        if in_block or inventory.files.get(unit, "").startswith("enabled"):
             findings.append(
                 _finding(KIND_RETIRED_ENABLED, unit, today, f"retired unit={unit} is enabled")
             )

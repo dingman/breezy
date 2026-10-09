@@ -486,8 +486,8 @@ def test_in_process_studies_lock_openers_are_listed() -> None:
     unmapped: list[str] = []
     seen = 0
     for path in sorted(SRC.rglob("*.py")):
-        if sandbox in path.parents or path.name.startswith("monitor_watch"):
-            continue  # the helper, the wrapper's mount code and this check only name the lock
+        if sandbox in path.parents or path.name == "monitor_watch_memory.py":
+            continue  # the helper, the wrapper's mount code and the constant naming the lock
         if not lock_openers(path.read_text(encoding="utf-8")):
             continue
         seen += 1

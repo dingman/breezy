@@ -13,6 +13,7 @@ from typing import Any, Final
 
 from breezy.runtime.autonomy_sandbox.bus_handoff import BusSnapshot
 from breezy.runtime.monitor_watch import WatchWiring, evaluate_watch
+from breezy.runtime.monitor_watch_memory import RECORDER_UNIT
 from breezy.runtime.monitor_watch_model import DetectorResult, WatchResult
 from breezy.runtime.unit_health_obs import UnitObservation, parse_observation
 from breezy.runtime.unit_health_store import MemAvailWindow
@@ -112,7 +113,10 @@ def snapshot(
     loaded: str = "",
     now_ns: int = NOW_NS,
 ) -> BusSnapshot:
-    base = make_snapshot(now_ns=now_ns, units=list(blocks), inventory=loaded)
+    units = list(blocks)
+    if not any(f"Id={RECORDER_UNIT}\n" in b for b in units):
+        units.append(show_block(RECORDER_UNIT, MainPID="0"))  # the recorder is always loaded
+    base = make_snapshot(now_ns=now_ns, units=units, inventory=loaded)
     reads = tuple(
         dataclasses.replace(r, stdout=unit_files) if r.name == "unit_files_inventory" else r
         for r in base.reads
@@ -140,7 +144,9 @@ def wiring(tmp_path: Path, deploy: Path, **overrides: Any) -> WatchWiring:
         "producer": None,
         "summary": lambda since_ns, timeout_s: [],
         "node_log_tail": lambda: "",
-        "rss_kib": lambda unit: 0,
+        "find_node_pid": lambda: None,
+        "pid_rss_kib": lambda pid: 1,
+        "journal_evidence": lambda identifier, timeout_s: False,
     }
     base.update(overrides)
     return WatchWiring(**base)

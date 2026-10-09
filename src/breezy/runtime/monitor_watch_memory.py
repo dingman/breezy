@@ -275,9 +275,14 @@ def evaluate_memory(
     critical_from: str = MEMORY_CRITICAL_FROM,
 ) -> DetectorResult:
     limits = Limits(deploy_dir, blocks)
-    violations, terms, unknown = _violations(
-        limits, deploy_dir=deploy_dir, blocks=blocks, raised=raised
-    )
+    try:
+        violations, terms, unknown = _violations(
+            limits, deploy_dir=deploy_dir, blocks=blocks, raised=raised
+        )
+    except OSError:
+        return DetectorResult(
+            DETECTOR_MEMORY, Outcome.INCONCLUSIVE, (), {}, ("deploy_dir_unreadable",)
+        )
     metrics: dict[str, str] = {"memavail_samples": str(window.count)}
     total = terms["holder"] + terms["own"] + terms["ingest"]
     if node_rss_kib is None or recorder_rss_kib is None:
@@ -311,6 +316,19 @@ def evaluate_memory(
         return DetectorResult(DETECTOR_MEMORY, Outcome.INCONCLUSIVE, (), metrics, tuple(unknown))
     outcome = Outcome.PASS if not unknown else Outcome.INCONCLUSIVE
     return DetectorResult(DETECTOR_MEMORY, outcome, (), metrics, tuple(unknown))
+
+
+def free_addback_kib(
+    blocks: Mapping[str, Mapping[str, str]],
+    units: Collection[str],
+    *,
+    node_kib: int,
+    recorder_kib: int,
+) -> int:
+    """The free side's add-back (3.10.1 item 6): ``MemoryCurrent`` of every counted unit except
+    the node and the recorder, whose resident set is the very ``VmRSS`` the sum side counts."""
+    cgroup_units = set(units) - {NODE_UNIT, RECORDER_UNIT}
+    return addback_kib(blocks, cgroup_units, node_kib + recorder_kib)
 
 
 def addback_kib(

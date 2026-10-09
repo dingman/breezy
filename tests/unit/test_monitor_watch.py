@@ -241,7 +241,9 @@ def test_retired_timer_enabled_is_fail(tmp_path: Path, deploy: Path) -> None:
         judge(tmp_path, deploy, [*healthy(deploy), on], unit_files=files), "retired_timer_enabled"
     ) == {TIMER_R}
     off = timer_block(TIMER_R, enabled="disabled")
-    assert judge(tmp_path, deploy, [*healthy(deploy), off], unit_files=files).outcome == "PASS"
+    disabled = installed(deploy, skip=[TIMER_R], instances=[INSTANCE_ONE])
+    disabled += f"{TIMER_R:<44} disabled  enabled\n"
+    assert judge(tmp_path, deploy, [*healthy(deploy), off], unit_files=disabled).outcome == "PASS"
 
 
 def test_unreadable_timer_properties_make_the_pass_unknown(tmp_path: Path, deploy: Path) -> None:
@@ -262,7 +264,10 @@ def test_present_timer_without_a_show_block_is_unknown_not_a_pass(
 
 def real_blocks_and_files() -> tuple[list[str], str]:
     files = installed(REPO_DEPLOY, skip=TIMER_RETIRED_BY_RULING)
-    instances = ["breezy-family-tally@pm_us_crh_v2.timer", "us-source-collector@obs.timer"]
+    instances = [
+        "breezy-family-tally@pm_us_crh_v2.timer",
+        *sorted(TIMER_INSTANCE_INTERVAL_S),
+    ]
     files += "".join(f"{name:<44} enabled   enabled\n" for name in instances)
     names = [n for n in TIMER_MAX_INTERVAL_S if "@." not in n] + instances
     return healthy_timer_blocks(names), files
@@ -296,11 +301,10 @@ def test_template_instance_override_uses_its_own_interval(tmp_path: Path) -> Non
     """``us-source-collector@obs`` fires at least every 50 min, ``@nbp`` every 6 h: a trigger 3 h
     ago is stale for the first only."""
     blocks, files = real_blocks_and_files()
-    files += f"{'us-source-collector@nbp.timer':<44} enabled   enabled\n"
     three_hours = -3 * 3600
     obs = timer_block("us-source-collector@obs.timer", last_s=three_hours, next_s=300)
     nbp = timer_block("us-source-collector@nbp.timer", last_s=three_hours, next_s=300)
-    rest = [b for b in blocks if "Id=us-source-collector@obs.timer" not in b]
+    rest = [b for b in blocks if "us-source-collector@obs" not in b and "@nbp" not in b]
     result = run_watch(real_wiring(tmp_path), snapshot(blocks=[*rest, obs, nbp], unit_files=files))
     assert subjects(result.by_detector(TIMERS), "timer_last_trigger_stale") == {
         "us-source-collector@obs.timer"

@@ -14,10 +14,12 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from breezy.persistence.autonomy.detector_catalog import CATALOG
 from breezy.runtime.monitor_watch_model import (
     NS,
     SEVERITY_CRITICAL,
@@ -38,6 +40,13 @@ SKIPS_RELDIR: Final = "derived/verdicts/_aut6_daily_skips"
 _MAX_JSON_BYTES: Final = 65_536
 _MAX_LISTED: Final = 5
 REASON_UNWIRED: Final = "producer_reader_unwired"
+#: Clock skew tolerated before a heartbeat stamped in the future is a finding.
+HEARTBEAT_FUTURE_SLACK_S: Final = 60
+VERDICTS_RELDIR: Final = "derived/verdicts"
+_DAY_DIR_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
+_VERDICTS_READ_PER_FAMILY: Final = 20
+_CADENCE_BY_DETECTOR: Final = {row.id: row.cadence for row in CATALOG}
+PRODUCER_CADENCES: Final = frozenset({"intraday", "daily"})
 
 
 class ReaderUnwired(Exception):
@@ -89,6 +98,14 @@ class FileProducerSource:
         except FileNotFoundError:
             return None
 
+    @property
+    def intraday_reader_wired(self) -> bool:
+        return self._missing is not None
+
+    @property
+    def daily_reader_wired(self) -> bool:
+        return self._daily is not None
+
     def missing_intraday(self, now_ns: int) -> Sequence[str]:
         if self._missing is None:
             raise ReaderUnwired
@@ -106,6 +123,36 @@ class FileProducerSource:
         except FileNotFoundError:
             return []
         return [_read_json(directory / n) for n in names if n.endswith(".json")]
+
+
+def scan_verdict_cadences(data_root: Path) -> frozenset[str]:
+    """Which producers have left verdict files: ``intraday`` and/or ``daily``.
+
+    The newest day directory of every family directory is sampled (the health pass's own
+    ``_host`` verdicts and the ``_aut6_*`` state are skipped) and each verdict's ``detector`` is
+    looked up in the catalogue for its cadence. A missing verdict root is no evidence; any other
+    listing error raises ``OSError`` so the caller can fail closed.
+    """
+    root = data_root / VERDICTS_RELDIR
+    try:
+        families = sorted(p for p in root.iterdir() if p.is_dir() and p.name[0] not in "._")
+    except FileNotFoundError:
+        return frozenset()
+    found: set[str] = set()
+    for family in families:
+        days = sorted(p.name for p in family.iterdir() if _DAY_DIR_RE.fullmatch(p.name))
+        if not days:
+            continue
+        newest = family / days[-1]
+        for name in sorted(os.listdir(newest))[:_VERDICTS_READ_PER_FAMILY]:
+            try:
+                detector = _read_json(newest / name).get("detector")
+            except (OSError, ValueError, TypeError):
+                continue  # one unreadable file is not the absence of evidence from the others
+            cadence = _CADENCE_BY_DETECTOR.get(str(detector))
+            if cadence in PRODUCER_CADENCES:
+                found.add(str(cadence))
+    return frozenset(found)
 
 
 def in_decision_window(second_of_day: int) -> bool:
@@ -154,7 +201,18 @@ def evaluate_producer(
                 DETECTOR_PRODUCER, Outcome.INCONCLUSIVE, (), {}, ("producer_heartbeat_unreadable",)
             )
         age_s = (now_ns - stamp) // NS
-        if age_s > PRODUCER_HEARTBEAT_STALE_S:
+        if -age_s > HEARTBEAT_FUTURE_SLACK_S:
+            findings.append(
+                _finding(
+                    DETECTOR_PRODUCER,
+                    "producer_heartbeat_future",
+                    SEVERITY_CRITICAL,
+                    today,
+                    f"intraday heartbeat dated {-age_s}s in the future",
+                    {"ahead_s": str(-age_s)},
+                )
+            )
+        elif age_s > PRODUCER_HEARTBEAT_STALE_S:
             findings.append(
                 _finding(
                     DETECTOR_PRODUCER,
@@ -208,7 +266,13 @@ def _skip_stamp(record: Mapping[str, Any]) -> int:
     return stamp if type(stamp) is int else -1
 
 
-def evaluate_daily(source: ProducerSource, *, now_ns: int, today: str) -> DetectorResult:
+def evaluate_daily(
+    source: ProducerSource,
+    *,
+    now_ns: int,
+    today: str,
+    deployed_since_ns: int | None = None,
+) -> DetectorResult:
     try:
         verdicts = dict(source.newest_daily_verdict_ns())
         skips = list(source.daily_skips())
@@ -253,15 +317,32 @@ def evaluate_daily(source: ProducerSource, *, now_ns: int, today: str) -> Detect
             )
         )
     if not verdicts and not findings:
-        return DetectorResult(
-            DETECTOR_DAILY,
-            Outcome.INCONCLUSIVE,
-            (),
-            {**metrics, "unknown_reason": "no_daily_subjects"},
-        )
+        return _no_subjects(metrics, now_ns, today, deployed_since_ns)
     outcome = Outcome.FAIL if findings else Outcome.PASS
     return DetectorResult(DETECTOR_DAILY, outcome, tuple(findings), metrics)
 
 
 def _same_day(ts_ns: int, today: str) -> bool:
     return dt.datetime.fromtimestamp(ts_ns / NS, tz=dt.UTC).date().isoformat() == today
+
+
+def _no_subjects(
+    metrics: Mapping[str, str], now_ns: int, today: str, deployed_since_ns: int | None
+) -> DetectorResult:
+    """No daily verdict exists at all: pending for 30 h after the deployment, a FAIL after."""
+    base = {**metrics, "unknown_reason": "no_daily_subjects"}
+    if deployed_since_ns is None:
+        return DetectorResult(
+            DETECTOR_DAILY, Outcome.INCONCLUSIVE, (), {**base, "deployment_evidence_missing": "1"}
+        )
+    if now_ns - deployed_since_ns <= DAILY_VERDICT_STALE_S * NS:
+        return DetectorResult(DETECTOR_DAILY, Outcome.INCONCLUSIVE, (), base)
+    finding = _finding(
+        DETECTOR_DAILY,
+        "daily_verdict_absent",
+        SEVERITY_CRITICAL,
+        today,
+        "no daily verdict 30h after the daily producer was first seen",
+        {**metrics, "subjects": ""},
+    )
+    return DetectorResult(DETECTOR_DAILY, Outcome.FAIL, (finding,), metrics)
