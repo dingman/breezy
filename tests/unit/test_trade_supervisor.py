@@ -2827,22 +2827,21 @@ _READY_LOG_LINES = (
 )
 
 
-def _make_ports(**overrides) -> SupervisorPorts:
-    base: dict[str, Any] = {
-        "find_node_pid": lambda: None,
-        "resolve_intent_lock_holder": lambda _p: None,
-        "intent_lock_free": lambda _p: True,
-        "count_intent_lock_holders": lambda _p: 0,
-        "terminate_after_recheck": lambda pid, **kw: None,
-        "process_alive": lambda _pid: False,
-        "probe_open_intent_state": lambda *a, **kw: False,
-        "spawn": FakeSpawner(),
-        "read_log_new": lambda _p: "",
-        "alert_sink": _RecordingAlertSink(),
-        "sigterm_poll_sleep": lambda _s: None,
-    }
-    base.update(overrides)
-    return SupervisorPorts(**base)
+def _make_ports(**overrides: Any) -> SupervisorPorts:
+    default = SupervisorPorts(
+        find_node_pid=lambda: None,
+        resolve_intent_lock_holder=lambda _p: None,
+        intent_lock_free=lambda _p: True,
+        count_intent_lock_holders=lambda _p: 0,
+        terminate_after_recheck=lambda pid, **kw: None,
+        process_alive=lambda _pid: False,
+        probe_open_intent_state=lambda *a, **kw: False,
+        spawn=FakeSpawner(),
+        read_log_new=lambda _p: "",
+        alert_sink=_RecordingAlertSink(),
+        sigterm_poll_sleep=lambda _s: None,
+    )
+    return replace(default, **overrides)
 
 
 # ---------------------------------------------------------------------------

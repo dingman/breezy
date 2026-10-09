@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -268,21 +270,24 @@ class _RecordingAlertSink:
         self.payloads.append(payload)
 
 
-def _make_ports(**overrides) -> SupervisorPorts:
-    base: dict[str, Any] = {
-        "find_node_pid": lambda: None,
-        "resolve_intent_lock_holder": lambda _p: 42,
-        "intent_lock_free": lambda _p: True,
-        "count_intent_lock_holders": lambda _p: 1,
-        "terminate_after_recheck": lambda pid, **kw: None,
-        "process_alive": lambda _pid: True,
-        "probe_open_intent_state": lambda *a, **kw: False,
-        "spawn": lambda **kw: None,
-        "read_log_new": lambda _p: "CurrentRungHoldStrategy subscribed X\n",
-        "alert_sink": _RecordingAlertSink(),
-    }
-    base.update(overrides)
-    return SupervisorPorts(**base)
+def _no_spawn(**_kw: object) -> subprocess.Popen[bytes]:
+    raise AssertionError("these tests never spawn a node")
+
+
+def _make_ports(**overrides: Any) -> SupervisorPorts:
+    default = SupervisorPorts(
+        find_node_pid=lambda: None,
+        resolve_intent_lock_holder=lambda _p: 42,
+        intent_lock_free=lambda _p: True,
+        count_intent_lock_holders=lambda _p: 1,
+        terminate_after_recheck=lambda pid, **kw: None,
+        process_alive=lambda _pid: True,
+        probe_open_intent_state=lambda *a, **kw: False,
+        spawn=_no_spawn,
+        read_log_new=lambda _p: "CurrentRungHoldStrategy subscribed X\n",
+        alert_sink=_RecordingAlertSink(),
+    )
+    return replace(default, **overrides)
 
 
 _READY_LOG_LINE = (
