@@ -1,6 +1,6 @@
 # M1v3-CONFIRM-readiness plan r4.1 (draft, 2026-10-09)
 
-**Status:** r4.2. It applies the round-5 amendments R42-1..R42-4 (coordinator-authored) to r4.1, committed at a0a2e687. Round-5 scores on r4.1: security 96 READY, market-math 95 READY, architect 94, python 94; both 94s ask only for the amendments applied here. r4.1 applied R41-1..R41-5 to r4 (bdb4f552).
+**Status:** READY r4.2 (2026-10-09). Final scores: security 96, python 96, architect 96, market-math 95. r4.2. It applies the round-5 amendments R42-1..R42-4 (coordinator-authored) to r4.1, committed at a0a2e687. Round-5 scores on r4.1: security 96 READY, market-math 95 READY, architect 94, python 94; both 94s ask only for the amendments applied here. r4.1 applied R41-1..R41-5 to r4 (bdb4f552).
 
 Round-4 scores:
 - security 95, READY
