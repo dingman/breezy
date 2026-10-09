@@ -28,6 +28,7 @@ ENTRY_MODULES: Final[tuple[str, ...]] = (
     "breezy.analysis.nbp_drift",
     "breezy.runtime.autonomy_canary_cli",
     "breezy.runtime.autonomy_health_cli",
+    "breezy.analysis.aut6_live_proof_inputs",
 )
 
 
