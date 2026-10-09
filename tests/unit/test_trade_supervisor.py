@@ -2828,7 +2828,7 @@ _READY_LOG_LINES = (
 
 
 def _make_ports(**overrides) -> SupervisorPorts:
-    base = {
+    base: dict[str, Any] = {
         "find_node_pid": lambda: None,
         "resolve_intent_lock_holder": lambda _p: None,
         "intent_lock_free": lambda _p: True,
@@ -2842,7 +2842,7 @@ def _make_ports(**overrides) -> SupervisorPorts:
         "sigterm_poll_sleep": lambda _s: None,
     }
     base.update(overrides)
-    return SupervisorPorts(**base)  # type: ignore[arg-type]
+    return SupervisorPorts(**base)
 
 
 # ---------------------------------------------------------------------------

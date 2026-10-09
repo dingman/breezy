@@ -269,7 +269,7 @@ class _RecordingAlertSink:
 
 
 def _make_ports(**overrides) -> SupervisorPorts:
-    base = {
+    base: dict[str, Any] = {
         "find_node_pid": lambda: None,
         "resolve_intent_lock_holder": lambda _p: 42,
         "intent_lock_free": lambda _p: True,
@@ -282,7 +282,7 @@ def _make_ports(**overrides) -> SupervisorPorts:
         "alert_sink": _RecordingAlertSink(),
     }
     base.update(overrides)
-    return SupervisorPorts(**base)  # type: ignore[arg-type]
+    return SupervisorPorts(**base)
 
 
 _READY_LOG_LINE = (
