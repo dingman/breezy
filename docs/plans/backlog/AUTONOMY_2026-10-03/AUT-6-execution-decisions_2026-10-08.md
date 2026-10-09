@@ -103,3 +103,17 @@ The WP decomposition was done by the planner, read-only, on 2026-10-08. Only WP1
   6. Enable the timer.
 
   LIVE means the first scheduled pass completed with `unexplained_failed_units=0` and wrote `day_<date>.json`, and `INCONCLUSIVE` appears only in `not_deployed`.
+
+## X-17 (2026-10-09, coordinator ruling): X-15 as built
+
+Two code fixes went live on 10-09, and both are gate-green:
+- 6dafbba1 / 2e7f35d5: oneshot services never enter `active`, so the `ActiveEnterTimestamp` test could never pass for them. The grace now accepts `InactiveEnterTimestamp ≤ LastTrigger + 1 s`, with the service activating or active.
+- c66fd5fd, merged via 1462514d: the service is resolved from the timer's `Unit=` property. It falls back to the `.timer`→`.service` name swap only when `Unit=` is empty. The 09:51Z false CRITICAL on `breezy-quote-tape-ingest-frequent.timer` (`Unit=breezy-quote-tape-ingest.service`) was caused by the name swap.
+
+**Ruling.** The X-15 sentence "If the condition persists across two passes with the service inactive, it is CRITICAL" is superseded. The detector stays single-pass:
+- a missing `NextElapse` outside the grace is CRITICAL on the first pass;
+- the grace is bounded by service state and min(interval, 1 h).
+
+**Why.** Both observed false positives had a root cause in the lookup, not in timing, and both are fixed at that root. A two-pass rule would add cross-pass state to a stateless check, and would delay a real stopped timer by 10 minutes.
+
+**Reopen** if a third false positive appears whose cause is timing.
