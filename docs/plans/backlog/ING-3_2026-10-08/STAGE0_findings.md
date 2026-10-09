@@ -162,3 +162,28 @@ The rule is "build W1/W2/W4/W5 only if the hypothesis carries ≥15% of anon pea
 
 ## Status
 Stage 0 is incomplete relative to the plan table. A3-iii, A3-iv and A3-ii at 2G were not run; the time and memory STOP conclusions do not depend on them. The snapshot was removed after this commit.
+
+## Post-STOP ruling (coordinator, 2026-10-09, peer loop)
+
+Peers consulted: trading-bot-architect (branch choice) and performance-optimizer (hotspot).
+
+**Ruling.** S0.7's memory leg governs. C2(c) does not apply, because its "no hypothesis ≥15%" clause is a time criterion. On that basis:
+- The TEMPORARY memory drop-in was **removed 2026-10-09 20:00:51Z** using the r2 removal procedure and the C4 amendments. The backup is at `~/.cache/breezy-ing3-s0/dropin.bak`.
+- An auto-rollback watch (`breezy-ing3-postremoval-watch.timer`) restores the drop-in on oom_kill or a non-zero exit.
+- The post-removal runs 20:00–21:15Z all exited 0 with no oom.
+
+**Branches (b) and (c) are parked.** They reopen if any one of these trips:
+- wall time > 700 s;
+- `DEFERRAL_STALLED`;
+- a timeout kill.
+
+**Correction to the architect's reasoning.** `RunDeadline.admit` is a start-gate only, so a 1.15× slowdown does NOT defer the last unit. It admits all three units and overshoots the 600 s budget, to about 601 s. Deferral needs a slowdown of at least ~1.245×. This is pinned by `tests/unit/test_quote_tape_ingest_deferral_pin.py` (merge 585d8f7e).
+
+**Residual risk (for r3).** Worst-case wall is the budget plus the largest unit, about 600 + 381·k s. That exceeds `TimeoutStartSec=780` if quote_tick is admitted late in a run. The failure mode is a timeout kill: OnFailure fires an alert, and the next run converts the remaining types, because conversion is idempotent and per-type marked. The fix candidate is a size-aware admit.
+
+**Perf notes.**
+- About 64% of the 523 s is in `read_feather_coalesced` and `_list_feather_data_files`, which are not yet timed. Dedupe is already filtered.
+- `consolidate_data` is unusable on this non-disjoint layout.
+- Options, ranked: profile those two first; then per-type process parallelism (~27%); then a landed-watermark fast path, which is high risk.
+
+**ING-3 closes** only after the first post-removal 09:45Z-class run on 2026-10-10 is verified: exit 0, oom_kill 0, wall < 700 s.
