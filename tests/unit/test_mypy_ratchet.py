@@ -397,6 +397,10 @@ CLEAN: Final[tuple[str, ...]] = (
 #: `type: ignore` comments removed -- src/breezy/analysis 13->3 (-10),
 #: scripts/analysis 359->351 (-8), tests/contract 11->7 (-4),
 #: tests/unit 1451->1288 (-163).
+#: SELF-CHECK-ORDERS-OFF (2026-10-09): the two fake-port helpers now build
+#: `SupervisorPorts(...)` with explicit typed keywords (+ `dataclasses.replace` for
+#: overrides) instead of `**dict[str, object]`, so each port is checked; no ignores,
+#: no Any-typed base. tests/unit 1288->1257 (-31, measured).
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 3,
     "scripts/analysis": 351,
@@ -406,7 +410,7 @@ CEILINGS: Final[dict[str, int]] = {
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1288,
+    "tests/unit": 1257,
 }
 
 
