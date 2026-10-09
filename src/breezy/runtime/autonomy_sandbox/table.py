@@ -389,6 +389,9 @@ _HEALTH_SHOW_PROPERTIES: Final = (
 #: inactive oneshot that restarts the recorder at 09:00Z is absent from the glob and must be named
 #: (the 2026-10-09 false CRITICAL). It equals ``unit_health_daemons.ROTATE_UNIT`` (a test pins it).
 _HEALTH_ROTATE_UNIT: Final = "breezy-quote-tape-rotate.service"
+#: The same gap for the two units that carry TEMPORARY drop-ins: rule #5 reads their live
+#: ``MemoryMax``/``DropInPaths``, which the glob shows only while they run (2026-10-09).
+_HEALTH_DROPIN_UNITS: Final = ("breezy-quote-tape-ingest.service", "breezy-replay-daily.service")
 _HEALTH_BUS_BIND: Final = "cache/aut6_health_bus"
 _HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
     BusRead(
@@ -401,6 +404,7 @@ _HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
             _HEALTH_SHOW_PROPERTIES,
             "--",
             _HEALTH_ROTATE_UNIT,
+            *_HEALTH_DROPIN_UNITS,
             "breezy-*",
             "us-source-collector@*",
         ),
