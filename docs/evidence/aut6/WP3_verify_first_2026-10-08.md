@@ -175,3 +175,62 @@ Both scratch units appear in the failed read. They do NOT appear in the two inve
 to `breezy-*` and `us-source-collector@*` by design and the scratch names (`claude-*`, `run-*`) match neither;
 the transient is carried by the `run_transient` read instead.
 Cleanup: `reset-failed` of those two scratch units only (rc 0, logger tag `claude-aut6`).
+
+## F6: wall time of a full health pass (S6 slice, 2026-10-09 ~06:00-06:50Z)
+
+Requirement (plan r15 WP3 verify-first F6): p99 wall time of a full pass over >= 20 manual runs <= 90 s, else the
+reads are batched before the timer is enabled. Nothing was enabled, started or linked; the timer stays off.
+
+**Method.** Each run is its own transient unit (`systemd-run --user --wait --collect --unit=claude-aut6-f6-<n>`), so
+`INVOCATION_ID` and the cgroup are real. Inside it, per pass: (1) `write_bus_snapshot` for the health row with the
+real home and data root (the unsandboxed pre line: the six fixed `systemctl --user` reads), then (2) the CLI
+`autonomy_health_cli --dry-run` inside the health row's real `bwrap` argv (`tests/support/bwrap_harness.run_in_row`:
+`build_bwrap_argv`, read-only root, `--tmpfs` home and `/tmp`, no network, host `/proc`, the four real binds). The
+worktree code was imported through `PYTHONPATH`. `--dry-run` reads everything a real pass reads (snapshot, journal,
+`git worktree list`, `/proc`, node logs, meminfo, the fold) and writes only to a scratch copy of
+`evidence/unit_health` that it deletes; its summary line and its would-be findings are printed. The driver is not
+committed (scratchpad); the four bind sources and `cache/aut6_health_bus` were created empty on the live root by the
+unit's own `install -d` pre line (no content written there).
+
+**Deviation.** The unit's real `ExecStart` chain through `deploy/systemd/breezy-autonomy-bwrap` cannot be driven by a
+transient unit: the wrapper refuses it (`refused: unit_not_in_row`, exit 78) because the cgroup leaf must be
+`breezy-autonomy-health.service`. That guard was not bypassed; the harness route above is the one the S2 V-6 probes
+used. Not measured: systemd's own unit start and stop around the three commands (milliseconds on a oneshot).
+
+| batch | n | p50 | p99 | max | min | non-zero exits |
+|---|---|---|---|---|---|---|
+| A, before the pin, per pass (snapshot + row) | 22 | 2.27 s | 2.31 s | 2.31 s | 1.20 s | 0 |
+| A, outer `systemd-run --wait` wall | 22 | 2.69 s | 2.74 s | 2.74 s | 1.43 s | 0 |
+| B, pin set and verified, per pass | 22 | 2.29 s | 2.37 s | 2.37 s | 1.52 s | 0 |
+| B, outer `systemd-run --wait` wall | 22 | 2.70 s | 2.79 s | 2.79 s | 1.72 s | 0 |
+
+Split: snapshot 0.21-0.33 s; row 0.97-2.01 s (the pass itself reports `wall_s=0.39-0.67`; the rest is bwrap setup,
+interpreter start and the import closure). **Result: PASS.** p99 2.4 s against the 90 s requirement (and the 110 s
+`timeout`), a factor of about 38 inside it; no batching of reads is needed. The dry pass does the same writes into
+its scratch copy as a real pass would (54 class records, outbox entries, heartbeat, rollups), so the figure includes
+them; it does not include a real fsync-to-live-root difference (same filesystem, same calls).
+
+### What the first real pass would find (dry-run on the real snapshot, 2026-10-09 ~06:50Z)
+
+`AUTONOMY_HEALTH pass_result=UNKNOWN failed_units=0 new_failures=54 foreign_failed=19 journal_blind=0 drift=1
+cursor_reset=1 unknown_reasons=fold_unreadable`
+
+- **Findings (5):**
+  - `fold_unreadable` (CRITICAL, `_host`): there is no registry export yet (`evidence/registry/` does not exist), so
+    the fold probe raises `unreadable`. By design the pass is UNKNOWN until AUT-5a's bootstrap exists (plan section
+    3.3.2; activation says to enable the timer after the bootstrap rows exist).
+  - `unit_missing` x2 (CRITICAL): `breezy-autonomy-health.service` and `.timer` (X-8 not-deployed rule; clears when the
+    units are installed).
+  - `unit_config_drift` (WARNING until 2026-10-16, CRITICAL from it): `breezy-trade-supervisor.service` carries the
+    drop-in `fq-v1-halt-orders-off.conf`, which has no committed copy under `deploy/systemd/`. This is the
+    operator's orders-off drop-in; it was not touched. A committed baseline copy is a coordinator decision before 10-16.
+  - `timer_no_next_elapse` (CRITICAL): `us-source-collector@lamp.timer` shows no future elapse.
+- **54 new failures from the journal** (cursor reset: no cursor exists, so the pass reads back the 2-day fallback
+  window): `us-source-collector@lav` x12 and `@mos` x9 (EXIT_CODE, CRITICAL), `breezy-portfolio-roi` x2,
+  `breezy-pfm-history-1008a` x2, `breezy-exit-window-study` x2 (MEMORY_CEILING_SUSPECT), `breezy-autonomy-alert-redeliver`
+  x2, `breezy-fee-evidence-pull` x1 (all CRITICAL), and 24 `run-*` transients (UNRESOLVED_TRANSIENT, WARNING). A first
+  enabled pass would enqueue one alert per class record (about 54 plus the findings above) unless the activation seeds
+  the cursor or accepts the burst.
+- **Foreign (19, never paged):** 15 `claude-aut6-<hex>` agent transients, `claude-aut6-probe-*`,
+  `claude-aut6-v6-fail`, `claude-s5-focused2`, `suprestart-focused`.
+- `failed_units=0`: nothing is `failed` in the live snapshot at the moment of the pass.
