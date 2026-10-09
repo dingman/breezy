@@ -96,7 +96,10 @@ def test_pins_has_no_self_heal_constants_and_no_operator_control_names() -> None
 
 def test_empty_pins_at_arch0() -> None:
     assert pins.ENGINE_SOURCE_SHA256 == frozenset()
-    assert pins.PRODUCER_SOURCE_SHA256 == {}
+    # One reviewed row: AUT-6 WP3 S6 pins the health producer (P6-13); its value is checked
+    # against the closure by ``test_code_identity_pins_cover_import_closure``.
+    assert set(pins.PRODUCER_SOURCE_SHA256) == {"aut6.health"}
+    assert len(pins.PRODUCER_SOURCE_SHA256["aut6.health"]) == 64
     assert isinstance(pins.PRODUCER_SOURCE_SHA256, MappingProxyType)
     assert pins.REVOKED_SOURCE_SHA256 == frozenset()
     assert pins.ENABLED_WIDENING_KINDS == frozenset()
@@ -757,11 +760,13 @@ def test_regen_check_mode_exits_nonzero_on_drift(tmp_path: Path) -> None:
     stale = tmp_path / "closure_manifest.py"
     stale.write_text("# stale\n", encoding="utf-8")
     assert regen.main(["--check", "--target", str(stale)]) == 1
+    # No entries named: the regenerated text is the current manifest's, reproduced from the graph.
+    current = regen.render_manifest(closure_manifest.CLOSURE_MODULES)
     fresh = tmp_path / "fresh.py"
-    fresh.write_text(regen.render_manifest({}), encoding="utf-8")
+    fresh.write_text(current, encoding="utf-8")
     assert regen.main(["--check", "--target", str(fresh)]) == 0
     assert regen.main(["--target", str(stale)]) == 0  # write mode rewrites
-    assert stale.read_text(encoding="utf-8") == regen.render_manifest({})
+    assert stale.read_text(encoding="utf-8") == current
 
 
 def test_enabled_widening_kinds_subset_of_admission_implemented() -> None:

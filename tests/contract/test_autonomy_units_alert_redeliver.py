@@ -157,6 +157,7 @@ def test_deploy_units_config_lint_reports_only_the_x3_gap() -> None:
     assert [(e.unit, e.rule) for e in errors] == [
         (f"{UNIT}.service", "onfailure_scope"),
         ("breezy-autonomy-canary.service", "onfailure_scope"),
+        ("breezy-autonomy-health.service", "onfailure_scope"),  # AUT-6 WP3 S2: one reviewed row
     ]
 
 

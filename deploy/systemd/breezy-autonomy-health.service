@@ -1,0 +1,41 @@
+# AUT-6 WP3 (plan r15 sections 3.9 and 3.10): the unit health pass, every 10 minutes at :01. Read-only:
+# it makes no state-changing call. Under the shared bwrap wrapper, row breezy-autonomy-health
+# (binds evidence/unit_health, derived/verdicts, evidence/alerts and the bus-snapshot bind
+# cache/aut6_health_bus; no network, host /proc by the named E7A_R2_PROC exception).
+#
+# There is no bus inside the sandbox (E-7e(f)): the second pre line runs the row's fixed
+# `systemctl --user show|list-units|list-timers` reads UNSANDBOXED and hands the result over in
+# cache/aut6_health_bus; an in-row systemctl is expected to fail. journalctl works in-row. A failed
+# pre line never skips the main step (the `-` prefix): the main step maps a missing or stale
+# snapshot to an UNKNOWN pass. The lock file evidence/unit_health/.health.lock, the bind sources'
+# .bwrap_probe/ subdirectories and the buildside_restart/ marker directory are created by the
+# coordinator at activation.
+#
+# Bounds (E-9): TimeoutStartSec re-arms per command. Pre lines T + K = 5 and K + T = 20 (snapshot
+# budget B = 15, timeout B + 3), ExecStart K + T = 115, TimeoutStopSec=5; with AccuracySec=1s the
+# worst end is slot + 1 + 5 + 20 + 115 + 5 = slot + 146 s, so the 16:41Z pass ends by 16:43:26Z, before
+# the 16:45Z fixed point. HEALTH_PASS_BUDGET_S (90 s) is inside the 110 s timeout.
+# OnFailure target: X-3 ships the line before the notifier unit exists (WP4/WP7).
+[Unit]
+Description=Breezy AUT-6 unit health pass (every 10 minutes at :01, read-only, sandboxed)
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+MemoryMax=256M
+MemorySwapMax=0
+TimeoutStartSec=115
+TimeoutStopSec=5
+# No mount-namespace directives here (ReadWritePaths, ProtectHome, PrivateTmp, ...): systemd would
+# build a private mount namespace in which /usr/bin/bwrap cannot create its user namespace on this
+# host (AppArmor userns restriction): "bwrap: No permissions to create a new namespace", exit 1.
+# The bwrap row is the control; user-unit sandboxing is not enforced (E-7).
+# Pinned by test_bwrap_wrapped_unit_config_has_no_mount_namespace_directive.
+ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/evidence/unit_health %h/.local/share/breezy/derived/verdicts %h/.local/share/breezy/evidence/alerts %h/.local/share/breezy/cache/aut6_health_bus
+ExecStartPre=-/usr/bin/timeout -k 2 18 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap --bus-snapshot breezy-autonomy-health
+ExecStart=/usr/bin/timeout -k 5 110 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-health /home/jon/breezy/.venv/bin/python3 -I -m breezy.runtime.autonomy_health_cli
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-autonomy-health

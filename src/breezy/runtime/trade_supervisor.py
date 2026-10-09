@@ -57,6 +57,7 @@ from breezy.runtime.health import (
     log_alert_egress_status,
     resolve_alert_sink,
 )
+from breezy.runtime.process_lookup import find_pid_by_argv
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
@@ -542,26 +543,6 @@ def resolve_sending_family_id() -> str | None:
 # Process discovery and signalling. SIGTERM only -- never SIGKILL anywhere
 # in this module.
 # ---------------------------------------------------------------------------
-
-
-def find_pid_by_argv(anchor_pattern: str) -> int | None:
-    """``pgrep -f <anchor_pattern>``, anchored (trailing ``$``) by the
-    caller. Returns the first matching PID, or ``None``."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", anchor_pattern],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            return int(line)
-    return None
 
 
 def terminate(pid: int) -> None:

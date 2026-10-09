@@ -13,7 +13,12 @@ from typing import Final
 
 # --- Code identity (empty at ARCH-0: every production resolution refuses engine_code_unpinned).
 ENGINE_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
-PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType({})
+# aut6.health (P6-13, plan r15 section 3.4.1): sha256 of the import closure of
+# ``breezy.runtime.autonomy_health_cli`` (``closure_manifest``). Any change to a closure module
+# makes ``test_code_identity_pins_cover_import_closure`` fail until a reviewed commit re-pins it.
+PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
+    {"aut6.health": "0865d569468916f80781a838fe3d0c30d4aaea8be2807384ce4c04916fd90652"}
+)
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 
 # --- Widening and policy gates (AC 25).

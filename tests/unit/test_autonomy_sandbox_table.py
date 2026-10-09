@@ -89,6 +89,7 @@ def test_shipped_table_has_exactly_the_seam_b_stop_hook_and_capture_rows() -> No
         "breezy-label-outcomes",  # AUT-2 WP6 (E-15)
         "breezy-autonomy-alert-redeliver",  # AUT-6 WP1 (E-15)
         "breezy-autonomy-canary",  # AUT-6 WP2 (E-7a)
+        "breezy-autonomy-health",  # AUT-6 WP3 S2 (E-7e)
     }
     assert all(name == row.name for name, row in AUTONOMY_BWRAP_TABLE.items())
 
@@ -184,7 +185,7 @@ def test_constants_have_the_seam_b_values() -> None:
         "--user",
         "show",
         "-p",
-        "Id,Description,ExecStart,InvocationID,Result,Transient",
+        "Id,Description,ExecStart,WorkingDirectory,InvocationID,Result,Transient",
         "--",
         "run-*.service",
     )
@@ -670,7 +671,7 @@ def test_unwrapped_residual_units_disjoint_and_cited() -> None:
 
 def test_module_exposes_no_state_changing_bus_verbs() -> None:
     allowed = table_module.BUS_READ_VERBS
-    assert allowed == frozenset({"show", "list-units", "list-timers"})
+    assert allowed == frozenset({"show", "list-units", "list-timers", "list-unit-files"})
 
 
 # ------------------------------------------------------- wrapper-line-only units

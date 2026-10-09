@@ -36,6 +36,7 @@ WRITE_MECHANISMS: Final[frozenset[str]] = frozenset(
         "write_monotone",  # hwm.write_monotone, under the intent flock (7e)
         "native_stream_writer",  # AUT-1: one boot's StreamingFeatherWriter (E-7 rule 4)
         "replace_atomic",  # single_read.replace_atomic, under the owning unit's own lock
+        "append_fsync",  # AUT-6 health: fsynced O_APPEND sample line, under its own lock
     }
 )
 
@@ -235,6 +236,36 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "breezy-autonomy-canary only, after its first delivered canary record, through "
         "alert_outbox.write_armed_marker; never rewritten and never deleted by any code",
         "write_once",
+    ),
+    # AUT-6 WP3 S3 (plan r15 sections 3.9 and 3.11): the unit health pass. One writer, the
+    # breezy-autonomy-health pass (unit_health_store), under evidence/unit_health/.health.lock.
+    FileWriter(
+        "evidence/unit_health/<YYYY-MM-DD>/{<unit>__<invocation>__class,<unit>__<invocation>__action,"
+        "cursor_reset__<ts_ns>}.json",
+        "the breezy-autonomy-health pass only (unit_health_store.write_once: mkstemp, fsync, "
+        "os.link, 0444; an existing name is reused, never replaced)",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/unit_health/{cursor,heartbeat}.json, day_<YYYY-MM-DD>.json, seen/<unit>.json",
+        "the breezy-autonomy-health pass only, under .health.lock "
+        "(unit_health_store.replace_atomic: mkstemp, fsync, os.replace, 0600); the cursor is "
+        "written last",
+        "replace_atomic",
+    ),
+    # AUT-6 WP3 S4 (plan r15 section 3.9, LOW-2): the one operator-run writer in the health tree.
+    FileWriter(
+        "evidence/unit_health/buildside_restart/<YYYY-MM-DD>/<ts_ns>_<unit>.json",
+        "the build-side implementer only, by `breezy-autonomy-health --mark-buildside-restart` "
+        "immediately before a daemon restart (unit_health_daemons.write_buildside_marker: "
+        "write_once, 0444; never rewritten or deleted, no autonomy code path writes it)",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/unit_health/memavail_<YYYY-MM-DD>.jsonl",
+        "the breezy-autonomy-health pass only, under .health.lock (one fsynced O_APPEND line per "
+        "completed pass, F10)",
+        "append_fsync",
     ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",

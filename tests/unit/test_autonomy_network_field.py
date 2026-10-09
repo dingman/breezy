@@ -171,6 +171,8 @@ def test_every_row_declares_network() -> None:
         (AUTONOMY_BWRAP_TABLE["breezy-autonomy-alert-redeliver"], "egress"),
         # AUT-6 WP2 (A9): the canary row declares egress for its delivery POST
         (AUTONOMY_BWRAP_TABLE["breezy-autonomy-canary"], "egress"),
+        # AUT-6 WP3 S2 (E-7e): the health row has no network; its reads come from the bus snapshot
+        (AUTONOMY_BWRAP_TABLE["breezy-autonomy-health"], "none"),
     )
     assert {row.name for row, _ in expected} == set(AUTONOMY_BWRAP_TABLE)
     for row, value in expected:

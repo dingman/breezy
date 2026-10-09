@@ -76,6 +76,11 @@ AUT6_ENTRY_MODULES: Final[dict[str, tuple[str, ...]]] = {
         "breezy.runtime.alert_proof",
         _OUTBOX,
     ),
+    # WP3 S6: the health pass enqueues through alert_proof and the outbox (its alerts bind).
+    "breezy-autonomy-health": (
+        "breezy.runtime.alert_proof",
+        _OUTBOX,
+    ),
     "breezy-check-alerts": (
         "breezy.runtime.check_alerts_cli",
         "breezy.runtime.alert_delivery",
@@ -116,10 +121,21 @@ def test_aut6_only_the_outbox_module_holds_write_authority() -> None:
         assert row.argvs == () and row.sqlite == () and row.write_imports == frozenset(), row.module
 
 
+#: The one entry point whose write authority is wider than the alerts tree: the health pass owns
+#: its evidence tree, the verdict tree and its consumed bus snapshot (plan r15 section 3.1.1).
+_HEALTH_WRITES: Final = (
+    "evidence/unit_health/**",
+    "derived/verdicts/**",
+    _ALERTS_WRITES,
+    "cache/aut6_health_bus/",
+)
+_ENTRY_WRITES: Final[dict[str, tuple[str, ...]]] = {"breezy-autonomy-health": _HEALTH_WRITES}
+
+
 def test_aut6_closure_entry_points_with_the_outbox_have_alerts_write_authority() -> None:
     for entry, modules in AUT6_ENTRY_MODULES.items():
         row = AUT6_WRITE_AUTHORITY[entry]
-        assert row.writes == (_ALERTS_WRITES,), entry
+        assert row.writes == _ENTRY_WRITES.get(entry, (_ALERTS_WRITES,)), entry
         assert row.process_calls == (), entry
         assert {row.module for row in AUT6_WP1_ROWS} >= set(modules), entry
 

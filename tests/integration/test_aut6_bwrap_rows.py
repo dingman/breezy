@@ -4,27 +4,41 @@ Every test runs a child under real bubblewrap through ``tests.support.bwrap_harn
 ``breezy-autonomy-alert-redeliver`` row, with ``SandboxRoots`` substituted for the real home. The
 assertions observe what the child can and cannot do (E-7 rule 1), not what an argv says.
 
-This file is a member of ``BWRAP_HOST_TEST_FILES``; its 2 tests (the second parametrised over the
-1 AUT-6 row, so 2 cases) are part of ``BWRAP_HOST_EXPECTED_TESTS`` (L-12). Each later AUT-6 work
+This file is a member of ``BWRAP_HOST_TEST_FILES``; its tests (the self-probe parametrised over the
+AUT-6 rows) are part of ``BWRAP_HOST_EXPECTED_TESTS`` (L-12). Each later AUT-6 work
 package adds its row to ``AUT6_ROWS``, which widens the second test's cases.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Any, Final
 
 import pytest
 
+from breezy.runtime.autonomy_sandbox.bus_handoff import write_bus_snapshot
 from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE, SandboxRoots
-from tests.support.bwrap_harness import CHILD_ROOTS_PRELUDE, make_roots, roots_json, run_in_row
+from tests.support.bwrap_harness import (
+    CHILD_ROOTS_PRELUDE,
+    make_roots,
+    roots_json,
+    run_host_read,
+    run_in_row,
+)
 
 pytestmark = pytest.mark.bwrap_host
 
-AUT6_ROWS: Final[tuple[str, ...]] = ("breezy-autonomy-alert-redeliver", "breezy-autonomy-canary")
+HEALTH_ROW: Final = "breezy-autonomy-health"  # AUT-6 WP3 S2
+AUT6_ROWS: Final[tuple[str, ...]] = (
+    "breezy-autonomy-alert-redeliver",
+    "breezy-autonomy-canary",
+    HEALTH_ROW,
+)
 PRIVATE: Final = 0o700
 PROBE_DIR: Final = ".bwrap_probe"
 
@@ -132,3 +146,87 @@ def test_every_aut6_row_self_probe_both_directions_under_real_bwrap(
     out = _run(row, roots, PROBE_CODE, json.dumps(list(binds)))
     assert out["negative"] == {"state": "EROFS", "registry": "EROFS", "evidence": "EROFS"}
     assert out["positive"] == {rel: "ok" for rel in binds}
+
+
+_INVOCATION = "0123456789abcdef0123456789abcdef"
+
+
+class _CannedBus:
+    """What ``Popen`` returns for the unsandboxed writer: a canned answer per read, no real bus."""
+
+    def __init__(self, argv: list[str], **kwargs: Any) -> None:
+        self.pid = 4242
+        self.returncode = 0
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, f"VERB={argv[2]}\n".encode())
+        os.close(write_fd)
+        self.stdout = os.fdopen(read_fd, "rb")
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+HEALTH_READ_CODE = """
+import subprocess
+from breezy.runtime.autonomy_sandbox.bus_handoff import read_bus_snapshot
+row = sys.argv[2]
+until = sys.argv[3]
+out = {}
+try:
+    done = subprocess.run(
+        ["/usr/bin/systemctl", "--user", "show", "-p", "Id", "--", "breezy-x.service"],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"},
+    )
+    out["systemctl"] = "ok" if done.returncode == 0 else "failed"
+except OSError:
+    out["systemctl"] = "failed"
+from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE
+snap = read_bus_snapshot(AUTONOMY_BWRAP_TABLE[row], environ=os.environ, roots=roots)
+out["reads"] = {r.name: [r.rc, r.stdout] for r in snap.reads}
+journal = subprocess.run(
+    ["journalctl", "--user", "-o", "json", "-n", "5", "--until", until, "--no-pager"],
+    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+)
+out["journal_rc"] = journal.returncode
+out["journal"] = [json.loads(line) for line in journal.stdout.splitlines()]
+pid = int(sys.argv[4])
+with open(f"/proc/{pid}/status") as handle:
+    out["proc_name"] = handle.readline().split()[1]
+print(json.dumps(out))
+"""
+
+
+def test_health_reads_systemd_and_journal_inside_its_bwrap_row(roots: SandboxRoots) -> None:
+    """V-6 (E-7e form): in-row systemctl fails, the outside snapshot arrives, journalctl and
+    another process's /proc status work. Journal key order is per-process random: compare parsed."""
+    row = AUTONOMY_BWRAP_TABLE[HEALTH_ROW]
+    status = write_bus_snapshot(
+        row,
+        roots=roots,
+        environ={"INVOCATION_ID": _INVOCATION},
+        unit=f"{HEALTH_ROW}.service",
+        popen=_CannedBus,
+    )
+    assert status == 0
+    until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time() - 30))
+    outside = run_host_read(
+        ["journalctl", "--user", "-o", "json", "-n", "5", "--until", until, "--no-pager"]
+    )
+    command = [
+        sys.executable,
+        "-c",
+        CHILD_ROOTS_PRELUDE + textwrap.dedent(HEALTH_READ_CODE),
+        roots_json(roots),
+        HEALTH_ROW,
+        until,
+        str(os.getpid()),
+    ]
+    result = run_in_row(HEALTH_ROW, command, roots, env={"INVOCATION_ID": _INVOCATION})
+    assert result.returncode == 0, f"rc={result.returncode}\n{result.stderr}\n{result.stdout}"
+    report = json.loads(result.stdout)
+    assert report["systemctl"] == "failed"
+    assert report["reads"] == {read.name: [0, f"VERB={read.argv[2]}\n"] for read in row.bus_reads}
+    assert report["journal_rc"] == outside.returncode == 0
+    assert report["journal"] == [json.loads(line) for line in outside.stdout.splitlines()]
+    assert report["proc_name"]  # E7A_R2_PROC: a host pid's /proc/<pid>/status is readable
