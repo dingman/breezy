@@ -309,6 +309,17 @@ class HealthStore:
     def read_rollup(self, day: str) -> dict[str, Any] | None:
         return read_json(self.root / f"day_{day}.json")
 
+    def read_rollup_strict(self, day: str) -> dict[str, Any]:
+        """``{}`` when absent; ``StoreRecordError`` when present but unreadable, so a pass never
+        silently restarts a day's counters over a corrupt file."""
+        path = self.root / f"day_{day}.json"
+        if not path.exists():
+            return {}
+        body = read_json(path)
+        if body is None:
+            raise StoreRecordError("rollup_unreadable")
+        return body
+
     def write_rollup(self, day: str, body: Mapping[str, object]) -> None:
         replace_atomic(self.root / f"day_{day}.json", body)
 

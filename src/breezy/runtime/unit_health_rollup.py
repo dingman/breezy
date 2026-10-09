@@ -64,7 +64,7 @@ def rollup_body(
     cursor_reset: bool,
 ) -> dict[str, Any]:
     """The rollup of ``day``. Pass counters move only on the pass's own day."""
-    previous = env.store.read_rollup(day) or {}
+    previous = env.store.read_rollup_strict(day)
     names = unexplained_for_day(env.store, day, env.delivered)
     merged = sorted({*previous.get("foreign_failed", []), *(foreign if own_day else ())})
     return {

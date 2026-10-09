@@ -489,7 +489,7 @@ def test_one_persistent_blind_unit_does_not_stall_a_second_units_failure(tmp_pat
     assert h.alerts.events.count("unit_health_journal_blind") == 1
     day = h.store.read_rollup(DAY)
     assert day is not None
-    assert f"{blind}__{inv(7)}" in day["unexplained_failed_units"]["names"]
+    assert f"{blind}__blind-{inv(7)}" in day["unexplained_failed_units"]["names"]
 
 
 def test_blind_enqueue_refused_still_blocks_the_cursor(tmp_path: Path) -> None:
@@ -531,7 +531,8 @@ def test_corrupt_class_record_is_class_record_unreadable_not_an_enqueue_failure(
     assert result.pass_result == "UNKNOWN"
     assert "class_record_unreadable" in result.unknown_reasons
     assert "alert_enqueue_failed" not in result.unknown_reasons
-    assert h.alerts.payloads == []
+    assert h.alerts.events == ["class_record_unreadable"]
+    assert f"{UNIT}__{inv(1)}__class.json" in h.alerts.payloads[0].detail
     beat = store.read_heartbeat()
     assert beat is not None and beat["passes_unknown_streak"] == 1
     day = store.read_rollup(DAY)
@@ -663,3 +664,75 @@ def test_seen_history_is_bounded_by_the_named_constant(
     h.run()
     seen = h.store.read_seen(UNIT)
     assert seen is not None and seen["invocations"] == [inv(2), inv(3)]
+
+
+def test_blind_first_then_the_journal_shows_the_failure_gets_the_real_classification(
+    tmp_path: Path,
+) -> None:
+    unit = "breezy-late.service"
+    clock = FakeClock()
+    snap = live(
+        clock, units=[show_block(unit, Result="exit-code", InvocationID=inv(7))], failed=[unit]
+    )
+    h = harness(tmp_path, clock=clock, snapshot=snap)
+    assert h.run().journal_blind == (unit,)
+    assert h.alerts.events == ["unit_health_journal_blind"]
+    object.__setattr__(
+        h.env,
+        "journal",
+        FakeJournal(
+            Trace(), by_invocation={inv(7): [failure_line(unit, inv(7), "exit-code", seq=9)]}
+        ),
+    )
+    clock.advance(600)
+    result = h.run()
+    assert result.journal_blind == ()
+    assert h.alerts.events == ["unit_health_journal_blind", "unit_health_unit_failed"]
+    real = h.store.read_class(unit, inv(7))
+    assert real is not None and real["kind"] == "unit_failure"
+    assert len(h.store.finding_records_on(DAY, "unit_health_journal_blind")) == 1
+
+
+def test_unreadable_past_day_rollup_is_left_untouched_and_named(tmp_path: Path) -> None:
+    clock = FakeClock(now_ns=_at("2026-10-09", 0, 2))
+    ts_us = _at("2026-10-08", 23, 58) // 1000
+    snap = live(clock, units=[show_block(UNIT, Result="exit-code", InvocationID=inv(1))])
+    store = HealthStore(tmp_path / "unit_health")
+    store.root.mkdir(parents=True)
+    bad = store.root / "day_2026-10-08.json"
+    bad.write_text("{corrupt")
+    h = harness(
+        tmp_path,
+        clock=clock,
+        snapshot=snap,
+        store=store,
+        entries=[failure_line(UNIT, inv(1), "exit-code", ts_us=ts_us)],
+    )
+    result = h.run()
+    assert "rollup_unreadable" in result.unknown_reasons
+    assert bad.read_text() == "{corrupt"
+    today = store.read_rollup("2026-10-09")
+    assert today is not None and today["passes_completed"] + today["passes_unknown"] == 1
+
+
+def test_one_failing_day_write_does_not_skip_the_other_days(tmp_path: Path) -> None:
+    class Flaky(SpyStore):
+        def write_rollup(self, day: str, body: Any) -> None:
+            if day == "2026-10-08":
+                raise OSError(errno.ENOSPC, "no space")
+            super().write_rollup(day, body)
+
+    clock = FakeClock(now_ns=_at("2026-10-09", 0, 2))
+    ts_us = _at("2026-10-08", 23, 58) // 1000
+    snap = live(clock, units=[show_block(UNIT, Result="exit-code", InvocationID=inv(1))])
+    store = Flaky(tmp_path / "unit_health", Trace())
+    h = harness(
+        tmp_path,
+        clock=clock,
+        snapshot=snap,
+        store=store,
+        entries=[failure_line(UNIT, inv(1), "exit-code", ts_us=ts_us)],
+    )
+    result = h.run()
+    assert "rollup_write_failed" in result.unknown_reasons
+    assert store.read_rollup("2026-10-09") is not None

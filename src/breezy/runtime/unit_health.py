@@ -21,6 +21,11 @@ store error, unknown ownership and an enqueue refusal make the pass UNKNOWN: the
 heartbeat keeps its old ``ts_ns`` and nothing reads as zero failures. The health unit changes
 nothing in systemd and reads none of the trading gates (X-6).
 
+Operator step for an unreadable class record: records are 0444 and write-once and the health
+unit never repairs one. The pass pages CRITICAL ``class_record_unreadable`` naming the file
+(``<unit>__<invocation>__class.json``) and stays UNKNOWN; move that file out of
+``evidence/unit_health/<day>/``, and the next pass reclassifies the failure from the journal.
+
 Known limitation: scope is judged by unit name and, for ``run-*`` transients, by the path
 properties of the show block. A Breezy transient started with a custom ``--unit=`` name that is
 neither ``breezy-*`` nor ``run-*`` is read as foreign (listed under ``foreign_failed``), because
@@ -121,6 +126,7 @@ EVENT_UNIT_FAILED: Final = "unit_health_unit_failed"
 EVENT_FOLD_UNREADABLE: Final = "fold_unreadable"
 EVENT_CONFIG_DRIFT: Final = "unit_config_drift"
 EVENT_UNPARSEABLE: Final = "journal_entry_unparseable"
+EVENT_CLASS_UNREADABLE: Final = "class_record_unreadable"
 #: Units whose resident memory is added back to ``MemAvailable`` (section 3.10.1 item 6). S5 widens
 #: this to the studies holders and own-lock units; the node lives in the supervisor's cgroup.
 MEMORY_ADDBACK_UNITS: Final = frozenset(
@@ -274,8 +280,8 @@ class _Pass:
                     timeout_s=self.allowance(),
                 )
             except JournalError as exc:
-                # Only a genuine rejection of the stored cursor falls back; a timeout, an
-                # oversize read or any other failure stays UNKNOWN.
+                # A non-zero rc with a cursor falls back (a spurious reset is harmless: the
+                # re-read is deduped on invocation id); timeout, oversize and parse stay UNKNOWN.
                 if state.cursor is None or not exc.cursor_rejected:
                     raise
         batch = journal.failures(
@@ -346,6 +352,21 @@ class _Pass:
             "day": day,
         }
 
+    def read_class_or_page(self, unit: str, invocation: str) -> dict[str, Any] | None:
+        """The class record, or None. An unreadable one is paged (naming the file) and re-raised."""
+        try:
+            return self.store.read_class(unit, invocation)
+        except StoreRecordError:
+            name = f"{unit}__{invocation}__class.json"
+            self.commit_finding(
+                EVENT_CLASS_UNREADABLE,
+                unit,
+                f"classrec-{invocation}",
+                "CRITICAL",
+                f"class record {name} unreadable; move it out of evidence/unit_health/<day>/",
+            )
+            raise
+
     def enqueue(self, payload: AlertPayload) -> None:
         if not self.env.alert(payload):
             raise _EnqueueFailed
@@ -360,11 +381,11 @@ class _Pass:
             return
         unit, invocation = entry.unit, entry.invocation_id
         day = day_of_ns(entry.ts_us * 1000)
-        body = self.store.read_class(unit, invocation)
+        body = self.read_class_or_page(unit, invocation)
         if body is None:
             record = self.class_body(entry, block, day, owner is Ownership.UNRESOLVED)
             self.store.write_class(day, unit, invocation, record)
-            body = self.store.read_class(unit, invocation)
+            body = self.read_class_or_page(unit, invocation)
         if body is None:
             raise StoreRecordError("class_record_unreadable")
         day = str(body.get("day", day))
@@ -450,7 +471,7 @@ class _Pass:
             if not _INVOCATION_RE.fullmatch(invocation):
                 self.blind(name, f"noinv-{self.today}")
                 continue
-            if self.store.read_class(name, invocation) is not None:
+            if self.read_class_or_page(name, invocation) is not None:
                 continue
             found = self.env.journal.failures_for_invocation(invocation, timeout_s=self.allowance())
             matching = [e for e in found if e.unit == name and e.invocation_id == invocation]
@@ -465,8 +486,10 @@ class _Pass:
         """Page the blind unit once. The pass is UNKNOWN, but once the page is durably enqueued
         this unit no longer holds the cursor back from the others."""
         self.scan.blind.append(unit)
+        # Its own key namespace: the real failure's class record, when the journal later shows
+        # it, must not be shadowed by this finding.
         self.commit_finding(
-            EVENT_JOURNAL_BLIND, unit, key, "CRITICAL", f"unit={unit} journal_blind"
+            EVENT_JOURNAL_BLIND, unit, f"blind-{key}", "CRITICAL", f"unit={unit} journal_blind"
         )
 
     # ---- the pass body
@@ -587,23 +610,24 @@ def _finish(env: PassEnv, run: _Pass, unknown: bool, label: str) -> None:
         env.store.write_heartbeat(beat)
     except OSError:
         scan.reasons.append("heartbeat_write_failed")
-    try:
-        for day in rollup_days(env, run.today, scan.days):
-            own = day == run.today
+    for day in rollup_days(env, run.today, scan.days):
+        try:
             env.store.write_rollup(
                 day,
                 rollup_body(
                     env,
                     day,
-                    own_day=own,
+                    own_day=day == run.today,
                     completed=not unknown,
                     streak=beat["passes_unknown_streak"],
                     foreign=scan.foreign,
                     cursor_reset=scan.cursor_reset,
                 ),
             )
-    except OSError:
-        scan.reasons.append("rollup_write_failed")
+        except StoreRecordError as exc:
+            scan.reasons.append(exc.reason)  # the unreadable file is left untouched
+        except OSError:
+            scan.reasons.append("rollup_write_failed")
 
 
 def run_health_pass(env: PassEnv) -> PassResult:
