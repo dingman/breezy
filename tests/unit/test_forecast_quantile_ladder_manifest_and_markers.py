@@ -34,7 +34,7 @@ _EXEC_CLIENT_PATH = (
 )
 # re-pinned 2026-10-02: AMBIG-LATCH-CLEAR (resolver zero-fill clears AMBIGUOUS refusal), reviewer-approved  # noqa: E501
 # re-pinned 2026-10-09: AMBIG-LATCH-RESUME Phase B (resume method, accept-fill/no-id clears, pre-POST context, no-id resolver; hunks H1-H12 per plan r6 section 4)  # noqa: E501
-_EXEC_CLIENT_SHA256 = "e4dd8c93b2c9b883f2d138a9786fd00ce02f25b99d9b6fec95099ebbb3e80f79"
+_EXEC_CLIENT_SHA256 = "170cd55d01072c5adb95ce23dadde9c92dbe2540167e1979159dd5e8a27b6d7a"
 
 
 # ---------------------------------------------------------------------------

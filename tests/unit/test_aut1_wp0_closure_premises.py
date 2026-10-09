@@ -49,7 +49,10 @@ def test_static_walk_positive_and_negative_controls() -> None:
     walked = _adapter_modules(static_module_closure(dirty))
     # 34 since AUT-1 WP3 step 1 added ``adapters.polymarket_us.recorder_watchdog``, which
     # ``data.py`` and ``node_config.py`` import. The exact-count and fresh-process equality stand.
-    assert len(walked) == 34
+    # 35 since 2026-10-09 (AMBIG-LATCH-RESUME Phase B): the exec client imports the pure
+    # ``adapters.polymarket_us.no_id_attribution`` (diffed against base: it is the ONLY
+    # added module). The fresh-process equality below still holds.
+    assert len(walked) == 35
     imported = sorted(m for m in _fresh_process_modules(dirty) if m.startswith("breezy.adapters"))
     assert walked == imported
 

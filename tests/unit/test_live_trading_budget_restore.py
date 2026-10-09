@@ -250,8 +250,12 @@ def _functions_calling_bare_name(name: str, source: str) -> set[str]:
 
 def test_restore_live_trading_budget_is_called_from_exactly_the_terminal_zero_site() -> None:
     source = CLIENT_SOURCE_PATH.read_text(encoding="utf-8")
+    # Widened by exactly one reviewed row, 2026-10-09 (AMBIG-LATCH-RESUME Phase B,
+    # plan r6 line 776): `_resolve_no_order` restores the no-id slot, keyed
+    # `noid:<intent_id>` and idempotent per key; T33 tests it. Exact comparison kept.
     assert _functions_calling_bare_name("restore_live_trading_budget", source) == {
         "_resolve_terminal_zero",
+        "_resolve_no_order",
     }
 
 
