@@ -3776,6 +3776,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if intent_id in self._no_id_next_check_ns and now_ns < self._no_id_next_check_ns[intent_id]:
             return
         recheck_ns = now_ns + _NO_ID_RECHECK_INTERVAL_NS
+        # Set BEFORE any read: every later exit (a raise included, whether caught
+        # here or by the dispatch wrapper) is bounded to one pass per interval.
+        # Nothing above this line reads the venue.
+        self._no_id_next_check_ns[intent_id] = recheck_ns
         echo = None if context is None else context.no_id_echo
         window_start_ns = created_ns - _NO_ID_WINDOW_BACKSKEW_NS
         window_end_ns = created_ns + _NO_ID_WINDOW_FORWARD_NS

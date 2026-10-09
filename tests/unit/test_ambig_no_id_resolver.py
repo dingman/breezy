@@ -1681,3 +1681,39 @@ async def test_a_non_ambiguous_take_leaves_its_pre_post_context_row(
     assert row is not None and row.venue_order_id == ""
     assert current.intent_id not in client._ambiguous_bookings
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raiser", ["_durable_net_qty", "_no_id_trade_activity"])
+async def test_a_deterministic_raise_is_bounded_to_one_pass_per_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+    raiser: str,
+) -> None:
+    """`_durable_net_qty` raises inside the baseline block (caught in the branch);
+    `_no_id_trade_activity` raises out of the branch (caught by the dispatch wrapper)."""
+    client, _current, _cmd, _sender, _ev = await _no_id_take(tmp_path, monkeypatch)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("corrupt record (rig)")
+
+    if raiser == "_no_id_trade_activity":
+
+        async def _aboom(*_a: Any, **_k: Any) -> Any:
+            raise RuntimeError("scan exploded (rig)")
+
+        monkeypatch.setattr(PolymarketUSExecutionClient, raiser, _aboom)
+    else:
+        monkeypatch.setattr(PolymarketUSExecutionClient, raiser, _boom)
+    client.advance(305)
+    await run_passes(client, 1)
+    reads = _reads(client)
+    assert reads > 0
+    client.advance(10)
+    await run_passes(client, 1)
+    assert _reads(client) == reads, "inside 60 s: ZERO venue reads"
+    client.advance(60)
+    await run_passes(client, 1)
+    assert _reads(client) > reads, "after 60 s: re-read"
+    await client._disconnect()
