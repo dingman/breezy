@@ -290,6 +290,17 @@ RESOLVER_CONTRADICTION_ALERT_SITE: Final[str] = "global"
 
 def _resolver_contradiction_detail(alert: Mapping[str, str]) -> str:
     intent_id = alert.get("intent_id", "<unknown>")
+    if alert.get("no_id") == "true":
+        # AMBIG-LATCH-RESUME (plan r6 2.10): a no-id entry has no venue order
+        # id, no GET and no zero-fill claim. It names its closed reason token
+        # and the AUTOMATED next action -- never a hand step.
+        manual = alert.get("manual_reconcile")
+        manual_part = f" manual_reconcile={manual}" if manual else ""
+        return (
+            f"intent {intent_id} (no venue order id) stays AMBIGUOUS: "
+            f"reason={alert.get('reason', '<unknown>')}{manual_part}; "
+            f"next={alert.get('next', '<unknown>')}"
+        )
     venue_order_id = alert.get("venue_order_id", "<unknown>")
     trade_count = alert.get("trade_count", "<unknown>")
     create_fill_evidence = alert.get("create_fill_evidence", "<unknown>")
