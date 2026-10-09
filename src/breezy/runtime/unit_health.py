@@ -36,6 +36,7 @@ snapshot (``--collect``, reset, failed between the snapshot and the journal read
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -147,6 +148,7 @@ MEMORY_ADDBACK_UNITS: Final = frozenset(
 )
 #: ``systemctl show`` prints an unset ``MemoryCurrent`` as 2**64 - 1.
 _MEMORY_UNSET_FROM: Final = 2**63
+_LOG: Final = logging.getLogger(__name__)
 _INVOCATION_RE: Final = re.compile(r"[0-9a-f]{32}")
 _HOST: Final = "_host"
 _LOST_CURSOR_DAYS: Final = 2
@@ -565,6 +567,18 @@ class _Pass:
             self.process_entry(entry)
         self.reconcile()
 
+    def emit_host_verdict(self, verdict: HostVerdict) -> None:
+        """Hand ``verdict`` to the sink; a refusal is a reason, never a lost finding or a crash."""
+        sink = self.env.host_verdict
+        if sink is None:
+            return
+        try:
+            sink(verdict)
+        except Exception as exc:  # noqa: BLE001 - the finding and its page are committed after
+            _LOG.error("host_verdict_sink_failed exception_type=%s", type(exc).__name__)
+            if "host_verdict_sink_failed" not in self.scan.reasons:
+                self.scan.reasons.append("host_verdict_sink_failed")
+
     def run_extras(self, observation: UnitObservation | None) -> None:
         env = self.env
         if env.fold_probe is not None:
@@ -572,12 +586,11 @@ class _Pass:
                 env.fold_probe()
             except FoldUnreadable as exc:
                 self.scan.reasons.append("fold_unreadable")
-                if env.host_verdict is not None:
-                    env.host_verdict(
-                        HostVerdict(
-                            PRODUCER_STALE_DETECTOR, "FAIL", {"fold_reason": exc.reason}, self.now
-                        )
+                self.emit_host_verdict(
+                    HostVerdict(
+                        PRODUCER_STALE_DETECTOR, "FAIL", {"fold_reason": exc.reason}, self.now
                     )
+                )
                 self.commit_finding(
                     EVENT_FOLD_UNREADABLE,
                     _HOST,

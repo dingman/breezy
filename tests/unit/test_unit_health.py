@@ -690,6 +690,27 @@ def test_fold_unreadable_health_pass_increments_passes_unknown_streak(tmp_path: 
     assert h.alerts.events == ["fold_unreadable"]  # one direct page per day
 
 
+@pytest.mark.parametrize("failure", [OSError, ValueError, RuntimeError])
+def test_a_failing_fold_verdict_sink_is_a_reason_and_the_page_still_goes_out(
+    tmp_path: Path, failure: type[Exception]
+) -> None:
+    """A refused verdict write (a missing bind, a bad mode) must not crash the pass (S6)."""
+
+    def probe() -> None:
+        raise unit_health.FoldUnreadable("empty")
+
+    def sink(_verdict: Any) -> None:
+        raise failure("derived/verdicts is not writable")
+
+    h = harness(tmp_path, fold_probe=probe, host_verdict=sink)
+    result = h.run()
+    assert result.pass_result == "UNKNOWN"
+    assert set(result.unknown_reasons) >= {"fold_unreadable", "host_verdict_sink_failed"}
+    assert h.alerts.events == ["fold_unreadable"]
+    beat = h.store.read_heartbeat()
+    assert beat is not None and beat["pass_result"] == "UNKNOWN"
+
+
 # --------------------------------------------------------------------------- budget (F6)
 
 
