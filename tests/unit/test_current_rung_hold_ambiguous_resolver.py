@@ -1305,11 +1305,16 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
 
         _, remaining = live_trading_budget_remaining(client._permit)
         assert remaining == 1  # true-up to the SAME cost as booked -- no change
-        assert client.trading_refusals == refusals_before, (
+        assert submit_chain.AMBIGUOUS_REASON in refusals_before, (
+            "non-vacuity: the initial AMBIGUOUS submit's own refusal was present "
+            "before the resolver ran"
+        )
+        assert client.trading_refusals == tuple(
+            reason for reason in refusals_before if reason != submit_chain.AMBIGUOUS_REASON
+        ), (
             "fee_reconciled=False must be a durable flag on the record, "
-            "never a NEW latched trading refusal (the initial AMBIGUOUS "
-            "submit's own refusal, captured before the resolver ran, is "
-            "unrelated and expected to still be present)"
+            "never a NEW latched trading refusal; the only change is the "
+            "AMBIGUOUS refusal cleared on fill retirement (2026-10-03)"
         )
         await client._disconnect()
 

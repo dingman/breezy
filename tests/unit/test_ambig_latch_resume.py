@@ -19,6 +19,7 @@ import ast
 import inspect
 import sqlite3
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +96,11 @@ class _StateSpy:
 
 
 async def _armed_with_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, start: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    start: bool = True,
+    before_submit: Callable[[TimedClient], None] | None = None,
 ) -> tuple[TimedClient, Any, Any, str]:
     """One with-id AMBIGUOUS intent on a started client; context aged past the
     zero-fill floor. Returns (client, sender, latch_cm, intent_id)."""
@@ -103,11 +108,40 @@ async def _armed_with_id(
     client, _events, _permit, latch_cm = await build_client(
         tmp_path, monkeypatch, sender=sender, start=start
     )
+    if before_submit is not None:
+        before_submit(client)
     await client._submit_order(make_command(client))
+    client.latch_cm = latch_cm  # keep the flock held (dropping it GCs the generator)
     current = client._latch.current_open()
     assert current is not None
     _backdate_resolver_context(client, current.intent_id)
     return client, sender, latch_cm, current.intent_id
+
+
+def _watch_degraded(client: Any, sink: Any) -> Any:
+    return install_component_degraded_alert(
+        client._msgbus,
+        component_id=str(client.id),
+        reasons=lambda: client.trading_refusals,
+        sink=sink,
+        ambiguous_reason=AMBIGUOUS,
+        ambiguous_clears=lambda: client.ambiguous_refusal_clears,
+    )
+
+
+async def _armed_watched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[TimedClient, _Sink, Any]:
+    """Like ``_armed_with_id`` but with the degraded alert installed BEFORE the
+    AMBIGUOUS submit, so episode 1 is a real transition the alert sees."""
+    sink = _Sink()
+    handlers: list[Any] = []
+    client, _s, _cm, _i = await _armed_with_id(
+        tmp_path,
+        monkeypatch,
+        before_submit=lambda c: handlers.append(_watch_degraded(c, sink)),
+    )
+    return client, sink, handlers[0]
 
 
 def _terminal_zero_evidence(client: Any) -> None:
@@ -131,7 +165,11 @@ def _fill_evidence(client: Any) -> None:
 
 def _clear_like_the_resolver(client: Any) -> None:
     """What the inline clear block does to the client's own state (used where
-    the test needs a clear without running a whole resolver pass)."""
+    the test needs a clear without running a whole resolver pass). The resolver
+    retires the singleton first, so an OPEN intent is retired here too."""
+    current = client._latch.current_open()
+    if current is not None:
+        client._retire(current.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", 1)
     client._trading_refusals = [r for r in client._trading_refusals if r.reason != AMBIGUOUS]
     client._ambiguous_refusal_clears += 1
 
@@ -551,8 +589,7 @@ async def test_after_an_accept_fill_clear_a_take_reaches_the_sender(
     sender.response = type(sender.response)(
         status=200, headers={}, body=_ambiguous_create_body("ord-2")
     )
-    denied: list[Any] = []
-    client._msgbus.subscribe(topic="*", handler=lambda e: denied.append(e))
+    denied = client.order_events
 
     await client._submit_order(make_command(client))
 
@@ -579,8 +616,7 @@ async def test_resume_leaves_order_admission_unchanged_while_the_permit_is_inval
     assert client.is_degraded
     client._permit = None
     calls = len(sender.calls)
-    events: list[Any] = []
-    client._msgbus.subscribe(topic="*", handler=events.append)
+    events = client.order_events
 
     await client._submit_order(make_command(client))
     before = [e.reason for e in events if isinstance(e, OrderDenied)]
@@ -621,16 +657,7 @@ async def test_a_refusal_during_resuming_ends_degraded_and_re_alerts(
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
-    client, _sender, _cm, _intent = await _armed_with_id(tmp_path, monkeypatch)
-    sink = _Sink()
-    install_component_degraded_alert(
-        client._msgbus,
-        component_id=str(client.id),
-        reasons=lambda: client.trading_refusals,
-        sink=sink,
-        ambiguous_reason=AMBIGUOUS,
-        ambiguous_clears=lambda: client.ambiguous_refusal_clears,
-    )
+    client, sink, _handler = await _armed_watched(tmp_path, monkeypatch)
     _terminal_zero_evidence(client)
     await run_passes(client, 1)
     spy = _StateSpy(client)
@@ -669,16 +696,7 @@ async def test_a_refusal_after_resume_re_degrades_and_re_alerts_subject_to_the_t
     caplog: pytest.LogCaptureFixture,
     gate_env: None,  # noqa: F811
 ) -> None:
-    client, _sender, _cm, _intent = await _armed_with_id(tmp_path, monkeypatch)
-    sink = _Sink()
-    install_component_degraded_alert(
-        client._msgbus,
-        component_id=str(client.id),
-        reasons=lambda: client.trading_refusals,
-        sink=sink,
-        ambiguous_reason=AMBIGUOUS,
-        ambiguous_clears=lambda: client.ambiguous_refusal_clears,
-    )
+    client, sink, _handler = await _armed_watched(tmp_path, monkeypatch)
     assert len(sink.payloads) == 1  # episode 1 (AMBIGUOUS, a transition)
     caplog.set_level("WARNING")
 
@@ -714,21 +732,9 @@ async def test_a_second_ambiguous_inside_the_resume_window_refuses_resume_and_al
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
-    def _watch(client: Any, sink: _Sink) -> Any:
-        return install_component_degraded_alert(
-            client._msgbus,
-            component_id=str(client.id),
-            reasons=lambda: client.trading_refusals,
-            sink=sink,
-            ambiguous_reason=AMBIGUOUS,
-            ambiguous_clears=lambda: client.ambiguous_refusal_clears,
-        )
-
     # (a) the second AMBIGUOUS lands while still DEGRADED (clear done, no resume):
     (tmp_path / "a").mkdir()
-    client, _s, _cm, _i = await _armed_with_id(tmp_path / "a", monkeypatch)
-    sink_a = _Sink()
-    handler_a = _watch(client, sink_a)
+    client, sink_a, handler_a = await _armed_watched(tmp_path / "a", monkeypatch)
     assert len(sink_a.payloads) == 1
     _clear_like_the_resolver(client)
     client._refuse(AMBIGUOUS)  # no transition: already DEGRADED
@@ -747,16 +753,7 @@ async def test_a_second_ambiguous_after_resume_alerts_by_transition_and_then_res
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
-    client, _s, _cm, _i = await _armed_with_id(tmp_path, monkeypatch)
-    sink = _Sink()
-    handler = install_component_degraded_alert(
-        client._msgbus,
-        component_id=str(client.id),
-        reasons=lambda: client.trading_refusals,
-        sink=sink,
-        ambiguous_reason=AMBIGUOUS,
-        ambiguous_clears=lambda: client.ambiguous_refusal_clears,
-    )
+    client, sink, handler = await _armed_watched(tmp_path, monkeypatch)
     _clear_like_the_resolver(client)
     assert client.resume_if_refusals_cleared() is True
     client._refuse(AMBIGUOUS)  # a transition this time
@@ -775,16 +772,7 @@ async def test_two_ambiguous_episodes_added_and_cleared_between_ticks_each_alert
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
-    client, _s, _cm, _i = await _armed_with_id(tmp_path, monkeypatch)
-    sink = _Sink()
-    handler = install_component_degraded_alert(
-        client._msgbus,
-        component_id=str(client.id),
-        reasons=lambda: client.trading_refusals,
-        sink=sink,
-        ambiguous_reason=AMBIGUOUS,
-        ambiguous_clears=lambda: client.ambiguous_refusal_clears,
-    )
+    client, sink, handler = await _armed_watched(tmp_path, monkeypatch)
     assert len(sink.payloads) == 1
     _clear_like_the_resolver(client)  # episode 1 cleared (counter 1)
     client._refuse(AMBIGUOUS)  # episode 2 added while DEGRADED ...

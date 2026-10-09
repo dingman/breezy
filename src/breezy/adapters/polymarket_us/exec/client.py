@@ -174,8 +174,9 @@ FIVE INVARIANTS, EACH WITH ITS OWN VERIFIED CITATION
    fixed, not a disconnect/reconnect cycle within one running process
    (``self._trading_refusals``, appended-only). Only a full process
    RESTART re-derives the refusal set from scratch, by reconciling again.
-   Sole carve-out: resolver-retired terminal zero-fill clears the AMBIGUOUS
-   refusal only (2026-10-02).
+   Sole carve-out: resolver-retired terminal zero-fill, accept-fill or no-id
+   no-fill clears the AMBIGUOUS refusal only (2026-10-02; accept-fill and
+   no-id 2026-10-03).
    Pinned by
    ``tests/unit/test_polymarket_us_exec_client.py::test_a_latched_refusal_persists_across_a_reconnect_after_the_condition_clears``.
 2. **Native PnL and native cash are NON-AUTHORITATIVE while a position is
@@ -1695,6 +1696,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._store: ClosableStateStore | None = None
         self._store_thread: int | None = None
         self._trading_refusals: list[ClassifiedRefusal] = []
+        # AMBIG-LATCH-RESUME: how many AMBIGUOUS refusals a resolver clear has
+        # removed (F6), the intent whose create POST is awaited in THIS
+        # process, the per-intent "complete negative pass seen" stamp, and the
+        # per-intent next no-id re-check time.
+        self._ambiguous_refusal_clears: int = 0
+        self._post_in_flight_intent_id: str | None = None
+        self._resolved_no_id_ts_ns: dict[str, int] = {}
+        self._no_id_next_check_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
         self._order_sender = order_sender
         self._write_signer = write_signer
@@ -1903,6 +1912,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         this property reads reason strings, and none of them move.
         """
         return tuple(refusal.reason for refusal in self._trading_refusals)
+
+    @property
+    def ambiguous_refusal_clears(self) -> int:
+        """How many AMBIGUOUS trading refusals a resolver retirement has
+        cleared (F6). Read by the degraded alert so an episode added and
+        cleared between two re-poll ticks is still counted."""
+        return self._ambiguous_refusal_clears
 
     @property
     def resolver_error_count(self) -> int:
@@ -3105,6 +3121,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             ]
             if len(kept_refusals) != len(self._trading_refusals):
                 self._trading_refusals = kept_refusals
+                self._ambiguous_refusal_clears += 1
                 self._log.info(
                     f"resolver: cleared the AMBIGUOUS trading refusal "
                     f"({submit_chain.AMBIGUOUS_REASON!r}) on retirement of "
@@ -3315,6 +3332,29 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             liquidity_side=LiquiditySide.TAKER,
             ts_event=now_ns,
         )
+        # 2026-10-03 (A3): the AMBIGUOUS refusal `_refuse` appended at create
+        # time has no subject left once this GET-confirmed fill retirement
+        # has recorded the fill, trued up the booking, closed the singleton
+        # and emitted the fill. LAST statement: any raise above keeps the
+        # refusal (the conservative direction). The cross-session early
+        # return above never reaches here by design: AMBIGUOUS_REASON has
+        # only `_submit_order` producers, so an entry exists only in the
+        # submitting process. Inline (not a helper) so the resolver callee
+        # set is unchanged. Every other reason stays.
+        if self._latch.current_open() is None:
+            kept_refusals = [
+                refusal
+                for refusal in self._trading_refusals
+                if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            ]
+            if len(kept_refusals) != len(self._trading_refusals):
+                self._trading_refusals = kept_refusals
+                self._ambiguous_refusal_clears += 1
+                self._log.info(
+                    f"resolver: cleared the AMBIGUOUS trading refusal "
+                    f"({submit_chain.AMBIGUOUS_REASON!r}) on fill retirement of "
+                    f"intent {context.intent_id}"
+                )
 
     async def _order_trade_activity(
         self, venue_order_id: str, created_ns: int
@@ -5974,6 +6014,40 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._log.error(f"Trading refused: {reason}")
         if not was_already_degraded:
             self.degrade()
+
+    def resume_if_refusals_cleared(self) -> bool:
+        """Resume from DEGRADED once no refusal and no open submit intent remain.
+
+        Returns True iff the call ends with the client RUNNING. Synchronous,
+        no ``await``, and its callees are exactly ``self._latch.is_latched``,
+        ``self.resume``, ``self.degrade``, ``self._log.info`` and
+        ``self._log.warning``: the native ``_resume`` / ``_degrade`` actions are
+        no-ops, so this changes a health indicator and sends nothing. RUNNING
+        never gates sending (see ``_submit_order``'s refusal check, the permit,
+        the latch and the operator caps).
+        """
+        if not self.is_degraded:
+            return False
+        if self._trading_refusals:
+            return False
+        if self._latch is None:
+            return False
+        try:
+            latched = self._latch.is_latched()
+        except Exception as exc:  # noqa: BLE001 - an unreadable latch must only skip the resume
+            self._log.warning(
+                f"health: resume skipped, latch unreadable ({exc.__class__.__name__})"
+            )
+            return False
+        if latched:
+            return False
+        self.resume()
+        if self._trading_refusals and not self.is_degraded:
+            self._log.warning("health: a refusal landed during RESUMING; re-degrading")
+            self.degrade()
+            return False
+        self._log.info("health: resumed from DEGRADED (no refusals, no open submit intent)")
+        return True
 
     def __repr__(self) -> str:
         return (

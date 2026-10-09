@@ -165,6 +165,8 @@ class TimedClient(PolymarketUSExecutionClient):  # type: ignore[misc]
     """
 
     admitted: bool | None = None
+    order_events: list[Any]
+    latch_cm: Any
 
     def __init__(self, **kwargs: Any) -> None:
         if type(self).admitted is not None:
@@ -282,6 +284,7 @@ async def build_client(
     if start:
         client.start()
     assert isinstance(client, TimedClient)
+    client.order_events = order_events
     return client, order_events, permit, latch_cm
 
 
