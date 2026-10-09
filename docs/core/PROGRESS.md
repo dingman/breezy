@@ -74,7 +74,7 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
-| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1 merged bd32de69; WP3b+WP5 staged (waves 1/2); WP2, WP3, WP9 next |
+| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1/WP3b/WP5 merged+live; WP2 canary LIVE 10-08 (absence rule BLOCKED-EXTERNAL: needs operator dead-man endpoint, ruling r3); WP3 S1 merged, S2-S3 built, S4 building, S5-S6 next; WP9 after |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
 | 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
@@ -89,7 +89,6 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 |---|---|---|---|
 | CF-12-STAGE | LOW | READY `BP/CF-12-STAGE_plan_r1.1_delta_2026-10-08.md`; build after waves 1/2 merge | CF-12 |
 | CF-12-W3 | LOW | needs r5 re-plan after STAGE + WP3b | CF-12 |
-| DEFER-STREAK-LOAD | LOW | built 71bdc124, staged in wave 1 | CF-12 |
 | SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
 ### RUN / ANALYSE
@@ -97,13 +96,13 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 |---|---|
 | AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
 | AUD-10b | Blocked on ING-3 |
-| F13 backfills | PFM 1008bc unit (ETA 10-09 ~04:30Z) → GFS MOS archive → `source_breaks`; smoke build waits C1 freeze ≥10-21 |
+| F13 freeze prep | PFM history + GFS MOS 2021-25 + 2026H1 DONE 10-09; `source_breaks` PROPOSAL `F13-source-breaks-proposal_2026-10-09.md`; draft build + freeze ≥10-21 |
 
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | READY r6.1 + amendments R1–R15; build after SUP-RESTART activated |
-| SUP-RESTART-ANYTIME | built bb5f4c24 (fixes the hourly false permit_absent CRITICAL), staged wave 2; activation = supervisor restart 01:00–16:40Z |
+| AMBIG-LATCH-RESUME | READY r6.1 + amendments R1–R15; build after the SUP-RESTART D2.4 proof |
+| SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
 ### Comment backlog (R0.1)
