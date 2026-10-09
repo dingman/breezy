@@ -346,6 +346,9 @@ class AlertDetail(str, Enum):
     #: decode marker; any stale marker was discarded, so a node fails closed on
     #: the new retirement reason until the next supervisor start.
     DECODE_MARKER_WRITE_FAILED = "decode_marker_write_failed"
+    #: [SELF-CHECK-ORDERS-OFF] A permit was issued while the supervisor's own
+    #: ``BREEZY_ORDERS_ENABLED`` is not ``"1"`` -- env/node drift.
+    SELF_CHECK_FAIL_ORDERS_ENV_MISMATCH = "self_check_fail_orders_env_mismatch"
 
 
 class StopPriorAction(str, Enum):
@@ -397,6 +400,10 @@ class SelfCheckResult(str, Enum):
     #: without a log, so this PASSes on flock+liveness evidence alone
     #: rather than reporting a false FAIL for a healthy node.
     PASS_ADOPTED_LOG_UNKNOWN = "PASS_ADOPTED_LOG_UNKNOWN"
+    #: [SELF-CHECK-ORDERS-OFF] The node's "orders not requested" marker AND
+    #: the supervisor's own ``BREEZY_ORDERS_ENABLED == "0"`` agree: no permit
+    #: is expected, so its absence is the verified healthy state.
+    PASS_ORDERS_NOT_REQUESTED = "PASS_ORDERS_NOT_REQUESTED"
     FAIL_NODE_NOT_READY = "FAIL_NODE_NOT_READY"
     FAIL_SHADOW_MODE_NO_PERMIT = "FAIL_SHADOW_MODE_NO_PERMIT"
     #: [A-1 follow-up, 2026-09-25] See ``AlertDetail.SELF_CHECK_FAIL_
@@ -412,6 +419,18 @@ class SelfCheckResult(str, Enum):
     FAIL_CONTINUOUS_PHASE0_FORBIDDEN = "FAIL_CONTINUOUS_PHASE0_FORBIDDEN"
     FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID = "FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID"
     FAIL_CONTINUOUS_FAMILY_HALTED = "FAIL_CONTINUOUS_FAMILY_HALTED"
+    #: [SELF-CHECK-ORDERS-OFF] See ``AlertDetail.SELF_CHECK_FAIL_ORDERS_ENV_MISMATCH``.
+    FAIL_ORDERS_ENV_MISMATCH = "FAIL_ORDERS_ENV_MISMATCH"
+
+
+class OrdersEnv(str, Enum):
+    """[SELF-CHECK-ORDERS-OFF] The supervisor's own ``BREEZY_ORDERS_ENABLED``
+    as a tri-state. Only the exact token ``"0"`` is ``OFF``; unset, blank or
+    any other value is ``UNKNOWN`` and never counts as off (fail closed)."""
+
+    ON = "on"
+    OFF = "off"
+    UNKNOWN = "unknown"
 
 
 #: Every FAIL member maps to a fixed alert detail; PASS emits no alert.
@@ -434,6 +453,7 @@ SELF_CHECK_ALERT_DETAIL: Final[dict[SelfCheckResult, AlertDetail]] = {
     SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED: (
         AlertDetail.SELF_CHECK_FAIL_CONTINUOUS_FAMILY_HALTED
     ),
+    SelfCheckResult.FAIL_ORDERS_ENV_MISMATCH: AlertDetail.SELF_CHECK_FAIL_ORDERS_ENV_MISMATCH,
 }
 
 
@@ -680,6 +700,8 @@ def self_check(
     log_available: bool = True,
     continuous_check: ContinuousFamilyCheck | None = None,
     permit_expiry_at_daily_ceiling: bool = False,
+    orders_not_requested_seen: bool = False,
+    orders_env: OrdersEnv = OrdersEnv.ON,
 ) -> SelfCheckResult:
     """[B4/E3/D2] The 17:05 UTC self-check. Exactly one PASS/FAIL result.
 
@@ -714,6 +736,18 @@ def self_check(
     permit WAS issued and A-1's clamp is working as designed, not a
     genuine refusal. Still alerts (see ``SELF_CHECK_ALERT_DETAIL``), never
     silenced.
+
+    [SELF-CHECK-ORDERS-OFF] ``orders_not_requested_seen`` (the node's own
+    "permit not minted: orders not requested" marker, latched-or-live) and
+    ``orders_env`` (the supervisor's OWN ``BREEZY_ORDERS_ENABLED`` as a
+    tri-state) default to values that keep every existing caller byte-
+    identical. A missing permit is expected -- and the self-check PASSes as
+    ``PASS_ORDERS_NOT_REQUESTED`` -- ONLY when both independent sources
+    agree orders are off AND no permit was issued. A permit issued while the
+    env is not ``ON`` is ``FAIL_ORDERS_ENV_MISMATCH``. Under that agreed
+    state only the family-halt check is skipped (the halt exists to stop
+    sending; orders-off is a strictly stronger no-send state); phase0 and
+    startup-evidence integrity are still checked.
     """
     if not child_alive:
         return SelfCheckResult.FAIL_CHILD_EXITED
@@ -725,7 +759,14 @@ def self_check(
         return SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN
     if not strategy_subscribed:
         return SelfCheckResult.FAIL_NODE_NOT_READY
-    if not (permit_issued and permit_expiry_valid):
+    if permit_issued and orders_env is not OrdersEnv.ON:
+        return SelfCheckResult.FAIL_ORDERS_ENV_MISMATCH
+    expected_no_permit = orders_expected_off(
+        orders_not_requested_seen=orders_not_requested_seen,
+        orders_env=orders_env,
+        permit_issued=permit_issued,
+    )
+    if not expected_no_permit and not (permit_issued and permit_expiry_valid):
         if permit_issued and permit_expiry_at_daily_ceiling:
             return SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
         return SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
@@ -734,9 +775,20 @@ def self_check(
             return SelfCheckResult.FAIL_CONTINUOUS_PHASE0_FORBIDDEN
         if not continuous_check.startup_evidence_valid:
             return SelfCheckResult.FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID
-        if not continuous_check.family_not_halted:
+        if not expected_no_permit and not continuous_check.family_not_halted:
             return SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED
+    if expected_no_permit:
+        return SelfCheckResult.PASS_ORDERS_NOT_REQUESTED
     return SelfCheckResult.PASS
+
+
+def orders_expected_off(
+    *, orders_not_requested_seen: bool, orders_env: OrdersEnv, permit_issued: bool
+) -> bool:
+    """[SELF-CHECK-ORDERS-OFF D1] "No permit expected": the node's marker AND
+    the supervisor's own env token ``"0"`` agree, and no permit was issued.
+    ``UNKNOWN`` never counts as off (fail closed)."""
+    return orders_not_requested_seen and orders_env is OrdersEnv.OFF and not permit_issued
 
 
 _PERMIT_ISSUED_RE: Final[re.Pattern[str]] = re.compile(
@@ -796,7 +848,11 @@ SELF_CHECK_ESCALATION_STORE_KEY: Final[str] = "runtime:supervisor:self_check_esc
 #: without importing it (this module owns zero I/O and never imports the
 #: shell it is imported BY).
 _PASS_RESULT_VALUES: Final[frozenset[str]] = frozenset(
-    {SelfCheckResult.PASS.value, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN.value}
+    {
+        SelfCheckResult.PASS.value,
+        SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN.value,
+        SelfCheckResult.PASS_ORDERS_NOT_REQUESTED.value,
+    }
 )
 
 
@@ -1963,7 +2019,11 @@ _RELAUNCH_POLL_INTERVAL_S: Final[float] = 15.0
 
 #: Self-check results that are a PASS of some kind -- never alerted on.
 _SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
-    {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
+    {
+        SelfCheckResult.PASS,
+        SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN,
+        SelfCheckResult.PASS_ORDERS_NOT_REQUESTED,
+    }
 )
 
 #: [B1/D5] The self-check FAIL results that are specifically about the
@@ -1973,6 +2033,7 @@ _PERMIT_FAIL_SELF_CHECK_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
     {
         SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT,
         SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING,
+        SelfCheckResult.FAIL_ORDERS_ENV_MISMATCH,
     }
 )
 
@@ -2008,6 +2069,9 @@ class SelfCheckFacts:
     permit_issued: bool
     permit_expiry_valid: bool
     permit_expiry_at_daily_ceiling: bool
+    #: [SELF-CHECK-ORDERS-OFF] The node's orders-not-requested marker, latched
+    #: (survives the offset-draining reader) or live when stateless.
+    orders_not_requested_seen: bool
 
 
 def derive_self_check_facts(
@@ -2030,6 +2094,7 @@ def derive_self_check_facts(
             permit_issued=permit_issued_live,
             permit_expiry_valid=permit_expiry_valid(log_text, now_ns=now_ns),
             permit_expiry_at_daily_ceiling=False,
+            orders_not_requested_seen=PERMIT_NOT_REQUESTED_MARKER in log_text,
         )
     if strategy_subscribed_live and not state.strategy_subscribed_seen:
         state = record_strategy_subscribed_seen(state, now)
@@ -2073,6 +2138,7 @@ def derive_self_check_facts(
         permit_issued=permit_issued,
         permit_expiry_valid=expiry_valid,
         permit_expiry_at_daily_ceiling=at_ceiling,
+        orders_not_requested_seen=state.orders_not_requested_seen,
     )
 
 
@@ -2083,9 +2149,17 @@ def self_check_log_fields(
     continuous_family_halt_source: str | None,
     load_outcome: EscalationLoadOutcome,
     gap_hours: float | None,
+    orders_env: OrdersEnv | None = None,
+    family_halt_check_skipped: bool = False,
 ) -> dict[str, int | str]:
-    """The fields of the single ``self_check`` decision-log line."""
+    """The fields of the single ``self_check`` decision-log line.
+
+    [SELF-CHECK-ORDERS-OFF A3] ``orders_env`` (the tri-state, never the raw
+    value) is logged when supplied; ``family_halt_check`` says whether the
+    family-halt check ran, next to the unchanged halt fields."""
     fields: dict[str, int | str] = {"result": result.value}
+    if orders_env is not None:
+        fields["orders_env"] = orders_env.value
     if continuous_check is not None:
         fields.update(
             continuous_phase0_clean=continuous_check.phase0_clean,
@@ -2093,6 +2167,8 @@ def self_check_log_fields(
             continuous_family_not_halted=continuous_check.family_not_halted,
             continuous_family_halt_source=continuous_family_halt_source or "unknown",
         )
+        if orders_env is not None:
+            fields["family_halt_check"] = "skipped" if family_halt_check_skipped else "checked"
     if load_outcome is EscalationLoadOutcome.ABSENT:
         # The only outcome permitted to be silent.
         fields["escalation_state"] = "absent"

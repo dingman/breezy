@@ -397,6 +397,9 @@ CLEAN: Final[tuple[str, ...]] = (
 #: `type: ignore` comments removed -- src/breezy/analysis 13->3 (-10),
 #: scripts/analysis 359->351 (-8), tests/contract 11->7 (-4),
 #: tests/unit 1451->1288 (-163).
+#: SELF-CHECK-ORDERS-OFF (2026-10-09): the new defaulted `SupervisorPorts.orders_env`
+#: field would add one `**base` arg-type error per fake-port helper; the two helpers
+#: now carry the ct14-precedent `type: ignore[arg-type]`; tests/unit 1288->1258 (-30).
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 3,
     "scripts/analysis": 351,
@@ -406,7 +409,7 @@ CEILINGS: Final[dict[str, int]] = {
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1288,
+    "tests/unit": 1258,
 }
 
 

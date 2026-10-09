@@ -63,7 +63,7 @@ from breezy.runtime.health import (
     resolve_alert_sink,
 )
 from breezy.runtime.process_lookup import find_pid_by_argv
-from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
+from breezy.runtime.settings import ORDERS_ENABLED_VAR, SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
 from breezy.runtime.submit_intent import (
@@ -109,6 +109,7 @@ from breezy.runtime.trade_supervisor_core import (
     MiddayDeadAction,
     MiddayRecheckAction,
     OpenIntentShape,
+    OrdersEnv,
     PermitAlertAction,
     PermitAlertDecision,
     PermitCapability,
@@ -154,6 +155,7 @@ from breezy.runtime.trade_supervisor_core import (
     midday_watch_window_end,
     next_due,
     node_log_spawned_at,
+    orders_expected_off,
     parse_permit_expiry_ns,
     permit_capability_valid,
     permit_expiry_valid,  # noqa: F401 - re-exported: moved/used via this module's namespace
@@ -601,6 +603,19 @@ def resolve_sending_family_id() -> str | None:
     if raw is None or not raw.strip():
         return None
     return raw
+
+
+def resolve_orders_env() -> OrdersEnv:
+    """[SELF-CHECK-ORDERS-OFF] The supervisor's OWN :data:`ORDERS_ENABLED_VAR`
+    as a tri-state: exactly ``"1"`` is ``ON``, exactly ``"0"`` is ``OFF``,
+    anything else (unset, blank, ``" 0"``, ``"yes"``) is ``UNKNOWN`` and never
+    counts as off. Read-only; the value is never logged."""
+    raw = os.environ.get(ORDERS_ENABLED_VAR)
+    if raw == "1":
+        return OrdersEnv.ON
+    if raw == "0":
+        return OrdersEnv.OFF
+    return OrdersEnv.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1179,9 @@ class SupervisorPorts:
     send_alert_durable: Callable[..., bool] = field(
         default=lambda sink, payload: _emit_durable_assumed(sink, payload)
     )
+    #: [SELF-CHECK-ORDERS-OFF] The supervisor's own orders-enabled tri-state.
+    #: Default ``ON`` keeps every fake port set on the legacy FAIL behaviour.
+    orders_env: Callable[[], OrdersEnv] = field(default=lambda: OrdersEnv.ON)
 
 
 def _boot_alert_sink() -> AlertSink:
@@ -1199,6 +1217,7 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         probe_open_intent_resolvable=probe_open_intent_resolvable,
         probe_open_intent_with_id=probe_open_intent_is_with_id,
         send_alert_durable=durable_alert_send,
+        orders_env=resolve_orders_env,
     )
 
 
@@ -2765,6 +2784,7 @@ def _do_self_check(
             launch_ns=launch_time_ns(launch_day),
         )
 
+    orders_env = ports.orders_env()
     result = self_check(
         child_alive=child_alive,
         flock_holder_count=holder_count,
@@ -2775,6 +2795,8 @@ def _do_self_check(
         log_available=node_log is not None,
         continuous_check=continuous_check,
         permit_expiry_at_daily_ceiling=facts.permit_expiry_at_daily_ceiling,
+        orders_not_requested_seen=facts.orders_not_requested_seen,
+        orders_env=orders_env,
     )
     # [B1/D5] A permit-specific FAIL seeds B1's own heartbeat timer so its
     # first CRITICAL for the SAME underlying fault waits for the heartbeat
@@ -2801,6 +2823,12 @@ def _do_self_check(
             continuous_family_halt_source=continuous_family_halt_source,
             load_outcome=load_outcome,
             gap_hours=gap_hours,
+            orders_env=orders_env,
+            family_halt_check_skipped=orders_expected_off(
+                orders_not_requested_seen=facts.orders_not_requested_seen,
+                orders_env=orders_env,
+                permit_issued=facts.permit_issued,
+            ),
         ),
     )
 

@@ -29,9 +29,14 @@ from breezy.runtime.trade_supervisor_core import (
     NODE_LOG_NAME_RE,
     PERMIT_ALERT_HEARTBEAT,
     PERMIT_DEFERRED_MAX,
+    PERMIT_NOT_REQUESTED_MARKER,
     READY_ADOPTION_ALERT_EVENT,
+    SELF_CHECK_ALERT_DETAIL,
     AlertDetail,
+    ContinuousFamilyCheck,
     DaySchedulerState,
+    EscalationLoadOutcome,
+    OrdersEnv,
     PermitAlertAction,
     PermitCapability,
     ReadyAdoptionVerdict,
@@ -41,6 +46,7 @@ from breezy.runtime.trade_supervisor_core import (
     decide_ready_adoption,
     decide_ready_adoption_alert,
     decode_self_check_escalation_state,
+    derive_self_check_facts,
     encode_self_check_escalation_state,
     escalated_self_check_severity,
     initial_scheduler_state,
@@ -60,6 +66,8 @@ from breezy.runtime.trade_supervisor_core import (
     record_self_check_result,
     record_strategy_subscribed_seen,
     reset_ready_adoption_deferral,
+    self_check,
+    self_check_result_alert,
 )
 
 _DAY = dt.date(2026, 9, 25)
@@ -641,11 +649,15 @@ class TestLatchLogFactsParity:
         from breezy.runtime.trade_supervisor_core import PERMIT_NOT_REQUESTED_MARKER
 
         log_text = (
-            "trading node failed\n"
-            f"live-trading permit issued issued_at_ns=1 expires_at_ns={_FAR_FUTURE_NS} "
-            "ttl_s=1\n"
-            "CurrentRungHoldStrategy subscribed X\n"
-        ) + PERMIT_NOT_REQUESTED_MARKER + "\n"
+            (
+                "trading node failed\n"
+                f"live-trading permit issued issued_at_ns=1 expires_at_ns={_FAR_FUTURE_NS} "
+                "ttl_s=1\n"
+                "CurrentRungHoldStrategy subscribed X\n"
+            )
+            + PERMIT_NOT_REQUESTED_MARKER
+            + "\n"
+        )
         state = initial_scheduler_state(_DAY)
 
         drained = latch_log_facts(state, _utc(20, 0), log_text)
@@ -676,12 +688,8 @@ class TestLatchLogFactsParity:
             inline = record_orders_not_requested_seen(inline, _utc(20, 0))
 
         assert drained.strategy_subscribed_seen == inline.strategy_subscribed_seen
-        assert (
-            drained.permit_issued_seen_expires_at_ns == inline.permit_issued_seen_expires_at_ns
-        )
-        assert (
-            drained.first_boot_permit_expires_at_ns == inline.first_boot_permit_expires_at_ns
-        )
+        assert drained.permit_issued_seen_expires_at_ns == inline.permit_issued_seen_expires_at_ns
+        assert drained.first_boot_permit_expires_at_ns == inline.first_boot_permit_expires_at_ns
         assert drained.midday_cause_seen == inline.midday_cause_seen
         # The now-equal field -- previously exceeded, never asserted here.
         assert drained.orders_not_requested_seen == inline.orders_not_requested_seen
@@ -1121,3 +1129,231 @@ class TestReadyAdoptionAlert:
         assert 470 // 13 == 36
         doc = inspect.getdoc(decide_ready_adoption_alert) or ""
         assert "36" in doc and "470" in doc
+
+
+# ---------------------------------------------------------------------------
+# SELF-CHECK-ORDERS-OFF -- the pure self-check classifies an agreed
+# orders-off node (node marker AND supervisor env "0") as its own PASS.
+# ---------------------------------------------------------------------------
+
+_HALTED = ContinuousFamilyCheck(
+    phase0_clean=True, startup_evidence_valid=True, family_not_halted=False
+)
+_CLEAN = ContinuousFamilyCheck(
+    phase0_clean=True, startup_evidence_valid=True, family_not_halted=True
+)
+
+
+def _sc(**overrides: Any) -> SelfCheckResult:
+    base: dict[str, Any] = {
+        "child_alive": True,
+        "flock_holder_count": 1,
+        "flock_held_by_tracked_pid": True,
+        "permit_issued": False,
+        "permit_expiry_valid": False,
+        "strategy_subscribed": True,
+    }
+    base.update(overrides)
+    return self_check(**base)
+
+
+class TestSelfCheckOrdersOff:
+    def test_self_check_orders_off_agreed_no_permit_passes_orders_not_requested(self) -> None:
+        result = _sc(
+            orders_not_requested_seen=True, orders_env=OrdersEnv.OFF, continuous_check=_HALTED
+        )
+        assert result is SelfCheckResult.PASS_ORDERS_NOT_REQUESTED
+        assert (
+            _sc(orders_not_requested_seen=True, orders_env=OrdersEnv.OFF)
+            is SelfCheckResult.PASS_ORDERS_NOT_REQUESTED
+        )
+
+    def test_self_check_orders_requested_no_permit_still_fails_shadow_mode(self) -> None:
+        """Positive control: env ON, no marker, no permit."""
+        assert (
+            _sc(orders_not_requested_seen=False, orders_env=OrdersEnv.ON)
+            is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+        )
+
+    def test_self_check_marker_seen_but_env_on_fails_shadow_mode(self) -> None:
+        assert (
+            _sc(orders_not_requested_seen=True, orders_env=OrdersEnv.ON)
+            is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+        )
+
+    def test_self_check_marker_seen_but_env_unknown_fails_shadow_mode(self) -> None:
+        assert (
+            _sc(orders_not_requested_seen=True, orders_env=OrdersEnv.UNKNOWN)
+            is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+        )
+
+    def test_self_check_env_off_without_marker_fails_shadow_mode(self) -> None:
+        assert (
+            _sc(orders_not_requested_seen=False, orders_env=OrdersEnv.OFF)
+            is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+        )
+
+    @pytest.mark.parametrize("env", [OrdersEnv.OFF, OrdersEnv.UNKNOWN])
+    @pytest.mark.parametrize("marker", [True, False])
+    def test_self_check_permit_issued_while_env_not_on_fails_orders_env_mismatch(
+        self, env: OrdersEnv, marker: bool
+    ) -> None:
+        result = _sc(
+            permit_issued=True,
+            permit_expiry_valid=True,
+            orders_not_requested_seen=marker,
+            orders_env=env,
+        )
+        assert result is SelfCheckResult.FAIL_ORDERS_ENV_MISMATCH
+
+    def test_self_check_permit_issued_while_env_on_is_plain_pass(self) -> None:
+        result = _sc(permit_issued=True, permit_expiry_valid=True, orders_env=OrdersEnv.ON)
+        assert result is SelfCheckResult.PASS
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            ({}, SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT),
+            ({"permit_issued": True, "permit_expiry_valid": True}, SelfCheckResult.PASS),
+            (
+                {"permit_issued": True, "permit_expiry_valid": False},
+                SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT,
+            ),
+            (
+                {
+                    "permit_issued": True,
+                    "permit_expiry_valid": False,
+                    "permit_expiry_at_daily_ceiling": True,
+                },
+                SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING,
+            ),
+            ({"strategy_subscribed": False}, SelfCheckResult.FAIL_NODE_NOT_READY),
+            ({"child_alive": False}, SelfCheckResult.FAIL_CHILD_EXITED),
+            ({"flock_holder_count": 2}, SelfCheckResult.FAIL_MULTIPLE_FLOCK_HOLDERS),
+            ({"flock_held_by_tracked_pid": False}, SelfCheckResult.FAIL_NODE_NOT_READY),
+            ({"log_available": False}, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN),
+            (
+                {"permit_issued": True, "permit_expiry_valid": True, "continuous_check": _HALTED},
+                SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED,
+            ),
+        ],
+    )
+    def test_self_check_defaults_byte_identical_to_pre_change(
+        self, kwargs: dict[str, Any], expected: SelfCheckResult
+    ) -> None:
+        assert _sc(**kwargs) is expected
+
+    def test_self_check_orders_off_agreed_skips_family_halt_only(self) -> None:
+        agreed = {"orders_not_requested_seen": True, "orders_env": OrdersEnv.OFF}
+        assert _sc(continuous_check=_HALTED, **agreed) is SelfCheckResult.PASS_ORDERS_NOT_REQUESTED
+        dirty = ContinuousFamilyCheck(
+            phase0_clean=False, startup_evidence_valid=True, family_not_halted=False
+        )
+        assert (
+            _sc(continuous_check=dirty, **agreed)
+            is SelfCheckResult.FAIL_CONTINUOUS_PHASE0_FORBIDDEN
+        )
+        bad_evidence = ContinuousFamilyCheck(
+            phase0_clean=True, startup_evidence_valid=False, family_not_halted=False
+        )
+        assert (
+            _sc(continuous_check=bad_evidence, **agreed)
+            is SelfCheckResult.FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID
+        )
+
+    def test_self_check_env_on_family_halted_still_fails_family_halted(self) -> None:
+        result = _sc(
+            permit_issued=True,
+            permit_expiry_valid=True,
+            orders_env=OrdersEnv.ON,
+            continuous_check=_HALTED,
+        )
+        assert result is SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED
+
+    def test_self_check_result_alert_orders_not_requested_emits_nothing_and_mismatch_maps_detail(
+        self,
+    ) -> None:
+        assert (
+            self_check_result_alert(
+                result=SelfCheckResult.PASS_ORDERS_NOT_REQUESTED,
+                load_outcome=EscalationLoadOutcome.CORRUPT,
+                consecutive_failures=5,
+            )
+            is None
+        )
+        spec = self_check_result_alert(
+            result=SelfCheckResult.FAIL_ORDERS_ENV_MISMATCH,
+            load_outcome=EscalationLoadOutcome.PRESENT,
+            consecutive_failures=1,
+        )
+        assert spec is not None
+        assert spec.detail is AlertDetail.SELF_CHECK_FAIL_ORDERS_ENV_MISMATCH
+        assert AlertDetail.SELF_CHECK_FAIL_ORDERS_ENV_MISMATCH.value == (
+            "self_check_fail_orders_env_mismatch"
+        )
+        for member in SelfCheckResult:
+            if member.name.startswith("FAIL_"):
+                assert member in SELF_CHECK_ALERT_DETAIL, member
+
+    def test_record_self_check_result_orders_not_requested_resets_consecutive_failures(
+        self,
+    ) -> None:
+        prior = SelfCheckEscalationState(consecutive_failures=3, last_self_check_utc="x")
+        after = record_self_check_result(
+            prior, SelfCheckResult.PASS_ORDERS_NOT_REQUESTED.value, now_utc="y"
+        )
+        assert after.consecutive_failures == 0
+        assert after.last_self_check_utc == "y"
+
+    def test_self_check_adopt_cleared_latch_without_marker_falls_back_to_shadow_mode_fail(
+        self,
+    ) -> None:
+        """Pins R2: adoption clears the latch; with no marker in the delta the
+        louder FAIL_SHADOW_MODE_NO_PERMIT result is the outcome."""
+        latched = replace(initial_scheduler_state(_DAY), orders_not_requested_seen=True)
+        cleared = record_child_adopted(latched, _utc(17, 5))
+        facts = derive_self_check_facts(state=cleared, log_text="", now=_utc(17, 5))
+        assert facts.orders_not_requested_seen is False
+        assert (
+            _sc(
+                permit_issued=facts.permit_issued,
+                permit_expiry_valid=facts.permit_expiry_valid,
+                orders_not_requested_seen=facts.orders_not_requested_seen,
+                orders_env=OrdersEnv.OFF,
+            )
+            is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+        )
+
+    def test_adopted_node_boot_log_replay_relatches_orders_not_requested_then_self_check_passes(
+        self,
+    ) -> None:
+        now = _utc(17, 5)
+        latched = replace(initial_scheduler_state(_DAY), orders_not_requested_seen=True)
+        adopted = record_child_adopted(latched, now)
+        assert adopted.orders_not_requested_seen is False
+        replayed = latch_log_facts(adopted, now, f"boot\n{PERMIT_NOT_REQUESTED_MARKER}\n")
+        facts = derive_self_check_facts(state=replayed, log_text="", now=now)
+        assert facts.orders_not_requested_seen is True
+        result = _sc(
+            permit_issued=facts.permit_issued,
+            permit_expiry_valid=facts.permit_expiry_valid,
+            orders_not_requested_seen=facts.orders_not_requested_seen,
+            orders_env=OrdersEnv.OFF,
+            continuous_check=_HALTED,
+        )
+        assert result is SelfCheckResult.PASS_ORDERS_NOT_REQUESTED
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"child_alive": False}, SelfCheckResult.FAIL_CHILD_EXITED),
+            ({"flock_holder_count": 2}, SelfCheckResult.FAIL_MULTIPLE_FLOCK_HOLDERS),
+            ({"flock_held_by_tracked_pid": False}, SelfCheckResult.FAIL_NODE_NOT_READY),
+            ({"strategy_subscribed": False}, SelfCheckResult.FAIL_NODE_NOT_READY),
+        ],
+    )
+    def test_expected_no_permit_does_not_mask_node_not_ready_child_exited_or_multiple_flock_holders(
+        self, overrides: dict[str, Any], expected: SelfCheckResult
+    ) -> None:
+        result = _sc(orders_not_requested_seen=True, orders_env=OrdersEnv.OFF, **overrides)
+        assert result is expected

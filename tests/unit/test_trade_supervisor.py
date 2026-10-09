@@ -2842,7 +2842,7 @@ def _make_ports(**overrides) -> SupervisorPorts:
         "sigterm_poll_sleep": lambda _s: None,
     }
     base.update(overrides)
-    return SupervisorPorts(**base)
+    return SupervisorPorts(**base)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
