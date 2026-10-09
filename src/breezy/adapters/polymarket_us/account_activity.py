@@ -205,6 +205,10 @@ def _parse_rfc3339_ns(value: object) -> int:
     return epoch_s * 1_000_000_000 + int(frac_digits)
 
 
+#: Public name for the RFC3339 parser, reused by the pure no-id attribution module.
+parse_rfc3339_ns = _parse_rfc3339_ns
+
+
 def _hash_transaction_id(transaction_id: object) -> str | None:
     if not isinstance(transaction_id, str) or not transaction_id:
         return None
