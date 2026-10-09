@@ -52,6 +52,7 @@ Deployment values are never hardcoded here: every one comes from settings.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -111,6 +112,7 @@ from breezy.runtime.settings import (
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import SubmitIntentLatch
+from breezy.runtime.supervisor_decode_marker import supervisor_admits_retirement_reason
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
@@ -130,6 +132,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         PolymarketUSDataClientConfig,
         PolymarketUSExecClientConfig,
     )
+
+logger = logging.getLogger(__name__)
 
 #: The ingest Actor's ``"pkg.mod:Class"`` colon path.
 #:
@@ -994,6 +998,14 @@ def build_trade_node_config(
         if settings.catalog_root is not None
         else None
     )
+    # AMBIG-LATCH-RESUME (DH1): the no-id resolver may retire only if the RUNNING
+    # supervisor's decode marker lists the new reason, so a supervisor that cannot
+    # decode it never meets a RETIRED record it would read as corrupt (L-48).
+    # Read once, here, at node boot; the boot line is the activation proof.
+    no_id_retire_admitted = supervisor_admits_retirement_reason(
+        Path(state_store_path), "RESOLVER_NO_ID_NO_FILL"
+    )
+    logger.info("no_id_retire_admitted=%s", no_id_retire_admitted)
     exec_client_config = msgspec_replace(
         exec_client_config,
         state_store_opener=lambda: SqliteStateStore(state_store_path),
@@ -1003,6 +1015,7 @@ def build_trade_node_config(
         submit_veto=submit_veto,
         exit_manifest=exit_manifest,
         resolver_instrument_loader=resolver_instrument_loader,
+        no_id_retire_admitted=no_id_retire_admitted,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

@@ -23,6 +23,7 @@ CONTRADICTION, then INCOMPLETE, then the rest.
 """
 
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -273,7 +274,7 @@ def _matches_echo(leg: NoIdLeg, echo: NoIdEcho) -> bool:
 
 def _open_order_verdict(
     open_orders: Sequence[Any],
-    known_order_ids: frozenset[str],
+    known_order_ids: AbstractSet[str],
     echo: NoIdEcho | None,
     window_start_ns: int,
     window_end_ns: int,
@@ -312,7 +313,7 @@ def classify_no_id_evidence(
     out_of_order: bool,
     open_orders: Sequence[Any],
     open_orders_ok: bool,
-    known_order_ids: frozenset[str],
+    known_order_ids: AbstractSet[str],
     echo: NoIdEcho | None,
     window_start_ns: int,
     window_end_ns: int,

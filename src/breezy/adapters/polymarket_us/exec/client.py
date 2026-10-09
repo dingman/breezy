@@ -316,6 +316,14 @@ from breezy.adapters.polymarket_us.fees import (
     taker_fee_at_fill,
     taker_fee_coefficient_of,
 )
+from breezy.adapters.polymarket_us.no_id_attribution import (
+    NoIdEcho,
+    NoIdLeg,
+    classify_no_id_evidence,
+    holding_delta_consistent,
+    manual_leg_net_effect,
+    no_id_aggressor_legs,
+)
 from breezy.adapters.polymarket_us.operator_controls import (
     DailyBudgetExhausted,
     SpendBooking,
@@ -1157,6 +1165,26 @@ class AmbiguousResolverContext:
     baseline_durable_net: str | None = None
     baseline_ts_ns: int | None = None
 
+    @property
+    def no_id_echo(self) -> NoIdEcho | None:
+        """The wire echo a no-id attribution joins on, or ``None`` (an old blob
+        written before these fields existed: the resolver then uses the
+        window-only rules). A property, so the scanned resolver bodies build no
+        object (no new callee)."""
+        if (
+            self.wire_market_slug is None
+            or self.wire_price is None
+            or self.wire_outcome_side is None
+            or self.wire_action is None
+        ):
+            return None
+        return NoIdEcho(
+            slug=self.wire_market_slug,
+            outcome_side=self.wire_outcome_side,
+            action=self.wire_action,
+            price=self.wire_price,
+        )
+
     def to_bytes(self) -> bytes:
         return json.dumps(
             {
@@ -1588,6 +1616,11 @@ _NO_ID_WINDOW_BACKSKEW_NS: Final[int] = 120 * 1_000_000_000
 #: A pre-POST holding snapshot is only a baseline if no Breezy fill on the
 #: instrument landed within this long before it (it might not reflect it yet).
 _NO_ID_BASELINE_QUIET_NS: Final[int] = 300 * 1_000_000_000
+#: The native reject reason for a no-id submit that complete venue reads show
+#: neither an order nor a fill for (the name says what is proven).
+_NO_ID_NO_FILL_REASON: Final[str] = (
+    "resolver: complete venue reads show no order and no fill for this no-id submit"
+)
 #: After a CONTRADICTION or INCOMPLETE verdict the no-id branch makes no
 #: further reads for that intent until this long has passed.
 _NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
@@ -1658,6 +1691,27 @@ class TradeJoin:
     uninterpretable_rows: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class NoIdTradeJoin:
+    """The outcome of scanning ``/v1/portfolio/activities`` for every AGGRESSOR
+    leg at or after a no-id submit's attribution window start (plan r6
+    section 2.8.6).
+
+    ``complete`` is True on ``eof`` OR on ORDERED early termination: the first
+    page whose TRADE rows pass below the window start without any ordering
+    violation. With non-increasing order among TRADE rows (checked on every row
+    actually read, never assumed), every later TRADE row is also older, so it
+    can hold no attributable leg. ``out_of_order`` stops the read incomplete.
+    """
+
+    complete: bool
+    out_of_order: bool
+    legs: tuple[NoIdLeg, ...]
+    passive_manual: tuple[bool, ...]
+    uninterpretable_rows: int
+    pages: int
+
+
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
     """Slice 3: a pure, deterministic function of ``venue_order_id`` alone.
 
@@ -1705,6 +1759,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         submit_veto: Callable[[], str | None] | None = None,
         exit_manifest: FamilyManifest | None = None,
         resolver_instrument_loader: Callable[[str], Any] | None = None,
+        no_id_retire_admitted: bool = False,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -1794,6 +1849,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._credentials = credentials
         self._api_base_url = api_base_url
         self._retirement_reasons = retirement_reasons
+        # AMBIG-LATCH-RESUME (DH1): whether the running supervisor can decode the
+        # `RESOLVER_NO_ID_NO_FILL` retirement reason. Set once at node boot;
+        # `_resolve_no_order` refuses to retire without it (fail closed).
+        self._no_id_retire_admitted: bool = bool(no_id_retire_admitted)
         # Item 4 (slice 4 review): the family-halt chokepoint veto, injected
         # exactly the way the submit-intent latch is -- a plain callable this
         # adapters-layer module never imports the type of. `None` -> no veto,
@@ -2634,8 +2693,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # No-id AMBIGUOUS, or nothing to resolve yet.
                 self._log.debug(
                     f"resolver: no durable resolver context for intent "
-                    f"{current.intent_id}; nothing to resolve this pass"
+                    f"{current.intent_id}; window-only no-id pass"
                 )
+                # AMBIG-LATCH-RESUME (window-only mode): no context means no
+                # echo; the branch applies the strictest rules and acts only
+                # after its own min age.
+                try:
+                    await self._resolve_no_id_intent(
+                        current.intent_id, current.created_ns, None, None
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill the polling task
+                    self._note_resolver_error(current.intent_id, exc)
                 continue
             try:
                 context = AmbiguousResolverContext.from_bytes(raw_context)
@@ -2794,6 +2862,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         f"(backoff: {self._resolver_consecutive_failures} consecutive "
                         "failure(s))"
                     )
+                continue
+            if context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID:
+                # AMBIG-LATCH-RESUME (attributed mode): the pre-POST context has
+                # no venue id, so there is nothing a GET by id could resolve.
+                # The with-id path from the GET below is byte-unchanged.
+                try:
+                    await self._resolve_no_id_intent(
+                        current.intent_id, current.created_ns, context, instrument
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill the polling task
+                    self._note_resolver_error(current.intent_id, exc)
                 continue
             try:
                 order_payload = await self._private_read(
@@ -3557,6 +3636,467 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             complete=reached_eof, trade_count=len(trade_refs), qty=total_qty,
             last_trade_ts_ns=last_ts, uninterpretable_rows=uninterpretable_rows,
         )
+
+    async def _no_id_trade_activity(self, window_start_ns: int) -> NoIdTradeJoin | None:
+        """AMBIG-LATCH-RESUME (plan r6 2.8.6): page ``/v1/portfolio/activities``
+        (``SORT_ORDER_DESCENDING``) collecting every AGGRESSOR leg at or after
+        ``window_start_ns``. Same page loop and cap as
+        :meth:`_order_trade_activity`, which stays byte-identical and eof-only;
+        the duplication is deliberate (``RESOLVER-PAGE-LOOP-DRY`` is recorded
+        in the plan, not done here).
+
+        ``complete`` is True on ``eof`` or on ordered early termination (see
+        :class:`NoIdTradeJoin`). It is False -- never guessed -- on the page cap,
+        a missing cursor, a malformed page, an uninterpretable row, or any
+        ordering violation. ``None`` on a read failure. Awaits only
+        ``self._private_read(PORTFOLIO_ACTIVITIES_PATH, ...)``.
+        """
+        cursor: str | None = None
+        found: tuple[NoIdLeg, ...] = ()
+        found_passive: tuple[bool, ...] = ()
+        uninterpretable_rows = 0
+        prev_row_ts_ns: int | None = None
+        pages = 0
+        for _page_index in range(_RESOLVER_ACTIVITY_MAX_PAGES):
+            query: dict[str, object] = {
+                "limit": _RESOLVER_ACTIVITY_PAGE_LIMIT,
+                "sortOrder": _RESOLVER_ACTIVITY_SORT_ORDER,
+            }
+            if cursor:
+                query["cursor"] = cursor
+            try:
+                page = await self._private_read(PORTFOLIO_ACTIVITIES_PATH, query)
+            except Exception as exc:  # noqa: BLE001 - read failure stays AMBIGUOUS
+                self._log.warning(
+                    f"resolver: no-id activities read failed ({type(exc).__name__}: {exc}); "
+                    "scan incomplete"
+                )
+                return None
+            if not isinstance(page, Mapping):
+                self._log.warning(
+                    "resolver: no-id activities page was not an object; scan incomplete"
+                )
+                return None
+            if not isinstance(page.get("activities"), list):
+                self._log.warning(
+                    "resolver: no-id activities page carried a non-list activities field; "
+                    "scan incomplete"
+                )
+                return NoIdTradeJoin(
+                    False, False, found, found_passive, uninterpretable_rows, pages
+                )
+            pages = _page_index + 1
+            scan = no_id_aggressor_legs(page, window_start_ns, prev_row_ts_ns)
+            found = (*found, *scan.legs)
+            found_passive = (*found_passive, *scan.passive_manual)
+            uninterpretable_rows += scan.uninterpretable_rows
+            prev_row_ts_ns = scan.last_row_ts_ns
+            if scan.out_of_order:
+                self._log.warning(
+                    "resolver: no-id activities rows are not in non-increasing time order; "
+                    "scan incomplete"
+                )
+                return NoIdTradeJoin(
+                    False, True, found, found_passive, uninterpretable_rows, pages
+                )
+            if scan.uninterpretable_rows:
+                self._log.warning(
+                    f"resolver: no-id activities page carried {scan.uninterpretable_rows} "
+                    "uninterpretable trade row(s); scan incomplete"
+                )
+                return NoIdTradeJoin(
+                    False, False, found, found_passive, uninterpretable_rows, pages
+                )
+            eof_value = page.get("eof")
+            if "eof" in page and not isinstance(eof_value, bool):
+                self._log.warning(
+                    "resolver: no-id activities page carried a non-bool eof field; "
+                    "scan incomplete"
+                )
+                return NoIdTradeJoin(
+                    False, False, found, found_passive, uninterpretable_rows, pages
+                )
+            if scan.passed_window_start or eof_value is True:
+                return NoIdTradeJoin(
+                    True, False, found, found_passive, uninterpretable_rows, pages
+                )
+            next_cursor = page.get("nextCursor")
+            cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+            if not cursor:
+                break
+        return NoIdTradeJoin(False, False, found, found_passive, uninterpretable_rows, pages)
+
+    async def _resolve_no_id_intent(
+        self,
+        intent_id: str,
+        created_ns: int,
+        context: AmbiguousResolverContext | None,
+        instrument: Any,
+    ) -> None:
+        """AMBIG-LATCH-RESUME (plan r6 2.8.4-2.8.6): resolve an OPEN AMBIGUOUS
+        intent that has NO venue order id, from complete GET reads only.
+
+        ``context`` is ``None`` in window-only mode (the pre-POST write failed,
+        or the intent predates contexts). Reads go through the same
+        ``self._private_read`` / ``self._read_open_orders`` seams as the with-id
+        resolver; this body can reach no send path (T42). It never retires on
+        create-time evidence, partial or contradictory reads: every failure
+        leaves the intent AMBIGUOUS and re-checks in
+        :data:`_NO_ID_RECHECK_INTERVAL_NS`.
+        """
+        if intent_id == self._post_in_flight_intent_id:
+            self._log.debug(f"resolver: no-id intent {intent_id} POST in flight; skipping")
+            return
+        now_ns = self._clock.timestamp_ns()
+        age_ns = now_ns - created_ns
+        if age_ns < _RESOLVER_NO_ID_MIN_AGE_NS:
+            return
+        if (
+            context is None
+            and age_ns >= _STALE_INTENT_ALERT_AFTER_NS
+            and intent_id not in self._resolver_stale_alerted_intent_ids
+        ):
+            self._resolver_stale_alerted_intent_ids = self._resolver_stale_alerted_intent_ids | {
+                intent_id
+            }
+            self._resolver_stale_alert_details = {
+                **self._resolver_stale_alert_details,
+                intent_id: {
+                    "severity": "CRITICAL",
+                    "event": "open_intent_stale",
+                    "site": "global",
+                    "intent_id": intent_id,
+                    "venue_order_id": "none",
+                    "age_minutes": f"{age_ns // 60_000_000_000}",
+                    "last_failure_kind": "none",
+                    "no_context": "true",
+                    "next": "no_id_resolver_window_only",
+                },
+            }
+        if intent_id in self._no_id_next_check_ns and now_ns < self._no_id_next_check_ns[intent_id]:
+            return
+        recheck_ns = now_ns + _NO_ID_RECHECK_INTERVAL_NS
+        echo = None if context is None else context.no_id_echo
+        window_start_ns = created_ns - _NO_ID_WINDOW_BACKSKEW_NS
+        window_end_ns = created_ns + _NO_ID_WINDOW_FORWARD_NS
+
+        try:
+            positions_payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+            positions = self._declared_positions(positions_payload)
+        except Exception as exc:  # noqa: BLE001 - transient; never `_refuse`
+            self._resolver_consecutive_failures += 1
+            self._no_id_next_check_ns[intent_id] = recheck_ns
+            self._log.warning(
+                f"resolver: no-id positions read failed ({type(exc).__name__}: {exc}); "
+                "stays AMBIGUOUS"
+            )
+            return
+        open_orders_ok = True
+        try:
+            open_orders = await self._read_open_orders()
+        except Exception as exc:  # noqa: BLE001 - recorded as INCOMPLETE below
+            open_orders = ()
+            open_orders_ok = False
+            self._log.warning(
+                f"resolver: no-id open-orders read failed ({type(exc).__name__}: {exc})"
+            )
+        join = await self._no_id_trade_activity(window_start_ns)
+        if join is None:
+            self._resolver_consecutive_failures += 1
+            self._no_id_next_check_ns[intent_id] = recheck_ns
+            self._log.warning(
+                f"resolver: no-id intent {intent_id} activities read failed; stays AMBIGUOUS"
+            )
+            return
+        self._resolver_consecutive_failures = 0
+
+        known = {
+            leg.order_id
+            for leg in join.legs
+            if self.client_order_id_for(VenueOrderId(leg.order_id)) is not None
+        } | {
+            order.venue_order_id
+            for order in open_orders
+            if self.client_order_id_for(VenueOrderId(order.venue_order_id)) is not None
+        }
+        verdict = classify_no_id_evidence(
+            legs=join.legs,
+            passive_manual=join.passive_manual,
+            legs_complete=join.complete,
+            out_of_order=join.out_of_order,
+            open_orders=open_orders,
+            open_orders_ok=open_orders_ok,
+            known_order_ids=known,
+            echo=echo,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+        )
+        outcome_kind: str = verdict.kind
+        outcome_token = f"{verdict.token}"
+        manual_reason = ""
+
+        if outcome_kind == "NO_FILL":
+            # The positions baseline, checked only when attribution is clean.
+            try:
+                if echo is not None and context is not None:
+                    same_day_instrument = False
+                    for candidate in self._instrument_provider.list_all():
+                        if candidate.id == instrument.id:
+                            same_day_instrument = True
+                            break
+                    if same_day_instrument:
+                        slug = base_slug_of(instrument.id)
+                        venue_leg_qty = _resolver_leg_holding_qty(
+                            positions, slug, leg_of(instrument.id)
+                        )
+                        durable_qty = self._durable_net_qty(instrument.id)
+                        if venue_leg_qty is None or durable_qty is None:
+                            outcome_kind = "INCOMPLETE"
+                            outcome_token = "holding_unreadable"
+                        elif (
+                            context.baseline_venue_net is not None
+                            and context.baseline_durable_net is not None
+                            and context.baseline_ts_ns is not None
+                        ):
+                            manual = manual_leg_net_effect(
+                                legs=join.legs,
+                                passive_manual=join.passive_manual,
+                                slug=echo.slug,
+                                after_ns=context.baseline_ts_ns,
+                                now_ns=now_ns,
+                                settle_ns=_RESOLVER_ZERO_FILL_MIN_AGE_NS,
+                                straddle_ns=_NO_ID_MANUAL_STRADDLE_NS,
+                            )
+                            # Deliberately NOT `.get(...)`: a dict-method call here is a
+                            # new, unpermitted callee under E0-NOSEND-RESOLVER.
+                            slug_payload = positions[slug] if slug in positions else None  # noqa: SIM401
+                            now_venue_net = "0"
+                            if slug_payload is not None:
+                                now_venue_net = (
+                                    f"{slug_payload['netPosition']}"
+                                    if isinstance(slug_payload, Mapping)
+                                    and "netPosition" in slug_payload
+                                    else "unknown"
+                                )
+                            if manual.status == "unsettled" or manual.value is None:
+                                if manual.status == "unsettled":
+                                    outcome_kind = "INCOMPLETE"
+                                    outcome_token = "manual_leg_unsettled"
+                                else:
+                                    outcome_kind = "CONTRADICTION"
+                                    outcome_token = "unexplained_holding_delta"
+                                    manual_reason = f"{manual.reason}"
+                            else:
+                                consistent = holding_delta_consistent(
+                                    base_venue_net=context.baseline_venue_net,
+                                    now_venue_net=now_venue_net,
+                                    base_durable_net=context.baseline_durable_net,
+                                    now_durable_net=durable_qty,
+                                    leg_sign=1 if echo.outcome_side == "OUTCOME_SIDE_YES" else -1,
+                                    manual_net=manual.value,
+                                )
+                                if consistent is None:
+                                    outcome_kind = "INCOMPLETE"
+                                    outcome_token = "holding_unreadable"
+                                elif consistent is False:
+                                    outcome_kind = "CONTRADICTION"
+                                    outcome_token = "unexplained_holding_delta"
+                                elif manual.count:
+                                    self._log.info(
+                                        "resolver: no-id holding delta reconciled by "
+                                        f"{manual.count} manual leg(s)"
+                                    )
+                        elif (
+                            echo.action == "ORDER_ACTION_BUY" and venue_leg_qty > durable_qty
+                        ) or (echo.action != "ORDER_ACTION_BUY" and venue_leg_qty < durable_qty):
+                            outcome_kind = "CONTRADICTION"
+                            outcome_token = "unexplained_holding"
+                elif echo is None:
+                    for candidate in self._instrument_provider.list_all():
+                        venue_leg_qty = _resolver_leg_holding_qty(
+                            positions, base_slug_of(candidate.id), leg_of(candidate.id)
+                        )
+                        durable_qty = self._durable_net_qty(candidate.id)
+                        if venue_leg_qty is None or durable_qty is None:
+                            outcome_kind = "INCOMPLETE"
+                            outcome_token = "holding_unreadable"
+                            break
+                        if venue_leg_qty != durable_qty:
+                            outcome_kind = "CONTRADICTION"
+                            outcome_token = "unexplained_holding"
+                            break
+            except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
+                self._note_resolver_error(intent_id, exc)
+                return
+
+        if outcome_kind == "CONTRADICTION":
+            holding = outcome_token in {"unexplained_holding", "unexplained_holding_delta"}
+            details = {
+                "severity": "CRITICAL",
+                "event": "resolver_evidence_contradiction",
+                "site": "global",
+                "intent_id": intent_id,
+                "venue_order_id": "none",
+                "no_id": "true",
+                "reason": outcome_token,
+                "next": (
+                    "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution"
+                    if holding
+                    else "no_id_recheck_60s"
+                ),
+            }
+            if manual_reason:
+                details = {**details, "manual_reconcile": manual_reason}
+            self._resolver_contradiction_details = {
+                **self._resolver_contradiction_details,
+                intent_id: details,
+            }
+            self._no_id_next_check_ns[intent_id] = recheck_ns
+            self._log.error(
+                f"resolver: no-id intent {intent_id} evidence contradiction "
+                f"({outcome_token}); stays AMBIGUOUS, re-check in 60s"
+            )
+            return
+        if outcome_kind == "INCOMPLETE":
+            self._no_id_next_check_ns[intent_id] = recheck_ns
+            self._log.warning(
+                f"resolver: no-id intent {intent_id} evidence incomplete "
+                f"({outcome_token}); stays AMBIGUOUS, re-check in 60s"
+            )
+            return
+        if outcome_kind == "ADOPT":
+            if context is None:
+                return
+            try:
+                self._adopt_no_id_venue_order(context, f"{verdict.order_id}")
+                cached = self._cache.order(ClientOrderId(context.client_order_id))
+                if cached is not None and cached.status is OrderStatus.INITIALIZED:
+                    self._generate_submitted(cached, now_ns)
+            except Exception as exc:  # noqa: BLE001 - stays AMBIGUOUS, next pass retries
+                self._note_resolver_error(intent_id, exc)
+                return
+            self._log.warning(
+                f"resolver: no-id intent {intent_id} adopted venue order "
+                f"{_redact_order_id(f'{verdict.order_id}')}; resolving on the with-id path"
+            )
+            return
+        # NO_FILL with the baseline passing: the H2 analogue, set only by a
+        # complete negative pass in THIS run.
+        self._resolved_no_id_ts_ns[intent_id] = now_ns
+        try:
+            self._resolve_no_order(intent_id, context, now_ns, positions)
+        except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
+            self._note_resolver_error(intent_id, exc)
+
+    def _adopt_no_id_venue_order(
+        self, context: AmbiguousResolverContext, venue_order_id: str
+    ) -> None:
+        """Record the venue order id the attribution join found, in the ONE
+        durable key the with-id resolver already reads. Nothing else changes, so
+        the next pass takes the unchanged with-id path (GET by id, then
+        accept-fill / terminal-zero). No ``try``: a store failure propagates to
+        the caller's ``try`` and the intent stays AMBIGUOUS."""
+        adopted = dataclasses.replace(context, venue_order_id=venue_order_id)
+        self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{adopted.intent_id}", adopted.to_bytes())
+
+    def _resolve_no_order(
+        self,
+        intent_id: str,
+        context: AmbiguousResolverContext | None,
+        now_ns: int,
+        positions: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Retire a no-id intent that complete reads show neither an order nor a
+        fill for. Mirrors :meth:`_resolve_terminal_zero` step for step.
+
+        Refuses unless the running supervisor can decode the new retirement
+        reason (``_no_id_retire_admitted``, fail-closed) and unless
+        ``_resolved_no_id_ts_ns`` carries a complete negative pass from THIS run
+        (the SAFETY H2 analogue). The AMBIGUOUS-refusal clear is the LAST step.
+        """
+        if not self._no_id_retire_admitted:
+            self._resolver_contradiction_details = {
+                **self._resolver_contradiction_details,
+                intent_id: {
+                    "severity": "CRITICAL",
+                    "event": "resolver_no_id_retire_blocked",
+                    "site": "global",
+                    "intent_id": intent_id,
+                    "venue_order_id": "none",
+                    "no_id": "true",
+                    "reason": "supervisor_decode_marker_absent",
+                    "next": "next_node_boot_rereads_supervisor_marker",
+                },
+            }
+            self._log.error(
+                f"resolver: no-id retirement of intent {intent_id} is blocked -- the running "
+                "supervisor's decode marker does not list the reason; fail-closed"
+            )
+            return
+        if intent_id not in self._resolved_no_id_ts_ns:
+            self._log.error(
+                f"resolver: refusing to retire intent {intent_id} -- no complete negative "
+                "no-id pass was recorded for it in this run; SAFETY H2 fail-closed"
+            )
+            return
+        current = self._latch.current_open()
+        if current is None or current.intent_id != intent_id:
+            self._ambiguous_bookings.pop(intent_id, None)
+            return
+        self._retire(intent_id, "RESOLVER_NO_ID_NO_FILL", now_ns)
+        self._log.info(f"resolver: retired intent {intent_id} (RESOLVER_NO_ID_NO_FILL)")
+        booking = self._ambiguous_bookings.pop(intent_id, None)
+        if booking is not None:
+            # Same process only: on restart the ledger died with the process.
+            self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
+            if (
+                self._permit is not None
+                and context is not None
+                and restore_live_trading_budget(
+                    permit=self._permit,
+                    venue_order_id=f"noid:{intent_id}",
+                    order_notional_usd=context.notional_usd,
+                )
+            ):
+                self._mark_budget_restored(f"noid:{intent_id}")
+        else:
+            self._log.info("resolver: cross-process no-id no-fill; permit restore skipped")
+        if positions is not None:
+            self._write_startup_position_evidence(
+                now_ns=now_ns,
+                eof_complete=True,
+                position_read_refused=False,
+                raw_positions=positions,
+            )
+        if context is not None:
+            cached = self._cache.order(ClientOrderId(context.client_order_id))
+            if cached is not None and cached.status is OrderStatus.INITIALIZED:
+                # (INITIALIZED, REJECTED) is the legal edge the create path's
+                # REJECT branch already uses.
+                self.generate_order_rejected(
+                    strategy_id=StrategyId(context.strategy_id),
+                    instrument_id=InstrumentId.from_str(context.instrument_id),
+                    client_order_id=ClientOrderId(context.client_order_id),
+                    reason=_NO_ID_NO_FILL_REASON,
+                    ts_event=now_ns,
+                )
+        # LAST: the AMBIGUOUS refusal has no subject left (same block as the
+        # zero-fill and accept-fill clears). Any raise above keeps it.
+        if self._latch.current_open() is None:
+            kept_refusals = [
+                refusal
+                for refusal in self._trading_refusals
+                if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            ]
+            if len(kept_refusals) != len(self._trading_refusals):
+                self._trading_refusals = kept_refusals
+                self._ambiguous_refusal_clears += 1
+                self._log.info(
+                    f"resolver: cleared the AMBIGUOUS trading refusal "
+                    f"({submit_chain.AMBIGUOUS_REASON!r}) on no-id retirement of "
+                    f"intent {intent_id}"
+                )
+
 
     def _durable_net_qty(self, instrument_id: InstrumentId) -> Decimal | None:
         """EDGE-2 slice D (§4 AC4(e) baseline): THIS instrument's own

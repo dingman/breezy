@@ -285,6 +285,7 @@ async def build_client(
         client.start()
     assert isinstance(client, TimedClient)
     client.order_events = order_events
+    client.latch_cm = latch_cm  # keeps the flock held (dropping it GCs the generator)
     return client, order_events, permit, latch_cm
 
 

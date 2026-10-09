@@ -1845,6 +1845,14 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # `EXEC_RESOLVER_PERMITTED_CALLEES` below, exactly like
         # `_resolve_ambiguous_intents` itself.
         "_order_trade_activity",
+        # AMBIG-LATCH-RESUME Phase B (plan r6 2.8.7): the no-id resolver branch
+        # and its activities scan. Old(23) -> new(25), WIDENED not relaxed: both
+        # are scanned by `EXEC_RESOLVER_COROUTINES`/`EXEC_RESOLVER_PERMITTED_
+        # CALLEES` below, await only the existing GET seams
+        # (`tests/unit/test_ambig_no_id_firewall_delta.py` T42), and reach no
+        # send path.
+        "_resolve_no_id_intent",
+        "_no_id_trade_activity",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -2111,6 +2119,14 @@ EXEC_RESOLVER_COROUTINES = frozenset(
         # GETs), so it is scanned exactly like `_resolve_ambiguous_intents`
         # itself, not treated as a plain read-only classifier callee.
         "_order_trade_activity",
+        # AMBIG-LATCH-RESUME Phase B (plan r6 2.8.7): the no-id resolver and
+        # its helpers are scanned exactly like the with-id resolver.
+        # `_adopt_no_id_venue_order` is the only new resolver-reachable helper
+        # that writes durable state (one key, pinned by T42(iv)).
+        "_resolve_no_id_intent",
+        "_no_id_trade_activity",
+        "_resolve_no_order",
+        "_adopt_no_id_venue_order",
     }
 )
 
@@ -2283,6 +2299,29 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "self._instrument_provider.list_all",
         "_resolver_leg_holding_qty",
         "self._durable_net_qty",
+        # AMBIG-LATCH-RESUME Phase B (plan r6 2.8.7, #1-#17): ADDITIONS ONLY, no
+        # new egress callee. Each is a scanned coroutine/helper, a pure function
+        # outside `exec/` (purity-pinned by T48), a local store/cache read or
+        # write, or a native event publish. `self._store_set` is pinned to ONE
+        # call site and ONE key by T42(iv). The proof is
+        # `tests/unit/test_ambig_no_id_firewall_delta.py`.
+        "self._resolve_no_id_intent",
+        "self._no_id_trade_activity",
+        "self._resolve_no_order",
+        "self._adopt_no_id_venue_order",
+        "no_id_aggressor_legs",
+        "classify_no_id_evidence",
+        "NoIdTradeJoin",
+        "self.client_order_id_for",
+        "VenueOrderId",
+        "self._cache.order",
+        "self._generate_submitted",
+        "self.generate_order_rejected",
+        "self._store_set",
+        "dataclasses.replace",
+        "adopted.to_bytes",
+        "holding_delta_consistent",
+        "manual_leg_net_effect",
     }
 )
 
