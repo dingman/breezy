@@ -2268,6 +2268,18 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     WIDENED again (AUD-04, 2026-09-21): old -> new adds the offline portfolio
     ROI report, an analysis script importing ONLY the pure cent quantiser.
     Same property, no accessor, no operator value -- see the row's own comment.
+
+    WIDENED again (AMBIG-LATCH-RESUME Phase A, 2026-10-09): old -> new adds
+    exactly two READ-ONLY, non-latch-owning importers of ``submit_intent``.
+    ``runtime.supervisor_decode_marker`` imports ``RetirementReason`` only,
+    to advertise the member values the running supervisor can decode.
+    ``scripts/ops/ambig_latch_phase_a_check.py`` imports ``RetirementReason``,
+    ``SubmitIntent`` and ``SubmitIntentState`` only, to build one synthetic
+    RETIRED intent in memory and round-trip it through ``to_bytes``/
+    ``from_bytes``. Neither opens ``open_submit_intent_latch``, neither holds
+    the process lock, neither opens a store, and neither assigns an operator
+    control (``operator_controls`` is imported by neither). The comparison
+    stays ``==``.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2301,6 +2313,15 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # hands it; it opens no latch, takes no flock and opens no store (the reads are injected
         # callables), so it adds no second latch.
         "src/breezy/analysis/labeling/prelaunch_intents.py",
+        # WIDENED (AMBIG-LATCH-RESUME Phase A, 2026-10-09), not relaxed (L-6/L-12): the
+        # comparison is still `==`; old -> new added exactly these two paths. Both are
+        # read-only, non-latch-owning importers: `RetirementReason` only (the decode
+        # marker) and `RetirementReason`/`SubmitIntent`/`SubmitIntentState` for an
+        # in-memory synthetic round trip (the U2 check). Neither opens
+        # `open_submit_intent_latch`, holds the lock, opens a store or touches an
+        # operator control.
+        "src/breezy/runtime/supervisor_decode_marker.py",
+        "scripts/ops/ambig_latch_phase_a_check.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",

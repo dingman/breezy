@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "consume_stop_intent_marker",
     "discard_stop_intent_marker",
+    "process_start_ticks",
     "stop_intent_marker_path",
     "write_stop_intent_marker",
 ]
@@ -155,6 +156,12 @@ def _process_start_ticks(pid: int) -> int | None:
         return int(fields[_STAT_STARTTIME_FIELD_INDEX])
     except ValueError:
         return None
+
+
+#: Public alias (AMBIG-LATCH-RESUME Phase A): ``runtime.supervisor_decode_marker``
+#: binds its pid to the same /proc start-tick identity this module uses, and
+#: must not import a private name across modules. Same function object.
+process_start_ticks = _process_start_ticks
 
 
 def write_stop_intent_marker(
