@@ -52,7 +52,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | ING-2-AMEND2 | Post-rotation ingest still fails daily (606–705 s, peak 4.3–9.8G) → TEMPORARY drop-in STAYS; superseded by ING-3 (plan r2 READY, `docs/plans/backlog/ING-3_2026-10-08/`): Stage 0 snapshot at 09:00Z rotation, runs after 09:30Z alone |
 | FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
 | R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
-| Failed units | fee-evidence-pull 10-09 11:10Z OK (60/60); portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09; collector 429 back-off now exits 0 BACKED_OFF (1462514d) |
+| Failed units | portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09 |
 
 ### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
 Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
@@ -87,8 +87,8 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| CF-12-STAGE | LOW | DONE 10-09 (merged via integration 1462514d; tests/unit mypy ceiling 1288) | CF-12 |
-| CF-12-W3 | LOW | needs r5 re-plan after STAGE + WP3b | CF-12 |
+| CF-12-W3 | LOW | r5.1 READY; Stage 0 10-09 STOP (tests/unit FIN 1308>1288) → blocked on W3e | CF-12 |
+| CF-12-W3e | LOW | NEEDS PLAN: typing slice for call sites W3 makes visible (tests/unit +20 net; scripts/analysis +52 unattributed); file list in W3 r5.1 Stage 0 report (scratchpad cf12w3/fin_1.out) | W3 Stage 0 |
 | SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
 ### RUN / ANALYSE
@@ -101,7 +101,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | Phase A merged be9b80da + fix-forward 43b03682 (bounded page defer), LIVE (U1 10:32Z/12:05Z, U2 EXIT=0 ×2). Phase B merged 004f306f (security APPROVE + F4 sign-off, architect SOUND, gate EXIT=0); activates at the 10-09 16:50Z launch. Owed: §5.4 boot proof (`no_id_retire_admitted=True` in the node log FILE), then positive in-service proof at the next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (~2 KB/day, LOW); boot-retry WARN latch done; malformed-webhook startup crash in marker-fail handler (LOW) |
+| AMBIG-LATCH-RESUME | A LIVE (43b03682, U2 EXIT=0); B merged 004f306f, activates at 16:50Z launch. Owed: §5.4 boot proof (`no_id_retire_admitted=True`), in-service proof at next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (LOW) |
 | SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
