@@ -549,6 +549,11 @@ def test_quiescence_does_not_wait_for_old_files(store: Store) -> None:
     conn.close()
 
 
+_RACE_MAX_ROWS = 20_000
+_RACE_MIN_ROWS = 20
+_RACE_PAUSE_S = 0.0001
+
+
 def test_racing_writer_never_silent_miss(store: Store) -> None:
     import threading
 
@@ -559,9 +564,13 @@ def test_racing_writer_never_silent_miss(store: Store) -> None:
     def loop() -> None:
         own = sqlite3.connect(store.db, isolation_level=None, timeout=5)
         own.execute("PRAGMA wal_autocheckpoint=0")
-        while not stop.is_set():
+        # Bounded: an unthrottled writer on tmpfs (no fsync cost) wrote ~1M rows / 4 GB of WAL
+        # in seconds and hit the /tmp quota (disk I/O error -> COPY_ERROR, not the asserted
+        # outcome). The cap plus a tiny pause keeps the writer racing the snapshot.
+        while not stop.is_set() and committed[0] - 3 < _RACE_MAX_ROWS:
             own.execute("INSERT INTO t(v) VALUES ('race')")
             committed[0] += 1
+            time.sleep(_RACE_PAUSE_S)
         own.close()
 
     thread = threading.Thread(target=loop)
@@ -574,6 +583,8 @@ def test_racing_writer_never_silent_miss(store: Store) -> None:
                 assert len(values) >= floor, (len(values), floor)
             else:
                 assert outcome.reason is REASON.FINGERPRINT_UNSTABLE
+        # not vacuous: the writer really committed rows while snapshots ran
+        assert committed[0] - 3 >= _RACE_MIN_ROWS, committed[0]
     finally:
         stop.set()
         thread.join()
