@@ -385,6 +385,10 @@ _HEALTH_SHOW_PROPERTIES: Final = (
     "MemorySwapPeak,MemoryHigh,MemoryMax,Type,Restart,MainPID,UnitFileState,LoadState,TimeoutStartUSec,LastTriggerUSec,"
     "NextElapseUSecRealtime,NextElapseUSecMonotonic,Unit,FragmentPath,DropInPaths"
 )
+#: ``show -- 'breezy-*'`` lists a loaded unit only while it is active, activating or failed, so the
+#: inactive oneshot that restarts the recorder at 09:00Z is absent from the glob and must be named
+#: (the 2026-10-09 false CRITICAL). It equals ``unit_health_daemons.ROTATE_UNIT`` (a test pins it).
+_HEALTH_ROTATE_UNIT: Final = "breezy-quote-tape-rotate.service"
 _HEALTH_BUS_BIND: Final = "cache/aut6_health_bus"
 _HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
     BusRead(
@@ -396,6 +400,7 @@ _HEALTH_BUS_READS: Final[tuple[BusRead, ...]] = (
             "-p",
             _HEALTH_SHOW_PROPERTIES,
             "--",
+            _HEALTH_ROTATE_UNIT,
             "breezy-*",
             "us-source-collector@*",
         ),
