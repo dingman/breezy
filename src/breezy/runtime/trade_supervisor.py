@@ -1261,6 +1261,18 @@ def probe_open_intent_is_with_id(store_path: Path, *, node_pid: int | None) -> b
     return probe_open_intent_shape(store_path, node_pid=node_pid) is OpenIntentShape.WITH_ID
 
 
+def _open_intent_resolvable(*, ports: SupervisorPorts, store_path: Path, open_intent: bool) -> bool:
+    """``False`` unless an OPEN intent is resolvable. A raising probe is
+    ``False`` too (today's refusal stays), logged by exception TYPE only."""
+    if not open_intent:
+        return False
+    try:
+        return bool(ports.probe_open_intent_resolvable(store_path, node_pid=None))
+    except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+        log_decision("launch_resolvable_probe_failed", error_type=type(exc).__name__)
+        return False
+
+
 def _announce_launch_to_resolve(*, ports: SupervisorPorts, store_path: Path) -> None:
     """[AMBIG-LATCH-RESUME Phase A, CM1/DH1] Log the decision and alert by the
     OPEN intent's shape before the launch proceeds over it.
@@ -1332,8 +1344,8 @@ def _do_launch(
         return None, None, state, True
 
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    resolvable = (
-        ports.probe_open_intent_resolvable(store_path, node_pid=None) if open_intent else False
+    resolvable = _open_intent_resolvable(
+        ports=ports, store_path=store_path, open_intent=open_intent
     )
     action = decide_launch_action(
         lock_free=lock_free,
@@ -1368,9 +1380,6 @@ def _do_launch(
         )
         return None, None, state, True
 
-    if action is LaunchAction.LAUNCH_TO_RESOLVE:
-        _announce_launch_to_resolve(ports=ports, store_path=store_path)
-
     # action is LAUNCH or LAUNCH_TO_RESOLVE. [D3] A prior spawn attempt this window may have
     # raised -- gate a retry on the SAME bounded budget RELAUNCH_CHECK
     # uses (<=2 attempts, >=3 min apart, never at/after 17:00 UTC), never a
@@ -1396,6 +1405,10 @@ def _do_launch(
             return None, None, state, False
 
     log_path = node_log_path(log_dir, now)
+    if action is LaunchAction.LAUNCH_TO_RESOLVE:
+        # Once per ACTUAL spawn attempt: after the D3 gap/budget gates above, so
+        # a poll held inside the gap (or an exhausted-budget refusal) never pages.
+        _announce_launch_to_resolve(ports=ports, store_path=store_path)
     try:
         proc = ports.spawn(
             node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path
@@ -1712,8 +1725,8 @@ def _handle_boot_retry_precheck_refusal(
     lock_path = intent_lock_path(store_path)
     lock_free = ports.intent_lock_free(lock_path)
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
-    resolvable = (
-        ports.probe_open_intent_resolvable(store_path, node_pid=None) if open_intent else False
+    resolvable = _open_intent_resolvable(
+        ports=ports, store_path=store_path, open_intent=open_intent
     )
     action = decide_launch_action(
         lock_free=lock_free,

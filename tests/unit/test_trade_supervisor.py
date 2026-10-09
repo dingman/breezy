@@ -8623,3 +8623,104 @@ class TestExistingIntentOpenPinsHoldWithDefaultPorts:
             == "intent_open_launch_to_resolve_no_id"
         )
         assert not [v for v in values if "operator" in v.lower()]
+
+
+class TestLaunchToResolveOpsSafety:
+    """Ops-safety review: a raising resolvable probe keeps today's refusal, and
+    the launch-to-resolve CRITICAL fires once per ACTUAL spawn attempt."""
+
+    @staticmethod
+    def _raising(*_a: object, **_kw: object) -> bool:
+        raise RuntimeError("probe blew up")
+
+    def test_a_raising_resolvable_probe_refuses_in_do_launch_and_logs_the_type_only(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=self._raising,
+        )
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, log, _state, done = _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert (pid, log, done) == (None, None, True)
+        assert spawner.calls == []
+        assert [p.detail for p in sink.payloads] == [AlertDetail.INTENT_OPEN_BLOCKS_ARM.value]
+        messages = [r.getMessage() for r in caplog.records]
+        assert "launch_resolvable_probe_failed error_type=RuntimeError" in messages
+        assert "probe blew up" not in " ".join(messages)
+
+    def test_a_raising_resolvable_probe_refuses_at_the_boot_retry_precheck(
+        self, tmp_path: Path
+    ) -> None:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=self._raising,
+        )
+        _do_boot_retry(
+            ports=ports,
+            state=_boot_retry_ready_state(_utc(17, 0)),
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN.value in [
+            p.detail for p in sink.payloads
+        ]
+
+    def _ports(self) -> tuple[FakeSpawner, _RecordingAlertSink, SupervisorPorts]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: False,
+        )
+        return spawner, sink, ports
+
+    def test_polls_inside_the_retry_gap_announce_nothing_then_one_announce_on_spawn(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = replace(kwargs["state"], relaunch_attempts=1, last_relaunch_attempt_at=_utc(16, 50))
+        for minute in (51, 52, 52):
+            _pid, _log, _st, done = _do_launch(
+                ports=ports, **{**kwargs, "state": state, "now": _utc(16, minute)}
+            )
+            assert done is False
+        assert spawner.calls == []
+        assert sink.payloads == []
+        pid, _log, _st, done = _do_launch(
+            ports=ports, **{**kwargs, "state": state, "now": _utc(16, 54)}
+        )
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value
+        ]
+
+    def test_an_exhausted_retry_budget_refuses_without_the_launch_to_resolve_announce(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, sink, ports = self._ports()
+        kwargs = _launch_kwargs(tmp_path)
+        state = replace(
+            kwargs["state"], relaunch_attempts=99, last_relaunch_attempt_at=_utc(16, 50)
+        )
+        pid, _log, _st, done = _do_launch(ports=ports, **{**kwargs, "state": state})
+        assert (pid, done) == (None, True)
+        assert spawner.calls == []
+        assert [p.detail for p in sink.payloads] == [AlertDetail.LAUNCH_SPAWN_FAILED.value]
