@@ -8724,3 +8724,213 @@ class TestLaunchToResolveOpsSafety:
         assert (pid, done) == (None, True)
         assert spawner.calls == []
         assert [p.detail for p in sink.payloads] == [AlertDetail.LAUNCH_SPAWN_FAILED.value]
+
+
+class TestDurableLaunchToResolveAlert:
+    """Review fix 1/4: the non-with-id launch-to-resolve CRITICAL must be durable
+    (delivered or queued) BEFORE the spawn; otherwise defer, never consume budget."""
+
+    @staticmethod
+    def _ports(*, durable: Callable[..., bool], with_id: bool = False) -> tuple[Any, Any, Any]:
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: with_id,
+            send_alert_durable=durable,
+        )
+        return spawner, sink, ports
+
+    def test_an_undelivered_no_id_alert_defers_the_spawn_and_consumes_no_budget(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spawner, _sink, ports = self._ports(durable=lambda _s, _p: False)
+        kwargs = _launch_kwargs(tmp_path)
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, log, state, done = _do_launch(ports=ports, **kwargs)
+        assert (pid, log, done) == (None, None, False)
+        assert spawner.calls == []
+        assert state.relaunch_attempts == kwargs["state"].relaunch_attempts == 0
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert [r.getMessage() for r in errors] == ["launch_to_resolve_alert_undelivered"]
+
+    def test_the_next_poll_spawns_once_when_the_alert_becomes_durable(self, tmp_path: Path) -> None:
+        outcomes = iter([False, False, True])
+        sent: list[str] = []
+
+        def _send(_sink: object, payload: AlertPayload) -> bool:
+            sent.append(payload.event)
+            return next(outcomes)
+
+        spawner, _sink, ports = self._ports(durable=_send)
+        kwargs = _launch_kwargs(tmp_path)
+        for _ in range(2):
+            assert _do_launch(ports=ports, **kwargs)[3] is False
+        assert spawner.calls == []
+        pid, _log, _state, done = _do_launch(ports=ports, **kwargs)
+        assert pid is not None and done is True
+        assert len(spawner.calls) == 1
+        assert sent == ["TRADE_SUPERVISOR_LAUNCH_TO_RESOLVE_NO_ID"] * 3
+
+    def test_the_with_id_path_does_not_consult_the_durable_send(self, tmp_path: Path) -> None:
+        def _never(_s: object, _p: AlertPayload) -> bool:
+            raise AssertionError("with-id path must not use the durable send")
+
+        spawner, sink, ports = self._ports(durable=_never, with_id=True)
+        _do_launch(ports=ports, **_launch_kwargs(tmp_path))
+        assert len(spawner.calls) == 1
+        assert [p.severity for p in sink.payloads] == ["WARN"]
+
+    def test_boot_retry_defers_without_spawning_or_consuming_an_attempt(
+        self, tmp_path: Path
+    ) -> None:
+        spawner, _sink, ports = self._ports(durable=lambda _s, _p: False)
+        start = _boot_retry_ready_state(_utc(17, 0))
+        _pid, _log, state = _do_boot_retry(
+            ports=ports,
+            state=start,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert state.boot_retry_attempts == start.boot_retry_attempts
+
+    def test_boot_retry_announces_immediately_before_the_spawn(self, tmp_path: Path) -> None:
+        seen: list[int] = []
+        sink = _RecordingAlertSink()
+
+        def _spawn(**_kw: object) -> FakePopen:
+            seen.append(len(sink.payloads))
+            return FakePopen(7001)
+
+        ports = _make_ports(
+            spawn=_spawn,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+            probe_open_intent_resolvable=lambda *a, **kw: True,
+            probe_open_intent_with_id=lambda *a, **kw: True,
+        )
+        _do_boot_retry(
+            ports=ports,
+            state=_boot_retry_ready_state(_utc(17, 0)),
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        # first-attempt WARN + launch-to-resolve WARN were both sent before the spawn call
+        assert seen == [2]
+
+    def test_a_declined_boot_retry_neither_announces_nor_spawns(self, tmp_path: Path) -> None:
+        spawner, sink, ports = self._ports(durable=lambda _s, _p: True)
+        start = replace(_boot_retry_ready_state(_utc(17, 0)), boot_retry_attempts=99)
+        _do_boot_retry(
+            ports=ports,
+            state=start,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert spawner.calls == []
+        assert AlertDetail.INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID.value not in [
+            p.detail for p in sink.payloads
+        ]
+
+    def test_a_raising_boot_retry_spawn_is_contained_and_pages_spawn_failed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sink = _RecordingAlertSink()
+
+        def _boom(**_kw: object) -> FakePopen:
+            raise OSError("exec format error secret")
+
+        ports = _make_ports(
+            spawn=_boom,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: False,
+        )
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            pid, _log, _state = _do_boot_retry(
+                ports=ports,
+                state=_boot_retry_ready_state(_utc(17, 0)),
+                now=_utc(17, 10),
+                tracked_pid=None,
+                node_log=None,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+        assert pid is None
+        assert (
+            "TRADE_SUPERVISOR_MIDDAY_WATCH",
+            "CRITICAL",
+            AlertDetail.LAUNCH_SPAWN_FAILED.value,
+        ) in [(p.event, p.severity, p.detail) for p in sink.payloads]
+        messages = " | ".join(r.getMessage() for r in caplog.records)
+        assert "boot_retry_spawn_failed error_type=OSError" in messages
+        assert "secret" not in messages
+
+
+class TestDurableAlertSend:
+    """The real durable send: delivered (2xx) or queued in the alert outbox is durable."""
+
+    @staticmethod
+    def _sink(status: int) -> Any:
+        from breezy.runtime.health import WebhookAlertSink
+
+        client = httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(status)))
+        return WebhookAlertSink("https://alerts.example.invalid/hook", client=client)
+
+    @staticmethod
+    def _payload() -> AlertPayload:
+        return AlertPayload(
+            severity="CRITICAL", event="TRADE_SUPERVISOR_X", site="trade_node", detail="d"
+        )
+
+    def test_a_2xx_is_durable(self, tmp_path: Path) -> None:
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(200), self._payload(), alerts_root=tmp_path, egress_configured=True
+            )
+            is True
+        )
+
+    def test_a_failed_post_that_was_queued_in_the_outbox_is_durable(self, tmp_path: Path) -> None:
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(500), self._payload(), alerts_root=tmp_path, egress_configured=True
+            )
+            is True
+        )
+        assert list((tmp_path / "outbox").iterdir())
+
+    def test_a_failed_post_with_an_unwritable_outbox_is_not_durable(self, tmp_path: Path) -> None:
+        blocker = tmp_path / "root_is_a_file"
+        blocker.write_text("x")
+        assert (
+            _ts_module.durable_alert_send(
+                self._sink(500), self._payload(), alerts_root=blocker, egress_configured=True
+            )
+            is False
+        )
+
+    def test_an_unconfigured_egress_cannot_block_the_launch(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        assert (
+            _ts_module.durable_alert_send(
+                sink, self._payload(), alerts_root=tmp_path, egress_configured=False
+            )
+            is True
+        )
+        assert len(sink.payloads) == 1
+
+    def test_default_ports_wire_the_real_durable_send(self) -> None:
+        ports = _ts_module.default_ports(alert_sink=_RecordingAlertSink())
+        assert ports.send_alert_durable is _ts_module.durable_alert_send

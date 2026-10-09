@@ -34,6 +34,7 @@ from breezy.runtime.submit_intent import RetirementReason
 
 __all__ = [
     "SupervisorDecodeMarker",
+    "discard_supervisor_decode_marker",
     "read_supervisor_decode_marker",
     "supervisor_admits_retirement_reason",
     "supervisor_decode_marker_path",
@@ -97,6 +98,16 @@ def write_supervisor_decode_marker(
         except OSError:
             pass
         raise
+
+
+def discard_supervisor_decode_marker(store_path: Path) -> None:
+    """Best-effort removal, never raises: after a failed write no stale marker
+    (a previous incarnation's, or this one's earlier write) may survive to admit
+    a reason this supervisor never advertised."""
+    try:
+        supervisor_decode_marker_path(store_path).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _is_plain_int(value: object) -> bool:

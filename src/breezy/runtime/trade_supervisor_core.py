@@ -342,6 +342,10 @@ class AlertDetail(str, Enum):
     #: no-id resolver. Neither names an operator.
     INTENT_OPEN_LAUNCH_TO_RESOLVE = "intent_open_launch_to_resolve"
     INTENT_OPEN_LAUNCH_TO_RESOLVE_NO_ID = "intent_open_launch_to_resolve_no_id"
+    #: [AMBIG-LATCH-RESUME Phase A review] The supervisor could not write its
+    #: decode marker; any stale marker was discarded, so a node fails closed on
+    #: the new retirement reason until the next supervisor start.
+    DECODE_MARKER_WRITE_FAILED = "decode_marker_write_failed"
 
 
 class StopPriorAction(str, Enum):

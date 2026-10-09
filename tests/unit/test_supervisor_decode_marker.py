@@ -19,6 +19,7 @@ import pytest
 
 import breezy.runtime.trade_supervisor as ts
 from breezy.runtime.build_sha import BUILD_REVISION_ENV_VAR
+from breezy.runtime.health import AlertPayload
 from breezy.runtime.stop_intent_marker import process_start_ticks
 from breezy.runtime.submit_intent import RetirementReason
 from breezy.runtime.supervisor_decode_marker import (
@@ -241,3 +242,53 @@ class TestMainWritesTheMarker:
         assert failed == ["supervisor_decode_marker_write_failed error_type=OSError"]
         assert "disk full" not in " ".join(messages)  # type name only, never the message
         assert supervisor_admits_retirement_reason(store_path, NEW_REASON) is False
+
+
+class TestMarkerWriteFailureIsLoudAndLeavesNoStaleMarker:
+    """Review fix 2: a failed write alerts WARN (type name only) and removes any
+    pre-existing marker so a stale one cannot admit a reason."""
+
+    def test_failure_emits_a_warn_and_unlinks_the_stale_marker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        write_supervisor_decode_marker(store_path, revision="aaaaaaaaaaaa")  # stale, live pid
+        assert supervisor_admits_retirement_reason(store_path, NEW_REASON) is True
+        monkeypatch.setenv("POLYMARKET_US_EXEC_STATE_DB", str(store_path))
+        monkeypatch.setattr(ts, "configure_supervisor_logging", lambda _d: None)
+        monkeypatch.setattr(ts, "_run_forever", lambda **_kw: None)
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.payloads: list[AlertPayload] = []
+
+            def emit(self, payload: AlertPayload) -> None:
+                self.payloads.append(payload)
+
+        sink = _Sink()
+        monkeypatch.setattr(ts, "resolve_alert_sink", lambda *a, **k: sink)
+
+        def _raising(*_a: object, **_kw: object) -> None:
+            raise OSError("disk full secret")
+
+        monkeypatch.setattr(ts, "write_supervisor_decode_marker", _raising)
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.trade_supervisor"):
+            assert ts.main([SUPERVISOR_ARGV_TOKEN], log_dir=tmp_path / "logs") == ts.EXIT_OK
+        assert not supervisor_decode_marker_path(store_path).exists()
+        assert supervisor_admits_retirement_reason(store_path, NEW_REASON) is False
+        [payload] = sink.payloads
+        assert (payload.severity, payload.event) == (
+            "WARN",
+            "TRADE_SUPERVISOR_DECODE_MARKER_WRITE_FAILED",
+        )
+        assert "secret" not in repr(payload) + " ".join(r.getMessage() for r in caplog.records)
+
+    def test_discard_is_best_effort_and_idempotent(self, tmp_path: Path) -> None:
+        from breezy.runtime.supervisor_decode_marker import discard_supervisor_decode_marker
+
+        store_path = tmp_path / "s.sqlite3"
+        discard_supervisor_decode_marker(store_path)  # absent: no raise
+        write_supervisor_decode_marker(store_path, revision=REVISION)
+        discard_supervisor_decode_marker(store_path)
+        assert not supervisor_decode_marker_path(store_path).exists()
