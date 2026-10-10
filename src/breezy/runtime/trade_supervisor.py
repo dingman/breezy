@@ -456,8 +456,10 @@ def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> b
 
     A corrupt table is ``False`` (today's refusal stays): the node's resolver
     treats corrupt as OPEN-unknown and never retires it. For a v2 table it is
-    also ``False`` when any slot is unreadable or any open slot has no durable
-    resolver context (EXEC-PAR WP5a); a v1 record needs no context read. Same
+    also ``False`` when any slot is unreadable or any open slot has no durable,
+    decodable resolver context -- the same classification as
+    :func:`probe_open_intent_shape` (EXEC-PAR WP5a); a v1 record needs no
+    context read. Same
     no-live-node guard and fresh read-only connection as
     :func:`probe_open_intent`.
     """
@@ -474,10 +476,11 @@ def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> b
             return False
         if table.version != 2:
             return True
-        return all(
-            store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{slot.intent_id}") is not None
-            for slot in table.open
-        )
+        try:
+            shapes = {_context_shape(store, slot.intent_id) for slot in table.open}
+        except ValueError:
+            return False  # a garbled context blob is not resolvable
+        return shapes <= {OpenIntentShape.WITH_ID, OpenIntentShape.NO_ID}
 
 
 #: Worst-first order for combining the per-slot shapes of a v2 table.
@@ -528,7 +531,8 @@ def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIn
             if record is None:
                 return OpenIntentShape.UNKNOWN
             return _context_shape(store, record.intent_id)
-    except Exception:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
+    except Exception as exc:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
+        logger.warning("open_intent_shape_probe_failed error_type=%s", type(exc).__name__)
         return OpenIntentShape.UNKNOWN
 
 

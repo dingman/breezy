@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+import pytest
 
 import breezy.runtime.trade_supervisor as ts
 from breezy.analysis.labeling.prelaunch_intents import (
     IntentObservation,
     observe_open_slots_post_stop,
+    observe_post_stop_from_store,
 )
 from breezy.domain.exec_intent import RESOLVER_CONTEXT_KEY_PREFIX
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -315,3 +319,52 @@ def test_rollback_drill_after_drain_and_reset_old_reader_sees_valid_v1_retired(
     assert breaker is not None
     assert json.loads(breaker)["halted"] is None
     store.close()
+
+
+def test_probe_resolvable_v2_garbled_context_is_not_resolvable(tmp_path: Path) -> None:
+    store_path = _store(tmp_path)
+    _put(store_path, _v2_bytes([_open(1), _open(2, slug="slug-b")]))
+    _context(store_path, _id(1), "ord-1")
+    _context(store_path, _id(2), "ord-2")
+    assert ts.probe_open_intent_resolvable(store_path, node_pid=None) is True
+    for garbage in (b"null", b"{not json", b'{"venueOrderId": 7}'):
+        with SqliteStateStore(store_path) as store:
+            store.set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{_id(2)}", garbage)
+        assert ts.probe_open_intent_resolvable(store_path, node_pid=None) is False, garbage
+        assert ts.probe_open_intent_shape(store_path, node_pid=None) is OpenIntentShape.UNKNOWN
+
+
+def test_probe_shape_logs_the_swallowed_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store_path = _store(tmp_path)
+    _put(store_path, _v2_bytes([_open(1), _open(2, slug="slug-b")]))
+    with SqliteStateStore(store_path) as store:
+        store.set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{_id(1)}", b"{not json")
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.trade_supervisor"):
+        shape = ts.probe_open_intent_shape(store_path, node_pid=None)
+    assert shape is OpenIntentShape.UNKNOWN
+    assert any("JSONDecodeError" in r.getMessage() for r in caplog.records)
+
+
+def test_post_stop_observation_caller_classifies_v2_and_keeps_v1(tmp_path: Path) -> None:
+    """The store-backed caller reads the table: v2 is classified, v1 results are unchanged."""
+    store_path = _store(tmp_path)
+
+    def observe() -> IntentObservation:
+        return observe_post_stop_from_store(
+            store_path,
+            stop_signal_present=True,
+            node_pid=lambda: None,
+            is_ambiguous=lambda _i: False,
+        )
+
+    assert observe() is IntentObservation.NONE  # absent
+    _put(store_path, _open(1, slug=None).to_bytes())
+    assert observe() is IntentObservation.OPEN  # v1, as before
+    _put(store_path, _v2_bytes([_open(1), _open(2, slug="slug-b")]))
+    assert observe() is IntentObservation.OPEN  # v2 classified, not UNKNOWN
+    _put(store_path, _v2_bytes([_open(1)], {"odd": b"{}"}))
+    assert observe() is IntentObservation.AMBIGUOUS
+    _put(store_path, b'{"v":2,"slots":"x"}')
+    assert observe() is IntentObservation.UNKNOWN  # corrupt

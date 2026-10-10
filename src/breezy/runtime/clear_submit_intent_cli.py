@@ -8,7 +8,8 @@ EXEC-PAR (plan r5 3.1, 3.6) adds, all node-down and never raising uncaught:
 
 * ``--list`` the slots of a v1 or v2 table;
 * ``--intent-id`` to clear one slot of a v2 table;
-* ``--slot-key KEY --ack-unreadable-slot`` to drop an unreadable slot, only
+* ``--slot-key KEY --ack-unreadable-slot`` (with ``--resolution``/``--evidence``,
+  the same sufficiency gate as a readable clear) to drop an unreadable slot, only
   after the ORIGINAL table bytes were dumped (0600, fsynced with their
   directory) to ``<store>.unreadable_slot.<sha256(key)[:16]>.<ts>.bin``;
 * ``--reset-entry-halt --ack-held-positions-reviewed`` to clear the breaker.
@@ -17,9 +18,11 @@ EXEC-PAR (plan r5 3.1, 3.6) adds, all node-down and never raising uncaught:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -37,6 +40,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLatch,
     SubmitIntentLockHeld,
     SubmitIntentLockNotHeld,
+    SubmitIntentMismatch,
     decode_slot_table,
     open_submit_intent_latch,
 )
@@ -64,11 +68,13 @@ _EVIDENCE_MODE: Final[int] = 0o600
 _Action = Callable[[SubmitIntentLatch, SqliteStateStore], int]
 
 
-def _load_evidence(path: Path) -> dict[str, object]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _load_evidence(path: Path) -> tuple[dict[str, object], str]:
+    """The evidence object and the SHA-256 of the exact bytes it was parsed from."""
+    data = path.read_bytes()
+    raw = json.loads(data.decode("utf-8"))
     if not isinstance(raw, dict):
         raise TypeError("evidence artefact must be a JSON object")
-    return raw
+    return raw, hashlib.sha256(data).hexdigest()
 
 
 def _evidence_is_sufficient(payload: Mapping[str, object], resolution: str) -> str | None:
@@ -136,10 +142,14 @@ def _write_evidence(path: Path, content: bytes) -> None:
         raise
 
 
-def _evidence_bytes(key: str, original: bytes, slot_text: bytes) -> bytes:
+def _evidence_bytes(
+    key: str, original: bytes, slot_text: bytes, resolution: str, resolution_sha256: str
+) -> bytes:
     """One header line, then the ORIGINAL table bytes verbatim to end of file."""
     header = {
         "key": key,
+        "resolution": resolution,
+        "resolution_evidence_sha256": resolution_sha256,
         "original_bytes_sha256": hashlib.sha256(original).hexdigest(),
         "slot_canonicalised_json_label": (
             "canonicalised (re-serialised) copy of the slot, for convenience; the "
@@ -213,7 +223,14 @@ def _clear_action(intent_id: str | None, out: TextIO, err: TextIO) -> _Action:
     return run
 
 
-def _slot_key_action(key: str, store_path: Path, now_ns: int, out: TextIO, err: TextIO) -> _Action:
+def _slot_key_action(
+    key: str,
+    store_path: Path,
+    now_ns: int,
+    resolution: tuple[str, str],
+    out: TextIO,
+    err: TextIO,
+) -> _Action:
     def run(latch: SubmitIntentLatch, store: SqliteStateStore) -> int:
         original, table = _read_table(store)
         unreadable = dict(table.unreadable)
@@ -221,15 +238,21 @@ def _slot_key_action(key: str, store_path: Path, now_ns: int, out: TextIO, err: 
             print(f"{_PREFIX}: {key!r} is not an unreadable slot of the table; refused", file=err)
             return EXIT_REFUSED
         evidence = _evidence_path(store_path, key, now_ns)
+        content = _evidence_bytes(key, original, unreadable[key], *resolution)
         try:
-            _write_evidence(evidence, _evidence_bytes(key, original, unreadable[key]))
+            _write_evidence(evidence, content)
         except OSError as exc:
             print(
-                f"{_PREFIX}: evidence dump failed ({type(exc).__name__}); slot kept; refused",
+                f"{_PREFIX}: evidence dump failed ({_error_detail(exc)}); slot kept; refused",
                 file=err,
             )
             return EXIT_REFUSED
-        latch.discard_unreadable_slot(key, now_ns=now_ns)
+        latch.discard_unreadable_slot(
+            key,
+            now_ns=now_ns,
+            evidence_path=str(evidence),
+            evidence_sha256=hashlib.sha256(content).hexdigest(),
+        )
         print(f"{_PREFIX}: removed unreadable slot key={key} evidence={evidence}", file=out)
         return EXIT_OK
 
@@ -247,6 +270,14 @@ def _reset_action(out: TextIO) -> _Action:
     return run
 
 
+def _error_detail(exc: Exception) -> str:
+    """Type, errno name and path for an OS or store error (never just the type)."""
+    if isinstance(exc, OSError):
+        name = errno.errorcode.get(exc.errno, "?") if exc.errno is not None else "?"
+        return f"{type(exc).__name__} {name} {exc.strerror} path={exc.filename}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _run_under_lock(store_path: Path, action: _Action, err: TextIO) -> int:
     store = SqliteStateStore(store_path)
     try:
@@ -261,6 +292,12 @@ def _run_under_lock(store_path: Path, action: _Action, err: TextIO) -> int:
     except SubmitIntentCorrupt:
         print(f"{_PREFIX}: the slot table is corrupt; refused", file=err)
         return EXIT_REFUSED
+    except SubmitIntentMismatch:
+        print(f"{_PREFIX}: the slot is no longer present in the table; refused", file=err)
+        return EXIT_REFUSED
+    except (OSError, sqlite3.Error) as exc:
+        print(f"{_PREFIX}: store error ({_error_detail(exc)}); refused", file=err)
+        return EXIT_REFUSED
     finally:
         store.close()
 
@@ -271,7 +308,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution", help="order-id=<id> or no-order-exists")
     parser.add_argument("--evidence", type=Path, help="path to a positions + fill-record artefact")
     parser.add_argument("--intent-id", help="the slot to clear (required for a v2 table)")
-    parser.add_argument("--list", action="store_true", help="list the slots and exit")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list the slots and exit; takes the intent lock, so it refuses while the node is up",
+    )
     parser.add_argument("--slot-key", help="an unreadable slot to drop (node down)")
     parser.add_argument("--ack-unreadable-slot", action="store_true")
     parser.add_argument("--reset-entry-halt", action="store_true")
@@ -279,21 +320,31 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _clear_with_evidence(
-    args: argparse.Namespace, store_path: Path, out: TextIO, err: TextIO
-) -> int:
+def _checked_evidence_sha256(args: argparse.Namespace, err: TextIO) -> str | None:
+    """The evidence file's SHA-256 once it passes the sufficiency gate, else ``None`` (refused)."""
+    if args.resolution is None or args.evidence is None:
+        print(f"{_PREFIX}: --resolution and --evidence are required; refused", file=err)
+        return None
     evidence_path: Path = args.evidence
     if not evidence_path.is_file():
         print(f"{_PREFIX}: evidence file is missing; refused", file=err)
-        return EXIT_REFUSED
+        return None
     try:
-        evidence = _load_evidence(evidence_path)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        evidence, digest = _load_evidence(evidence_path)
+    except (OSError, ValueError, TypeError) as exc:
         print(f"{_PREFIX}: evidence unreadable ({exc}); refused", file=err)
-        return EXIT_REFUSED
+        return None
     evidence_reason = _evidence_is_sufficient(evidence, args.resolution)
     if evidence_reason is not None:
         print(f"{_PREFIX}: {evidence_reason}; refused", file=err)
+        return None
+    return digest
+
+
+def _clear_with_evidence(
+    args: argparse.Namespace, store_path: Path, out: TextIO, err: TextIO
+) -> int:
+    if _checked_evidence_sha256(args, err) is None:
         return EXIT_REFUSED
     return _run_under_lock(store_path, _clear_action(args.intent_id, out, err), err)
 
@@ -308,7 +359,11 @@ def _drop_unreadable(
     if not is_valid_slot_key(key):
         print(f"{_PREFIX}: --slot-key is not a valid slot key; refused", file=err)
         return EXIT_REFUSED
-    return _run_under_lock(store_path, _slot_key_action(key, store_path, now_ns, out, err), err)
+    digest = _checked_evidence_sha256(args, err)
+    if digest is None:
+        return EXIT_REFUSED
+    action = _slot_key_action(key, store_path, now_ns, (args.resolution, digest), out, err)
+    return _run_under_lock(store_path, action, err)
 
 
 def clear_submit_intent(
@@ -340,6 +395,12 @@ def clear_submit_intent(
         return EXIT_REFUSED
     if not args.yes:
         print(f"{_PREFIX}: --yes is required; refused", file=err)
+        return EXIT_REFUSED
+    if args.reset_entry_halt and (args.resolution is not None or args.evidence is not None):
+        print(
+            f"{_PREFIX}: --resolution/--evidence do not apply to --reset-entry-halt; refused",
+            file=err,
+        )
         return EXIT_REFUSED
     if args.reset_entry_halt and not args.ack_held_positions_reviewed:
         print(f"{_PREFIX}: --ack-held-positions-reviewed is required; refused", file=err)

@@ -1096,33 +1096,48 @@ class SubmitIntentLatch:
                 ),
             )
 
-    def discard_unreadable_slot(self, key: str, *, now_ns: int) -> None:
+    def discard_unreadable_slot(
+        self, key: str, *, now_ns: int, evidence_path: str, evidence_sha256: str
+    ) -> None:
         """Operator recovery (node down): drop the unreadable slot ``key``.
 
         Only the recovery CLI calls this, and only after the original table
-        bytes were dumped durably. Every other slot is re-emitted unchanged.
-        Removing the last slot of the table writes a synthetic v1 RETIRED
-        record (``OPERATOR_CLEARED``, id/fingerprint derived from ``key``) so
-        an older reader still sees a valid record. A key that is not an
-        unreadable slot raises :class:`SubmitIntentMismatch`.
+        bytes were dumped durably to ``evidence_path`` (whose SHA-256 is
+        ``evidence_sha256``). Like :meth:`retire`, a history entry is written
+        BEFORE the table: a valid RETIRED record (``OPERATOR_CLEARED``) whose
+        id derives from ``key`` and whose fingerprint is the dump hash, plus
+        trailing ``unreadable_slot_key``/``evidence_path``/``evidence_sha256``
+        keys (the record decoder ignores them). Every other slot is re-emitted
+        unchanged; removing the last slot makes that same record the v1
+        RETIRED record, so an older reader still sees a valid one. A key that
+        is not an unreadable slot raises :class:`SubmitIntentMismatch`.
         """
         self._require_held()
+        if _FINGERPRINT_RE.fullmatch(evidence_sha256) is None:
+            raise SubmitIntentInvalidFingerprint()
         with self._mutex:
             table = self._read_table()
             rest = tuple((k, v) for k, v in table.unreadable if k != key)
             if len(rest) == len(table.unreadable):
                 raise SubmitIntentMismatch(key, None, None)
-            last: SubmitIntent | None = None
-            if not rest and not table.open:
-                digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-                last = SubmitIntent(
-                    intent_id=digest[:32],
-                    fingerprint=digest,
-                    created_ns=now_ns,
-                    state=SubmitIntentState.RETIRED,
-                    retired_ns=now_ns,
-                    retirement_reason=RetirementReason.OPERATOR_CLEARED,
-                )
+            record = SubmitIntent(
+                intent_id=hashlib.sha256(key.encode("utf-8")).hexdigest()[:32],
+                fingerprint=evidence_sha256,
+                created_ns=now_ns,
+                state=SubmitIntentState.RETIRED,
+                retired_ns=now_ns,
+                retirement_reason=RetirementReason.OPERATOR_CLEARED,
+            )
+            history = {
+                **record.to_payload(),
+                "unreadable_slot_key": key,
+                "evidence_path": evidence_path,
+                "evidence_sha256": evidence_sha256,
+            }
+            self._store.set(
+                history_key(record.intent_id), json.dumps(history, sort_keys=True).encode("utf-8")
+            )
+            last = record if not rest and not table.open else None
             self._store.set(
                 CURRENT_INTENT_KEY,
                 self._encode(replace(table, unreadable=rest, last=last)),

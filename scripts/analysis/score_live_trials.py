@@ -197,7 +197,6 @@ _KNOWN_INTENT_STATES = frozenset({"OPEN", "RETIRED"})
 #: Duplicated literal (never imported, C10): the EXEC-PAR slot table's `"v"`.
 _SLOT_TABLE_VERSION = 2
 
-
 class NodeStorePreflightRefused(Exception):
     """`node_store_path_check` returned MISMATCH or DISCOVERY_FAILED
     (REVISE-1/REVISE-4): `self.reason` is `node_store_mismatch` or
@@ -206,7 +205,6 @@ class NodeStorePreflightRefused(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
-
 
 #: B1 (v2-only live-provenance sidecar, ruling Q4
 #: `docs/evidence/grok_partial_fill_ruling_2026-09-04.md`): the 17-column
@@ -373,7 +371,6 @@ def _filled_trial_from_json(row: Mapping[str, Any]) -> FilledTrial:
         scheduled_release_at_ns=int(row["scheduled_release_at_ns"]),
         venue_settlement_tmax_f=row.get("venue_settlement_tmax_f"),
     )
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class UnresolvedTake:
@@ -757,8 +754,7 @@ def score_live_trials(
             extra_refusals.append(malformed_qty)
             continue
         fee_reconciled, venue_order_id, skip_ask_guard = fee_reconciled_by_trial_id.get(
-            trial.trial_id,
-            (True, "", False),
+            trial.trial_id, (True, "", False),
         )
         no_side_residual = no_side_residual_by_trial_id.get(trial.trial_id, False)
         exclusion = _admit_fill(
