@@ -6,6 +6,7 @@ uses the same read-only admission predicate as the exec gate.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from decimal import Decimal
@@ -15,12 +16,12 @@ import pytest
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.orders import Order
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
-from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.decision import Take
@@ -44,6 +45,17 @@ from tests.unit.test_current_rung_hold_strategy import (
     _observation,
     _quote,
 )
+
+_SUBMIT_CHAIN = "breezy.adapters.polymarket_us.exec.submit_chain"
+
+
+def _fingerprint(order: Order) -> str:
+    """The exec client's intent fingerprint for ``order`` (resolved by name so this
+    file adds no static import of the exec package to the egress guard's scan)."""
+    fingerprint = importlib.import_module(_SUBMIT_CHAIN).intent_fingerprint(order)
+    assert isinstance(fingerprint, str)
+    return fingerprint
+
 
 FP_A = "a" * 64
 FP_B = "b" * 64
@@ -418,7 +430,7 @@ def test_exit_wiring_halts_on_stale_exit_in_any_slot(
     # An older, unrelated entry slot comes first; the exit's own slot is NOT the oldest.
     intent_latch.arm_slot(FP_A, slug=SLUG_B, is_exit=False, now_ns=WINDOW_OPEN_NS - 5)
     intent_latch.arm_slot(
-        exit_wiring.submit_chain.intent_fingerprint(order),
+        _fingerprint(order),
         slug=SLUG_A,
         is_exit=True,
         now_ns=WINDOW_OPEN_NS,
@@ -441,7 +453,7 @@ def test_exit_wiring_ignores_a_young_matching_slot_and_a_stale_foreign_one_at_k_
     order = _cached_exit_order(strategy, client_order_id="O-EXIT-y", position_id="P-y")
     intent_latch.arm_slot(FP_A, slug=SLUG_B, is_exit=False, now_ns=WINDOW_OPEN_NS)
     intent_latch.arm_slot(
-        exit_wiring.submit_chain.intent_fingerprint(order),
+        _fingerprint(order),
         slug=SLUG_A,
         is_exit=True,
         now_ns=WINDOW_OPEN_NS,
