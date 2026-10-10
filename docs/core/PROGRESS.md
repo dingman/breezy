@@ -64,7 +64,7 @@ Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
 | F6 bridge | permanent veto: RULING_FQ-v2-NO-TRADE_2026-10-08 (FQ-R8-2 G-B); F6b CANCELLED |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
 | F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
-| F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07; readiness build SHELVED 10-09 (Stage −1 d̂_p90 0.49–0.74 > 0.30, serial latch; DECISION_READINESS_BUILD_SHELVED) |
+| F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07; readiness build SHELVED 10-09 (serial latch d̂_p90 0.49–0.74). EXEC-PAR (parallel slot intents) plan r1 NOT-READY ×3 → r2 in progress |
 Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 live stages); owes HALT_INERT test (R8-2f).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
@@ -89,7 +89,6 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 |---|---|---|---|
 | CF-12-W3 | LOW | r5.1 READY; Stage 0 10-09 STOP (tests/unit FIN 1308>1288) → blocked on W3e | CF-12 |
 | CF-12-W3e | LOW | PLAN r1 drafted (`BP/CF-12-W3e_plan_r1.md`; measured FIN tests/unit 1176/1285); peer review PAUSED — ROI priority 10-09 (no trading lever) | W3 Stage 0 |
-| SELF-CHECK-ORDERS-OFF | LOW | 17:05Z self-check pages CRITICAL on a deliberately orders-off node (`derive_self_check_facts` ignores `orders_not_requested_seen`); needs plan | SUP review 10-08 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |
@@ -101,7 +100,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | A LIVE (43b03682, U2 EXIT=0); B merged 004f306f, activates at 16:50Z launch. Owed: §5.4 boot proof (`no_id_retire_admitted=True`), in-service proof at next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (LOW) |
+| AMBIG-LATCH-RESUME | A+B LIVE; §5.4 boot proof DONE 10-10 16:50Z (`no_id_retire_admitted=True`). Owed: in-service proof at next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (LOW) |
 | SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
