@@ -38,6 +38,7 @@ from breezy.runtime.submit_intent import (
     BREAKER_KEY,
     CURRENT_INTENT_KEY,
     SubmitIntent,
+    SubmitIntentAdmissionDenied,
     decode_slot_table,
 )
 from breezy.runtime.submit_intent_slots import BreakerRecord, parse_breaker
@@ -175,6 +176,46 @@ async def test_supervisor_rolled_back_mid_run_blocks_v2_write(
             assert len(sender.calls) == 3
 
 
+@pytest.mark.asyncio
+async def test_rolled_back_supervisor_refuses_the_one_to_two_transition_in_arm_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """One slot at v1, supervisor rolled back, a SECOND ``arm_slot``: refused by the arbiter.
+
+    ``arm_slot`` is called directly so the ``admission_refusal`` pre-check cannot
+    be what refuses it: only the arbiter-side predicate inside ``arm_slot`` stands
+    between a rolled-back supervisor and a v2 table it cannot decode.
+    """
+    store_path = tmp_path / "exec_state.db"
+    supervisor = _Supervisor(store_path)
+    supervisor.advertise_v2()
+    with caps():
+        async with par_rig(
+            tmp_path,
+            monkeypatch,
+            sender=ScriptedSender(),
+            max_slots=2,
+            v2_predicate=supervisor.predicate,
+            store_path=store_path,
+        ) as rig:
+            arm_open_intent(rig, 0, venue_order_id="ord-a")
+            before = rig.latch._store.get(CURRENT_INTENT_KEY)
+            assert decode_slot_table(before).version == 1
+
+            supervisor.roll_back("marker_without_slot_schema")
+            with pytest.raises(SubmitIntentAdmissionDenied) as denied:
+                rig.latch.arm_slot(
+                    "a" * 64, slug=rig.slug(1), is_exit=False, now_ns=rig.clock.timestamp_ns()
+                )
+
+            assert denied.value.reason == "v2_predicate"
+            after = rig.latch._store.get(CURRENT_INTENT_KEY)
+            assert after == before, "the persisted bytes are unchanged"
+            assert decode_slot_table(after).version == 1, "still a v1 table"
+
+
 # ---------------------------------------------------------------------------
 # the rollback drill
 # ---------------------------------------------------------------------------
@@ -243,6 +284,11 @@ async def test_drain_then_reset_then_rollback_drill(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
+    """Drain, reset (real CLI, node down), verify ``halted: null``, THEN run K = 1.
+
+    The stand-in for the "old reader" is the CURRENT code at K = 1 plus
+    ``SubmitIntent.from_bytes`` on the stored bytes; no historical build is run.
+    """
     store_path = tmp_path / "exec_state.db"
     sender = ScriptedSender(ok(zero_fill_body(order_id="ord-k1")))
     with caps():
@@ -298,6 +344,52 @@ async def test_drain_then_reset_then_rollback_drill(
             assert again.latch.admission_refusal(again.slug(2), False) is None
         finally:
             await again.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_to_exactly_one_open_slot_rewrites_the_table_as_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Drain to <= 1 open (here exactly 1): v1 bytes whose record is still OPEN.
+
+    The "old reader" stand-in is the current code at K = 1 and
+    ``SubmitIntent.from_bytes``.
+    """
+    store_path = tmp_path / "exec_state.db"
+    with caps():
+        node = await build_par_rig(
+            tmp_path, monkeypatch, sender=ScriptedSender(), max_slots=2, store_path=store_path
+        )
+        ids = [
+            arm_open_intent(node, 0, venue_order_id="ord-a", registered=True),
+            arm_open_intent(node, 1, venue_order_id="ord-b", registered=True),
+        ]
+        assert decode_slot_table(node.latch._store.get(CURRENT_INTENT_KEY)).version == 2
+        wire_order(node, "ord-a", 0, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        wire_order(node, "ord-b", 1, state="ORDER_STATE_NEW", cum_quantity=0)
+        wire_positions(node, {})
+        for intent_id in ids:
+            backdate(node.client, intent_id)
+        await run_passes(node.client, count=6)
+
+        assert not node.latch.is_open_intent(ids[0])
+        assert node.latch.is_open_intent(ids[1])
+        raw = node.latch._store.get(CURRENT_INTENT_KEY)
+        assert raw is not None
+        assert decode_slot_table(raw).version == 1, "rewritten as v1 once <= 1 is open"
+        record = SubmitIntent.from_bytes(raw)
+        assert record.state.value == "OPEN" and record.intent_id == ids[1]
+        await node.close()
+
+        old = await build_par_rig(
+            tmp_path, monkeypatch, sender=ScriptedSender(), max_slots=1, store_path=store_path
+        )
+        try:
+            assert old.latch.admission_refusal(old.slug(2), False) == "slot_open"
+        finally:
+            await old.close()
 
 
 @pytest.mark.asyncio
