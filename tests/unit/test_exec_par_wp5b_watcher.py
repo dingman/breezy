@@ -31,6 +31,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.runtime import breaker_watcher
 from breezy.runtime.breaker_watcher import (
+    COUNTER_RESEND_MIN_NS,
     NO_CLIENT_ERROR_TICKS,
     REALERT_INTERVAL_NS,
     STUCK_AGE_NS,
@@ -461,7 +462,8 @@ async def test_refusal_counters_alert_on_value_change_at_every_k(max_slots: int)
     sink = _Sink()
     latch = _RecordingLatch()
     actor = build_exec_watcher(max_slots, latch=latch, alert_sink=sink)
-    _register(actor, TestClock())
+    clock = TestClock()
+    _register(actor, clock)
     client = _Client()
     actor.bind_client(lambda: client)
 
@@ -477,6 +479,7 @@ async def test_refusal_counters_alert_on_value_change_at_every_k(max_slots: int)
     assert len(sink.events("EXEC_PAR_NO_FILL_RETIRE_REFUSAL")) == 1
 
     client.stuck_refusals_after_settle_failure_total = 2
+    clock.set_time(COUNTER_RESEND_MIN_NS)  # a change re-sends once the minimum gap has passed
     await actor.tick()
     assert len(sink.events("EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE")) == 2
     assert len(sink.events("EXEC_PAR_NO_FILL_RETIRE_REFUSAL")) == 1
@@ -530,6 +533,15 @@ _CLIENT_SOURCE = Path(__file__).resolve().parents[2] / (
 )
 
 
+def _view_member_names() -> set[str]:
+    """Member names of ``ExecClientView``, from its class body (no runtime introspection)."""
+    tree = ast.parse(Path(inspect.getfile(breaker_watcher)).read_text(encoding="utf-8"))
+    (view_cls,) = [
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ExecClientView"
+    ]
+    return {fn.name for fn in view_cls.body if isinstance(fn, ast.FunctionDef)}
+
+
 def test_real_exec_client_exposes_every_watcher_view_property() -> None:
     """AST of the real class (importing ``exec`` is barred by barrier X1)."""
     tree = ast.parse(_CLIENT_SOURCE.read_text(encoding="utf-8"))
@@ -544,7 +556,7 @@ def test_real_exec_client_exposes_every_watcher_view_property() -> None:
         if isinstance(fn, ast.FunctionDef)
         and any(isinstance(d, ast.Name) and d.id == "property" for d in fn.decorator_list)
     }
-    view = set(ExecClientView.__protocol_attrs__)  # type: ignore[attr-defined]
+    view = _view_member_names()
     assert {
         "no_fill_retire_refusals_total",
         "stuck_refusals_after_settle_failure_total",
@@ -718,3 +730,24 @@ async def test_a_client_getter_returning_none_logs_error_after_five_ticks_then_h
         clock.set_time(NOW + REALERT_INTERVAL_NS)
         await actor.tick()
         assert errors() == 2  # hourly after that
+
+
+@pytest.mark.asyncio
+async def test_a_rising_counter_resends_at_most_every_300_seconds() -> None:
+    assert COUNTER_RESEND_MIN_NS == 300 * SEC
+    client = _Client(stuck_refusals_after_settle_failure_total=1)
+    actor, _, sink, clock = _watcher(client)
+    for step in range(60):  # a storm: a new value every 5 s for 295 s
+        clock.set_time(NOW + step * 5 * SEC)
+        client.stuck_refusals_after_settle_failure_total = step + 1
+        await actor.tick()
+    assert len(sink.events("EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE")) == 1
+    clock.set_time(NOW + COUNTER_RESEND_MIN_NS)
+    client.stuck_refusals_after_settle_failure_total = 99
+    await actor.tick()
+    sent = sink.events("EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE")
+    assert len(sent) == 2 and "=99" in sent[1].detail
+    clock.set_time(NOW + COUNTER_RESEND_MIN_NS + 5 * SEC)
+    client.stuck_refusals_after_settle_failure_total = 100
+    await actor.tick()
+    assert len(sink.events("EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE")) == 2
