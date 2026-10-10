@@ -119,3 +119,26 @@ def test_admit_pure_deterministic(
     second = admit(table, slug, is_exit, k, halted, NOW)
     assert first == second
     assert before == (table.open_slots, table.unreadable_slots, table.cooloff)
+
+
+@given(
+    table_st,
+    st.sampled_from(SLUGS),
+    st.booleans(),
+    st.booleans(),
+    st.integers(2, 6),
+    st.integers(0, 2 * NOW),
+)
+def test_admit_k_gt_1_matches_oracle_for_any_table(
+    table: SlotTableView, slug: str, is_exit: bool, halted: bool, k: int, now_ns: int
+) -> None:
+    # Independent oracle written from the spec rules (regression property).
+    if table.unreadable_slots > 0 or any(s.slug == slug for s in table.open_slots):
+        denied = True
+    elif is_exit:
+        denied = False
+    else:
+        non_exit_open = len([s for s in table.open_slots if not s.is_exit])
+        in_cooloff = any(c == slug and until > now_ns for c, until in table.cooloff)
+        denied = halted or non_exit_open >= k or in_cooloff
+    assert isinstance(admit(table, slug, is_exit, k, halted, now_ns), Wait) == denied
