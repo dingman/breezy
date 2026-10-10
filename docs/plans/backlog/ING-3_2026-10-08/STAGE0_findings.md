@@ -187,3 +187,13 @@ Peers consulted: trading-bot-architect (branch choice) and performance-optimizer
 - Options, ranked: profile those two first; then per-type process parallelism (~27%); then a landed-watermark fast path, which is high risk.
 
 **ING-3 closes** only after the first post-removal 09:45Z-class run on 2026-10-10 is verified: exit 0, oom_kill 0, wall < 700 s.
+
+## Close-out (2026-10-10)
+
+The first post-rotation run without the drop-in was the **09:45Z fire**. It exited 0 after 627 s wall, below the 700 s tripwire. It deferred 4 units across 63 instances; `rss_peak_mb` was 1872 and systemd's memory peak was 4G, at MemoryHigh including page cache. There was no oom.
+
+The **10:00Z fire drained the backlog**: deferred 0, 143 s, `rss_peak_mb` 994. This is branch (a) behaviour, a one-run drain, which is well within `STALL_MIN_CONSECUTIVE_RUNS=4`.
+
+Every run from 20:00Z 10-09 through 10:00Z 10-10 exited 0 with no oom. The auto-rollback watch timer was stopped at 10:1xZ. **ING-3 CLOSED.**
+
+The residual risk carries forward: a timeout kill if a large unit is admitted late (600 + 381·k s against a 780 s limit).

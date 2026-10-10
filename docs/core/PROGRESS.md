@@ -49,7 +49,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 ### LIVE-PROOF owed
 | ID | Proof owed (exact) |
 |---|---|
-| ING-3 | Stage 0 done (30804514): mem PASS, time STOP; drop-in REMOVED 10-09 20:00Z (auto-rollback watch); pin 585d8f7e; close after 10-10 09:45Z run verified |
+| ING-3 | CLOSED 10-10: drop-in removed; 09:45Z post-rotation run exit 0 (627 s, 4 units deferred, drained 10:00Z); residual late-admit timeout risk → r3 candidate |
 | FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
 | R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
 | Failed units | portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09 |
