@@ -26,6 +26,7 @@ from typing import Final
 
 __all__ = [
     "BREAKER_ABSENT_GRACE_NS",
+    "BREAKER_FUTURE_SKEW_NS",
     "BREAKER_HEARTBEAT_MAX_AGE_NS",
     "BREAKER_KEY",
     "BREAKER_RESOLVER_PASS_MAX_AGE_NS",
@@ -49,6 +50,9 @@ _NS_PER_SECOND: Final[int] = 1_000_000_000
 BREAKER_HEARTBEAT_MAX_AGE_NS: Final[int] = 60 * _NS_PER_SECOND
 BREAKER_RESOLVER_PASS_MAX_AGE_NS: Final[int] = 600 * _NS_PER_SECOND
 BREAKER_ABSENT_GRACE_NS: Final[int] = 60 * _NS_PER_SECOND
+#: A heartbeat or resolver-pass stamp further than this ahead of "now" is a
+#: clock fault, not freshness, and counts as stale.
+BREAKER_FUTURE_SKEW_NS: Final[int] = 5 * _NS_PER_SECOND
 DEFAULT_COOLOFF_NS: Final[int] = 120 * _NS_PER_SECOND
 
 _SLOT_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^(?:[A-Za-z0-9._-]{1,128}|\?:[0-9a-f]{32})$")

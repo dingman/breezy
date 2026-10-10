@@ -320,6 +320,7 @@ def test_arm_from_empty_preserves_unexpired_cooloff(tmp_path: Path) -> None:
         assert _table(store)["cooloff"] == {"S-A": NOW + 1 + COOLOFF_NS}
         # past expiry the entry is pruned on the next write
         late = NOW + 1 + COOLOFF_NS + 1
+        latch.write_breaker_heartbeat(hb_ns=late, resolver_pass_ns=late)
         latch.arm_slot(FP, slug="S-A", is_exit=False, now_ns=late)
     assert "S-A" not in _sub(store, "cooloff")
 
@@ -328,6 +329,7 @@ def test_every_slug_open_at_boot_gets_synthetic_cooloff(tmp_path: Path) -> None:
     raw = _v2({_id(1): _rec(1, "S-A"), _id(2): _rec(2, "S-B")})
     store = Store({CURRENT_INTENT_KEY: raw})
     with _latch(store, tmp_path) as latch:
+        latch.adopt_legacy_open_slugs(lambda _i: None)
         latch.seed_boot_cooloff(now_ns=NOW)
         table = _table(store)
         assert table["v"] == 2
@@ -338,6 +340,7 @@ def test_every_slug_open_at_boot_gets_synthetic_cooloff(tmp_path: Path) -> None:
         assert latch.admission_refusal("S-B", False) == "cooloff"
     one = Store({CURRENT_INTENT_KEY: _canon(_rec(3, "S-C")).encode("utf-8")})
     with _latch(one, tmp_path) as latch:
+        latch.adopt_legacy_open_slugs(lambda _i: None)
         latch.seed_boot_cooloff(now_ns=NOW)
     assert _table(one)["v"] == 1 and _table(one)["cooloff"] == {"S-C": NOW + COOLOFF_NS}
     k1 = Store({CURRENT_INTENT_KEY: _canon(_rec(4, "S-D")).encode("utf-8")})
