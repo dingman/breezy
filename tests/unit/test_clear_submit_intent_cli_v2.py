@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
 import os
+import sqlite3
 import stat
 from collections.abc import Callable
 from pathlib import Path
@@ -27,7 +29,9 @@ from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
     SubmitIntent,
     SubmitIntentLatch,
+    SubmitIntentMismatch,
     SubmitIntentState,
+    history_key,
     open_submit_intent_latch,
 )
 from breezy.runtime.submit_intent_slots import BreakerRecord, encode_breaker, encode_v2
@@ -101,9 +105,15 @@ def _mixed() -> bytes:
     return _v2([_open(1), _open(2, "slug-b")], {UNREADABLE_KEY: b'{"junk":1}'})
 
 
-def _slot_args(key: str = UNREADABLE_KEY, *, ack: bool = True) -> list[str]:
+def _slot_args(
+    store_path: Path, key: str = UNREADABLE_KEY, *, ack: bool = True, evidence: bool = True
+) -> list[str]:
     args = ["--yes", "--slot-key", key]
-    return [*args, "--ack-unreadable-slot"] if ack else args
+    if ack:
+        args.append("--ack-unreadable-slot")
+    if evidence:
+        args += ["--resolution", "no-order-exists", "--evidence", str(_evidence(store_path.parent))]
+    return args
 
 
 def _evidence_files(store_path: Path) -> list[Path]:
@@ -162,7 +172,7 @@ def test_clear_cli_lists_slots_and_clears_by_intent_id(tmp_path: Path) -> None:
 def test_clear_cli_rejects_slot_key_with_path_characters(tmp_path: Path) -> None:
     store_path, raw = _seed(tmp_path, _unreadable_only())
     for bad in ("../evil", "a/b", "..", "", "x" * 129, "?:zz", "a b", "a\nb"):
-        result = _run(store_path, _slot_args(bad))
+        result = _run(store_path, _slot_args(store_path, bad))
         assert result.code == EXIT_REFUSED, bad
     assert _table(store_path) == raw
     assert _evidence_files(store_path) == []
@@ -172,7 +182,7 @@ def test_clear_cli_unreadable_slot_requires_key_ack_and_dumps_original_bytes_060
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store_path, raw = _seed(tmp_path, _mixed())
-    assert _run(store_path, _slot_args(ack=False)).code == EXIT_REFUSED  # no ack
+    assert _run(store_path, _slot_args(store_path, ack=False)).code == EXIT_REFUSED  # no ack
     assert _run(store_path, ["--yes", "--ack-unreadable-slot"]).code == EXIT_REFUSED  # no key
     assert _table(store_path) == raw
 
@@ -187,14 +197,14 @@ def test_clear_cli_unreadable_slot_requires_key_ack_and_dumps_original_bytes_060
     seen_at_removal: list[bytes | None] = []
     real_discard = SubmitIntentLatch.discard_unreadable_slot
 
-    def watched_discard(self: SubmitIntentLatch, key: str, *, now_ns: int) -> None:
+    def watched_discard(self: SubmitIntentLatch, key: str, *, now_ns: int, **kwargs: str) -> None:
         files = _evidence_files(store_path)
         seen_at_removal.append(files[0].read_bytes() if files else None)
-        real_discard(self, key, now_ns=now_ns)
+        real_discard(self, key, now_ns=now_ns, **kwargs)
 
     monkeypatch.setattr(os, "fsync", spy_fsync)
     monkeypatch.setattr(SubmitIntentLatch, "discard_unreadable_slot", watched_discard)
-    result = _run(store_path, _slot_args(), clock_ns=lambda: FIXED_TS)
+    result = _run(store_path, _slot_args(store_path), clock_ns=lambda: FIXED_TS)
     monkeypatch.undo()
 
     assert result.code == EXIT_OK, result.err
@@ -206,6 +216,9 @@ def test_clear_cli_unreadable_slot_requires_key_ack_and_dumps_original_bytes_060
     parsed = json.loads(header.split(b" ", 2)[2])
     assert parsed["key"] == UNREADABLE_KEY
     assert "canonicalised" in parsed["slot_canonicalised_json_label"]
+    resolution_file = (store_path.parent / "evidence.json").read_bytes()
+    assert parsed["resolution_evidence_sha256"] == hashlib.sha256(resolution_file).hexdigest()
+    assert parsed["resolution"] == "no-order-exists"
     assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
     assert seen_at_removal == [dumped]  # the dump existed, complete, before the removal
     assert (str(files[0]), False) in synced
@@ -218,7 +231,7 @@ def test_clear_cli_unreadable_slot_requires_key_ack_and_dumps_original_bytes_060
 
 def test_clear_cli_evidence_filename_uses_key_hash_not_key(tmp_path: Path) -> None:
     store_path, _ = _seed(tmp_path, _unreadable_only())
-    result = _run(store_path, _slot_args(), clock_ns=lambda: FIXED_TS)
+    result = _run(store_path, _slot_args(store_path), clock_ns=lambda: FIXED_TS)
     assert result.code == EXIT_OK, result.err
     digest = hashlib.sha256(UNREADABLE_KEY.encode()).hexdigest()[:16]
     files = _evidence_files(store_path)
@@ -235,7 +248,7 @@ def test_clear_cli_aborts_if_evidence_dump_fails(tmp_path: Path) -> None:
     digest = hashlib.sha256(UNREADABLE_KEY.encode()).hexdigest()[:16]
     blocker = store_path.parent / f"state.db.unreadable_slot.{digest}.{FIXED_TS}.bin"
     blocker.write_bytes(b"pre-existing")  # O_EXCL creation must fail
-    result = _run(store_path, _slot_args(), clock_ns=lambda: FIXED_TS)
+    result = _run(store_path, _slot_args(store_path), clock_ns=lambda: FIXED_TS)
     assert result.code == EXIT_REFUSED
     assert "evidence" in result.err
     assert _table(store_path) == raw  # the slot was NOT removed
@@ -246,13 +259,13 @@ def test_clear_cli_refuses_erasing_table_over_open_slots(tmp_path: Path) -> None
     store_path, raw = _seed(tmp_path, _mixed())
     # naming a READABLE open slot (or an absent key) must never erase it
     for key in (_id(1), "nope"):
-        result = _run(store_path, _slot_args(key), clock_ns=lambda: FIXED_TS)
+        result = _run(store_path, _slot_args(store_path, key), clock_ns=lambda: FIXED_TS)
         assert result.code == EXIT_REFUSED, key
     assert _table(store_path) == raw
     assert _evidence_files(store_path) == []
     # a v1 OPEN record is likewise not an unreadable slot
     v1_path, v1_raw = _seed(tmp_path / "v1", _open(7).to_bytes())
-    assert _run(v1_path, _slot_args(_id(7))).code == EXIT_REFUSED
+    assert _run(v1_path, _slot_args(v1_path, _id(7))).code == EXIT_REFUSED
     assert _table(v1_path) == v1_raw
 
 
@@ -289,3 +302,97 @@ def test_module_exposes_the_slot_key_validator() -> None:
     assert cli.is_valid_slot_key("a.b_c-1")
     assert cli.is_valid_slot_key("?:" + "0" * 32)
     assert not cli.is_valid_slot_key("a/b")
+
+
+def test_clear_cli_slot_key_requires_resolution_evidence_no_dump_when_absent(
+    tmp_path: Path,
+) -> None:
+    store_path, raw = _seed(tmp_path, _mixed())
+    missing = _run(store_path, _slot_args(store_path, evidence=False), clock_ns=lambda: FIXED_TS)
+    assert missing.code == EXIT_REFUSED
+    assert "evidence" in missing.err
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"open_orders": []}), encoding="utf-8")
+    insufficient = _run(
+        store_path,
+        [
+            *_slot_args(store_path, evidence=False),
+            "--resolution",
+            "no-order-exists",
+            "--evidence",
+            str(bad),
+        ],
+        clock_ns=lambda: FIXED_TS,
+    )
+    assert insufficient.code == EXIT_REFUSED
+    assert _table(store_path) == raw
+    assert _evidence_files(store_path) == []
+
+
+def test_discard_unreadable_slot_writes_history_with_dump_reference(tmp_path: Path) -> None:
+    store_path, _ = _seed(tmp_path, _unreadable_only())
+    result = _run(store_path, _slot_args(store_path), clock_ns=lambda: FIXED_TS)
+    assert result.code == EXIT_OK, result.err
+    dump = _evidence_files(store_path)[0]
+    dump_sha = hashlib.sha256(dump.read_bytes()).hexdigest()
+    slot_id = hashlib.sha256(UNREADABLE_KEY.encode()).hexdigest()[:32]
+    with SqliteStateStore(store_path) as store:
+        history = store.get(history_key(slot_id))
+        current = store.get(CURRENT_INTENT_KEY)
+    assert history is not None and current is not None
+    record = SubmitIntent.from_bytes(history)  # history readers decode it
+    assert record.state is SubmitIntentState.RETIRED
+    assert record.fingerprint == dump_sha
+    extra = json.loads(history)
+    assert extra["evidence_path"] == str(dump)
+    assert extra["evidence_sha256"] == dump_sha
+    assert extra["unreadable_slot_key"] == UNREADABLE_KEY
+    # the synthetic v1 RETIRED record references the same dump hash
+    assert SubmitIntent.from_bytes(current).fingerprint == dump_sha
+
+
+def test_clear_cli_slot_key_and_reset_paths_exit_2_on_store_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path, raw = _seed(tmp_path, _mixed())
+
+    def mismatch(self: SubmitIntentLatch, key: str, **kwargs: str | int) -> None:
+        raise SubmitIntentMismatch(key, None, None)
+
+    monkeypatch.setattr(SubmitIntentLatch, "discard_unreadable_slot", mismatch)
+    raced = _run(store_path, _slot_args(store_path), clock_ns=lambda: FIXED_TS)
+    assert raced.code == EXIT_REFUSED and "refused" in raced.err
+
+    def sqlite_boom(self: SubmitIntentLatch) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SubmitIntentLatch, "reset_breaker_halt", sqlite_boom)
+    locked = _run(store_path, ["--yes", "--reset-entry-halt", "--ack-held-positions-reviewed"])
+    assert locked.code == EXIT_REFUSED and "database is locked" in locked.err
+
+    def os_boom(self: SubmitIntentLatch) -> bool:
+        raise OSError(errno.EIO, "Input/output error", "/x/state.db")
+
+    monkeypatch.setattr(SubmitIntentLatch, "reset_breaker_halt", os_boom)
+    io_err = _run(store_path, ["--yes", "--reset-entry-halt", "--ack-held-positions-reviewed"])
+    assert io_err.code == EXIT_REFUSED
+    assert "EIO" in io_err.err and "/x/state.db" in io_err.err
+    assert _table(store_path) == raw
+
+
+def test_clear_cli_reset_rejects_stray_resolution_and_list_help_names_the_lock(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.db"
+    ev = str(_evidence(tmp_path))
+    stray = _run(
+        store_path,
+        ["--yes", "--reset-entry-halt", "--ack-held-positions-reviewed", "--resolution", "x"],
+    )
+    assert stray.code == EXIT_REFUSED
+    stray_ev = _run(
+        store_path,
+        ["--yes", "--reset-entry-halt", "--ack-held-positions-reviewed", "--evidence", ev],
+    )
+    assert stray_ev.code == EXIT_REFUSED
+    assert "refuses while the node is up" in cli._build_parser().format_help().replace("\n", " ")

@@ -16,16 +16,21 @@ Until AUT-5a journals the STOP, ``unknown`` is a metric only and never an alert.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
+    CURRENT_INTENT_KEY,
     SlotTable,
     SubmitIntent,
     SubmitIntentCorrupt,
     SubmitIntentState,
+    decode_slot_table,
 )
 from breezy.runtime.trade_supervisor_core import (
     PreLaunchProbeInvariantError,
@@ -37,6 +42,7 @@ __all__ = [
     "Z19Counts",
     "observe_open_intent_post_stop",
     "observe_open_slots_post_stop",
+    "observe_post_stop_from_store",
     "reconstruct_open_intent_at",
     "z19_alerts",
     "z19_counts",
@@ -102,6 +108,35 @@ def observe_open_slots_post_stop(
     if table.unreadable or any(is_ambiguous(slot) for slot in table.open):
         return IntentObservation.AMBIGUOUS
     return IntentObservation.OPEN
+
+
+def observe_post_stop_from_store(
+    store_path: Path,
+    *,
+    stop_signal_present: bool,
+    node_pid: _NodePid,
+    is_ambiguous: Callable[[SubmitIntent], bool],
+) -> IntentObservation:
+    """The store-backed post-STOP observation: reads the slot table (v1 or v2) read-only.
+
+    A v1 record yields exactly :func:`observe_open_intent_post_stop`'s result;
+    a v2 table is classified by :func:`observe_open_slots_post_stop` instead of
+    collapsing to ``unknown``. An unreadable store is ``unknown``.
+    """
+
+    def read_table() -> SlotTable | None:
+        with SqliteStateStore(store_path) as store:
+            return decode_slot_table(store.get(CURRENT_INTENT_KEY))
+
+    try:
+        return observe_open_slots_post_stop(
+            stop_signal_present=stop_signal_present,
+            node_pid=node_pid,
+            read_table=read_table,
+            is_ambiguous=is_ambiguous,
+        )
+    except sqlite3.Error:
+        return IntentObservation.UNKNOWN
 
 
 def reconstruct_open_intent_at(history: Sequence[SubmitIntent], at_ns: int) -> IntentObservation:
