@@ -34,7 +34,8 @@ _EXEC_CLIENT_PATH = (
 )
 # re-pinned 2026-10-02: AMBIG-LATCH-CLEAR (resolver zero-fill clears AMBIGUOUS refusal), reviewer-approved  # noqa: E501
 # re-pinned 2026-10-09: AMBIG-LATCH-RESUME Phase B (resume method, accept-fill/no-id clears, pre-POST context, no-id resolver; hunks H1-H12 per plan r6 section 4)  # noqa: E501
-_EXEC_CLIENT_SHA256 = "5f23be3ec8228022aa8477194856ec254994057f4ee06da13fac02cc4c8e34db"
+# re-pinned 2026-10-10: WP-DR day-roll settle (3 resolver sites skip prior-day true-up; fill-on-new-day latches UNBUDGETED), reviewer-approved (python-reviewer + prediction-market-reviewer)  # noqa: E501
+_EXEC_CLIENT_SHA256 = "d1abf935e666aaacc9ad38bd538c7a15f5bc5dfc4ad5ac5a295d5174ffab6f0d"
 
 
 # ---------------------------------------------------------------------------
