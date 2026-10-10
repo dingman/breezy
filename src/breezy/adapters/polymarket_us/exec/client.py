@@ -327,6 +327,7 @@ from breezy.adapters.polymarket_us.no_id_attribution import (
 from breezy.adapters.polymarket_us.operator_controls import (
     DailyBudgetExhausted,
     SpendBooking,
+    cost_budget_bucket_rank,
     utc_day_for_ns,
 )
 from breezy.adapters.polymarket_us.parsing import _to_decimal
@@ -1164,6 +1165,24 @@ class AmbiguousResolverContext:
     baseline_venue_net: str | None = None
     baseline_durable_net: str | None = None
     baseline_ts_ns: int | None = None
+    #: EXEC-PAR D6: the wire body's ``quantity`` as text, written at BOTH
+    #: ``_note_ambiguous_open`` call sites, so the duplicate detector can
+    #: compare a holding delta with ONE order's quantity without dividing by a
+    #: price. Same AR-N6 trailing-optional shape: an OLD blob has no key and
+    #: decodes ``None`` (not evaluable).
+    wire_quantity: str | None = None
+
+    @property
+    def wire_quantity_decimal(self) -> Decimal | None:
+        """``wire_quantity`` as a positive finite ``Decimal``, else ``None``. A
+        property, so the scanned resolver body builds nothing (no new callee)."""
+        if self.wire_quantity is None:
+            return None
+        try:
+            value = Decimal(self.wire_quantity)
+        except InvalidOperation:
+            return None
+        return value if value.is_finite() and value > 0 else None
 
     @property
     def no_id_echo(self) -> NoIdEcho | None:
@@ -1195,6 +1214,7 @@ class AmbiguousResolverContext:
                 "baselineVenueNet": self.baseline_venue_net,
                 "baselineDurableNet": self.baseline_durable_net,
                 "baselineTsNs": self.baseline_ts_ns,
+                "wireQuantity": self.wire_quantity,
                 "intentId": self.intent_id,
                 "venueOrderId": self.venue_order_id,
                 "instrumentId": self.instrument_id,
@@ -1290,6 +1310,7 @@ class AmbiguousResolverContext:
                 baseline_venue_net=_optional_text("baselineVenueNet"),
                 baseline_durable_net=_optional_text("baselineDurableNet"),
                 baseline_ts_ns=baseline_ts_ns,
+                wire_quantity=_optional_text("wireQuantity"),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1628,6 +1649,14 @@ _NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
 #: (the venue's 30 s timestamp tolerance), so it cannot be reconciled.
 _NO_ID_MANUAL_STRADDLE_NS: Final[int] = 30 * 1_000_000_000
 
+#: EXEC-PAR 3.6 (the duplicate detector, a belt for stuck slots): the lag guard
+#: before a holding delta is read as a duplicate -- the WP0-measured positions
+#: feed lag bound when one exists, else this 300 s default (the no-id floor, so
+#: the detector never looks at an order younger than the feed can be stale).
+_DUPLICATE_LAG_GUARD_NS: Final[int] = 300 * 1_000_000_000
+#: ... and it needs this many CONSECUTIVE passes seeing the suspect delta.
+_DUPLICATE_CONFIRM_PASSES: Final[int] = 2
+
 #: AC4(b): the two `createFillEvidence` tokens that BLOCK a resolver
 #: zero-fill and raise `resolver_evidence_contradiction` if the GET still
 #: reports terminal zero. `none` and `unknown` (legacy) are both admissible
@@ -1712,6 +1741,21 @@ class NoIdTradeJoin:
     pages: int
 
 
+def _leg_magnitude_of_signed_net(net: str, leg: Leg) -> Decimal | None:
+    """EXEC-PAR 3.6: the absolute holding a SIGNED venue ``netPosition`` string
+    implies on ``leg`` -- YES is ``max(net, 0)``, NO (a short YES at the venue)
+    is ``max(-net, 0)``. ``None`` for anything that is not a finite number;
+    never raises. Pure, so the scanned resolver body calls it as one named row.
+    """
+    try:
+        value = Decimal(net)
+    except InvalidOperation:
+        return None
+    if not value.is_finite():
+        return None
+    return max(value, Decimal(0)) if leg == "yes" else max(-value, Decimal(0))
+
+
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
     """Slice 3: a pure, deterministic function of ``venue_order_id`` alone.
 
@@ -1760,6 +1804,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         exit_manifest: FamilyManifest | None = None,
         resolver_instrument_loader: Callable[[str], Any] | None = None,
         no_id_retire_admitted: bool = False,
+        frozen_cost_budget_bucket: str | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -1835,7 +1880,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # process, the per-intent "complete negative pass seen" stamp, and the
         # per-intent next no-id re-check time.
         self._ambiguous_refusal_clears: int = 0
-        self._post_in_flight_intent_id: str | None = None
+        #: EXEC-PAR D4: every intent whose create POST is awaited in THIS
+        #: process (K > 1 can have several). Mutated only by whole-value
+        #: reassignment (set algebra on a frozenset, never `.add`), so the
+        #: scanned order coroutine makes no new call.
+        self._post_in_flight_intent_ids: frozenset[str] = frozenset()
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
@@ -1853,6 +1902,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `RESOLVER_NO_ID_NO_FILL` retirement reason. Set once at node boot;
         # `_resolve_no_order` refuses to retire without it (fail closed).
         self._no_id_retire_admitted: bool = bool(no_id_retire_admitted)
+        #: EXEC-PAR 3.9: the D-PREREG-frozen cap/budget bucket LABEL (never a
+        #: dollar value), handed in by the composition root. At boot with K > 1
+        #: a live label above it, an unreadable label, or an absent frozen label
+        #: forces K to 1 (:meth:`_apply_slot_boot_guards`).
+        self._frozen_cost_budget_bucket: str | None = frozen_cost_budget_bucket
         # Item 4 (slice 4 review): the family-halt chokepoint veto, injected
         # exactly the way the submit-intent latch is -- a plain callable this
         # adapters-layer module never imports the type of. `None` -> no veto,
@@ -1898,6 +1952,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # found after a SECOND `_connect()` in the same process must still
         # refuse -- the seed will not re-walk it.
         self._spend_seeded: bool = False
+        #: EXEC-PAR H6: the UTC day the boot spend seed bucketed fills under (the
+        #: ``today`` of :meth:`_seed_spend_from_durable_fills`); ``None`` until it
+        #: ran. The seeded partial of a boot-registered intent is derived under
+        #: this same day filter.
+        self._seed_day: date | None = None
         # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
         # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
         # Restart re-entry finds this dict empty (the ledger died too) and
@@ -1933,6 +1992,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # stays untouched). Reset to 0 by that same coroutine on any
         # successful GET.
         self._resolver_consecutive_failures: int = 0
+        #: EXEC-PAR H5: per-intent mirrors of the failure counter above (the
+        #: GLOBAL counter still drives the sleep) and a monotonic "last served"
+        #: stamp, so one failing slot is skipped in favour of the others and
+        #: healthy slots are served round-robin. Whole-value reassignment only.
+        self._resolver_intent_failures: dict[str, int] = {}
+        self._resolver_intent_served: dict[str, int] = {}
+        self._resolver_serve_seq: int = 0
+        #: EXEC-PAR 3.6: the loop-top heartbeat the breaker watcher publishes,
+        #: the monotonic contradiction-event counter (the watcher latches its
+        #: entry halt on any increase) and the duplicate detector's per-intent
+        #: consecutive-sighting counters.
+        self._resolver_last_pass_ns: int = 0
+        self._contradiction_events_total: int = 0
+        self._duplicate_suspect_total: int = 0
+        self._duplicate_suspect_passes: dict[str, int] = {}
         self._resolver_last_failure_kind: dict[str, str] = {}
         # Item 3 (2026-09-11 incident addendum): one-shot stale-intent
         # bookkeeping for `stale_ambiguous_intent_alerts` above. An intent id
@@ -2050,6 +2124,90 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         this property reads reason strings, and none of them move.
         """
         return tuple(refusal.reason for refusal in self._trading_refusals)
+
+    @property
+    def trading_refusal_scopes(self) -> tuple[str, ...]:
+        """EXEC-PAR 3.4/3.8: the scope of each latched refusal, parallel to
+        :attr:`trading_refusals` -- the market slug a refusal is scoped to, or
+        ``""`` for an UNSCOPED refusal (which denies every order, exits
+        included). A K > 1 lone AMBIGUOUS take is scoped to its own slug."""
+        return tuple(refusal.instrument for refusal in self._trading_refusals)
+
+    @property
+    def contradiction_events_total(self) -> int:
+        """EXEC-PAR 3.6: a monotonic, in-memory count of intents that newly
+        entered a recorded CONTRADICTION (and of duplicate-suspect trips). The
+        breaker watcher latches its entry halt on any increase; the halt then
+        survives the contradiction's own clearing at ``_retire``."""
+        return self._contradiction_events_total
+
+    @property
+    def duplicate_suspect_total(self) -> int:
+        """EXEC-PAR 3.6: how many intents the duplicate detector tripped on."""
+        return self._duplicate_suspect_total
+
+    @property
+    def resolver_last_pass_ns(self) -> int:
+        """EXEC-PAR 3.6: when the resolver loop last reached its top (``0`` =
+        never). The watcher publishes it so a dead resolver task denies entries
+        while a venue-wide 5xx backoff (a live loop) does not."""
+        return self._resolver_last_pass_ns
+
+    @property
+    def ambiguous_notional_breaker_tripped(self) -> bool:
+        """EXEC-PAR 3.6: the AMBIGUOUS open notional exceeds the breaker
+        fraction of the daily budget -- evaluated INSIDE the ledger, so this
+        module reads no operator control. Any evaluation failure counts as
+        tripped (the ledger's own contract)."""
+        return self._ledger is not None and bool(self._ledger.breaker_fraction_exceeded())
+
+    @property
+    def k_forced_to_1_reason(self) -> str | None:
+        """EXEC-PAR 3.9: why K was forced to 1 at boot (the watcher alerts on
+        it), or ``None`` while the configured K stands."""
+        if self._latch is None:
+            return None
+        reason: str | None = self._latch.k_forced_reason
+        return reason
+
+    @property
+    def unreadable_slot_keys(self) -> tuple[str, ...]:
+        """EXEC-PAR 3.1: keys of quarantined (unreadable or slug-less) slots."""
+        if self._latch is None:
+            return ()
+        keys: tuple[str, ...] = self._latch.unreadable_slot_keys()
+        return keys
+
+    @property
+    def open_intent_ages(self) -> tuple[tuple[str, str, int], ...]:
+        """EXEC-PAR 3.6: ``(intent_id, slug, age_ns)`` for every readable OPEN
+        slot (``slug`` is ``""`` for a K=1 record), oldest first -- the watcher's
+        "stuck" input."""
+        if self._latch is None:
+            return ()
+        now_ns = self._clock.timestamp_ns()
+        return tuple(
+            (intent.intent_id, intent.slug or "", now_ns - intent.created_ns)
+            for intent in self._latch.open_submit_intents()
+        )
+
+    @property
+    def held_position_slugs(self) -> tuple[str, ...]:
+        """EXEC-PAR 3.6: the slugs the resolver-refreshed startup-position
+        evidence reports as held (non-zero or UNKNOWN net) -- the list the
+        watcher's alert names. Empty when there is no evidence."""
+        evidence = self.read_startup_position_evidence()
+        if evidence is None:
+            return ()
+        held: list[str] = []
+        for snapshot in evidence.positions:
+            try:
+                is_flat = snapshot.net_position is not None and Decimal(snapshot.net_position) == 0
+            except InvalidOperation:
+                is_flat = False
+            if not is_flat:
+                held.append(snapshot.slug)
+        return tuple(held)
 
     @property
     def ambiguous_refusal_clears(self) -> int:
@@ -2208,12 +2366,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             await self._publish_account_state()
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
+            # EXEC-PAR 3.1/3.9: the K > 1 boot guards (bucket drift, legacy slug
+            # adoption, synthetic cool-off). Synchronous; a no-op at K = 1.
+            self._apply_slot_boot_guards()
             # S0 (plan rev 3, R3-1): boot-seed the daily ledger and the
             # permit's session budget from today's durable fills, AFTER
             # intent reconciliation and BEFORE the startup position evidence
             # read below -- a mid-day relaunch must not re-grant budget a
             # prior process in this same calendar day already spent.
             self._seed_spend_from_durable_fills()
+            # EXEC-PAR H6: register every still-OPEN intent as uncharged,
+            # AMBIGUOUS open exposure. No `await` from the seed through
+            # `_spend_seeded = True`, so every fill handler (synchronous) runs
+            # wholly before or wholly after this span. A raise propagates and
+            # fails the connect closed, exactly as the seed does.
+            self._register_open_intents_at_boot()
             # AC6b (EDGE-2 plan r3, D8): the NEXT statement, no `await`
             # between -- a fill the resolver's own immediate pass above
             # already recorded (before this line runs) was necessarily
@@ -2329,6 +2496,135 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         self._intent_reconciled = True
 
+    def _apply_slot_boot_guards(self) -> None:
+        """EXEC-PAR 3.1/3.9, run once per ``_connect`` after the latch reconciled.
+
+        A no-op unless the CONFIGURED K exceeds 1 (``max_slots`` is the effective
+        K, so an already-forced latch is skipped too). Then, in order:
+
+        * the cost/budget bucket guard: the live ``cap / budget`` bucket LABEL
+          (never a dollar value) is compared with the frozen label; a label above
+          it, a derivation that raises, or an absent frozen label forces K to 1
+          for this process (``force_k1``; the watcher alerts on the reason). The
+          reason names no value. A K already forced to 1 over a v2 table left by a
+          K > 1 run still resolves every open slot: selection never reads K.
+        * legacy slug adoption: a slug-less OPEN record takes its resolver
+          context's ``wire_market_slug``; one without a context stays slug-less
+          and quarantines admission.
+        * the synthetic cool-off: every slug OPEN at boot cools from boot time.
+        """
+        if self._latch is None or not self._intent_reconciled:
+            return
+        if self._latch.max_slots() <= 1:
+            return
+        forced = self._bucket_force_reason()
+        if forced is not None:
+            self._latch.force_k1(forced)
+            self._log.error(
+                f"EXEC-PAR: submit-intent slots forced to K=1 for this process: {forced}"
+            )
+            return
+        self._latch.adopt_legacy_open_slugs(self._slug_of_open_intent)
+        self._latch.seed_boot_cooloff(now_ns=self._clock.timestamp_ns())
+
+    def _bucket_force_reason(self) -> str | None:
+        """The reason K must be forced to 1, or ``None`` if the live bucket label
+        stands within the frozen one. Names no operator-control value."""
+        if self._frozen_cost_budget_bucket is None:
+            return "the frozen cost/budget bucket label is not configured"
+        if self._ledger is None:
+            return "no spend ledger to derive the cost/budget bucket from"
+        try:
+            live_rank = cost_budget_bucket_rank(self._ledger.cost_budget_bucket())
+            frozen_rank = cost_budget_bucket_rank(self._frozen_cost_budget_bucket)
+        except Exception as exc:  # noqa: BLE001 - an underivable bucket forces K=1
+            return f"the cost/budget bucket could not be derived ({exc.__class__.__name__})"
+        if live_rank > frozen_rank:
+            return "the live cap/budget bucket is above the frozen D-PREREG bucket"
+        return None
+
+    def _slug_of_open_intent(self, intent_id: str) -> str | None:
+        """The wire market slug in an OPEN intent's resolver context, else ``None``
+        (a missing, malformed or slug-less context never raises)."""
+        raw = self._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+        if raw is None:
+            return None
+        try:
+            return AmbiguousResolverContext.from_bytes(raw).wire_market_slug
+        except ExecutionReportMappingError:
+            return None
+
+    def _register_open_intents_at_boot(self) -> None:
+        """EXEC-PAR H6: register every readable OPEN intent as uncharged AMBIGUOUS
+        exposure -- ``notional - P`` (P, the seeded partial, below), or unknown
+        when there is no usable context -- so open exposure survives a restart
+        (D2) and the fill settles through the registry instead of latching
+        UNBUDGETED (D1).
+
+        Exits are never registered: ``order_side == "SELL"`` is skipped, and a
+        legacy context without ``orderSide`` (or none at all) is treated as a BUY.
+
+        ``P`` = the durable fill record's ``cumulative_cost`` iff its ``ts_event``
+        day is the seed's own day (the seed already counted it), else ``0``; a
+        no-id intent has no lookup (``P = 0``). Permit seeding is unchanged and no
+        permit restore follows for these (D3).
+        """
+        if self._ledger is None or self._latch is None or not self._intent_reconciled:
+            return
+        now_ns = self._clock.timestamp_ns()
+        for intent in self._latch.open_submit_intents():
+            if self._ledger.has_open_exposure(intent.intent_id):
+                # A second `_connect` in one process: already registered (this
+                # process's own order, or the first connect's registration).
+                continue
+            context = self._boot_context_of(intent.intent_id)
+            if context is not None and context.order_side == "SELL":
+                continue
+            partial = Decimal(0) if context is None else self._seeded_partial_of(context)
+            notional = None if context is None else max(context.notional_usd - partial, Decimal(0))
+            self._ledger.register_open_exposure(
+                intent.intent_id,
+                notional,
+                booking=None,
+                seeded_partial_usd=partial,
+                side="BUY",
+                now_ns=now_ns,
+            )
+            self._ledger.mark_ambiguous(intent.intent_id)
+
+    def _boot_context_of(self, intent_id: str) -> AmbiguousResolverContext | None:
+        raw = self._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+        if raw is None:
+            return None
+        try:
+            return AmbiguousResolverContext.from_bytes(raw)
+        except ExecutionReportMappingError:
+            self._log.warning(
+                f"boot: resolver context for intent {intent_id} is malformed; its "
+                "exposure is registered as unknown"
+            )
+            return None
+
+    def _seeded_partial_of(self, context: AmbiguousResolverContext) -> Decimal:
+        """H6 ``P``: see :meth:`_register_open_intents_at_boot`. Any failure to read
+        the record yields ``0`` -- the larger (conservative) uncharged notional."""
+        if context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID or self._seed_day is None:
+            return Decimal(0)
+        try:
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{context.venue_order_id}")
+            if raw is None:
+                return Decimal(0)
+            record = DurableFillRecord.from_bytes(raw)
+        except Exception as exc:  # noqa: BLE001 - an unreadable record is P = 0
+            self._log.warning(
+                f"boot: fill record for intent {context.intent_id} unreadable "
+                f"({exc.__class__.__name__}); seeded partial taken as 0"
+            )
+            return Decimal(0)
+        if utc_day_for_ns(record.ts_event) != self._seed_day:
+            return Decimal(0)
+        return record.cumulative_cost
+
     def _seed_candidate_ids(self, today: date) -> list[str]:
         """AC6b/G4 (EDGE-2 plan r3, D9): every venue order id
         :meth:`_seed_spend_from_durable_fills` must consider -- the
@@ -2401,6 +2697,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         now_ns = self._clock.timestamp_ns()
         today = utc_day_for_ns(now_ns)
+        self._seed_day = today
         seen: set[str] = set()
         total = Decimal(0)
         count = 0
@@ -2620,6 +2917,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     sleep_secs = doubled if doubled < _RESOLVER_BACKOFF_CAP_SECS else _RESOLVER_BACKOFF_CAP_SECS  # noqa: E501, FURB136
                 await asyncio.sleep(sleep_secs)
             first_iteration = False
+            # EXEC-PAR 3.6: the loop-top stamp the breaker watcher publishes as
+            # `resolver_pass_ns` -- a plain attribute write, so a dead resolver
+            # task (the stamp stops) is told apart from a venue-wide backoff (a
+            # live loop whose stamp keeps moving).
+            self._resolver_last_pass_ns = self._clock.timestamp_ns()
             if self._latch is None:
                 self._log.debug("resolver: no latch bound; skipping this pass")
                 continue
@@ -2667,7 +2969,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         raw_positions=refresh_positions,
                     )
             try:
-                current = self._latch.current_open()
+                # EXEC-PAR H5: the next OPEN slot by (per-intent failures, last
+                # served, created) -- independent of K, so a restart forced to
+                # K=1 over a v2 table still resolves every slot (E7). Unreadable
+                # slots are skipped inside the latch.
+                current = self._latch.next_open_for_resolution(
+                    self._resolver_intent_failures, self._resolver_intent_served
+                )
             except self._latch.CorruptError:
                 # Fail closed like `is_latched()` does: a corrupt singleton
                 # is treated as OPEN-unknown -- never retire, never act, but
@@ -2688,6 +2996,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if current is None:
                 self._log.debug("resolver: no OPEN intent; nothing to resolve this pass")
                 continue
+            self._resolver_serve_seq += 1
+            self._resolver_intent_served = {
+                **self._resolver_intent_served,
+                current.intent_id: self._resolver_serve_seq,
+            }
             raw_context = self._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
             if raw_context is None:
                 # No-id AMBIGUOUS, or nothing to resolve yet.
@@ -2700,7 +3013,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # after its own min age.
                 try:
                     await self._resolve_no_id_intent(
-                        current.intent_id, current.created_ns, None, None
+                        current.intent_id,
+                        current.created_ns,
+                        None,
+                        None,
+                        intent_slug=current.slug or "",
                     )
                 except Exception as exc:  # noqa: BLE001 - never kill the polling task
                     self._note_resolver_error(current.intent_id, exc)
@@ -2843,6 +3160,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # the GET path below uses -- every pass this intent fails to
                 # progress on, for whatever reason, slows the next attempt.
                 self._resolver_consecutive_failures += 1
+                self._resolver_intent_failures = {
+                    **self._resolver_intent_failures,
+                    current.intent_id: (
+                        self._resolver_intent_failures[current.intent_id]  # noqa: SIM401
+                        if current.intent_id in self._resolver_intent_failures
+                        else 0
+                    )
+                    + 1,
+                }
                 self._set_resolver_last_failure_kind(context, "instrument_unavailable")
                 if context.instrument_id not in self._resolver_missing_instrument_logged:
                     self._resolver_missing_instrument_logged = (
@@ -2869,7 +3195,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # The with-id path from the GET below is byte-unchanged.
                 try:
                     await self._resolve_no_id_intent(
-                        current.intent_id, current.created_ns, context, instrument
+                        current.intent_id,
+                        current.created_ns,
+                        context,
+                        instrument,
+                        intent_slug=current.slug or "",
                     )
                 except Exception as exc:  # noqa: BLE001 - never kill the polling task
                     self._note_resolver_error(current.intent_id, exc)
@@ -2880,6 +3210,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
             except Exception as exc:  # noqa: BLE001 - GET failure stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
+                self._resolver_intent_failures = {
+                    **self._resolver_intent_failures,
+                    current.intent_id: (
+                        self._resolver_intent_failures[current.intent_id]  # noqa: SIM401
+                        if current.intent_id in self._resolver_intent_failures
+                        else 0
+                    )
+                    + 1,
+                }
                 self._set_resolver_last_failure_kind(context, "get_exception")
                 self._log.warning(
                     f"resolver GET failed for venue order {context.venue_order_id} "
@@ -2919,6 +3258,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
             except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
+                self._resolver_intent_failures = {
+                    **self._resolver_intent_failures,
+                    current.intent_id: (
+                        self._resolver_intent_failures[current.intent_id]  # noqa: SIM401
+                        if current.intent_id in self._resolver_intent_failures
+                        else 0
+                    )
+                    + 1,
+                }
                 self._set_resolver_last_failure_kind(context, "mapping_error")
                 self._log.warning(
                     f"resolver GET body for venue order {context.venue_order_id} "
@@ -2932,6 +3280,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # is reachable and the shape still parses, which is exactly what
             # the backoff exists to detect the absence of.
             self._resolver_consecutive_failures = 0
+            self._resolver_intent_failures = {
+                **self._resolver_intent_failures,
+                current.intent_id: 0,
+            }
             # FAILURE-KIND-PERSIST (r2/r3, ARCH B1): a successful GET means
             # THIS pass's evidence supersedes whatever kind an earlier pass
             # recorded -- reset to "none" UNLESS the recorded kind is
@@ -3134,7 +3486,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # would kill this coroutine for the process lifetime. Caught,
                 # counted, and logged; the NEXT poll still runs.
                 try:
-                    self._resolve_terminal_zero(context, now_ns, positions)
+                    self._resolve_terminal_zero(
+                        context, now_ns, positions, slug=current.slug or ""
+                    )
                 except Exception as exc:  # noqa: BLE001 - see the comment above
                     self._note_resolver_error(context.intent_id, exc)
                     continue
@@ -3144,7 +3498,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 if fill_confirmed:
                     try:
-                        self._resolve_accept_fill(context, report, instrument, now_ns)
+                        self._resolve_accept_fill(
+                            context,
+                            report,
+                            instrument,
+                            now_ns,
+                            slug=current.slug or "",
+                            intent_fingerprint=current.fingerprint,
+                            intent_created_ns=current.created_ns,
+                        )
                     except Exception as exc:  # noqa: BLE001 - see the comment above
                         self._note_resolver_error(context.intent_id, exc)
                         continue
@@ -3161,6 +3523,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         context: AmbiguousResolverContext,
         now_ns: int,
         positions: Mapping[str, Any] | None = None,
+        *,
+        slug: str = "",
     ) -> None:
         """Resolution D: GET-confirmed terminal, zero-filled, no LONG.
 
@@ -3194,8 +3558,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "fail-closed"
             )
             return
-        current = self._latch.current_open()
-        if current is None or current.intent_id != context.intent_id:
+        if not self._latch.is_open_intent(context.intent_id):
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
         # A1-c: backfill for a context written before this change, which
@@ -3215,6 +3578,33 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"client_order_id={context.client_order_id}"
             )
             self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
+        # EXEC-PAR E1/E9: settle the registry entry (and release a held booking)
+        # BEFORE `_retire`, with a FRESH clock read: this method runs after an
+        # `await`, and a sibling task's authorize may have moved the ledger's
+        # own clock or rolled its day. Read the booking first (inline, not
+        # `.get`: a dict-method call is an unpermitted callee here) and `pop` it
+        # only once the outcome is decided, so it stays reachable meanwhile.
+        booking = (
+            self._ambiguous_bookings[context.intent_id]  # noqa: SIM401
+            if context.intent_id in self._ambiguous_bookings
+            else None
+        )
+        settle_failed = False
+        if self._ledger is not None:
+            settle_ns = self._clock.timestamp_ns()
+            try:
+                self._ledger.settle(
+                    context.intent_id,
+                    booking=booking,
+                    realized_usd=submit_chain.ZERO,
+                    fill_ts_ns=None,
+                    now_ns=settle_ns,
+                )
+            except Exception as exc:  # noqa: BLE001 - E9: abandon, retire, never stick
+                self._note_resolver_error(context.intent_id, exc)
+                self._ledger.abandon_open_exposure(context.intent_id)
+                settle_failed = True
+        self._ambiguous_bookings.pop(context.intent_id, None)
         self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
         # B3 (Decision 3, HF-4 rev2): `_retire` itself does not log -- one
         # INFO line per retirement, matching the strategy-side `rearm:`
@@ -3223,26 +3613,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             f"resolver: retired intent {context.intent_id} "
             "(STATUS_REPORT_ZERO_FILL_TERMINAL)"
         )
-        booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             # Same-process only (Resolution E): on restart the ledger died
-            # with the process and this dict is empty -- the reminted
-            # budget already starts whole, so there is nothing to true up.
-            # WP-DR: a booking from a PRIOR UTC day cannot be trued up (the
-            # ledger day already rolled and its spend is gone); a zero-fill
-            # carries no spend, so skipping is complete. Day-equality only,
-            # never a blanket except: same-day ledger errors still escalate.
-            today = utc_day_for_ns(now_ns)
-            if booking.day != today:
-                self._log.info(
-                    f"resolver: prior-day booking for intent {context.intent_id} "
-                    f"(booking day {booking.day}, today {today}); "
-                    "no spend; ledger true-up skipped"
-                )
-            else:
-                self._ledger.true_up_booking(
-                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
-                )
+            # with the process and the booking is absent -- the reminted
+            # budget already starts whole. (The ledger release itself already
+            # ran through `settle` above; a prior-UTC-day booking adds no spend.)
             # AC6 (EDGE-2 plan r3, D3): the permit restore is gated on the
             # SAME `booking is not None` check as the ledger true-up right
             # above -- a cross-process or next-day terminal-zero never took
@@ -3285,11 +3660,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # E0-NOSEND-RESOLVER's permitted callee set is unchanged. Cleared
         # only while the durable latch holds no other open intent; every
         # other reason stays. New list, no in-place mutation.
-        if self._latch.current_open() is None:
+        # EXEC-PAR H8: also scoped -- remove the AMBIGUOUS refusal scoped to THIS
+        # slug, and the unscoped one only when no slot at all remains open.
+        if not settle_failed:
+            no_slot_open = self._latch.open_slot_count() == 0
             kept_refusals = [
                 refusal
                 for refusal in self._trading_refusals
                 if refusal.reason != submit_chain.AMBIGUOUS_REASON
+                or (refusal.instrument == "" and not no_slot_open)
+                or (refusal.instrument != "" and refusal.instrument != slug)
             ]
             if len(kept_refusals) != len(self._trading_refusals):
                 self._trading_refusals = kept_refusals
@@ -3306,6 +3686,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         report: Any,
         instrument: Any,
         now_ns: int,
+        *,
+        slug: str = "",
+        intent_fingerprint: str | None = None,
+        intent_created_ns: int | None = None,
     ) -> None:
         """Slice 3 (plan rev 6.1): GET-confirmed FILLED/PARTIALLY_FILLED with
         a LONG present on an eof-complete positions read.
@@ -3350,10 +3734,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "it in this run; SAFETY H2 fail-closed"
             )
             return
-        current = self._latch.current_open()
-        if current is None or current.intent_id != context.intent_id:
+        if not self._latch.is_open_intent(context.intent_id):
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
+        if intent_fingerprint is None or intent_created_ns is None:
+            # A direct caller (the by-id resolver loop always passes both): the
+            # single-slot record, matched by id, supplies them as before.
+            sole = self._latch.current_open()
+            if sole is not None and sole.intent_id == context.intent_id:
+                intent_fingerprint = sole.fingerprint
+                intent_created_ns = sole.created_ns
         avg_px = report.avg_px
         if avg_px is None or avg_px <= 0:
             self._log.error(
@@ -3365,6 +3755,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         cumulative_qty = report.filled_qty.as_decimal()
         cumulative_cost = cumulative_qty * avg_px
+        # EXEC-PAR 3.5 (M5): ONE fresh clock read after the `await`s of this pass
+        # stamps BOTH the resolver-written fill record's `ts_event` and the
+        # ledger settle (`fill_ts_ns` and `now_ns`), so the record's day and the
+        # ledger's effective day cannot disagree -- a discovery at 23:59:59.9 is
+        # stamped and settled on the SAME day.
+        stamp_ns = self._clock.timestamp_ns()
         record = DurableFillRecord(
             venue_order_id=context.venue_order_id,
             client_order_id=context.client_order_id,
@@ -3394,7 +3790,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # the venue. Conservative -- the discovery day's ledger and
             # permit budget see this spend even if the fill itself belongs
             # to the prior day, never the reverse.
-            ts_event=now_ns,
+            ts_event=stamp_ns,
             venue_fee_raw=None,
             trade_id=_synthetic_get_fill_trade_id(context.venue_order_id).value,
             order_qty=report.quantity.as_decimal(),
@@ -3406,8 +3802,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self.record_fill(
                 record,
                 fill_time_instrument=instrument,
-                intent_fingerprint=current.fingerprint,
-                intent_created_ns=current.created_ns,
+                intent_fingerprint=intent_fingerprint,
+                intent_created_ns=intent_created_ns,
             )
         except Exception as exc:  # noqa: BLE001 - see the CREATE path's identical guard
             fill_record_bytes = record.to_bytes()
@@ -3417,26 +3813,43 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             self._refuse(_FILL_WRITE_FAILED)
             return
-        booking = self._ambiguous_bookings.pop(context.intent_id, None)
-        if booking is not None:
-            today = utc_day_for_ns(now_ns)
-            if booking.day != today:
-                # WP-DR: a fill discovered on a NEW UTC day against a
-                # prior-day booking cannot be trued up (the ledger day rolled)
-                # and the in-process ledger has no additive API. Treat it as
-                # UNBOOKED so the AC6b condition below latches the durable
-                # `_RESOLVER_FILL_UNBUDGETED` refusal (fail-closed; a respawn
-                # re-seeds the spend by the record's discovery-time ts_event).
-                self._log.warning(
-                    f"resolver: prior-day booking for intent {context.intent_id} "
-                    f"(booking day {booking.day}, today {today}); fill treated "
-                    "as unbooked -> FILL_UNBUDGETED will latch"
+        # EXEC-PAR D1/D5/E1/E2: settle the registry entry through the ledger
+        # (a same-day booking is trued up to the realized cost; a prior-day or
+        # uncharged entry adds the realized cost minus the seeded partial once,
+        # iff the record's day is the effective day) BEFORE `_retire`. The
+        # booking is READ here and popped only after the outcome is decided.
+        booking = (
+            self._ambiguous_bookings[context.intent_id]  # noqa: SIM401
+            if context.intent_id in self._ambiguous_bookings
+            else None
+        )
+        registered = False
+        if self._ledger is not None:
+            try:
+                registered = self._ledger.settle(
+                    context.intent_id,
+                    booking=booking,
+                    realized_usd=cumulative_cost,
+                    fill_ts_ns=stamp_ns,
+                    now_ns=stamp_ns,
                 )
+            except Exception as exc:  # noqa: BLE001 - E2: absorb into the single latch
+                # A same-day integrity error (over-cost, double settle, unknown
+                # booking). Count it, abandon the entry (no spend added; the
+                # authorized cost stays charged), force the unbooked path so the
+                # one existing UNBUDGETED producer below latches the global
+                # DURABLE refusal, and fall through to the retire. It cannot
+                # self-heal: a respawn re-seeds from the durable record.
+                self._log.error(
+                    f"resolver: settle of intent {context.intent_id} raised "
+                    f"{exc.__class__.__name__}; abandoning its open exposure and "
+                    "latching the fill as unbudgeted"
+                )
+                self._note_resolver_error(context.intent_id, exc)
+                self._ledger.abandon_open_exposure(context.intent_id)
+                registered = False
                 booking = None
-            else:
-                self._ledger.true_up_booking(
-                    booking, filled_cost_usd=cumulative_cost, now_ns=now_ns
-                )
+        self._ambiguous_bookings.pop(context.intent_id, None)
         # A1-b (B-2): anchored to the indentation of the statement this
         # block PRECEDES (`_retire`, 8-space function-body indent), NOT the
         # `true_up_booking` line above -- `_ambiguous_bookings` is
@@ -3489,7 +3902,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `FILL_BY_DAY_KEY_PREFIX` and books this record whether or not its
         # instrument is loaded (G4).
         if (
-            booking is None
+            not registered
+            and booking is None
             and context.order_side != "SELL"
             and self._spend_seeded
         ):
@@ -3530,20 +3944,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # only `_submit_order` producers, so an entry exists only in the
         # submitting process. Inline (not a helper) so the resolver callee
         # set is unchanged. Every other reason stays.
-        if self._latch.current_open() is None:
-            kept_refusals = [
-                refusal
-                for refusal in self._trading_refusals
-                if refusal.reason != submit_chain.AMBIGUOUS_REASON
-            ]
-            if len(kept_refusals) != len(self._trading_refusals):
-                self._trading_refusals = kept_refusals
-                self._ambiguous_refusal_clears += 1
-                self._log.info(
-                    f"resolver: cleared the AMBIGUOUS trading refusal "
-                    f"({submit_chain.AMBIGUOUS_REASON!r}) on fill retirement of "
-                    f"intent {context.intent_id}"
-                )
+        no_slot_open = self._latch.open_slot_count() == 0
+        kept_refusals = [
+            refusal
+            for refusal in self._trading_refusals
+            if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            or (refusal.instrument == "" and not no_slot_open)
+            or (refusal.instrument != "" and refusal.instrument != slug)
+        ]
+        if len(kept_refusals) != len(self._trading_refusals):
+            self._trading_refusals = kept_refusals
+            self._ambiguous_refusal_clears += 1
+            self._log.info(
+                f"resolver: cleared the AMBIGUOUS trading refusal "
+                f"({submit_chain.AMBIGUOUS_REASON!r}) on fill retirement of "
+                f"intent {context.intent_id}"
+            )
 
     async def _order_trade_activity(
         self, venue_order_id: str, created_ns: int
@@ -3763,6 +4179,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         created_ns: int,
         context: AmbiguousResolverContext | None,
         instrument: Any,
+        *,
+        intent_slug: str = "",
     ) -> None:
         """AMBIG-LATCH-RESUME (plan r6 2.8.4-2.8.6): resolve an OPEN AMBIGUOUS
         intent that has NO venue order id, from complete GET reads only.
@@ -3775,7 +4193,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         leaves the intent AMBIGUOUS and re-checks in
         :data:`_NO_ID_RECHECK_INTERVAL_NS`.
         """
-        if intent_id == self._post_in_flight_intent_id:
+        if intent_id in self._post_in_flight_intent_ids:
             self._log.debug(f"resolver: no-id intent {intent_id} POST in flight; skipping")
             return
         now_ns = self._clock.timestamp_ns()
@@ -3820,6 +4238,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             positions = self._declared_positions(positions_payload)
         except Exception as exc:  # noqa: BLE001 - transient; never `_refuse`
             self._resolver_consecutive_failures += 1
+            self._resolver_intent_failures = {
+                **self._resolver_intent_failures,
+                intent_id: (
+                    self._resolver_intent_failures[intent_id]  # noqa: SIM401
+                    if intent_id in self._resolver_intent_failures
+                    else 0
+                )
+                + 1,
+            }
             self._no_id_next_check_ns[intent_id] = recheck_ns
             self._log.warning(
                 f"resolver: no-id positions read failed ({type(exc).__name__}); "
@@ -3838,12 +4265,93 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         join = await self._no_id_trade_activity(window_start_ns)
         if join is None:
             self._resolver_consecutive_failures += 1
+            self._resolver_intent_failures = {
+                **self._resolver_intent_failures,
+                intent_id: (
+                    self._resolver_intent_failures[intent_id]  # noqa: SIM401
+                    if intent_id in self._resolver_intent_failures
+                    else 0
+                )
+                + 1,
+            }
             self._no_id_next_check_ns[intent_id] = recheck_ns
             self._log.warning(
                 f"resolver: no-id intent {intent_id} activities read failed; stays AMBIGUOUS"
             )
             return
         self._resolver_consecutive_failures = 0
+        self._resolver_intent_failures = {**self._resolver_intent_failures, intent_id: 0}
+
+        # EXEC-PAR 3.6, the duplicate detector -- a belt for STUCK slots, not a
+        # general double-POST detector: only an order old enough to pass the
+        # positions-feed lag guard is examined. Suspect iff the venue's holding
+        # on this leg exceeds the baseline by MORE than one order's wire
+        # quantity (never divided by a price). A missing baseline, holding or
+        # wire quantity is "not evaluable": it resets the counter and never
+        # trips. Two consecutive suspect passes trip it: a sticky contradiction
+        # event the breaker watcher latches on.
+        if (
+            context is not None
+            and instrument is not None
+            and age_ns >= _DUPLICATE_LAG_GUARD_NS
+            and context.baseline_venue_net is not None
+        ):
+            wire_quantity = context.wire_quantity_decimal
+            duplicate_suspect = False
+            if wire_quantity is not None:
+                try:
+                    duplicate_leg = leg_of(instrument.id)
+                    venue_holding = _resolver_leg_holding_qty(
+                        positions, base_slug_of(instrument.id), duplicate_leg
+                    )
+                    baseline_holding = _leg_magnitude_of_signed_net(
+                        context.baseline_venue_net, duplicate_leg
+                    )
+                except Exception as exc:  # noqa: BLE001 - not evaluable, never fatal
+                    self._note_resolver_error(intent_id, exc)
+                    venue_holding = None
+                    baseline_holding = None
+                if venue_holding is not None and baseline_holding is not None:
+                    duplicate_suspect = venue_holding - baseline_holding > wire_quantity
+            if duplicate_suspect:
+                sightings = (
+                    self._duplicate_suspect_passes[intent_id]  # noqa: SIM401
+                    if intent_id in self._duplicate_suspect_passes
+                    else 0
+                ) + 1
+                self._duplicate_suspect_passes = {
+                    **self._duplicate_suspect_passes,
+                    intent_id: sightings,
+                }
+                if sightings == _DUPLICATE_CONFIRM_PASSES:
+                    self._duplicate_suspect_total += 1
+                    self._contradiction_events_total += 1
+                    self._resolver_contradiction_details = {
+                        **self._resolver_contradiction_details,
+                        intent_id: {
+                            "severity": "CRITICAL",
+                            "event": "resolver_duplicate_suspect",
+                            "site": "global",
+                            "intent_id": intent_id,
+                            "venue_order_id": "none",
+                            "no_id": "true",
+                            "reason": "holding_exceeds_baseline_by_more_than_one_order",
+                            "next": "entry_halt_sticky_until_operator_reset",
+                        },
+                    }
+                    self._log.error(
+                        f"resolver: no-id intent {intent_id} DUPLICATE_SUSPECT -- the venue "
+                        "holding exceeds the baseline by more than one order's quantity on "
+                        f"{_DUPLICATE_CONFIRM_PASSES} consecutive passes; stays AMBIGUOUS, "
+                        "the entry halt latches"
+                    )
+                if sightings >= _DUPLICATE_CONFIRM_PASSES:
+                    return
+            else:
+                self._duplicate_suspect_passes = {
+                    **self._duplicate_suspect_passes,
+                    intent_id: 0,
+                }
 
         known = {
             leg.order_id
@@ -4034,7 +4542,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # the interval, never on every 5 s poll.
         self._no_id_next_check_ns[intent_id] = recheck_ns
         try:
-            self._resolve_no_order(intent_id, context, now_ns, positions)
+            self._resolve_no_order(intent_id, context, now_ns, positions, slug=intent_slug)
         except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
             self._note_resolver_error(intent_id, exc)
 
@@ -4055,6 +4563,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         context: AmbiguousResolverContext | None,
         now_ns: int,
         positions: Mapping[str, Any] | None = None,
+        *,
+        slug: str = "",
     ) -> None:
         """Retire a no-id intent that complete reads show neither an order nor a
         fill for. Mirrors :meth:`_resolve_terminal_zero` step for step.
@@ -4091,27 +4601,36 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "no-id pass was recorded for it in this run; SAFETY H2 fail-closed"
             )
             return
-        current = self._latch.current_open()
-        if current is None or current.intent_id != intent_id:
+        if not self._latch.is_open_intent(intent_id):
             self._ambiguous_bookings.pop(intent_id, None)
             return
+        # EXEC-PAR E1/E9: settle (releasing the booking, or removing a boot
+        # registration) BEFORE `_retire`, with a fresh clock read.
+        booking = (
+            self._ambiguous_bookings[intent_id]  # noqa: SIM401
+            if intent_id in self._ambiguous_bookings
+            else None
+        )
+        settle_failed = False
+        if self._ledger is not None:
+            settle_ns = self._clock.timestamp_ns()
+            try:
+                self._ledger.settle(
+                    intent_id,
+                    booking=booking,
+                    realized_usd=submit_chain.ZERO,
+                    fill_ts_ns=None,
+                    now_ns=settle_ns,
+                )
+            except Exception as exc:  # noqa: BLE001 - E9: abandon, retire, never stick
+                self._note_resolver_error(intent_id, exc)
+                self._ledger.abandon_open_exposure(intent_id)
+                settle_failed = True
+        self._ambiguous_bookings.pop(intent_id, None)
         self._retire(intent_id, "RESOLVER_NO_ID_NO_FILL", now_ns)
         self._log.info(f"resolver: retired intent {intent_id} (RESOLVER_NO_ID_NO_FILL)")
-        booking = self._ambiguous_bookings.pop(intent_id, None)
         if booking is not None:
             # Same process only: on restart the ledger died with the process.
-            # WP-DR: skip the true-up for a prior-UTC-day booking (no spend).
-            today = utc_day_for_ns(now_ns)
-            if booking.day != today:
-                self._log.info(
-                    f"resolver: prior-day booking for intent {intent_id} "
-                    f"(booking day {booking.day}, today {today}); "
-                    "no spend; ledger true-up skipped"
-                )
-            else:
-                self._ledger.true_up_booking(
-                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
-                )
             if (
                 self._permit is not None
                 and context is not None
@@ -4145,11 +4664,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
         # LAST: the AMBIGUOUS refusal has no subject left (same block as the
         # zero-fill and accept-fill clears). Any raise above keeps it.
-        if self._latch.current_open() is None:
+        if not settle_failed:
+            no_slot_open = self._latch.open_slot_count() == 0
             kept_refusals = [
                 refusal
                 for refusal in self._trading_refusals
                 if refusal.reason != submit_chain.AMBIGUOUS_REASON
+                or (refusal.instrument == "" and not no_slot_open)
+                or (refusal.instrument != "" and refusal.instrument != slug)
             ]
             if len(kept_refusals) != len(self._trading_refusals):
                 self._trading_refusals = kept_refusals
@@ -5964,6 +6486,32 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # contradiction health surface -- a no-op when `intent_id` never
         # contradicted.
         self._resolver_contradiction_details.pop(intent_id, None)
+        # EXEC-PAR H5: the per-intent resolver bookkeeping dies with the intent
+        # (whole-value reassignment, like the stale-alert set above).
+        self._resolver_intent_failures = {
+            key: value
+            for key, value in self._resolver_intent_failures.items()
+            if key != intent_id
+        }
+        self._resolver_intent_served = {
+            key: value for key, value in self._resolver_intent_served.items() if key != intent_id
+        }
+        self._duplicate_suspect_passes = {
+            key: value
+            for key, value in self._duplicate_suspect_passes.items()
+            if key != intent_id
+        }
+        # EXEC-PAR E1 leak backstop: every handler settles BEFORE calling here,
+        # so an entry still open now is a registry leak. Never settle from here
+        # (that would hide the leak and re-open the unregistered-booking raise):
+        # log it and count it; the entry stays, which is conservative because it
+        # keeps its headroom held.
+        if self._ledger is not None and self._ledger.has_open_exposure(intent_id):
+            self._resolver_error_count += 1
+            self._log.error(
+                f"retire: intent {intent_id} retired while its open exposure is still "
+                "registered; the entry stays held (conservative) and needs investigation"
+            )
 
     def _generate_submitted(self, order: Any, now_ns: int) -> None:
         """``OrderSubmitted`` -- shared by every D9 leaf that reaches a POST."""
@@ -5990,6 +6538,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         wire_price: str | None = None,
         wire_outcome_side: str | None = None,
         wire_action: str | None = None,
+        wire_quantity: int | str | None = None,
         register_booking: bool = True,
         capture_holding_baseline: bool = False,
     ) -> None:
@@ -6049,6 +6598,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             wire_price=wire_price,
             wire_outcome_side=wire_outcome_side,
             wire_action=wire_action,
+            wire_quantity=None if wire_quantity is None else str(wire_quantity),
             baseline_venue_net=None if baseline is None else baseline.venue_net,
             baseline_durable_net=None if baseline is None else baseline.durable_net,
             baseline_ts_ns=None if baseline is None else baseline.ts_ns,
@@ -6149,9 +6699,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """Authorize, arm, POST, retire. Deny before any venue contact."""
         order = command.order
         now_ns = self._clock.timestamp_ns()
-        if self._trading_refusals:
-            reason = submit_chain.latched_refusal_reason(self._trading_refusals[0].reason)
-            return self._deny(order, reason, now_ns)
+        # EXEC-PAR 3.3 step 1: only an UNSCOPED refusal denies every order. A
+        # refusal scoped to one slug (K > 1 only) is checked below, once the
+        # order's own slug is known. At K = 1 every refusal is unscoped, so this
+        # is the same first-entry denial as before.
+        for latched in self._trading_refusals:
+            if latched.instrument == "":
+                reason = submit_chain.latched_refusal_reason(latched.reason)
+                return self._deny(order, reason, now_ns)
         if self._cache.account_for_venue(self.venue) is None:
             reason = submit_chain.missing_account_reason(self.venue)
             return self._deny(order, reason, now_ns)
@@ -6233,18 +6788,45 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return self._deny(order, unmappable, now_ns)
         if submit_chain.permit_is_missing(self._permit):
             return self._deny(order, submit_chain.PERMIT_ABSENT_REASON, now_ns)
-        # SAFETY C1 (plan rev 6.1): the authoritative re-check, immediately
-        # before the permit spend below and with NO `await` between here and
-        # `self._latch.arm(...)`. Two `_submit_order` tasks created in one
-        # synchronous burst (`submit_order` wraps every command in its own
-        # task, `live/execution_client.py:277-282`) cannot interleave between
-        # this line and `arm()`: whichever task's `SubmitOrder` was scheduled
-        # first runs this whole prefix -- including `arm()` -- with no
-        # suspension point, so the second task observes `is_latched() is
-        # True` here, before it has spent anything. This is a WAIT, not a
-        # refusal: no money, no permit, no `_trading_refusals` entry.
-        if self._latch is not None and self._latch.is_latched():
+        # SAFETY C1 (plan rev 6.1) / EXEC-PAR 3.3 step 3: the authoritative
+        # admission re-check, immediately before the permit spend below and with
+        # NO `await` between here and `self._latch.arm_slot(...)`. Two
+        # `_submit_order` tasks created in one synchronous burst
+        # (`submit_order` wraps every command in its own task,
+        # `live/execution_client.py:277-282`) cannot interleave between this
+        # line and `arm_slot()`: whichever task's `SubmitOrder` was scheduled
+        # first runs this whole prefix -- including `arm_slot()` -- with no
+        # suspension point, so the second observes the slot already taken
+        # here, before it has spent anything. This is a WAIT, not a refusal: no
+        # money, no permit, no `_trading_refusals` entry. At K = 1 it denies
+        # exactly when a slot is open (the old `is_latched`), for entries and
+        # exits alike. The slug is derived from the order's own instrument; an
+        # unmappable one is a denial, never a raise out of the task.
+        try:
+            slug = base_slug_of(order.instrument_id)
+        except Exception:  # noqa: BLE001 - an unmappable instrument is a denial, not a crash
+            return self._deny(order, submit_chain.UNMAPPABLE_INSTRUMENT_REASON, now_ns)
+        for scoped in self._trading_refusals:
+            if scoped.instrument == slug:
+                reason = submit_chain.latched_refusal_reason(scoped.reason)
+                return self._deny(order, reason, now_ns)
+        if (
+            self._latch is not None
+            and self._latch.admission_refusal(slug, is_exit_order) is not None
+        ):
             return self._deny(order, submit_chain.OPEN_INTENT_WAIT_REASON, now_ns)
+        # EXEC-PAR 3.5: the read-only open-exposure pre-check, before any permit
+        # spend. A plain budget exhaustion is deferred to the in-lock day stop;
+        # a denial here is a plain deny with no day-stop marker. Entries only:
+        # an exit never debits the daily counter.
+        if order.side != OrderSide.SELL:
+            exposure_denial = self._ledger.exposure_admission_refusal(
+                submit_chain.order_price_decimal(order),
+                submit_chain.order_quantity_decimal(order),
+                now_ns,
+            )
+            if exposure_denial is not None:
+                return self._deny(order, exposure_denial, now_ns)
         # Item 4 (slice 4 review): the family-halt chokepoint veto -- the
         # SAME class of race as SAFETY C1 above (an already-created
         # `_submit_order` task is not reachable by the strategy's own
@@ -6270,6 +6852,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             body = submit_chain.build_exit_order_body(order, instrument, exit_view)
         else:
             body = submit_chain.build_order_body(order, instrument)
+        # EXEC-PAR 3.3 step 5: the wire body must name the market the admission
+        # gate keyed on and the order's own quantity (both `_note_ambiguous_open`
+        # sites record this same body). Plain comparisons, no calls.
+        if body["marketSlug"] != slug:
+            return self._deny(order, submit_chain.BODY_SLUG_MISMATCH_REASON, now_ns)
+        if body["quantity"] != submit_chain.order_quantity_decimal(order):
+            return self._deny(order, submit_chain.BODY_QUANTITY_MISMATCH_REASON, now_ns)
         encoded = submit_chain.encode_order_body(body)
         order_notional = submit_chain.order_notional_usd(order)
         fingerprint = submit_chain.wire_fingerprint_bytes(
@@ -6330,13 +6919,38 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._ledger.release_booking(booking, now_ns=now_ns)
             return self._deny(order, submit_chain.RECONCILE_NOT_RUN_REASON, now_ns)
         try:
-            intent = self._latch.arm(submit_chain.intent_fingerprint(order), now_ns=now_ns)
+            intent = self._latch.arm_slot(
+                submit_chain.intent_fingerprint(order),
+                slug=slug,
+                is_exit=is_exit_order,
+                now_ns=now_ns,
+            )
         except Exception as exc:  # noqa: BLE001 - store/latch failures must deny, not crash the loop
             if booking is not None:
                 self._ledger.release_booking(booking, now_ns=now_ns)
             if submit_chain.is_latch_arm_refusal(exc):
                 return self._deny(order, submit_chain.LATCH_ARM_REFUSED_REASON, now_ns)
             return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
+        # EXEC-PAR 3.5 / E4 / E11: register the order's exposure in the same
+        # synchronous span as `authorize_order_cost` (no `await`), charged and
+        # for exactly the booked cost. Exits have no booking and are never
+        # registered. A registration failure never POSTs: release the booking
+        # (no registry entry exists yet, same task, the booking's own clock),
+        # retire the just-armed slot, deny.
+        if booking is not None:
+            try:
+                self._ledger.register_open_exposure(
+                    intent.intent_id,
+                    booking.cost,
+                    booking=booking,
+                    seeded_partial_usd=submit_chain.ZERO,
+                    side=order.side.name,
+                    now_ns=now_ns,
+                )
+            except Exception:  # noqa: BLE001 - fail closed: never POST an unregistered order
+                self._ledger.release_booking(booking, now_ns=now_ns)
+                self._retire(intent.intent_id, submit_chain.RETIRE_REJECT, now_ns)
+                return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
         # AMBIG-LATCH-RESUME: the durable context BEFORE the POST, with no
         # `await` between `arm` and this write, so the resolver (same loop) can
         # never observe an armed intent without it. It carries the wire echo a
@@ -6355,16 +6969,24 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_price=body["price"]["value"],
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
+                wire_quantity=body["quantity"],
             )
         except Exception:  # noqa: BLE001 - fail closed: never POST without a durable context
             if booking is not None:
-                self._ledger.release_booking(booking, now_ns=now_ns)
+                # Registered above, so the release routes through the registry.
+                self._ledger.settle(
+                    intent.intent_id,
+                    booking=booking,
+                    realized_usd=None,
+                    fill_ts_ns=None,
+                    now_ns=now_ns,
+                )
             return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
         headers = self._write_signer.sign_headers(
             write_transport._WRITE_METHOD,
             write_transport.ORDERS_PATH,
         )
-        self._post_in_flight_intent_id = intent.intent_id
+        self._post_in_flight_intent_ids = self._post_in_flight_intent_ids | {intent.intent_id}
         try:
             response = await self._order_sender.post_order(
                 self._api_base_url,
@@ -6372,7 +6994,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 body=encoded,
             )
         except Exception as exc:
-            self._refuse(submit_chain.AMBIGUOUS_REASON)
+            self._refuse(
+                submit_chain.AMBIGUOUS_REASON,
+                instrument=slug if self._latch.max_slots() > 1 else "",
+            )
+            self._ledger.mark_ambiguous(intent.intent_id)
             self._log.error(submit_chain.AMBIGUOUS_REASON)
             # Exception TYPE only -- never its message, which may embed a
             # URL, header, or other request detail the transport layer
@@ -6388,7 +7014,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 raise
             return
         finally:
-            self._post_in_flight_intent_id = None
+            self._post_in_flight_intent_ids = self._post_in_flight_intent_ids - {intent.intent_id}
         outcome = submit_chain.classify_create_order_outcome(
             response,
             instrument=instrument,
@@ -6506,9 +7132,55 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._refuse(_FILL_WRITE_FAILED)
             else:
                 if booking is not None:
-                    self._ledger.true_up_booking(
-                        booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
-                    )
+                    # EXEC-PAR D5 / E1: settle through the registry with a FRESH
+                    # clock read (the POST await may have crossed midnight or
+                    # moved the ledger's own clock), before `_retire`.
+                    settle_ns = self._clock.timestamp_ns()
+                    try:
+                        self._ledger.settle(
+                            intent.intent_id,
+                            booking=booking,
+                            realized_usd=outcome.filled_cost_usd,
+                            fill_ts_ns=fill.ts_event,
+                            now_ns=settle_ns,
+                        )
+                    except Exception as settle_exc:
+                        # E10': a same-day integrity error escapes the task, as
+                        # today, but first converge on the resolver's with-id
+                        # accept-fill route so the existing UNBUDGETED producer
+                        # latches: abandon the entry (no spend added), upgrade the
+                        # context to with-id (no booking held), emit the
+                        # `OrderSubmitted` Nautilus needs before the resolver's
+                        # `OrderFilled`, then re-raise. The intent stays OPEN.
+                        self._log.error(
+                            "create-order accept-fill settle failed "
+                            f"({settle_exc.__class__.__name__}); abandoning the open "
+                            f"exposure and handing intent {intent.intent_id} to the resolver"
+                        )
+                        self._ledger.abandon_open_exposure(intent.intent_id)
+                        try:
+                            self._note_ambiguous_open(
+                                intent_id=intent.intent_id,
+                                venue_order_id=fill.venue_order_id.value,
+                                order=order,
+                                notional_usd=order_notional,
+                                booking=None,
+                                now_ns=now_ns,
+                                register_booking=False,
+                                wire_market_slug=body["marketSlug"],
+                                wire_price=body["price"]["value"],
+                                wire_outcome_side=body["outcomeSide"],
+                                wire_action=body["action"],
+                                wire_quantity=body["quantity"],
+                            )
+                        except Exception as upgrade_exc:  # noqa: BLE001 - never mask the settle error
+                            self._log.error(
+                                "could not upgrade the resolver context to with-id "
+                                f"({upgrade_exc.__class__.__name__}); the intent falls "
+                                "back to the no-id route"
+                            )
+                        self._generate_submitted(order, now_ns)
+                        raise
                 self._retire(intent.intent_id, retire_name, now_ns)
                 if outcome.fee_reconciled is False:
                     # The fill is real; only the fee is untrusted -- the
@@ -6594,8 +7266,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             and outcome.venue_order_id is not None
         ):
             if booking is not None:
-                self._ledger.true_up_booking(
-                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
+                settle_ns = self._clock.timestamp_ns()
+                self._ledger.settle(
+                    intent.intent_id,
+                    booking=booking,
+                    realized_usd=submit_chain.ZERO,
+                    fill_ts_ns=None,
+                    now_ns=settle_ns,
                 )
             self._retire(intent.intent_id, retire_name, now_ns)
             self._generate_submitted(order, now_ns)
@@ -6609,7 +7286,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         if outcome.kind == submit_chain.KIND_REJECT and retire_name is not None:
             if booking is not None:
-                self._ledger.release_booking(booking, now_ns=now_ns)
+                settle_ns = self._clock.timestamp_ns()
+                self._ledger.settle(
+                    intent.intent_id,
+                    booking=booking,
+                    realized_usd=None,
+                    fill_ts_ns=None,
+                    now_ns=settle_ns,
+                )
             self._retire(intent.intent_id, retire_name, now_ns)
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
@@ -6619,7 +7303,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 ts_event=now_ns,
             )
             return
-        self._refuse(submit_chain.AMBIGUOUS_REASON)
+        self._refuse(
+            submit_chain.AMBIGUOUS_REASON,
+            instrument=slug if self._latch.max_slots() > 1 else "",
+        )
+        self._ledger.mark_ambiguous(intent.intent_id)
         self._log.error(submit_chain.AMBIGUOUS_REASON)
         # `outcome.detail` is redacted (shape and length only, never body
         # content) by `submit_chain._body_detail` -- safe to log even
@@ -6681,6 +7369,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_price=body["price"]["value"],
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
+                wire_quantity=body["quantity"],
             )
         else:
             self._ambiguous_bookings[intent.intent_id] = booking
@@ -6729,8 +7418,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         reason: str,
         *,
         classification: RefusalClass = RefusalClass.DURABLE,
+        instrument: str = "",
     ) -> None:
         """Record a reason this client cannot be trusted to trade, and alert.
+
+        EXEC-PAR D3: ``instrument`` (keyword-only, default ``""`` = global) scopes
+        the entry, and the dedupe key is ``(reason, instrument)`` -- a scoped
+        refusal for one instrument no longer masks the same reason for another,
+        and a global one is still deduped against a global one. Only the scoped
+        AMBIGUOUS producer in ``_submit_order`` passes an instrument.
 
         ERROR, not WARNING: an unattributable position is the operator's
         problem to resolve, and the node will go on running -- refusing -- in
@@ -6796,11 +7492,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``tests/unit/test_exec_refusal_health_surface.py``), so nothing here
         stops the node, publishes a shutdown, or writes a fault latch.
         """
-        if any(refusal.reason == reason for refusal in self._trading_refusals):
+        if any(
+            refusal.reason == reason and refusal.instrument == instrument
+            for refusal in self._trading_refusals
+        ):
             return
         was_already_degraded = self.is_degraded
         self._trading_refusals.append(
-            ClassifiedRefusal(instrument="", reason=reason, classification=classification)
+            ClassifiedRefusal(instrument=instrument, reason=reason, classification=classification)
         )
         self._log.error(f"Trading refused: {reason}")
         if not was_already_degraded:

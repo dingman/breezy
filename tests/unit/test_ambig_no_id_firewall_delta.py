@@ -69,6 +69,17 @@ PRE_RESOLVER_CALLEES = frozenset(
         # WP-DR (2026-10-10): a pure date function, no I/O, no egress. ONE
         # named row added to the baseline; the delta stays pinned by `==`.
         "utc_day_for_ns",
+        # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2): NAMED rows added to the baseline,
+        # never relaxed (L-12) -- local-state calls only (the slot table, the
+        # exposure registry, a pure leg-magnitude helper). `true_up_booking`
+        # (replaced by `settle`) left the resolver and is removed.
+        "self._latch.next_open_for_resolution",
+        "self._latch.is_open_intent",
+        "self._latch.max_slots",
+        "self._latch.open_slot_count",
+        "self._ledger.settle",
+        "self._ledger.abandon_open_exposure",
+        "_leg_magnitude_of_signed_net",
         "AmbiguousResolverContext.from_bytes",
         "ClientOrderId",
         "DurableFillRecord",
@@ -108,7 +119,6 @@ PRE_RESOLVER_CALLEES = frozenset(
         "self._durable_net_qty",
         "self._instrument_provider.list_all",
         "self._latch.current_open",
-        "self._ledger.true_up_booking",
         "self._log.debug",
         "self._log.error",
         "self._log.info",
@@ -198,12 +208,22 @@ PRE_ORDER_CALLEES = frozenset(
         "self._clock.timestamp_ns",
         "self._deny",
         "self._generate_submitted",
-        "self._latch.arm",
-        "self._latch.is_latched",
         "self._latch.retire",
         "self._ledger.authorize_order_cost",
         "self._ledger.release_booking",
-        "self._ledger.true_up_booking",
+        # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2/E10'/E11): NAMED rows added to the
+        # baseline, never relaxed (L-12). `arm`, `is_latched` and
+        # `true_up_booking` (replaced by `arm_slot`, `admission_refusal` and
+        # `settle`) left the order coroutine and are removed.
+        "base_slug_of",
+        "self._latch.admission_refusal",
+        "self._latch.arm_slot",
+        "self._latch.max_slots",
+        "self._ledger.exposure_admission_refusal",
+        "self._ledger.register_open_exposure",
+        "self._ledger.mark_ambiguous",
+        "self._ledger.settle",
+        "self._ledger.abandon_open_exposure",
         "self._log.error",
         "self._log.warning",
         "self._mark_budget_exhausted",
@@ -269,8 +289,11 @@ FROZEN_SOURCE_SHA256: Final[dict[str, str]] = {
 }
 
 #: ``ast.dump`` of ``_submit_order`` up to and including the ``arm`` try block.
+#: Re-pinned by EXEC-PAR WP4 (reviewer-approved with the exec client's own pin):
+#: the per-slug admission, the open-exposure pre-check, the two body pins, the
+#: `arm_slot` call and the registration all sit INSIDE this prefix by design.
 SUBMIT_PREFIX_SHA256: Final[str] = (
-    "560388a1c438ee27e53a338c4872e2441d58baf7c23c7625cc37e63c321f1bb7"
+    "4183d5f475c62f6f7ccdea387cc7bce051063935400a83492d21441e52aec6eb"
 )
 
 

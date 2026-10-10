@@ -81,6 +81,18 @@ OPEN_INTENT_WAIT_REASON: Final[str] = (
 STORE_RAISED_REASON: Final[str] = (
     "the durable store raised before the post; this client refuses to submit"
 )
+#: EXEC-PAR 3.3: plain denials from ``_submit_order`` (no permit, no booking,
+#: no ``_trading_refusals`` entry). Names only -- never a value.
+UNMAPPABLE_INSTRUMENT_REASON: Final[str] = (
+    "the order's instrument has no Polymarket.us market slug; this client refuses to submit"
+)
+BODY_SLUG_MISMATCH_REASON: Final[str] = (
+    "the wire body names a different market than the order's instrument; "
+    "this client refuses to submit"
+)
+BODY_QUANTITY_MISMATCH_REASON: Final[str] = (
+    "the wire body quantity differs from the order quantity; this client refuses to submit"
+)
 AMBIGUOUS_REASON: Final[str] = (
     "create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
 )
@@ -121,6 +133,7 @@ _IOC_ZERO_FILL_TERMINAL_STATES: Final[frozenset[str]] = frozenset(
 _LATCH_ARM_REFUSAL_TYPES: Final[frozenset[str]] = frozenset(
     {
         "SubmitIntentLatched",
+        "SubmitIntentAdmissionDenied",
         "SubmitIntentInvalidFingerprint",
         "SubmitIntentLockNotHeld",
     }

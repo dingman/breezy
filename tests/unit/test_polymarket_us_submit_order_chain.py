@@ -903,7 +903,10 @@ def test_ambiguous_classified_path_source_logs_the_venues_shape_not_its_body() -
     import inspect
 
     source = inspect.getsource(PolymarketUSExecutionClient._submit_order)
-    classified_block = source[source.rindex("self._refuse(submit_chain.AMBIGUOUS_REASON)") :]
+    # EXEC-PAR WP4 (D3): the refusal call gained a scoped `instrument=` keyword and
+    # now spans lines; the needle is the same call (the LAST one in the method).
+    needle = "self._refuse(\n            submit_chain.AMBIGUOUS_REASON,"
+    classified_block = source[source.rindex(needle) :]
     assert "path=classified" in classified_block
     assert "outcome.detail" in classified_block
     assert "client_order_id=" in classified_block
@@ -939,11 +942,33 @@ async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
         #: background task never got scheduled long enough to hit before.
         CorruptError = SubmitIntentCorrupt
 
-        def arm(self, fingerprint: str, *, now_ns: int) -> object:
+        def arm_slot(
+            self, fingerprint: str, *, slug: str, is_exit: bool, now_ns: int
+        ) -> object:
             raise RuntimeError("state store raised before the post")
 
         def retire(self, *_args: object, **_kwargs: object) -> object:
             raise AssertionError("retire must not run")
+
+        # EXEC-PAR WP4: the slot API the order path and the resolver now call.
+        # An empty, single-slot latch: nothing is open, nothing is refused.
+        def admission_refusal(self, slug: str, is_exit: bool) -> None:
+            return None
+
+        def max_slots(self) -> int:
+            return 1
+
+        def open_slot_count(self) -> int:
+            return 0
+
+        def is_open_intent(self, intent_id: str) -> bool:
+            return False
+
+        def open_submit_intents(self) -> tuple[object, ...]:
+            return ()
+
+        def next_open_for_resolution(self, failures: object, served: object) -> None:
+            return None
 
         def current(self) -> None:
             return None
@@ -952,9 +977,9 @@ async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
             return None
 
         def is_latched(self) -> bool:
-            # SAFETY C1 (plan rev 6.1): the new pre-spend re-check calls this
-            # before `arm()`. `False` lets the test still reach the raising
-            # `arm()` below, which is this test's whole point.
+            # SAFETY C1 (plan rev 6.1): `resume_if_refusals_cleared` still calls
+            # this; `False` lets the test still reach the raising `arm_slot()`
+            # above, which is this test's whole point.
             return False
 
         def reconcile_at_startup(self, **_kwargs: object) -> None:

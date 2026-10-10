@@ -3048,7 +3048,9 @@ async def test_record_fill_is_written_before_true_up_booking_retire_and_order_fi
     # `DailySpendLedger` is `__slots__`-only (no instance `__dict__`), so the
     # spy is installed on the CLASS, not the instance -- this rig's ledger is
     # the only live instance for the duration of this test.
-    original_true_up = DailySpendLedger.true_up_booking
+    # EXEC-PAR WP4 (D5): the post-POST ledger call is now `settle` (a same-day
+    # booking is trued up through it); the ordering pin is the same strength.
+    original_true_up = DailySpendLedger.settle
 
     def _spy_record_fill(record: DurableFillRecord, **kwargs: Any) -> None:
         # AUD-13b: the write sites now pass `fill_time_instrument=` through.
@@ -3056,7 +3058,7 @@ async def test_record_fill_is_written_before_true_up_booking_retire_and_order_fi
         original_record_fill(record, **kwargs)
 
     def _spy_true_up(ledger_self: Any, *args: Any, **kwargs: Any) -> Any:
-        rig.trace.append("true_up_booking")
+        rig.trace.append("settle")
         return original_true_up(ledger_self, *args, **kwargs)
 
     def _spy_retire(*args: Any, **kwargs: Any) -> Any:
@@ -3064,7 +3066,7 @@ async def test_record_fill_is_written_before_true_up_booking_retire_and_order_fi
         return original_retire(*args, **kwargs)
 
     monkeypatch.setattr(rig.client, "record_fill", _spy_record_fill)
-    monkeypatch.setattr(DailySpendLedger, "true_up_booking", _spy_true_up)
+    monkeypatch.setattr(DailySpendLedger, "settle", _spy_true_up)
     monkeypatch.setattr(rig.client, "_retire", _spy_retire)
 
     with _accept_fill_caps():
@@ -3074,7 +3076,7 @@ async def test_record_fill_is_written_before_true_up_booking_retire_and_order_fi
 
     assert rig.trace == [
         "record_fill",
-        "true_up_booking",
+        "settle",
         "_retire",
         "OrderSubmitted",
         "OrderFilled",
@@ -4779,9 +4781,31 @@ async def test_a_resolver_fill_discovered_after_midnight_seeds_the_discovery_day
         # what this test pins (the durable record's `ts_event`).
         rig.client._ambiguous_bookings.pop(current.intent_id, None)
 
-        rig.client._resolve_accept_fill(
-            context, _FakeResolverAcceptFillReport(), instrument, day_d_plus_1_ns,
-        )
+        # EXEC-PAR WP4 (r5.1 E8): the resolver now stamps the record from ONE fresh
+        # clock read (shared with the ledger settle), so the discovery time must
+        # come from an INJECTED clock. Installed only now, after the submit: the
+        # permit was issued against the real clock.
+        real_clock_descriptor = PolymarketUSExecutionClient._clock
+
+        class _DiscoveryClock:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def timestamp_ns(self) -> int:
+                return day_d_plus_1_ns
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(
+                PolymarketUSExecutionClient,
+                "_clock",
+                property(lambda self: _DiscoveryClock(real_clock_descriptor.__get__(self))),
+            )
+            rig.client._resolve_accept_fill(
+                context, _FakeResolverAcceptFillReport(), instrument, day_d_plus_1_ns,
+            )
 
         await rig.client._disconnect()
 
@@ -5276,12 +5300,20 @@ async def test_no_id_no_fill_after_midnight_clears_refusal(
         await rig.client._disconnect()
 
 
+def _registry_failure(self: DailySpendLedger, *args: Any, **kwargs: Any) -> None:
+    """The "registry double" of EXEC-PAR r5 3.7: registers nothing. Production
+    reaches the UNBUDGETED latch only through a registry failure (D1); the
+    successor ``test_accept_fill_after_midnight_settles_via_registry_no_latch``
+    (``test_exec_par_wp4_resolver.py``) pins the registered behaviour."""
+
+
 @pytest.mark.asyncio
-async def test_accept_fill_after_midnight_retires_once_and_latches_fill_unbudgeted(
+async def test_accept_fill_after_midnight_unregistered_retires_once_and_latches_fill_unbudgeted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
+    monkeypatch.setattr(DailySpendLedger, "register_open_exposure", _registry_failure)
     sender = _FakeOrderSender()
     rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
     with _accept_fill_caps():
@@ -5309,11 +5341,19 @@ async def test_accept_fill_after_midnight_retires_once_and_latches_fill_unbudget
 
 
 @pytest.mark.asyncio
-async def test_same_day_over_cost_true_up_still_escalates(
+async def test_same_day_over_cost_settle_never_absorbs_and_latches_unbudgeted_in_one_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
+    """SUPERSEDES ``test_same_day_over_cost_true_up_still_escalates`` (EXEC-PAR
+    r5.1 E2, deliberate): the same-day integrity error is still never absorbed
+    -- the over-cost realized amount is NOT added to the day's spend -- but it no
+    longer escapes the handler. The handler counts it, abandons the registry
+    entry (no spend added), retires the intent and reaches the single existing
+    UNBUDGETED producer, so the visible end state (retired plus a global DURABLE
+    halt) arrives in one pass instead of two. The create path still re-raises
+    (E10')."""
     sender = _FakeOrderSender()
     rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
     with _accept_fill_caps():
@@ -5321,10 +5361,16 @@ async def test_same_day_over_cost_true_up_still_escalates(
         current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-overcost", sender)
         rig.client._resolved_by_get_ts_ns[current.intent_id] = now_ns
 
-        with pytest.raises(LiveTradingPermissionError, match="cannot cost more than authorized"):
-            rig.client._resolve_accept_fill(context, _OverCostFillReport(), rig.instrument, now_ns)
+        rig.client._resolve_accept_fill(context, _OverCostFillReport(), rig.instrument, now_ns)
 
-        assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
+        assert client_module._RESOLVER_FILL_UNBUDGETED in rig.client.trading_refusals
+        assert rig.client.resolver_error_count == 1
+        assert rig.client._ledger.spent_today_usd(now_ns=now_ns) == Decimal("0.37"), (
+            "the over-cost realized amount is never absorbed into the day's spend"
+        )
+        after = rig.client._latch.current()
+        assert after is not None
+        assert after.state is SubmitIntentState.RETIRED
         await rig.client._disconnect()
 
 

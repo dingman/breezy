@@ -1976,9 +1976,25 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "assert_live_order_submission_permitted",
         "self._ledger.authorize_order_cost",
         "self._ledger.release_booking",
-        "self._ledger.true_up_booking",
-        "self._latch.arm",
         "self._latch.retire",
+        # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2/E10'/E11), WIDENED by NAMED rows, never
+        # relaxed (L-12): the per-slug admission, the arm that re-runs it, the
+        # exposure registry (pre-check, register at arm, AMBIGUOUS mark, settle
+        # and abandon), the effective K for the refusal scope, and the pure
+        # slug reader. Each is a local-state call: no I/O, no sender, no egress
+        # (none contains "read", "send", "post" or "request").
+        # `self._latch.arm`, `self._latch.is_latched` (replaced by
+        # `admission_refusal`) and `self._ledger.true_up_booking` (replaced by
+        # `settle`) are no longer called from the order coroutine and are gone.
+        "base_slug_of",
+        "self._latch.admission_refusal",
+        "self._latch.arm_slot",
+        "self._latch.max_slots",
+        "self._ledger.exposure_admission_refusal",
+        "self._ledger.register_open_exposure",
+        "self._ledger.mark_ambiguous",
+        "self._ledger.settle",
+        "self._ledger.abandon_open_exposure",
         # BL-10 (r1/r2 delta): the single-use capability's own spend call,
         # run synchronously right after the mint above and BEFORE
         # `self._ledger.authorize_order_cost`/`self._latch.arm` -- see
@@ -1987,9 +2003,8 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # `SessionNotionalExhausted`, both already-permitted exception
         # types on this path; it reaches no network of its own.
         "authorization.consume",
-        # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check.
-        # Read-only against the durable singleton; adds no send path.
-        "self._latch.is_latched",
+        # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check is now
+        # `self._latch.admission_refusal` (above, EXEC-PAR WP4).
         # Item 4 (slice 4 review): the family-halt chokepoint veto -- the
         # SAME class of re-check as SAFETY C1 immediately above, and reached
         # the identical way: a plain synchronous callable, no send path.
@@ -2193,7 +2208,6 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "self._resolve_terminal_zero",
         "self._ambiguous_bookings.pop",
         "self._retire",
-        "self._ledger.true_up_booking",
         "self.generate_order_canceled",
         "StrategyId",
         "ClientOrderId",
@@ -2328,6 +2342,20 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # `domain/exec_intent.py` restates it): no I/O, no sender, no egress.
         # ONE named row added; the set stays pinned by `==`.
         "utc_day_for_ns",
+        # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2/E9), WIDENED by NAMED rows, never
+        # relaxed (L-12). Local-state calls only: the slot table (selection,
+        # by-id guards, effective K, open count), the exposure registry (settle
+        # and the non-raising abandon) and a pure leg-magnitude helper. None
+        # contains "read", "send", "post" or "request"; none can reach
+        # `self._order_sender.post_order`, which stays absent from this set.
+        # `self._ledger.true_up_booking` (replaced by `settle`) is gone.
+        "self._latch.next_open_for_resolution",
+        "self._latch.is_open_intent",
+        "self._latch.max_slots",
+        "self._latch.open_slot_count",
+        "self._ledger.settle",
+        "self._ledger.abandon_open_exposure",
+        "_leg_magnitude_of_signed_net",
     }
 )
 
@@ -3070,12 +3098,15 @@ def test_e0_nosend_detects_a_call_on_the_result_of_a_call() -> None:
 
 def test_submit_veto_sits_after_is_latched_and_before_the_permit_spend_no_await_between() -> None:
     """Item 4 (slice 4 review): the family-halt veto is the SAME class of
-    authoritative re-check as SAFETY C1's ``is_latched()`` -- it must run
+    authoritative re-check as SAFETY C1's admission check (EXEC-PAR WP4: the
+    callee is now ``self._latch.admission_refusal``, which at K=1 is exactly
+    ``is_latched()``; the pin is rewritten for the renamed callee at the SAME
+    strength -- ``latch < veto < permit`` with no ``await`` between) -- it must run
     AFTER that re-check, BEFORE ``assert_live_order_submission_permitted``
     (the permit spend), with NO ``await`` anywhere between the three, or an
     already-created ``_submit_order`` task could interleave between the
     veto's read and the spend exactly the way SAFETY C1 closed for
-    ``is_latched()``.
+    the admission check.
     """
     source = (REPO_ROOT / "src/breezy/adapters/polymarket_us/exec/client.py").read_text()
     tree = ast.parse(source)
@@ -3087,7 +3118,7 @@ def test_submit_veto_sits_after_is_latched_and_before_the_permit_spend_no_await_
     is_latched_lines = [
         n.lineno
         for n in ast.walk(submit_order)
-        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.is_latched"
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.admission_refusal"
     ]
     veto_lines = [
         n.lineno
@@ -3119,7 +3150,7 @@ def test_a_planted_await_between_the_veto_and_the_permit_spend_breaks_the_pin() 
     source = (
         '"""Docstring."""\n\n\n'
         "async def _submit_order(self, command):\n"
-        "    if self._latch is not None and self._latch.is_latched():\n"
+        "    if self._latch.admission_refusal(slug, False) is not None:\n"
         "        return self._deny(order, 'x', now_ns)\n"
         "    if self._submit_veto is not None:\n"
         "        veto_reason = self._submit_veto()\n"
@@ -3137,7 +3168,7 @@ def test_a_planted_await_between_the_veto_and_the_permit_spend_breaks_the_pin() 
     is_latched_lines = [
         n.lineno
         for n in ast.walk(submit_order)
-        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.is_latched"
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.admission_refusal"
     ]
     permit_spend_lines = [
         n.lineno
@@ -3148,6 +3179,85 @@ def test_a_planted_await_between_the_veto_and_the_permit_spend_breaks_the_pin() 
     await_lines = [n.lineno for n in ast.walk(submit_order) if isinstance(n, ast.Await)]
     between = [ln for ln in await_lines if max(is_latched_lines) < ln < min(permit_spend_lines)]
     assert between != [], "the planted await must be visible to the same check"
+
+
+def _submit_order_node(source: str) -> ast.AsyncFunctionDef:
+    return next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_submit_order"
+    )
+
+
+def _call_lines(node: ast.AST, callee: str) -> list[int]:
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == callee
+    ]
+
+
+def _await_lines_in(node: ast.AST) -> list[int]:
+    return [n.lineno for n in ast.walk(node) if isinstance(n, ast.Await)]
+
+
+def _awaits_between_authorize_and(source: str, callee: str) -> list[int]:
+    """Awaits strictly between the first ``authorize_order_cost`` and the LAST
+    call to ``callee`` in ``_submit_order`` (EXEC-PAR WP4)."""
+    node = _submit_order_node(source)
+    authorize = _call_lines(node, "self._ledger.authorize_order_cost")
+    targets = _call_lines(node, callee)
+    assert authorize and targets, f"authorize_order_cost and {callee} must both be present"
+    assert min(authorize) < min(targets)
+    return [ln for ln in _await_lines_in(node) if min(authorize) < ln < max(targets)]
+
+
+_CLIENT_SOURCE_PATH = REPO_ROOT / "src/breezy/adapters/polymarket_us/exec/client.py"
+
+
+def test_no_await_between_authorize_order_cost_and_register_open_exposure() -> None:
+    """EXEC-PAR WP4: the booking and its registry entry are made in ONE
+    synchronous span, so no other task can authorize, roll the day or settle
+    between the grant and the registration that makes it settleable."""
+    source = _CLIENT_SOURCE_PATH.read_text()
+    assert _awaits_between_authorize_and(source, "self._ledger.register_open_exposure") == []
+
+
+def test_no_await_between_authorize_order_cost_and_the_pre_post_release_booking_calls() -> None:
+    """EXEC-PAR WP4: every ``release_booking`` left in ``_submit_order`` is
+    pre-POST -- in the same synchronous span as ``authorize_order_cost``, where no
+    registry entry exists yet and the clock is the booking's own. That is the
+    mechanical reason these calls stay on ``release_booking`` (everything after
+    the POST ``await`` goes through ``settle`` with a fresh clock)."""
+    source = _CLIENT_SOURCE_PATH.read_text()
+    assert _awaits_between_authorize_and(source, "self._ledger.release_booking") == []
+    node = _submit_order_node(source)
+    awaits = _await_lines_in(node)
+    assert awaits, "the POST await is the order path's one suspension point"
+    assert max(_call_lines(node, "self._ledger.release_booking")) < min(awaits)
+    post_await_ledger_calls = [
+        ln
+        for callee in ("self._ledger.release_booking", "self._ledger.true_up_booking")
+        for ln in _call_lines(node, callee)
+        if ln > min(awaits)
+    ]
+    assert post_await_ledger_calls == []
+
+
+@pytest.mark.parametrize(
+    "callee", ["self._ledger.register_open_exposure", "self._ledger.release_booking"]
+)
+def test_a_planted_await_after_authorize_order_cost_breaks_the_new_pins(callee: str) -> None:
+    """Non-vacuity: the helper behind both new pins sees an await planted in the
+    exact span it polices."""
+    source = (
+        '"""Docstring."""\n\n\n'
+        "async def _submit_order(self, command):\n"
+        "    booking = self._ledger.authorize_order_cost(price_usd=p, quantity=q, now_ns=n)\n"
+        "    await asyncio.sleep(0)\n"
+        f"    {callee}(booking)\n"
+    )
+    assert _awaits_between_authorize_and(source, callee) != []
 
 
 def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
@@ -3195,12 +3305,19 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "assert_live_order_submission_permitted",
             "self._ledger.authorize_order_cost",
             "self._ledger.release_booking",
-            "self._ledger.true_up_booking",
-            "self._latch.arm",
             "self._latch.retire",
+            # EXEC-PAR WP4 named rows -- see the definition site's comment.
+            "base_slug_of",
+            "self._latch.admission_refusal",
+            "self._latch.arm_slot",
+            "self._latch.max_slots",
+            "self._ledger.exposure_admission_refusal",
+            "self._ledger.register_open_exposure",
+            "self._ledger.mark_ambiguous",
+            "self._ledger.settle",
+            "self._ledger.abandon_open_exposure",
             # BL-10 (r1/r2 delta): see the definition site's comment above.
             "authorization.consume",
-            "self._latch.is_latched",
             # Item 4 (slice 4 review): the family-halt chokepoint veto.
             "self._submit_veto",
         # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver

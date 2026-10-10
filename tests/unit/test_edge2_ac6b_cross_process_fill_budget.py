@@ -74,6 +74,7 @@ from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import SubmitIntentState
+from tests.unit.exec_par_rig import as_if_booted
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
     build_instrument,
@@ -104,6 +105,19 @@ from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 from tests.unit.test_polymarket_us_submit_order_chain import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+
+
+def _registry_failure(self: DailySpendLedger, *args: Any, **kwargs: Any) -> None:
+    """The "registry double" of EXEC-PAR r5 3.7: ``register_open_exposure`` registers
+    nothing, so the intent under test is UNREGISTERED. In production the
+    UNBUDGETED latch below is defence in depth that only a registry failure can
+    reach: every in-process intent is registered at arm and every intent OPEN at
+    boot is registered by the boot hunk (D1)."""
+
+
+def _spent(client: Any) -> Decimal:
+    spent: Decimal = client._ledger.spent_today_usd(now_ns=client._clock.timestamp_ns())
+    return spent
 
 
 @pytest.fixture(autouse=True)
@@ -200,7 +214,49 @@ async def test_cross_process_terminal_zero_does_not_restore_current_permit(
 
 
 @pytest.mark.asyncio
-async def test_cross_process_accept_fill_latches_unbudgeted_refusal(
+async def test_cross_process_accept_fill_of_registered_intent_adds_spend_once_no_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D1: the same cross-process shape, but the intent is REGISTERED (as the
+    boot hunk registers every inherited OPEN intent). The fill settles through
+    the registry: today's spend rises by the realized amount exactly once and
+    nothing latches."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._spend_seeded is True
+        armed = client._latch.current()
+        assert armed is not None
+        as_if_booted(client, armed.intent_id, notional="0.40")
+        assert _spent(client) == Decimal(0)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=2)
+
+        assert _RESOLVER_FILL_UNBUDGETED not in client.trading_refusals
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert _spent(client) == Decimal("0.40"), "the realized cost counts exactly once"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_accept_fill_unregistered_intent_latches_unbudgeted_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
@@ -209,6 +265,7 @@ async def test_cross_process_accept_fill_latches_unbudgeted_refusal(
     exactly what r2 would have refused on every boot. GREEN under r3: the
     boot's own `_connect` already ran (`_spend_seeded` is `True`), so this
     genuinely-unbudgeted cross-process BUY fill must latch."""
+    monkeypatch.setattr(DailySpendLedger, "register_open_exposure", _registry_failure)
     enable_operator_gate(monkeypatch, order_count="2")
     with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
         MAX_POSITION_COST_USD_ENV_VAR, "10.00",
@@ -243,7 +300,48 @@ async def test_cross_process_accept_fill_latches_unbudgeted_refusal(
 
 
 @pytest.mark.asyncio
-async def test_cross_process_no_leg_buy_fill_latches_unbudgeted_refusal(
+async def test_cross_process_no_leg_buy_fill_of_registered_intent_adds_spend_once_no_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D1 on the NO leg: a REGISTERED opening buy settles through the registry
+    (classification still uses the RECORDED "BUY", never the venue echo)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(
+            tmp_path,
+        )
+        armed = client._latch.current()
+        assert armed is not None
+        as_if_booted(client, armed.intent_id, notional="0.40")
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{venue_order_id}"
+        ] = _no_leg_order_get_body(
+            venue_order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1,
+            avg_px="0.40",
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {**build_position(slug), "netPosition": "-1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=2)
+
+        assert _RESOLVER_FILL_UNBUDGETED not in client.trading_refusals
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        # The venue reports the YES-space price 0.40; the NO leg's realized cost
+        # is its complement, 0.60 -- counted exactly once.
+        assert _spent(client) == Decimal("0.60")
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_no_leg_buy_fill_unregistered_intent_latches_unbudgeted_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
@@ -281,7 +379,51 @@ async def test_cross_process_no_leg_buy_fill_latches_unbudgeted_refusal(
 
 
 @pytest.mark.asyncio
-async def test_legacy_context_without_order_side_refuses_as_a_buy(
+async def test_legacy_context_registered_counts_as_a_buy_once_no_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D1: a pre-INC-E2 context decodes as a BUY; when its intent is REGISTERED
+    (boot hunk: a legacy context without ``orderSide`` is treated as a BUY) the
+    fill counts once through the registry and nothing latches."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    order_id = "ord-ac6b-legacy-registered"
+    with _accept_fill_caps():
+        await rig.client._connect()
+        armed = rig.client._latch.arm("5" * 64, now_ns=rig.clock.timestamp_ns())
+        instrument = rig.instrument
+        now_ns = rig.clock.timestamp_ns()
+        legacy_blob = json.dumps(
+            {
+                "intentId": armed.intent_id,
+                "venueOrderId": order_id,
+                "instrumentId": str(instrument.id),
+                "clientOrderId": "O-legacy",
+                "strategyId": str(STRATEGY_ID.value),
+                "notionalUsd": "0.40",
+                "bookingId": 1,
+                "createdNs": now_ns,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        context = AmbiguousResolverContext.from_bytes(legacy_blob)
+        assert context.order_side == "BUY"
+        rig.client._resolved_by_get_ts_ns[armed.intent_id] = now_ns
+        as_if_booted(rig.client, armed.intent_id, notional="0.40")
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), instrument, now_ns,
+        )
+
+        assert _RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
+        assert _spent(rig.client) == Decimal("0.37"), "the report's realized cost, once"
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_legacy_context_unregistered_refuses_as_a_buy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
@@ -541,7 +683,48 @@ async def test_spend_seeded_is_set_immediately_after_the_seed(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_unbudgeted_refusal_precedes_the_order_unknown_early_return(
+async def test_registered_order_unknown_intent_adds_spend_once_then_early_return_no_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D1: a REGISTERED cross-session intent still skips only
+    ``generate_order_filled`` (the FU-8 gate), but its spend now settles through
+    the registry once and no refusal latches."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    order_id = "ord-ac6b-unknown-reg"
+    with _accept_fill_caps():
+        await rig.client._connect()
+        armed = rig.client._latch.arm("9" * 64, now_ns=rig.clock.timestamp_ns())
+        instrument = rig.instrument
+        now_ns = rig.clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=armed.intent_id,
+            venue_order_id=order_id,
+            instrument_id=str(instrument.id),
+            client_order_id="O-cross-session-unknown",
+            strategy_id=str(STRATEGY_ID.value),
+            notional_usd=Decimal("0.40"),
+            booking_id=-1,
+            created_ns=now_ns,
+        )
+        rig.client._resolved_by_get_ts_ns[armed.intent_id] = now_ns
+        as_if_booted(rig.client, armed.intent_id, notional="0.40")
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), instrument, now_ns,
+        )
+
+        assert _RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
+        assert _spent(rig.client) == Decimal("0.37")
+        fills = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+        assert fills == [], "the FU-8 gate must still skip generate_order_filled"
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unregistered_latch_precedes_the_order_unknown_early_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811

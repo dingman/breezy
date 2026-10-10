@@ -538,16 +538,25 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "assert_live_order_submission_permitted",
                 "self._ledger.authorize_order_cost",
                 "self._ledger.release_booking",
-                "self._ledger.true_up_booking",
-                "self._latch.arm",
                 "self._latch.retire",
+                # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2/E10'/E11): WIDENED by NAMED
+                # rows -- the per-slug admission (replacing `is_latched`), the
+                # arm that re-runs it (replacing `arm`), the exposure registry
+                # (replacing `true_up_booking`), the effective K and the pure
+                # slug reader. Local-state calls; none reaches a sender.
+                "base_slug_of",
+                "self._latch.admission_refusal",
+                "self._latch.arm_slot",
+                "self._latch.max_slots",
+                "self._ledger.exposure_admission_refusal",
+                "self._ledger.register_open_exposure",
+                "self._ledger.mark_ambiguous",
+                "self._ledger.settle",
+                "self._ledger.abandon_open_exposure",
                 # BL-10 (r1/r2 delta): the single-use capability's own spend
                 # call -- see `firewall.EXEC_ORDER_COROUTINE_PERMITTED_
                 # CALLEES`'s definition-site comment.
                 "authorization.consume",
-                # SAFETY C1 (plan rev 6.1): the pre-spend re-check, read-only
-                # against the durable singleton -- adds no send path.
-                "self._latch.is_latched",
                 # Item 4 (slice 4 review): the family-halt chokepoint veto,
                 # the SAME class of re-check as SAFETY C1 immediately above.
                 "self._submit_veto",
@@ -641,9 +650,16 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "assert_live_order_submission_permitted",
                 "self._ledger.authorize_order_cost",
                 "self._ledger.release_booking",
-                "self._ledger.true_up_booking",
-                "self._latch.arm",
                 "self._latch.retire",
+                "base_slug_of",
+                "self._latch.admission_refusal",
+                "self._latch.arm_slot",
+                "self._latch.max_slots",
+                "self._ledger.exposure_admission_refusal",
+                "self._ledger.register_open_exposure",
+                "self._ledger.mark_ambiguous",
+                "self._ledger.settle",
+                "self._ledger.abandon_open_exposure",
                 "self._write_signer.sign_headers",
                 "self._order_sender.post_order",
                 "submit_chain.latched_refusal_reason",

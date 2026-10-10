@@ -58,18 +58,32 @@ class _Names:
 
     def __init__(self) -> None:
         self._seen: dict[str, str] = {}
+        self._bookings: dict[int, str] = {}
 
     def alias(self, value: str) -> str:
         if value not in self._seen:
             self._seen[value] = f"<ID{len(self._seen) + 1}>"
         return self._seen[value]
 
+    def booking(self, value: int) -> str:
+        """``SpendBooking`` ids come from a PROCESS-GLOBAL counter, so they depend
+        on how many bookings earlier tests made: alias them by first sight."""
+        if value not in self._bookings:
+            self._bookings[value] = f"<BK{len(self._bookings) + 1}>"
+        return self._bookings[value]
+
 
 def _norm(value: Any, names: _Names) -> Any:
     if isinstance(value, dict):
-        return {
-            _norm_text(k, names): _norm(v, names) for k, v in value.items() if k not in _D6_KEYS
-        }
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _D6_KEYS:
+                continue
+            if key == "bookingId" and type(item) is int and item > 0:
+                out[_norm_text(key, names)] = names.booking(item)
+            else:
+                out[_norm_text(key, names)] = _norm(item, names)
+        return out
     if isinstance(value, list):
         return [_norm(v, names) for v in value]
     if isinstance(value, str):

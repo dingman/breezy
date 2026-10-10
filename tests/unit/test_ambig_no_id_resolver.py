@@ -31,6 +31,7 @@ import pytest
 from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected, OrderSubmitted
 from nautilus_trader.model.identifiers import ClientOrderId
 
+from breezy.adapters.polymarket_us.operator_controls import DailySpendLedger
 from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
 from breezy.runtime.component_health_watch import install_component_degraded_alert
 from breezy.runtime.health import AlertPayload
@@ -270,7 +271,7 @@ async def test_exception_path_keeps_the_no_id_context_and_registers_the_booking(
     assert context is not None and context.venue_order_id == ""
     assert AMBIGUOUS in client.trading_refusals
     assert client._ambiguous_bookings[current.intent_id] is not None
-    assert client._post_in_flight_intent_id is None
+    assert client._post_in_flight_intent_ids == frozenset()
     await client._disconnect()
 
     # (b) a CancelledError is re-raised, and the context + flag are consistent
@@ -286,7 +287,7 @@ async def test_exception_path_keeps_the_no_id_context_and_registers_the_booking(
     current = client._latch.current_open()
     assert current is not None
     assert read_context(client, current.intent_id) is not None
-    assert client._post_in_flight_intent_id is None
+    assert client._post_in_flight_intent_ids == frozenset()
     await client._disconnect()
 
 
@@ -303,7 +304,7 @@ async def test_classified_no_id_path_registers_the_booking(
     assert context is not None and context.venue_order_id == ""
     assert AMBIGUOUS in client.trading_refusals
     assert client._ambiguous_bookings[current.intent_id] is not None
-    assert client._post_in_flight_intent_id is None
+    assert client._post_in_flight_intent_ids == frozenset()
     outcome = submit_chain.classify_create_order_outcome(
         sender.response,
         instrument=build_instrument(),
@@ -414,7 +415,7 @@ async def test_the_no_id_branch_skips_an_intent_whose_post_is_in_flight(
     await asyncio.wait_for(entered.wait(), timeout=5)
     current = client._latch.current_open()
     assert current is not None
-    assert client._post_in_flight_intent_id == current.intent_id
+    assert client._post_in_flight_intent_ids == frozenset({current.intent_id})
     client.advance(400)
     paths_before = read_paths(client)
 
@@ -425,7 +426,7 @@ async def test_the_no_id_branch_skips_an_intent_whose_post_is_in_flight(
     assert client._latch.current_open() is not None
     gate.set()
     await task
-    assert client._post_in_flight_intent_id is None
+    assert client._post_in_flight_intent_ids == frozenset()
     await client._disconnect()
 
 
@@ -578,13 +579,57 @@ async def test_same_process_no_id_found_fill_is_adopted_and_books_through_accept
     await client._disconnect()
 
 
+def _registry_failure(self: DailySpendLedger, *args: Any, **kwargs: Any) -> None:
+    """The "registry double" (EXEC-PAR r5 3.7): registers nothing."""
+
+
 @pytest.mark.asyncio
-async def test_cross_process_sigterm_mid_post_untracked_fill_is_adopted_and_recorded(
+async def test_registered_no_id_adopted_fill_adds_spend_once_no_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_env: None,  # noqa: F811
+) -> None:
+    """D1: the same SIGTERM-mid-POST shape, but the inherited no-id intent is
+    REGISTERED at boot (adopted before registration, no fill record yet: P = 0).
+    The fill settles through the registry: today's spend rises by the realized
+    cost exactly once and AC6b's latch does not fire."""
+    first, cm, intent_id, created = await prior_process(
+        tmp_path / "fill", monkeypatch, with_context="no_id", age_s=305
+    )
+    second, _cm2 = await boot_second_process(
+        tmp_path / "fill", monkeypatch, first, cm, admitted=True
+    )
+    _negative(second, activities=[_echo_leg(created + SEC_NS, ORDER_X)])
+    payloads = wire_payloads(second)
+    payloads[f"/v1/order/{ORDER_X}"] = _order_get_body(
+        ORDER_X, slug=SLUG, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40"
+    )
+    payloads[PORTFOLIO_POSITIONS_PATH] = {"positions": {SLUG: {"netPosition": "1"}}, "eof": True}
+
+    await second._connect()  # the immediate pass adopts the venue id, THEN boot registers it
+    assert second._ledger.has_open_exposure(intent_id)
+    await _run_exactly_one_pass(second)  # then the with-id path
+
+    assert _retirement(second) == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+    assert [r.venue_order_id for r in second.fill_records_for(build_instrument().id)] == [ORDER_X]
+    assert client_module._RESOLVER_FILL_UNBUDGETED not in second.trading_refusals
+    spent = second._ledger.spent_today_usd(now_ns=second._clock.timestamp_ns())
+    assert spent == Decimal("0.40"), "the realized cost counts exactly once"
+    assert not second._ledger.has_open_exposure(intent_id)
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_sigterm_mid_post_untracked_fill_is_adopted_and_recorded_unregistered_latches_ac6b(  # noqa: E501
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     gate_env: None,  # noqa: F811
 ) -> None:
     # MED-2: a prior process died mid-POST; an untracked fill exists.
+    # EXEC-PAR r5 3.7 (D1): this scenario is retained for the UNREGISTERED shape. The
+    # registry double registers nothing; in production the AC6b latch is
+    # defence in depth reached only through a registry failure.
+    monkeypatch.setattr(DailySpendLedger, "register_open_exposure", _registry_failure)
     first, cm, intent_id, created = await prior_process(
         tmp_path / "fill", monkeypatch, with_context="no_id", age_s=305
     )
@@ -1631,7 +1676,7 @@ async def test_a_raising_sign_headers_does_not_strand_the_in_flight_flag(
     monkeypatch.setattr(client._write_signer, "sign_headers", _boom, raising=False)
     with pytest.raises(RuntimeError):
         await client._submit_order(make_command(client))
-    assert client._post_in_flight_intent_id is None
+    assert client._post_in_flight_intent_ids == frozenset()
     assert sender.calls == []
     await client._disconnect()
 
