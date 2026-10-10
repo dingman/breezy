@@ -50,11 +50,13 @@ from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.symbology import base_slug_of
 from breezy.runtime.exec_par_telemetry import ExecParDigest
-from breezy.runtime.health import AlertPayload, AlertSink, emit_alert
+from breezy.runtime.health import AlertPayload, AlertSink
 from breezy.runtime.submit_intent_slots import BREAKER_HEARTBEAT_MAX_AGE_NS
 
 __all__ = [
     "DIGEST_EVERY_TICKS",
+    "NO_CLIENT_ERROR_TICKS",
+    "REALERT_INTERVAL_NS",
     "STUCK_AGE_NS",
     "STUCK_TRIP_COUNT",
     "WATCHER_INTERVAL_SECONDS",
@@ -80,6 +82,13 @@ STUCK_TRIP_COUNT: Final[int] = 2
 
 #: One digest line per minute at the 5 s tick.
 DIGEST_EVERY_TICKS: Final[int] = 12
+
+#: A condition that keeps holding is re-alerted this often (fire-and-forget
+#: sinks can lose a send; this bounds the silence).
+REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
+
+#: Consecutive ticks with no registered exec client before it is an ERROR.
+NO_CLIENT_ERROR_TICKS: Final[int] = 5
 
 _SITE: Final[str] = "exec_par_watcher"
 _ORDER_EVENT_TOPIC: Final[str] = "events.order.*"
@@ -115,6 +124,8 @@ class ExecClientView(Protocol):
     def k_forced_to_1_reason(self) -> str | None: ...
     @property
     def stuck_refusals_after_settle_failure_total(self) -> int: ...
+    @property
+    def no_fill_retire_refusals_total(self) -> int: ...
 
 
 class BreakerLatchPort(Protocol):
@@ -122,12 +133,6 @@ class BreakerLatchPort(Protocol):
 
     def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None: ...
     def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None: ...
-
-
-def _count(client: object, name: str) -> int:
-    """A non-negative int counter, ``0`` when the client predates it."""
-    value: object = getattr(client, name, 0)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 def _reason_label(reason: str) -> str:
@@ -158,8 +163,12 @@ class ExecRefusalAlertActor(Actor):
         self._inflight = 0
         self._inflight_lock = threading.Lock()
         self._ticks = 0
-        self._counter_alerted: dict[str, int] = {}
-        self._k_forced_alerted: str | None = None
+        #: condition key -> (value alerted, when). Set only after the send
+        #: succeeded; pruned when the condition ends.
+        self._alerted: dict[str, tuple[object, int]] = {}
+        self._conditions: dict[str, tuple[object, str, str, str]] = {}
+        self._no_client_streak = 0
+        self._no_client_logged_ns: int | None = None
 
     # -- wiring -----------------------------------------------------------
 
@@ -300,13 +309,24 @@ class ExecRefusalAlertActor(Actor):
     # -- the tick -----------------------------------------------------------
 
     async def tick(self) -> bool:
-        """Evaluate once. ``True`` iff the whole evaluation completed. Never raises."""
-        client = self._client_getter()
-        if client is None:
-            return False
-        now_ns = self.clock.timestamp_ns()
+        """Evaluate once. ``True`` iff the whole evaluation completed. Never raises.
+
+        Order: read facts, PERSIST (the breaker halt) first, then alert (every
+        alert contained on its own), then the heartbeat. A fault before the
+        persist withholds the heartbeat; a fault in an alert never does.
+        """
         try:
-            self._evaluate(client, now_ns)
+            client = self._client_getter()
+            now_ns = self.clock.timestamp_ns()
+            if client is None:
+                self._note_no_client(now_ns)
+                return False
+            self._no_client_streak = 0
+            self._no_client_logged_ns = None
+            self._conditions = {}
+            self._persist(client, now_ns)
+            self._collect_conditions(client, now_ns)
+            self._deliver_conditions(now_ns)
             self._complete(client, now_ns)
         except Exception as exc:  # noqa: BLE001 - contained; the missing heartbeat is the signal
             logger.error("%s evaluation failed (heartbeat withheld): %s", _SITE, type(exc).__name__)
@@ -314,41 +334,76 @@ class ExecRefusalAlertActor(Actor):
         self._emit_digest(now_ns)
         return True
 
-    def _evaluate(self, client: ExecClientView, now_ns: int) -> None:
-        self._alert_k_forced(client)
-        self._alert_counter(
-            EVENT_STUCK_REFUSAL,
-            _count(client, "stuck_refusals_after_settle_failure_total"),
-            "stuck_refusals_after_settle_failure_total",
+    def _note_no_client(self, now_ns: int) -> None:
+        self._no_client_streak += 1
+        if self._no_client_streak < NO_CLIENT_ERROR_TICKS:
+            return
+        last = self._no_client_logged_ns
+        if last is None or now_ns - last >= REALERT_INTERVAL_NS:
+            self._no_client_logged_ns = now_ns
+            logger.error(
+                "%s: no registered exec client for %d consecutive ticks; nothing is being watched",
+                _SITE,
+                self._no_client_streak,
+            )
+
+    def _persist(self, client: ExecClientView, now_ns: int) -> None:
+        """State the node must keep even if every alert is lost (the base keeps none)."""
+
+    def _collect_conditions(self, client: ExecClientView, now_ns: int) -> None:
+        reason = client.k_forced_to_1_reason
+        if reason is not None:
+            self._condition("k_forced", reason, EVENT_K_FORCED, f"k_forced_to_1 reason={reason}")
+        counters = (
+            (
+                EVENT_STUCK_REFUSAL,
+                "stuck_refusals_after_settle_failure_total",
+                client.stuck_refusals_after_settle_failure_total,
+            ),
+            (
+                EVENT_NO_FILL_REFUSAL,
+                "no_fill_retire_refusals_total",
+                client.no_fill_retire_refusals_total,
+            ),
         )
-        self._alert_counter(
-            EVENT_NO_FILL_REFUSAL,
-            _count(client, "no_fill_retire_refusals_total"),
-            "no_fill_retire_refusals_total",
-        )
+        for event, label, value in counters:
+            if value > 0:
+                self._condition(event, value, event, f"{label}={value}")
+
+    def _condition(self, key: str, value: object, event: str, detail: str) -> None:
+        self._conditions[key] = (value, "CRITICAL", event, detail)
+
+    def _deliver_conditions(self, now_ns: int) -> None:
+        """Alert each live condition that is new, changed, or due its hourly re-alert.
+
+        A condition is recorded as alerted ONLY after the sink accepted the send;
+        a raising sink is retried on the next tick. A key whose condition ended
+        is forgotten, so a later episode alerts afresh.
+        """
+        for key in [k for k in self._alerted if k not in self._conditions]:
+            del self._alerted[key]
+        for key, (value, severity, event, detail) in self._conditions.items():
+            previous = self._alerted.get(key)
+            if (
+                previous is not None
+                and previous[0] == value
+                and now_ns - previous[1] < REALERT_INTERVAL_NS
+            ):
+                continue
+            if self._send(severity, event, detail):
+                self._alerted[key] = (value, now_ns)
+
+    def _send(self, severity: str, event: str, detail: str) -> bool:
+        payload = AlertPayload(severity=severity, event=event, site=_SITE, detail=detail)
+        try:
+            self._alert_sink.emit(payload)
+        except Exception as exc:  # noqa: BLE001 - one lost alert must not stop the others
+            logger.error("%s: alert %s not sent (%s); will retry", _SITE, event, type(exc).__name__)
+            return False
+        return True
 
     def _complete(self, client: ExecClientView, now_ns: int) -> None:
         """Runs only after a fully evaluated tick (the base writes nothing)."""
-
-    def _alert(self, severity: str, event: str, detail: str) -> None:
-        emit_alert(
-            self._alert_sink,
-            AlertPayload(severity=severity, event=event, site=_SITE, detail=detail),
-        )
-
-    def _alert_k_forced(self, client: ExecClientView) -> None:
-        reason = client.k_forced_to_1_reason
-        if reason is None or reason == self._k_forced_alerted:
-            return
-        self._k_forced_alerted = reason
-        self._alert("CRITICAL", EVENT_K_FORCED, f"k_forced_to_1 reason={reason}")
-
-    def _alert_counter(self, event: str, value: int, label: str) -> None:
-        """Alert when ``value`` > 0 and differs from the last alerted value."""
-        if value <= 0 or self._counter_alerted.get(event) == value:
-            return
-        self._counter_alerted[event] = value
-        self._alert("CRITICAL", event, f"{label}={value}")
 
     def _emit_digest(self, now_ns: int) -> None:
         digest = self._digest
@@ -378,22 +433,21 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
         self._halt_written = False
+        self._trip_reason: str | None = None
         self._seen_contradictions = 0
         self._seen_duplicates = 0
-        self._unreadable_alerted: set[str] = set()
-        self._held_stuck_alerted: set[str] = set()
-        self._trip_alerted: set[str] = set()
+        self._stuck: tuple[tuple[str, str], ...] = ()
         self._last_hb_ns: int | None = None
         self._denied_at_last_hb = 0
 
-    def _evaluate(self, client: ExecClientView, now_ns: int) -> None:
-        super()._evaluate(client, now_ns)
+    def _persist(self, client: ExecClientView, now_ns: int) -> None:
+        """Compute the trip reasons and latch the halt BEFORE anything can fail."""
         ages = client.open_intent_ages
-        stuck = tuple((iid, slug) for iid, slug, age in ages if age > STUCK_AGE_NS)
+        self._stuck = tuple((iid, slug) for iid, slug, age in ages if age > STUCK_AGE_NS)
         contradictions = client.contradiction_events_total
         duplicates = client.duplicate_suspect_total
         reasons: list[str] = []
-        if len(stuck) >= STUCK_TRIP_COUNT:
+        if len(self._stuck) >= STUCK_TRIP_COUNT:
             reasons.append("stuck_slots")
         if client.ambiguous_notional_breaker_tripped:
             reasons.append("ambiguous_notional")
@@ -401,50 +455,60 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
             reasons.append("contradiction")
         if duplicates > self._seen_duplicates:
             reasons.append("duplicate_suspect")
-        held = client.held_position_slugs
-        self._alert_unreadable(client.unreadable_slot_keys)
-        self._alert_stuck_on_held(stuck, held)
-        if reasons:
-            self._trip(",".join(reasons), held, now_ns)
+        if reasons and not self._halt_written:
+            reason = ",".join(reasons)
+            # A raise leaves the seen-counters behind, so the next tick sees the
+            # same event again and retries the write.
+            self._latch.write_breaker_halt(reason, ts_ns=now_ns)
+            self._halt_written = True
+            self._trip_reason = reason
         self._seen_contradictions = max(self._seen_contradictions, contradictions)
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
 
-    def _trip(self, reason: str, held: tuple[str, ...], now_ns: int) -> None:
-        if not self._halt_written:
-            # A raise here leaves the seen-counters behind, so the next tick
-            # sees the same event again and retries the write.
-            self._latch.write_breaker_halt(reason, ts_ns=now_ns)
-            self._halt_written = True
-        if reason in self._trip_alerted:
-            return
-        self._trip_alerted.add(reason)
-        listing = ",".join(held) if held else "none"
-        self._alert(
-            "CRITICAL",
-            EVENT_BREAKER_TRIPPED,
-            f"entry halt latched reason={reason} held_positions={listing}",
-        )
-
-    def _alert_unreadable(self, keys: tuple[str, ...]) -> None:
-        fresh = [key for key in keys if key not in self._unreadable_alerted]
-        if not fresh:
-            return
-        self._unreadable_alerted.update(fresh)
-        self._alert(
-            "CRITICAL", EVENT_UNREADABLE_SLOT, f"unreadable slots={','.join(sorted(fresh))}"
-        )
-
-    def _alert_stuck_on_held(
-        self, stuck: tuple[tuple[str, str], ...], held: tuple[str, ...]
-    ) -> None:
-        for intent_id, slug in stuck:
-            if slug and slug in held and intent_id not in self._held_stuck_alerted:
-                self._held_stuck_alerted.add(intent_id)
-                self._alert(
-                    "CRITICAL",
+    def _collect_conditions(self, client: ExecClientView, now_ns: int) -> None:
+        super()._collect_conditions(client, now_ns)
+        held = self._held(client)
+        listing = "unknown" if held is None else (",".join(held) or "none")
+        if self._trip_reason is not None:
+            self._condition(
+                "tripped",
+                self._trip_reason,
+                EVENT_BREAKER_TRIPPED,
+                f"entry halt latched reason={self._trip_reason} held_positions={listing}",
+            )
+        keys = self._unreadable(client)
+        if keys:
+            self._condition(
+                "unreadable",
+                keys,
+                EVENT_UNREADABLE_SLOT,
+                f"unreadable slots={','.join(sorted(keys))}",
+            )
+        for intent_id, slug in self._stuck:
+            if held is not None and slug and slug in held:
+                self._condition(
+                    f"held_stuck:{intent_id}",
+                    slug,
                     EVENT_STUCK_ON_HELD,
                     f"stuck entry blocks the exit of a held position slug={slug}",
                 )
+
+    @staticmethod
+    def _held(client: ExecClientView) -> tuple[str, ...] | None:
+        """The held-position list, or ``None`` (alerted as "unknown") if unreadable."""
+        try:
+            return client.held_position_slugs
+        except Exception as exc:  # noqa: BLE001 - the halt is already written; alert degraded
+            logger.error("%s: held positions unreadable (%s)", _SITE, type(exc).__name__)
+            return None
+
+    @staticmethod
+    def _unreadable(client: ExecClientView) -> tuple[str, ...]:
+        try:
+            return client.unreadable_slot_keys
+        except Exception as exc:  # noqa: BLE001 - an alert input must not stop the tick
+            logger.error("%s: unreadable-slot keys unreadable (%s)", _SITE, type(exc).__name__)
+            return ()
 
     def _complete(self, client: ExecClientView, now_ns: int) -> None:
         """The heartbeat: written only after the whole evaluation succeeded."""

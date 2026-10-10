@@ -1,16 +1,18 @@
 """EXEC-PAR WP5b: the supervisor-side breaker watch (dead watcher, trip, unreadable slot).
 
 The supervisor cannot read the node's in-memory counters; it sees what the node
-persists. ``probe_breaker_record`` is a read-only WAL read of the breaker record
-and the slot table, run from the existing per-iteration permit-watch tick. At
-K=1 (the configured constant) every check is inert: no alert, and no port is
-touched beyond the two inert probe ports.
+persists. ``probe_breaker_record`` is a read-only (``mode=ro``) read of the
+breaker record and the slot table, run from the existing per-iteration tick.
+K is read first: at the configured K=1 the tick returns before any store is
+opened, because a K=1 node writes v1 bytes and never a breaker record.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ import pytest
 from breezy.runtime import trade_supervisor as ts
 from breezy.runtime.breaker_supervisor_watch import (
     ABSENT_RECORD_GRACE_NS,
+    BOOT_GRACE_NS,
     BreakerAlertDetail,
     BreakerProbe,
     BreakerWatchState,
@@ -42,6 +45,8 @@ FRESH = BreakerProbe(
     resolver_pass_ns=NOW - 5 * SEC,
     unreadable_slots=0,
 )
+STALE_HB = replace(FRESH, hb_ns=NOW - 120 * SEC)
+_REPO = Path(__file__).resolve().parents[2]
 
 
 class _Sink:
@@ -76,6 +81,30 @@ def _now() -> dt.datetime:
     return dt.datetime.fromtimestamp(NOW / SEC, tz=dt.UTC)
 
 
+def _seasoned(pid: int = 42) -> BreakerWatchState:
+    """A state that has watched ``pid`` for an hour (past the boot grace)."""
+    return BreakerWatchState(node_pid=pid, node_first_seen_ns=NOW - 3600 * SEC)
+
+
+def _decide(
+    probe: BreakerProbe,
+    state: BreakerWatchState,
+    *,
+    k: int = 2,
+    live: bool = True,
+    now_ns: int = NOW,
+    pid: int | None = 42,
+) -> list[Any]:
+    return decide_breaker_alerts(
+        probe=probe, k_configured=k, node_live=live, now_ns=now_ns, state=state, node_pid=pid
+    )
+
+
+def _deliver(state: BreakerWatchState, specs: list[Any]) -> None:
+    for spec in specs:
+        state.delivered(spec)
+
+
 def _run(ports: SupervisorPorts, watch: BreakerWatchState, tracked_pid: int | None = 42) -> None:
     ts._dispatch_breaker_watch(
         ports=ports, watch=watch, now=_now(), tracked_pid=tracked_pid, store_path=Path("/nowhere")
@@ -87,7 +116,7 @@ def _k(value: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# probe_breaker_record: read-only WAL read
+# probe_breaker_record: read-only read
 # ---------------------------------------------------------------------------
 
 
@@ -120,111 +149,131 @@ def test_probe_breaker_record_absent_garbled_and_missing_store(tmp_path: Path) -
     assert not probe_breaker_record(tmp_path).readable  # a directory is not a store
 
 
+def test_probe_opens_the_store_read_only_and_never_creates_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "store.sqlite3"
+    with SqliteStateStore(path) as store:
+        store.set(
+            BREAKER_KEY, encode_breaker(BreakerRecord(None, None, hb_ns=1, resolver_pass_ns=2))
+        )
+    uris: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy(database: str, timeout: float = 5.0, uri: bool = False) -> sqlite3.Connection:
+        uris.append(database)
+        return real_connect(database, timeout=timeout, uri=uri)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+
+    def forbidden(*_a: object, **_kw: object) -> None:
+        raise AssertionError("the probe must not use the SqliteStateStore constructor")
+
+    monkeypatch.setattr(ts, "SqliteStateStore", forbidden)
+    assert probe_breaker_record(path).present
+    assert len(uris) == 1 and uris[0].startswith("file:") and uris[0].endswith("?mode=ro")
+    missing = tmp_path / "absent.sqlite3"
+    assert not probe_breaker_record(missing).readable
+    assert not missing.exists()
+
+
 # ---------------------------------------------------------------------------
 # decide_breaker_alerts
 # ---------------------------------------------------------------------------
 
 
 def test_dead_watcher_denies_entries_and_supervisor_alerts() -> None:
-    stale = replace(FRESH, hb_ns=NOW - 61 * SEC)
-    state = BreakerWatchState()
-    specs = decide_breaker_alerts(
-        probe=stale, k_configured=2, node_live=True, now_ns=NOW, state=state
-    )
+    state = _seasoned()
+    specs = _decide(STALE_HB, state)
     assert [s.detail for s in specs] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
     assert specs[0].severity == "CRITICAL"
-    # the same episode does not re-alert on the next tick
-    assert (
-        decide_breaker_alerts(probe=stale, k_configured=2, node_live=True, now_ns=NOW, state=state)
-        == []
-    )
+    _deliver(state, specs)
+    # a delivered episode does not re-alert on the next tick
+    assert _decide(STALE_HB, state) == []
     # a recovery then a new episode alerts again
-    assert (
-        decide_breaker_alerts(probe=FRESH, k_configured=2, node_live=True, now_ns=NOW, state=state)
-        == []
-    )
-    again = decide_breaker_alerts(
-        probe=stale, k_configured=2, node_live=True, now_ns=NOW, state=state
-    )
-    assert [s.detail for s in again] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
+    assert _decide(FRESH, state) == []
+    assert [s.detail for s in _decide(STALE_HB, state)] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
+
+
+def test_an_undelivered_alert_is_due_again_on_the_next_tick() -> None:
+    state = _seasoned()
+    assert _decide(STALE_HB, state) != []
+    assert _decide(STALE_HB, state) != []  # never marked delivered
 
 
 def test_dead_resolver_pass_alerts_and_the_backoff_cap_does_not() -> None:
-    state = BreakerWatchState()
+    state = _seasoned()
     capped = replace(FRESH, resolver_pass_ns=NOW - 300 * SEC)
-    assert (
-        decide_breaker_alerts(probe=capped, k_configured=2, node_live=True, now_ns=NOW, state=state)
-        == []
-    )
+    assert _decide(capped, state) == []
     dead = replace(FRESH, resolver_pass_ns=NOW - 601 * SEC)
-    specs = decide_breaker_alerts(
-        probe=dead, k_configured=2, node_live=True, now_ns=NOW, state=state
-    )
-    assert [s.detail for s in specs] == [BreakerAlertDetail.BREAKER_RESOLVER_PASS_STALE]
+    assert [s.detail for s in _decide(dead, state)] == [
+        BreakerAlertDetail.BREAKER_RESOLVER_PASS_STALE
+    ]
 
 
 def test_absent_record_alerts_only_after_the_grace_with_a_live_node() -> None:
-    absent = BreakerProbe(
-        readable=True, present=False, halted=False, hb_ns=0, resolver_pass_ns=0, unreadable_slots=0
-    )
+    absent = BreakerProbe.absent()
     state = BreakerWatchState()
-    assert (
-        decide_breaker_alerts(probe=absent, k_configured=2, node_live=True, now_ns=NOW, state=state)
-        == []
-    )
+    assert _decide(absent, state, pid=None) == []
     later = NOW + ABSENT_RECORD_GRACE_NS + 1
-    specs = decide_breaker_alerts(
-        probe=absent, k_configured=2, node_live=True, now_ns=later, state=state
-    )
+    specs = _decide(absent, state, pid=None, now_ns=later)
     assert [s.detail for s in specs] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
 
 
 def test_an_unreadable_record_with_a_live_node_alerts_dead_watcher() -> None:
-    garbled = BreakerProbe(
-        readable=False, present=False, halted=False, hb_ns=0, resolver_pass_ns=0, unreadable_slots=0
-    )
-    specs = decide_breaker_alerts(
-        probe=garbled, k_configured=2, node_live=True, now_ns=NOW, state=BreakerWatchState()
-    )
+    garbled = replace(BreakerProbe.absent(), readable=False)
+    specs = _decide(garbled, BreakerWatchState(), pid=None)
     assert [s.detail for s in specs] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
 
 
 def test_no_dead_watcher_alert_when_the_node_is_not_live() -> None:
     stale = replace(FRESH, hb_ns=NOW - 3600 * SEC, resolver_pass_ns=NOW - 3600 * SEC)
-    assert (
-        decide_breaker_alerts(
-            probe=stale, k_configured=2, node_live=False, now_ns=NOW, state=BreakerWatchState()
-        )
-        == []
-    )
+    assert _decide(stale, _seasoned(), live=False) == []
 
 
 def test_breaker_trip_alerts_once_and_unreadable_slot_alerts_at_any_k() -> None:
     state = BreakerWatchState()
     halted = replace(FRESH, halted=True, unreadable_slots=1)
-    specs = decide_breaker_alerts(
-        probe=halted, k_configured=1, node_live=True, now_ns=NOW, state=state
-    )
+    specs = _decide(halted, state, k=1)
     assert sorted(s.detail.value for s in specs) == sorted(
         [
             BreakerAlertDetail.BREAKER_ENTRY_HALT_LATCHED.value,
             BreakerAlertDetail.SLOT_TABLE_UNREADABLE_SLOT.value,
         ]
     )
-    assert (
-        decide_breaker_alerts(probe=halted, k_configured=1, node_live=True, now_ns=NOW, state=state)
-        == []
-    )
+    _deliver(state, specs)
+    assert _decide(halted, state, k=1) == []
 
 
 def test_k1_stale_record_never_raises_a_dead_watcher_alert() -> None:
     stale = replace(FRESH, hb_ns=0, resolver_pass_ns=0)
-    assert (
-        decide_breaker_alerts(
-            probe=stale, k_configured=1, node_live=True, now_ns=NOW, state=BreakerWatchState()
-        )
-        == []
+    assert _decide(stale, _seasoned(), k=1) == []
+
+
+# ---------------------------------------------------------------------------
+# R6: boot grace
+# ---------------------------------------------------------------------------
+
+
+def test_a_freshly_seen_node_pid_gets_a_boot_grace_for_stale_stamps() -> None:
+    state = BreakerWatchState()
+    previous_nodes_record = replace(
+        FRESH, hb_ns=NOW - 7200 * SEC, resolver_pass_ns=NOW - 7200 * SEC
     )
+    assert _decide(previous_nodes_record, state, pid=7) == []  # first sighting of pid 7
+    assert _decide(previous_nodes_record, state, pid=7, now_ns=NOW + BOOT_GRACE_NS) == []
+    after = _decide(previous_nodes_record, state, pid=7, now_ns=NOW + BOOT_GRACE_NS + 1)
+    assert {s.detail for s in after} == {
+        BreakerAlertDetail.BREAKER_WATCHER_DEAD,
+        BreakerAlertDetail.BREAKER_RESOLVER_PASS_STALE,
+    }, "a watcher that never heartbeats is still caught once the grace ends"
+
+
+def test_a_new_pid_restarts_the_grace() -> None:
+    state = _seasoned(pid=7)
+    stale = replace(FRESH, hb_ns=NOW - 7200 * SEC)
+    assert _decide(stale, state, pid=7) != []
+    assert _decide(stale, state, pid=8) == []  # relaunched: new grace
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +283,35 @@ def test_k1_stale_record_never_raises_a_dead_watcher_alert() -> None:
 
 def test_dispatch_emits_the_alert_through_the_existing_sink() -> None:
     sink = _Sink()
-    stale = replace(FRESH, hb_ns=NOW - 120 * SEC)
-    ports = _ports(sink, probe_breaker_record=lambda _p: stale, configured_exec_par_k=_k(2))
-    _run(ports, BreakerWatchState())
+    ports = _ports(sink, probe_breaker_record=lambda _p: STALE_HB, configured_exec_par_k=_k(2))
+    _run(ports, _seasoned())
     (payload,) = sink.payloads
     assert payload.detail == BreakerAlertDetail.BREAKER_WATCHER_DEAD.value
     assert payload.event == "TRADE_SUPERVISOR_BREAKER_WATCHER_DEAD"
+
+
+def test_dispatch_marks_delivered_only_after_the_durable_send_confirms() -> None:
+    sink = _Sink()
+    outcomes = iter([False, True])
+    sent: list[AlertPayload] = []
+
+    def durable(_sink: object, payload: AlertPayload) -> bool:
+        sent.append(payload)
+        return next(outcomes)
+
+    ports = _ports(
+        sink,
+        probe_breaker_record=lambda _p: STALE_HB,
+        configured_exec_par_k=_k(2),
+        send_alert_durable=durable,
+    )
+    watch = _seasoned()
+    _run(ports, watch)  # outbox refused: not delivered
+    assert watch.active == set()
+    _run(ports, watch)  # retried, confirmed
+    assert watch.active == {"heartbeat_stale"}
+    _run(ports, watch)  # now deduped: no third send
+    assert len(sent) == 2
 
 
 def test_dispatch_is_contained_when_the_probe_raises() -> None:
@@ -248,11 +320,13 @@ def test_dispatch_is_contained_when_the_probe_raises() -> None:
     def boom(_p: Path) -> BreakerProbe:
         raise RuntimeError("wal read blew up")
 
-    _run(_ports(sink, probe_breaker_record=boom, configured_exec_par_k=_k(2)), BreakerWatchState())
+    _run(_ports(sink, probe_breaker_record=boom, configured_exec_par_k=_k(2)), _seasoned())
     assert sink.payloads == []
 
 
-def test_k1_dispatch_touches_no_process_port_and_emits_nothing() -> None:
+def test_k1_dispatch_opens_no_store_and_touches_no_process_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     sink = _Sink()
     touched: list[str] = []
 
@@ -264,11 +338,75 @@ def test_k1_dispatch_touches_no_process_port_and_emits_nothing() -> None:
         touched.append("find_node_pid")
         return 1
 
-    ports = _ports(sink, process_alive=alive, find_node_pid=find)  # inert default probe ports
-    _run(ports, BreakerWatchState(), tracked_pid=None)
-    _run(ports, BreakerWatchState(), tracked_pid=42)
+    def opened(*_a: object, **_kw: object) -> None:
+        touched.append("store_opened")
+        raise AssertionError("K=1 must not open a store")
+
+    monkeypatch.setattr(sqlite3, "connect", opened)
+    monkeypatch.setattr(ts, "SqliteStateStore", opened)
+    # the REAL probe port and the REAL (K=1) constant: nothing may be opened
+    ports = _ports(
+        sink,
+        process_alive=alive,
+        find_node_pid=find,
+        probe_breaker_record=probe_breaker_record,
+        configured_exec_par_k=ts.configured_exec_par_k,
+    )
+    store = tmp_path / "state.sqlite3"
+    for pid in (None, 42):
+        ts._dispatch_breaker_watch(
+            ports=ports, watch=BreakerWatchState(), now=_now(), tracked_pid=pid, store_path=store
+        )
     assert touched == []
     assert sink.payloads == []
+    assert not store.exists()
+
+
+def test_k_gt_1_dispatch_probes_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SqliteStateStore(path) as store:
+        store.set(
+            BREAKER_KEY, encode_breaker(BreakerRecord(None, None, hb_ns=1, resolver_pass_ns=1))
+        )
+    uris: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy(database: str, timeout: float = 5.0, uri: bool = False) -> sqlite3.Connection:
+        uris.append(database)
+        return real_connect(database, timeout=timeout, uri=uri)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    sink = _Sink()
+    ports = _ports(sink, probe_breaker_record=probe_breaker_record, configured_exec_par_k=_k(2))
+    ts._dispatch_breaker_watch(
+        ports=ports, watch=_seasoned(), now=_now(), tracked_pid=42, store_path=path
+    )
+    assert uris and all(u.endswith("?mode=ro") for u in uris)
+    assert sink.payloads, "a 1970 heartbeat with a live node is a dead watcher"
+
+
+def test_supervisor_import_does_not_pull_in_node_config_or_the_watcher() -> None:
+    """R5 finding: the supervisor ALREADY imports ``nautilus_trader`` (and pandas)
+    before this WP, via ``breezy.domain.exec_intent`` ->
+    ``breezy.domain.archived_climate_day`` (``RESOLVER_CONTEXT_KEY_PREFIX``), so
+    "no Nautilus" cannot be asserted. What WP5b must not add is ``node_config``
+    (the heavy config module) or the watcher Actor module."""
+    code = (
+        "import sys\n"
+        "import breezy.runtime.trade_supervisor\n"
+        "ours = sorted(m for m in ('breezy.runtime.node_config', 'breezy.runtime.breaker_watcher')"
+        " if m in sys.modules)\n"
+        "print('OURS=' + ','.join(ours))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={"PYTHONPATH": str(_REPO / "src"), "PATH": "/usr/bin"},
+        cwd=_REPO,
+    )
+    assert result.stdout.strip().rsplit("OURS=", 1)[1] == ""
 
 
 def test_default_ports_wire_the_real_probe_and_the_configured_k() -> None:
@@ -305,3 +443,14 @@ def test_alert_detail_enum_pin_green() -> None:
 @pytest.mark.parametrize("name", ["probe_breaker_record", "configured_exec_par_k"])
 def test_supervisor_ports_carry_the_new_ports(name: str) -> None:
     assert name in SupervisorPorts.__dataclass_fields__
+
+
+def test_probe_reads_a_store_whose_path_has_uri_metacharacters(tmp_path: Path) -> None:
+    odd = tmp_path / "a%b#c?d"
+    odd.mkdir()
+    path = odd / "store.sqlite3"
+    with SqliteStateStore(path) as store:
+        store.set(
+            BREAKER_KEY, encode_breaker(BreakerRecord(None, None, hb_ns=3, resolver_pass_ns=4))
+        )
+    assert probe_breaker_record(path).hb_ns == 3

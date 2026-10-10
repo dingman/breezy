@@ -32,6 +32,7 @@ import os
 import re
 import resource
 import signal
+import sqlite3
 import subprocess
 import sys
 import time as _time
@@ -58,6 +59,7 @@ from breezy.runtime.build_sha import (
     _read_ref_sha,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
 )
 from breezy.runtime.build_sha import resolve_build_revision as _resolve_build_revision_impl
+from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import (
     AlertPayload,
@@ -543,23 +545,43 @@ def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIn
         return OpenIntentShape.UNKNOWN
 
 
-def probe_breaker_record(store_path: Path) -> BreakerProbe:
-    """[EXEC-PAR WP5b] Read-only WAL read of the breaker record and the slot
-    table's unreadable slots, via a FRESH ``SqliteStateStore`` connection.
+def _read_only_values(store_path: Path, keys: tuple[str, ...]) -> dict[str, bytes | None]:
+    """Raw ``state`` values over a ``mode=ro`` SQLite URI connection.
 
-    Like the continuous-family self-check read below, it is safe while the node
-    is live (WAL serves concurrent readers) and only ever calls ``.get()``. A
-    failure to read the record is ``readable=False`` (never a raise); a corrupt
-    slot table counts no unreadable slot here, because that case is surfaced by
-    the existing intent probes and must stay unchanged at K=1.
+    Unlike the ``SqliteStateStore`` constructor this runs no PRAGMA, no
+    ``CREATE TABLE`` and no commit, so a probe can never create or alter the
+    store (a missing file raises instead of being created).
+    """
+    # SQLite URI escaping of the three characters that end or alter a URI path
+    # (no `urllib`: the alert-egress import pin forbids it in this module).
+    escaped = str(store_path).replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+    uri = f"file:{escaped}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    try:
+        found: dict[str, bytes | None] = {}
+        for key in keys:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+            found[key] = None if row is None else bytes(row[0])
+        return found
+    finally:
+        conn.close()
+
+
+def probe_breaker_record(store_path: Path) -> BreakerProbe:
+    """[EXEC-PAR WP5b] Read-only read of the breaker record and the slot table's
+    unreadable slots, safe while the node is live (WAL serves concurrent readers).
+
+    Opened ``mode=ro`` (see :func:`_read_only_values`) and decoded with the
+    existing pure decoders. A failure to read is ``readable=False`` (never a
+    raise); a corrupt slot table counts no unreadable slot here, because the
+    existing intent probes already surface that case.
     """
     try:
-        with SqliteStateStore(store_path) as store:
-            raw_record = store.get(BREAKER_KEY)
-            raw_table = store.get(CURRENT_INTENT_KEY)
+        values = _read_only_values(store_path, (BREAKER_KEY, CURRENT_INTENT_KEY))
     except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
         logger.warning("breaker_record_probe_failed error_type=%s", type(exc).__name__)
         return replace(BreakerProbe.absent(), readable=False)
+    raw_record, raw_table = values[BREAKER_KEY], values[CURRENT_INTENT_KEY]
     unreadable = 0
     if raw_table is not None:
         try:
@@ -585,13 +607,11 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
 def configured_exec_par_k() -> int:
     """The K this source tree's node is configured for (a ``Final``, not env).
 
-    Imported lazily: ``node_config`` pulls in Nautilus and pandas, which the
-    long-lived supervisor otherwise never loads. Read at call time, so a
-    supervisor restart picks up a changed constant (the same rule as every other
-    supervisor-side code change).
+    Read from the dependency-free ``exec_par_constants`` (``node_config`` pulls
+    in Nautilus and pandas, which the long-lived supervisor must not load). A
+    supervisor restart picks up a changed constant, like any supervisor-side
+    code change.
     """
-    from breezy.runtime.node_config import EXEC_PAR_MAX_CONCURRENT_INTENTS
-
     return EXEC_PAR_MAX_CONCURRENT_INTENTS
 
 
@@ -3121,37 +3141,38 @@ def _do_breaker_watch(
     tracked_pid: int | None,
     store_path: Path,
 ) -> None:
-    """[EXEC-PAR WP5b] One breaker-watch tick: probe, decide, alert.
+    """[EXEC-PAR WP5b] One breaker-watch tick: probe, decide, alert durably.
 
-    The node-liveness ports are consulted ONLY when the probe or the configured K
-    could make an alert due, so at K=1 with nothing persisted this touches no
-    process port at all.
+    K is read first and a K<=1 tick returns before ANY store is opened: at K=1
+    the node writes v1 bytes and never a breaker record, so there is nothing to
+    watch. At K>1 the probe opens the store read-only. Each alert goes through
+    ``ports.send_alert_durable`` and is marked delivered only when that confirms
+    it, so a lost send is retried on the next tick.
     """
-    probe = ports.probe_breaker_record(store_path)
-    k_configured = ports.configured_exec_par_k()
-    if k_configured <= 1 and not (probe.halted or probe.unreadable_slots):
+    if ports.configured_exec_par_k() <= 1:
         watch.active.clear()
-        watch.first_live_ns = None
+        watch.node_pid = None
+        watch.node_first_seen_ns = None
         return
+    probe = ports.probe_breaker_record(store_path)
     pid = tracked_pid if tracked_pid is not None else ports.find_node_pid()
     node_live = pid is not None and ports.process_alive(pid)
     specs = decide_breaker_alerts(
         probe=probe,
-        k_configured=k_configured,
+        k_configured=ports.configured_exec_par_k(),
         node_live=node_live,
         now_ns=int(now.timestamp() * 1e9),
         state=watch,
+        node_pid=pid,
     )
     for spec in specs:
-        emit_alert(
-            ports.alert_sink,
-            AlertPayload(
-                severity=spec.severity,
-                event=spec.event,
-                site="trade_node",
-                detail=spec.detail.value,
-            ),
+        payload = AlertPayload(
+            severity=spec.severity, event=spec.event, site="trade_node", detail=spec.detail.value
         )
+        if ports.send_alert_durable(ports.alert_sink, payload):
+            watch.delivered(spec)
+        else:
+            log_decision("breaker_watch_alert_not_durable", alert=spec.event)
 
 
 def _dispatch_breaker_watch(

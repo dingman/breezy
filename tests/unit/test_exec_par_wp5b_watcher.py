@@ -12,8 +12,10 @@ the real client exposes (``contradiction_events_total``,
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -29,9 +31,12 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.runtime import breaker_watcher
 from breezy.runtime.breaker_watcher import (
+    NO_CLIENT_ERROR_TICKS,
+    REALERT_INTERVAL_NS,
     STUCK_AGE_NS,
     WATCHER_INTERVAL_SECONDS,
     BreakerWatcherActor,
+    ExecClientView,
     ExecRefusalAlertActor,
     build_exec_watcher,
 )
@@ -99,21 +104,6 @@ class _Client:
     def resolver_last_pass_ns(self) -> int:
         self.read_loops.append(asyncio.get_running_loop())
         return self.pass_ns
-
-
-@dataclass
-class _OldClient:
-    """A client that predates ``no_fill_retire_refusals_total``."""
-
-    contradiction_events_total: int = 0
-    duplicate_suspect_total: int = 0
-    ambiguous_notional_breaker_tripped: bool = False
-    resolver_last_pass_ns: int = NOW
-    open_intent_ages: tuple[tuple[str, str, int], ...] = ()
-    held_position_slugs: tuple[str, ...] = ()
-    unreadable_slot_keys: tuple[str, ...] = ()
-    k_forced_to_1_reason: str | None = None
-    stuck_refusals_after_settle_failure_total: int = 0
 
 
 class _RecordingLatch:
@@ -492,17 +482,6 @@ async def test_refusal_counters_alert_on_value_change_at_every_k(max_slots: int)
     assert len(sink.events("EXEC_PAR_NO_FILL_RETIRE_REFUSAL")) == 1
 
 
-@pytest.mark.asyncio
-async def test_missing_no_fill_counter_on_an_older_client_is_zero_not_a_crash() -> None:
-    sink = _Sink()
-    actor = build_exec_watcher(1, latch=_RecordingLatch(), alert_sink=sink)
-    _register(actor, TestClock())
-    old = _OldClient()
-    actor.bind_client(lambda: old)
-    assert await actor.tick() is True
-    assert sink.emitted == []
-
-
 # ---------------------------------------------------------------------------
 # Digest
 # ---------------------------------------------------------------------------
@@ -540,3 +519,202 @@ async def test_watcher_counts_entries_denied_during_a_heartbeat_gap() -> None:
     clock.set_time(NOW + 61 * SEC)  # the gap since the last heartbeat exceeded 60 s
     await actor.tick()
     assert digest.snapshot(NOW + 62 * SEC).heartbeat_stale_denials == 1
+
+
+# ---------------------------------------------------------------------------
+# R1: the counters are read through a typed view, checked against the REAL class
+# ---------------------------------------------------------------------------
+
+_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / (
+    "src/breezy/adapters/polymarket_us/exec/client.py"
+)
+
+
+def test_real_exec_client_exposes_every_watcher_view_property() -> None:
+    """AST of the real class (importing ``exec`` is barred by barrier X1)."""
+    tree = ast.parse(_CLIENT_SOURCE.read_text(encoding="utf-8"))
+    (cls,) = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "PolymarketUSExecutionClient"
+    ]
+    properties = {
+        fn.name
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef)
+        and any(isinstance(d, ast.Name) and d.id == "property" for d in fn.decorator_list)
+    }
+    view = set(ExecClientView.__protocol_attrs__)  # type: ignore[attr-defined]
+    assert {
+        "no_fill_retire_refusals_total",
+        "stuck_refusals_after_settle_failure_total",
+    } <= view
+    assert view <= properties, sorted(view - properties)
+
+
+# ---------------------------------------------------------------------------
+# R2: delivery that can be lost is retried and periodically repeated
+# ---------------------------------------------------------------------------
+
+
+class _FlakySink(_Sink):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempts = 0
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.attempts += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise OSError("sink down")
+        super().emit(payload)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_alert_send_is_not_marked_sent_and_is_retried_next_tick() -> None:
+    sink = _FlakySink(failures=1)
+    client = _Client(stuck_refusals_after_settle_failure_total=1)
+    actor, _, _, _ = _watcher(client, sink=sink)
+    assert await actor.tick() is True  # a lost alert never withholds the heartbeat
+    assert sink.emitted == []
+    await actor.tick()
+    assert len(sink.events("EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE")) == 1
+    await actor.tick()
+    assert len(sink.emitted) == 1  # now deduped
+
+
+@pytest.mark.asyncio
+async def test_every_alert_kind_is_realerted_hourly_while_its_condition_holds() -> None:
+    stuck = STUCK_AGE_NS + SEC
+    client = _Client(
+        stuck_refusals_after_settle_failure_total=1,
+        no_fill_retire_refusals_total=1,
+        k_forced_to_1_reason="bucket",
+        unreadable_slot_keys=("slot-x",),
+        contradiction_events_total=1,
+        ages=(("a", "S-H", stuck),),
+        held_position_slugs=("S-H",),
+    )
+    actor, _, sink, clock = _watcher(client)
+    await actor.tick()
+    first = len(sink.emitted)
+    assert first == 6
+    clock.set_time(NOW + REALERT_INTERVAL_NS - SEC)
+    await actor.tick()
+    assert len(sink.emitted) == first  # inside the hour: deduped
+    clock.set_time(NOW + REALERT_INTERVAL_NS)
+    await actor.tick()
+    assert len(sink.emitted) == 2 * first  # the hour is up: every condition again
+
+
+@pytest.mark.asyncio
+async def test_an_ended_episode_alerts_afresh_when_it_returns() -> None:
+    client = _Client(k_forced_to_1_reason="bucket")
+    actor, _, sink, _ = _watcher(client)
+    await actor.tick()
+    client.k_forced_to_1_reason = None
+    await actor.tick()
+    client.k_forced_to_1_reason = "bucket"
+    await actor.tick()
+    assert len(sink.events("EXEC_PAR_K_FORCED_TO_1")) == 2
+
+
+# ---------------------------------------------------------------------------
+# R3: the halt is persisted before anything that can fail
+# ---------------------------------------------------------------------------
+
+
+class _HeldRaises(_Client):
+    @property
+    def held_position_slugs(self) -> tuple[str, ...]:
+        raise RuntimeError("positions evidence blew up")
+
+    @held_position_slugs.setter
+    def held_position_slugs(self, value: tuple[str, ...]) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_held_position_slugs_raising_still_writes_the_halt_and_alerts_unknown() -> None:
+    client = _HeldRaises(contradiction_events_total=1)
+    actor, latch, sink, _ = _watcher(client)
+    assert await actor.tick() is True
+    assert [reason for reason, _ in latch.halts] == ["contradiction"]
+    (alert,) = sink.events("EXEC_PAR_BREAKER_TRIPPED")
+    assert "held_positions=unknown" in alert.detail
+
+
+@pytest.mark.asyncio
+async def test_the_halt_is_written_before_any_alert_is_sent() -> None:
+    order: list[str] = []
+
+    class _OrderLatch(_RecordingLatch):
+        def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None:
+            order.append("halt")
+            super().write_breaker_halt(reason, ts_ns=ts_ns)
+
+    class _OrderSink(_Sink):
+        def emit(self, payload: AlertPayload) -> None:
+            order.append(payload.event)
+            super().emit(payload)
+
+    client = _Client(contradiction_events_total=1, k_forced_to_1_reason="bucket")
+    actor, _, _, _ = _watcher(client, _OrderLatch(), _OrderSink())
+    await actor.tick()
+    assert order[0] == "halt" and len(order) > 1
+
+
+@pytest.mark.asyncio
+async def test_a_raising_alert_sink_never_withholds_the_heartbeat_or_the_halt() -> None:
+    class _Dead(_Sink):
+        def emit(self, payload: AlertPayload) -> None:
+            raise OSError("down")
+
+    client = _Client(contradiction_events_total=1, unreadable_slot_keys=("k",))
+    actor, latch, _, _ = _watcher(client, sink=_Dead())
+    assert await actor.tick() is True
+    assert latch.halts and latch.heartbeats
+
+
+@pytest.mark.asyncio
+async def test_a_raising_client_getter_or_clock_is_contained_by_tick() -> None:
+    actor = BreakerWatcherActor(latch=_RecordingLatch(), alert_sink=_Sink())
+    _register(actor, TestClock())
+
+    def boom() -> ExecClientView | None:
+        raise RuntimeError("engine registry blew up")
+
+    actor.bind_client(boom)
+    assert await actor.tick() is False
+
+
+# ---------------------------------------------------------------------------
+# R4: a getter that keeps returning None is loud
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_client_getter_returning_none_logs_error_after_five_ticks_then_hourly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = TestClock()
+    clock.set_time(NOW)
+    actor = BreakerWatcherActor(latch=_RecordingLatch(), alert_sink=_Sink())
+    _register(actor, clock)
+    actor.bind_client(lambda: None)
+
+    def errors() -> int:
+        return len([r for r in caplog.records if r.levelno == logging.ERROR])
+
+    with caplog.at_level(logging.ERROR, logger="breezy.runtime.breaker_watcher"):
+        for _ in range(NO_CLIENT_ERROR_TICKS - 1):
+            await actor.tick()
+        assert errors() == 0
+        await actor.tick()
+        assert errors() == 1
+        await actor.tick()
+        assert errors() == 1  # not every tick
+        clock.set_time(NOW + REALERT_INTERVAL_NS)
+        await actor.tick()
+        assert errors() == 2  # hourly after that
