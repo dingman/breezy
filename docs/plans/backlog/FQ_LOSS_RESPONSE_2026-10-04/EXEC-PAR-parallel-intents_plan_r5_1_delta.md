@@ -201,3 +201,29 @@ Final peer verdicts on r5 + r5.1:
 **The plan is READY.** Build order: WP-DR (merging) → WP0 → WP1 → WP2 → WP3 → WP5a → WP4 → WP5b → WP6 → WP7.
 
 K stays 1 until D-PREREG is frozen and WP0 and the activation gates pass.
+
+## E14. WP4 review rulings (coordinator, 2026-10-10)
+
+1. **Settle failure at zero-fill/no-id (E9).** The AMBIGUOUS refusal stays latched (fail-closed). This must be visible:
+   - log an ERROR that names the stuck refusal and its slug;
+   - expose a client counter, `stuck_refusals_after_settle_failure_total`.
+2. **Resolver fairness.** A slot's failure penalty in `next_open_for_resolution` expires once the slot has had no new failure for 300 s (the global backoff cap). Within that window, failing slots are ordered after healthy ones. After it, ordering is by last-served, then created. Required test: no slot waits more than (K × poll) + 300 s while healthy slots cycle.
+3. **Post-booking settle sites (zero-fill terminal, reject, and the pre-POST context-failure handler).** Each gets a local guard in the E9 pattern:
+   - log ERROR, `abandon_open_exposure`, then retire (or deny, pre-POST);
+   - in the pre-POST handler the ORIGINAL store error is preserved and re-raised or denied as today; a secondary settle error is logged, never substituted.
+4. **E10′ hardening.**
+   - `abandon_open_exposure` sits inside the guarded block.
+   - A test proves the resolver's `record_fill`, with its synthetic trade id, is idempotent against the create-path record (no double fill record).
+   - If the with-id upgrade fails, the no-id route must NOT retire as NO_FILL while a durable fill record exists for the intent. Add the guard if it is missing, and a test.
+5. **`contradiction_events_total`** counts:
+   - DUPLICATE_SUSPECT trips;
+   - holding-bearing contradictions: `unexplained_holding*`, and terminal-zero with a LONG holding and no fill.
+   
+   It does NOT count ordinary consistent holding deltas. Fix the docstring. Add a test for an event that is observed and then retired: it is still counted, and the counter is monotonic. Manual trades that trip it fail closed (§9.8, accepted).
+6. **Permit session notional for boot-registered fills** is NOT debited. Recorded as accepted:
+   - it is bounded by `f_adm × budget`;
+   - the daily ledger counts it;
+   - D-PREREG must restate it.
+7. **The duplicate detector also acts at K=1.** That is more conservative and accepted. Document it in the K=1 differential notes. The consecutive-pass counter resets on an INCOMPLETE pass.
+8. **Early return on `is_open_intent == False`:** call `abandon_open_exposure` before returning, so no registry entry leaks.
+9. **Leak backstop counter.** The direct `_resolver_error_count` increment is kept if routing it through `_note_resolver_error` would need a new callee; a comment says why. The pin comment on `SUBMIT_PREFIX_SHA256` cites "EXEC-PAR r5 §5 WP4 + r5.1 E14", not "reviewer-approved". The six repeated failure-counter increments get a comment naming the SIM401/callee constraint.
