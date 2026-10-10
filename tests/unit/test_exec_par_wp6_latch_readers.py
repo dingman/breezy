@@ -20,8 +20,10 @@ from hypothesis import strategies as st
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
     RetirementReason,
+    SubmitIntentAdmissionDenied,
     SubmitIntentCorrupt,
     SubmitIntentLatch,
+    SubmitIntentLatched,
     open_submit_intent_latch,
 )
 from breezy.settlement.exit_guard import SettlementCloseRefused, assert_settlement_close_permitted
@@ -178,6 +180,33 @@ _table_st = st.fixed_dictionaries(
 )
 
 
+def _assert_gate_agrees(
+    snapshot: dict[str, bytes],
+    tmp_path: Path,
+    *,
+    k: int,
+    clock: Clock,
+    slug: str,
+    is_exit: bool,
+) -> None:
+    """On a fresh copy of the table, ``arm_slot`` (the real gate) must refuse exactly
+    when the read-only predicate does, with the same reason, and admit otherwise."""
+    with _latches(
+        Store(dict(snapshot)), tmp_path, k=k, clock=clock, breaker=False, subdir=uuid.uuid4().hex
+    ) as (intent_latch, latch):
+        refusal = latch.admission_would_refuse(slug, is_exit)
+        if refusal is None:
+            armed = intent_latch.arm_slot(FP, slug=slug, is_exit=is_exit, now_ns=clock.now_ns)
+            assert armed.intent_id
+            return
+        with pytest.raises(SubmitIntentLatched) as raised:
+            intent_latch.arm_slot(FP, slug=slug, is_exit=is_exit, now_ns=clock.now_ns)
+        if refusal == "corrupt":
+            return  # a corrupt table raises the plain latched error (fail closed)
+        assert isinstance(raised.value, SubmitIntentAdmissionDenied)
+        assert raised.value.reason == refusal
+
+
 @settings(
     max_examples=60,
     deadline=None,
@@ -218,11 +247,15 @@ def test_prefilter_equals_exec_admission_for_all_tables(
             intent_latch.write_breaker_heartbeat(hb_ns=hb, resolver_pass_ns=rp)
             if mode == "halted":
                 intent_latch.write_breaker_halt("x", ts_ns=clock.now_ns)
+        snapshot = dict(store.data)
         for slug in SLUGS:
             for is_exit in (False, True):
                 assert latch.admission_would_refuse(
                     slug, is_exit
                 ) == intent_latch.admission_refusal(slug, is_exit)
+                _assert_gate_agrees(
+                    snapshot, tmp_path, k=k, clock=clock, slug=slug, is_exit=is_exit
+                )
 
 
 @settings(
@@ -323,3 +356,44 @@ def test_exit_guard_with_no_refusals_ignores_scopes() -> None:
         attributed_order_id="SETTLE-1",
         refusal_scopes=(),
     )
+
+
+@pytest.mark.parametrize(
+    ("scope", "instrument_id", "blocks"),
+    [
+        ("X-T7", "X-T75.VENUE", False),
+        ("X-T7", "X-T7.VENUE", True),
+        ("X-T7", "X-T7^no.VENUE", True),
+        ("X-T7", "X-T7", True),
+        ("X-T7", "X-T7-9.VENUE", False),
+    ],
+)
+def test_exit_guard_scope_match_is_slug_boundary_aware(
+    scope: str, instrument_id: str, blocks: bool
+) -> None:
+    def _call() -> None:
+        assert_settlement_close_permitted(
+            trading_refusals=("ambiguous send",),
+            instrument_id=instrument_id,
+            attributed_order_id="SETTLE-1",
+            refusal_scopes=(scope,),
+        )
+
+    if blocks:
+        with pytest.raises(SettlementCloseRefused, match="unresolved trading refusal"):
+            _call()
+    else:
+        _call()
+
+
+@pytest.mark.parametrize("leg", ["X-T7^no.VENUE", "X-T7.VENUE", "X-T8.VENUE"])
+def test_exit_guard_full_instrument_id_scope_is_not_a_base_slug_and_fails_closed(
+    leg: str,
+) -> None:
+    with pytest.raises(SettlementCloseRefused, match="unresolved trading refusal"):
+        assert_settlement_close_permitted(
+            trading_refusals=("ambiguous send",),
+            instrument_id=leg,
+            attributed_order_id="SETTLE-1",
+            refusal_scopes=("X-T7.VENUE",),
+        )

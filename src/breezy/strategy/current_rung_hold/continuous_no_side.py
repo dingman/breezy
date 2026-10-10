@@ -307,8 +307,15 @@ class NoSideShadowMixin:
             self._no_refuse_notice.add(notice_key)
             self._record_no_refuse(f"no_refuse: reason={reason}")
 
-        if self._admission_refusal(no_iid) is not None:
-            _refuse_once(_NO_REFUSE_INTENT_OPEN)
+        no_admission_refusal = self._admission_refusal(no_iid)
+        if no_admission_refusal is not None:
+            # K=1 keeps the bare closed-set label; at K > 1 the LOG label carries
+            # the actual admission reason (the offer-tape reason stays closed-set).
+            _refuse_once(
+                _NO_REFUSE_INTENT_OPEN
+                if self._latch.max_slots() == 1
+                else f"{_NO_REFUSE_INTENT_OPEN}:{no_admission_refusal}"
+            )
             _append_no_offer_tape(decision_label="refuse", admission_reason=_NO_REFUSE_INTENT_OPEN)
             return
 

@@ -1711,7 +1711,8 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
             hour_lst = _local_hour(now_ns, offset)
             if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
                 return
-            if self._admission_refusal(iid) is not None:
+            refusal = self._admission_refusal(iid)
+            if refusal is not None:
                 # Silent-failure review (2026-09-25): this WAIT is silent on
                 # `diagnostics`/`refusals` by design (AC4 above), but it is
                 # still a genuine `open_intent_wait` -- routed through the
@@ -1719,7 +1720,9 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
                 # is not invisible to `last_open_intent_wait`/the log line.
                 # Deduped by the SAME per-process state (minute bucket,
                 # intent_id) either check already shares.
-                self._maybe_observe_open_intent_wait(now_ns=now_ns, instrument_id=iid)
+                self._maybe_observe_open_intent_wait(
+                    now_ns=now_ns, instrument_id=iid, reason=refusal
+                )
                 return
             if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
                 self._hunt_no_only(
@@ -1916,7 +1919,8 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         # hunt loop: with this filter in place, `_submit_order`'s WAIT path
         # (and `on_order_denied`'s clear) is reached ONLY by the genuine
         # same-burst race it exists for.
-        if self._admission_refusal(str(snapshot.instrument_id)) is not None:
+        hunt_refusal = self._admission_refusal(str(snapshot.instrument_id))
+        if hunt_refusal is not None:
             self.diagnostics.record(_DIAG_OPEN_INTENT_WAIT)
             self._report_alerter(
                 self.diagnostics_alerter,
@@ -1926,7 +1930,9 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
             # -- the WAIT outcome above is already decided; this can never
             # change it, add a refusal/diagnostic key, or affect the gate.
             self._maybe_observe_open_intent_wait(
-                now_ns=snapshot.ts_event, instrument_id=str(snapshot.instrument_id)
+                now_ns=snapshot.ts_event,
+                instrument_id=str(snapshot.instrument_id),
+                reason=hunt_refusal,
             )
             return
 
@@ -2496,7 +2502,7 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         """
         assert self._latch is not None
         try:
-            intent_open = self._admission_refusal(instrument_id) is not None
+            release_refusal = self._admission_refusal(instrument_id)
         except TrialDayLatchError:
             # Edge case (Decision 1, fail-closed properties): an unbound
             # intent_latch double raises rather than answers -- treated as
@@ -2508,10 +2514,10 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
                 "as OPEN"
             )
             return False
-        if intent_open:
+        if release_refusal is not None:
             self.log.debug(
                 f"rearm: {station}/{climate_day} inflight release skipped -- "
-                "the account-wide submit intent is still OPEN"
+                + self._inflight_release_blocked_text(release_refusal)
             )
             return False
         if last_attempt_ns is None or now_ns < last_attempt_ns + _REARM_MIN_DELAY_NS:
@@ -2574,6 +2580,14 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         """
         self.log.info(summary)
 
+    def _inflight_release_blocked_text(self, refusal: str) -> str:
+        """Why a stale-inflight release is held: the account-wide wording at K=1
+        (byte-identical to before), the actual admission reason at K > 1."""
+        assert self._latch is not None
+        if self._latch.max_slots() == 1:
+            return "the account-wide submit intent is still OPEN"
+        return f"admission refused ({refusal})"
+
     def _admission_slug(self, instrument_id: str) -> str | None:
         """The venue slug the exec gate keys admission on, or ``None`` if unreadable.
 
@@ -2611,7 +2625,9 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
             return ""
         return self._admission_slug(instrument_id) or instrument_id
 
-    def _maybe_observe_open_intent_wait(self, *, now_ns: int, instrument_id: str) -> None:
+    def _maybe_observe_open_intent_wait(
+        self, *, now_ns: int, instrument_id: str, reason: str | None = None
+    ) -> None:
         """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): reads the open
         submit intent at most once per event-time MINUTE bucket (per slug at
         K > 1; account-wide at K=1) -- contained under
@@ -2623,14 +2639,18 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         minute_bucket = now_ns // _NS_PER_MINUTE
         try:
             scope = self._open_intent_wait_scope(instrument_id)
-        except Exception:  # noqa: BLE001 - observability must never affect the WAIT
+        except Exception as exc:  # noqa: BLE001 - observability must never affect the WAIT
+            self.log.debug(
+                f"open_intent_wait: scope derivation failed ({type(exc).__name__}); "
+                "using the instrument id"
+            )
             scope = instrument_id
         if self._open_intent_wait_last_minute_bucket.get(scope) == minute_bucket:
             return
         self._open_intent_wait_last_minute_bucket[scope] = minute_bucket
         self._run_observability(
             "continuous_rung_hold open-intent-wait observation failed",
-            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns, scope=scope),
+            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns, scope=scope, reason=reason),
         )
 
     def _open_intent_for_wait(self, scope: str) -> SubmitIntent | None:
@@ -2642,28 +2662,38 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         intents = self._latch.open_submit_intents()
         return next((i for i in intents if i.slug == scope), intents[0] if intents else None)
 
-    def _log_open_intent_wait_if_due(self, *, now_ns: int, scope: str) -> None:
+    def _log_open_intent_wait_if_due(
+        self, *, now_ns: int, scope: str, reason: str | None = None
+    ) -> None:
         """F-4: logs once per NEW ``intent_id``, then at most once per hour
         while the SAME id persists (``_open_intent_wait_log_state``, per
         scope). Never reads or logs ``SubmitIntent.fingerprint``
         (``repr=False`` on that dataclass) -- only ``intent_id`` and the age
-        derived from ``created_ns``. At K > 1 the line also names the slug.
+        derived from ``created_ns``. At K > 1 the line also names the slug and
+        the admission reason; with no open intent at all (a breaker halt, a
+        cool-off) it is a reason-only line, deduped the same way.
         """
         intent = self._open_intent_for_wait(scope)
-        if intent is None:
+        if intent is None and not (scope and reason):
             # The intent cleared between the pre-filter's read and this one
             # (a genuine, if narrow, race) -- nothing to log.
             return
+        ident = intent.intent_id if intent is not None else f"reason:{reason}"
         state = self._open_intent_wait_log_state.get(scope)
-        if state is not None and state[0] == intent.intent_id and now_ns - state[1] < _NS_PER_HOUR:
+        if state is not None and state[0] == ident and now_ns - state[1] < _NS_PER_HOUR:
             return
-        self._open_intent_wait_log_state[scope] = (intent.intent_id, now_ns)
+        self._open_intent_wait_log_state[scope] = (ident, now_ns)
         station = ",".join(self._config.stations)
+        if intent is None:
+            self._record_open_intent_wait(
+                f"open_intent_wait: station={station} slug={scope} reason={reason}"
+            )
+            return
         age_s = (now_ns - intent.created_ns) / _NS_PER_SECOND
-        slug_part = f" slug={scope}" if scope else ""
+        suffix = f" slug={scope} reason={reason}" if scope else ""
         self._record_open_intent_wait(
             f"open_intent_wait: station={station} intent_id={intent.intent_id} "
-            f"age_s={age_s}{slug_part}"
+            f"age_s={age_s}{suffix}"
         )
 
     def _record_open_intent_wait(self, summary: str) -> None:

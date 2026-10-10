@@ -50,8 +50,13 @@ _SUBMIT_CHAIN = "breezy.adapters.polymarket_us.exec.submit_chain"
 
 
 def _fingerprint(order: Order) -> str:
-    """The exec client's intent fingerprint for ``order`` (resolved by name so this
-    file adds no static import of the exec package to the egress guard's scan)."""
+    """Compute the exec client's intent fingerprint for ``order``, for TEST SETUP ONLY.
+
+    It exists so a test can arm a slot whose fingerprint matches a cached order. It
+    has no submit capability and no egress capability: it calls one pure hashing
+    function. The module is resolved by name only so this file adds no static import
+    of the exec package to the egress guard's scan.
+    """
     fingerprint = importlib.import_module(_SUBMIT_CHAIN).intent_fingerprint(order)
     assert isinstance(fingerprint, str)
     return fingerprint
@@ -405,13 +410,111 @@ def test_no_side_shadow_refuses_only_the_open_slug_at_k_gt_1(
     _arm_slot(strategy, FP_A, SLUG_B)  # a different slug is open and K is not full
 
     _run_no_shadow(strategy)
-    assert strategy.last_no_refuse != "no_refuse: reason=intent_open"
+    assert strategy.last_no_refuse is None or "intent_open" not in strategy.last_no_refuse
 
     strategy2_path = store_path.with_name("state2.db")
     strategy2 = _start_k(strategy2_path, (interior_instrument,), k=2)
     _arm_slot(strategy2, FP_A, SLUG_A)  # THIS slug is open
     _run_no_shadow(strategy2)
-    assert strategy2.last_no_refuse == "no_refuse: reason=intent_open"
+    # K>1: the log label carries the actual admission reason
+    assert strategy2.last_no_refuse == "no_refuse: reason=intent_open:slug_open"
+
+
+def test_no_side_refusal_label_carries_the_breaker_reason_at_k_gt_1(
+    store_path: Path, interior_instrument: BinaryOption
+) -> None:
+    strategy = _start_k(store_path, (interior_instrument,), k=2)
+    intent_latch = _latch_of(strategy)._intent_latch
+    assert intent_latch is not None
+    intent_latch.write_breaker_halt("x", ts_ns=WINDOW_OPEN_NS)
+
+    _run_no_shadow(strategy)
+
+    assert strategy.last_no_refuse == "no_refuse: reason=intent_open:breaker_halted"
+
+
+def test_silent_wait_on_a_breaker_halt_logs_one_deduped_reason_line_at_k_gt_1(
+    store_path: Path, interior_instrument: BinaryOption, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    strategy = _start_k(store_path, (interior_instrument,), k=2)
+    intent_latch = _latch_of(strategy)._intent_latch
+    assert intent_latch is not None
+    intent_latch.write_breaker_halt("x", ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    lines: list[str] = []
+    monkeypatch.setattr(strategy, "_emit_open_intent_wait", lines.append)
+
+    for minutes in (0, 1, 2):
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + minutes * 60 * NS_PER_SEC)
+        )
+
+    assert len(lines) == 1  # no open intent anywhere; one line, then deduped per hour
+    assert f"slug={SLUG_A}" in lines[0] and "reason=breaker_halted" in lines[0]
+    assert "intent_id=" not in lines[0]
+
+
+def test_silent_wait_on_cooloff_logs_the_reason_at_k_gt_1(
+    store_path: Path, interior_instrument: BinaryOption
+) -> None:
+    strategy = _start_k(store_path, (interior_instrument,), k=2)
+    latch = _latch_of(strategy)
+    intent_latch = latch._intent_latch
+    assert intent_latch is not None
+    slot = intent_latch.arm_slot(FP_A, slug=SLUG_A, is_exit=False, now_ns=WINDOW_OPEN_NS)
+    intent_latch.retire(
+        slot.intent_id, RetirementReason.ACCEPTED_ZERO_FILL_TERMINAL, now_ns=WINDOW_OPEN_NS
+    )
+    reason = latch.admission_would_refuse(SLUG_A, False)
+    assert reason is not None and "cool" in reason
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    line = strategy.last_open_intent_wait
+    assert line is not None and f"reason={reason}" in line and f"slug={SLUG_A}" in line
+
+
+def test_k1_wait_line_has_no_reason_suffix(
+    store_path: Path, interior_instrument: BinaryOption
+) -> None:
+    _arm_and_release_stale_intent(store_path)
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert strategy.last_open_intent_wait is not None
+    assert "reason=" not in strategy.last_open_intent_wait
+
+
+def test_inflight_release_skip_text_k1_is_unchanged_and_k_gt_1_names_the_reason(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path
+) -> None:
+    k1 = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert k1._inflight_release_blocked_text("anything") == (
+        "the account-wide submit intent is still OPEN"
+    )
+    k2 = _start_k(tmp_path / "k2.db", (interior_instrument,), k=2)
+    text = k2._inflight_release_blocked_text("breaker_halted")
+    assert "breaker_halted" in text and "account-wide" not in text
+
+
+def test_scope_helper_failure_is_contained_and_logged_at_debug(
+    store_path: Path, interior_instrument: BinaryOption, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    strategy = _start_k(store_path, (interior_instrument,), k=2)
+    _arm_slot(strategy, FP_A, SLUG_A)
+
+    def _boom(instrument_id: str) -> str:
+        raise RuntimeError("scope fault")
+
+    monkeypatch.setattr(strategy, "_open_intent_wait_scope", _boom)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert strategy.diagnostics.count("open_intent_wait") == 1  # the WAIT is unaffected
 
 
 # ---------------------------------------------------------------------------
