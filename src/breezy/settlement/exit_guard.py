@@ -160,11 +160,25 @@ class SettlementCloseRefused(Exception):
     """
 
 
+def _blocking_refusals(
+    trading_refusals: Sequence[str],
+    instrument_id: str,
+    refusal_scopes: Sequence[str] | None,
+) -> bool:
+    """Whether any refusal blocks a close of `instrument_id` (fail closed on doubt)."""
+    if not trading_refusals:
+        return False
+    if refusal_scopes is None or len(refusal_scopes) != len(trading_refusals):
+        return True
+    return any(not scope or instrument_id.startswith(scope) for scope in refusal_scopes)
+
+
 def assert_settlement_close_permitted(
     *,
     trading_refusals: Sequence[str],
     instrument_id: str,
     attributed_order_id: str | None,
+    refusal_scopes: Sequence[str] | None = None,
 ) -> None:
     """Refuse a settlement close the same way `_submit_order` would refuse it.
 
@@ -184,8 +198,15 @@ def assert_settlement_close_permitted(
 
     Raises :class:`SettlementCloseRefused` on either failure; returns
     `None` (permits the close) only when both checks pass.
+
+    `refusal_scopes` (EXEC-PAR, K > 1) is parallel to `trading_refusals`: the
+    instrument/slug each refusal is scoped to, `""` meaning unscoped. When
+    given, a refusal scoped to ANOTHER slug no longer blocks this close; an
+    unscoped one, one whose scope prefixes `instrument_id`, or a length
+    mismatch with `trading_refusals` still refuses (fail closed). `None`
+    (the default) is the unscoped behaviour above.
     """
-    if trading_refusals:
+    if _blocking_refusals(trading_refusals, instrument_id, refusal_scopes):
         raise SettlementCloseRefused(
             f"refusing to close {instrument_id} via settlement-as-exit: "
             f"the exec client latch carries {len(trading_refusals)} "

@@ -53,6 +53,7 @@ from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
+from breezy.runtime.submit_intent import SubmitIntent
 from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_helpers import (
@@ -474,11 +475,11 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         #: read `current_open_submit_intent()` to at most once per event-
         #: time MINUTE bucket (`snapshot.ts_event // 60e9`) -- `None` until
         #: the first `is_intent_open()` WAIT tick this process ever sees.
-        self._open_intent_wait_last_minute_bucket: int | None = None
+        self._open_intent_wait_last_minute_bucket: dict[str, int] = {}
         #: F-4: `(intent_id, last_logged_ns)` for the LOG line's OWN dedupe
         #: -- once per NEW `intent_id`, then at most once per hour while the
         #: SAME id persists. `None` until a line is actually logged.
-        self._open_intent_wait_log_state: tuple[str, int] | None = None
+        self._open_intent_wait_log_state: dict[str, tuple[str, int]] = {}
         #: Mirrors `last_rearm_decision`/`last_no_take_shadow` (L-27:
         #: asserted by presence, never via log capture) -- the MOST RECENT
         #: `open_intent_wait:` line actually logged (never set on a
@@ -1710,7 +1711,7 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
             hour_lst = _local_hour(now_ns, offset)
             if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
                 return
-            if self._latch.is_intent_open():
+            if self._admission_refusal(iid) is not None:
                 # Silent-failure review (2026-09-25): this WAIT is silent on
                 # `diagnostics`/`refusals` by design (AC4 above), but it is
                 # still a genuine `open_intent_wait` -- routed through the
@@ -1718,7 +1719,7 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
                 # is not invisible to `last_open_intent_wait`/the log line.
                 # Deduped by the SAME per-process state (minute bucket,
                 # intent_id) either check already shares.
-                self._maybe_observe_open_intent_wait(now_ns=now_ns)
+                self._maybe_observe_open_intent_wait(now_ns=now_ns, instrument_id=iid)
                 return
             if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
                 self._hunt_no_only(
@@ -1915,7 +1916,7 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         # hunt loop: with this filter in place, `_submit_order`'s WAIT path
         # (and `on_order_denied`'s clear) is reached ONLY by the genuine
         # same-burst race it exists for.
-        if self._latch.is_intent_open():
+        if self._admission_refusal(str(snapshot.instrument_id)) is not None:
             self.diagnostics.record(_DIAG_OPEN_INTENT_WAIT)
             self._report_alerter(
                 self.diagnostics_alerter,
@@ -1924,7 +1925,9 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
             # F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): observability ONLY
             # -- the WAIT outcome above is already decided; this can never
             # change it, add a refusal/diagnostic key, or affect the gate.
-            self._maybe_observe_open_intent_wait(now_ns=snapshot.ts_event)
+            self._maybe_observe_open_intent_wait(
+                now_ns=snapshot.ts_event, instrument_id=str(snapshot.instrument_id)
+            )
             return
 
         now_ns = snapshot.ts_event
@@ -2493,7 +2496,7 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         """
         assert self._latch is not None
         try:
-            intent_open = self._latch.is_intent_open()
+            intent_open = self._admission_refusal(instrument_id) is not None
         except TrialDayLatchError:
             # Edge case (Decision 1, fail-closed properties): an unbound
             # intent_latch double raises rather than answers -- treated as
@@ -2571,45 +2574,96 @@ class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
         """
         self.log.info(summary)
 
-    def _maybe_observe_open_intent_wait(self, *, now_ns: int) -> None:
-        """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): reads
-        ``current_open_submit_intent()`` at most once per event-time MINUTE
-        bucket -- contained under :meth:`_run_observability` exactly like
-        every other observability call in this class (``_observe_halt``,
-        ``_report_alerter``), so a store-read failure can never affect the
-        WAIT outcome ``is_intent_open()`` already decided, nor raise into
-        ``_hunt_tick``.
-        """
-        minute_bucket = now_ns // _NS_PER_MINUTE
-        if minute_bucket == self._open_intent_wait_last_minute_bucket:
-            return
-        self._open_intent_wait_last_minute_bucket = minute_bucket
-        self._run_observability(
-            "continuous_rung_hold open-intent-wait observation failed",
-            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns),
-        )
+    def _admission_slug(self, instrument_id: str) -> str | None:
+        """The venue slug the exec gate keys admission on, or ``None`` if unreadable.
 
-    def _log_open_intent_wait_if_due(self, *, now_ns: int) -> None:
-        """F-4: logs once per NEW ``intent_id``, then at most once per hour
-        while the SAME id persists (``_open_intent_wait_log_state``). Never
-        reads or logs ``SubmitIntent.fingerprint`` (``repr=False`` on that
-        dataclass) -- only ``intent_id`` and the age derived from
-        ``created_ns``.
+        ``base_slug_of`` accepts either leg's id, so a YES and a NO id of one
+        market share a slug (and so a slot).
+        """
+        try:
+            return base_slug_of(InstrumentId.from_str(instrument_id))
+        except (VenuePayloadError, ValueError):
+            return None
+
+    def _admission_refusal(self, instrument_id: str) -> str | None:
+        """EXEC-PAR WP6: why the exec gate would refuse a new entry on this
+        instrument's slug now, or ``None``. The read-only twin of the gate.
+
+        The SAME predicate `_submit_order` applies (quarantine, K-full,
+        cool-off, breaker halt, stale heartbeat / resolver pass, same slug),
+        never a bare slug test. At an effective K of 1 it is truthy exactly
+        when the old ``is_intent_open()`` was (the slug is irrelevant there).
+        An unreadable slug at K > 1 fails closed.
         """
         assert self._latch is not None
-        intent = self._latch.current_open_submit_intent()
-        if intent is None:
-            # The singleton cleared between `is_intent_open()`'s read and
-            # this one (a genuine, if narrow, race) -- nothing to log.
+        slug = self._admission_slug(instrument_id)
+        if slug is None:
+            if self._latch.max_slots() > 1:
+                return "slug_unresolvable"
+            slug = instrument_id
+        return self._latch.admission_would_refuse(slug, False)
+
+    def _open_intent_wait_scope(self, instrument_id: str) -> str:
+        """The dedupe/naming scope of a WAIT observation: ``""`` at K=1 (one
+        account-wide intent, today's behaviour), the slug at K > 1."""
+        assert self._latch is not None
+        if self._latch.max_slots() == 1:
+            return ""
+        return self._admission_slug(instrument_id) or instrument_id
+
+    def _maybe_observe_open_intent_wait(self, *, now_ns: int, instrument_id: str) -> None:
+        """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): reads the open
+        submit intent at most once per event-time MINUTE bucket (per slug at
+        K > 1; account-wide at K=1) -- contained under
+        :meth:`_run_observability` exactly like every other observability
+        call in this class (``_observe_halt``, ``_report_alerter``), so a
+        store-read failure can never affect the WAIT outcome the admission
+        pre-filter already decided, nor raise into ``_hunt_tick``.
+        """
+        minute_bucket = now_ns // _NS_PER_MINUTE
+        try:
+            scope = self._open_intent_wait_scope(instrument_id)
+        except Exception:  # noqa: BLE001 - observability must never affect the WAIT
+            scope = instrument_id
+        if self._open_intent_wait_last_minute_bucket.get(scope) == minute_bucket:
             return
-        state = self._open_intent_wait_log_state
+        self._open_intent_wait_last_minute_bucket[scope] = minute_bucket
+        self._run_observability(
+            "continuous_rung_hold open-intent-wait observation failed",
+            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns, scope=scope),
+        )
+
+    def _open_intent_for_wait(self, scope: str) -> SubmitIntent | None:
+        """The intent a WAIT names: the singleton at K=1; at K > 1 the OPEN
+        intent on this slug, else the oldest OPEN intent (the K-full blocker)."""
+        assert self._latch is not None
+        if not scope:
+            return self._latch.current_open_submit_intent()
+        intents = self._latch.open_submit_intents()
+        return next((i for i in intents if i.slug == scope), intents[0] if intents else None)
+
+    def _log_open_intent_wait_if_due(self, *, now_ns: int, scope: str) -> None:
+        """F-4: logs once per NEW ``intent_id``, then at most once per hour
+        while the SAME id persists (``_open_intent_wait_log_state``, per
+        scope). Never reads or logs ``SubmitIntent.fingerprint``
+        (``repr=False`` on that dataclass) -- only ``intent_id`` and the age
+        derived from ``created_ns``. At K > 1 the line also names the slug.
+        """
+        intent = self._open_intent_for_wait(scope)
+        if intent is None:
+            # The intent cleared between the pre-filter's read and this one
+            # (a genuine, if narrow, race) -- nothing to log.
+            return
+        state = self._open_intent_wait_log_state.get(scope)
         if state is not None and state[0] == intent.intent_id and now_ns - state[1] < _NS_PER_HOUR:
             return
-        self._open_intent_wait_log_state = (intent.intent_id, now_ns)
+        self._open_intent_wait_log_state[scope] = (intent.intent_id, now_ns)
         station = ",".join(self._config.stations)
         age_s = (now_ns - intent.created_ns) / _NS_PER_SECOND
+        slug_part = f" slug={scope}" if scope else ""
         self._record_open_intent_wait(
-            f"open_intent_wait: station={station} intent_id={intent.intent_id} age_s={age_s}"
+            f"open_intent_wait: station={station} intent_id={intent.intent_id} "
+            f"age_s={age_s}{slug_part}"
         )
 
     def _record_open_intent_wait(self, summary: str) -> None:
