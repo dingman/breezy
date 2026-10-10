@@ -105,6 +105,9 @@ from breezy.adapters.polymarket_us.tape_records import (
 )
 from breezy.persistence.catalog import CatalogPathError
 from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.exec_par_constants import (
+    EXEC_PAR_MAX_CONCURRENT_INTENTS,  # noqa: F401 - re-exported: existing importers keep working
+)
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.settings import (
     BreezyRuntimeSettings,
@@ -719,8 +722,9 @@ TRADE_RISK_MAX_ORDER_SUBMIT_RATE: Final[str] = "5/00:00:01"
 
 _EXEC_PAR_NS_PER_SECOND: Final[int] = 1_000_000_000
 
-#: K, the most submit intents OPEN at once. 1 = today's one-at-a-time latch.
-EXEC_PAR_MAX_CONCURRENT_INTENTS: Final[int] = 1
+# K, EXEC_PAR_MAX_CONCURRENT_INTENTS, lives in the dependency-free
+# `exec_par_constants` (the supervisor reads it without importing this module)
+# and is re-exported at the top of this file.
 
 #: `f_adm`: AMBIGUOUS open notional (and any single order) may not exceed this
 #: fraction of the daily budget. A ratio, never a dollar value.

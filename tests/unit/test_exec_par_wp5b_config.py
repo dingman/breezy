@@ -19,12 +19,12 @@ from breezy.adapters.polymarket_us import factories
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import node_config
+from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
 from breezy.runtime.node_config import (
     BREAKER_HEARTBEAT_MAX_AGE_NS,
     BREAKER_OPEN_AMBIGUOUS_FRACTION,
     EXEC_PAR_FROZEN_BUCKET,
     EXEC_PAR_MARKER_ABSENT_REASON,
-    EXEC_PAR_MAX_CONCURRENT_INTENTS,
     OPEN_EXPOSURE_BOUND_FRACTION,
     RESOLVER_PASS_STALE_NS,
     TRADE_RISK_MAX_ORDER_SUBMIT_RATE,
@@ -95,10 +95,36 @@ def _module_assignments() -> dict[str, ast.AnnAssign]:
 # ---------------------------------------------------------------------------
 
 
+_CONSTANTS_MODULE = _REPO / "src/breezy/runtime/exec_par_constants.py"
+
+
+def _constants_module() -> dict[str, ast.AnnAssign]:
+    return {
+        node.target.id: node
+        for node in ast.parse(_CONSTANTS_MODULE.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+
+
+def test_k_lives_in_a_dependency_free_module_that_node_config_reexports() -> None:
+    from breezy.runtime import exec_par_constants
+
+    tree = ast.parse(_CONSTANTS_MODULE.read_text(encoding="utf-8"))
+    imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert imported == {"typing"}
+    assert exec_par_constants.EXEC_PAR_MAX_CONCURRENT_INTENTS is EXEC_PAR_MAX_CONCURRENT_INTENTS
+    assert vars(node_config)["EXEC_PAR_MAX_CONCURRENT_INTENTS"] is EXEC_PAR_MAX_CONCURRENT_INTENTS
+
+
 def test_constants_are_final_and_not_env_derived() -> None:
     assignments = _module_assignments()
     for name in _CONSTANTS:
-        node = assignments[name]
+        node = assignments[name] if name in assignments else _constants_module()[name]
         annotation = ast.unparse(node.annotation)
         assert annotation.startswith("Final"), name
         assert node.value is not None
