@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from breezy.runtime.submit_intent import SubmitIntent, SubmitIntentCorrupt, SubmitIntentState
+from breezy.runtime.submit_intent import (
+    SlotTable,
+    SubmitIntent,
+    SubmitIntentCorrupt,
+    SubmitIntentState,
+)
 from breezy.runtime.trade_supervisor_core import (
     PreLaunchProbeInvariantError,
     assert_no_live_node_before_intent_probe,
@@ -31,6 +36,7 @@ __all__ = [
     "IntentObservation",
     "Z19Counts",
     "observe_open_intent_post_stop",
+    "observe_open_slots_post_stop",
     "reconstruct_open_intent_at",
     "z19_alerts",
     "z19_counts",
@@ -48,6 +54,7 @@ class IntentObservation(StrEnum):
 
 _NodePid = Callable[[], int | None]
 _ReadCurrent = Callable[[], SubmitIntent | None]
+_ReadTable = Callable[[], SlotTable | None]
 
 
 def observe_open_intent_post_stop(
@@ -68,6 +75,33 @@ def observe_open_intent_post_stop(
     if current is None or current.state is not SubmitIntentState.OPEN:
         return IntentObservation.NONE
     return IntentObservation.AMBIGUOUS if is_ambiguous(current) else IntentObservation.OPEN
+
+
+def observe_open_slots_post_stop(
+    *,
+    stop_signal_present: bool,
+    node_pid: _NodePid,
+    read_table: _ReadTable,
+    is_ambiguous: Callable[[SubmitIntent], bool],
+) -> IntentObservation:
+    """:func:`observe_open_intent_post_stop` over the EXEC-PAR slot table (v1 or v2).
+
+    Any readable OPEN slot that ``is_ambiguous`` makes the day AMBIGUOUS; an
+    unreadable slot is OPEN and unclassifiable, so also AMBIGUOUS -- never
+    ``none``. A corrupt table is ``unknown``.
+    """
+    if not stop_signal_present:
+        return IntentObservation.UNKNOWN
+    try:
+        assert_no_live_node_before_intent_probe(node_pid())
+        table = read_table()
+    except (PreLaunchProbeInvariantError, SubmitIntentCorrupt, OSError):
+        return IntentObservation.UNKNOWN
+    if table is None or not (table.open or table.unreadable):
+        return IntentObservation.NONE
+    if table.unreadable or any(is_ambiguous(slot) for slot in table.open):
+        return IntentObservation.AMBIGUOUS
+    return IntentObservation.OPEN
 
 
 def reconstruct_open_intent_at(history: Sequence[SubmitIntent], at_ns: int) -> IntentObservation:

@@ -37,12 +37,16 @@ __all__ = [
     "discard_supervisor_decode_marker",
     "read_supervisor_decode_marker",
     "supervisor_admits_retirement_reason",
+    "supervisor_admits_slot_schema",
     "supervisor_decode_marker_path",
     "write_supervisor_decode_marker",
 ]
 
 _MARKER_SUFFIX: Final[str] = ".supervisor_decode"
 _SCHEMA_VERSION: Final[int] = 1
+#: Slot-table schema versions this supervisor can decode (EXEC-PAR WP5a). The
+#: marker field is trailing-optional, so ``_SCHEMA_VERSION`` stays 1.
+SUPPORTED_SLOT_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({2})
 
 ProcessStartTicks = Callable[[int], int | None]
 
@@ -53,6 +57,7 @@ class SupervisorDecodeMarker:
     start_ticks: int
     revision: str
     retirement_reasons: frozenset[str]
+    slot_schema_versions: frozenset[int] = frozenset()
 
 
 def supervisor_decode_marker_path(store_path: Path) -> Path:
@@ -86,6 +91,7 @@ def write_supervisor_decode_marker(
         "start_ticks": start_ticks,
         "revision": revision,
         "retirement_reasons": sorted(member.value for member in RetirementReason),
+        "slot_schema_versions": sorted(SUPPORTED_SLOT_SCHEMA_VERSIONS),
     }
     marker_path = supervisor_decode_marker_path(store_path)
     tmp_path = marker_path.with_name(f"{marker_path.name}.tmp.{os.getpid()}")
@@ -114,6 +120,20 @@ def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _slot_schema_versions(value: object) -> frozenset[int] | None:
+    """Absent (a pre-WP5a marker) is empty; a present malformed field is ``None``."""
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        return None
+    versions: set[int] = set()
+    for item in value:
+        if not isinstance(item, int) or isinstance(item, bool):
+            return None
+        versions.add(item)
+    return frozenset(versions)
+
+
 def read_supervisor_decode_marker(store_path: Path) -> SupervisorDecodeMarker | None:
     """The decoded marker, or ``None`` for an absent, unreadable or malformed
     file (every failure is the same fail-closed answer)."""
@@ -131,11 +151,15 @@ def read_supervisor_decode_marker(store_path: Path) -> SupervisorDecodeMarker | 
         return None
     if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
         return None
+    slot_versions = _slot_schema_versions(payload.get("slot_schema_versions"))
+    if slot_versions is None:
+        return None
     return SupervisorDecodeMarker(
         pid=pid,  # type: ignore[arg-type]
         start_ticks=start_ticks,  # type: ignore[arg-type]
         revision=revision,
         retirement_reasons=frozenset(reasons),
+        slot_schema_versions=slot_versions,
     )
 
 
@@ -151,6 +175,23 @@ def supervisor_admits_retirement_reason(
     Anything else is ``False``."""
     marker = read_supervisor_decode_marker(store_path)
     if marker is None or reason not in marker.retirement_reasons:
+        return False
+    current = process_start_ticks(marker.pid)
+    return current is not None and current == marker.start_ticks
+
+
+def supervisor_admits_slot_schema(
+    store_path: Path,
+    version: int = 2,
+    *,
+    process_start_ticks: ProcessStartTicks = _default_process_start_ticks,
+) -> bool:
+    """``True`` iff the marker decodes, advertises slot-table ``version``, and
+    its pid is alive with the SAME ``/proc`` start ticks (the identity check of
+    :func:`supervisor_admits_retirement_reason`). A node asks before it writes
+    a v2 table; anything else is ``False`` (fail closed)."""
+    marker = read_supervisor_decode_marker(store_path)
+    if marker is None or version not in marker.slot_schema_versions:
         return False
     current = process_start_ticks(marker.pid)
     return current is not None and current == marker.start_ticks
