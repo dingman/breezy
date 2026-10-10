@@ -183,12 +183,8 @@ def test_settle_is_atomic_on_raise() -> None:
         with pytest.raises(LiveTradingPermissionError, match="does not match"):
             _settle(ledger, "k", booking=None, realized="1.00")
         with pytest.raises(LiveTradingPermissionError, match="exactly Decimal"):
-            ledger.settle(
-                "k",
-                booking=booking,
-                realized_usd=1.0,  # type: ignore[arg-type]
-                fill_ts_ns=None,
-                now_ns=D1_MIDDAY,
+            getattr(ledger, "settle")(  # noqa: B009
+                "k", booking=booking, realized_usd=1.0, fill_ts_ns=None, now_ns=D1_MIDDAY
             )
         assert ledger.has_open_exposure("k")
         assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal("5.00")
@@ -202,9 +198,11 @@ def test_public_true_up_and_release_wrappers_unchanged() -> None:
         ledger = DailySpendLedger()
         booking = _auth(ledger, "5.00", D1_MIDDAY)
         with pytest.raises(LiveTradingPermissionError, match="exactly SpendBooking"):
-            ledger.release_booking("x", now_ns=D1_MIDDAY)  # type: ignore[arg-type]
+            getattr(ledger, "release_booking")("x", now_ns=D1_MIDDAY)  # noqa: B009
         with pytest.raises(LiveTradingPermissionError, match="exactly Decimal"):
-            ledger.true_up_booking(booking, filled_cost_usd=1.0, now_ns=D1_MIDDAY)  # type: ignore[arg-type]
+            getattr(ledger, "true_up_booking")(  # noqa: B009
+                booking, filled_cost_usd=1.0, now_ns=D1_MIDDAY
+            )
         with pytest.raises(LiveTradingPermissionError, match="must not be negative"):
             ledger.true_up_booking(booking, filled_cost_usd=Decimal(-1), now_ns=D1_MIDDAY)
         with pytest.raises(LiveTradingPermissionError, match="more than authorized"):
@@ -276,7 +274,9 @@ def test_settle_tolerates_stale_now_ns_never_raises_clock_backwards() -> None:
         assert _settle(ledger, "k", booking=booking, realized="1.00", now_ns=1) is True
         assert _settle(ledger, "k", now_ns=1) is False
         with pytest.raises(LiveTradingPermissionError, match="exactly int"):
-            ledger.settle("k", booking=None, realized_usd=None, fill_ts_ns=None, now_ns=1.5)  # type: ignore[arg-type]
+            getattr(ledger, "settle")(  # noqa: B009
+                "k", booking=None, realized_usd=None, fill_ts_ns=None, now_ns=1.5
+            )
 
 
 def test_settle_over_cost_same_day_still_raises() -> None:
@@ -498,7 +498,7 @@ def test_abandon_never_raises_and_adds_no_spend() -> None:
         assert ledger.abandon_open_exposure("k") is True
         assert ledger.abandon_open_exposure("k") is False
         assert ledger.abandon_open_exposure("never") is False
-        assert ledger.abandon_open_exposure(None) is False  # type: ignore[arg-type]
+        assert getattr(ledger, "abandon_open_exposure")(None) is False  # noqa: B009
         assert ledger.abandon_open_exposure("u") is True
         assert ledger.unknown_key_count() == 0
         # a charged booking stays charged (conservative)
@@ -661,7 +661,7 @@ def test_breaker_fraction_exceeded_true_on_any_raise() -> None:
     with _budget(daily="100.00"):
         assert ledger.breaker_fraction_exceeded() is False  # 10 <= 25
         assert ledger.breaker_fraction_exceeded(Decimal("0.05")) is True  # 10 > 5
-        assert ledger.breaker_fraction_exceeded(1.5) is True  # type: ignore[arg-type]
+        assert getattr(ledger, "breaker_fraction_exceeded")(1.5) is True  # noqa: B009
 
 
 @pytest.mark.parametrize(
@@ -731,3 +731,20 @@ def test_operator_caps_never_assigned() -> None:
         and c.value.startswith("BREEZY_MAX")
     }
     assert controls == {MAX_DAILY_BUDGET_USD_ENV_VAR, MAX_POSITION_COST_USD_ENV_VAR}
+
+
+def test_inlock_refuses_while_unknown_notional_key_present() -> None:
+    with _budget(daily="100.00", position="100.00"):
+        ledger = DailySpendLedger()
+        _register(ledger, "u", None)
+        with pytest.raises(OpenExposureBoundExceeded) as info:
+            _auth(ledger, "1.00", D1_MIDDAY)
+        assert not isinstance(info.value, DailyBudgetExhausted)
+        # the day-stop type still wins when plain spend already exceeds the budget
+        _auth_ledger = DailySpendLedger()
+        _auth(_auth_ledger, "99.50", D1_MIDDAY)
+        _register(_auth_ledger, "u", None)
+        with pytest.raises(DailyBudgetExhausted):
+            _auth(_auth_ledger, "1.00", D1_MIDDAY)
+        ledger.abandon_open_exposure("u")
+        _auth(ledger, "1.00", D1_MIDDAY)  # admitted once the unknown key is gone

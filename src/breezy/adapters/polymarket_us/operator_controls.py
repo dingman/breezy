@@ -661,6 +661,11 @@ class DailySpendLedger:
         self, cost: Decimal, daily_budget: Decimal, *, rolled: bool
     ) -> None:
         """The two open-exposure invariants; raises the non-day-stop type."""
+        if self._unknown_keys:
+            raise OpenExposureBoundExceeded(
+                f"{MAX_DAILY_BUDGET_USD_ENV_VAR} refuses this order: an open order's "
+                f"notional is unknown, so the daily budget cannot be shown to hold"
+            )
         uncharged, ambiguous = self._totals_locked(rolled=rolled)
         spent = Decimal(0) if rolled else self._spent_usd
         if spent + uncharged + cost > daily_budget:
