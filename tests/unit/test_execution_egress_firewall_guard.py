@@ -2324,7 +2324,8 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "manual_leg_net_effect",
         # WP-DR (2026-10-10): the resolver's prior-UTC-day booking skip
         # compares `booking.day` with `utc_day_for_ns(now_ns)`. A pure date
-        # function (`operator_controls.py`): no I/O, no sender, no egress.
+        # function (`operator_controls.py`, the copy the client imports;
+        # `domain/exec_intent.py` restates it): no I/O, no sender, no egress.
         # ONE named row added; the set stays pinned by `==`.
         "utc_day_for_ns",
     }

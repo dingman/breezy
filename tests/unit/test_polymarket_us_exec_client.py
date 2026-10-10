@@ -5373,7 +5373,7 @@ async def test_same_day_zero_fill_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_later_same_day_authorize_after_skip_raises_nothing(
+async def test_new_day_authorize_after_prior_day_skip_raises_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
@@ -5393,4 +5393,33 @@ async def test_later_same_day_authorize_after_skip_raises_nothing(
 
         assert booking.day == utc_day_for_ns(next_day_ns)
         assert rig.client._ledger.spent_today_usd(now_ns=next_day_ns + 1) == Decimal("0.37")
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_accept_fill_after_midnight_sell_does_not_latch_fill_unbudgeted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED-first: a SELL context that (artificially) still holds a prior-day
+    booking raised before the fix; after it the booking is skipped and, being
+    an exit, the fill never latches UNBUDGETED."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-sell", sender)
+        sell_context = dataclasses.replace(context, order_side="SELL")
+        next_day_ns = now_ns + _DAY_NS
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = next_day_ns
+
+        rig.client._resolve_accept_fill(
+            sell_context, _FakeResolverAcceptFillReport(), rig.instrument, next_day_ns,
+        )
+
+        after = rig.client._latch.current()
+        assert after is not None
+        assert after.state is SubmitIntentState.RETIRED
+        assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
         await rig.client._disconnect()
