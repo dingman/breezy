@@ -22,12 +22,14 @@ from hypothesis import strategies as st
 from breezy.adapters.polymarket_us import operator_controls
 from breezy.adapters.polymarket_us.operator_controls import (
     COST_BUDGET_BUCKET_ABOVE_SENTINEL,
+    COST_BUDGET_BUCKET_ORDER,
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailyBudgetExhausted,
     DailySpendLedger,
     OpenExposureBoundExceeded,
     SpendBooking,
+    cost_budget_bucket_rank,
 )
 from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
@@ -139,19 +141,25 @@ def test_settle_same_day_unknown_or_double_booking_still_raises() -> None:
         ledger = DailySpendLedger()
         trued = _auth(ledger, "5.00", D1_MIDDAY)
         released = _auth(ledger, "5.00", D1_MIDDAY)
-        _register(ledger, "t", "5.00", booking=trued)
-        _register(ledger, "r", "5.00", booking=released)
-        ledger.true_up_booking(trued, filled_cost_usd=Decimal("1.00"), now_ns=D1_MIDDAY)
-        ledger.release_booking(released, now_ns=D1_MIDDAY)
+        # the same booking registered under two keys: the second settle is a double settle
+        for key in ("t1", "t2"):
+            _register(ledger, key, "5.00", booking=trued)
+        for key in ("r1", "r2"):
+            _register(ledger, key, "5.00", booking=released)
+        assert _settle(ledger, "t1", booking=trued, realized="1.00")
+        assert _settle(ledger, "r1", booking=released)
         with pytest.raises(LiveTradingPermissionError, match="trued up"):
-            _settle(ledger, "t", booking=trued, realized="1.00")
+            _settle(ledger, "t2", booking=trued, realized="1.00")
         with pytest.raises(LiveTradingPermissionError, match="released"):
-            _settle(ledger, "r", booking=released)
+            _settle(ledger, "r2", booking=released)
+        # unknown / already-settled bookings cannot be registered as charged either
         foreign = _auth(DailySpendLedger(), "5.00", D1_MIDDAY)
         with pytest.raises(LiveTradingPermissionError, match="not known"):
             _register(ledger, "f", "5.00", booking=foreign)
-        # the failed settles left both entries registered
-        assert ledger.has_open_exposure("t") and ledger.has_open_exposure("r")
+        with pytest.raises(LiveTradingPermissionError, match="trued up"):
+            _register(ledger, "again", "5.00", booking=trued)
+        # the failed settles left the entries registered (atomic)
+        assert ledger.has_open_exposure("t2") and ledger.has_open_exposure("r2")
 
 
 def test_settle_unregistered_key_with_no_booking_is_noop_false() -> None:
@@ -362,9 +370,9 @@ def test_cross_day_settles_counter() -> None:
         _register(ledger, "unc", "5.00", now_ns=D2_MIDDAY)
         _settle(ledger, "old", booking=old, realized="1.00", fill_ts_ns=D2_MIDDAY, now_ns=D2_MIDDAY)
         _settle(ledger, "unc", realized="1.00", fill_ts_ns=D2_MIDDAY, now_ns=D2_MIDDAY)
-        assert ledger.cross_day_settles_total == 2
+        assert ledger.cross_day_settles_total == 1
         _settle(ledger, "missing", now_ns=D2_MIDDAY)
-        assert ledger.cross_day_settles_total == 2
+        assert ledger.cross_day_settles_total == 1
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +577,9 @@ def test_precheck_is_read_only_view_roll() -> None:
         # nothing was rolled or mutated
         assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal("90.00")
         assert ledger.uncharged_open_total() == ZERO
-        ledger.release_booking(booking, now_ns=D1_MIDDAY)  # still live on D1
+        # still live on D1: the registry settles it through the same-day path
+        assert _settle(ledger, "k", booking=booking, now_ns=D1_MIDDAY) is True
+        assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == ZERO
 
 
 def test_precheck_uses_inlock_cost_function_boundary_to_the_cent() -> None:
@@ -610,11 +620,11 @@ def test_precheck_reads_budget_only_when_totals_nonzero(monkeypatch: pytest.Monk
     assert reads == []
     _register(ledger, "u", None)
     assert ledger.exposure_admission_refusal(Decimal(1), Decimal(1), D1_MIDDAY)
-    assert reads == []  # unknown notional denies without reading the budget
+    assert reads == [1]  # unknown notional reads the budget for the day-stop precedence
     ledger.abandon_open_exposure("u")
     _register(ledger, "k", "5.00")
     assert ledger.exposure_admission_refusal(Decimal(1), Decimal(1), D1_MIDDAY) is None
-    assert reads == [1]
+    assert reads == [1, 1]
     assert ledger.breaker_fraction_exceeded() is False  # not ambiguous, f off
 
 
@@ -748,3 +758,225 @@ def test_inlock_refuses_while_unknown_notional_key_present() -> None:
             _auth(_auth_ledger, "1.00", D1_MIDDAY)
         ledger.abandon_open_exposure("u")
         _auth(ledger, "1.00", D1_MIDDAY)  # admitted once the unknown key is gone
+
+
+# ---------------------------------------------------------------------------
+# budget-review round: day-stop precedence, ranks, breaker, guards
+# ---------------------------------------------------------------------------
+
+
+def test_precheck_unknown_key_with_exhausted_budget_defers_to_day_stop() -> None:
+    with _budget(daily="100.00", position="100.00"):
+        ledger = DailySpendLedger()
+        _auth(ledger, "95.00", D1_MIDDAY)
+        _register(ledger, "u", None)
+        # plain spent + cost > budget: defer so the in-lock DailyBudgetExhausted marks the stop
+        assert ledger.exposure_admission_refusal(Decimal("10.00"), Decimal(1), D1_MIDDAY) is None
+        with pytest.raises(DailyBudgetExhausted):
+            _auth(ledger, "10.00", D1_MIDDAY)
+        # budget has room: the unknown reason is returned
+        reason = ledger.exposure_admission_refusal(Decimal("1.00"), Decimal(1), D1_MIDDAY)
+        assert reason is not None and "unknown" in reason
+        # a day roll is evaluated on the view: spent resets, so the unknown reason applies
+        assert ledger.exposure_admission_refusal(Decimal("10.00"), Decimal(1), D2_MIDDAY)
+    with operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR):
+        raised = ledger.exposure_admission_refusal(Decimal("1.00"), Decimal(1), D1_MIDDAY)
+    assert isinstance(raised, str) and raised
+
+
+def test_bucket_sentinel_ranks_above_every_label_without_string_order() -> None:
+    assert COST_BUDGET_BUCKET_ORDER[-1] == COST_BUDGET_BUCKET_ABOVE_SENTINEL
+    ranks = [cost_budget_bucket_rank(label) for label in COST_BUDGET_BUCKET_ORDER]
+    assert ranks == sorted(ranks) and len(set(ranks)) == len(ranks)
+    sentinel_rank = cost_budget_bucket_rank(COST_BUDGET_BUCKET_ABOVE_SENTINEL)
+    assert all(cost_budget_bucket_rank(lb) < sentinel_rank for lb in COST_BUDGET_BUCKET_ORDER[:-1])
+    # plain string order is NOT the bucket order, so callers must use the rank
+    assert sorted(COST_BUDGET_BUCKET_ORDER) != list(COST_BUDGET_BUCKET_ORDER)
+    with pytest.raises(LiveTradingPermissionError):
+        cost_budget_bucket_rank("0.07")
+
+
+def test_breaker_fails_closed_on_unknown_sized_ambiguous_exposure() -> None:
+    ledger = DailySpendLedger(f_breaker=Decimal("0.25"))
+    _register(ledger, "u", None)
+    assert ledger.unknown_ambiguous_count() == 0
+    assert ledger.breaker_fraction_exceeded() is False  # not ambiguous
+    ledger.mark_ambiguous("u")
+    assert ledger.unknown_ambiguous_count() == 1
+    assert ledger.breaker_fraction_exceeded() is True  # no budget read needed
+    _register(ledger, "k", "1.00")
+    ledger.mark_ambiguous("k")
+    assert ledger.unknown_ambiguous_count() == 1
+    ledger.abandon_open_exposure("u")
+    assert ledger.unknown_ambiguous_count() == 0
+
+
+def test_public_true_up_or_release_of_registered_booking_raises() -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        _register(ledger, "k", "5.00", booking=booking)
+        with pytest.raises(LiveTradingPermissionError, match="registered"):
+            ledger.release_booking(booking, now_ns=D1_MIDDAY)
+        with pytest.raises(LiveTradingPermissionError, match="registered"):
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal(1), now_ns=D1_MIDDAY)
+        assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal("5.00")
+        assert _settle(ledger, "k", booking=booking, realized="1.00") is True
+        # an unregistered booking keeps using the public methods
+        other = _auth(ledger, "2.00", D1_MIDDAY)
+        ledger.release_booking(other, now_ns=D1_MIDDAY)
+        # after abandon the entry no longer holds the booking
+        third = _auth(ledger, "2.00", D1_MIDDAY)
+        _register(ledger, "t", "2.00", booking=third)
+        ledger.abandon_open_exposure("t")
+        ledger.release_booking(third, now_ns=D1_MIDDAY)
+
+
+def test_cross_day_counter_ignores_same_day_uncharged_settle() -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        # charged on D1, converted by a roll, settled on D2: a real crossing
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        _register(ledger, "x", "5.00", booking=booking, now_ns=D1_MIDDAY)
+        _auth(ledger, "1.00", D2_MIDDAY)
+        _settle(
+            ledger, "x", booking=booking, realized="1.00", fill_ts_ns=D2_MIDDAY, now_ns=D2_MIDDAY
+        )
+        assert ledger.cross_day_settles_total == 1
+        # registered uncharged and settled on the same day: not a crossing
+        _register(ledger, "unc", "5.00", now_ns=D2_MIDDAY)
+        _settle(ledger, "unc", realized="1.00", fill_ts_ns=D2_MIDDAY, now_ns=D2_MIDDAY)
+        assert ledger.cross_day_settles_total == 1
+
+
+def test_f_adm_refuses_a_single_order_over_its_fraction_with_zero_ambiguous() -> None:
+    with _budget(daily="100.00", position="100.00"):
+        ledger = DailySpendLedger(f_adm=Decimal("0.50"))
+        with pytest.raises(OpenExposureBoundExceeded):
+            _auth(ledger, "50.01", D1_MIDDAY)
+        _auth(ledger, "50.00", D1_MIDDAY)
+    assert "cost > f_adm" in (DailySpendLedger.__init__.__doc__ or "")
+
+
+@pytest.mark.parametrize("side", ["sell", "Sell", "SELL"])
+def test_register_open_exposure_refuses_sell_case_insensitively(side: str) -> None:
+    ledger = DailySpendLedger()
+    with pytest.raises(LiveTradingPermissionError):
+        _register(ledger, "exit", "5.00", side=side)
+    assert not ledger.has_open_exposure("exit")
+
+
+@pytest.mark.parametrize("side", ["", "hold", "BUYS", " SELL"])
+def test_register_open_exposure_refuses_unknown_side(side: str) -> None:
+    ledger = DailySpendLedger()
+    with pytest.raises(LiveTradingPermissionError, match="BUY or SELL"):
+        _register(ledger, "k", "5.00", side=side)
+
+
+def test_register_open_exposure_side_must_be_str_and_buy_is_case_insensitive() -> None:
+    ledger = DailySpendLedger()
+    with pytest.raises(LiveTradingPermissionError, match="exactly str"):
+        getattr(ledger, "register_open_exposure")(  # noqa: B009
+            "k",
+            Decimal(1),
+            booking=None,
+            seeded_partial_usd=Decimal(0),
+            side=1,
+            now_ns=D1_MIDDAY,
+        )
+    _register(ledger, "k", "5.00", side="buy")
+    assert ledger.has_open_exposure("k")
+
+
+@settings(max_examples=120, deadline=None)
+@given(
+    orders=st.lists(
+        st.tuples(
+            st.integers(min_value=1, max_value=2_000),  # authorized cost, cents
+            st.integers(min_value=0, max_value=2_000),  # realized cents (clamped)
+            st.booleans(),  # authorized on D1
+            st.sampled_from(["fill", "zero", "abandon"]),
+        ),
+        min_size=1,
+        max_size=7,
+    ),
+    probe_cents=st.integers(min_value=0, max_value=500),
+    data=st.data(),
+)
+def test_exactly_once_with_zero_fill_abandon_midstream_roll_and_conversion(
+    orders: list[tuple[int, int, bool, str]], probe_cents: int, data: st.DataObject
+) -> None:
+    """BUY-only, cent-up both sides. The oracle is a closed form of D2 spend,
+    independent of the ledger: fills stamped D2 count their realized cost; a
+    D2-authorized order that is abandoned leaves its charge; releases and
+    prior-day abandons leave nothing; an unregistered D2 probe stays charged;
+    and once D2 has been seen every pending D1 entry is uncharged exposure.
+    """
+    ordered = sorted(orders, key=lambda o: not o[2])  # D1 authorizations first
+    with _budget(daily="1000000.00", position="1000000.00"):
+        ledger = DailySpendLedger()
+        books: dict[int, SpendBooking] = {}
+        pending: set[int] = set()
+        expected = ZERO
+        d2_seen = False
+        probe_done = probe_cents == 0
+        next_auth = 0
+        while next_auth < len(ordered) or pending or not probe_done:
+            actions: list[str] = []
+            if next_auth < len(ordered):
+                actions.append("auth")
+            if pending:
+                actions.append("resolve")
+            if not probe_done and not any(o[2] for o in ordered[next_auth:]):
+                actions.append("probe")
+            action = data.draw(st.sampled_from(actions))
+            if action == "auth":
+                cost_c, _real, on_d1, _outcome = ordered[next_auth]
+                at = D1_MIDDAY if on_d1 else D2_MIDDAY
+                d2_seen = d2_seen or not on_d1
+                cost = Decimal(cost_c) / 100
+                books[next_auth] = _auth(ledger, str(cost), at)
+                _register(ledger, f"k{next_auth}", str(cost), booking=books[next_auth], now_ns=at)
+                pending.add(next_auth)
+                next_auth += 1
+            elif action == "probe":
+                _auth(ledger, str(Decimal(probe_cents) / 100), D2_MIDDAY)
+                expected += Decimal(probe_cents) / 100
+                d2_seen = True
+                probe_done = True
+            else:
+                index = data.draw(st.sampled_from(sorted(pending)))
+                cost_c, real_c, on_d1, outcome = ordered[index]
+                realized = Decimal(min(real_c, cost_c)) / 100
+                key = f"k{index}"
+                if outcome == "abandon":
+                    assert ledger.abandon_open_exposure(key) is True
+                    if not on_d1:
+                        expected += Decimal(cost_c) / 100
+                else:
+                    # a D2 clock may only appear once every D1 authorization has been made
+                    d1_auth_left = any(o[2] for o in ordered[next_auth:])
+                    fresh = not d1_auth_left and data.draw(st.booleans())
+                    d2_seen = d2_seen or fresh
+                    # a clock that has not seen D2 cannot settle a D2-stamped fill
+                    fill_d2 = (not on_d1) or (d2_seen and data.draw(st.booleans()))
+                    assert _settle(
+                        ledger,
+                        key,
+                        booking=books[index],
+                        realized=str(realized) if outcome == "fill" else None,
+                        fill_ts_ns=D2_MIDDAY if fill_d2 else D1_MIDDAY,
+                        now_ns=D2_MIDDAY if fresh else D1_MIDDAY,
+                    )
+                    if outcome == "fill" and fill_d2:
+                        expected += realized
+                pending.discard(index)
+            for index in pending:
+                assert ledger.has_open_exposure(f"k{index}")  # never dropped before settle
+            if d2_seen:
+                pending_d1 = sum(
+                    (Decimal(ordered[i][0]) / 100 for i in pending if ordered[i][2]), ZERO
+                )
+                assert ledger.uncharged_open_total() == pending_d1
+        assert ledger.spent_today_usd(now_ns=D2_MIDDAY) == expected
+        assert ledger.uncharged_open_total() == ZERO

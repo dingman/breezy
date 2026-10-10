@@ -177,7 +177,15 @@ _COST_BUDGET_BUCKETS: Final = (
 #: Label for any ratio above the last bucket; it orders above every bucket.
 COST_BUDGET_BUCKET_ABOVE_SENTINEL: Final = ">0.50"
 
+#: Every bucket label, lowest to highest, sentinel last. String comparison of
+#: labels is NOT this order; compare with :func:`cost_budget_bucket_rank`.
+COST_BUDGET_BUCKET_ORDER: Final = (
+    *(label for _, label in _COST_BUDGET_BUCKETS),
+    COST_BUDGET_BUCKET_ABOVE_SENTINEL,
+)
+
 _SELL_SIDE: Final = "SELL"
+_BUY_SIDE: Final = "BUY"
 
 #: Process-wide monotonic booking ids so two ledgers cannot collide on the
 #: same ``(cost, day, booking_id)`` triple. Incremented under the issuing
@@ -302,6 +310,8 @@ class _OpenExposure:
     seeded_partial: Decimal
     charged: bool
     ambiguous: bool = False
+    #: A roll converted this entry from charged to uncharged.
+    crossed: bool = False
 
 
 def _require_exact_decimal(value: object, label: str, *, allow_zero: bool = True) -> Decimal:
@@ -315,6 +325,18 @@ def _require_exact_decimal(value: object, label: str, *, allow_zero: bool = True
     if value < Decimal(0) or (value == Decimal(0) and not allow_zero):
         raise LiveTradingPermissionError(f"{label} must not be negative")
     return value
+
+
+def cost_budget_bucket_rank(label: str) -> int:
+    """Position of ``label`` in :data:`COST_BUDGET_BUCKET_ORDER` (sentinel highest).
+
+    Raises:
+        LiveTradingPermissionError: for a label that is not a known bucket.
+    """
+    try:
+        return COST_BUDGET_BUCKET_ORDER.index(label)
+    except ValueError:
+        raise LiveTradingPermissionError("unknown cost/budget bucket label") from None
 
 
 def _require_int_ns(now_ns: object) -> None:
@@ -380,8 +402,13 @@ class DailySpendLedger:
     )
 
     def __init__(self, *, f_adm: Decimal | None = None, f_breaker: Decimal | None = None) -> None:
-        #: Optional Breezy-owned fractions of the daily budget (never operator
-        #: controls). ``None`` = that bound is off.
+        """``f_adm`` / ``f_breaker`` are optional fractions of the daily budget.
+
+        When ``f_adm`` is configured, ``cost > f_adm x budget`` ALONE refuses an
+        order (:class:`OpenExposureBoundExceeded`), even with zero AMBIGUOUS
+        exposure: the bound is per order as well as cumulative. ``None`` = off.
+        Both are Breezy-owned, never operator controls.
+        """
         self._f_adm = None if f_adm is None else self._checked_fraction(f_adm, "f_adm")
         self._f_breaker = (
             None if f_breaker is None else self._checked_fraction(f_breaker, "f_breaker")
@@ -557,7 +584,20 @@ class DailySpendLedger:
         """
         _require_booking_type(booking)
         with self._lock:
+            self._refuse_if_registered_locked(booking)
             self._release_locked(booking, now_ns)
+
+    def _refuse_if_registered_locked(self, booking: SpendBooking) -> None:
+        """All settlement of a registered booking routes through :meth:`settle`.
+
+        A prior-day booking is left to the day rule's own refusal.
+        """
+        if booking.day != self._day:
+            return
+        if any(entry.booking == booking for entry in self._open.values()):
+            raise LiveTradingPermissionError(
+                "booking is held by a registered open exposure; settle it through settle()"
+            )
 
     def _release_locked(self, booking: SpendBooking, eff_now: int) -> None:
         """Release body; caller holds the lock and has type-checked ``booking``."""
@@ -589,6 +629,7 @@ class DailySpendLedger:
         """
         realized = _round_cost_up_to_cent(_checked_filled_cost(booking, filled_cost_usd))
         with self._lock:
+            self._refuse_if_registered_locked(booking)
             return self._true_up_locked(booking, realized, now_ns)
 
     def _true_up_locked(self, booking: SpendBooking, realized: Decimal, eff_now: int) -> Decimal:
@@ -639,6 +680,8 @@ class DailySpendLedger:
         self._day = day
         self._spent_usd = Decimal(0)
         for entry in self._open.values():
+            if entry.charged:
+                entry.crossed = True
             entry.charged = False
 
     def _totals_locked(self, *, rolled: bool) -> tuple[Decimal, Decimal]:
@@ -699,8 +742,13 @@ class DailySpendLedger:
         if type(key) is not str or not key:
             raise LiveTradingPermissionError("exposure key must be a non-empty str")
         _require_int_ns(now_ns)
-        if side == _SELL_SIDE:
+        if type(side) is not str:
+            raise LiveTradingPermissionError(f"side must be exactly str, not {type(side).__name__}")
+        normalised_side = side.upper()
+        if normalised_side == _SELL_SIDE:
             raise LiveTradingPermissionError("exits are never registered as open exposure")
+        if normalised_side != _BUY_SIDE:
+            raise LiveTradingPermissionError("side must be BUY or SELL")
         if notional_usd is not None:
             _require_exact_decimal(notional_usd, "notional_usd")
         partial = _require_exact_decimal(seeded_partial_usd, "seeded_partial_usd")
@@ -712,7 +760,7 @@ class DailySpendLedger:
             eff_now = max(now_ns, self._last_ns, self._registry_last_ns)
             eff_day = utc_day_for_ns(eff_now)
             charged = booking is not None and booking.day == eff_day and self._day == booking.day
-            if charged and booking is not None:
+            if charged and booking is not None:  # narrows ``booking`` for the type checker
                 self._require_open_booking(booking, now_ns=eff_now, action="registered")
             self._open[key] = _OpenExposure(
                 notional=notional_usd, booking=booking, seeded_partial=partial, charged=charged
@@ -781,7 +829,8 @@ class DailySpendLedger:
                 self._settle_live_locked(booking, realized, eff_now)
             else:
                 self._settle_uncharged_locked(entry, realized, fill_day, eff_day)
-                self._cross_day_settles += 1
+                if entry.crossed or (booking is not None and booking.day != eff_day):
+                    self._cross_day_settles += 1
             del self._open[key]
             self._unknown_keys.discard(key)
             self._registry_last_ns = eff_now
@@ -807,10 +856,14 @@ class DailySpendLedger:
 
     @property
     def cross_day_settles_total(self) -> int:
+        """Settles of a real day crossing: the entry was charged on a prior day
+        (a roll converted it) or its booking is from a day other than the
+        effective day. A same-day uncharged settle is not counted."""
         with self._lock:
             return self._cross_day_settles
 
     def has_open_exposure(self, key: str) -> bool:
+        """Whether ``key`` is registered and not yet settled or abandoned."""
         with self._lock:
             return key in self._open
 
@@ -825,8 +878,14 @@ class DailySpendLedger:
             return self._totals_locked(rolled=False)[1]
 
     def unknown_key_count(self) -> int:
+        """Number of registered keys whose notional is unknown (per key)."""
         with self._lock:
             return len(self._unknown_keys)
+
+    def unknown_ambiguous_count(self) -> int:
+        """Number of AMBIGUOUS entries whose notional is unknown."""
+        with self._lock:
+            return sum(1 for e in self._open.values() if e.ambiguous and e.notional is None)
 
     def exposure_admission_refusal(
         self, price_usd: Decimal, quantity: Decimal, now_ns: int
@@ -851,9 +910,15 @@ class DailySpendLedger:
     def _exposure_refusal_locked(self, cost: Decimal, day: date, now_ns: int) -> str | None:
         if now_ns < max(self._last_ns, self._registry_last_ns):
             raise LiveTradingPermissionError("the injected clock moved backwards")
-        if self._unknown_keys:
-            return "open exposure has an unknown notional"
         rolled = self._day != day
+        if self._unknown_keys:
+            try:
+                budget = operator_max_daily_budget_usd()
+            except LiveTradingPermissionError as exc:
+                return str(exc)
+            if (Decimal(0) if rolled else self._spent_usd) + cost > budget:
+                return None  # in-lock DailyBudgetExhausted marks the day stop
+            return "open exposure has an unknown notional"
         uncharged, ambiguous = self._totals_locked(rolled=rolled)
         if uncharged == 0 and ambiguous == 0:
             return None
@@ -869,13 +934,17 @@ class DailySpendLedger:
     def breaker_fraction_exceeded(self, f: Decimal | None = None) -> bool:
         """True iff AMBIGUOUS open exposure exceeds ``f x budget``.
 
-        False, without reading the budget, when no AMBIGUOUS exposure is open
-        or no fraction is configured. ANY raise (unset control, bad ``f``)
-        counts as tripped.
+        True, without reading the budget, when any AMBIGUOUS entry has an
+        unknown notional (its size cannot be bounded). False, without reading
+        the budget, when no AMBIGUOUS exposure is open or no fraction is
+        configured. ANY raise (unset control, bad ``f``) counts as tripped.
         """
         try:
             with self._lock:
                 ambiguous = self._totals_locked(rolled=False)[1]
+                unknown_sized = any(e.ambiguous and e.notional is None for e in self._open.values())
+            if unknown_sized:
+                return True
             fraction = self._f_breaker if f is None else f
             if ambiguous == 0 or fraction is None:
                 return False
