@@ -95,7 +95,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 | ID | Open work (exact) |
 |---|---|
 | AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
-| AUD-10b | Blocked on ING-3 |
+| AUD-10b | ING-3 block cleared 10-10; parked P2 by ROI (no family trades, nothing to promote) |
 | F13 freeze prep | backfills DONE; draft build clean 10-09 (observed ⊆ proposed after nbp gap fix c34f1417; ArchiveCache fix bb1ea022, 182 s); left: peer review of list → freeze ≥10-21 |
 
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
