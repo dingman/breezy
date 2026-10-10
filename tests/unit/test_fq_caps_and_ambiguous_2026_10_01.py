@@ -486,7 +486,12 @@ async def test_a_ledger_true_up_raise_keeps_the_ambiguous_refusal(
         def _raise(*_args: Any, **_kwargs: Any) -> None:
             raise RuntimeError("simulated true-up failure")
 
+        # EXEC-PAR WP4: the resolver's ledger call is now ``settle`` (r5 §5 WP4
+        # allowlist: ``true_up_booking`` replaced by ``settle``; §3.5 settle before
+        # ``_retire``; r5.1 E9: on a settle raise the AMBIGUOUS clear is skipped).
+        # Both seams raise, so the legacy one stays covered if it is reintroduced.
         monkeypatch.setattr(type(client._ledger), "true_up_booking", _raise)
+        monkeypatch.setattr(type(client._ledger), "settle", _raise)
         await _run_exactly_one_pass(client)
 
         assert _AMBIGUOUS_REASON in client.trading_refusals
@@ -521,8 +526,16 @@ async def test_a_corrupt_latch_read_after_retire_keeps_the_ambiguous_refusal(
                 raise SubmitIntentCorrupt()
             return real_current_open()
 
+        def _open_slot_count() -> int:
+            if retired["done"]:
+                raise SubmitIntentCorrupt()
+            return 1
+
         monkeypatch.setattr(client, "_retire", _retire_then_poison)
         monkeypatch.setattr(client._latch, "current_open", _current_open)
+        # EXEC-PAR WP4: r5 §3.4 H8 makes ``open_slot_count`` the post-retire check
+        # that gates the AMBIGUOUS clear; poison it the same way as ``current_open``.
+        monkeypatch.setattr(client._latch, "open_slot_count", _open_slot_count)
         await _run_exactly_one_pass(client)
 
         assert retired["done"] is True
