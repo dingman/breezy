@@ -2322,6 +2322,14 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # operator control.
         "src/breezy/runtime/supervisor_decode_marker.py",
         "scripts/ops/ambig_latch_phase_a_check.py",
+        # WIDENED (EXEC-PAR WP6, 2026-10-10), not relaxed (L-6/L-12): the comparison
+        # is still `==`; old -> new added exactly this one path. `continuous_strategy`
+        # imports `SubmitIntent` ONLY as the return annotation of `_open_intent_for_wait`;
+        # the value it returns comes from its injected `TrialDayLatch` (the existing
+        # composition-root latch). It opens no latch, takes no flock, opens no store and
+        # touches no operator control (its `operator_controls` import is the pre-existing
+        # `utc_day_for_ns` date helper).
+        "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",
