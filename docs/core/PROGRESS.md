@@ -64,7 +64,7 @@ Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
 | F6 bridge | permanent veto: RULING_FQ-v2-NO-TRADE_2026-10-08 (FQ-R8-2 G-B); F6b CANCELLED |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
 | F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
-| F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07; readiness build SHELVED 10-09 (serial latch d̂_p90 0.49–0.74). EXEC-PAR (parallel slot intents) plan r1 NOT-READY ×3 → r2 in progress |
+| F7b / M1-v3 | M1-v3 frozen, read >= 12-07; serial latch unviable (d̂_p90 0.49). EXEC-PAR plan r5+r5.1 READY; WP-DR/WP1/WP0(PASS @0.05,K=6)/WP3/WP2/WP5a merged 9a3dc6a9; sup restart 01:05Z 10-11; WP4 building, WP6 ready; then WP5b/WP7/D-PREREG (freeze <12-07) |
 Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 live stages); owes HALT_INERT test (R8-2f).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
