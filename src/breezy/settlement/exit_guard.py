@@ -160,6 +160,21 @@ class SettlementCloseRefused(Exception):
     """
 
 
+def _scope_blocks(scope: str, instrument_id: str) -> bool:
+    """Whether a refusal scoped to the base slug `scope` blocks `instrument_id`.
+
+    A scope is a BASE SLUG (what the exec client scopes refusals on). It blocks an
+    instrument id that equals it, or that continues it at a separator: ``slug.VENUE``
+    (YES leg) or ``slug^no.VENUE`` (NO leg). A bare prefix does not (``X-T7`` must not
+    block ``X-T75.VENUE``). Fail closed: an empty scope (unscoped) blocks everything,
+    and a scope that is not a base slug (it contains ``.`` or ``^``, e.g. a full YES
+    instrument id) blocks everything rather than silently permitting the other leg.
+    """
+    if not scope or "." in scope or "^" in scope:
+        return True
+    return instrument_id == scope or instrument_id.startswith((f"{scope}.", f"{scope}^"))
+
+
 def _blocking_refusals(
     trading_refusals: Sequence[str],
     instrument_id: str,
@@ -170,7 +185,7 @@ def _blocking_refusals(
         return False
     if refusal_scopes is None or len(refusal_scopes) != len(trading_refusals):
         return True
-    return any(not scope or instrument_id.startswith(scope) for scope in refusal_scopes)
+    return any(_scope_blocks(scope, instrument_id) for scope in refusal_scopes)
 
 
 def assert_settlement_close_permitted(
@@ -201,9 +216,10 @@ def assert_settlement_close_permitted(
 
     `refusal_scopes` (EXEC-PAR, K > 1) is parallel to `trading_refusals`: the
     instrument/slug each refusal is scoped to, `""` meaning unscoped. When
-    given, a refusal scoped to ANOTHER slug no longer blocks this close; an
-    unscoped one, one whose scope prefixes `instrument_id`, or a length
-    mismatch with `trading_refusals` still refuses (fail closed). `None`
+    given, a refusal scoped to ANOTHER base slug no longer blocks this close;
+    an unscoped one, one whose base-slug scope matches `instrument_id` at a
+    `.`/`^` boundary, a non-slug scope, or a length mismatch with
+    `trading_refusals` still refuses (fail closed). `None`
     (the default) is the unscoped behaviour above.
     """
     if _blocking_refusals(trading_refusals, instrument_id, refusal_scopes):
