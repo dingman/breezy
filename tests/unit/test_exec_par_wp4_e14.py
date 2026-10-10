@@ -482,3 +482,43 @@ async def test_stuck_refusal_counter_ignores_another_slots_refusal(
             assert not rig.latch.is_open_intent(by_slug[rig.slug(0)]), "A retired"
             assert rig.client.stuck_refusals_after_settle_failure_total == 0
             assert rig.client.log_lines("ERROR", "stuck") == []
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_slot_table_read_after_retire_keeps_the_ambiguous_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The WP4 seam for the fail-closed property that
+    ``test_fq_caps_and_ambiguous_2026_10_01`` pins on the retired ``current_open``
+    seam: the post-retire check is ``open_slot_count`` (r5 3.4 H8), and a raise
+    there keeps the refusal and is counted."""
+    from breezy.runtime.submit_intent import SubmitIntentCorrupt
+
+    with caps():
+        async with par_rig(
+            tmp_path, monkeypatch, sender=ScriptedSender(ok(ambiguous_body("ord-z")))
+        ) as rig:
+            await rig.client._submit_order(rig.buy())
+            (intent_id,) = rig.open_intent_ids()
+            backdate(rig.client, intent_id)
+            _terminal_zero(rig, "ord-z", 0)
+            wire_positions(rig, {})
+            real_retire = rig.client._retire
+            state = {"retired": False}
+
+            def retire_then_poison(*args: Any, **kwargs: Any) -> None:
+                real_retire(*args, **kwargs)
+                state["retired"] = True
+
+            def poisoned_count() -> int:
+                raise SubmitIntentCorrupt()
+
+            monkeypatch.setattr(rig.client, "_retire", retire_then_poison)
+            monkeypatch.setattr(rig.latch, "open_slot_count", poisoned_count)
+            await run_one_pass(rig.client)
+
+            assert state["retired"] is True
+            assert AMBIGUOUS in rig.client.trading_refusals
+            assert rig.client.resolver_error_count == 1
