@@ -100,9 +100,17 @@ CRASH_POINTS = (
     "post_before_send",
     "post_after_send",
     "after_reply_before_classify",
+    "after_classify_before_retire",
 )
 #: The points after which the wire bytes had left the process.
-_BYTES_LEFT = frozenset({"post_after_send", "after_reply_before_classify"})
+_BYTES_LEFT = frozenset(
+    {"post_after_send", "after_reply_before_classify", "after_classify_before_retire"}
+)
+
+
+#: Crash points whose death precedes the durable resolver context (the context is
+#: written right after the registry entry); a restart then holds a context-less slot.
+_NO_CONTEXT = frozenset({"after_arm_slot", "register_open_exposure", "note_ambiguous_open"})
 
 
 def _install_crash(rig: ParRig, point: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -127,6 +135,8 @@ def _install_crash(rig: ParRig, point: str, monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch.setattr(rig.client, "_note_ambiguous_open", note_then_die)
     elif point == "sign_headers":
         monkeypatch.setattr(rig.client._write_signer, "sign_headers", _boom)
+    elif point == "after_classify_before_retire":
+        monkeypatch.setattr(rig.client, "_retire", _boom)
     elif point == "after_reply_before_classify":
         real_classify = submit_chain.classify_create_order_outcome
         armed = {"live": True}
@@ -172,14 +182,36 @@ async def test_crash_at_every_line_arm_slot_to_post_no_double_order(
         second = await reboot(first, monkeypatch, sender=sender, max_slots=2)
         try:
             assert second.latch.open_slot_count() == 1, "the restart inherits the open slot"
+            (inherited,) = second.latch.open_submit_intents()
+            slug, other = second.slug(0), second.slug(1)
             # The strategy re-hunts the same market after the restart.
             await second.client._submit_order(second.buy(second.instrument))
 
-            assert len(second.denied_reasons()) == 1, "the retry on the open slug is denied"
+            assert second.denied_reasons() == [WAIT], "the retry on the open slug is a WAIT"
+            assert second.latch.admission_refusal(slug, False) == "slug_open"
             assert len(sender.calls) == posted_before_death, "no second POST for the slot"
-            assert len(sender.calls) <= 1
-            bodies = [call["body"] for call in sender.calls]
-            assert len(set(bodies)) == len(bodies), "never the same wire body twice"
+
+            # Another market is not blocked by the inherited slot, unless the slot has no
+            # durable context yet (an unknown-exposure slot denies every entry).
+            context_written = point not in _NO_CONTEXT
+            await second.client._submit_order(second.buy(second.instruments[1]))
+            if context_written:
+                assert len(sender.calls) == posted_before_death + 1, "a different slug is admitted"
+                sent = json.loads(sender.calls[-1]["body"])
+                assert sent["marketSlug"] == other
+                if posted_before_death:
+                    assert sender.calls[-1]["body"] != sender.calls[0]["body"]
+                assert second.latch.open_slot_count() == 1, "that order retired; the slot stays"
+            else:
+                assert len(sender.calls) == posted_before_death, "unknown exposure denies entries"
+            posted_now = len(sender.calls)
+
+            # The resolver works the inherited slot; it never re-POSTs it.
+            wire_positions(second, {})
+            if context_written:
+                backdate(second.client, inherited.intent_id)
+            await run_passes(second.client, count=6)
+            assert len(sender.calls) == posted_now, "the inherited slot is never re-POSTed"
         finally:
             await second.close()
 

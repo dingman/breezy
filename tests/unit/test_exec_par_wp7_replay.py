@@ -15,12 +15,17 @@ dict-order dependency) is what this test exists to catch.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import json
+import os
 import sqlite3
+import sys
 import types
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -125,6 +130,68 @@ async def _session(directory: Path, monkeypatch: pytest.MonkeyPatch) -> Replay:
     path = rig.store_path
     await rig.close()
     return replace(result, store_rows=_store_rows(path))
+
+
+DUMP_ENV = "WP7_REPLAY_DUMP"
+SUBPROCESS_HASH_SEED = "4242"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _as_json(replay: Replay) -> dict[str, Any]:
+    return {
+        "store_rows": [[key, value.hex()] for key, value in replay.store_rows],
+        "posted_bodies": [body.hex() for body in replay.posted_bodies],
+        "posted_headers": [[list(pair) for pair in headers] for headers in replay.posted_headers],
+        "event_names": list(replay.event_names),
+        "denied": list(replay.denied),
+        "spent": replay.spent,
+    }
+
+
+@pytest.mark.skipif(DUMP_ENV not in os.environ, reason="driven by the child-process replay test")
+@pytest.mark.asyncio
+async def test_replay_session_dump_for_child_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Child half of the hash-seed replay: run one session, dump its artefacts."""
+    with caps():
+        result = await _session(tmp_path / "child", monkeypatch)
+    Path(os.environ[DUMP_ENV]).write_text(json.dumps(_as_json(result)), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_replay_is_independent_of_the_hash_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Set/dict ordering must not leak into persisted state or wire bytes: the
+    same session in a CHILD pytest with a different ``PYTHONHASHSEED`` reproduces
+    this process's artefacts exactly."""
+    assert os.environ.get("PYTHONHASHSEED") != SUBPROCESS_HASH_SEED
+    with caps():
+        local = await _session(tmp_path / "parent", monkeypatch)
+    dump = tmp_path / "child.json"
+    child_env = {**os.environ, "PYTHONHASHSEED": SUBPROCESS_HASH_SEED, DUMP_ENV: str(dump)}
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        f"--basetemp={tmp_path / 'child_bt'}",
+        f"{Path(__file__)}::test_replay_session_dump_for_child_process",
+        env=child_env,
+        cwd=REPO_ROOT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(child.communicate(), timeout=240)
+    assert child.returncode == 0, output.decode(errors="replace")[-3000:]
+    assert json.loads(dump.read_text(encoding="utf-8")) == _as_json(local)
 
 
 @pytest.mark.asyncio
