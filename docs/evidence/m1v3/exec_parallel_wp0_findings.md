@@ -1,5 +1,46 @@
 # EXEC-PAR WP0 recorded verifications (2026-10-10)
 
+## Headline (read this first)
+
+**The build-gate PASS rests on the 0.05 bucket at K=6.**
+Stress arm: p_amb 0.33, one stuck slot, throttle, f_adm 0.50, worse free-balance arm. Statistic: day-level p90, CI upper bound.
+
+| Universe | 0.05 bucket, K=6, p90 CI upper | Bar |
+|---|---|---|
+| main4 (LAX, MDW, MIA, SFO) | 0.2755 | <= 0.30 |
+| main4+nyc (production-relevant) | 0.2905 | <= 0.30 |
+
+- **The no-id variant also passes at 0.05.** On main4 it passes at K=6. On main4+nyc it needs K=7 (K=6 does not pass).
+- **The 0.10 pass is fragile and must NOT be frozen.**
+  - It holds only on main4, at K=7 (upper 0.289; 0.313 at K=6).
+  - It is driven by the free-balance arm B.
+  - It fails on main4+nyc (upper 0.420 at K=6) and under the no-id arm on main4.
+  - It passes on main4+nyc only when the free balance is unbounded or 3 budgets (K=7), which are sensitivities and not the primary arm.
+- **D-PREREG freezes the 0.05 label.**
+- The 0.25 and 0.50 buckets never pass in either universe.
+
+### Universe choice
+- **main4+nyc is the production-relevant universe**, because Polymarket.us lists 5 cities.
+- main4 is the universe that reproduces the plan's baseline (K=1, p_amb=0, p90 0.4909 vs the plan's 0.491). main4+nyc gives 0.5364 there.
+- Summary of `exec_parallel_dhat_results_main4_nyc.json`:
+  - 389 candidates over 33 days with candidates.
+  - Smallest passing K per bucket: <=0.02 -> 6, 0.05 -> 6, 0.10 -> none, 0.25 -> none, 0.50 -> none.
+  - The no-id variant passes <=0.02 and 0.05 at K=7.
+  - The free-balance sensitivities (unbounded; 3 budgets) pass 0.10 at K=7.
+  - Verdict: PASS, on the 0.05 bucket.
+
+### What the 0.05 pass does and does not test
+- At the 0.05 bucket, f_adm and the free balance do not bind. Neither the ambiguous bound nor `free_balance` drops appear in its drop mix.
+- The pass therefore tests only K against the hold times: `admit:k_full` plus the throttle.
+- **The activation re-run must re-test the stop rule at the real bucket** (cost = cap, E6).
+
+### Caveats that favour or weaken the PASS
+- p_amb is drawn **independently per order**. Real ambiguity is likely clustered in time (a venue incident hits several orders at once). This assumption favours PASS.
+- The hold mixture (5 s with p=0.2, otherwise 150 s) is **assumed, not measured**. Only the bounds are tied to the exec client constants.
+- The 120 s same-slug cool-off is **not tied to a production constant**. It is moot here: every slug has one candidate per day.
+- Candidates are taken from the **first 12:00-13:00Z row only** per rung (take-all, first row). Later re-pricing and re-entries are not simulated.
+- The earlier caveats still apply: the hold inputs contain no NO >= 0.90 order, every AMBIGUOUS order was YES, and n_amb = 7.
+
 Tree: ff of `feat/data-capture-and-risk` (b86ebf37) plus WP1 `breezy.domain.exec_slots.admit` (12d7ae78).
 Line numbers are in this tree and may differ from the plan's earlier citations.
 Data rule: every simulation input is dated before 2026-10-07 and the tool refuses anything else.
