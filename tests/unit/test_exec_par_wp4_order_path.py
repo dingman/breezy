@@ -275,7 +275,7 @@ async def test_breaker_record_store_raise_or_garbled_denies_entries_not_raises(
                     raise OSError("store went away")
                 return real_get(key)  # type: ignore[no-any-return]
 
-            rig.latch._store.get = raising_get  # type: ignore[method-assign]
+            rig.latch._store.get = raising_get
             await rig.client._submit_order(rig.buy(rig.instrument))
             assert rig.denied_reasons() == [WAIT, WAIT]
             assert sender.calls == []

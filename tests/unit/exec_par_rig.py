@@ -614,7 +614,7 @@ class SpyLedger(DailySpendLedger):
         self.settle_raises = 0
         self.client: Any = None
 
-    def settle(  # type: ignore[override]
+    def settle(
         self,
         key: str,
         *,
@@ -828,4 +828,5 @@ def durable_record(
 
 def decimal_spent(rig: ParRig) -> Decimal:
     """Today's recorded spend in the rig's ledger (a read; never mutates)."""
-    return rig.ledger.spent_today_usd(now_ns=rig.clock.timestamp_ns())
+    spent: Decimal = rig.ledger.spent_today_usd(now_ns=rig.clock.timestamp_ns())
+    return spent

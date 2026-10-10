@@ -5469,3 +5469,22 @@ async def test_accept_fill_after_midnight_sell_does_not_latch_fill_unbudgeted(
         assert after.state is SubmitIntentState.RETIRED
         assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
         await rig.client._disconnect()
+
+
+#: EXEC-PAR WP4: names other test modules (``exec_par_rig``) reach through this
+#: module on purpose -- barrier X1 pins which test modules import the exec
+#: package, so the rig must not import it directly. Listing them here makes the
+#: re-export explicit for mypy; nothing else about this module changes.
+__all__ = [
+    "ACCOUNT_BALANCES_PATH",
+    "OPEN_ORDERS_PATH",
+    "PORTFOLIO_ACTIVITIES_PATH",
+    "PORTFOLIO_POSITIONS_PATH",
+    "AmbiguousResolverContext",
+    "DurableFillRecord",
+    "PolymarketUSExecutionClient",
+    "client_module",
+    "credentials",
+    "enable_operator_gate",
+    "submit_chain",
+]

@@ -252,4 +252,5 @@ async def run_k1_scenarios(tmp_path: Path, mp: pytest.MonkeyPatch) -> dict[str, 
     with caps(), _deterministic_ids():
         for name, scenario in SCENARIOS.items():
             results[name] = await scenario(tmp_path / name, mp)
-    return json.loads(json.dumps(results, sort_keys=True, default=str))
+    normalised: dict[str, Any] = json.loads(json.dumps(results, sort_keys=True, default=str))
+    return normalised
