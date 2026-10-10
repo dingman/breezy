@@ -25,6 +25,7 @@ tests read that file. Empty capture is an error, not a vacuous ``any([])``.
 from __future__ import annotations
 
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -119,3 +120,37 @@ def capture_nautilus_logs() -> Callable[[], list[str]]:
         return lines
 
     return _read
+
+
+#: Upper bound on how long Nautilus's asynchronous Rust logger may take to
+#: deliver a line to the capture file under CPU load.
+LOG_DELIVERY_TIMEOUT_S = 2.0
+_LOG_POLL_INTERVAL_S = 0.02
+
+
+def wait_for_logged(
+    read: Callable[[], list[str]],
+    *needles: str,
+    timeout_s: float = LOG_DELIVERY_TIMEOUT_S,
+) -> str:
+    """Poll ``read`` until every needle appears; return the text read so far.
+
+    The Rust logger writes on its own thread, so a line emitted just before the
+    call may land after a single read. The wait is bounded and polls the
+    *delivery* of the same line; it never relaxes what is asserted -- callers
+    still assert each needle on the returned text. A reader that has nothing
+    yet raises (see :func:`capture_nautilus_logs`); that is treated as "not
+    delivered yet" until the deadline, when the last error is re-raised.
+    """
+    deadline = time.monotonic() + timeout_s
+    text = ""
+    while True:
+        try:
+            text = "\n".join(read())
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+        else:
+            if all(needle in text for needle in needles) or time.monotonic() >= deadline:
+                return text
+        time.sleep(_LOG_POLL_INTERVAL_S)

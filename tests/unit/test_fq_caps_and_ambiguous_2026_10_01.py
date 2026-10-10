@@ -35,6 +35,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from tests.support.nautilus_log_capture import capture_nautilus_logs, wait_for_logged
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.test_polymarket_us_exec_client import (
     TRADER_ID,
@@ -443,7 +444,6 @@ async def test_a_permit_restore_raise_keeps_the_ambiguous_refusal_and_logs_the_e
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     from breezy.adapters.polymarket_us import safety
     from breezy.adapters.polymarket_us.exec import client as client_module
@@ -459,12 +459,13 @@ async def test_a_permit_restore_raise_keeps_the_ambiguous_refusal_and_logs_the_e
             raise safety.LiveTradingPermissionError("simulated restore failure")
 
         monkeypatch.setattr(client_module, "restore_live_trading_budget", _raise)
+        read_logs = capture_nautilus_logs()
         await _run_exactly_one_pass(client)
 
         assert _AMBIGUOUS_REASON in client.trading_refusals
         assert client.resolver_error_count == 1
-        captured = capfd.readouterr()
-        assert "LiveTradingPermissionError" in captured.out + captured.err
+        logged = wait_for_logged(read_logs, "LiveTradingPermissionError")
+        assert "LiveTradingPermissionError" in logged
         await client._disconnect()
 
 

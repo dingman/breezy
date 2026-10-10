@@ -12,7 +12,6 @@ import ast
 import importlib.util
 import itertools
 import sys
-import time
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -55,6 +54,7 @@ from breezy.strategy.current_rung_hold.monitor_store import (
 )
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
 from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
+from tests.support.nautilus_log_capture import capture_nautilus_logs, wait_for_logged
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     _cont_latch_factory,
@@ -276,29 +276,27 @@ def test_on_start_refuses_a_non_testclock(
     store_path: Path,
     interior_instrument: BinaryOption,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """NB-2: asserts BOTH the raise AND the `log.error` call -- one line
     strictly more visible than the v2 precedent, defence in depth.
     `Strategy.log` is a Nautilus Cython `Logger` (an immutable extension
     type -- `strategy.log.error = ...` raises `AttributeError: ... is
     read-only`), so the ERROR line is observed at the OS file-descriptor
-    level (`capfd`), the same layer Nautilus's own logger writes to."""
+    level, read back from the Nautilus log file capture."""
     strategy = _register_backtest(
         store_path=store_path,
         instruments=(interior_instrument,),
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     monkeypatch.setattr(continuous_backtest_only_module, "TestClock", str)
-    capfd.readouterr()  # drain anything buffered from registration
+    read_logs = capture_nautilus_logs()
     with pytest.raises(ContinuousNotABacktestClockError):
         strategy.on_start()
     # Nautilus's Rust-backed logger writes on its own background thread --
-    # a short, bounded wait for the flush, never a retry loop on content.
-    time.sleep(0.1)
-    captured = capfd.readouterr()
-    assert "ERROR" in captured.err
-    assert _TARGET_NAME in captured.err
+    # bounded wait for delivery of the same lines, assertions unchanged.
+    logged = wait_for_logged(read_logs, "ERROR", _TARGET_NAME)
+    assert "ERROR" in logged
+    assert _TARGET_NAME in logged
 
 
 def test_on_start_succeeds_against_a_real_testclock_with_flat_startup_evidence(
