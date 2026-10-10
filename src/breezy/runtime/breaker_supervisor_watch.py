@@ -30,6 +30,7 @@ from breezy.runtime.submit_intent_slots import (
 __all__ = [
     "ABSENT_RECORD_GRACE_NS",
     "BOOT_GRACE_NS",
+    "REALERT_INTERVAL_NS",
     "BreakerAlertDetail",
     "BreakerAlertSpec",
     "BreakerProbe",
@@ -44,6 +45,10 @@ ABSENT_RECORD_GRACE_NS: Final[int] = 120 * 1_000_000_000
 #: A freshly seen node pid gets this long to write its first heartbeat before a
 #: stale stamp counts (the record may be the previous node's).
 BOOT_GRACE_NS: Final[int] = 600 * 1_000_000_000
+
+#: A delivered page whose condition still holds is repeated this often, so a
+#: delivered-then-lost page cannot leave the condition silent.
+REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
 
 _CRITICAL: Final[str] = "CRITICAL"
 
@@ -106,12 +111,13 @@ class BreakerWatchState:
     on the next tick instead of being silently considered sent.
     """
 
-    active: set[str] = field(default_factory=set)
+    #: condition key -> when its alert was last CONFIRMED delivered.
+    active: dict[str, int] = field(default_factory=dict)
     node_pid: int | None = None
     node_first_seen_ns: int | None = None
 
-    def delivered(self, spec: BreakerAlertSpec) -> None:
-        self.active.add(spec.key)
+    def delivered(self, spec: BreakerAlertSpec, now_ns: int) -> None:
+        self.active[spec.key] = now_ns
 
 
 _DEAD = BreakerAlertSpec(
@@ -187,12 +193,18 @@ def decide_breaker_alerts(
     state: BreakerWatchState,
     node_pid: int | None = None,
 ) -> list[BreakerAlertSpec]:
-    """The alerts due this tick: conditions true now and not yet CONFIRMED delivered.
+    """The alerts due this tick: conditions true now that are not yet CONFIRMED
+    delivered, or were last delivered at least ``REALERT_INTERVAL_NS`` ago.
 
     ``state.active`` is pruned to the conditions still true (an ended episode can
     alert again) but never gains a key here: the caller marks each alert with
-    ``state.delivered(spec)`` only after the durable send succeeded. A node with
-    no pid (a test double) anchors its boot grace on the first live sighting.
+    ``state.delivered(spec, now_ns)`` only after the durable send succeeded. A
+    node with no pid (a test double) anchors its boot grace on the first live
+    sighting.
+
+    The supervisor returns before probing at a configured K<=1 (a K=1 node writes
+    no breaker record), so the halted and unreadable-slot alerts are unreachable
+    there BY DESIGN; ``k_configured`` is still honoured here for direct callers.
     """
     conditions: dict[str, BreakerAlertSpec] = {}
     if probe.unreadable_slots > 0:
@@ -202,5 +214,9 @@ def decide_breaker_alerts(
     first_seen = _note_node(state, node_pid if node_pid is not None else 0, node_live, now_ns)
     if k_configured > 1 and node_live:
         conditions.update(_watcher_conditions(probe, now_ns, first_seen))
-    state.active &= set(conditions)
-    return [spec for key, spec in conditions.items() if key not in state.active]
+    state.active = {k: t for k, t in state.active.items() if k in conditions}
+    return [
+        spec
+        for key, spec in conditions.items()
+        if key not in state.active or now_ns - state.active[key] >= REALERT_INTERVAL_NS
+    ]

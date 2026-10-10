@@ -556,7 +556,7 @@ def _read_only_values(store_path: Path, keys: tuple[str, ...]) -> dict[str, byte
     # (no `urllib`: the alert-egress import pin forbids it in this module).
     escaped = str(store_path).replace("%", "%25").replace("?", "%3f").replace("#", "%23")
     uri = f"file:{escaped}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         found: dict[str, bytes | None] = {}
         for key in keys:
@@ -576,6 +576,9 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
     raise); a corrupt slot table counts no unreadable slot here, because the
     existing intent probes already surface that case.
     """
+    if not store_path.exists():
+        # No store yet (a node that has not created it): "absent", not a fault.
+        return BreakerProbe.absent()
     try:
         values = _read_only_values(store_path, (BREAKER_KEY, CURRENT_INTENT_KEY))
     except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
@@ -3169,8 +3172,15 @@ def _do_breaker_watch(
         payload = AlertPayload(
             severity=spec.severity, event=spec.event, site="trade_node", detail=spec.detail.value
         )
-        if ports.send_alert_durable(ports.alert_sink, payload):
-            watch.delivered(spec)
+        try:
+            durable = ports.send_alert_durable(ports.alert_sink, payload)
+        except Exception as exc:  # noqa: BLE001 -- one failing send must not starve the others
+            log_decision(
+                "breaker_watch_alert_send_raised", alert=spec.event, error_type=type(exc).__name__
+            )
+            continue
+        if durable:
+            watch.delivered(spec, int(now.timestamp() * 1e9))
         else:
             log_decision("breaker_watch_alert_not_durable", alert=spec.event)
 

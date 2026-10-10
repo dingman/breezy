@@ -54,6 +54,7 @@ from breezy.runtime.health import AlertPayload, AlertSink
 from breezy.runtime.submit_intent_slots import BREAKER_HEARTBEAT_MAX_AGE_NS
 
 __all__ = [
+    "COUNTER_RESEND_MIN_NS",
     "DIGEST_EVERY_TICKS",
     "NO_CLIENT_ERROR_TICKS",
     "REALERT_INTERVAL_NS",
@@ -86,6 +87,10 @@ DIGEST_EVERY_TICKS: Final[int] = 12
 #: A condition that keeps holding is re-alerted this often (fire-and-forget
 #: sinks can lose a send; this bounds the silence).
 REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
+
+#: A monotonic counter that keeps rising re-alerts at most this often (the first
+#: >0 value always sends at once); the hourly re-alert above is unconditional.
+COUNTER_RESEND_MIN_NS: Final[int] = 300 * 1_000_000_000
 
 #: Consecutive ticks with no registered exec client before it is an ERROR.
 NO_CLIENT_ERROR_TICKS: Final[int] = 5
@@ -166,7 +171,7 @@ class ExecRefusalAlertActor(Actor):
         #: condition key -> (value alerted, when). Set only after the send
         #: succeeded; pruned when the condition ends.
         self._alerted: dict[str, tuple[object, int]] = {}
-        self._conditions: dict[str, tuple[object, str, str, str]] = {}
+        self._conditions: dict[str, tuple[object, str, str, str, bool]] = {}
         self._no_client_streak = 0
         self._no_client_logged_ns: int | None = None
 
@@ -368,13 +373,18 @@ class ExecRefusalAlertActor(Actor):
         )
         for event, label, value in counters:
             if value > 0:
-                self._condition(event, value, event, f"{label}={value}")
+                self._condition(event, value, event, f"{label}={value}", rate_limited=True)
 
-    def _condition(self, key: str, value: object, event: str, detail: str) -> None:
-        self._conditions[key] = (value, "CRITICAL", event, detail)
+    def _condition(
+        self, key: str, value: object, event: str, detail: str, *, rate_limited: bool = False
+    ) -> None:
+        self._conditions[key] = (value, "CRITICAL", event, detail, rate_limited)
 
     def _deliver_conditions(self, now_ns: int) -> None:
         """Alert each live condition that is new, changed, or due its hourly re-alert.
+
+        A rising counter (``rate_limited``) re-sends on a change only after
+        ``COUNTER_RESEND_MIN_NS`` since its last successful send.
 
         A condition is recorded as alerted ONLY after the sink accepted the send;
         a raising sink is retried on the next tick. A key whose condition ended
@@ -382,14 +392,14 @@ class ExecRefusalAlertActor(Actor):
         """
         for key in [k for k in self._alerted if k not in self._conditions]:
             del self._alerted[key]
-        for key, (value, severity, event, detail) in self._conditions.items():
+        for key, (value, severity, event, detail, rate_limited) in self._conditions.items():
             previous = self._alerted.get(key)
-            if (
-                previous is not None
-                and previous[0] == value
-                and now_ns - previous[1] < REALERT_INTERVAL_NS
-            ):
-                continue
+            if previous is not None:
+                age = now_ns - previous[1]
+                changed = previous[0] != value
+                min_gap = COUNTER_RESEND_MIN_NS if rate_limited else 0
+                if age < REALERT_INTERVAL_NS and not (changed and age >= min_gap):
+                    continue
             if self._send(severity, event, detail):
                 self._alerted[key] = (value, now_ns)
 

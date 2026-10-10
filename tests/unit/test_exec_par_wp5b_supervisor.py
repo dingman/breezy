@@ -23,6 +23,7 @@ from breezy.runtime import trade_supervisor as ts
 from breezy.runtime.breaker_supervisor_watch import (
     ABSENT_RECORD_GRACE_NS,
     BOOT_GRACE_NS,
+    REALERT_INTERVAL_NS,
     BreakerAlertDetail,
     BreakerProbe,
     BreakerWatchState,
@@ -102,7 +103,7 @@ def _decide(
 
 def _deliver(state: BreakerWatchState, specs: list[Any]) -> None:
     for spec in specs:
-        state.delivered(spec)
+        state.delivered(spec, NOW)
 
 
 def _run(ports: SupervisorPorts, watch: BreakerWatchState, tracked_pid: int | None = 42) -> None:
@@ -173,7 +174,8 @@ def test_probe_opens_the_store_read_only_and_never_creates_one(
     assert probe_breaker_record(path).present
     assert len(uris) == 1 and uris[0].startswith("file:") and uris[0].endswith("?mode=ro")
     missing = tmp_path / "absent.sqlite3"
-    assert not probe_breaker_record(missing).readable
+    absent = probe_breaker_record(missing)
+    assert absent.readable and not absent.present, "a store not created yet is absent, not a fault"
     assert not missing.exists()
 
 
@@ -307,9 +309,9 @@ def test_dispatch_marks_delivered_only_after_the_durable_send_confirms() -> None
     )
     watch = _seasoned()
     _run(ports, watch)  # outbox refused: not delivered
-    assert watch.active == set()
+    assert watch.active == {}
     _run(ports, watch)  # retried, confirmed
-    assert watch.active == {"heartbeat_stale"}
+    assert set(watch.active) == {"heartbeat_stale"}
     _run(ports, watch)  # now deduped: no third send
     assert len(sent) == 2
 
@@ -454,3 +456,85 @@ def test_probe_reads_a_store_whose_path_has_uri_metacharacters(tmp_path: Path) -
             BREAKER_KEY, encode_breaker(BreakerRecord(None, None, hb_ns=3, resolver_pass_ns=4))
         )
     assert probe_breaker_record(path).hb_ns == 3
+
+
+def test_a_missing_store_at_k_gt_1_does_not_page_as_unreadable(tmp_path: Path) -> None:
+    sink = _Sink()
+    ports = _ports(sink, probe_breaker_record=probe_breaker_record, configured_exec_par_k=_k(2))
+    ts._dispatch_breaker_watch(
+        ports=ports,
+        watch=BreakerWatchState(),
+        now=_now(),
+        tracked_pid=42,
+        store_path=tmp_path / "not-yet.sqlite3",
+    )
+    assert sink.payloads == []
+
+
+def test_corruption_still_pages_immediately(tmp_path: Path) -> None:
+    path = tmp_path / "store.sqlite3"
+    with SqliteStateStore(path) as store:
+        store.set(BREAKER_KEY, b"garbage")
+    sink = _Sink()
+    ports = _ports(sink, probe_breaker_record=probe_breaker_record, configured_exec_par_k=_k(2))
+    ts._dispatch_breaker_watch(
+        ports=ports, watch=BreakerWatchState(), now=_now(), tracked_pid=42, store_path=path
+    )
+    assert [p.detail for p in sink.payloads] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD.value]
+
+
+def test_the_probe_connection_timeout_is_one_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "store.sqlite3"
+    with SqliteStateStore(path) as store:
+        store.set(
+            BREAKER_KEY, encode_breaker(BreakerRecord(None, None, hb_ns=1, resolver_pass_ns=1))
+        )
+    seen: list[float] = []
+    real_connect = sqlite3.connect
+
+    def spy(database: str, timeout: float = 5.0, uri: bool = False) -> sqlite3.Connection:
+        seen.append(timeout)
+        return real_connect(database, timeout=timeout, uri=uri)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    probe_breaker_record(path)
+    assert seen == [1.0]
+
+
+def test_one_raising_send_does_not_starve_the_other_alerts() -> None:
+    sink = _Sink()
+    calls: list[str] = []
+
+    def durable(_sink: object, payload: AlertPayload) -> bool:
+        calls.append(payload.event)
+        if len(calls) == 1:
+            raise OSError("outbox exploded")
+        return True
+
+    probe = replace(FRESH, halted=True, unreadable_slots=1)
+    ports = _ports(
+        sink,
+        probe_breaker_record=lambda _p: probe,
+        configured_exec_par_k=_k(2),
+        send_alert_durable=durable,
+    )
+    watch = _seasoned()
+    _run(ports, watch)
+    assert len(calls) == 2, "the second spec was still attempted"
+    assert len(watch.active) == 1, "and delivered; the raising one is retried next tick"
+
+
+def test_a_delivered_page_is_repeated_hourly_while_the_condition_holds() -> None:
+    state = _seasoned()
+    _deliver(state, _decide(STALE_HB, state))
+
+    def stale_at(now_ns: int) -> BreakerProbe:
+        return replace(FRESH, hb_ns=now_ns - 120 * SEC, resolver_pass_ns=now_ns - SEC)
+
+    just_before = NOW + REALERT_INTERVAL_NS - 1
+    assert _decide(stale_at(just_before), state, now_ns=just_before) == []
+    due = NOW + REALERT_INTERVAL_NS
+    again = _decide(stale_at(due), state, now_ns=due)
+    assert [s.detail for s in again] == [BreakerAlertDetail.BREAKER_WATCHER_DEAD]
