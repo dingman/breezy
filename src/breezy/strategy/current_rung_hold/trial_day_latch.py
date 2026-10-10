@@ -772,6 +772,40 @@ class TrialDayLatch:
             )
         return self._intent_latch.current_open()
 
+    def _require_intent_latch(self, caller: str) -> SubmitIntentLatch:
+        self._require_held()
+        if self._intent_latch is None:
+            raise TrialDayLatchError(
+                f"{caller}() requires a TrialDayLatch bound to an "
+                "intent_latch at construction; see open_trial_day_latch"
+            )
+        return self._intent_latch
+
+    def admission_would_refuse(self, slug: str, is_exit: bool) -> str | None:
+        """EXEC-PAR WP6: why the exec gate would refuse a new ``slug`` order now.
+
+        ``None`` when it would admit. A read-only pass-through of
+        ``SubmitIntentLatch.admission_refusal`` -- the SAME predicate
+        ``_submit_order`` and ``arm_slot`` apply (quarantine, the v2 predicate,
+        the breaker halt and its stale heartbeat / resolver-pass denials, same
+        slug, K-full, cool-off) -- so a strategy pre-filter can never disagree
+        with the gate it fronts. At an effective K of 1 it is truthy exactly
+        when :meth:`is_intent_open` is (an OPEN or unreadable singleton).
+        """
+        return self._require_intent_latch("admission_would_refuse").admission_refusal(slug, is_exit)
+
+    def open_submit_intents(self) -> tuple[SubmitIntent, ...]:
+        """EXEC-PAR WP6: every readable OPEN slot, oldest first (read-only).
+
+        Unreadable slots are not included; :meth:`admission_would_refuse`
+        already treats them as quarantine.
+        """
+        return self._require_intent_latch("open_submit_intents").open_submit_intents()
+
+    def max_slots(self) -> int:
+        """EXEC-PAR WP6: the effective K of the bound intent latch."""
+        return self._require_intent_latch("max_slots").max_slots()
+
     def _trial_key(
         self,
         station: str,

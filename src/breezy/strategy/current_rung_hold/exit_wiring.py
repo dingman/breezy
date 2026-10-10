@@ -170,25 +170,31 @@ def check_exit_intent_for_ambiguous_send(
     the one OPEN, and has been open longer than a healthy round trip would
     ever leave it.
 
-    A no-op unless ALL of: a latch is bound, an intent is currently OPEN, it
-    has been open at least :data:`_AMBIGUOUS_EXIT_STALE_NS`, the cached
-    order for ``client_order_id`` still exists, AND its own intent
-    fingerprint (the SAME recipe ``_submit_order``'s own ``arm()`` call
-    used) matches the OPEN intent's. Idempotent, like
+    A no-op unless ALL of: a latch is bound, some intent is currently OPEN
+    (any slot, EXEC-PAR WP6), it has been open at least
+    :data:`_AMBIGUOUS_EXIT_STALE_NS`, the cached order for
+    ``client_order_id`` still exists, AND its own intent fingerprint (the
+    SAME recipe ``_submit_order``'s own ``arm()`` call used) matches that
+    OPEN intent's. Idempotent, like
     :func:`halt_family_for_ambiguous_exit` itself: a family already halted
     is left untouched.
     """
     if strategy._latch is None:
         return
-    current = strategy._latch.current_open_submit_intent()
-    if current is None:
-        return
-    if now_ns - current.created_ns < _AMBIGUOUS_EXIT_STALE_NS:
+    # EXEC-PAR WP6: every OPEN slot is a candidate (at K=1 the one singleton);
+    # the fingerprint, not the slot's position, ties an intent to this exit.
+    stale = [
+        intent
+        for intent in strategy._latch.open_submit_intents()
+        if now_ns - intent.created_ns >= _AMBIGUOUS_EXIT_STALE_NS
+    ]
+    if not stale:
         return
     order = strategy.cache.order(ClientOrderId(client_order_id))
     if order is None:
         return
-    if submit_chain.intent_fingerprint(order) != current.fingerprint:
+    fingerprint = submit_chain.intent_fingerprint(order)
+    if not any(intent.fingerprint == fingerprint for intent in stale):
         return
     halt_family_for_ambiguous_exit(
         strategy,
