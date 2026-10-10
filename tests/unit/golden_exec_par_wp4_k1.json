@@ -1,0 +1,1269 @@
+{
+ "accept_fill_create": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderSubmitted",
+    null
+   ],
+   [
+    "OrderFilled",
+    null
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.37",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000004"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000005"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 2,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-f1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/fill/ord-f1",
+    {
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "cumulativeCost": "0.37",
+     "cumulativeFee": "0.03",
+     "cumulativeQty": "1",
+     "feeCoefficientAtFill": "0.06",
+     "feeReconciled": true,
+     "feeSource": "RECORDED",
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "orderQty": "1",
+     "orderSide": "BUY",
+     "tradeId": "trd-902",
+     "tsEvent": 1787617188120237895,
+     "venueFeeRaw": "0.03",
+     "venueOrderId": "ord-f1"
+    }
+   ],
+   [
+    "exec/polymarket_us/fill_index/tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+    [
+     "ord-f1"
+    ]
+   ],
+   [
+    "exec/polymarket_us/fill_by_day/2026-08-25",
+    [
+     "ord-f1"
+    ]
+   ],
+   [
+    "exec/polymarket_us/fill_by_fingerprint/2026-10-10:<ID1><ID2>",
+    "ord-f1"
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "ACCEPTED_WITH_DURABLE_FILL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "ACCEPTED_WITH_DURABLE_FILL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "ambiguous_then_resolver_accept_fill": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderSubmitted",
+    null
+   ],
+   [
+    "OrderFilled",
+    null
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.37",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000012"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000013"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 6,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-af1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 6,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-af1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 6,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633479000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-af1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 6,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633479000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-af1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/fill/ord-af1",
+    {
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "cumulativeCost": "0.37",
+     "cumulativeFee": "0",
+     "cumulativeQty": "1",
+     "feeCoefficientAtFill": "0.06",
+     "feeReconciled": false,
+     "feeSource": "MODELLED_AT_FILL_TIME",
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "orderQty": "1",
+     "orderSide": "BUY",
+     "tradeId": "GET-ord-af1",
+     "tsEvent": 1791633600000000000,
+     "venueFeeRaw": null,
+     "venueOrderId": "ord-af1"
+    }
+   ],
+   [
+    "exec/polymarket_us/fill_index/tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+    [
+     "ord-af1"
+    ]
+   ],
+   [
+    "exec/polymarket_us/fill_by_day/2026-10-10",
+    [
+     "ord-af1"
+    ]
+   ],
+   [
+    "exec/polymarket_us/fill_by_fingerprint/2026-10-10:<ID1><ID2>",
+    "ord-af1"
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-af1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "STATUS_REPORT_ACCEPT_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "STATUS_REPORT_ACCEPT_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "ambiguous_then_resolver_zero_fill": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderSubmitted",
+    null
+   ],
+   [
+    "OrderCanceled",
+    null
+   ]
+  ],
+  "permit": [
+   "1000.00",
+   "6"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.00",
+  "writes": [
+   [
+    "durability:probe",
+    "0000000000000000000000000000000f"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000010"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 5,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-az1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 5,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-az1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 5,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633479000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-az1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 5,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=35 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633479000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-az1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-az1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "STATUS_REPORT_ZERO_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "STATUS_REPORT_ZERO_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/budget_restore/ord-az1",
+    1
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "ambiguous_then_wait": {
+  "bookings_held": [
+   "<ID1>"
+  ],
+  "events": [
+   [
+    "OrderSubmitted",
+    null
+   ],
+   [
+    "OrderDenied",
+    "this client has latched a trading refusal and will not act on venue state it could not attribute: create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [
+   "create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
+  ],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.37",
+  "writes": [
+   [
+    "durability:probe",
+    "0000000000000000000000000000000a"
+   ],
+   [
+    "durability:probe",
+    "0000000000000000000000000000000b"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID2><ID3>",
+     "intent_id": "<ID1>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID1>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 4,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID1>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-a1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID1>",
+    {
+     "baselineDurableNet": null,
+     "baselineTsNs": null,
+     "baselineVenueNet": null,
+     "bookingId": 4,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": "status=200 body_kind=empty-executions rpc_code=none body_len=34 state=absent cum=absent",
+     "createFillEvidence": "none",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID1>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "ord-a1",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ]
+  ]
+ },
+ "no_response_then_no_id_no_fill": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderRejected",
+    "resolver: complete venue reads show no order and no fill for this no-id submit"
+   ]
+  ],
+  "permit": [
+   "1000.00",
+   "6"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.00",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000018"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000019"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 8,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791634000000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791634000000000000,
+     "retirement_reason": "RESOLVER_NO_ID_NO_FILL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791634000000000000,
+     "retirement_reason": "RESOLVER_NO_ID_NO_FILL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/budget_restore/noid:<ID3>",
+    1
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791634000000000000,
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "no_response_then_wait": {
+  "bookings_held": [
+   "<ID1>"
+  ],
+  "events": [
+   [
+    "OrderDenied",
+    "this client has latched a trading refusal and will not act on venue state it could not attribute: create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [
+   "create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
+  ],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.37",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000015"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000016"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID2><ID3>",
+     "intent_id": "<ID1>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID1>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 7,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID1>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ]
+  ]
+ },
+ "refusal_latched_denies": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderDenied",
+    "this client has latched a trading refusal and will not act on venue state it could not attribute: scenario refusal"
+   ]
+  ],
+  "permit": [
+   "1000.00",
+   "6"
+  ],
+  "refusals": [
+   "scenario refusal"
+  ],
+  "resolver_errors": 0,
+  "sender_calls": 0,
+  "spent": "0",
+  "writes": [
+   [
+    "durability:probe",
+    "0000000000000000000000000000000d"
+   ],
+   [
+    "durability:probe",
+    "0000000000000000000000000000000e"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "reject_create": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderRejected",
+    "venue 4xx google.rpc.Status with no order id"
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.00",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000007"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000008"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 3,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "DEFINITIVE_REJECT",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "DEFINITIVE_REJECT",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ]
+  ]
+ },
+ "zero_fill_create": {
+  "bookings_held": [],
+  "events": [
+   [
+    "OrderSubmitted",
+    null
+   ],
+   [
+    "OrderCanceled",
+    null
+   ]
+  ],
+  "permit": [
+   "999.63",
+   "5"
+  ],
+  "refusals": [],
+  "resolver_errors": 0,
+  "sender_calls": 1,
+  "spent": "0.00",
+  "writes": [
+   [
+    "durability:probe",
+    "00000000000000000000000000000001"
+   ],
+   [
+    "durability:probe",
+    "00000000000000000000000000000002"
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/startup_evidence",
+    {
+     "eof_complete": true,
+     "fill_walk_complete": true,
+     "open_orders": [],
+     "open_orders_read_refused": false,
+     "position_read_refused": false,
+     "positions": [],
+     "ts_ns": 1791633600000000000,
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": null,
+     "retirement_reason": null,
+     "state": "OPEN",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/resolver/<ID3>",
+    {
+     "baselineDurableNet": "0",
+     "baselineTsNs": 1791633600000000000,
+     "baselineVenueNet": "0",
+     "bookingId": 1,
+     "clientOrderId": "O-19700101-000000-001-001-1",
+     "createDetail": null,
+     "createFillEvidence": "unknown",
+     "createdNs": 1791633600000000000,
+     "fillParseError": null,
+     "instrumentId": "tc-temp-nychigh-2026-08-25-lt79f.POLYMARKET_US",
+     "intentId": "<ID3>",
+     "lastFailureKind": "none",
+     "notionalUsd": "0.37",
+     "orderSide": "BUY",
+     "strategyId": "WEATHER-001",
+     "venueOrderId": "",
+     "wireAction": "ORDER_ACTION_BUY",
+     "wireMarketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
+     "wireOutcomeSide": "OUTCOME_SIDE_YES",
+     "wirePrice": "0.37"
+    }
+   ],
+   [
+    "exec/polymarket_us/venue_id/ord-z1",
+    "O-19700101-000000-001-001-1"
+   ],
+   [
+    "exec/polymarket_us/intent/history/<ID3>",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "ACCEPTED_ZERO_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ],
+   [
+    "exec/polymarket_us/intent/current",
+    {
+     "created_ns": 1791633600000000000,
+     "fingerprint": "<ID1><ID2>",
+     "intent_id": "<ID3>",
+     "retired_ns": 1791633600000000000,
+     "retirement_reason": "ACCEPTED_ZERO_FILL_TERMINAL",
+     "state": "RETIRED",
+     "v": 1
+    }
+   ]
+  ]
+ }
+}
