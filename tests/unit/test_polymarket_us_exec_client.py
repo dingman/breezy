@@ -5178,3 +5178,219 @@ async def test_a_stale_prior_day_fingerprint_index_does_not_match_a_new_days_pro
     # negative above is the day scope, not a fingerprint typo.
     assert rig.client._has_durable_fill_record(fingerprint, stale_day_ns) is True
     await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# WP-DR: the resolver's ledger true-up must not raise on a PRIOR-day booking.
+# The "next day" is modelled as the real submit time + 24 h passed as the
+# resolver's `now_ns` (the booking day is then provably != today's UTC day).
+# ---------------------------------------------------------------------------
+
+_DAY_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
+
+
+class _OverCostFillReport:
+    """avgPx 0.90 against a 0.37 booking: a same-day over-cost true-up."""
+
+    avg_px = Decimal("0.90")
+    filled_qty = Quantity(1, 0)
+    quantity = Quantity(1, 0)
+
+
+async def _arm_booked_ambiguous(
+    rig: _AcceptFillRig, order_id: str, sender: _FakeOrderSender
+) -> tuple[Any, AmbiguousResolverContext, int]:
+    """One real with-id AMBIGUOUS take (a same-process booking exists)."""
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_with_id_body(order_id))
+    command = rig.limit_buy()
+    rig.client._cache.add_order(command.order, position_id=None)
+    await rig.client._submit_order(command)
+    current = rig.client._latch.current_open()
+    assert current is not None
+    assert current.intent_id in rig.client._ambiguous_bookings
+    now_ns = rig.clock.timestamp_ns()
+    context = AmbiguousResolverContext(
+        intent_id=current.intent_id,
+        venue_order_id=order_id,
+        instrument_id=str(rig.instrument.id),
+        client_order_id=command.order.client_order_id.value,
+        strategy_id=str(STRATEGY_ID.value),
+        notional_usd=Decimal("0.37"),
+        booking_id=rig.client._ambiguous_bookings[current.intent_id].booking_id,
+        created_ns=now_ns,
+    )
+    return current, context, now_ns
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_retire_after_midnight_cancels_clears_refusal_and_restores_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-zero", sender)
+        assert submit_chain.AMBIGUOUS_REASON in rig.client.trading_refusals
+        _, count_before = live_trading_budget_remaining(rig.client._permit)
+        next_day_ns = now_ns + _DAY_NS
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = next_day_ns
+
+        rig.client._resolve_terminal_zero(context, next_day_ns)
+
+        after = rig.client._latch.current()
+        assert after is not None
+        assert after.state is SubmitIntentState.RETIRED
+        assert submit_chain.AMBIGUOUS_REASON not in rig.client.trading_refusals
+        _, count_after = live_trading_budget_remaining(rig.client._permit)
+        assert count_after == count_before + 1
+        assert any(type(e).__name__ == "OrderCanceled" for e in rig.order_events)
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_id_no_fill_after_midnight_clears_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-noid", sender)
+        assert submit_chain.AMBIGUOUS_REASON in rig.client.trading_refusals
+        next_day_ns = now_ns + _DAY_NS
+        rig.client._no_id_retire_admitted = True
+        rig.client._resolved_no_id_ts_ns[current.intent_id] = next_day_ns
+
+        rig.client._resolve_no_order(current.intent_id, context, next_day_ns)
+
+        after = rig.client._latch.current()
+        assert after is not None
+        assert after.state is SubmitIntentState.RETIRED
+        assert submit_chain.AMBIGUOUS_REASON not in rig.client.trading_refusals
+        assert rig.client._budget_was_restored(f"noid:{current.intent_id}")
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_accept_fill_after_midnight_retires_once_and_latches_fill_unbudgeted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-fill", sender)
+        next_day_ns = now_ns + _DAY_NS
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = next_day_ns
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), rig.instrument, next_day_ns,
+        )
+
+        after = rig.client._latch.current()
+        assert after is not None
+        assert after.state is SubmitIntentState.RETIRED, "must not stay OPEN"
+        assert client_module._RESOLVER_FILL_UNBUDGETED in rig.client.trading_refusals
+        assert current.intent_id not in rig.client._ambiguous_bookings
+        assert len(rig.client.fill_records_for(rig.instrument.id)) == 1
+        # Re-entry is a no-op: retired exactly once, one fill record.
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), rig.instrument, next_day_ns,
+        )
+        assert len(rig.client.fill_records_for(rig.instrument.id)) == 1
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_same_day_over_cost_true_up_still_escalates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-overcost", sender)
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = now_ns
+
+        with pytest.raises(LiveTradingPermissionError, match="cannot cost more than authorized"):
+            rig.client._resolve_accept_fill(context, _OverCostFillReport(), rig.instrument, now_ns)
+
+        assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_same_day_paths_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Golden: a same-day accept-fill trues up the booking and never latches
+    UNBUDGETED; a same-day zero-fill releases the spend, restores the permit
+    slot and clears the refusal."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-gold-fill", sender)
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = now_ns
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), rig.instrument, now_ns,
+        )
+        assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
+        assert rig.client._ledger.spent_today_usd(now_ns=now_ns) == Decimal("0.37")
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_same_day_zero_fill_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-gold-zero", sender)
+        _, count_before = live_trading_budget_remaining(rig.client._permit)
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = now_ns
+        rig.client._resolve_terminal_zero(context, now_ns)
+        assert rig.client._ledger.spent_today_usd(now_ns=now_ns) == Decimal(0)
+        _, count_after = live_trading_budget_remaining(rig.client._permit)
+        assert count_after == count_before + 1
+        assert submit_chain.AMBIGUOUS_REASON not in rig.client.trading_refusals
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_later_same_day_authorize_after_skip_raises_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with _accept_fill_caps():
+        await rig.client._connect()
+        current, context, now_ns = await _arm_booked_ambiguous(rig, "ord-dr-prune", sender)
+        next_day_ns = now_ns + _DAY_NS
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = next_day_ns
+        rig.client._resolve_terminal_zero(context, next_day_ns)
+
+        booking = rig.client._ledger.authorize_order_cost(
+            price_usd=Decimal("0.37"), quantity=Decimal(1), now_ns=next_day_ns + 1,
+        )
+
+        assert booking.day == utc_day_for_ns(next_day_ns)
+        assert rig.client._ledger.spent_today_usd(now_ns=next_day_ns + 1) == Decimal("0.37")
+        await rig.client._disconnect()

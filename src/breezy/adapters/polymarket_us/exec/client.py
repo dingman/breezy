@@ -3228,7 +3228,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # Same-process only (Resolution E): on restart the ledger died
             # with the process and this dict is empty -- the reminted
             # budget already starts whole, so there is nothing to true up.
-            self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
+            # WP-DR: a booking from a PRIOR UTC day cannot be trued up (the
+            # ledger day already rolled and its spend is gone); a zero-fill
+            # carries no spend, so skipping is complete. Day-equality only,
+            # never a blanket except: same-day ledger errors still escalate.
+            if booking.day != utc_day_for_ns(now_ns):
+                self._log.info(
+                    f"resolver: skipped prior-day ledger true-up for intent "
+                    f"{context.intent_id}; booking day {booking.day}, "
+                    f"today {utc_day_for_ns(now_ns)}"
+                )
+            else:
+                self._ledger.true_up_booking(
+                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
+                )
             # AC6 (EDGE-2 plan r3, D3): the permit restore is gated on the
             # SAME `booking is not None` check as the ledger true-up right
             # above -- a cross-process or next-day terminal-zero never took
@@ -3404,7 +3417,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._refuse(_FILL_WRITE_FAILED)
             return
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
-        if booking is not None:
+        if booking is not None and booking.day != utc_day_for_ns(now_ns):
+            # WP-DR: a fill discovered on a NEW UTC day against a prior-day
+            # booking cannot be trued up (the ledger day rolled) and the
+            # in-process ledger has no additive API. Treat it as UNBOOKED so
+            # the AC6b condition below latches the durable
+            # `_RESOLVER_FILL_UNBUDGETED` refusal (fail-closed; a respawn
+            # re-seeds the spend by the record's discovery-time ts_event).
+            self._log.info(
+                f"resolver: skipped prior-day ledger true-up for intent "
+                f"{context.intent_id}; booking day {booking.day}, "
+                f"today {utc_day_for_ns(now_ns)}"
+            )
+            booking = None
+        elif booking is not None:
             self._ledger.true_up_booking(booking, filled_cost_usd=cumulative_cost, now_ns=now_ns)
         # A1-b (B-2): anchored to the indentation of the statement this
         # block PRECEDES (`_retire`, 8-space function-body indent), NOT the
@@ -4069,7 +4095,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         booking = self._ambiguous_bookings.pop(intent_id, None)
         if booking is not None:
             # Same process only: on restart the ledger died with the process.
-            self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
+            # WP-DR: skip the true-up for a prior-UTC-day booking (no spend).
+            if booking.day != utc_day_for_ns(now_ns):
+                self._log.info(
+                    f"resolver: skipped prior-day ledger true-up for intent "
+                    f"{intent_id}; booking day {booking.day}, "
+                    f"today {utc_day_for_ns(now_ns)}"
+                )
+            else:
+                self._ledger.true_up_booking(
+                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
+                )
             if (
                 self._permit is not None
                 and context is not None

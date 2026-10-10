@@ -66,6 +66,9 @@ NO_ID_PERMITTED_COROUTINE_ADDITIONS: Final[frozenset[str]] = frozenset(
 #: Frozen from the tree before this item.
 PRE_RESOLVER_CALLEES = frozenset(
     {
+        # WP-DR (2026-10-10): a pure date function, no I/O, no egress. ONE
+        # named row added to the baseline; the delta stays pinned by `==`.
+        "utc_day_for_ns",
         "AmbiguousResolverContext.from_bytes",
         "ClientOrderId",
         "DurableFillRecord",
