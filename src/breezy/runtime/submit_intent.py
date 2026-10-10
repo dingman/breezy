@@ -39,6 +39,7 @@ from typing import Final, Protocol, Self
 from breezy.domain.exec_slots import SlotRecord, SlotTableView, Wait, admit
 from breezy.runtime.submit_intent_slots import (
     BREAKER_ABSENT_GRACE_NS,
+    BREAKER_FUTURE_SKEW_NS,
     BREAKER_HEARTBEAT_MAX_AGE_NS,
     BREAKER_KEY,
     BREAKER_RESOLVER_PASS_MAX_AGE_NS,
@@ -63,6 +64,7 @@ __all__ = [
     "StateStore",
     "SubmitIntent",
     "SubmitIntentAdmissionDenied",
+    "SubmitIntentBootOrderError",
     "SubmitIntentCorrupt",
     "SubmitIntentError",
     "SubmitIntentInvalidFingerprint",
@@ -168,6 +170,13 @@ class SubmitIntentAdmissionDenied(SubmitIntentLatched):
     def __init__(self, reason: str, intent_id: str | None = None) -> None:
         super().__init__(intent_id)
         self.reason = reason
+
+
+class SubmitIntentBootOrderError(SubmitIntentError):
+    """Raised when boot steps run out of order (cool-off seeded before adoption)."""
+
+    def __init__(self) -> None:
+        super().__init__("slot adoption must run before the boot cool-off seed")
 
 
 class SubmitIntentInvalidSlug(SubmitIntentError):
@@ -504,6 +513,7 @@ class SubmitIntentLatch:
         self._clock_ns: Callable[[], int] = clock_ns or time.time_ns
         self._boot_ns = self._clock_ns()
         self._k_forced_reason: str | None = None
+        self._adoption_ran = False
         self._logged_unreadable: set[str] = set()
         self._mutex = threading.Lock()
         #: The thread that OPENED this latch (recorded here, at construction
@@ -588,7 +598,13 @@ class SubmitIntentLatch:
                 retired_ns=None,
                 retirement_reason=None,
             )
-            self._store.set(CURRENT_INTENT_KEY, intent.to_bytes())
+            # Share the slot encoder so an unexpired cool-off carried by a v1
+            # RETIRED record survives. Without one the bytes equal to_bytes().
+            cooloff = _live_cooloff(self._read_table().cooloff, now_ns)
+            self._store.set(
+                CURRENT_INTENT_KEY,
+                self._encode(_Table(version=1, open=(intent,), cooloff=cooloff)),
+            )
             return intent
 
     def retire(
@@ -648,7 +664,14 @@ class SubmitIntentLatch:
                 return current
             if history is not None:
                 record, raw = history
-                self._store.set(CURRENT_INTENT_KEY, raw)
+                repaired = self._table_after_retire(table, current, record)
+                # Without any cool-off the history bytes are copied verbatim
+                # (the K=1 behaviour); otherwise the shared encoder keeps the
+                # cool-off and adds the retire's own.
+                self._store.set(
+                    CURRENT_INTENT_KEY,
+                    self._encode(repaired) if repaired.cooloff else raw,
+                )
                 return record
             if has_durable_fill_record(current.fingerprint, current.created_ns) is True:
                 return self._retire_unlocked(
@@ -728,10 +751,14 @@ class SubmitIntentLatch:
                 continue
             working = self._table_after_retire(working, slot, record)
             repaired = record
-        if repaired is None:
-            return table.open[0] if table.open else None
-        self._store.set(CURRENT_INTENT_KEY, self._encode(working))
-        return working.open[0] if working.open else repaired
+        if repaired is not None:
+            self._store.set(CURRENT_INTENT_KEY, self._encode(working))
+        if working.open:
+            return working.open[0]
+        if working.unreadable:
+            # "No intent" and "only quarantined slots" must never look alike.
+            raise SubmitIntentCorrupt()
+        return repaired
 
     @staticmethod
     def _encode(table: _Table) -> bytes:
@@ -805,10 +832,15 @@ class SubmitIntentLatch:
         return self._k_forced_reason
 
     def force_k1(self, reason: str) -> None:
-        """Pin the effective K to 1 for the rest of this process (first reason wins)."""
-        if self._k_forced_reason is None:
-            self._k_forced_reason = reason
-            _LOG.error("submit intent slots forced to K=1: %s", reason)
+        """Pin the effective K to 1 for the rest of this process (first reason wins).
+
+        Process-local and not persisted: every boot re-evaluates the cause and
+        calls this again if it still holds.
+        """
+        with self._mutex:
+            if self._k_forced_reason is None:
+                self._k_forced_reason = reason
+                _LOG.error("submit intent slots forced to K=1: %s", reason)
 
     def open_slot_count(self) -> int:
         """Open slots, unreadable ones included. Raises on a corrupt table."""
@@ -869,6 +901,7 @@ class SubmitIntentLatch:
             try:
                 table = self._read_table()
             except SubmitIntentCorrupt:
+                _LOG.warning("slot table is corrupt; refusing admission (fail closed)")
                 return "corrupt"
             return self._admission_locked(table, slug, is_exit, self._clock_ns())
 
@@ -887,6 +920,7 @@ class SubmitIntentLatch:
             try:
                 table = self._read_table()
             except SubmitIntentCorrupt:
+                _LOG.warning("slot table is corrupt; arm_slot refused (fail closed)")
                 raise SubmitIntentLatched() from None
             refusal = self._admission_locked(table, slug, is_exit, now_ns)
             if refusal is not None:
@@ -918,7 +952,7 @@ class SubmitIntentLatch:
 
     def _admission_locked(self, table: _Table, slug: str, is_exit: bool, now_ns: int) -> str | None:
         k = self.max_slots()
-        breaker_reason = None if k == 1 or is_exit else self._breaker_denial()
+        breaker_reason = None if k == 1 or is_exit else self._breaker_denial(now_ns)
         slugless = sum(1 for i in table.open if i.slug is None) if k > 1 else 0
         view = SlotTableView(
             open_slots=tuple(SlotRecord(i.intent_id, i.slug or "", i.is_exit) for i in table.open),
@@ -948,6 +982,7 @@ class SubmitIntentLatch:
         (``?:<id>``). Returns the number adopted; a no-op at an effective K of 1.
         """
         self._require_held()
+        self._adoption_ran = True
         if self.max_slots() == 1:
             return 0
         with self._mutex:
@@ -969,21 +1004,28 @@ class SubmitIntentLatch:
     def _find_slug(slug_of: Callable[[str], str | None], slot: SubmitIntent) -> str | None:
         try:
             found = slug_of(slot.intent_id)
+            if not isinstance(found, str) or not 0 < len(found) <= _MAX_SLUG_LEN:
+                return None
         except Exception:  # noqa: BLE001 - a missing context quarantines, it never raises
-            return None
-        if found is None or not 0 < len(found) <= _MAX_SLUG_LEN:
             return None
         return found
 
     def seed_boot_cooloff(self, *, now_ns: int) -> int:
-        """Give every slug OPEN at boot a synthetic cool-off from ``now_ns`` (K > 1 only)."""
+        """Give every non-exit slug OPEN at boot a synthetic cool-off (K > 1 only).
+
+        Boot order is adopt-then-seed: a slug-less slot has nothing to cool, so
+        seeding before :meth:`adopt_legacy_open_slugs` ran raises
+        :class:`SubmitIntentBootOrderError`.
+        """
         self._require_held()
         if self._k_configured == 1 or self._cooloff_ns == 0:
             return 0
+        if not self._adoption_ran:
+            raise SubmitIntentBootOrderError()
         with self._mutex:
             table = self._read_table()
             cooloff = _live_cooloff(table.cooloff, now_ns)
-            slugs = [i.slug for i in table.open if i.slug is not None]
+            slugs = [i.slug for i in table.open if i.slug is not None and not i.is_exit]
             for slug in slugs:
                 cooloff = _with_cooloff(cooloff, slug, now_ns + self._cooloff_ns)
             if slugs:
@@ -1048,20 +1090,29 @@ class SubmitIntentLatch:
         except SlotTableError:
             raise SubmitIntentCorrupt() from None
 
-    def _breaker_denial(self) -> str | None:
-        """Entry-denial label from ONE breaker ``get`` (K > 1), fail closed."""
-        now_ns = self._clock_ns()
+    def _breaker_denial(self, now_ns: int) -> str | None:
+        """Entry-denial label from ONE breaker ``get`` (K > 1), fail closed.
+
+        ``now_ns`` is the caller's clock. A stamp more than
+        ``BREAKER_FUTURE_SKEW_NS`` ahead of it is a clock fault and counts as
+        stale.
+        """
         try:
             record = self._read_breaker()
-        except Exception:  # noqa: BLE001 - unreadable breaker state denies entries
+        except Exception as exc:  # noqa: BLE001 - unreadable breaker state denies entries
+            _LOG.warning(
+                "breaker record unreadable (%s); denying entries (fail closed)",
+                type(exc).__name__,
+            )
             return "breaker_unreadable"
         if record is None:
             return "breaker_absent" if now_ns - self._boot_ns > BREAKER_ABSENT_GRACE_NS else None
         if record.is_halted:
             return "breaker_halted"
-        if now_ns - record.hb_ns > BREAKER_HEARTBEAT_MAX_AGE_NS:
+        if not -BREAKER_FUTURE_SKEW_NS <= now_ns - record.hb_ns <= BREAKER_HEARTBEAT_MAX_AGE_NS:
             return "breaker_heartbeat_stale"
-        if now_ns - record.resolver_pass_ns > BREAKER_RESOLVER_PASS_MAX_AGE_NS:
+        age = now_ns - record.resolver_pass_ns
+        if not -BREAKER_FUTURE_SKEW_NS <= age <= BREAKER_RESOLVER_PASS_MAX_AGE_NS:
             return "breaker_resolver_stale"
         return None
 
