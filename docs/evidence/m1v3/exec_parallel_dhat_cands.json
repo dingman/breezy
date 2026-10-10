@@ -1,0 +1,2419 @@
+{
+ "schema": 1,
+ "extraction": {
+  "first": "2026-08-30",
+  "last": "2026-10-06",
+  "stats": {
+   "rungs": 1085,
+   "norow": 96,
+   "nobid": 169
+  },
+  "rule": "first 12:00-13:00Z depth row per rung; NO ask = 1 - best YES bid >= 0.90"
+ },
+ "days": {
+  "2026-08-30": [],
+  "2026-08-31": [],
+  "2026-09-01": [
+   {
+    "ts_ns": 1788264066187516377,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-01-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788264366157361876,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-01-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788264729036417348,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-01-lt87f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1788264729147955661,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-01-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788266455001337311,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-01-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-09-03": [
+   {
+    "ts_ns": 1788436801639076016,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-03-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1788436802160100404,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-03-gte92lt93f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1788436802177332573,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-03-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1788436802194578158,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-03-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1788436802243446144,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-03-gte90lt91f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788436802424848460,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-03-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788436803013524438,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-03-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788436803145442120,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-03-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1788436803572112112,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-03-gte80f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1788436803736926441,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-03-gte68lt69f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788436806013710810,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-03-lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-04": [
+   {
+    "ts_ns": 1788523205012157218,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-04-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788523205014898048,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-04-lt87f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788523205055685042,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-04-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1788523205668618557,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-04-lt82f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788523211001541592,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-04-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788523213911231159,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-04-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1788523226001784634,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-04-lt89f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788523226002384865,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-04-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1788523228001954288,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-04-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.92"
+   }
+  ],
+  "2026-09-05": [
+   {
+    "ts_ns": 1788609600043252989,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-05-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1788609600043357943,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-05-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788609600051482485,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-05-gte94f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1788609600211817661,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-05-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788609600490041016,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-05-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788609606569158849,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-05-lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788609622040626371,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-05-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1788609647052600308,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-05-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788609647052744714,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-05-gte75f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-09-06": [],
+  "2026-09-07": [
+   {
+    "ts_ns": 1788782400020346430,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-07-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782400621435275,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-07-lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782401307466624,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-07-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788782401522391742,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-07-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782401789657815,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-07-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788782402055697049,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-07-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782402896664903,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-07-lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782403768197866,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-07-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788782404001472713,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-07-gte84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782404002068815,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-07-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1788782404002173048,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-07-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782404002353773,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-07-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788782404002376001,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-07-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788782404002586743,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-07-lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-08": [],
+  "2026-09-09": [
+   {
+    "ts_ns": 1788955200253892288,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-09-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1788955201075959647,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-09-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788955201236667349,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-09-gte91lt92f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788955204229094247,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-09-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788955210090434950,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-09-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1788955211012460833,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-09-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1788955217001402980,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-09-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788955217001438941,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-09-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1788955217001780922,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-09-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1788955219742696738,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-09-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1788955222388319440,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-09-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1788955224002286736,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-09-lt87f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-10": [
+   {
+    "ts_ns": 1789041600047735082,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-10-lt85f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789041601312198935,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-10-gte83f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789041602457357719,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-10-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789041602503835301,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-10-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789041602809087397,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-10-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789041604715613786,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-10-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789041607076451114,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-10-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789041607161906035,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-10-gte94f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789041607163390777,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-10-lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789041629050560439,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-10-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789041637094887709,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-10-gte91lt92f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789041658970650172,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-10-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789041712834681681,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-10-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-11": [
+   {
+    "ts_ns": 1789128000026049329,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-11-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789128008056038766,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-11-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789128023863445835,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-11-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789128026002464440,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-11-gte84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789128034181561407,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-11-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789128034985179476,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-11-lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789128044073022523,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-11-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789128045487555330,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-11-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789128108944235767,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-11-gte78f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-12": [
+   {
+    "ts_ns": 1789214400081250883,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-12-gte92f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214400823143749,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-12-lt84f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789214400919758073,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-12-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789214402356987829,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-12-lt75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214402366592079,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-12-gte90lt91f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214402377199563,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-12-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789214402380537236,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-12-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789214402653303930,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-12-gte75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214402744932161,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-12-gte94f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214405170053790,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-12-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1789214419879633957,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-12-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789214424696927022,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-12-lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789214450888270945,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-12-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-13": [
+   {
+    "ts_ns": 1789300800078793761,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-13-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789300800080195887,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-13-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789300800084776708,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-13-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789300800455527880,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-13-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789300800462636578,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-13-lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789300800463398763,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-13-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789300800520973753,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-13-gte93f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1789300800540591546,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-13-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789300800714099659,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-13-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789300825377252897,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-13-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789300830386440421,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-13-gte84f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789300830879920381,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-13-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789300862031874250,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-13-lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789300966767314234,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-13-gte80f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-14": [
+   {
+    "ts_ns": 1789387211524037992,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-14-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789387224027072210,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-14-lt72f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789387235123906282,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-14-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789387248274066335,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-14-lt72f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789387300001085227,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-14-gte80f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789387302825424910,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-14-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1789387302833536069,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-14-gte83f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1789387302834736758,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-14-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789387336648449880,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-14-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-15": [
+   {
+    "ts_ns": 1789473600015150416,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-15-lt70f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789473600165218490,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-15-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789473601102279037,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-15-lt80f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789473601481013194,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-15-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789473602001186808,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-15-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789473602022476552,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-15-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789473602119752740,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-15-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789473602703827428,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-15-gte88f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789473603308203334,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-15-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789473609419028843,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-15-gte83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789473613767096910,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-15-lt69f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789473670002805740,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-15-gte77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-16": [
+   {
+    "ts_ns": 1789560000021991958,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-16-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789560000070817930,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-16-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560001194702055,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-16-gte81f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789560001333286638,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-16-lt73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560004328685794,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-16-gte94f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560004328874159,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-16-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789560004363606584,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-16-lt75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560004363999201,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-16-gte83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560004384055850,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-16-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789560005642887997,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-16-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789560013849275077,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-16-lt66f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789560032120041664,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-16-gte79f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789560045184372867,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-16-gte74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560049307870595,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-16-gte71lt72f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789560049307874523,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-16-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-09-17": [
+   {
+    "ts_ns": 1789646400022379615,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-17-gte82f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789646401728855952,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-17-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789646403436116896,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-17-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789646406496298955,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-17-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789646407469494727,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-17-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789646407553146064,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-17-lt74f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789646407572263085,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-17-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789646415025837711,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-17-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789646415031272274,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-17-lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789646415673398123,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-17-lt75f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789646426021432695,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-17-lt69f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789646432044120439,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-17-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789646439348061827,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-17-gte77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-18": [
+   {
+    "ts_ns": 1789732813166991431,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-18-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789732827001123887,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-18-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789732827001496337,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-18-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789732832001169636,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-18-lt68f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1789732832008107035,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-18-gte81f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789732840811260839,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-18-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789732858001292128,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-18-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789732914791409807,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-18-gte68lt69f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789732920001593764,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-18-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789732935001747210,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-18-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-19": [
+   {
+    "ts_ns": 1789819200154182748,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-19-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789819200233497528,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-19-lt69f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789819201091001512,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-19-lt72f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789819201543270653,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-19-gte80f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1789819202986116622,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-19-gte90lt91f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789819204682729836,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-19-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789819204764268707,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-19-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789819207143341382,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-19-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789819207143473832,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-19-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789819207143693814,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-19-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789819224068847692,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-19-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789819224075221959,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-19-gte78f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789819259487618681,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-19-gte92f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789819259974115481,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-19-lt84f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789819340033069337,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-19-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-09-20": [
+   {
+    "ts_ns": 1789905600493096451,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-20-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1789905602517665923,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-20-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789905602642851631,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-20-gte71lt72f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789905602642873505,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-20-gte73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905603035231566,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-20-gte71lt72f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1789905605170458887,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-20-gte92f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905605170597193,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-20-lt84f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789905609653716831,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-20-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905612007018698,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-20-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905620001185195,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-20-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905620001468055,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-20-lt69f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789905645135812578,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-20-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789905645135912070,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-20-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-21": [
+   {
+    "ts_ns": 1789992000062384985,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-21-lt84f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1789992000366144569,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-21-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789992001697333550,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-21-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992002782993835,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-21-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992004420564664,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-21-gte70lt71f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789992005280444372,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-21-gte92f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992006200007371,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-21-gte90lt91f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789992006404541579,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-21-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1789992006677801215,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-21-gte74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992006947510361,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-21-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789992010090881925,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-21-gte81f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1789992010101476975,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-21-lt73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992010947741191,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-21-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1789992016818185369,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-21-gte71f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1789992027000835672,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-21-gte74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-22": [
+   {
+    "ts_ns": 1790078400233678723,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-22-gte76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790078401754938690,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-22-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790078403225486584,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-22-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790078408463656718,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-22-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790078410080642496,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-22-gte91f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790078410638567617,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-22-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790078412264513702,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-22-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790078418504586237,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-22-lt63f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790078426792330757,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-22-lt75f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790078429291099109,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-22-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-23": [
+   {
+    "ts_ns": 1790164800221552416,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-23-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790164800954031809,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-23-lt63f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790164805522753056,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-23-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790164805555516377,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-23-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790164805913454179,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-23-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790164806466222812,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-23-gte83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790164808237695645,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-23-lt78f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790164815112655897,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-23-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790164815113675898,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-23-lt65f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790164826706025856,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-23-gte90f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790164847455348997,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-23-lt82f.POLYMARKET_US",
+    "no_ask": "0.96"
+   }
+  ],
+  "2026-09-24": [
+   {
+    "ts_ns": 1790251201216893612,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-24-lt66f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790251204069780472,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-24-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790251204071503126,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-24-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790251204072597137,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-24-gte86f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790251204075265706,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-24-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790251204078815790,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-24-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790251206611051045,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-24-gte80f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790251298630493108,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-24-gte70lt71f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790251298643562642,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-24-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790251306304875118,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-24-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-25": [
+   {
+    "ts_ns": 1790337602001321005,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-25-gte72f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790337602001481859,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-25-gte70lt71f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790337602002368411,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-25-lt64f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790337602126016455,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-25-gte93f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790337604658251473,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-25-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790337604661347710,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-25-lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790337614188206926,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-25-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790337614191029444,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-25-gte75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790337620193533873,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-25-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790337621576343212,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-25-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790337629428435424,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-25-lt67f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790337658002127762,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-25-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790337666038139355,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-25-gte75f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790337671001690677,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-25-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790337693768897441,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-25-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.93"
+   }
+  ],
+  "2026-09-26": [
+   {
+    "ts_ns": 1790424000009664661,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-26-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790424001955818987,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-26-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790424003039030743,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-26-lt66f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790424004094318897,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-26-lt66f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790424005913040730,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-26-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790424006554610630,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-26-gte74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790424006937276073,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-26-lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790424010341977787,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-26-gte74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790424013805828341,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-26-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790424022541226333,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-26-gte64lt65f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-27": [
+   {
+    "ts_ns": 1790510400413056304,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-27-gte75f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790510401040505446,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-27-gte70f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790510401045392513,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-27-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790510401047143099,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-27-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1790510401051036291,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-27-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790510401052087402,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-27-gte91f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790510401061944007,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-27-lt62f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790510401064332709,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-27-gte62lt63f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790510402341245256,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-27-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790510413332013051,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-27-lt67f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790510421184218184,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-27-gte84f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790510421198215445,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-27-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-28": [
+   {
+    "ts_ns": 1790596801002320117,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-28-gte84f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790596801324573848,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-28-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790596802037903389,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-28-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790596803036560649,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-28-gte66lt67f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790596803770531062,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-28-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1790596804247466636,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-28-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790596810001848208,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-28-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790596810317309712,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-28-lt68f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790596811014546847,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-28-lt69f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790596811796338397,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-28-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1790596819980610675,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-28-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790596825478455869,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-28-lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790596825523179639,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-28-gte76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-09-29": [
+   {
+    "ts_ns": 1790683200001922490,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-29-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790683200029373289,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-29-lt83f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790683200045734469,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-29-lt69f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790683200048843038,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-29-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790683202811190062,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-29-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1790683202817076894,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-29-lt74f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790683202822050375,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-29-gte80lt81f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1790683202889237046,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-29-lt80f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790683202900383685,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-29-gte88f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790683202987766528,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-29-gte91f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790683203063969842,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-29-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790683211825466250,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-29-lt73f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790683223001483306,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-29-gte82f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790683233069460488,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-29-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.95"
+   }
+  ],
+  "2026-09-30": [
+   {
+    "ts_ns": 1790769600061963274,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-30-gte84lt85f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1790769606132695793,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-30-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790769612002090386,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-30-gte73lt74f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790769612002408067,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-09-30-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790769613012184019,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-30-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790769613146041980,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-30-gte82lt83f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790769619809979106,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-30-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790769655061053502,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-30-gte86f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790769673764823381,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-09-30-gte84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790769680710651712,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-09-30-gte90f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790769700027754068,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-30-lt72f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790769733205193488,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-09-30-gte78lt79f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790769733208913351,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-09-30-lt78f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-10-01": [
+   {
+    "ts_ns": 1790857688637763646,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-01-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790857700341421364,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-01-gte89lt90f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790857701549566281,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-01-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790857702422793155,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-01-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790857716983992733,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-01-gte77lt78f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790857721517280570,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-01-lt69f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790857721642162834,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-01-gte69lt70f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790857721718709325,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-01-lt83f.POLYMARKET_US",
+    "no_ask": "0.95"
+   },
+   {
+    "ts_ns": 1790857722113876388,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-01-gte77f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790857726950405121,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-01-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790857729355705137,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-01-gte83f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790857731396490569,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-01-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1790857733873106389,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-01-gte75lt76f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790857752870613002,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-01-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-10-02": [
+   {
+    "ts_ns": 1790942400094267612,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-02-gte79lt80f.POLYMARKET_US",
+    "no_ask": "0.91"
+   },
+   {
+    "ts_ns": 1790942400095422781,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-02-gte81lt82f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1790942400360636463,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-02-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790942400378161101,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte69f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790942400553465725,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-02-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790942402348877537,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-02-lt85f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1790942403361639496,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte61lt62f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1790942403740920834,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1790942405547353977,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-02-gte91lt92f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1790942405733507329,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-02-gte93f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1790942405869551587,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-02-gte91lt92f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1790942415817286029,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-02-lt85f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790942427608775707,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-02-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1790942427610041378,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-02-lt81f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-10-03": [
+   {
+    "ts_ns": 1791028800036329846,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-03-gte74lt75f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791028800063888087,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-03-gte68lt69f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1791028800516640904,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-03-gte95lt96f.POLYMARKET_US",
+    "no_ask": "0.90"
+   },
+   {
+    "ts_ns": 1791028803403476542,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1791028805854791802,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-03-gte83lt84f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1791028806113815223,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-03-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1791028806315483635,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-03-gte64lt65f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791028807123213481,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-03-lt91f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791028812793573719,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-03-gte91lt92f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791028813248319563,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-03-gte92lt93f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791028813290646361,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-03-lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791028813291076518,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-03-gte94f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791028825050778177,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-03-lt83f.POLYMARKET_US",
+    "no_ask": "0.98"
+   }
+  ],
+  "2026-10-04": [
+   {
+    "ts_ns": 1791115200242871848,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-04-gte65lt66f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1791115200244695448,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-04-gte67lt68f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791115204001766940,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-04-lt70f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1791115204003075652,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-04-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791115204066701421,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-04-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791115210473811593,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-04-gte93lt94f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791115213338372829,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-04-gte93f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ],
+  "2026-10-05": [
+   {
+    "ts_ns": 1791201600025651710,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-05-gte72lt73f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791201600025677861,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-05-lt68f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791201600344894045,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-05-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791201600345039618,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-05-gte93f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791201601511597981,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-05-gte101lt102f.POLYMARKET_US",
+    "no_ask": "0.93"
+   },
+   {
+    "ts_ns": 1791201602628496691,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-05-gte70lt71f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791201602651689526,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-05-lt64f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791201606057770591,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-05-gte88lt89f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791201614048271566,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-05-gte103lt104f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791201616983367471,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-05-gte90f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791201617076663448,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-05-gte86lt87f.POLYMARKET_US",
+    "no_ask": "0.93"
+   }
+  ],
+  "2026-10-06": [
+   {
+    "ts_ns": 1791288000017046795,
+    "station": "NYC",
+    "instrument_id": "tc-temp-nychigh-2026-10-06-gte65lt66f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791288002194437424,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-06-gte70lt71f.POLYMARKET_US",
+    "no_ask": "0.96"
+   },
+   {
+    "ts_ns": 1791288003001348517,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-06-gte76lt77f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791288003002017418,
+    "station": "MDW",
+    "instrument_id": "tc-temp-mdwhigh-2026-10-06-lt70f.POLYMARKET_US",
+    "no_ask": "0.99"
+   },
+   {
+    "ts_ns": 1791288005282000164,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-06-gte89f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791288005282146216,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-06-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.98"
+   },
+   {
+    "ts_ns": 1791288005282208947,
+    "station": "SFO",
+    "instrument_id": "tc-temp-sfohigh-2026-10-06-gte85lt86f.POLYMARKET_US",
+    "no_ask": "0.94"
+   },
+   {
+    "ts_ns": 1791288005828431573,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-06-gte87lt88f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1791288008275909057,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-06-lt92f.POLYMARKET_US",
+    "no_ask": "0.97"
+   },
+   {
+    "ts_ns": 1791288008375499541,
+    "station": "LAX",
+    "instrument_id": "tc-temp-laxhigh-2026-10-06-gte92lt93f.POLYMARKET_US",
+    "no_ask": "0.92"
+   },
+   {
+    "ts_ns": 1791288012526427895,
+    "station": "MIA",
+    "instrument_id": "tc-temp-miahigh-2026-10-06-gte93f.POLYMARKET_US",
+    "no_ask": "0.99"
+   }
+  ]
+ }
+}
