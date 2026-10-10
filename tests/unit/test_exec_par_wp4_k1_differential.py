@@ -7,6 +7,12 @@ observable output (events, denial reasons, durable write sequence, latched
 refusals, permit and ledger), after dropping only the context blob's
 ``wireQuantity`` key (delta D6). None of D1-D5 is reachable by these scenarios,
 which is part of the claim: at K=1 an ordinary day looks the same.
+
+E14.7 (accepted, not a golden change): the duplicate detector also acts at K=1.
+It examines only a no-id AMBIGUOUS intent older than the 300 s lag guard that
+carries a holding baseline and a wire quantity, so none of these scenarios reach
+it; it is strictly more conservative (it can only keep an intent AMBIGUOUS and
+raise the sticky contradiction counter), so the golden is unchanged.
 """
 
 from __future__ import annotations

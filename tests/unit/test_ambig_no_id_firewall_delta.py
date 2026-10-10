@@ -289,7 +289,7 @@ FROZEN_SOURCE_SHA256: Final[dict[str, str]] = {
 }
 
 #: ``ast.dump`` of ``_submit_order`` up to and including the ``arm`` try block.
-#: Re-pinned by EXEC-PAR WP4 (reviewer-approved with the exec client's own pin):
+#: Re-pinned by EXEC-PAR r5 §5 WP4 + r5.1 E14 (with the exec client's own pin):
 #: the per-slug admission, the open-exposure pre-check, the two body pins, the
 #: `arm_slot` call and the registration all sit INSIDE this prefix by design.
 SUBMIT_PREFIX_SHA256: Final[str] = (

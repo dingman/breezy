@@ -781,7 +781,7 @@ async def test_duplicate_detector_single_fill_does_not_trip(
     with caps():
         async with par_rig(tmp_path, monkeypatch, sender=ScriptedSender()) as rig:
             await _detector_case(rig, monkeypatch, leg=leg, price=price, net=single)
-            assert rig.client.contradiction_events_total == 0
+            assert rig.client.duplicate_suspect_total == 0
 
 
 @pytest.mark.asyncio
@@ -800,7 +800,10 @@ async def test_duplicate_detector_doubled_holding_trips(
     with caps():
         async with par_rig(tmp_path, monkeypatch, sender=ScriptedSender()) as rig:
             await _detector_case(rig, monkeypatch, leg=leg, price=price, net=doubled)
-            assert rig.client.contradiction_events_total == 1
+            assert rig.client.duplicate_suspect_total == 1
+            # E14.5: the ordinary unexplained-holding contradiction (first pass)
+            # is counted too, plus the duplicate trip itself.
+            assert rig.client.contradiction_events_total == 2
 
 
 @pytest.mark.asyncio
@@ -822,7 +825,7 @@ async def test_duplicate_detector_none_baseline_or_wire_quantity_not_evaluable(
                 baseline=None if case == "no_baseline" else ("0", "0", 0),
                 wire_quantity=None if case == "no_wire_quantity" else "1",
             )
-            assert rig.client.contradiction_events_total == 0
+            assert rig.client.duplicate_suspect_total == 0
             assert rig.client.resolver_error_count == 0
 
 
@@ -841,13 +844,13 @@ async def test_duplicate_detector_needs_second_pass_and_lag_guard_age(
                 await _detector_case(
                     rig, local, leg="yes", price="0.40", net="2", age_s=250.0, passes=4
                 )
-            assert rig.client.contradiction_events_total == 0, "younger than the lag guard"
+            assert rig.client.duplicate_suspect_total == 0, "younger than the lag guard"
         async with par_rig(tmp_path / "old", monkeypatch, sender=ScriptedSender()) as rig2:
             await _detector_case(rig2, monkeypatch, leg="yes", price="0.40", net="2", passes=1)
             # One pass is a first sighting at most: it needs a second consecutive pass.
-            first = rig2.client.contradiction_events_total
+            first = rig2.client.duplicate_suspect_total
             await run_passes(rig2.client, count=2)
-            assert first == 0 and rig2.client.contradiction_events_total == 1
+            assert first == 0 and rig2.client.duplicate_suspect_total == 1
 
 
 @pytest.mark.asyncio
@@ -862,7 +865,7 @@ async def test_duplicate_detector_records_contradiction_not_just_log(
             (detail,) = rig.client.resolver_evidence_contradictions
             assert detail["intent_id"] == intent_id
             assert detail["event"] == "resolver_duplicate_suspect"
-            assert rig.client.contradiction_events_total == 1
+            assert rig.client.duplicate_suspect_total == 1
             assert rig.latch.is_open_intent(intent_id), "a contradiction never retires"
 
 

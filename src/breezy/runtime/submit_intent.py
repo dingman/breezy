@@ -89,6 +89,9 @@ _SCHEMA_VERSION: Final[int] = 1
 _FINGERPRINT_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _INTENT_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
 _MAX_SLUG_LEN: Final[int] = 256
+#: EXEC-PAR E14.2: how long a resolver failure keeps a slot behind healthy ones
+#: (the global backoff cap, 300 s). Mirrors the exec client's backoff cap.
+FAILURE_PENALTY_NS: Final[int] = 300 * 1_000_000_000
 
 
 class StateStore(Protocol):
@@ -885,22 +888,40 @@ class SubmitIntentLatch:
         return tuple(sorted(keys))
 
     def next_open_for_resolution(
-        self, failures: Mapping[str, int], served: Mapping[str, int]
+        self,
+        failures: Mapping[str, int],
+        served: Mapping[str, int],
+        last_failure_ns: Mapping[str, int] | None = None,
     ) -> SubmitIntent | None:
         """The readable OPEN slot to resolve next, independent of ``max_slots``.
 
-        Sorted by (per-intent failures, last served, created); unreadable
-        slots are skipped (logged once per key).
+        Sorted by (failure penalty, last served, created); unreadable slots are
+        skipped (logged once per key). A slot is PENALISED while it has a failure
+        count and, when ``last_failure_ns`` is given, that failure is less than
+        :data:`FAILURE_PENALTY_NS` old: failing slots then order after healthy
+        ones. After the window the penalty lapses and ordering is by last-served,
+        so no slot waits longer than (K x poll) + the window while healthy slots
+        cycle. Without ``last_failure_ns`` any failure count penalises (the
+        pre-E14 two-argument behaviour).
         """
         self._require_held()
         with self._mutex:
             table = self._read_table()
         if not table.open:
             return None
+        now_ns = self._clock_ns()
+
+        def penalised(intent_id: str) -> int:
+            if failures.get(intent_id, 0) <= 0:
+                return 0
+            if last_failure_ns is None or intent_id not in last_failure_ns:
+                return 1
+            return 1 if now_ns - last_failure_ns[intent_id] < FAILURE_PENALTY_NS else 0
+
         return min(
             table.open,
             key=lambda i: (
-                failures.get(i.intent_id, 0),
+                penalised(i.intent_id),
                 served.get(i.intent_id, 0),
                 i.created_ns,
                 i.intent_id,
