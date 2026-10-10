@@ -17,6 +17,7 @@ import random
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol, runtime_checkable
 
 import pytest
 
@@ -70,8 +71,24 @@ def _arm(sim: ModuleType, **kw: object) -> object:
     return sim.Arm(**base)
 
 
-def _run(sim: ModuleType, cands: list[object], arm: object, seed: int = 1) -> object:
-    return sim.simulate_day(tuple(cands), arm, random.Random(seed))
+@runtime_checkable
+class _Outcome(Protocol):
+    """The result fields of ``simulate_day`` that these tests read."""
+
+    @property
+    def admitted(self) -> int: ...
+
+    @property
+    def drops(self) -> dict[str, int]: ...
+
+    @property
+    def first5s_fraction(self) -> float: ...
+
+
+def _run(sim: ModuleType, cands: list[object], arm: object, seed: int = 1) -> _Outcome:
+    out = sim.simulate_day(tuple(cands), arm, random.Random(seed))
+    assert isinstance(out, _Outcome)
+    return out
 
 
 # --------------------------------------------------------------------------- data rule
@@ -139,7 +156,13 @@ def test_extraction_bounds_equal_the_triage_script_bounds(sim: ModuleType) -> No
             names = [t.id for t in getattr(node.targets[0], "elts", []) if isinstance(t, ast.Name)]
             if names == ["FIRST", "LAST"]:
                 dates = [
-                    dt.date(*[int(a.value) for a in call.args if isinstance(a, ast.Constant)])
+                    dt.date(
+                        *[
+                            a.value
+                            for a in call.args
+                            if isinstance(a, ast.Constant) and isinstance(a.value, int)
+                        ]
+                    )
                     for call in node.value.elts
                     if isinstance(call, ast.Call)
                 ]
@@ -176,7 +199,9 @@ def test_simulation_uses_production_admit(sim: ModuleType, monkeypatch: pytest.M
         now_ns: int,
     ) -> exec_slots.Admit | exec_slots.Wait:
         calls.append(1)
-        return real(table, slug, is_exit, k, entry_halted, now_ns)
+        result = real(table, slug, is_exit, k, entry_halted, now_ns)
+        assert isinstance(result, exec_slots.Admit | exec_slots.Wait)
+        return result
 
     monkeypatch.setattr(sim, "admit", spy)
     cands = [_cand(sim, 0.0, 1), _cand(sim, 0.01, 2), _cand(sim, 5.0, 3)]
