@@ -9,7 +9,6 @@ Reuses the real-store harness from ``test_continuous_rung_hold_strategy.py``
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -51,6 +50,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     family_halt_key,
     open_trial_day_latch,
 )
+from tests.support.nautilus_log_capture import capture_nautilus_logs, wait_for_logged
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     TEST_CONT_FAMILY_ID,
@@ -792,7 +792,6 @@ def test_never_arm_walk_halts_when_the_family_is_already_halted(
 def test_never_arm_log_names_family_id_and_source(
     store_path: Path,
     interior_instrument: BinaryOption,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """EDGE-3 test 20 (§6.2): the never-arm error line names both the
     bound family id and the halt's decoded source -- AC-10.
@@ -819,18 +818,21 @@ def test_never_arm_log_names_family_id_and_source(
         fee=Decimal(0),
         ts_ns=WINDOW_OPEN_NS,
     )
-    capfd.readouterr()  # drain anything buffered before this point
+    read_logs = capture_nautilus_logs()
     assert strategy._run_never_arm_walk() is False
     # Nautilus's Rust-backed logger writes on its own background thread --
-    # a short, bounded wait for the flush, never a retry loop on content
-    # (the same pattern `test_continuous_rung_hold_backtest_only.py`'s
-    # `test_on_start_refuses_a_non_testclock` uses).
-    time.sleep(0.1)
-    captured = capfd.readouterr()
-    assert "family halt is set" in captured.err
-    assert f"family_id={TEST_CONT_FAMILY_ID}" in captured.err
-    assert "source=per_family" in captured.err
-    assert "never arming" in captured.err
+    # bounded wait for delivery of the same lines, assertions unchanged.
+    logged = wait_for_logged(
+        read_logs,
+        "family halt is set",
+        f"family_id={TEST_CONT_FAMILY_ID}",
+        "source=per_family",
+        "never arming",
+    )
+    assert "family halt is set" in logged
+    assert f"family_id={TEST_CONT_FAMILY_ID}" in logged
+    assert "source=per_family" in logged
+    assert "never arming" in logged
 
 
 def test_never_arm_walk_consumes_a_durable_fill_with_no_trial(
