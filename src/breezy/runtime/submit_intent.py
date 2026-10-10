@@ -23,21 +23,67 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import logging
 import os
 import re
 import threading
+import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Final, Protocol, Self
 
+from breezy.domain.exec_slots import SlotRecord, SlotTableView, Wait, admit
+from breezy.runtime.submit_intent_slots import (
+    BREAKER_ABSENT_GRACE_NS,
+    BREAKER_HEARTBEAT_MAX_AGE_NS,
+    BREAKER_KEY,
+    BREAKER_RESOLVER_PASS_MAX_AGE_NS,
+    DEFAULT_COOLOFF_NS,
+    BreakerRecord,
+    SlotTableError,
+    canonical_text,
+    encode_breaker,
+    encode_v2,
+    parse_breaker,
+    parse_table,
+)
+
+_LOG = logging.getLogger(__name__)
+
+__all__ = [
+    "BREAKER_KEY",
+    "CURRENT_INTENT_KEY",
+    "DEFAULT_COOLOFF_NS",
+    "BreakerRecord",
+    "RetirementReason",
+    "StateStore",
+    "SubmitIntent",
+    "SubmitIntentAdmissionDenied",
+    "SubmitIntentCorrupt",
+    "SubmitIntentError",
+    "SubmitIntentInvalidFingerprint",
+    "SubmitIntentInvalidSlug",
+    "SubmitIntentLatch",
+    "SubmitIntentLatched",
+    "SubmitIntentLockError",
+    "SubmitIntentLockHeld",
+    "SubmitIntentLockNotHeld",
+    "SubmitIntentMismatch",
+    "SubmitIntentState",
+    "history_key",
+    "hold_submit_intent_process_lock",
+    "open_submit_intent_latch",
+]
+
 CURRENT_INTENT_KEY: Final[str] = "exec/polymarket_us/intent/current"
 _SCHEMA_VERSION: Final[int] = 1
 _FINGERPRINT_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _INTENT_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
+_MAX_SLUG_LEN: Final[int] = 256
 
 
 class StateStore(Protocol):
@@ -114,6 +160,21 @@ class SubmitIntentLatched(SubmitIntentError):
             super().__init__("submit intent is latched")
         else:
             super().__init__(f"submit intent {intent_id} is latched")
+
+
+class SubmitIntentAdmissionDenied(SubmitIntentLatched):
+    """``arm_slot`` refused by the slot arbiter. ``reason`` is a stable label."""
+
+    def __init__(self, reason: str, intent_id: str | None = None) -> None:
+        super().__init__(intent_id)
+        self.reason = reason
+
+
+class SubmitIntentInvalidSlug(SubmitIntentError):
+    """Raised when ``arm_slot`` is given an empty or oversized slug."""
+
+    def __init__(self) -> None:
+        super().__init__("submit intent slug is invalid")
 
 
 class SubmitIntentMismatch(SubmitIntentError):
@@ -240,14 +301,40 @@ def _retired_from(
     )
 
 
+def _optional_slug(payload: dict[str, object]) -> str | None:
+    value = payload.get("slug")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 0 < len(value) <= _MAX_SLUG_LEN:
+        raise SubmitIntentCorrupt()
+    return value
+
+
+def _optional_true(payload: dict[str, object], name: str) -> bool:
+    value = payload.get(name)
+    if value is None:
+        return False
+    if value is not True:
+        raise SubmitIntentCorrupt()
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class SubmitIntent:
+    """One submit-intent record.
+
+    ``slug`` and ``is_exit`` are trailing-optional (EXEC-PAR WP2) and emitted
+    only when set, so a K=1 record's bytes are identical to the pre-WP2 ones.
+    """
+
     intent_id: str
     fingerprint: str = field(repr=False)
     created_ns: int
     state: SubmitIntentState
     retired_ns: int | None
     retirement_reason: RetirementReason | None
+    slug: str | None = None
+    is_exit: bool = False
 
     def __post_init__(self) -> None:
         if self.state is SubmitIntentState.RETIRED:
@@ -260,7 +347,10 @@ class SubmitIntent:
             raise SubmitIntentCorrupt()
 
     def to_bytes(self) -> bytes:
-        payload = {
+        return json.dumps(self.to_payload(), sort_keys=True).encode("utf-8")
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
             "v": _SCHEMA_VERSION,
             "intent_id": self.intent_id,
             "fingerprint": self.fingerprint,
@@ -271,7 +361,11 @@ class SubmitIntent:
                 None if self.retirement_reason is None else self.retirement_reason.value
             ),
         }
-        return json.dumps(payload, sort_keys=True).encode("utf-8")
+        if self.slug is not None:
+            payload["slug"] = self.slug
+        if self.is_exit:
+            payload["is_exit"] = True
+        return payload
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> Self:
@@ -281,7 +375,10 @@ class SubmitIntent:
             decoded = None
         if not isinstance(decoded, dict):
             raise SubmitIntentCorrupt()
-        payload: dict[str, object] = decoded
+        return cls.from_payload(decoded)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> Self:
         if _require_int(payload, "v") != _SCHEMA_VERSION:
             raise SubmitIntentCorrupt()
         intent_id = _require_str(payload, "intent_id")
@@ -295,6 +392,8 @@ class SubmitIntent:
             state=_require_enum(payload, "state", SubmitIntentState),
             retired_ns=_optional_int(payload, "retired_ns"),
             retirement_reason=_optional_enum(payload, "retirement_reason", RetirementReason),
+            slug=_optional_slug(payload),
+            is_exit=_optional_true(payload, "is_exit"),
         )
 
 
@@ -321,6 +420,54 @@ class _HeldSubmitIntentLock:
             os.close(self._fd)
 
 
+#: Retirement reasons after which no cool-off is written: nothing reached the
+#: venue (definitive reject) or the operator cleared the slot by hand.
+_NO_COOLOFF_REASONS: Final[frozenset[RetirementReason]] = frozenset(
+    {RetirementReason.DEFINITIVE_REJECT, RetirementReason.OPERATOR_CLEARED}
+)
+_LEGACY_KEY_PREFIX: Final[str] = "?:"
+
+
+@dataclass(frozen=True, slots=True)
+class _Table:
+    """Decoded slot table: readable OPEN slots, unreadable slots, cool-offs.
+
+    ``last`` is the v1 RETIRED record when no slot is open. ``version`` is 0
+    (absent), 1 or 2 as stored.
+    """
+
+    version: int
+    open: tuple[SubmitIntent, ...] = ()
+    unreadable: tuple[tuple[str, bytes], ...] = ()
+    cooloff: tuple[tuple[str, int], ...] = ()
+    last: SubmitIntent | None = None
+
+
+def _live_cooloff(cooloff: tuple[tuple[str, int], ...], now_ns: int) -> tuple[tuple[str, int], ...]:
+    return tuple((slug, until) for slug, until in cooloff if until > now_ns)
+
+
+def _with_cooloff(
+    cooloff: tuple[tuple[str, int], ...], slug: str, until_ns: int
+) -> tuple[tuple[str, int], ...]:
+    merged = dict(cooloff)
+    merged[slug] = max(merged.get(slug, 0), until_ns)
+    return tuple(sorted(merged.items()))
+
+
+def _slot_from_value(key: str, value: object) -> SubmitIntent | None:
+    """A readable OPEN slot keyed by its own intent id, else ``None``."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        record = SubmitIntent.from_payload(value)
+    except SubmitIntentCorrupt:
+        return None
+    if record.state is not SubmitIntentState.OPEN or record.intent_id != key:
+        return None
+    return record
+
+
 class SubmitIntentLatch:
     """One-at-a-time submit latch persisted through ``StateStore.get``/``set``.
 
@@ -337,9 +484,27 @@ class SubmitIntentLatch:
     #: importing this module.
     CorruptError = SubmitIntentCorrupt
 
-    def __init__(self, store: StateStore, lock: _HeldSubmitIntentLock) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        lock: _HeldSubmitIntentLock,
+        *,
+        max_slots: int = 1,
+        cooloff_ns: int = DEFAULT_COOLOFF_NS,
+        v2_predicate: Callable[[], bool] | None = None,
+        clock_ns: Callable[[], int] | None = None,
+    ) -> None:
+        if max_slots < 1 or cooloff_ns < 0:
+            raise ValueError("max_slots must be >= 1 and cooloff_ns >= 0")
         self._store = store
         self._lock = lock
+        self._k_configured = max_slots
+        self._cooloff_ns = cooloff_ns
+        self._v2_predicate: Callable[[], bool] = v2_predicate or (lambda: False)
+        self._clock_ns: Callable[[], int] = clock_ns or time.time_ns
+        self._boot_ns = self._clock_ns()
+        self._k_forced_reason: str | None = None
+        self._logged_unreadable: set[str] = set()
         self._mutex = threading.Lock()
         #: The thread that OPENED this latch (recorded here, at construction
         #: -- :func:`open_submit_intent_latch` is the only factory). A
@@ -469,6 +634,9 @@ class SubmitIntentLatch:
         """
         self._require_held()
         with self._mutex:
+            table = self._read_table()
+            if table.version == 2:
+                return self._reconcile_slots(table, has_durable_fill_record, now_ns)
             current = self.current()
             if current is None:
                 return None
@@ -496,19 +664,406 @@ class SubmitIntentLatch:
         reason: RetirementReason,
         now_ns: int,
     ) -> SubmitIntent:
-        current = self.current()
-        if (
-            current is None
-            or current.state is not SubmitIntentState.OPEN
-            or current.intent_id != intent_id
-        ):
-            current_id = None if current is None else current.intent_id
-            current_state = None if current is None else current.state.value
+        table = self._read_table()
+        slot = next((i for i in table.open if i.intent_id == intent_id), None)
+        if slot is None:
+            ref = table.open[0] if table.open else table.last
+            current_id = None if ref is None else ref.intent_id
+            current_state = None if ref is None else ref.state.value
             raise SubmitIntentMismatch(intent_id, current_id, current_state)
-        retired = _retired_from(current, reason, now_ns)
+        retired = _retired_from(slot, reason, now_ns)
         self._store.set(history_key(intent_id), retired.to_bytes())
-        self._store.set(CURRENT_INTENT_KEY, retired.to_bytes())
+        self._store.set(CURRENT_INTENT_KEY, self._after_retire(table, slot, retired))
         return retired
+
+    def _after_retire(self, table: _Table, slot: SubmitIntent, retired: SubmitIntent) -> bytes:
+        return self._encode(self._table_after_retire(table, slot, retired))
+
+    def _table_after_retire(
+        self, table: _Table, slot: SubmitIntent, retired: SubmitIntent
+    ) -> _Table:
+        """The table once ``slot`` is retired (cool-off added; ``last`` set when drained)."""
+        rest = tuple(i for i in table.open if i.intent_id != slot.intent_id)
+        now_ns = retired.retired_ns or 0
+        cooloff = _live_cooloff(table.cooloff, now_ns)
+        if (
+            self._k_configured > 1
+            and self._cooloff_ns > 0
+            and slot.slug is not None
+            and not slot.is_exit
+            and retired.retirement_reason not in _NO_COOLOFF_REASONS
+        ):
+            cooloff = _with_cooloff(cooloff, slot.slug, now_ns + self._cooloff_ns)
+        return _Table(
+            version=table.version,
+            open=rest,
+            unreadable=table.unreadable,
+            cooloff=cooloff,
+            last=None if rest else retired,
+        )
+
+    def _reconcile_slots(
+        self,
+        table: _Table,
+        has_durable_fill_record: Callable[[str, int], object],
+        now_ns: int,
+    ) -> SubmitIntent | None:
+        """Repair every open slot of a v2 table that history or a fill record retires.
+
+        Returns the oldest slot still open, else the last repaired record.
+        """
+        working = table
+        repaired: SubmitIntent | None = None
+        for slot in table.open:
+            try:
+                history = self._retired_history(slot)
+            except SubmitIntentCorrupt:
+                continue
+            if history is not None:
+                record = history[0]
+            elif has_durable_fill_record(slot.fingerprint, slot.created_ns) is True:
+                record = _retired_from(slot, RetirementReason.STARTUP_FILL_RECORD_MATCH, now_ns)
+                self._store.set(history_key(slot.intent_id), record.to_bytes())
+            else:
+                continue
+            working = self._table_after_retire(working, slot, record)
+            repaired = record
+        if repaired is None:
+            return table.open[0] if table.open else None
+        self._store.set(CURRENT_INTENT_KEY, self._encode(working))
+        return working.open[0] if working.open else repaired
+
+    @staticmethod
+    def _encode(table: _Table) -> bytes:
+        """v1 bytes while at most one slot is open and none is unreadable, else v2."""
+        if len(table.open) + len(table.unreadable) <= 1 and not table.unreadable:
+            record = table.open[0] if table.open else table.last
+            if record is None:
+                raise SubmitIntentCorrupt()
+            payload = record.to_payload()
+            if table.cooloff:
+                payload["cooloff"] = dict(table.cooloff)
+            return json.dumps(payload, sort_keys=True).encode("utf-8")
+        return encode_v2(
+            {i.intent_id: i.to_payload() for i in table.open},
+            dict(table.unreadable),
+            dict(table.cooloff),
+        )
+
+    def _read_table(self) -> _Table:
+        """Decode ``CURRENT_INTENT_KEY``; whole-table corruption raises ``SubmitIntentCorrupt``."""
+        raw = self._store.get(CURRENT_INTENT_KEY)
+        if raw is None:
+            return _Table(version=0)
+        try:
+            parsed = parse_table(raw)
+        except SlotTableError:
+            raise SubmitIntentCorrupt() from None
+        if parsed.v1_record is not None:
+            record = SubmitIntent.from_payload(parsed.v1_record)
+            is_open = record.state is SubmitIntentState.OPEN
+            return _Table(
+                version=1,
+                open=(record,) if is_open else (),
+                cooloff=parsed.cooloff,
+                last=None if is_open else record,
+            )
+        readable: list[SubmitIntent] = []
+        unreadable: dict[str, bytes] = dict(parsed.raw_slots)
+        for key, value in parsed.slots:
+            slot = _slot_from_value(key, value)
+            if slot is None:
+                unreadable[key] = canonical_text(value)
+            else:
+                readable.append(slot)
+        readable.sort(key=lambda i: (i.created_ns, i.intent_id))
+        table = _Table(
+            version=2,
+            open=tuple(readable),
+            unreadable=tuple(sorted(unreadable.items())),
+            cooloff=parsed.cooloff,
+        )
+        self._note_unreadable(table)
+        return table
+
+    def _note_unreadable(self, table: _Table) -> None:
+        for key, _ in table.unreadable:
+            if key not in self._logged_unreadable:
+                self._logged_unreadable.add(key)
+                _LOG.error("submit intent slot %s is unreadable; slot table quarantined", key)
+
+    # ------------------------------------------------------------------
+    # EXEC-PAR slot API (inert: no production caller yet)
+    # ------------------------------------------------------------------
+
+    def max_slots(self) -> int:
+        """The effective K: the configured K, or 1 once :meth:`force_k1` ran."""
+        return 1 if self._k_forced_reason is not None else self._k_configured
+
+    @property
+    def k_forced_reason(self) -> str | None:
+        return self._k_forced_reason
+
+    def force_k1(self, reason: str) -> None:
+        """Pin the effective K to 1 for the rest of this process (first reason wins)."""
+        if self._k_forced_reason is None:
+            self._k_forced_reason = reason
+            _LOG.error("submit intent slots forced to K=1: %s", reason)
+
+    def open_slot_count(self) -> int:
+        """Open slots, unreadable ones included. Raises on a corrupt table."""
+        self._require_held()
+        with self._mutex:
+            table = self._read_table()
+        return len(table.open) + len(table.unreadable)
+
+    def is_open_intent(self, intent_id: str) -> bool:
+        self._require_held()
+        with self._mutex:
+            table = self._read_table()
+        return any(i.intent_id == intent_id for i in table.open)
+
+    def open_submit_intents(self) -> tuple[SubmitIntent, ...]:
+        """Readable OPEN slots, oldest first. Unreadable slots are not included."""
+        self._require_held()
+        with self._mutex:
+            return self._read_table().open
+
+    def unreadable_slot_keys(self) -> tuple[str, ...]:
+        """Keys of unreadable slots, plus ``?:<id>`` for slug-less slots when K > 1."""
+        self._require_held()
+        with self._mutex:
+            table = self._read_table()
+        keys = [key for key, _ in table.unreadable]
+        if self.max_slots() > 1:
+            keys.extend(f"{_LEGACY_KEY_PREFIX}{i.intent_id}" for i in table.open if i.slug is None)
+        return tuple(sorted(keys))
+
+    def next_open_for_resolution(
+        self, failures: Mapping[str, int], served: Mapping[str, int]
+    ) -> SubmitIntent | None:
+        """The readable OPEN slot to resolve next, independent of ``max_slots``.
+
+        Sorted by (per-intent failures, last served, created); unreadable
+        slots are skipped (logged once per key).
+        """
+        self._require_held()
+        with self._mutex:
+            table = self._read_table()
+        if not table.open:
+            return None
+        return min(
+            table.open,
+            key=lambda i: (
+                failures.get(i.intent_id, 0),
+                served.get(i.intent_id, 0),
+                i.created_ns,
+                i.intent_id,
+            ),
+        )
+
+    def admission_refusal(self, slug: str, is_exit: bool) -> str | None:
+        """Why a new slot on ``slug`` would be refused now, or ``None``. Read-only."""
+        self._require_held()
+        with self._mutex:
+            try:
+                table = self._read_table()
+            except SubmitIntentCorrupt:
+                return "corrupt"
+            return self._admission_locked(table, slug, is_exit, self._clock_ns())
+
+    def arm_slot(self, fingerprint: str, *, slug: str, is_exit: bool, now_ns: int) -> SubmitIntent:
+        """Write a new OPEN slot if ``admit`` allows it, or raise.
+
+        At an effective K of 1 the record carries neither slug nor exit flag,
+        so the bytes equal :meth:`arm`'s.
+        """
+        self._require_held()
+        if _FINGERPRINT_RE.fullmatch(fingerprint) is None:
+            raise SubmitIntentInvalidFingerprint()
+        if not 0 < len(slug) <= _MAX_SLUG_LEN:
+            raise SubmitIntentInvalidSlug()
+        with self._mutex:
+            try:
+                table = self._read_table()
+            except SubmitIntentCorrupt:
+                raise SubmitIntentLatched() from None
+            refusal = self._admission_locked(table, slug, is_exit, now_ns)
+            if refusal is not None:
+                blocker = table.open[0].intent_id if table.open else None
+                raise SubmitIntentAdmissionDenied(refusal, blocker)
+            single = self.max_slots() == 1
+            intent = SubmitIntent(
+                intent_id=uuid.uuid4().hex,
+                fingerprint=fingerprint,
+                created_ns=now_ns,
+                state=SubmitIntentState.OPEN,
+                retired_ns=None,
+                retirement_reason=None,
+                slug=None if single else slug,
+                is_exit=False if single else is_exit,
+            )
+            self._store.set(
+                CURRENT_INTENT_KEY,
+                self._encode(
+                    _Table(
+                        version=table.version,
+                        open=(*table.open, intent),
+                        unreadable=table.unreadable,
+                        cooloff=_live_cooloff(table.cooloff, now_ns),
+                    )
+                ),
+            )
+            return intent
+
+    def _admission_locked(self, table: _Table, slug: str, is_exit: bool, now_ns: int) -> str | None:
+        k = self.max_slots()
+        breaker_reason = None if k == 1 or is_exit else self._breaker_denial()
+        slugless = sum(1 for i in table.open if i.slug is None) if k > 1 else 0
+        view = SlotTableView(
+            open_slots=tuple(SlotRecord(i.intent_id, i.slug or "", i.is_exit) for i in table.open),
+            unreadable_slots=len(table.unreadable) + slugless,
+            cooloff=table.cooloff,
+        )
+        verdict = admit(view, slug, is_exit, k, breaker_reason is not None, now_ns)
+        if isinstance(verdict, Wait):
+            if verdict.reason == "entry_halt" and breaker_reason is not None:
+                return breaker_reason
+            return verdict.reason
+        if len(table.open) + len(table.unreadable) >= 1 and not self._v2_permitted():
+            return "v2_predicate"
+        return None
+
+    def _v2_permitted(self) -> bool:
+        try:
+            return bool(self._v2_predicate())
+        except Exception:  # noqa: BLE001 - contained by contract: a raising predicate is a WAIT
+            _LOG.exception("v2 slot-table predicate raised; treating as not permitted")
+            return False
+
+    def adopt_legacy_open_slugs(self, slug_of: Callable[[str], str | None]) -> int:
+        """Give slug-less OPEN slots the slug ``slug_of(intent_id)`` finds (K > 1 only).
+
+        A slot with no findable slug stays slug-less and so quarantined
+        (``?:<id>``). Returns the number adopted; a no-op at an effective K of 1.
+        """
+        self._require_held()
+        if self.max_slots() == 1:
+            return 0
+        with self._mutex:
+            table = self._read_table()
+            adopted = 0
+            slots: list[SubmitIntent] = []
+            for slot in table.open:
+                found = self._find_slug(slug_of, slot) if slot.slug is None else None
+                if found is None:
+                    slots.append(slot)
+                else:
+                    slots.append(replace(slot, slug=found))
+                    adopted += 1
+            if adopted:
+                self._store.set(CURRENT_INTENT_KEY, self._encode(replace(table, open=tuple(slots))))
+            return adopted
+
+    @staticmethod
+    def _find_slug(slug_of: Callable[[str], str | None], slot: SubmitIntent) -> str | None:
+        try:
+            found = slug_of(slot.intent_id)
+        except Exception:  # noqa: BLE001 - a missing context quarantines, it never raises
+            return None
+        if found is None or not 0 < len(found) <= _MAX_SLUG_LEN:
+            return None
+        return found
+
+    def seed_boot_cooloff(self, *, now_ns: int) -> int:
+        """Give every slug OPEN at boot a synthetic cool-off from ``now_ns`` (K > 1 only)."""
+        self._require_held()
+        if self._k_configured == 1 or self._cooloff_ns == 0:
+            return 0
+        with self._mutex:
+            table = self._read_table()
+            cooloff = _live_cooloff(table.cooloff, now_ns)
+            slugs = [i.slug for i in table.open if i.slug is not None]
+            for slug in slugs:
+                cooloff = _with_cooloff(cooloff, slug, now_ns + self._cooloff_ns)
+            if slugs:
+                self._store.set(CURRENT_INTENT_KEY, self._encode(replace(table, cooloff=cooloff)))
+            return len(slugs)
+
+    # ------------------------------------------------------------------
+    # Breaker record (latch side only; the watcher is the single writer)
+    # ------------------------------------------------------------------
+
+    def read_breaker_record(self) -> BreakerRecord | None:
+        """The breaker record, ``None`` if absent; a garbled one raises ``SubmitIntentCorrupt``."""
+        self._require_held()
+        with self._mutex:
+            return self._read_breaker()
+
+    def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None:
+        """Write a heartbeat, preserving ``halted``. Never overwrites a garbled record."""
+        self._require_held()
+        with self._mutex:
+            existing = self._read_breaker()
+            self._store.set(
+                BREAKER_KEY,
+                encode_breaker(
+                    BreakerRecord(
+                        halted_reason=None if existing is None else existing.halted_reason,
+                        halted_ts_ns=None if existing is None else existing.halted_ts_ns,
+                        hb_ns=hb_ns,
+                        resolver_pass_ns=resolver_pass_ns,
+                    )
+                ),
+            )
+
+    def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None:
+        """Latch the entry halt (sticky: the first reason stays). Overwrites a garbled record."""
+        self._require_held()
+        with self._mutex:
+            try:
+                existing = self._read_breaker()
+            except SubmitIntentCorrupt:
+                existing = None
+            if existing is not None and existing.is_halted:
+                return
+            self._store.set(
+                BREAKER_KEY,
+                encode_breaker(
+                    BreakerRecord(
+                        halted_reason=reason,
+                        halted_ts_ns=ts_ns,
+                        hb_ns=0 if existing is None else existing.hb_ns,
+                        resolver_pass_ns=0 if existing is None else existing.resolver_pass_ns,
+                    )
+                ),
+            )
+
+    def _read_breaker(self) -> BreakerRecord | None:
+        raw = self._store.get(BREAKER_KEY)
+        if raw is None:
+            return None
+        try:
+            return parse_breaker(raw)
+        except SlotTableError:
+            raise SubmitIntentCorrupt() from None
+
+    def _breaker_denial(self) -> str | None:
+        """Entry-denial label from ONE breaker ``get`` (K > 1), fail closed."""
+        now_ns = self._clock_ns()
+        try:
+            record = self._read_breaker()
+        except Exception:  # noqa: BLE001 - unreadable breaker state denies entries
+            return "breaker_unreadable"
+        if record is None:
+            return "breaker_absent" if now_ns - self._boot_ns > BREAKER_ABSENT_GRACE_NS else None
+        if record.is_halted:
+            return "breaker_halted"
+        if now_ns - record.hb_ns > BREAKER_HEARTBEAT_MAX_AGE_NS:
+            return "breaker_heartbeat_stale"
+        if now_ns - record.resolver_pass_ns > BREAKER_RESOLVER_PASS_MAX_AGE_NS:
+            return "breaker_resolver_stale"
+        return None
 
     def shared_state_binding(self) -> tuple[StateStore, _HeldSubmitIntentLock]:
         """Return the exact ``(store, lock)`` this latch was opened with.
@@ -592,6 +1147,11 @@ def hold_submit_intent_process_lock(store_path: Path) -> Iterator[_HeldSubmitInt
 def open_submit_intent_latch(
     store: StateStore,
     store_path: Path,
+    *,
+    max_slots: int = 1,
+    cooloff_ns: int = DEFAULT_COOLOFF_NS,
+    v2_predicate: Callable[[], bool] | None = None,
+    clock_ns: Callable[[], int] | None = None,
 ) -> Iterator[SubmitIntentLatch]:
     """Acquire the exclusive process lock and yield a latch bound to it.
 
@@ -599,6 +1159,18 @@ def open_submit_intent_latch(
     ``retire`` must run on one thread. A second factory over the same store
     path raises ``SubmitIntentLockHeld``. Using the latch after this ``with``
     exits raises ``SubmitIntentLockNotHeld``.
+
+    The keyword arguments configure the EXEC-PAR slot table and default to
+    the single-slot (K=1) behaviour: ``max_slots`` is K, ``v2_predicate`` gates
+    every 1 -> 2 transition (default: never), ``clock_ns`` times the breaker
+    checks.
     """
     with hold_submit_intent_process_lock(store_path) as lock:
-        yield SubmitIntentLatch(store, lock)
+        yield SubmitIntentLatch(
+            store,
+            lock,
+            max_slots=max_slots,
+            cooloff_ns=cooloff_ns,
+            v2_predicate=v2_predicate,
+            clock_ns=clock_ns,
+        )
