@@ -39,6 +39,7 @@ __all__ = [
     "encode_breaker",
     "encode_raw_slot",
     "encode_v2",
+    "is_valid_slot_key",
     "parse_breaker",
     "parse_table",
 ]
@@ -126,8 +127,13 @@ def _parse_cooloff(value: object) -> tuple[tuple[str, int], ...]:
     return tuple(sorted(pairs))
 
 
+def is_valid_slot_key(key: str) -> bool:
+    """Whether ``key`` matches ``[A-Za-z0-9._-]{1,128}|\\?:[0-9a-f]{32}`` (no path characters)."""
+    return _SLOT_KEY_RE.fullmatch(key) is not None
+
+
 def _check_key(key: str) -> str:
-    if _SLOT_KEY_RE.fullmatch(key) is None:
+    if not is_valid_slot_key(key):
         raise SlotTableError("slot key")
     return key
 

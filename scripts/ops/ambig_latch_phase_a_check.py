@@ -23,7 +23,8 @@ no network call, and never prints a revision, pid, path or environment value.
    invalid input (exit 2); use ``none`` when the node was down at U1.
 2. Decode check: ``supervisor_admits_retirement_reason(store,
    "RESOLVER_NO_ID_NO_FILL")`` is True, the marker pid equals ``MainPID``, and a
-   synthetic RETIRED intent with that member round-trips in memory.
+   synthetic RETIRED intent with that member round-trips in memory, and
+   ``supervisor_admits_slot_schema(store, 2)`` is True (EXEC-PAR WP5a).
 3. Same-pid adoption: after that ``supervisor_started`` line, a
    ``permit_watch_adopted_live_node pid=<P>`` line has ``P`` equal to the
    pre-restart node pid AND to the intent-lock holder (``/proc/locks``). With
@@ -53,6 +54,7 @@ from breezy.runtime.submit_intent import RetirementReason, SubmitIntent, SubmitI
 from breezy.runtime.supervisor_decode_marker import (
     read_supervisor_decode_marker,
     supervisor_admits_retirement_reason,
+    supervisor_admits_slot_schema,
 )
 from breezy.runtime.trade_supervisor import (
     intent_lock_path,
@@ -245,6 +247,8 @@ def _check_two(store_path: Path | None, probes: Probes) -> CheckResult:
         return False, "marker_pid_not_mainpid"
     if not supervisor_admits_retirement_reason(store_path, NEW_REASON):
         return False, "marker_does_not_admit_new_member"
+    if not supervisor_admits_slot_schema(store_path, 2):
+        return False, "marker_does_not_admit_slot_schema_2"
     if not _synthetic_retired_round_trips():
         return False, "synthetic_round_trip_failed"
     return True, ""

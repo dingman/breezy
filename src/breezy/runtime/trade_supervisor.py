@@ -68,9 +68,8 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
-    SubmitIntent,
     SubmitIntentCorrupt,
-    SubmitIntentState,
+    decode_slot_table,
 )
 from breezy.runtime.supervisor_decode_marker import (
     discard_supervisor_decode_marker,
@@ -429,13 +428,14 @@ def count_lock_holders(lock_path: Path, *, locks_path: Path = DEFAULT_PROC_LOCKS
 
 
 def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
-    """Read-only-by-convention read of the submit-intent singleton via a
+    """Read-only-by-convention read of the submit-intent table via a
     FRESH ``SqliteStateStore`` connection (SQLite serves concurrent
     readers), outside any mutex or flock -- never invoked while a node PID
     is live (:func:`assert_no_live_node_before_intent_probe` enforces this).
 
-    A corrupt singleton is treated as OPEN (fail closed), matching
-    ``SubmitIntentLatch.is_latched``'s own stance.
+    OPEN iff any slot is open or unreadable (EXEC-PAR v2 table). A corrupt
+    table is treated as OPEN (fail closed), matching
+    ``SubmitIntentLatch.is_latched``'s own stance. A v1 record reads as before.
     """
     assert_no_live_node_before_intent_probe(node_pid)
     with SqliteStateStore(store_path) as store:
@@ -443,21 +443,23 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
         if raw is None:
             return False
         try:
-            record = SubmitIntent.from_bytes(raw)
+            table = decode_slot_table(raw)
         except SubmitIntentCorrupt:
             return True
-        return record.state is SubmitIntentState.OPEN
+        return bool(table.open or table.unreadable)
 
 
 def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> bool:
-    """[AMBIG-LATCH-RESUME Phase A, CM1] ``True`` iff the singleton DECODES
-    and is OPEN -- i.e. the node's resolver can retire it, so the supervisor
-    launches the node instead of stranding the intent (L-48).
+    """[AMBIG-LATCH-RESUME Phase A, CM1] ``True`` iff the table DECODES and
+    has an OPEN intent -- i.e. the node's resolver can retire it, so the
+    supervisor launches the node instead of stranding the intent (L-48).
 
-    A corrupt singleton is ``False`` (today's refusal stays): the node's
-    resolver treats corrupt as OPEN-unknown and never retires it. Same
+    A corrupt table is ``False`` (today's refusal stays): the node's resolver
+    treats corrupt as OPEN-unknown and never retires it. For a v2 table it is
+    also ``False`` when any slot is unreadable or any open slot has no durable
+    resolver context (EXEC-PAR WP5a); a v1 record needs no context read. Same
     no-live-node guard and fresh read-only connection as
-    :func:`probe_open_intent`; needs no adapter import and no context read.
+    :func:`probe_open_intent`.
     """
     assert_no_live_node_before_intent_probe(node_pid)
     with SqliteStateStore(store_path) as store:
@@ -465,10 +467,37 @@ def probe_open_intent_resolvable(store_path: Path, *, node_pid: int | None) -> b
         if raw is None:
             return False
         try:
-            record = SubmitIntent.from_bytes(raw)
+            table = decode_slot_table(raw)
         except SubmitIntentCorrupt:
             return False
-        return record.state is SubmitIntentState.OPEN
+        if table.unreadable or not table.open:
+            return False
+        if table.version != 2:
+            return True
+        return all(
+            store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{slot.intent_id}") is not None
+            for slot in table.open
+        )
+
+
+#: Worst-first order for combining the per-slot shapes of a v2 table.
+_SHAPE_SEVERITY: Final[tuple[OpenIntentShape, ...]] = (
+    OpenIntentShape.UNKNOWN,
+    OpenIntentShape.NO_CONTEXT,
+    OpenIntentShape.NO_ID,
+    OpenIntentShape.WITH_ID,
+)
+
+
+def _context_shape(store: SqliteStateStore, intent_id: str) -> OpenIntentShape:
+    raw_context = store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+    if raw_context is None:
+        return OpenIntentShape.NO_CONTEXT
+    payload = json.loads(raw_context)
+    venue_order_id = payload.get("venueOrderId") if isinstance(payload, dict) else None
+    if not isinstance(venue_order_id, str):
+        return OpenIntentShape.UNKNOWN
+    return OpenIntentShape.WITH_ID if venue_order_id else OpenIntentShape.NO_ID
 
 
 def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIntentShape:
@@ -479,7 +508,8 @@ def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIn
     ``WITH_ID``: ``venueOrderId`` is a non-empty string. ``NO_ID``:
     ``venueOrderId == ""``. ``NO_CONTEXT``: the key is absent. ``UNKNOWN``:
     anything undecodable, an unreadable singleton or store, or any exception
-    -- the fail-loud direction. Same no-live-node guard as
+    -- the fail-loud direction. A v2 table reports its worst slot (an
+    unreadable slot is ``UNKNOWN``). Same no-live-node guard as
     :func:`probe_open_intent`.
     """
     assert_no_live_node_before_intent_probe(node_pid)
@@ -488,15 +518,16 @@ def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIn
             raw_intent = store.get(CURRENT_INTENT_KEY)
             if raw_intent is None:
                 return OpenIntentShape.UNKNOWN
-            intent = SubmitIntent.from_bytes(raw_intent)
-            raw_context = store.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent.intent_id}")
-        if raw_context is None:
-            return OpenIntentShape.NO_CONTEXT
-        payload = json.loads(raw_context)
-        venue_order_id = payload.get("venueOrderId") if isinstance(payload, dict) else None
-        if not isinstance(venue_order_id, str):
-            return OpenIntentShape.UNKNOWN
-        return OpenIntentShape.WITH_ID if venue_order_id else OpenIntentShape.NO_ID
+            table = decode_slot_table(raw_intent)
+            if table.version == 2:
+                if table.unreadable:
+                    return OpenIntentShape.UNKNOWN
+                shapes = {_context_shape(store, slot.intent_id) for slot in table.open}
+                return next((s for s in _SHAPE_SEVERITY if s in shapes), OpenIntentShape.UNKNOWN)
+            record = table.open[0] if table.open else table.last
+            if record is None:
+                return OpenIntentShape.UNKNOWN
+            return _context_shape(store, record.intent_id)
     except Exception:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
         return OpenIntentShape.UNKNOWN
 

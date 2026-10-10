@@ -194,6 +194,10 @@ _CURRENT_INTENT_KEY = "exec/polymarket_us/intent/current"
 #: importing the enum).
 _KNOWN_INTENT_STATES = frozenset({"OPEN", "RETIRED"})
 
+#: Duplicated literal (never imported, C10): the EXEC-PAR slot table's `"v"`.
+_SLOT_TABLE_VERSION = 2
+
+
 class NodeStorePreflightRefused(Exception):
     """`node_store_path_check` returned MISMATCH or DISCOVERY_FAILED
     (REVISE-1/REVISE-4): `self.reason` is `node_store_mismatch` or
@@ -202,6 +206,7 @@ class NodeStorePreflightRefused(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
 
 #: B1 (v2-only live-provenance sidecar, ruling Q4
 #: `docs/evidence/grok_partial_fill_ruling_2026-09-04.md`): the 17-column
@@ -369,6 +374,7 @@ def _filled_trial_from_json(row: Mapping[str, Any]) -> FilledTrial:
         venue_settlement_tmax_f=row.get("venue_settlement_tmax_f"),
     )
 
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class UnresolvedTake:
     """A `TrialDayRecord` latched `reason="taken"` with no matching
@@ -409,6 +415,10 @@ def _decode_intent_state(value: object) -> str:
         return "absent"
     if not isinstance(payload, dict):
         return "absent"
+    if payload.get("v") == _SLOT_TABLE_VERSION:
+        # An EXEC-PAR v2 table holds only open (or unreadable, hence open)
+        # slots and has no top-level "state": it is never "absent".
+        return "OPEN"
     state = payload.get("state")
     if isinstance(state, str) and state in _KNOWN_INTENT_STATES:
         return state
@@ -747,7 +757,8 @@ def score_live_trials(
             extra_refusals.append(malformed_qty)
             continue
         fee_reconciled, venue_order_id, skip_ask_guard = fee_reconciled_by_trial_id.get(
-            trial.trial_id, (True, "", False),
+            trial.trial_id,
+            (True, "", False),
         )
         no_side_residual = no_side_residual_by_trial_id.get(trial.trial_id, False)
         exclusion = _admit_fill(

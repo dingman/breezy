@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_COOLOFF_NS",
     "BreakerRecord",
     "RetirementReason",
+    "SlotTable",
     "StateStore",
     "SubmitIntent",
     "SubmitIntentAdmissionDenied",
@@ -76,6 +78,7 @@ __all__ = [
     "SubmitIntentLockNotHeld",
     "SubmitIntentMismatch",
     "SubmitIntentState",
+    "decode_slot_table",
     "history_key",
     "hold_submit_intent_process_lock",
     "open_submit_intent_latch",
@@ -438,7 +441,7 @@ _LEGACY_KEY_PREFIX: Final[str] = "?:"
 
 
 @dataclass(frozen=True, slots=True)
-class _Table:
+class SlotTable:
     """Decoded slot table: readable OPEN slots, unreadable slots, cool-offs.
 
     ``last`` is the v1 RETIRED record when no slot is open. ``version`` is 0
@@ -475,6 +478,46 @@ def _slot_from_value(key: str, value: object) -> SubmitIntent | None:
     if record.state is not SubmitIntentState.OPEN or record.intent_id != key:
         return None
     return record
+
+
+def decode_slot_table(raw: bytes | None) -> SlotTable:
+    """Decode a stored ``CURRENT_INTENT_KEY`` value (``None`` = absent); pure, no I/O.
+
+    The read-only seam for consumers that hold no latch (the supervisor probes,
+    the operator CLI, the analysis readers). Whole-table corruption raises
+    :class:`SubmitIntentCorrupt`; an unreadable slot is reported in
+    ``unreadable`` and counts as OPEN for every caller.
+    """
+    if raw is None:
+        return SlotTable(version=0)
+    try:
+        parsed = parse_table(raw)
+    except SlotTableError:
+        raise SubmitIntentCorrupt() from None
+    if parsed.v1_record is not None:
+        record = SubmitIntent.from_payload(parsed.v1_record)
+        is_open = record.state is SubmitIntentState.OPEN
+        return SlotTable(
+            version=1,
+            open=(record,) if is_open else (),
+            cooloff=parsed.cooloff,
+            last=None if is_open else record,
+        )
+    readable: list[SubmitIntent] = []
+    unreadable: dict[str, bytes] = dict(parsed.raw_slots)
+    for key, value in parsed.slots:
+        slot = _slot_from_value(key, value)
+        if slot is None:
+            unreadable[key] = canonical_text(value)
+        else:
+            readable.append(slot)
+    readable.sort(key=lambda i: (i.created_ns, i.intent_id))
+    return SlotTable(
+        version=2,
+        open=tuple(readable),
+        unreadable=tuple(sorted(unreadable.items())),
+        cooloff=parsed.cooloff,
+    )
 
 
 class SubmitIntentLatch:
@@ -603,7 +646,7 @@ class SubmitIntentLatch:
             cooloff = _live_cooloff(self._read_table().cooloff, now_ns)
             self._store.set(
                 CURRENT_INTENT_KEY,
-                self._encode(_Table(version=1, open=(intent,), cooloff=cooloff)),
+                self._encode(SlotTable(version=1, open=(intent,), cooloff=cooloff)),
             )
             return intent
 
@@ -699,12 +742,12 @@ class SubmitIntentLatch:
         self._store.set(CURRENT_INTENT_KEY, self._after_retire(table, slot, retired))
         return retired
 
-    def _after_retire(self, table: _Table, slot: SubmitIntent, retired: SubmitIntent) -> bytes:
+    def _after_retire(self, table: SlotTable, slot: SubmitIntent, retired: SubmitIntent) -> bytes:
         return self._encode(self._table_after_retire(table, slot, retired))
 
     def _table_after_retire(
-        self, table: _Table, slot: SubmitIntent, retired: SubmitIntent
-    ) -> _Table:
+        self, table: SlotTable, slot: SubmitIntent, retired: SubmitIntent
+    ) -> SlotTable:
         """The table once ``slot`` is retired (cool-off added; ``last`` set when drained)."""
         rest = tuple(i for i in table.open if i.intent_id != slot.intent_id)
         now_ns = retired.retired_ns or 0
@@ -717,7 +760,7 @@ class SubmitIntentLatch:
             and retired.retirement_reason not in _NO_COOLOFF_REASONS
         ):
             cooloff = _with_cooloff(cooloff, slot.slug, now_ns + self._cooloff_ns)
-        return _Table(
+        return SlotTable(
             version=table.version,
             open=rest,
             unreadable=table.unreadable,
@@ -727,7 +770,7 @@ class SubmitIntentLatch:
 
     def _reconcile_slots(
         self,
-        table: _Table,
+        table: SlotTable,
         has_durable_fill_record: Callable[[str, int], object],
         now_ns: int,
     ) -> SubmitIntent | None:
@@ -761,7 +804,7 @@ class SubmitIntentLatch:
         return repaired
 
     @staticmethod
-    def _encode(table: _Table) -> bytes:
+    def _encode(table: SlotTable) -> bytes:
         """v1 bytes while at most one slot is open and none is unreadable, else v2."""
         if len(table.open) + len(table.unreadable) <= 1 and not table.unreadable:
             record = table.open[0] if table.open else table.last
@@ -777,43 +820,13 @@ class SubmitIntentLatch:
             dict(table.cooloff),
         )
 
-    def _read_table(self) -> _Table:
+    def _read_table(self) -> SlotTable:
         """Decode ``CURRENT_INTENT_KEY``; whole-table corruption raises ``SubmitIntentCorrupt``."""
-        raw = self._store.get(CURRENT_INTENT_KEY)
-        if raw is None:
-            return _Table(version=0)
-        try:
-            parsed = parse_table(raw)
-        except SlotTableError:
-            raise SubmitIntentCorrupt() from None
-        if parsed.v1_record is not None:
-            record = SubmitIntent.from_payload(parsed.v1_record)
-            is_open = record.state is SubmitIntentState.OPEN
-            return _Table(
-                version=1,
-                open=(record,) if is_open else (),
-                cooloff=parsed.cooloff,
-                last=None if is_open else record,
-            )
-        readable: list[SubmitIntent] = []
-        unreadable: dict[str, bytes] = dict(parsed.raw_slots)
-        for key, value in parsed.slots:
-            slot = _slot_from_value(key, value)
-            if slot is None:
-                unreadable[key] = canonical_text(value)
-            else:
-                readable.append(slot)
-        readable.sort(key=lambda i: (i.created_ns, i.intent_id))
-        table = _Table(
-            version=2,
-            open=tuple(readable),
-            unreadable=tuple(sorted(unreadable.items())),
-            cooloff=parsed.cooloff,
-        )
+        table = decode_slot_table(self._store.get(CURRENT_INTENT_KEY))
         self._note_unreadable(table)
         return table
 
-    def _note_unreadable(self, table: _Table) -> None:
+    def _note_unreadable(self, table: SlotTable) -> None:
         for key, _ in table.unreadable:
             if key not in self._logged_unreadable:
                 self._logged_unreadable.add(key)
@@ -940,7 +953,7 @@ class SubmitIntentLatch:
             self._store.set(
                 CURRENT_INTENT_KEY,
                 self._encode(
-                    _Table(
+                    SlotTable(
                         version=table.version,
                         open=(*table.open, intent),
                         unreadable=table.unreadable,
@@ -950,7 +963,9 @@ class SubmitIntentLatch:
             )
             return intent
 
-    def _admission_locked(self, table: _Table, slug: str, is_exit: bool, now_ns: int) -> str | None:
+    def _admission_locked(
+        self, table: SlotTable, slug: str, is_exit: bool, now_ns: int
+    ) -> str | None:
         k = self.max_slots()
         breaker_reason = None if k == 1 or is_exit else self._breaker_denial(now_ns)
         slugless = sum(1 for i in table.open if i.slug is None) if k > 1 else 0
@@ -1080,6 +1095,66 @@ class SubmitIntentLatch:
                     )
                 ),
             )
+
+    def discard_unreadable_slot(self, key: str, *, now_ns: int) -> None:
+        """Operator recovery (node down): drop the unreadable slot ``key``.
+
+        Only the recovery CLI calls this, and only after the original table
+        bytes were dumped durably. Every other slot is re-emitted unchanged.
+        Removing the last slot of the table writes a synthetic v1 RETIRED
+        record (``OPERATOR_CLEARED``, id/fingerprint derived from ``key``) so
+        an older reader still sees a valid record. A key that is not an
+        unreadable slot raises :class:`SubmitIntentMismatch`.
+        """
+        self._require_held()
+        with self._mutex:
+            table = self._read_table()
+            rest = tuple((k, v) for k, v in table.unreadable if k != key)
+            if len(rest) == len(table.unreadable):
+                raise SubmitIntentMismatch(key, None, None)
+            last: SubmitIntent | None = None
+            if not rest and not table.open:
+                digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+                last = SubmitIntent(
+                    intent_id=digest[:32],
+                    fingerprint=digest,
+                    created_ns=now_ns,
+                    state=SubmitIntentState.RETIRED,
+                    retired_ns=now_ns,
+                    retirement_reason=RetirementReason.OPERATOR_CLEARED,
+                )
+            self._store.set(
+                CURRENT_INTENT_KEY,
+                self._encode(replace(table, unreadable=rest, last=last)),
+            )
+
+    def reset_breaker_halt(self) -> bool:
+        """Operator reset (node down): clear ``halted``, keep the stamps.
+
+        Returns ``False`` when no halted record exists. A garbled record is
+        replaced by a fresh un-halted one (the operator reviewed the positions).
+        """
+        self._require_held()
+        with self._mutex:
+            try:
+                existing = self._read_breaker()
+            except SubmitIntentCorrupt:
+                self._store.set(
+                    BREAKER_KEY,
+                    encode_breaker(BreakerRecord(None, None, hb_ns=0, resolver_pass_ns=0)),
+                )
+                return True
+            if existing is None or not existing.is_halted:
+                return False
+            self._store.set(
+                BREAKER_KEY,
+                encode_breaker(
+                    BreakerRecord(
+                        None, None, hb_ns=existing.hb_ns, resolver_pass_ns=existing.resolver_pass_ns
+                    )
+                ),
+            )
+            return True
 
     def _read_breaker(self) -> BreakerRecord | None:
         raw = self._store.get(BREAKER_KEY)
