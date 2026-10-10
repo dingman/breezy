@@ -2018,6 +2018,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: EXEC-PAR E14.5: intents already counted as a holding-bearing
         #: contradiction, so the monotonic counter counts each once.
         self._holding_contradiction_intent_ids: frozenset[str] = frozenset()
+        #: EXEC-PAR M2: intents the E14.4 guard refused to retire as NO_FILL, and
+        #: the monotonic count of them (once per intent).
+        self._no_fill_refused_intent_ids: frozenset[str] = frozenset()
+        self._no_fill_retire_refusals_total: int = 0
         self._duplicate_suspect_passes: dict[str, int] = {}
         self._resolver_last_failure_kind: dict[str, str] = {}
         # Item 3 (2026-09-11 incident addendum): one-shot stale-intent
@@ -2156,6 +2160,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         contradiction's own clearing at ``_retire``. A manual trade that trips it
         fails closed (accepted, plan 9.8)."""
         return self._contradiction_events_total
+
+    @property
+    def no_fill_retire_refusals_total(self) -> int:
+        """EXEC-PAR M2 / E14.4: monotonic count of intents the NO_FILL guard
+        refused to retire because a durable create-path fill exists for them (the
+        with-id upgrade failed). Counted once per intent; the WP5b supervisor
+        alerts when it is above zero."""
+        return self._no_fill_retire_refusals_total
 
     @property
     def stuck_refusals_after_settle_failure_total(self) -> int:
@@ -3747,6 +3759,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"intent {context.intent_id}"
                 )
         else:
+            # M1: only THIS intent's refusal counts (its slug; `""` is the unscoped
+            # K=1 one), never another slot's.
             # E14.1: the AMBIGUOUS refusal stays latched (fail-closed) -- make
             # that visible: one ERROR naming the refusal and its slug, plus a
             # counter. A plain `+=` and f-string: no new callee.
@@ -3754,6 +3768,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 refusal
                 for refusal in self._trading_refusals
                 if refusal.reason == submit_chain.AMBIGUOUS_REASON
+                and refusal.instrument == slug
             ]
             if stuck_refusals:
                 self._stuck_refusals_after_settle_failure_total += 1
@@ -4725,7 +4740,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # E14.8: never leak a registry entry for an intent already closed.
                 self._ledger.abandon_open_exposure(intent_id)
             return
+        # E14.4 guard. Known gap (accepted): the flag is process-local. After a
+        # restart it is gone, and if the durable fill-record probe is also
+        # unreadable the guard cannot see the fill; the held-leg baseline check
+        # upstream (venue holding vs the durable net) then raises a CONTRADICTION
+        # instead of NO_FILL, so the intent still stays AMBIGUOUS.
         if intent_id in self._create_fill_recorded_intent_ids:
+            if intent_id not in self._no_fill_refused_intent_ids:
+                self._no_fill_refused_intent_ids = self._no_fill_refused_intent_ids | {intent_id}
+                self._no_fill_retire_refusals_total += 1
             self._log.error(
                 f"resolver: refusing to retire intent {intent_id} as NO_FILL -- a durable fill "
                 "record exists for it (a create-path accept-fill whose with-id upgrade failed); "
@@ -4810,6 +4833,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"intent {intent_id}"
                 )
         else:
+            # M1: only THIS intent's refusal counts (its slug; `""` is the unscoped
+            # K=1 one), never another slot's.
             # E14.1: the AMBIGUOUS refusal stays latched (fail-closed) -- make
             # that visible: one ERROR naming the refusal and its slug, plus a
             # counter. A plain `+=` and f-string: no new callee.
@@ -4817,6 +4842,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 refusal
                 for refusal in self._trading_refusals
                 if refusal.reason == submit_chain.AMBIGUOUS_REASON
+                and refusal.instrument == slug
             ]
             if stuck_refusals:
                 self._stuck_refusals_after_settle_failure_total += 1

@@ -324,6 +324,8 @@ async def test_failed_with_id_upgrade_never_lets_the_no_id_route_retire_as_no_fi
             await run_passes(rig.client, count=3)
 
             assert rig.latch.is_open_intent(intent_id), "a durable fill exists: never NO_FILL"
+            # M2: counted once per intent however many passes refuse (monotonic).
+            assert rig.client.no_fill_retire_refusals_total == 1
             assert not rig.events_named("OrderRejected")
             assert rig.client.log_lines("ERROR", "durable fill")
 
@@ -447,3 +449,36 @@ async def test_not_open_early_return_abandons_the_registry_entry(
 
             assert not rig.ledger.has_open_exposure(intent_id), "no registry entry leaks"
             assert decimal_spent(rig) == Decimal("0.37"), "abandon adds no spend"
+
+
+@pytest.mark.asyncio
+async def test_stuck_refusal_counter_ignores_another_slots_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """M1: the counter increments only for THIS intent's slug (or the unscoped
+    refusal at K=1), never because a different slot's AMBIGUOUS refusal is latched."""
+    ledger = SpyLedger()
+    sender = ScriptedSender(ok(ambiguous_body("ord-a")), ok(ambiguous_body("ord-b")))
+    with caps():
+        async with par_rig(tmp_path, monkeypatch, sender=sender, ledger=ledger, max_slots=2) as rig:
+            await rig.client._submit_order(rig.buy(rig.instruments[0]))
+            await rig.client._submit_order(rig.buy(rig.instruments[1]))
+            by_slug = {i.slug: i.intent_id for i in rig.latch.open_submit_intents()}
+            for intent_id in by_slug.values():
+                backdate(rig.client, intent_id)
+            # Only slot B's refusal remains latched; A's was cleared out of band.
+            rig.client._trading_refusals = [
+                r for r in rig.client._trading_refusals if r.instrument == rig.slug(1)
+            ]
+            wire_order(rig, "ord-a", 0, state="ORDER_STATE_CANCELED", cum_quantity=0)
+            wire_order(rig, "ord-b", 1, state="ORDER_STATE_NEW", cum_quantity=0)
+            wire_positions(rig, {})
+            ledger.settle_raises = 1
+
+            await run_passes(rig.client, count=2)
+
+            assert not rig.latch.is_open_intent(by_slug[rig.slug(0)]), "A retired"
+            assert rig.client.stuck_refusals_after_settle_failure_total == 0
+            assert rig.client.log_lines("ERROR", "stuck") == []
