@@ -56,7 +56,13 @@ def admit(
     entry_halted: bool,
     now_ns: int,
 ) -> Admit | Wait:
-    """Return ``Admit()`` or ``Wait(reason)`` for a would-be slot on ``slug``."""
+    """Return ``Admit()`` or ``Wait(reason)`` for a would-be slot on ``slug``.
+
+    Reason order (first match wins): quarantine -> slot_open (k == 1) /
+    slug_open (k > 1) -> entry_halt -> k_full -> cooloff. ``slug_open`` is
+    reported before ``entry_halt`` on purpose: the allow/deny outcome is
+    identical either way, only the reported reason differs.
+    """
     if table.unreadable_slots > 0:
         return Wait("quarantine")
     if k == 1:
