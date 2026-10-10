@@ -38,6 +38,7 @@ Breezy policy rather than venue truth.
 from __future__ import annotations
 
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -681,6 +682,17 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     #: the environment). Gates only a RETIREMENT path, never an order. Fail-closed
     #: default.
     no_id_retire_admitted: bool = False
+    #: EXEC-PAR WP5b: Breezy-owned parallel-intent knobs, filled by
+    #: ``build_trade_node_config`` from ``runtime.node_config`` ``Final``
+    #: constants (never the environment, never an operator control). The
+    #: defaults are the K=1, bound-off behaviour every earlier composition
+    #: root already has. ``max_concurrent_intents`` mirrors the injected
+    #: latch's K; the two fractions and the frozen bucket LABEL only take
+    #: effect when it exceeds 1 (see ``factories``).
+    max_concurrent_intents: int = 1
+    open_exposure_bound_fraction: Decimal | None = None
+    breaker_open_ambiguous_fraction: Decimal | None = None
+    frozen_cost_budget_bucket: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

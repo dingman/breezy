@@ -378,6 +378,23 @@ def exec_config_from_env(
     )
 
 
+def _spend_ledger_for(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
+    """The client's spend ledger, with the EXEC-PAR bounds only when K > 1.
+
+    At an effective K of 1 the open-exposure bound and the AMBIGUOUS-notional
+    breaker stay OFF (``None``), so the ledger is exactly the K=1 one: the
+    per-order ``cost > f_adm x budget`` refusal could otherwise deny an order
+    the one-at-a-time latch admitted today. The fractions are Breezy-owned
+    ``Final`` constants threaded through the config, never operator controls.
+    """
+    if config.max_concurrent_intents <= 1:
+        return DailySpendLedger()
+    return DailySpendLedger(
+        f_adm=config.open_exposure_bound_fraction,
+        f_breaker=config.breaker_open_ambiguous_fraction,
+    )
+
+
 def _required(
     value: str | None, *, field: str, config_name: str = "PolymarketUSDataClientConfig"
 ) -> str:
@@ -859,7 +876,7 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             order_sender=order_sender,
             write_signer=write_signer,
             live_trading_permit=config.live_trading_permit,
-            spend_ledger=DailySpendLedger(),
+            spend_ledger=_spend_ledger_for(config),
             submit_intent_latch=config.submit_intent_latch,
             credentials=credentials,
             api_base_url=stripped_api_base_url,
@@ -868,5 +885,6 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             exit_manifest=config.exit_manifest,
             resolver_instrument_loader=config.resolver_instrument_loader,
             no_id_retire_admitted=config.no_id_retire_admitted,
+            frozen_cost_budget_bucket=config.frozen_cost_budget_bucket,
         )
         return client

@@ -59,6 +59,7 @@ import re
 import stat
 from collections.abc import Callable
 from datetime import time as datetime_time
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -112,7 +113,10 @@ from breezy.runtime.settings import (
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import SubmitIntentLatch
-from breezy.runtime.supervisor_decode_marker import supervisor_admits_retirement_reason
+from breezy.runtime.supervisor_decode_marker import (
+    supervisor_admits_retirement_reason,
+    supervisor_admits_slot_schema,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
@@ -682,20 +686,92 @@ def build_quote_tape_node_config(
 #: never env-derived) native submit-rate ceiling -- `RiskEngineConfig`'s
 #: own field, `max_order_submit_rate: str` (format `"<count>/<HH:MM:SS>"`;
 #: default `"100/00:00:01"`, installed
-#: `nautilus_trader/risk/config.py:29-30`). This is defense-in-depth ONLY:
-#: the account-wide submit-intent latch (`runtime/submit_intent.py`)
-#: already fully serialises every order this process can send (at most one
-#: OPEN intent at a time), so this native cap can never bind behind it in
-#: normal operation. A handful of orders per second is already an order of
-#: magnitude above that serialised rate -- chosen deliberately loose so it
-#: is never the ceiling that actually stops a runaway; the operative bounds
-#: on order flow are, in order: the daily spend ledger, this native
-#: per-order notional cap (see the docstring above), and the submit-intent
-#: latch itself. Never read from an env var -- see the module docstring's
-#: ban on inventing a literal on an operator-reserved path; this literal is
-#: Breezy's, not the operator's, and is not one of the two OPERATOR-RESERVED
-#: controls (max daily budget, max per position).
+#: `nautilus_trader/risk/config.py:29-30`).
+#:
+#: EXEC-PAR r5 3.9 (re-stated; the VALUE is unchanged). Native behaviour: the
+#: throttle is `RiskEngine`'s submit throttler with `output_drop=
+#: self._deny_new_order` (`risk/engine.pyx:140-150`), so a submit over the
+#: rate is DROPPED (denied) upstream of `_submit_order`, never queued, and it
+#: wastes no permit and arms no intent. At K=1 the submit-intent latch admits
+#: at most one OPEN intent, so this ceiling can never bind. At K>1 up to K
+#: submits may be admitted in one synchronous burst; this ceiling is then
+#: defence in depth only, and the operative bounds on order flow stay, in
+#: order: the daily spend ledger (with its open-exposure bound), the native
+#: per-order notional cap (see the docstring above), and the slot table
+#: itself. It is deliberately NOT raised for K>1: a drop here is a visible,
+#: modelled denial (plan 6), and a loose ceiling must never become the thing
+#: that stops a runaway. Never read from an env var -- see the module
+#: docstring's ban on inventing a literal on an operator-reserved path; this
+#: literal is Breezy's, not the operator's, and is not one of the two
+#: OPERATOR-RESERVED controls (max daily budget, max per position).
 TRADE_RISK_MAX_ORDER_SUBMIT_RATE: Final[str] = "5/00:00:01"
+
+
+# ---------------------------------------------------------------------------
+# EXEC-PAR (r5 section 5 WP5b): Breezy-owned parallel-intent constants.
+#
+# Every one is a module-level `Final`, NEVER read from the environment, and
+# reaches the exec client only through `PolymarketUSExecClientConfig` fields
+# (`build_trade_node_config`). None is one of the two operator-reserved
+# controls (max daily budget, max per position). K stays 1 until D-PREREG is
+# frozen and the activation gates pass.
+# ---------------------------------------------------------------------------
+
+_EXEC_PAR_NS_PER_SECOND: Final[int] = 1_000_000_000
+
+#: K, the most submit intents OPEN at once. 1 = today's one-at-a-time latch.
+EXEC_PAR_MAX_CONCURRENT_INTENTS: Final[int] = 1
+
+#: `f_adm`: AMBIGUOUS open notional (and any single order) may not exceed this
+#: fraction of the daily budget. A ratio, never a dollar value.
+OPEN_EXPOSURE_BOUND_FRACTION: Final[Decimal] = Decimal("0.50")
+
+#: `f_breaker` (< `f_adm`): AMBIGUOUS open notional above this fraction of the
+#: daily budget trips the breaker.
+BREAKER_OPEN_AMBIGUOUS_FRACTION: Final[Decimal] = Decimal("0.25")
+
+#: Admission denies entries when the watcher heartbeat is older than this
+#: (12 polls of the 5 s watcher tick).
+BREAKER_HEARTBEAT_MAX_AGE_NS: Final[int] = 60 * _EXEC_PAR_NS_PER_SECOND
+
+#: Admission denies entries when the resolver's last pass is older than this
+#: (2 x the 300 s resolver backoff cap, so a venue-wide 5xx backoff does not
+#: false-trip while a dead resolver task does).
+RESOLVER_PASS_STALE_NS: Final[int] = 600 * _EXEC_PAR_NS_PER_SECOND
+
+#: The D-PREREG-frozen cap/budget bucket LABEL (WP0 findings). The unit is
+#: per-position cap / daily budget (r5.1 E6). A live label above it forces K=1.
+EXEC_PAR_FROZEN_BUCKET: Final[str] = "0.05"
+
+#: The marker-less force-to-1 reason (names no value).
+EXEC_PAR_MARKER_ABSENT_REASON: Final[str] = (
+    "the running supervisor's decode marker does not admit slot schema v2"
+)
+
+
+def force_k1_without_supervisor_marker(
+    latch: SubmitIntentLatch,
+    store_path: Path,
+    *,
+    admits: Callable[[Path], bool] | None = None,
+) -> bool:
+    """Force the slot latch to K=1 unless the RUNNING supervisor can decode v2.
+
+    A node must never write a v2 slot table a supervisor would read as corrupt
+    (L-48). At a configured K of 1 this is a no-op. A raising ``admits`` counts
+    as "not admitted" (fail closed). Returns ``True`` iff K was forced.
+    """
+    if latch.max_slots() <= 1:
+        return False
+    check = supervisor_admits_slot_schema if admits is None else admits
+    try:
+        admitted = bool(check(store_path))
+    except Exception:  # noqa: BLE001 - an unreadable marker is "not admitted"
+        admitted = False
+    if admitted:
+        return False
+    latch.force_k1(EXEC_PAR_MARKER_ABSENT_REASON)
+    return True
 
 
 def build_trade_risk_engine_config(
@@ -1017,6 +1093,12 @@ def build_trade_node_config(
         exit_manifest=exit_manifest,
         resolver_instrument_loader=resolver_instrument_loader,
         no_id_retire_admitted=no_id_retire_admitted,
+        max_concurrent_intents=(
+            1 if submit_intent_latch is None else submit_intent_latch.max_slots()
+        ),
+        open_exposure_bound_fraction=OPEN_EXPOSURE_BOUND_FRACTION,
+        breaker_open_ambiguous_fraction=BREAKER_OPEN_AMBIGUOUS_FRACTION,
+        frozen_cost_budget_bucket=EXEC_PAR_FROZEN_BUCKET,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
