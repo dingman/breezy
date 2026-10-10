@@ -1,0 +1,54 @@
+[
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000000, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000001\", \"retired_ns\": null, \"retirement_reason\": null, \"state\": \"OPEN\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/history/00000000000000000000000000000001",
+  "{\"created_ns\": 1700000000000000000, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000001\", \"retired_ns\": 1700000000000000001, \"retirement_reason\": \"DEFINITIVE_REJECT\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000000, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000001\", \"retired_ns\": 1700000000000000001, \"retirement_reason\": \"DEFINITIVE_REJECT\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000002, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000002\", \"retired_ns\": null, \"retirement_reason\": null, \"state\": \"OPEN\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/history/00000000000000000000000000000002",
+  "{\"created_ns\": 1700000000000000002, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000002\", \"retired_ns\": 1700000000000000003, \"retirement_reason\": \"STATUS_REPORT_ACCEPT_FILL_TERMINAL\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000002, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000002\", \"retired_ns\": 1700000000000000003, \"retirement_reason\": \"STATUS_REPORT_ACCEPT_FILL_TERMINAL\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000004, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000003\", \"retired_ns\": null, \"retirement_reason\": null, \"state\": \"OPEN\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/history/00000000000000000000000000000003",
+  "{\"created_ns\": 1700000000000000004, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000003\", \"retired_ns\": 1700000000000000005, \"retirement_reason\": \"STARTUP_FILL_RECORD_MATCH\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000004, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000003\", \"retired_ns\": 1700000000000000005, \"retirement_reason\": \"STARTUP_FILL_RECORD_MATCH\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000006, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000004\", \"retired_ns\": null, \"retirement_reason\": null, \"state\": \"OPEN\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/history/00000000000000000000000000000004",
+  "{\"created_ns\": 1700000000000000006, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000004\", \"retired_ns\": 1700000000000000007, \"retirement_reason\": \"OPERATOR_CLEARED\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000006, \"fingerprint\": \"cafef00d11111111111111111111111111111111111111111111111111111111\", \"intent_id\": \"00000000000000000000000000000004\", \"retired_ns\": 1700000000000000007, \"retirement_reason\": \"OPERATOR_CLEARED\", \"state\": \"RETIRED\", \"v\": 1}"
+ ],
+ [
+  "exec/polymarket_us/intent/current",
+  "{\"created_ns\": 1700000000000000009, \"fingerprint\": \"9f3ac0dea1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\", \"intent_id\": \"00000000000000000000000000000005\", \"retired_ns\": null, \"retirement_reason\": null, \"state\": \"OPEN\", \"v\": 1}"
+ ]
+]
