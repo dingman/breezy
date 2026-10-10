@@ -476,6 +476,8 @@ module = [
     "breezy.ingest.nws_actor",
     "breezy.ingest.nws_observation_actor",
     "breezy.ingest.nbm_quantile_actor",
+    # EXEC-PAR WP5b: the breaker watcher is a native Actor (same erasure).
+    "breezy.runtime.breaker_watcher",
 ]
 disallow_subclassing_any = false
 

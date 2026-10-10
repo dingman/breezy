@@ -22,7 +22,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -53,7 +53,17 @@ from breezy.persistence.live_orders_gate import (
 )
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
+from breezy.runtime.breaker_watcher import (
+    build_exec_watcher,
+    cross_day_settles_of,
+    exec_client_getter,
+)
+from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.runtime.node_config import (
+    EXEC_PAR_MAX_CONCURRENT_INTENTS,
+    force_k1_without_supervisor_marker,
+)
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
 from breezy.runtime.settings import (
     ORDERS_ENABLED_VAR,
@@ -69,6 +79,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockHeld,
     open_submit_intent_latch,
 )
+from breezy.runtime.supervisor_decode_marker import supervisor_admits_slot_schema
 from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_RUNTIME_ERROR, NodeFactory, _report
 from breezy.strategy.current_rung_hold.composition import (
     build_continuous_rung_hold_strategies,
@@ -955,6 +966,27 @@ def _compose_family(
     )
 
 
+def _open_exec_latch(
+    store: SqliteStateStore, store_path: Path
+) -> AbstractContextManager[SubmitIntentLatch]:
+    """Open the process-wide submit-intent latch for the configured K.
+
+    At the shipped K=1 this is EXACTLY the pre-EXEC-PAR call (no slot keywords),
+    so the K=1 latch, its flock and its store writes are byte-for-byte today's.
+    Only a K>1 build adds the slot count and the v2 predicate -- evaluated at each
+    1 -> 2 transition, because the RUNNING supervisor must be able to decode a v2
+    table.
+    """
+    if EXEC_PAR_MAX_CONCURRENT_INTENTS <= 1:
+        return open_submit_intent_latch(store, store_path)
+    return open_submit_intent_latch(
+        store,
+        store_path,
+        max_slots=EXEC_PAR_MAX_CONCURRENT_INTENTS,
+        v2_predicate=lambda: supervisor_admits_slot_schema(store_path),
+    )
+
+
 def run(
     *,
     env: Mapping[str, str] | None = None,
@@ -1041,7 +1073,15 @@ def run(
         today_by_station = _today_by_station(_composable_stations(manifest))
         with ExitStack() as stack:
             store = stack.enter_context(SqliteStateStore(store_path))
-            latch = stack.enter_context(open_submit_intent_latch(store, store_path))
+            latch = stack.enter_context(_open_exec_latch(store, store_path))
+            # K>1 only does anything: a supervisor that cannot decode v2 forces K=1.
+            force_k1_without_supervisor_marker(latch, store_path)
+            exec_watcher = build_exec_watcher(
+                latch.max_slots(),
+                latch=latch,
+                alert_sink=resolve_alert_sink(),
+                digest=ExecParDigest(),
+            )
             sending_permit = phase1_sending_permit(
                 sending_family_id=settings.sending_family_id,
                 permit=order_submission_permit,
@@ -1087,13 +1127,22 @@ def run(
                 if fee_drift_resolve_client is not None:
                     fee_drift_resolve_client(node)
 
+                # EXEC-PAR WP5b: the watcher reads the registered exec client,
+                # which exists only now. Registered at every K (alerts only at
+                # K=1); the breaker itself exists only at K>1.
+                get_client = exec_client_getter(node, POLYMARKET_US_CLIENT_NAME)
+                exec_watcher.bind_client(
+                    get_client, cross_day_settles_total=cross_day_settles_of(get_client)
+                )
+
             return trade_cli.run(
                 env=env,
                 node_factory=node_factory,
                 stderr=out,
                 strategies=composed,
                 extra_actors=tuple(extra_actors)
-                + (() if fee_drift_actor is None else (fee_drift_actor,)),
+                + (() if fee_drift_actor is None else (fee_drift_actor,))
+                + (exec_watcher,),
                 submit_intent_latch=latch,
                 after_build=_after_build,
                 live_trading_permit=live_trading_permit,

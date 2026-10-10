@@ -46,6 +46,11 @@ from breezy.domain.exec_intent import RESOLVER_CONTEXT_KEY_PREFIX
 from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, default_alerts_root
 from breezy.runtime.alert_proof import COUNTERS as _ALERT_COUNTERS
 from breezy.runtime.alert_proof import deliver_with_proof
+from breezy.runtime.breaker_supervisor_watch import (
+    BreakerProbe,
+    BreakerWatchState,
+    decide_breaker_alerts,
+)
 from breezy.runtime.build_sha import (
     BUILD_REVISION_ENV_VAR,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
     _looks_like_git_sha,  # noqa: F401 - re-exported, see Rev 3.1 R8 note below
@@ -67,10 +72,12 @@ from breezy.runtime.settings import ORDERS_ENABLED_VAR, SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
 from breezy.runtime.submit_intent import (
+    BREAKER_KEY,
     CURRENT_INTENT_KEY,
     SubmitIntentCorrupt,
     decode_slot_table,
 )
+from breezy.runtime.submit_intent_slots import SlotTableError, parse_breaker
 from breezy.runtime.supervisor_decode_marker import (
     discard_supervisor_decode_marker,
     write_supervisor_decode_marker,
@@ -534,6 +541,58 @@ def probe_open_intent_shape(store_path: Path, *, node_pid: int | None) -> OpenIn
     except Exception as exc:  # noqa: BLE001 -- deliberate: every failure is UNKNOWN (loud).
         logger.warning("open_intent_shape_probe_failed error_type=%s", type(exc).__name__)
         return OpenIntentShape.UNKNOWN
+
+
+def probe_breaker_record(store_path: Path) -> BreakerProbe:
+    """[EXEC-PAR WP5b] Read-only WAL read of the breaker record and the slot
+    table's unreadable slots, via a FRESH ``SqliteStateStore`` connection.
+
+    Like the continuous-family self-check read below, it is safe while the node
+    is live (WAL serves concurrent readers) and only ever calls ``.get()``. A
+    failure to read the record is ``readable=False`` (never a raise); a corrupt
+    slot table counts no unreadable slot here, because that case is surfaced by
+    the existing intent probes and must stay unchanged at K=1.
+    """
+    try:
+        with SqliteStateStore(store_path) as store:
+            raw_record = store.get(BREAKER_KEY)
+            raw_table = store.get(CURRENT_INTENT_KEY)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
+        logger.warning("breaker_record_probe_failed error_type=%s", type(exc).__name__)
+        return replace(BreakerProbe.absent(), readable=False)
+    unreadable = 0
+    if raw_table is not None:
+        try:
+            unreadable = len(decode_slot_table(raw_table).unreadable)
+        except SubmitIntentCorrupt:
+            unreadable = 0
+    if raw_record is None:
+        return replace(BreakerProbe.absent(), unreadable_slots=unreadable)
+    try:
+        record = parse_breaker(raw_record)
+    except SlotTableError:
+        return replace(BreakerProbe.absent(), readable=False, unreadable_slots=unreadable)
+    return BreakerProbe(
+        readable=True,
+        present=True,
+        halted=record.is_halted,
+        hb_ns=record.hb_ns,
+        resolver_pass_ns=record.resolver_pass_ns,
+        unreadable_slots=unreadable,
+    )
+
+
+def configured_exec_par_k() -> int:
+    """The K this source tree's node is configured for (a ``Final``, not env).
+
+    Imported lazily: ``node_config`` pulls in Nautilus and pandas, which the
+    long-lived supervisor otherwise never loads. Read at call time, so a
+    supervisor restart picks up a changed constant (the same rule as every other
+    supervisor-side code change).
+    """
+    from breezy.runtime.node_config import EXEC_PAR_MAX_CONCURRENT_INTENTS
+
+    return EXEC_PAR_MAX_CONCURRENT_INTENTS
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1276,14 @@ class SupervisorPorts:
     #: [SELF-CHECK-ORDERS-OFF] The supervisor's own orders-enabled tri-state.
     #: Default ``ON`` keeps every fake port set on the legacy FAIL behaviour.
     orders_env: Callable[[], OrdersEnv] = field(default=lambda: OrdersEnv.ON)
+    #: [EXEC-PAR WP5b] The read-only breaker-record / slot-table probe and the
+    #: configured K. The defaults are inert (nothing present, K=1), so every
+    #: fake port set behaves exactly as before; ``default_ports`` wires the real
+    #: ones.
+    probe_breaker_record: Callable[[Path], BreakerProbe] = field(
+        default=lambda _path: BreakerProbe.absent()
+    )
+    configured_exec_par_k: Callable[[], int] = field(default=lambda: 1)
 
 
 def _boot_alert_sink() -> AlertSink:
@@ -1253,6 +1320,8 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         probe_open_intent_with_id=probe_open_intent_is_with_id,
         send_alert_durable=durable_alert_send,
         orders_env=resolve_orders_env,
+        probe_breaker_record=probe_breaker_record,
+        configured_exec_par_k=configured_exec_par_k,
     )
 
 
@@ -3044,6 +3113,65 @@ def _dispatch_permit_watch(
         return tracked_pid, node_log, state
 
 
+def _do_breaker_watch(
+    *,
+    ports: SupervisorPorts,
+    watch: BreakerWatchState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    store_path: Path,
+) -> None:
+    """[EXEC-PAR WP5b] One breaker-watch tick: probe, decide, alert.
+
+    The node-liveness ports are consulted ONLY when the probe or the configured K
+    could make an alert due, so at K=1 with nothing persisted this touches no
+    process port at all.
+    """
+    probe = ports.probe_breaker_record(store_path)
+    k_configured = ports.configured_exec_par_k()
+    if k_configured <= 1 and not (probe.halted or probe.unreadable_slots):
+        watch.active.clear()
+        watch.first_live_ns = None
+        return
+    pid = tracked_pid if tracked_pid is not None else ports.find_node_pid()
+    node_live = pid is not None and ports.process_alive(pid)
+    specs = decide_breaker_alerts(
+        probe=probe,
+        k_configured=k_configured,
+        node_live=node_live,
+        now_ns=int(now.timestamp() * 1e9),
+        state=watch,
+    )
+    for spec in specs:
+        emit_alert(
+            ports.alert_sink,
+            AlertPayload(
+                severity=spec.severity,
+                event=spec.event,
+                site="trade_node",
+                detail=spec.detail.value,
+            ),
+        )
+
+
+def _dispatch_breaker_watch(
+    *,
+    ports: SupervisorPorts,
+    watch: BreakerWatchState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    store_path: Path,
+) -> None:
+    """Containment around :func:`_do_breaker_watch`: a fault here must never end
+    the supervisor or skip the next phase dispatch (the B1 stance)."""
+    try:
+        _do_breaker_watch(
+            ports=ports, watch=watch, now=now, tracked_pid=tracked_pid, store_path=store_path
+        )
+    except Exception as exc:  # noqa: BLE001 -- deliberate: see docstring.
+        log_decision("breaker_watch_exception_contained", error_type=type(exc).__name__)
+
+
 def _run_phase(
     *,
     phase: Phase,
@@ -3154,6 +3282,7 @@ def _run_forever(
     tracked_pid: int | None = None
     node_log: Path | None = None
     iterations = 0
+    breaker_watch = BreakerWatchState()
 
     try:
         while max_iterations is None or iterations < max_iterations:
@@ -3194,6 +3323,13 @@ def _run_forever(
                     store_path=store_path,
                     log_dir=log_dir,
                     handler_read_log=False,
+                )
+                _dispatch_breaker_watch(
+                    ports=active_ports,
+                    watch=breaker_watch,
+                    now=now,
+                    tracked_pid=tracked_pid,
+                    store_path=store_path,
                 )
                 sleep(_SCHEDULE_POLL_INTERVAL_S)
                 continue
@@ -3251,6 +3387,13 @@ def _run_forever(
                 store_path=store_path,
                 log_dir=log_dir,
                 handler_read_log=permit_watch_handler_read_log,
+            )
+            _dispatch_breaker_watch(
+                ports=active_ports,
+                watch=breaker_watch,
+                now=now,
+                tracked_pid=tracked_pid,
+                store_path=store_path,
             )
 
             # [D1] EVERY dispatch is followed by a bounded sleep -- without
