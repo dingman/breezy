@@ -217,6 +217,19 @@ def operator_max_position_cost_usd() -> Decimal:
     return _read_operator_money(MAX_POSITION_COST_USD_ENV_VAR)
 
 
+def cost_budget_bucket_label() -> str:
+    """The ``cap / budget`` bucket LABEL only; never a dollar value (BG-10(a)).
+
+    The value-free, module-level reader for offline tools that must record which ladder rung
+    the operator's caps fall on. It reuses :meth:`DailySpendLedger.cost_budget_bucket` -- the
+    single implementation of the ladder -- on a throwaway ledger (no state is read or kept).
+
+    Raises:
+        LiveTradingPermissionError: naming the control, never its value, if either is unset.
+    """
+    return DailySpendLedger().cost_budget_bucket()
+
+
 def utc_day_for_ns(now_ns: int) -> date:
     """The UTC calendar day containing ``now_ns``.
 
