@@ -3,32 +3,28 @@
 ``phase-a`` reads fills, node logs and the committed reflog snapshot, and writes the outcome-blind
 table (no wins, no P&L, no ``tmax_f``), including the S0-D p-hat reconstruction over a derived NBP
 store that the coordinator fetched beforehand (``nbp_backfill.py``; never run here) and the S0-G
-alternative-source discovery. ``phase-b`` first refuses unless the frozen pins hold
-(``phase_b_refusals``), then reproduces the corrected FQ audit through the clipping wrapper; it
-never reads a pre-October climate day (the frozen holdout, plan P9).
+alternative-source discovery. ``phase-b`` first refuses unless the frozen pins, the family pin
+coverage and the predeclaration hold, then reproduces the corrected FQ audit (STOP on a mismatch)
+and writes the classified result (``fq_loss_taxonomy_phase_b``); it never reads a pre-October
+climate day (the frozen holdout, plan P9). ``verify`` checks that the committed result artefact
+follows the predeclaration commit.
 Plan: docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/TE-2_plan_r3_2.md.
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import datetime as dt
 import itertools
-import json
 import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
 from breezy.analysis.labeling.fill_source import FillRead, read_durable_fills
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
-from breezy.analysis.labeling.settlement_source import NwsCliFinal
-from breezy.domain.nws_climate_day import NwsClimateDay
-from breezy.persistence.catalog import open_station_catalog
 from breezy.registry.sites import default_registry
 from scripts.analysis.fq_loss_taxonomy_core import (
     lower_tail,
@@ -55,11 +51,9 @@ from scripts.analysis.fq_loss_taxonomy_inputs import (
     load_derived_cycles,
     partition_union,
     phase_a_truth,
-    phase_b_refusals,
     pin_label,
     published_cycles,
     reconstruct_all,
-    reproduce_audit,
     resolve_pins,
     s0a_counts,
     s0a_gate,
@@ -67,9 +61,22 @@ from scripts.analysis.fq_loss_taxonomy_inputs import (
     truth_status,
     vector_table,
 )
+from scripts.analysis.fq_loss_taxonomy_inputs import (
+    CatalogRouter as _CatalogRouter,
+)
+from scripts.analysis.fq_loss_taxonomy_phase_b import (
+    EXIT_STOP,
+    PhaseBInputs,
+    PhaseBRefused,
+    check_gates,
+    execute,
+    verify_artefact,
+)
 from scripts.analysis.fq_loss_taxonomy_reconstruct import SEMANTICS_NOTE
+from scripts.analysis.fq_loss_taxonomy_report import fields_dict as _fields_dict
+from scripts.analysis.fq_loss_taxonomy_report import write_json as _write_json
 
-__all__ = ["P7_POLICY", "PinPolicy", "UnparseableInstrumentStop", "main"]
+__all__ = ["EXIT_STOP", "P7_POLICY", "PinPolicy", "UnparseableInstrumentStop", "main"]
 
 TERMINAL_CLIMATE_DAY: Final = dt.date(2026, 10, 5)
 LAST_CLIMATE_DAY: Final = dt.date(2026, 10, 6)
@@ -86,10 +93,7 @@ WIDENED_PATHS: Final = (
     "deploy/families/",
 )
 PIN_RANGE: Final = ("1d7ea1016d7c", "4ba7f10cd1f6")
-AUDIT_NET: Final = Decimal("-2.17")
-AUDIT_TOLERANCE: Final = Decimal("0.005")
 BOOT_HEADER_LINES: Final = 400
-EXIT_STOP: Final = 2
 DEFAULT_ARCHIVE_ROOT: Final = Path.home() / ".local/share/breezy/us_source_archive"
 VENUE: Final = "polymarket_us"
 _BOOT_STAMP: Final = re.compile(r"(\d{8}T\d{6})Z")
@@ -112,20 +116,6 @@ P7_POLICY: Final = PinPolicy(
     ),
     PIN_RANGE,
 )  # fmt: skip
-
-
-class _CatalogRouter:
-    """The production ``NwsCliFinal`` over one station catalog per station (read-only)."""
-
-    def __init__(self, base: Path) -> None:
-        self._base = base
-        self._sources: dict[str, NwsCliFinal] = {}
-
-    def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
-        if station not in self._sources:
-            catalog = open_station_catalog(self._base, "polymarket_us", station)
-            self._sources[station] = NwsCliFinal(catalog)
-        return self._sources[station].record(station, climate_day)
 
 
 def _boots_from_logs(logs: Sequence[Path], expected_count: int) -> list[Boot]:
@@ -171,20 +161,21 @@ def _fq_only(fills: FillRead) -> FillRead:
     return FillRead(fills=october, n_keys=len(october), n_undecodable=0)
 
 
-def _fields_dict(obj: Any) -> Any:
-    """Explicit field-by-field JSON mapping (recursive); replaces ``dataclasses.asdict``."""
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: _fields_dict(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
-    if isinstance(obj, (list, tuple)):
-        return [_fields_dict(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _fields_dict(v) for k, v in obj.items()}
-    return obj
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+def _predecessor_p_hats(
+    reconstructor: Reconstructor,
+    specs: Sequence[FillSpec],
+    boots: Sequence[Boot],
+    pins: Sequence[BootPin],
+) -> dict[str, tuple[str, float | None]]:
+    """p-hat under the reflog predecessor for fills of NEAR-BOUNDARY pinned boots (plan P7)."""
+    by_boot = {p.boot_number: p for p in pins}
+    shown: dict[str, tuple[str, float | None]] = {}
+    for spec in specs:
+        pin = by_boot.get(boot_for(boots, spec.decision_now_ns) or 0)
+        if pin and pin.state == "PINNED" and pin.near_boundary and pin.predecessor:
+            before = reconstructor.reconstruct(spec, pin.predecessor)
+            shown[spec.fill_id] = (pin.predecessor, before.p_hat_reconstructed)
+    return shown
 
 
 def _truth_projection(
@@ -245,8 +236,9 @@ def _phase_a(args: argparse.Namespace, policy: PinPolicy) -> int:
     gate = s0d_gate(results)
     label = pin_label(git, WIDENED_PATHS, *policy.pin_range)
     rows = fill_rows(
-        fills, results, specs, {p.boot_number: p for p in pins}, label, TERMINAL_CLIMATE_DAY
-    )
+        fills, results, specs, {p.boot_number: p for p in pins}, label, TERMINAL_CLIMATE_DAY,
+        _predecessor_p_hats(reconstructor, specs, boots, pins),
+    )  # fmt: skip
     union = partition_union(
         itertools.chain.from_iterable(iter_partition_events(p) for p in args.logs)
     )
@@ -275,33 +267,28 @@ def _phase_a(args: argparse.Namespace, policy: PinPolicy) -> int:
 
 
 def _phase_b(args: argparse.Namespace) -> int:
-    pins = json.loads(args.pins_json.read_text())
+    inputs = PhaseBInputs(
+        args.output_dir, args.repo_root, args.pins_json, args.predeclaration, args.phase_a_table,
+        args.now_ns, args.archive_root, args.venue_outcomes, args.te1_ledger,
+    )  # fmt: skip
     try:
-        refusals = phase_b_refusals(
-            pins["head_blob_sha256"], pins["predeclaration_commit"], SubprocessGit(args.repo_root)
-        )
-    except ValueError as exc:
-        sys.stderr.write(f"PHASE B REFUSED: {exc}\n")
-        return EXIT_STOP
-    if refusals:
-        sys.stderr.write(f"PHASE B REFUSED: {[r.value for r in refusals]}\n")
+        gates = check_gates(inputs, SubprocessGit(args.repo_root))
+    except PhaseBRefused as refused:
+        sys.stderr.write(f"PHASE B REFUSED: {refused.reasons}\n")
         return EXIT_STOP
     fq_only = _fq_only(read_durable_fills(args.fills_db).require_clean())
     source = ClippingSettlementSource(_CatalogRouter(args.catalog_root), LAST_CLIMATE_DAY)
-    oct_audit = reproduce_audit(fq_only, source, now_ns=args.now_ns)
-    ok = (
-        oct_audit.n_fills == EXPECTED_FQ_FILLS
-        and oct_audit.n_wins == EXPECTED_FQ_WINS
-        and abs(oct_audit.net_pnl - AUDIT_NET) <= AUDIT_TOLERANCE
+    return execute(inputs, gates, fq_only, source)
+
+
+def _verify(args: argparse.Namespace) -> int:
+    violations = verify_artefact(
+        args.repo_root, args.pins_json, args.artefact, SubprocessGit(args.repo_root)
     )
-    _write_json(
-        args.output_dir / "phase_b_audit.json",
-        {"phase": "B", "audit_fq": _fields_dict(oct_audit)},
-    )
-    if not ok:
-        sys.stderr.write("STOP: the corrected audit (25 fills, 2 wins, -2.17) did not reproduce\n")
+    if violations:
+        sys.stderr.write(f"VERIFY FAILED: {list(violations)}\n")
         return EXIT_STOP
-    sys.stdout.write("audit reproduced (classification and tests are WP3)\n")
+    sys.stdout.write("verify ok: the artefact commit follows the predeclaration commit\n")
     return 0
 
 
@@ -314,22 +301,31 @@ def _parser() -> argparse.ArgumentParser:
         p.add_argument("--output-dir", type=Path, required=True)
         p.add_argument("--repo-root", type=Path, default=Path.cwd())
         p.add_argument("--catalog-root", type=Path, default=None)
+        p.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
+        p.add_argument("--venue-outcomes", type=Path, default=None)
     a = sub.choices["phase-a"]
     a.add_argument("--logs", type=Path, nargs="+", required=True)
     a.add_argument("--data-root", type=Path, required=True)
     a.add_argument("--reflog-snapshot", type=Path, required=True)
     a.add_argument("--reflog-snapshot-sha256", required=True)
     a.add_argument("--derived-store", type=Path, required=True)
-    a.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
-    a.add_argument("--venue-outcomes", type=Path, default=None)
     b = sub.choices["phase-b"]
     b.add_argument("--pins-json", type=Path, required=True)
     b.add_argument("--now-ns", type=int, required=True)
+    b.add_argument("--predeclaration", type=Path, required=True)
+    b.add_argument("--phase-a-table", type=Path, required=True)
+    b.add_argument("--te1-ledger", type=Path, default=None)
+    v = sub.add_parser("verify")
+    v.add_argument("--repo-root", type=Path, default=Path.cwd())
+    v.add_argument("--pins-json", type=Path, required=True)
+    v.add_argument("--artefact", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None, *, policy: PinPolicy = P7_POLICY) -> int:
     args = _parser().parse_args(argv)
+    if args.phase == "verify":
+        return _verify(args)
     if args.phase == "phase-b":
         if args.catalog_root is None:
             sys.stderr.write("phase-b needs --catalog-root\n")

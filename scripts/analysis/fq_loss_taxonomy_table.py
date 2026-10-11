@@ -32,13 +32,18 @@ def q_f_of(pmf: Mapping[int, float] | None) -> float | None:
 def fill_rows(
     fills: FillRead, results: Sequence[ReconstructedFill], specs: Sequence[FillSpec],
     pins: Mapping[int, BootPin], label: str, terminal_climate_day: dt.date,
+    predecessors: Mapping[str, tuple[str, float | None]] | None = None,
 ) -> list[dict[str, Any]]:  # fmt: skip
+    """One outcome-blind row per fill. ``predecessors`` maps fill_id -> (commit, p-hat) for the
+    fills of NEAR-BOUNDARY boots, so "reproduces under both" is shown, not inferred."""
     rows = []
     for fill, res, spec in zip(fills.fills, results, specs, strict=True):
         facts = bucket_facts_from_instrument_id(fill.instrument_id)
         if facts is None:
             raise UnparseableInstrumentStop(f"unparseable instrument id: {fill.instrument_id}")
         pin = pins.get(res.boot_number) if res.boot_number is not None else None
+        before = (predecessors or {}).get(spec.fill_id)
+        vector = res.vector or {}
         rows.append(
             {
                 "fill_id": spec.fill_id, "instrument_id": fill.instrument_id,
@@ -54,6 +59,10 @@ def fill_rows(
                 "boot": res.boot_number, "pinned_commit": pin.commit if pin else None,
                 "pin_state": pin.state if pin else "UNTESTABLE", "pin_label": label,
                 "k1b": facts.climate_day > terminal_climate_day, "q_f": q_f_of(res.pmf),
+                "pmf": None if not res.pmf else {str(t): m for t, m in sorted(res.pmf.items())},
+                "raw_q50": vector.get("q50"), "raw_sd": vector.get("sd"),
+                "predecessor_commit": before[0] if before else None,
+                "p_hat_predecessor": before[1] if before else None,
             }
         )  # fmt: skip
     return rows

@@ -12,8 +12,11 @@ from pathlib import Path
 from scripts.analysis.fq_loss_taxonomy_core import holdout_violations, io_violations
 
 _ANALYSIS = Path(__file__).resolve().parents[2] / "scripts/analysis"
-_CORE_FAMILY = ("core", "stats", "classify", "verdict", "guard")
-_IO_FAMILY = ("inputs", "pins", "logs", "truth", "reconstruct", "table")
+_CORE_FAMILY = ("core", "stats", "classify", "verdict", "guard", "battery")
+_IO_FAMILY = (
+    "inputs", "pins", "logs", "truth", "reconstruct", "table", "predecl", "fills", "report",
+    "phase_b",
+)  # fmt: skip
 _CORE_FILES = [_ANALYSIS / f"fq_loss_taxonomy_{n}.py" for n in _CORE_FAMILY]
 _IO_FILES = [_ANALYSIS / f"fq_loss_taxonomy_{n}.py" for n in _IO_FAMILY]
 _CLI = _ANALYSIS / "fq_v1_loss_taxonomy.py"
@@ -24,7 +27,7 @@ _PURE = (
     "__future__", "ast", "collections", "dataclasses", "datetime", "decimal", "enum",
     "itertools", "math", "re", "typing",
 )  # fmt: skip
-_CORE_ALLOWED = (*_PURE, "breezy", *_FAMILY_MODULES[:5])
+_CORE_ALLOWED = (*_PURE, "breezy", *_FAMILY_MODULES[: len(_CORE_FAMILY)])
 _IO_ALLOWED = (
     *_PURE, "breezy", "argparse", "hashlib", "json", "pathlib", "subprocess", "sys",
     *_FAMILY_MODULES,
@@ -92,3 +95,11 @@ def test_core_modules_are_io_free_by_ast_and_the_detector_fires_on_io() -> None:
         assert io_violations(path.read_text("utf-8")) == (), path.name
     for label, source in dirty.items():
         assert io_violations(source), label
+
+
+def test_every_family_module_on_disk_is_covered_by_an_ast_allowlist_family() -> None:
+    on_disk = {
+        p.stem.removeprefix("fq_loss_taxonomy_") for p in _ANALYSIS.glob("fq_loss_taxonomy_*.py")
+    }
+
+    assert on_disk == {*_CORE_FAMILY, *_IO_FAMILY}

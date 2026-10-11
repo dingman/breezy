@@ -39,6 +39,9 @@ class RefusalReason(StrEnum):
     DIRTY_PINNED_PATH = "dirty_pinned_path"
     PREDECLARATION_NOT_ANCESTOR = "predeclaration_not_ancestor"
     ARTEFACT_NOT_AFTER_PREDECLARATION = "artefact_not_after_predeclaration"
+    UNPINNED_FAMILY_MODULE = "unpinned_family_module"
+    PREDECLARATION_MODIFIED = "predeclaration_modified"
+    ARTEFACT_UNCOMMITTED = "artefact_uncommitted"
 
 
 class PinReason(StrEnum):
@@ -132,6 +135,9 @@ class BootPin:
     near_boundary: bool
     state: Literal["PINNED", "UNTESTABLE"]
     reason: PinReason | None
+    #: The reflog predecessor of the pinned commit (``None`` when the entry was a first entry);
+    #: a NEAR-BOUNDARY boot shows p-hat under both, so Phase A emits it (plan P7, r3.1 arch R1).
+    predecessor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,10 +190,11 @@ def _pin_boot(
     reproduces_under: Callable[[int, str], bool] | None,
 ) -> BootPin:
     commit = row.new
+    predecessor_commit = None if set(row.old) <= {"0"} else row.old
     near = (boot.boot_time - row.when).total_seconds() < config.near_boundary_s
 
     def pin(state: Literal["PINNED", "UNTESTABLE"], reason: PinReason | None = None) -> BootPin:
-        return BootPin(boot.number, commit, near, state, reason)
+        return BootPin(boot.number, commit, near, state, reason, predecessor_commit)
 
     logged = (
         (config.manifest_path, boot.logged_manifest_sha256),

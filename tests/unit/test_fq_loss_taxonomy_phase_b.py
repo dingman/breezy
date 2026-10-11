@@ -21,12 +21,14 @@ from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.persistence.catalog import open_station_catalog, write_records
 from scripts.analysis import fq_v1_loss_taxonomy as cli
 from scripts.analysis.fq_loss_taxonomy_battery import DayRecord, run_battery
+from scripts.analysis.fq_loss_taxonomy_fills import metar_daily_max
 from scripts.analysis.fq_loss_taxonomy_predecl import (
     PredeclarationError,
     load_predeclaration,
     thresholds_block,
     unpinned_family_modules,
 )
+from scripts.analysis.fq_loss_taxonomy_report import delivery, forward_route
 from scripts.analysis.fq_loss_taxonomy_verdict import (
     VerdictInputs,
     VerdictLabel,
@@ -34,7 +36,13 @@ from scripts.analysis.fq_loss_taxonomy_verdict import (
     render_footer,
 )
 from tests.support.te2_cli_fixtures import World, build_world
-from tests.support.te2_fixtures import fq_settlement_records, git_cmd, nws_record
+from tests.support.te2_fixtures import (
+    FQ_TMAX,
+    fq_instrument_ids,
+    fq_settlement_records,
+    git_cmd,
+    nws_record,
+)
 from tests.support.te2_phase_b_fixtures import (
     FAMILY,
     PRE_REL,
@@ -124,9 +132,13 @@ def test_phase_b_writes_json_and_md_with_every_section(
     assert len(payload["fills"]) == 25
     assert all(f["class"] in _CLASSES and isinstance(f["flags"], list) for f in payload["fills"])
     wins = [f for f in payload["fills"] if f["class"] == "WIN"]
-    assert sorted((f["tmax_f"], f["instrument_id"][-12:-1]) for f in wins) == [
-        (87, "gte86lt87"), (90, "gte89lt90")
-    ]  # fmt: skip
+    assert sorted(f["tmax_f"] for f in wins) == [87, 90]
+    assert {
+        ("gte86lt87" in f["instrument_id"], "gte89lt90" in f["instrument_id"]) for f in wins
+    } == {
+        (True, False),
+        (False, True),
+    }
     counts = Counter(f["class"] for f in payload["fills"])
     assert counts["WIN"] == 2 and counts["SIBLING_WON"] == 2
     assert sum(payload["class_counts"].values()) == 25
@@ -323,15 +335,17 @@ def test_load_predeclaration_rejects_missing_keys_and_wrong_phase_a_sha(tmp_path
         load_predeclaration(path, table)
 
 
-def _day(station: str, tail: bool = False, *, corr: float = 3.0, raw: float = 1.0) -> DayRecord:
+def _day(
+    station: str, tail: bool = False, *, corr: float = 3.0, raw: float = 1.0, won: bool = False
+) -> DayRecord:
     return DayRecord(
-        station=station, climate_day=dt.date(2026, 10, 2), p_d=0.5, won=False, ask_prob=0.5,
+        station=station, climate_day=dt.date(2026, 10, 2), p_d=0.5, won=won, ask_prob=0.5,
         fill_qs=(0.9,), tail_flags=(tail,), pi=0.5, corr_err=corr, raw_err=raw,
     )  # fmt: skip
 
 
 def test_ties_downgrade_t_art_and_a_downgraded_test_cannot_feed_variance() -> None:
-    days = [_day(f"S{i}") for i in range(6)] + [_day("S6", corr=1.0, raw=1.0)]  # one d == 0
+    days = [_day(f"S{i}", won=i < 3) for i in range(6)] + [_day("S6", corr=1.0, raw=1.0)]  # d == 0
     result = run_battery(days, level="cluster", alpha_primary=0.02, alpha_art=0.01)
 
     assert result.report["T-ART"]["n_after_drops"] == 6 and result.report["T-ART"]["n_dropped"] == 1
@@ -345,7 +359,7 @@ def test_ties_downgrade_t_art_and_a_downgraded_test_cannot_feed_variance() -> No
             t_loc=result.outcomes["T-LOC"],
             t_spread=result.outcomes["T-SPREAD"],
             t_art=result.outcomes["T-ART"],
-        )  # fmt: skip
+        )
     )
     assert verdict.label is VerdictLabel.INCONCLUSIVE
     assert "no unconditionally TESTABLE secondary" in (verdict.reason or "")
@@ -362,7 +376,7 @@ def test_battery_t_win_matches_the_exact_lower_tail() -> None:
 
 def _git_repo_with_artefact(tmp: Path, *, same_commit: bool) -> tuple[Path, Path]:
     repo = tmp / "r"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     git_cmd(repo, "init", "-q", "-b", "main")
     (repo / "docs/evidence/te2").mkdir(parents=True)
     pre = repo / PRE_REL
@@ -438,3 +452,67 @@ def test_near_boundary_boot_rows_carry_the_predecessor_p_hat_and_commit(tmp_path
     assert all(r["predecessor_commit"] is None and r["p_hat_predecessor"] is None for r in other)
     boot3 = next(p for p in table["pin_table"] if p["boot_number"] == 3)
     assert boot3["near_boundary"] is True and boot3["predecessor"] == world.commit
+
+
+_METAR_HEADER = "station,valid_utc,tmpf,tgroup_c,report_type,tmpf_source,metar\n"
+
+
+def test_metar_daily_max_uses_the_local_standard_day_window(tmp_path: Path) -> None:
+    station = tmp_path / "metar-routine" / "KLAX"
+    station.mkdir(parents=True)
+    (station / "2026.csv").write_text(
+        _METAR_HEADER
+        + "KLAX,2026-10-02T07:53Z,99,,3,x,x\n"  # 23:53 local on 10-01: before the window
+        + "KLAX,2026-10-02T20:53Z,80.6,,3,x,x\n"
+        + "KLAX,2026-10-03T07:53Z,70,,3,x,x\n"  # 23:53 local on 10-02: inside
+        + "KLAX,2026-10-03T08:53Z,95,,3,x,x\n"  # 00:53 local on 10-03: after the window
+    )
+
+    assert metar_daily_max(tmp_path, "KLAX", dt.date(2026, 10, 2), -8.0) == 81
+    assert metar_daily_max(tmp_path, "KMIA", dt.date(2026, 10, 2), -5.0) is None
+
+
+def test_alternative_sources_flag_k3_and_k4_and_k4_makes_the_verdict_fixable(
+    phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, table = phase_a
+    patched = json.loads(table.read_text())
+    patched["s0g"]["k3_status"] = "SOURCE_PRESENT"
+    table2 = tmp_path / "table_k3.json"
+    table2.write_text(json.dumps(patched))
+    archive = tmp_path / "archive"
+    for station, icao in (("LAX", "KLAX"), ("MDW", "KMDW"), ("MIA", "KMIA"), ("SFO", "KSFO")):
+        folder = archive / "metar-routine" / icao
+        folder.mkdir(parents=True)
+        rows = []
+        for (st, day), tmax in FQ_TMAX.items():
+            hot = 85 if (st, day) == ("MIA", dt.date(2026, 10, 3)) else tmax  # flips MIA 10-03
+            if st == station:
+                rows.append(f"{icao},{day.isoformat()}T20:00Z,{hot},,3,x,x\n")
+        (folder / "2026.csv").write_text(_METAR_HEADER + "".join(rows))
+    flipped = next(i for i in fq_instrument_ids() if "miahigh-2026-10-03-gte86lt87" in i)
+    venue = tmp_path / "venue.json"
+    venue.write_text(json.dumps({flipped: False}))
+    b = build_phase_b(tmp_path / "b", world, table2)
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    argv = b.argv(extra=["--archive-root", str(archive), "--venue-outcomes", str(venue)])
+    assert cli.main(argv) == 0
+    payload = json.loads(b.result_json.read_text())
+    assert payload["alt_truth"]["k3_status"] == "TESTED" and payload["alt_truth"]["k3_count"] == 2
+    assert payload["alt_truth"]["k4_status"] == "TESTED" and payload["alt_truth"]["k4_count"] == 1
+    assert payload["verdict"]["label"] == "FIXABLE_DEFECT"
+    assert {c["finding"] for c in payload["consumers"]} >= {"FIXABLE_DEFECT", "K3", "K4"}
+    assert payload["flag_counts"]["K3"] == 2 and payload["flag_counts"]["K4"] == 1
+
+
+def test_delivery_states_a_slip_and_forward_route_sizes_the_plan() -> None:
+    th = thresholds_block()
+
+    assert delivery(th, dt.date(2026, 10, 20))["slip"] is None
+    assert delivery(th, dt.date(2026, 10, 21))["slip"]
+    near = forward_route([0.2] * 7, th)
+    assert near["clusters_needed"] == 18 and near["route"] == "forward_evidence_plan_to_T2"
+    far = forward_route([0.01] * 7, th)
+    assert far["route"] == "closed_no_action_until_T1_12_07"
+    assert forward_route([], th)["clusters_needed"] is None

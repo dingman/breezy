@@ -12,11 +12,26 @@ from typing import Final, Literal
 
 from breezy.analysis.labeling.fill_source import FillRead
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
-from breezy.analysis.labeling.settlement_source import SettlementSource
+from breezy.analysis.labeling.settlement_source import NwsCliFinal, SettlementSource
 from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.persistence.catalog import open_station_catalog
 from breezy.settlement.trial_scorer import FilledTrial, ScoreRefusal, score_trial
 
 LAST_FQ_CLIMATE_DAY: Final = dt.date(2026, 10, 6)
+
+
+class CatalogRouter:
+    """The production ``NwsCliFinal`` over one station catalog per station (read-only)."""
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+        self._sources: dict[str, NwsCliFinal] = {}
+
+    def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
+        if station not in self._sources:
+            catalog = open_station_catalog(self._base, "polymarket_us", station)
+            self._sources[station] = NwsCliFinal(catalog)
+        return self._sources[station].record(station, climate_day)
 
 
 class ClippingSettlementSource:
@@ -81,12 +96,24 @@ def truth_status(
 
 
 @dataclass(frozen=True)
+class ScoredFill:
+    """One scored fill: ``pnl`` is already times quantity (cost + fee - payout, negated)."""
+
+    fill_id: str
+    instrument_id: str
+    won: bool
+    tmax_f: int
+    pnl: Decimal
+
+
+@dataclass(frozen=True)
 class AuditReproduction:
     n_fills: int
     n_wins: int
     net_pnl: Decimal
     wins: tuple[tuple[str, int], ...]
     n_refused: int
+    per_fill: tuple[ScoredFill, ...] = ()
 
 
 def reproduce_audit(fills: FillRead, source: SettlementSource, *, now_ns: int) -> AuditReproduction:
@@ -98,6 +125,7 @@ def reproduce_audit(fills: FillRead, source: SettlementSource, *, now_ns: int) -
     scored = refused = 0
     net = Decimal(0)
     wins: list[tuple[str, int]] = []
+    per_fill: list[ScoredFill] = []
     for fill in fills.fills:
         facts = bucket_facts_from_instrument_id(fill.instrument_id)
         if facts is None:
@@ -126,9 +154,15 @@ def reproduce_audit(fills: FillRead, source: SettlementSource, *, now_ns: int) -
             continue
         scored += 1
         net += result.pnl * qty
+        per_fill.append(
+            ScoredFill(
+                fill.venue_order_id, fill.instrument_id, bool(result.held),
+                result.settlement_tmax_f, result.pnl * qty,
+            )
+        )  # fmt: skip
         if result.held:
             wins.append((fill.instrument_id, result.settlement_tmax_f))
-    return AuditReproduction(scored, len(wins), net, tuple(wins), refused)
+    return AuditReproduction(scored, len(wins), net, tuple(wins), refused, tuple(per_fill))
 
 
 @dataclass(frozen=True)
