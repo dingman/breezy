@@ -389,3 +389,50 @@ def test_persist_writes_ascending_and_a_mid_loop_failure_leaves_later_days_stale
     with pytest.raises(OSError):
         persist_settled_pnl(Flaky(), rows)
     assert written == ["2026-10-12"]
+
+
+def _fee_row(pnl: str, settled: int, unrec: int, floor: str, amb: int = 0) -> SettledPnlDay:
+    return SettledPnlDay(
+        "2026-10-12",
+        pnl,
+        settled,
+        amb,
+        0,
+        0,
+        fee_unreconciled_entries=unrec,
+        fee_floor_total=floor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior", "new", "ok"),
+    [
+        # reconciling to a lower fee: rise 0.05 <= floor drop 0.07
+        (_fee_row("-5", 1, 1, "0.07"), _fee_row("-4.95", 1, 0, "0"), True),
+        # rise exactly equal to the drop
+        (_fee_row("-5", 1, 1, "0.07"), _fee_row("-4.93", 1, 0, "0"), True),
+        # rise larger than the fee delta
+        (_fee_row("-5", 1, 1, "0.07"), _fee_row("-4.9", 1, 0, "0"), False),
+        # fee-unreconciled count did not drop, so no allowance
+        (_fee_row("-5", 1, 1, "0.07"), _fee_row("-4.95", 1, 1, "0.02"), False),
+        # shrinking entry counts still raise even with a fee drop
+        (_fee_row("-5", 2, 1, "0.07"), _fee_row("-4.95", 1, 0, "0"), False),
+    ],
+)
+def test_pnl_rise_is_allowed_only_up_to_the_reconciled_fee_delta(
+    prior: SettledPnlDay, new: SettledPnlDay, ok: bool, tmp_path: Path
+) -> None:
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        latch.write_settled_pnl_day(prior)
+        if ok:
+            latch.write_settled_pnl_day(new)
+            assert latch.read_settled_pnl_day("2026-10-12") == new
+        else:
+            with pytest.raises(SettledPnlRegression):
+                latch.write_settled_pnl_day(new)
+
+
+def test_fee_floor_total_must_be_a_canonical_decimal() -> None:
+    with pytest.raises(ExecParRecordError):
+        encode_record(_fee_row("1", 1, 0, "1e3"))
