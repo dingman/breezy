@@ -65,3 +65,16 @@ All keys sit under `exec/polymarket_us/exec_par/`. Every record is canonical sor
 17. **Open ruling: cleanup demotion and look blockers.**
     - M5 `HOLD_CLEANUP_DEMOTION` alerts and reports only. It does not write `cleanup_demotion/<ts_ns>`, because that record forces K=1 at the next boot (BG-3) and the coordinator commits the lower K.
     - `PROMOTION_ELIGIBLE.look_blockers` are reported only. The node writes no failed look (r4.5 O5: "nothing more").
+18. **BG-6 must land before any K>1 operation (fix round).**
+    - Nothing else denies K>1 without a stamp. Until `StageEvalPorts` are wired, `app/trade.py` calls `force_k1_unless_stage_eval_wired`: a configured K>1 with no ports is forced to K=1 and raises the CRITICAL alert `EXEC_PAR_STAGE_EVAL_UNWIRED`. K=1 is untouched.
+    - Whoever wires the ports replaces the `None` in `app/trade.py` and passes it to `build_exec_watcher`. The guard then stands down. BG-6's boot-pending denial must exist before that happens.
+19. **Settled-P&L trigger and ingest wait.**
+    - `StageEvalPorts.settled_pnl_seq` is a cheap poll. Its implementation is BG-5c's job. A changed value triggers one pass, and a change during a pass triggers one follow-up pass.
+    - A reconcile never runs over a non-empty BG-1b ingest retry queue. The watcher binds `IngestGuard.pending`, and the pass waits for it to drain inside the reconcile phase. A queue that never drains is `reconcile_stuck`. This is what keeps the signed `counts_delta` exact: a row that lands after a rebuild would otherwise be counted twice.
+20. **Clocks, diagnostics and audit.**
+    - Every integrity age (stuck 60 s, reconcile 300 s, slow 2 s) uses the ONE injected monotonic clock. The wall clock is for stamps and climate days only.
+    - `stage_eval_slow` times the snapshot build plus the pure evaluation. It excludes reconciliation, which has its own 300 s bound (r4.3 M4, binding).
+    - A failed per-day snapshot read logs `what`, `day` and the exception TYPE only, never the message.
+    - `delete_gappy_mark` writes `gappy_log/<day>/<mark.ts_ns>` before the delete.
+    - A failed `stop_verdict` marker write stops the heartbeat until a node restart (r4.3 M3, fail-closed by design). `_pending_halt` keeps only the first reason, because the halt is sticky and the marker carries the stop reason.
+    - The liveness `previous_ok` is seeded from the store on the first pass after a restart.

@@ -27,6 +27,7 @@ from breezy.runtime.exec_par_records import (
     EXEC_PAR_PREFIX,
     DayCountsDelta,
     EpochRow,
+    GappyMark,
     LookRow,
     RebuildRow,
     ReconcilePhase,
@@ -46,6 +47,7 @@ _COUNTS = EXEC_PAR_PREFIX + "counts_delta/"
 _REBUILD = EXEC_PAR_PREFIX + "rebuild/"
 _REBUILD_LOG = EXEC_PAR_PREFIX + "rebuild_log/"
 _GAPPY = EXEC_PAR_PREFIX + "gappy/"
+_GAPPY_LOG = EXEC_PAR_PREFIX + "gappy_log/"
 
 
 class ExecParStageRowsMixin(ExecParCounterRowsMixin):
@@ -135,11 +137,20 @@ class ExecParStageRowsMixin(ExecParCounterRowsMixin):
     # -- BG-1d store halves ---------------------------------------------------
 
     def delete_gappy_mark(self, day: str) -> bool:
-        """Delete the day's mark (note 1); ``False`` if there was none."""
+        """Delete the day's mark (note 1); ``False`` if there was none.
+
+        The mark is audited to ``gappy_log/<day>/<mark.ts_ns>`` BEFORE the delete (the same
+        order as :meth:`retire_rebuild_row`), so a crash between the two replays cleanly."""
         self._require_held()
         key = f"{_GAPPY}{_part(day)}"
         self._es_require_delete()
         with self._mutex:
+            mark = self._er_get(key, GappyMark)
+            if mark is None:
+                return False
+            if mark.day != day:
+                raise self.CorruptError()
+            self._er_put_exclusive(f"{_GAPPY_LOG}{_part(day)}/{mark.ts_ns}", mark)
             return self._es_delete(key)
 
     def write_counts_delta(self, record: DayCountsDelta) -> None:

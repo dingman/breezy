@@ -65,6 +65,8 @@ from breezy.runtime.exec_par_epochs import (
     record_boot_epoch,
     record_clean_stop,
 )
+from breezy.runtime.exec_par_stage_guard import force_k1_unless_stage_eval_wired
+from breezy.runtime.exec_par_stage_runner import StageEvalPorts
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.node_config import (
@@ -808,9 +810,7 @@ def _compose_forecast_quantile_ladder(
     )
     fq_loss_stop_probe.probe_once()
     fq_parity_cache = (
-        fq_bridge.ParityFileCache(
-            catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid()
-        )
+        fq_bridge.ParityFileCache(catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid())
         if manifest.family_id == fq_bridge.PARITY_SUBJECT
         else None
     )
@@ -1035,6 +1035,16 @@ def _close_epoch(latch: SubmitIntentLatch) -> None:
         _boot_logger.exception("epoch stop_ts not written boot_ts=%s", latch.boot_ns)
 
 
+def _build_stage_eval_ports(latch: SubmitIntentLatch) -> StageEvalPorts | None:
+    """The in-node stage evaluator's ports, or ``None`` while they are not wired.
+
+    EXEC-PAR BG-5b: the durable-fill / slot / ledger readers, the mass-status probe and the
+    climate-day functions are the integration package's to supply (integration notes 16, 18).
+    Until then ``None``, and ``force_k1_unless_stage_eval_wired`` pins K=1.
+    """
+    return None
+
+
 def run(
     *,
     env: Mapping[str, str] | None = None,
@@ -1126,6 +1136,11 @@ def run(
             force_k1_without_supervisor_marker(latch, store_path)
             # BG-3: a SET/UNREADABLE durable flag, or an un-amended demotion, pins K=1.
             force_k1_on_durable_flag(latch)
+            # EXEC-PAR BG-5b: with no stage evaluator wired (BG-6 not built), K>1 fails closed.
+            stage_eval_ports = _build_stage_eval_ports(latch)
+            force_k1_unless_stage_eval_wired(
+                latch, stage_eval_ports=stage_eval_ports, alert_sink=resolve_alert_sink()
+            )
             # EXEC-PAR BG-2: the K-epoch row, after the forced-to-1 checks and
             # before `node.run`. `commit_sha` is the identity the supervisor
             # logs as `supervisor_started.revision`. A write failure propagates.
@@ -1137,6 +1152,7 @@ def run(
                 alert_sink=resolve_alert_sink(),
                 digest=ExecParDigest(),
                 commit_sha=commit_sha,
+                stage_eval_ports=stage_eval_ports,
             )
             sending_permit = phase1_sending_permit(
                 sending_family_id=settings.sending_family_id,
