@@ -593,10 +593,16 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         values, epoch_rows = _read_only_probe_rows(
             store_path, (BREAKER_KEY, CURRENT_INTENT_KEY, STAGE_EVAL_STAMP_KEY), EPOCH_KEY_PREFIX
         )
-        k_anchor_ns = _k_gt_1_anchor_ns(epoch_rows)
     except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
         logger.warning("breaker_record_probe_failed error_type=%s", type(exc).__name__)
         return replace(BreakerProbe.absent(), readable=False)
+    k_anchor_ns: int | None = None
+    anchor_readable = True
+    try:
+        k_anchor_ns = _k_gt_1_anchor_ns(epoch_rows)
+    except Exception as exc:  # noqa: BLE001 -- a corrupt epoch row must not hide the halt reading
+        anchor_readable = False
+        logger.warning("breaker_epoch_anchor_unreadable error_type=%s", type(exc).__name__)
     raw_record, raw_table = values[BREAKER_KEY], values[CURRENT_INTENT_KEY]
     stamp_ts_ns, stamp_readable = _decode_stamp(values[STAGE_EVAL_STAMP_KEY])
     base = replace(
@@ -604,6 +610,7 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         stamp_ts_ns=stamp_ts_ns,
         stamp_readable=stamp_readable,
         k_anchor_ns=k_anchor_ns,
+        anchor_readable=anchor_readable,
     )
     unreadable = 0
     if raw_table is not None:

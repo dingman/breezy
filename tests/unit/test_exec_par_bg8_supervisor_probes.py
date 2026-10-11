@@ -472,12 +472,40 @@ def test_probe_has_no_anchor_without_a_k_gt_1_epoch(tmp_path: Path) -> None:
     assert probe_breaker_record(path).k_anchor_ns is None
 
 
-def test_corrupt_epoch_row_is_an_unreadable_probe_not_a_crash(tmp_path: Path) -> None:
+def test_corrupt_epoch_row_is_an_unreadable_anchor_not_an_unreadable_probe(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "state.sqlite3"
-    _make_store(path)
+    _make_store(path, halted=True)
     with SqliteStateStore(path) as store:
         store.set(f"{EPOCH_KEY_PREFIX}123", b"garbage")
-    assert not probe_breaker_record(path).readable
+    probe = probe_breaker_record(path)
+    assert probe.readable and probe.halted
+    assert probe.k_anchor_ns is None and not probe.anchor_readable
+
+
+def test_k1_corrupt_epoch_row_plus_halted_breaker_gives_exactly_one_halt_alert(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _make_store(path, halted=True)
+    with SqliteStateStore(path) as store:
+        store.set(f"{EPOCH_KEY_PREFIX}123", b"garbage")
+    sink = _Sink()
+    ports = _ports(sink, probe_breaker_record=probe_breaker_record, configured_exec_par_k=_k(1))
+    watch = BreakerWatchState()
+    for i in range(6):
+        _tick(ports, watch, path, NOW + i * PROBE_INTERVAL_NS)
+    assert [p.event for p in sink.payloads] == [HALT_EVENT]
+
+
+def test_k2_unreadable_anchor_with_a_never_written_stamp_is_labelled() -> None:
+    never = replace(FRESH, stamp_ts_ns=None, anchor_readable=False)
+    state = BreakerWatchState()
+    assert _decide(never, state, k=2, live=False) == []
+    later = _decide(never, state, k=2, live=False, now_ns=NOW + STAGE_STAMP_MAX_AGE_NS)
+    assert [s.detail for s in later] == [BreakerAlertDetail.STAGE_STAMP_STALE_ANCHOR_UNREADABLE]
+    assert "anchor=unreadable" in later[0].detail.value
 
 
 def test_anchor_survives_a_supervisor_restart() -> None:
