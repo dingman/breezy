@@ -22,6 +22,19 @@ denial has no armed slot, so it is attributed by its own event time; the
 resolver's no-id ADOPT path emits a late ``OrderSubmitted``, which would carry
 the adoption time rather than the arm time.
 
+**AMBIGUOUS origin.** The ledger cannot say where a mark came from (that needs the pinned
+client), so the row's origin field is derived: ``boot`` when the intent's arm time is earlier
+than ``latch.boot_ns`` (armed before this process started), else ``live``; ``unknown`` when
+neither slot nor history is found. A pre-crash entry already counted is never counted twice
+(rows are idempotent by ``intent_id``).
+
+Known limits, both accepted: (1) restart window: a mark made less than 5 s before a crash,
+on an intent that also resolved before that crash, can be lost from memory. Negligible; the
+breaker's AMBIGUOUS-notional trip is separate and unaffected. (2) ADOPT: the resolver's no-id
+ADOPT path emits a late ``OrderSubmitted``, and no slot can be joined by client order id, so
+the ``order/<coid>`` row keeps ``ts_event`` and says so (``attribution="event_time"``);
+this affects only section 7 slippage and day attribution on that rare path.
+
 Failures are typed and loud: a missing day, arm time, ask, quantity, fee or
 theta is :class:`CounterAttributionError` (never a 0 default); any store failure
 is :class:`CounterWriteError` (value-free message, cause chained). Mapping a
@@ -52,6 +65,8 @@ from breezy.runtime.exec_par_records import (
 from breezy.runtime.exec_par_telemetry import WINDOW_NS
 
 __all__ = [
+    "ARM_EVENT_TIME",
+    "ARM_SLOT_JOIN",
     "UNATTRIBUTED",
     "AmbiguousMarkSource",
     "CounterAttributionError",
@@ -86,6 +101,8 @@ def reason_label(reason: str) -> str:
 
 
 UNATTRIBUTED: Final[str] = "unattributed"
+ARM_EVENT_TIME: Final[str] = "event_time"
+ARM_SLOT_JOIN: Final[str] = "slot_join"
 
 
 class AmbiguousMarkSource(Protocol):
@@ -112,6 +129,8 @@ class CounterWriterPort(Protocol):
     def write_order_anchor(self, record: OrderAnchor) -> bool: ...
     def read_order_anchor(self, client_order_id: str) -> OrderAnchor | None: ...
     def read_intent(self, intent_id: str) -> IntentView | None: ...
+    @property
+    def boot_ns(self) -> int: ...
     def write_denial(self, record: DenialRow) -> bool: ...
     def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
     def write_fill(self, record: FillRow) -> bool: ...
@@ -213,6 +232,7 @@ class ExecParCounterIngest:
             qty=str(quantity),
             notional=str(ask * quantity),
             window_start_ns=arm - arm % self._window_ns,
+            attribution=ARM_EVENT_TIME,
         )
         created: bool = self._write(lambda: self._store.write_order_anchor(anchor))
         if created:
@@ -266,7 +286,7 @@ class ExecParCounterIngest:
         first_error: ExecParCounterError | None = None
         for mark in sorted(marks.ambiguous_marks_pending()):
             try:
-                row = self._ambiguous_row(mark[0], mark[1], when)
+                row = self._ambiguous_row(mark[0], when)
                 if self._write_ambiguous(row):
                     created += 1
                 marks.ack_ambiguous_marks([mark])
@@ -280,17 +300,18 @@ class ExecParCounterIngest:
         written: bool = self._write(lambda: self._store.write_ambiguous(row))
         return written
 
-    def _ambiguous_row(self, intent_id: str, source: str, when: int) -> AmbiguousRow:
+    def _ambiguous_row(self, intent_id: str, when: int) -> AmbiguousRow:
         try:
             intent = self._store.read_intent(intent_id)
         except Exception as exc:
             raise CounterAttributionError("slot table unreadable for attribution") from exc
         if intent is None:  # neither a slot nor history: counted, never dropped
-            return AmbiguousRow(intent_id, source, UNATTRIBUTED, when, UNATTRIBUTED, when)
+            return AmbiguousRow(intent_id, "unknown", UNATTRIBUTED, when, UNATTRIBUTED, when)
         kind = "slot" if intent.retired_ns is None else "history"
         slug = _need_text(intent.slug, "slot slug")
         day = self._day(slug, intent.created_ns)
-        return AmbiguousRow(intent_id, source, day, intent.created_ns, kind, when)
+        origin = "boot" if intent.created_ns < self._store.boot_ns else "live"
+        return AmbiguousRow(intent_id, origin, day, intent.created_ns, kind, when)
 
     def _anchor(self, coid: str) -> OrderAnchor:
         anchor: OrderAnchor | None = self._write(lambda: self._store.read_order_anchor(coid))
