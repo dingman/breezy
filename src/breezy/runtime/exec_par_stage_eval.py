@@ -196,6 +196,8 @@ def _build_ctx(snap: StageSnapshot) -> StageContext:
         raise fail("non_monotonic")
     first_k_day = _first_k_gt1_day(snap)
     parse_day(first_k_day)
+    if first_k_day > snap.today:
+        raise fail("epoch_after_today")
     excluded = {x.day for x in snap.excluded_days}
     for label in (*excluded, *snap.gappy_days, *snap.pending_rebuild_days):
         parse_day(label)
@@ -285,13 +287,22 @@ def _needs_pnl_row(row: DayCounters) -> bool:
     return bool(row.fills) or bool(row.ambiguous)
 
 
-def _validate_pre_floor(ctx: StageContext, excluded: set[str]) -> None:
-    """s15-cumulative is never floored: every day since the first K>1 boot needs its row."""
+def _validate_cumulative_rows(ctx: StageContext, unreconciled: frozenset[str]) -> None:
+    """s15-cumulative is never floored: every day since the first K>1 boot needs its row.
+
+    Covers the pre-floor days and the excluded stage days (live stage days are checked by the
+    caller). An excluded day is exempt only while it is not yet reconciled (10a): once its
+    counters reconcile it counts, so a fill or AMBIGUOUS mark with no row is a FAIL.
+    """
     first = parse_day(ctx.first_k_day)
-    for offset in range((parse_day(ctx.floor_day) - first).days + 1):
-        label = (first + dt.timedelta(days=offset)).isoformat()
-        if label in excluded:
-            continue  # an unreconciled excluded day counts only once reconciled (10a)
+    labels = [
+        (first + dt.timedelta(days=offset)).isoformat()
+        for offset in range((parse_day(ctx.floor_day) - first).days + 1)
+    ]
+    excluded = {x.day for x in ctx.snap.excluded_days}
+    for label in (*labels, *ctx.excluded_in_stage):
+        if label in excluded and label in unreconciled:
+            continue
         row = ctx.by_day.get(label)
         if row is None:
             raise fail("missing_day")
@@ -302,7 +313,7 @@ def _validate_pre_floor(ctx: StageContext, excluded: set[str]) -> None:
 
 
 def _validate_pnl(ctx: StageContext) -> None:
-    excluded = {x.day for x in ctx.snap.excluded_days}
+    unreconciled = ctx.snap.gappy_days | ctx.snap.pending_rebuild_days
     for reading in ctx.pnl.values():
         if reading is not None:
             _validate_reading(reading)
@@ -311,9 +322,14 @@ def _validate_pnl(ctx: StageContext) -> None:
     for label in ctx.live:
         if _needs_pnl_row(ctx.by_day[label]) and ctx.pnl.get(label) is None:
             raise fail("settled_pnl_missing")
-    _validate_pre_floor(ctx, excluded)
+    _validate_cumulative_rows(ctx, unreconciled)
+    excluded = {x.day for x in ctx.snap.excluded_days}
     for label, reading in ctx.pnl.items():
-        if reading is None and label >= ctx.first_k_day and label not in excluded:
+        if (
+            reading is None
+            and label >= ctx.first_k_day
+            and not (label in excluded and label in unreconciled)
+        ):
             raise fail("settled_pnl_missing")
 
 
@@ -360,6 +376,11 @@ def _stage_stats(ctx: StageContext, fills: list[ParsedFill]) -> _Stats:
 def _parity(base: SerialBaseline | None, mean: Decimal | None) -> Decimal | None:
     if base is None:
         return None
+    fills, slip = base.fills, base.mean_slippage
+    if isinstance(fills, bool) or not isinstance(fills, int) or fills < 0:
+        raise fail("parity_baseline")
+    if slip is not None and not (isinstance(slip, Decimal) and slip.is_finite()):
+        raise fail("parity_baseline")
     if base.mean_slippage is None:
         if base.fills >= PARITY_MIN_SERIAL_FILLS:
             raise fail("parity_baseline")
@@ -370,6 +391,7 @@ def _parity(base: SerialBaseline | None, mean: Decimal | None) -> Decimal | None
 def _blockers(ctx: StageContext, stats: _Stats, parity: Decimal | None) -> tuple[str, ...]:
     """Deterministic look failures (s7 promotion conditions, s5 halt, fill days)."""
     out: list[str] = []
+    # N1: a marker older than the floor was consumed by that stage_reset; only ts >= floor counts.
     if any(v.reason in S5_REASONS and v.ts_ns >= ctx.floor.ts for v in ctx.snap.stop_verdicts):
         out.append("s5_halt_in_stage")
     if stats.fill_days < MIN_FILL_DAYS:
@@ -572,13 +594,15 @@ def _base_verdict(ctx: StageContext, looks: list[LookRecord], c: _Checks) -> Ver
     held, look_number = _look_state(ctx, looks, c.minima_met)
     nonexcluded = len(ctx.eligible)
     if held is not None and nonexcluded >= CLEANUP_HOLD_DAYS:
-        to_k = DEMOTE_K[ctx.stage_k]
+        to_k = target_k(StopOutcome.DOWN_ONE_STAGE, ctx.stage_k, ctx.snap.effective_k)
         return Verdict(
             VerdictKind.HOLD,
             HOLD_CLEANUP_DEMOTION,
             StopOutcome.DOWN_ONE_STAGE,
             to_k,
-            report=_report(ctx, c, held_days=nonexcluded, programme_paused=to_k == 1),
+            report=_report(
+                ctx, c, held_days=nonexcluded, programme_paused=DEMOTE_K[ctx.stage_k] == 1
+            ),
         )
     if held is not None:
         return Verdict(VerdictKind.HOLD, held, report=_report(ctx, c, held_days=nonexcluded))

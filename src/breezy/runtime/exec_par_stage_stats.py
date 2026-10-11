@@ -12,7 +12,7 @@ def wilson_deff_upper_bound(k: int, n: int, *, icc: float, m_bar: float, z: floa
     evaluator never estimates it (r4.5 O2/O5); BG-10(f) supplies ICC_v. ``z`` is
     :data:`Z_ONE_SIDED_90` or :data:`Z_ONE_SIDED_95`.
     """
-    if not all(isfinite(v) for v in (icc, m_bar, z)):
+    if not all(isfinite(v) for v in (icc, m_bar, z, k, n)):
         raise ValueError("Wilson-DEFF arguments must be finite")
     if n <= 0 or k < 0 or k > n or icc < 0 or m_bar <= 0 or z <= 0:
         raise ValueError("invalid Wilson-DEFF arguments")
