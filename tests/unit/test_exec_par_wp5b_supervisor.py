@@ -107,9 +107,19 @@ def _deliver(state: BreakerWatchState, specs: list[Any]) -> None:
         state.delivered(spec, NOW)
 
 
-def _run(ports: SupervisorPorts, watch: BreakerWatchState, tracked_pid: int | None = 42) -> None:
+def _run(
+    ports: SupervisorPorts,
+    watch: BreakerWatchState,
+    tracked_pid: int | None = 42,
+    *,
+    after_s: int = 0,
+) -> None:
     ts._dispatch_breaker_watch(
-        ports=ports, watch=watch, now=_now(), tracked_pid=tracked_pid, store_path=Path("/nowhere")
+        ports=ports,
+        watch=watch,
+        now=_now() + dt.timedelta(seconds=after_s),
+        tracked_pid=tracked_pid,
+        store_path=Path("/nowhere"),
     )
 
 
@@ -311,9 +321,9 @@ def test_dispatch_marks_delivered_only_after_the_durable_send_confirms() -> None
     watch = _seasoned()
     _run(ports, watch)  # outbox refused: not delivered
     assert watch.active == {}
-    _run(ports, watch)  # retried, confirmed
+    _run(ports, watch, after_s=61)  # retried on the 60 s throttle, confirmed
     assert set(watch.active) == {"heartbeat_stale"}
-    _run(ports, watch)  # now deduped: no third send
+    _run(ports, watch, after_s=122)  # now deduped: no third send
     assert len(sent) == 2
 
 
