@@ -23,6 +23,9 @@ D-PREREG 1, 1b, 10, 10a, r4.1 K9, r4.3 M3, r4.4 N4):
 * ``settled_pnl_floor_stub/<label>`` BG-5c N-A: a floor label's POST-floor settled-P&L row
 * ``settled_pnl_revision/<label>/<ts_ns>`` (``.../stub`` for a stub row) BG-5c WP-D audit row that
   must exist before a promoted CLI revision may replace a row non-monotonically
+* ``settled_pnl_basis/<label>`` (``.../stub`` for a stub row) BG-5c WP-D: the CLI-product tokens a
+  settled-P&L row was built from; a different token for the same station-day is a revision, even
+  one promoted while the node was down
 * ``force_k1``                 flag ``{reason, ts_ns, set_by}`` or, once
   cleared, the tombstone ``{cleared_ts_ns}``
 * ``day_convention``           ``{"v": 2}`` (BG-5c R1): per-station standard-time ``entry_day``;
@@ -99,6 +102,7 @@ __all__ = [
     "OrderAnchor",
     "RebuildRow",
     "ReconcilePhase",
+    "SettledPnlBasis",
     "SettledPnlDay",
     "SettledPnlRevision",
     "StageEvalDry",
@@ -220,6 +224,19 @@ class SettledPnlRevision:
     def __post_init__(self) -> None:
         if self.scope not in ("day", "stub"):
             raise ExecParRecordError("revision scope")
+
+
+@dataclass(frozen=True, slots=True)
+class SettledPnlBasis:
+    """BG-5c WP-D: the final CLI tokens (``station@day=token;...``) a row was built from."""
+
+    day: str
+    scope: str
+    basis: str
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("day", "stub"):
+            raise ExecParRecordError("basis scope")
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +490,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "fee_unreconciled_entries": "count",
         "fee_floor_total": "dec",
     },
+    SettledPnlBasis: {"day": "day", "scope": "str", "basis": "str"},
     SettledPnlRevision: {
         "day": "day",
         "ts_ns": "int",

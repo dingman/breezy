@@ -54,7 +54,6 @@ resolved is pending (counted as ``facts_missing``, only the exception TYPE is lo
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import dataclasses
 import datetime as dt
@@ -68,7 +67,13 @@ from typing import Final, Protocol
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.runtime.exec_par_days_port import DayConvention
 from breezy.runtime.exec_par_durable_sources import DurableSources, entry_inputs_from
-from breezy.runtime.exec_par_records import SettledPnlDay, SettledPnlRevision, StageReset
+from breezy.runtime.exec_par_daemon_executor import DaemonExecutor
+from breezy.runtime.exec_par_records import (
+    SettledPnlBasis,
+    SettledPnlDay,
+    SettledPnlRevision,
+    StageReset,
+)
 from breezy.runtime.exec_par_settled_pnl import (
     CENT,
     SETTLEMENT_DEADLINE_DAYS,
@@ -146,6 +151,8 @@ class PnlStore(Protocol):
     def read_floor_stub_pnl_day(self, day: str) -> SettledPnlDay | None: ...
     def write_settled_pnl_day(self, record: SettledPnlDay) -> None: ...
     def write_floor_stub_pnl_day(self, record: SettledPnlDay) -> None: ...
+    def read_settled_pnl_basis(self, day: str, scope: str) -> SettledPnlBasis | None: ...
+    def write_settled_pnl_basis(self, record: SettledPnlBasis) -> None: ...
     def write_settled_pnl_revision(self, record: SettledPnlRevision) -> None: ...
     def replace_settled_pnl_day_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None: ...
     def replace_floor_stub_pnl_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None: ...
@@ -172,6 +179,13 @@ class _Failure:
     reason: str
     named: bool
     cause: BaseException | None = None
+    #: the ROW landed even though the pass of this row failed (e.g. its basis write did not)
+    landed: bool = False
+
+
+def _new_executor() -> DaemonExecutor:
+    """Daemon workers: a hung local read must never block interpreter exit."""
+    return DaemonExecutor(_MAX_WORKERS, _THREAD_PREFIX)
 
 
 def cent_cost(value: Decimal) -> Decimal:
@@ -260,9 +274,7 @@ class SettledPnlDriver:
         self._timeout = read_timeout_s
         self._clock_ns = clock_ns
         self._monotonic = monotonic
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=_MAX_WORKERS, thread_name_prefix=_THREAD_PREFIX
-        )
+        self._executor = _new_executor()
         self._cache = FinalTruthCache()
         self._inflight: dict[_TruthKey, asyncio.Future[None]] = {}
         self._disposed = False
@@ -275,6 +287,8 @@ class SettledPnlDriver:
         self._revised: dict[_TruthKey, TruthRecord] = {}
         self._invalidated: set[_TruthKey] = set()
         self._revision_labels: dict[str, str] = {}
+        self._basis: dict[str, dict[str, TruthRecord]] = {}
+        self._basis_text: dict[tuple[str, str], str] = {}
         self._timeouts = 0
         self._errors = 0
         self._revisions = 0
@@ -320,6 +334,7 @@ class SettledPnlDriver:
         stale = self._drop_stale(keys)
         labels_by_key = self._labels_by_key(entries, resolved)
         shrink_labels = self._consume_events(labels_by_key)
+        self._basis = self._basis_by_label(labels_by_key)
         stale_labels = {label for key in stale for label in labels_by_key.get(key, ())}
         outcomes = self._outcomes(resolved.facts)
         today = self._today()
@@ -518,6 +533,19 @@ class SettledPnlDriver:
             self._cache.drop(key)
         return dropped
 
+    def _basis_by_label(
+        self, labels_by_key: Mapping[_TruthKey, set[str]]
+    ) -> dict[str, dict[str, TruthRecord]]:
+        """Per label, the cached FINAL each of its station-days is currently scored from."""
+        basis: dict[str, dict[str, TruthRecord]] = {}
+        for key, labels in labels_by_key.items():
+            record = self._cache.get(key)
+            if record is None:
+                continue
+            for label in labels:
+                basis.setdefault(label, {})[f"{key[0]}@{key[1].isoformat()}"] = record
+        return basis
+
     def _consume_events(self, labels_by_key: Mapping[_TruthKey, set[str]]) -> set[str]:
         """Map this pass's REVISED / INVALIDATED events onto labels. Revisions stay pending until
         their label persists; invalidations apply to this pass only."""
@@ -566,7 +594,8 @@ class SettledPnlDriver:
                 if failure is not None:
                     failures.append(failure)
                     failed_labels.add(label)
-                    continue
+                    if not failure.landed:
+                        continue
                 if self._written.get((kind, label)) != record:
                     self._written[(kind, label)] = record
                     landed = True
@@ -591,10 +620,44 @@ class SettledPnlDriver:
             return self._accept_revision(kind, record, label, suffix, exc)
         except Exception as exc:  # noqa: BLE001 - isolated: one row never blocks the others
             return _Failure(f"settled_pnl_persist_failed:{label}{suffix}", named=False, cause=exc)
+        return self._record_basis(kind, label, suffix)
+
+    def _basis_now(self, label: str) -> dict[str, TruthRecord]:
+        return self._basis.get(label, {})
+
+    def _record_basis(self, kind: str, label: str, suffix: str) -> _Failure | None:
+        """AFTER the row landed: remember which CLI products it was built from (durable)."""
+        current = self._basis_now(label)
+        text = ";".join(f"{k}={current[k].token}" for k in sorted(current))
+        if not text or self._basis_text.get((kind, label)) == text:
+            return None
+        try:
+            self._store.write_settled_pnl_basis(SettledPnlBasis(label, kind, text))
+        except Exception as exc:  # noqa: BLE001 - the row is in; only its basis is missing
+            return _Failure(
+                f"settled_pnl_basis_write_failed:{label}{suffix}",
+                named=False,
+                cause=exc,
+                landed=True,
+            )
+        self._basis_text[(kind, label)] = text
+        return None
+
+    def _durable_revision(self, kind: str, label: str) -> str | None:
+        """The product digest of a station-day whose final differs from the one the persisted
+        row was built from: a revision promoted while this process was down (or unseen)."""
+        stored = self._store.read_settled_pnl_basis(label, kind)
+        if stored is None:
+            return None
+        known = dict(item.split("=", 1) for item in stored.basis.split(";") if "=" in item)
+        current = self._basis_now(label)
+        for name in sorted(current):
+            if name in known and known[name] != current[name].token:
+                return current[name].product_sha256 or _NO_SHA
         return None
 
     def _shrank(self, prior: SettledPnlDay | None, record: SettledPnlDay, label: str) -> bool:
-        if prior is None or label in self._revision_labels:
+        if prior is None:
             return False
         return record.settled_entries < prior.settled_entries
 
@@ -618,9 +681,14 @@ class SettledPnlDriver:
         guard: SettledPnlRegression,
     ) -> _Failure | None:
         """A guard failure: accept it only as a promoted CLI revision, under an audit row."""
-        sha = self._revision_labels.get(label)
+        try:
+            sha = self._revision_labels.get(label) or self._durable_revision(kind, label)
+        except Exception as exc:  # noqa: BLE001 - an unreadable basis is a persist failure
+            return _Failure(f"settled_pnl_persist_failed:{label}{suffix}", named=False, cause=exc)
         if sha is None:
             return _Failure(f"settled_pnl_regression:{label}{suffix}", named=True, cause=guard)
+        if guard.kind != "pnl_rise":  # a revision changes P&L, never the entry count
+            return _Failure(f"settled_truth_shrank:{label}{suffix}", named=True, cause=guard)
         try:
             prior = self._prior(kind, label)
             ts_ns = self._clock_ns()
@@ -641,9 +709,11 @@ class SettledPnlDriver:
                 self._store.replace_settled_pnl_day_for_revision(record, ts_ns)
             else:
                 self._store.replace_floor_stub_pnl_for_revision(record, ts_ns)
+        except SettledPnlRegression as exc:  # the latch's own entry-shrink refusal
+            return _Failure(f"settled_truth_shrank:{label}{suffix}", named=True, cause=exc)
         except Exception as exc:  # noqa: BLE001 - isolated like any other row failure
             return _Failure(f"settled_pnl_persist_failed:{label}{suffix}", named=False, cause=exc)
-        return None
+        return self._record_basis(kind, label, suffix)
 
     # -- alerts and the raise --------------------------------------------------------------
 

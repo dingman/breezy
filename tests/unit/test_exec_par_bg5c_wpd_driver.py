@@ -159,6 +159,7 @@ class PnlStore:
         self.days: dict[str, SettledPnlDay] = {}
         self.stubs: dict[str, SettledPnlDay] = {}
         self.revisions: list[Any] = []
+        self.bases: dict[tuple[str, str], Any] = {}
         self.error: Exception | None = None
         self.fail_days: set[str] = set()
         self.writes = 0
@@ -190,6 +191,12 @@ class PnlStore:
         check_monotonic(self.stubs.get(record.day), record)
         self.stubs[record.day] = record
         self.writes += 1
+
+    def read_settled_pnl_basis(self, day: str, scope: str) -> Any:
+        return self.bases.get((day, scope))
+
+    def write_settled_pnl_basis(self, basis: Any) -> None:
+        self.bases[(basis.day, basis.scope)] = basis
 
     def write_settled_pnl_revision(self, audit: Any) -> None:
         self.revisions.append(audit)

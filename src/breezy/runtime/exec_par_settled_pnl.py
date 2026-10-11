@@ -83,7 +83,15 @@ class SettledPnlMissing(RuntimeError):
 
 
 class SettledPnlRegression(ValueError):
-    """A settled-P&L write would shrink the entry count or raise pnl without a new settlement."""
+    """A settled-P&L write would shrink the entry count or raise pnl without a new settlement.
+
+    ``kind`` is ``"entry_shrink"`` or ``"pnl_rise"``: only a ``pnl_rise`` may ever be accepted as
+    a promoted CLI revision.
+    """
+
+    def __init__(self, message: str, kind: str = "pnl_rise") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class SettledPnlRevisionUnaudited(RuntimeError):
@@ -313,7 +321,7 @@ def check_monotonic(prior: SettledPnlDay | None, new: SettledPnlDay) -> None:
     if prior is None:
         return
     if new.total_entries < prior.total_entries:
-        raise SettledPnlRegression("entry count would shrink")
+        raise SettledPnlRegression("entry count would shrink", kind="entry_shrink")
     rise = new.pnl_decimal - prior.pnl_decimal
     if rise <= 0 or new.settled_entries > prior.settled_entries:
         return
