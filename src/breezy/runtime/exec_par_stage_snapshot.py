@@ -7,6 +7,15 @@ Nautilus, no ``breezy.adapters`` write path. Currency values are carried as the 
 holds them and never printed; the one comparison against a budget fraction happens inside
 the injected predicate port (K6).
 
+Day model (BG-5c R1, A4, A5). Labels are per-station standard-time days: the snapshot covers the
+labels from the earlier of the first K>1 boot and the stations' floor days through the LATEST
+open label of any governed station (``governed.open_days_at(now)``), plus a bounded probe past
+that for entries that lead ``today`` by more than the two-day allowance (the evaluator turns those
+into ``counter_missing``). Each station's floor label also gets a post-floor STUB built from the
+per-entry rows (``arm_ns >= floor.ts``); every other label uses the whole-day counters. A stub
+whose rows cannot account for the stored counts (a BG-1d rebuild restored counts, not rows) is
+``pre_floor_unknown``.
+
 Failure semantics (spec 10a: "a missing day or a None value counts as FAIL, never 0"):
 
 * A per-day read that raises becomes a ``None`` field, so the evaluator FAILs with
@@ -27,24 +36,30 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol
 
 from breezy.runtime.exec_par_counter_ingest import UNATTRIBUTED
+from breezy.runtime.exec_par_days_port import DayConvention
 from breezy.runtime.exec_par_reconcile import DayCounts, PassStatus, RebuildRecord
 from breezy.runtime.exec_par_records import (
+    AmbiguousRow,
     DenialRow,
     EpochRow,
     ExcludedDay,
     FillRow,
     LookRow,
     OpenCostFlag,
+    OrderAnchor,
     SettledPnlDay,
     StageReset,
     StopVerdict,
     WindowPeak,
+    canonical_decimal,
 )
 from breezy.runtime.exec_par_settled_pnl import settled_pnl_or_fail
 from breezy.runtime.exec_par_stage_types import (
+    MAX_OPEN_DAYS_AHEAD,
     DayCounters,
     DayPnl,
     LookOutcome,
@@ -68,6 +83,10 @@ __all__ = [
 #: K>1 boot that s15-cumulative needs, so 400 days is far beyond any real stage.
 MAX_SNAPSHOT_DAYS = 400
 
+#: How many days past ``today + MAX_OPEN_DAYS_AHEAD`` are probed for entries that lead ``today``
+#: by more than the allowance. Bounded: day-keyed rows cannot be enumerated without a day.
+AHEAD_PROBE_DAYS = 7
+
 
 class SnapshotReads(Protocol):
     """The latch reads the builder uses (loop thread; a subset of ``SubmitIntentLatch``)."""
@@ -83,6 +102,7 @@ class SnapshotReads(Protocol):
     def read_open_cost_flags(self, day: str) -> tuple[OpenCostFlag, ...]: ...
     def read_window_peaks(self, day: str) -> tuple[WindowPeak, ...]: ...
     def read_ambiguous(self, day: str) -> tuple[object, ...]: ...
+    def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]: ...
 
 
 class SnapshotCounters(Protocol):
@@ -102,7 +122,7 @@ class SnapshotInputs:
     configured_k: int
     effective_k: int
     pass_status: PassStatus
-    day_of_ns: Callable[[int], str]
+    governed: DayConvention
     predicates: PnlPredicatePort
     serial_baseline: SerialBaseline | None
     #: ``None`` means no classification exists yet (BG-11): ``denied_counted`` is then ``None``.
@@ -111,12 +131,11 @@ class SnapshotInputs:
     on_read_error: Callable[[str, str, str], None] | None = None
 
 
-def _first_k_gt1_day(
-    epochs: tuple[EpochRow, ...], day_of_ns: Callable[[int], str], today: str
-) -> str:
+def _first_k_gt1_day(epochs: tuple[EpochRow, ...], governed: DayConvention, today: str) -> str:
+    """Instant-only (boot): the earliest station's open day at the first K>1 boot."""
     for epoch in epochs:
         if epoch.effective_k > 1:
-            return day_of_ns(epoch.boot_ts)
+            return min(governed.open_days_at(epoch.boot_ts))
     return today
 
 
@@ -133,14 +152,17 @@ def _day_range(start: str, end: str) -> tuple[str, ...]:
 def stage_day_labels(
     floor: StageReset | None,
     epochs: tuple[EpochRow, ...],
-    day_of_ns: Callable[[int], str],
+    governed: DayConvention,
     today: str,
+    through: str,
 ) -> tuple[str, ...]:
-    """The days a pass reads and reconciles: the earlier of the first K>1 day and the floor
-    day, through ``today``. A clock fault (start after today) reads ``today`` only."""
-    first_k_day = _first_k_gt1_day(epochs, day_of_ns, today)
-    start = first_k_day if floor is None else min(first_k_day, day_of_ns(floor.ts))
-    return _day_range(start, today)
+    """The days a pass reads and reconciles: the earlier of the first K>1 day and the stations'
+    floor days, through ``through`` (the latest open label of any station). A clock fault (start
+    after ``through``) reads ``through`` only. Floor and boot are instants, so they use
+    ``open_days_at`` (BG-5c R1)."""
+    first_k_day = _first_k_gt1_day(epochs, governed, today)
+    start = first_k_day if floor is None else min(first_k_day, *governed.open_days_at(floor.ts))
+    return _day_range(start, max(through, today))
 
 
 def _safe[T](
@@ -198,6 +220,115 @@ def _day_counters(
     )
 
 
+def _stub_ambiguous(rows: tuple[object, ...]) -> tuple[AmbiguousRow, ...]:
+    if not all(isinstance(row, AmbiguousRow) for row in rows):
+        raise TypeError("ambiguous rows are not AmbiguousRow")
+    return tuple(row for row in rows if isinstance(row, AmbiguousRow))
+
+
+def _stub_windows(anchors: tuple[OrderAnchor, ...]) -> tuple[WindowPeak, ...]:
+    """BG-1b's per-window peaks, re-derived from the post-floor anchors only."""
+    grouped: dict[int, list[OrderAnchor]] = {}
+    for anchor in anchors:
+        grouped.setdefault(anchor.window_start_ns, []).append(anchor)
+    return tuple(
+        WindowPeak(
+            day=group[0].day,
+            window_start_ns=start,
+            orders=len(group),
+            notional=canonical_decimal(sum((Decimal(a.notional) for a in group), Decimal(0))),
+            coids=",".join(sorted(a.client_order_id for a in group)),
+        )
+        for start, group in sorted(grouped.items())
+    )
+
+
+def _floor_stub(
+    reads: SnapshotReads,
+    counters: SnapshotCounters,
+    inputs: SnapshotInputs,
+    floor_ts: int,
+    day: str,
+) -> DayCounters:
+    """One floor label's counters from ONLY the entries armed at or after ``floor_ts`` (A4).
+
+    A read that fails leaves every field ``None`` (the evaluator FAILs on a missing counter). The
+    stub is ``pre_floor_unknown`` when the stored whole-day counts are not accounted for by the
+    per-entry rows (a rebuild restored counts, not rows), so no pre/post split can be proven.
+    """
+    report = inputs.on_read_error
+    anchors = _anchors_at(reads, day, report)
+    ambiguous = _safe(lambda: _stub_ambiguous(reads.read_ambiguous(day)), "ambiguous", day, report)
+    fills = _safe(lambda: reads.read_fills(day), "fills", day, report)
+    flags = _safe(lambda: reads.read_open_cost_flags(day), "open_flags", day, report)
+    counts = _safe(lambda: counters.read_day_counts(day), "counts", day, report)
+    if anchors is None or ambiguous is None or fills is None or flags is None or counts is None:
+        return DayCounters(day, None, None, None, None, None, None)
+    post_anchors = tuple(a for a in anchors if a.arm_ns >= floor_ts)
+    post_fills = tuple(f for f in fills if f.arm_ns >= floor_ts)
+    unknown = (
+        counts.posted_entries != len(anchors)
+        or counts.ambiguous != len(ambiguous)
+        or counts.fills != len({f.client_order_id for f in fills})
+    )
+    return DayCounters(
+        day=day,
+        posted=len(post_anchors),
+        ambiguous=sum(1 for row in ambiguous if row.arm_ns >= floor_ts),
+        denied_counted=_stub_denied(reads, day, floor_ts, inputs.counted_denial, report),
+        fills=post_fills,
+        open_flags=tuple(f for f in flags if f.ts_ns >= floor_ts),
+        windows=_stub_windows(post_anchors),
+        pre_floor_unknown=unknown,
+    )
+
+
+def _stub_denied(
+    reads: SnapshotReads,
+    day: str,
+    floor_ts: int,
+    classify: Callable[[str], bool] | None,
+    report: Report,
+) -> int | None:
+    if classify is None:
+        return None
+
+    def count() -> int:
+        return sum(
+            1 for row in reads.read_denials(day) if row.arm_ns >= floor_ts and classify(row.reason)
+        )
+
+    return _safe(count, "denied", day, report)
+
+
+def _anchors_at(reads: SnapshotReads, day: str, report: Report) -> tuple[OrderAnchor, ...] | None:
+    return _safe(lambda: reads.read_order_anchors(day), "anchors", day, report)
+
+
+def _ahead_tail(
+    reads: SnapshotReads,
+    counters: SnapshotCounters,
+    inputs: SnapshotInputs,
+    covered_through: str,
+) -> tuple[DayCounters, ...]:
+    """Entries past the covered labels: within the allowance they are open data, beyond it the
+    evaluator reports ``counter_missing``. A label with no posted entry is not added."""
+    today = dt.date.fromisoformat(inputs.today)
+    covered = dt.date.fromisoformat(covered_through)
+    rows: list[DayCounters] = []
+    for offset in range(1, MAX_OPEN_DAYS_AHEAD + AHEAD_PROBE_DAYS + 1):
+        day_date = today + dt.timedelta(days=offset)
+        if day_date <= covered:
+            continue
+        day = day_date.isoformat()
+        anchors = _anchors_at(reads, day, inputs.on_read_error)
+        if anchors is None:
+            rows.append(DayCounters(day, None, None, None, None, None, None))
+        elif anchors:
+            rows.append(_day_counters(reads, counters, inputs, day))
+    return tuple(rows)
+
+
 def _day_pnl(reads: SnapshotReads, day: str, report: Report) -> DayPnl | None:
     """``None``: no row (omitted); a ``DayPnl`` with a ``None`` reading: row unreadable."""
     try:
@@ -223,13 +354,25 @@ def build_stage_snapshot(
     looks = tuple(LookRecord(x.day, LookOutcome(x.outcome)) for x in reads.read_looks())
     verdicts = reads.read_stop_verdicts_since(0)
 
-    labels = stage_day_labels(floor, epochs, inputs.day_of_ns, inputs.today)
+    governed = inputs.governed
+    through = max({inputs.today, *governed.open_days_at(inputs.now_ns)})
+    labels = stage_day_labels(floor, epochs, governed, inputs.today, through)
+    tail = _ahead_tail(reads, counters, inputs, labels[-1])
+    all_labels = (*labels, *(x.day for x in tail))
 
     pnl = tuple(
-        row for day in labels if (row := _day_pnl(reads, day, inputs.on_read_error)) is not None
+        row for day in all_labels if (row := _day_pnl(reads, day, inputs.on_read_error)) is not None
     )
     gappy = counters.read_gappy_days()
     pending = frozenset(day for day in labels if counters.read_pending_rebuild(day) is not None)
+    stubs = (
+        ()
+        if floor is None
+        else tuple(
+            _floor_stub(reads, counters, inputs, floor.ts, day)
+            for day in sorted(governed.open_days_at(floor.ts))
+        )
+    )
     return StageSnapshot(
         today=inputs.today,
         configured_k=inputs.configured_k,
@@ -237,7 +380,7 @@ def build_stage_snapshot(
         floor=floor,
         epochs=epochs,
         excluded_days=excluded,
-        days=tuple(_day_counters(reads, counters, inputs, day) for day in labels),
+        days=(*(_day_counters(reads, counters, inputs, day) for day in labels), *tail),
         pnl_days=pnl,
         gappy_days=gappy,
         pending_rebuild_days=pending,
@@ -246,6 +389,7 @@ def build_stage_snapshot(
         stop_verdicts=verdicts,
         serial_baseline=inputs.serial_baseline,
         unattributed_ambiguous=_unattributed_ambiguous(reads, inputs.on_read_error),
-        day_of_ns=inputs.day_of_ns,
+        governed=governed,
         predicates=inputs.predicates,
+        floor_stubs=stubs,
     )

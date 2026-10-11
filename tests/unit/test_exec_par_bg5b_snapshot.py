@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import pytest
 
+from breezy.runtime.exec_par_counter_ingest import UNATTRIBUTED
 from breezy.runtime.exec_par_reconcile import DayCounts, PassStatus, RebuildRecord
 from breezy.runtime.exec_par_records import (
     DenialRow,
@@ -16,6 +17,7 @@ from breezy.runtime.exec_par_records import (
     FillRow,
     LookRow,
     OpenCostFlag,
+    OrderAnchor,
     SettledPnlDay,
     StageReset,
     StopVerdict,
@@ -32,6 +34,7 @@ from breezy.runtime.exec_par_stage_snapshot import (
     SnapshotInputs,
     build_stage_snapshot,
 )
+from tests.unit.exec_par_days import UtcDays
 
 NS = 1_000_000_000
 BASE = dt.date(2026, 12, 1)
@@ -45,8 +48,7 @@ def ns_of(day: str) -> int:
     return int(dt.datetime.fromisoformat(day).replace(tzinfo=dt.UTC).timestamp()) * NS
 
 
-def day_of_ns(ns: int) -> str:
-    return dt.datetime.fromtimestamp(ns // NS, dt.UTC).date().isoformat()
+GOV = UtcDays()
 
 
 class _Preds:
@@ -78,6 +80,10 @@ class _Reads:
     windows: dict[str, tuple[WindowPeak, ...]] = field(default_factory=dict)
     ambiguous_unattributed: int = 0
     raise_on: set[str] = field(default_factory=set)
+    #: The floor day d(0) holds three post-floor entries (they back the default counters' 3 posted).
+    anchors: dict[str, tuple[OrderAnchor, ...]] = field(
+        default_factory=lambda: {d(0): tuple(_anchor(d(0), f"A-{i}") for i in range(3))}
+    )
 
     def _maybe(self, name: str) -> None:
         if name in self.raise_on:
@@ -124,8 +130,14 @@ class _Reads:
         return self.windows.get(day, ())
 
     def read_ambiguous(self, day: str) -> tuple[object, ...]:
+        if day != UNATTRIBUTED:
+            return ()  # per-day AMBIGUOUS rows (the floor stub reads them): none in these tests
         self._maybe("unattributed")
         return (object(),) * self.ambiguous_unattributed
+
+    def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]:
+        self._maybe(f"anchors:{day}")
+        return self.anchors.get(day, ())
 
 
 @dataclass
@@ -148,6 +160,11 @@ class _Counters:
         return self.pending.get(day)
 
 
+def _anchor(day: str, coid: str) -> OrderAnchor:
+    arm = ns_of(day) + 10  # after the floor (d(0) + 5 ns)
+    return OrderAnchor(coid, "slug", day, arm, "0.40", "10", "4", arm, "event_time", "STN")
+
+
 def _inputs(**over: object) -> SnapshotInputs:
     base: dict[str, object] = {
         "now_ns": ns_of(d(4)) + 100,
@@ -155,7 +172,7 @@ def _inputs(**over: object) -> SnapshotInputs:
         "configured_k": 2,
         "effective_k": 2,
         "pass_status": PassStatus.OK,
-        "day_of_ns": day_of_ns,
+        "governed": GOV,
         "predicates": _Preds(),
         "serial_baseline": None,
         "counted_denial": None,
@@ -166,7 +183,7 @@ def _inputs(**over: object) -> SnapshotInputs:
 
 def _fill(day: str, coid: str = "O-1", trade: str = "T-1") -> FillRow:
     return FillRow(
-        trade, coid, day, ns_of(day), "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695"
+        trade, coid, day, ns_of(day), "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695", "STN"
     )
 
 
@@ -224,7 +241,9 @@ def test_no_k_gt1_epoch_means_only_today() -> None:
 
 
 def test_clock_before_the_first_epoch_still_builds_and_the_evaluator_fails() -> None:
-    snap = build_stage_snapshot(_Reads(), _Counters(), _inputs(today=d(-3)))
+    snap = build_stage_snapshot(
+        _Reads(anchors={}), _Counters(), _inputs(today=d(-3), now_ns=ns_of(d(-3)) + 100)
+    )
     assert [x.day for x in snap.days] == [d(-3)]
     assert evaluate_stage(snap).kind is VerdictKind.FAIL
 
@@ -282,9 +301,9 @@ def test_denied_counted_is_none_without_a_classifier_and_counts_with_one() -> No
     reads = _Reads(
         denials={
             d(1): (
-                DenialRow("O-1", "k-full", d(1), 1),
-                DenialRow("O-2", "breaker", d(1), 2),
-                DenialRow("O-3", "cool-off", d(1), 3),
+                DenialRow("O-1", "k-full", d(1), 1, "STN"),
+                DenialRow("O-2", "breaker", d(1), 2, "STN"),
+                DenialRow("O-3", "cool-off", d(1), 3, "STN"),
             )
         }
     )
@@ -298,7 +317,7 @@ def test_denied_counted_is_none_without_a_classifier_and_counts_with_one() -> No
 
 
 def test_a_classifier_that_raises_marks_the_day_none() -> None:
-    reads = _Reads(denials={d(1): (DenialRow("O-1", "k-full", d(1), 1),)})
+    reads = _Reads(denials={d(1): (DenialRow("O-1", "k-full", d(1), 1, "STN"),)})
 
     def boom(_: str) -> bool:
         raise RuntimeError("x")
@@ -357,5 +376,5 @@ def test_serial_baseline_predicates_and_clock_are_passed_through_untouched() -> 
     )
     assert snap.serial_baseline is baseline
     assert snap.predicates is preds
-    assert snap.day_of_ns is day_of_ns
+    assert snap.governed is GOV
     assert preds.calls == 0  # the builder itself never evaluates a currency predicate

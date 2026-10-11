@@ -55,7 +55,7 @@ def _latch(tmp_path: Path, store: _SelStore) -> Iterator[SubmitIntentLatch]:
 
 
 def _ingest(latch: SubmitIntentLatch, **kw: Any) -> ExecParCounterIngest:
-    kw.setdefault("climate_day_of", _day_of)
+    kw.setdefault("entry_day", _day_of)
     kw.setdefault("theta_of", lambda ts: Decimal("0.0695"))
     return ExecParCounterIngest(store=latch, **kw)
 

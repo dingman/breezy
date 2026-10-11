@@ -13,6 +13,10 @@ the order sits in the Nautilus cache when ``OrderSubmitted`` is published. So
 this layer persists ``order.price`` on the posted-entry anchor row. No strategy
 or client edit.
 
+**Day (BG-5c R1).** Every row's ``day`` is ``entry_day(station, arm_ns)`` of the entry's OWN
+station (per-station standard time) and the row carries that ``station``; ``station_of`` maps the
+instrument's base slug to it. There is no station-less day function.
+
 **Arm time (I2).** On the create path the client reads ``now_ns`` once and uses
 it for BOTH ``arm_slot(now_ns=...)`` (the slot ``created_ns``) and
 ``_generate_submitted(order, now_ns)``, so ``OrderSubmitted.ts_event`` equals the
@@ -180,14 +184,14 @@ class ExecParCounterIngest:
         self,
         *,
         store: CounterWriterPort,
-        climate_day_of: Callable[[str, int], str],
+        entry_day: Callable[[str, int], str],
         theta_of: Callable[[int], Decimal | None] = taker_fee_coefficient_as_of,
         station_of: Callable[[str], str] = lambda slug: slug,
         open_cost_flag_of: Callable[[str, str], bool] | None = None,
         window_ns: int = WINDOW_NS,
     ) -> None:
         self._store = store
-        self._climate_day_of = climate_day_of
+        self._entry_day = entry_day
         self._theta_of = theta_of
         self._station_of = station_of
         self._open_cost_flag_of = open_cost_flag_of
@@ -195,9 +199,16 @@ class ExecParCounterIngest:
 
     # -- helpers ----------------------------------------------------------
 
-    def _day(self, slug: str, ns: int) -> str:
+    def _station(self, slug: str) -> str:
         try:
-            day = self._climate_day_of(slug, ns)
+            station = self._station_of(slug)
+        except Exception as exc:
+            raise CounterAttributionError("station unresolved") from exc
+        return _need_text(station, "station")
+
+    def _day(self, station: str, ns: int) -> str:
+        try:
+            day = self._entry_day(station, ns)
         except Exception as exc:
             raise CounterAttributionError("climate day unresolved") from exc
         return _need_text(day, "climate day")
@@ -230,8 +241,9 @@ class ExecParCounterIngest:
             raise CounterAttributionError("decision ask outside (0, 1]")
         quantity = _need_positive(qty, "quantity")
         arm = _need_ns(arm_ns, "arm time")
-        day = self._day(slug, arm)
-        flag = self._open_cost_flag(slug, day, arm)
+        station = self._station(slug)
+        day = self._day(station, arm)
+        flag = self._open_cost_flag(station, day, arm)
         anchor = OrderAnchor(
             client_order_id=coid,
             slug=slug,
@@ -242,6 +254,7 @@ class ExecParCounterIngest:
             notional=str(ask * quantity),
             window_start_ns=arm - arm % self._window_ns,
             attribution=ARM_EVENT_TIME,
+            station=station,
         )
         created: bool = self._write(lambda: self._store.write_order_anchor(anchor))
         # Idempotent per client order id, so a replay after a failed window write repairs it
@@ -253,11 +266,10 @@ class ExecParCounterIngest:
             self._write(lambda: self._store.write_open_cost_flag(flag))
         return created
 
-    def _open_cost_flag(self, slug: str, day: str, arm_ns: int) -> OpenCostFlag | None:
+    def _open_cost_flag(self, station: str, day: str, arm_ns: int) -> OpenCostFlag | None:
         predicate = self._open_cost_flag_of
         if predicate is None:
             return None  # no seam wired: no row, never a False default
-        station = self._station_of(slug)
         try:
             exceeded = predicate(station, day)
         except Exception as exc:
@@ -277,7 +289,8 @@ class ExecParCounterIngest:
         coid = _need_text(client_order_id, "client order id")
         label = _need_text(reason, "denial reason")
         when = _need_ns(ts_ns, "denial time")
-        row = DenialRow(coid, label, self._day(_need_text(slug, "slug"), when), when)
+        station = self._station(_need_text(slug, "slug"))
+        row = DenialRow(coid, label, self._day(station, when), when, station)
         created: bool = self._write(lambda: self._store.write_denial(row))
         return created
 
@@ -314,12 +327,14 @@ class ExecParCounterIngest:
         except Exception as exc:
             raise CounterAttributionError("slot table unreadable for attribution") from exc
         if intent is None:  # neither a slot nor history: counted, never dropped
-            return AmbiguousRow(intent_id, "unknown", UNATTRIBUTED, when, UNATTRIBUTED, when)
+            return AmbiguousRow(
+                intent_id, "unknown", UNATTRIBUTED, when, UNATTRIBUTED, when, UNATTRIBUTED
+            )
         kind = "slot" if intent.retired_ns is None else "history"
-        slug = _need_text(intent.slug, "slot slug")
-        day = self._day(slug, intent.created_ns)
+        station = self._station(_need_text(intent.slug, "slot slug"))
+        day = self._day(station, intent.created_ns)
         origin = "armed_pre_boot" if intent.created_ns < self._store.boot_ns else "armed_post_boot"
-        return AmbiguousRow(intent_id, origin, day, intent.created_ns, kind, when)
+        return AmbiguousRow(intent_id, origin, day, intent.created_ns, kind, when, station)
 
     def _anchor(self, coid: str) -> OrderAnchor:
         anchor: OrderAnchor | None = self._write(lambda: self._store.read_order_anchor(coid))
@@ -364,6 +379,7 @@ class ExecParCounterIngest:
             fee_realized=str(realized),
             fee_exact=str(theta * quantity * price * (_ONE - price)),
             fee_theta=str(theta),
+            station=anchor.station,
         )
         created: bool = self._write(lambda: self._store.write_fill(row))
         return created
@@ -379,9 +395,8 @@ class ExecParCounterIngest:
                 anchor = self._store.read_order_anchor(str(event.client_order_id))
                 if anchor is not None:
                     return anchor.day
-            return _need_text(
-                self._climate_day_of(self._slug_of(event.instrument_id), event.ts_event), "day"
-            )
+            station = self._station(self._slug_of(event.instrument_id))
+            return self._day(station, event.ts_event)
         except Exception:  # noqa: BLE001 - best effort by design
             return None
 

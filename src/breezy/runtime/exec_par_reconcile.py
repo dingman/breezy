@@ -125,20 +125,24 @@ def compute_gap_spans(
     return tuple(sorted(spans, key=lambda s: (s.start_ns, s.end_ns, s.kind.value)))
 
 
-def gappy_days(spans: Iterable[GapSpan], *, day_of: Callable[[int], str]) -> frozenset[str]:
-    """Every climate day a gap span touches.
+def gappy_days(
+    spans: Iterable[GapSpan], *, open_days_at: Callable[[int], frozenset[str]]
+) -> frozenset[str]:
+    """Every governed open climate day a gap span overlaps.
 
-    ``day_of`` must be injected and must be the climate-day function (never a
-    UTC-date default): it maps a timestamp in ns to the day key.
+    A span is instant-only (it has no station), so ``open_days_at`` must be the injected
+    :meth:`GovernedDays.open_days_at` (never a UTC-date default): it maps a timestamp in ns to
+    every governed station's open day. The union is taken at both ends and hourly in between, so
+    every day any station had open during the span is marked (BG-5c R7.2).
     """
     days: set[str] = set()
     for span in spans:
         cursor = span.start_ns
         while cursor < span.end_ns:
-            days.add(day_of(cursor))
+            days |= open_days_at(cursor)
             cursor += _HOUR_NS
-        days.add(day_of(span.end_ns))
-        days.add(day_of(span.start_ns))
+        days |= open_days_at(span.end_ns)
+        days |= open_days_at(span.start_ns)
     return frozenset(days)
 
 
@@ -181,9 +185,9 @@ class DurableDaySources(Protocol):
     """Durable reads for a day; ``None`` means unreadable (never zero).
 
     ``entry_fill_count`` is the number of DISTINCT filled ENTRY orders (BUY,
-    not SELL) attributed to ``day`` by the entry's arm-time climate day (I2),
-    never by the fill's ``ts_event`` UTC day. Build it with
-    :func:`entry_fills_by_day`. Slot counts are likewise entry-only and keyed
+    not SELL) attributed to ``day`` by the entry's arm-time climate day (I2) under
+    its own station's standard time, never by the fill's ``ts_event`` UTC day.
+    Build it with :func:`entry_fills_by_day`. Slot counts are likewise entry-only and keyed
     by arm day, so AMBIGUOUS (always an armed entry slot: ``arm_slot`` runs
     before the POST, including no-id outcomes) is a subset of posted entries.
     """
@@ -208,22 +212,24 @@ class UnattributableFill(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class FillRecord:
-    """One fill-index record: venue order id, side, the entry's arm time.
+    """One fill-index record: venue order id, side, the entry's arm time and station.
 
     ``side`` is the Nautilus ``order_side``. ``is_exit`` is the joined slot's
-    flag when known and is preferred over ``side``.
+    flag when known and is preferred over ``side``. ``station`` is the entry's own
+    station (BG-5c R1): an exit has none, an ENTRY without one is unattributable.
     """
 
     order_id: str
     side: str
     arm_ns: int | None
+    station: str | None = None
     is_exit: bool | None = None
 
 
 def entry_fills_by_day(
-    records: Iterable[FillRecord], *, day_of: Callable[[int], str]
+    records: Iterable[FillRecord], *, entry_day: Callable[[str, int], str]
 ) -> dict[str, int]:
-    """Distinct filled entry orders per arm-time climate day.
+    """Distinct filled entry orders per arm-time climate day (per-station standard time).
 
     Exit records are skipped (slot ``is_exit`` when known, else Nautilus
     ``order_side == "SELL"``): they have no posted entry and no ledger spend.
@@ -232,16 +238,26 @@ def entry_fills_by_day(
     the instrument's leg to tell entry from exit.
 
     Repeated partial fills of one order id count once. An entry with no
-    arm time, an unknown side, or one order id mapping to two days raises
-    :class:`UnattributableFill` (fail closed).
+    arm time or station, an unknown side, or one order id mapping to two days raises
+    :class:`UnattributableFill` (fail closed). A floor-day entry without an arm time is
+    exactly the "pre-floor unknown" case: the whole day is excluded, never silently
+    included in or left out of the post-floor stub (BG-5c A4).
     """
     day_by_order: dict[str, str] = {}
     for record in records:
         if record.is_exit is True or (record.is_exit is None and record.side == "SELL"):
             continue
-        if record.side != "BUY" or record.arm_ns is None or not record.order_id:
+        if (
+            record.side != "BUY"
+            or record.arm_ns is None
+            or not record.station
+            or not record.order_id
+        ):
             raise UnattributableFill("fill record is not attributable")
-        day = day_of(record.arm_ns)
+        try:
+            day = entry_day(record.station, record.arm_ns)
+        except Exception as exc:
+            raise UnattributableFill("fill record is not attributable") from exc
         if day_by_order.setdefault(record.order_id, day) != day:
             raise UnattributableFill("order id maps to two arm days")
     counts: dict[str, int] = {}

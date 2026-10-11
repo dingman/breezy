@@ -30,7 +30,9 @@ def _pass_rig(tmp_path: Path, **kw: object):  # type: ignore[no-untyped-def]
 
 
 def _anchor(coid: str, day: str) -> OrderAnchor:
-    return OrderAnchor(coid, "slug", day, ns_of(day), "0.40", "10", "4", ns_of(day), "event_time")
+    return OrderAnchor(
+        coid, "slug", day, ns_of(day), "0.40", "10", "4", ns_of(day), "event_time", "STN"
+    )
 
 
 # -- item 1: a retried ingest after a rebuild is never counted twice -------------------------
@@ -256,7 +258,7 @@ async def test_a_pending_ambiguous_mark_is_ingested_before_the_rebuild_so_it_cou
         await asyncio.sleep(0.05)
         assert rig.events("EXEC_PAR_COUNTER_REBUILT") == []  # no rebuild over a pending mark
         rig.latch.write_ambiguous(
-            AmbiguousRow("a1", "armed_pre_boot", d(1), ns_of(d(1)), "slot", 1)
+            AmbiguousRow("a1", "armed_pre_boot", d(1), ns_of(d(1)), "slot", 1, "STN")
         )
         marks.pending.clear()  # the tick ingested it
         task = rig.ev.task

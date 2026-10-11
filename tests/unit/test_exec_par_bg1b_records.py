@@ -30,6 +30,7 @@ ANCHOR = OrderAnchor(
     notional="4.00",
     window_start_ns=1_700_000_000_000_000_000,
     attribution="event_time",
+    station="NYC",
 )
 FILL = FillRow(
     trade_id="TR-1",
@@ -43,10 +44,11 @@ FILL = FillRow(
     fee_realized="0.17",
     fee_exact="0.1681545",
     fee_theta="0.0695",
+    station="NYC",
 )
 ROWS = (
     ANCHOR,
-    DenialRow(client_order_id="O-2", reason="k-full", day="2026-10-11", arm_ns=7),
+    DenialRow(client_order_id="O-2", reason="k-full", day="2026-10-11", arm_ns=7, station="NYC"),
     AmbiguousRow(
         intent_id="a1",
         source="armed_pre_boot",
@@ -54,6 +56,7 @@ ROWS = (
         arm_ns=5,
         attribution="slot",
         ts_ns=9,
+        station="NYC",
     ),
     FILL,
     OpenCostFlag(station_day="NYC@2026-10-11", day="2026-10-11", exceeded=True, ts_ns=3),
@@ -91,8 +94,10 @@ def test_none_and_empty_and_bool_as_int_never_coerce() -> None:
     with pytest.raises(ExecParRecordError):
         encode_record(replace(ANCHOR, decision_ask=nothing))
     with pytest.raises(ExecParRecordError):
-        encode_record(DenialRow(client_order_id="O", reason="", day="d", arm_ns=1))
+        encode_record(DenialRow(client_order_id="O", reason="", day="d", arm_ns=1, station="NYC"))
     with pytest.raises(ExecParRecordError):
-        encode_record(DenialRow(client_order_id="O", reason="r", day="d", arm_ns=True))
+        encode_record(
+            DenialRow(client_order_id="O", reason="r", day="d", arm_ns=True, station="NYC")
+        )
     with pytest.raises(ExecParRecordError):
         encode_record(OpenCostFlag(station_day="s", day="d", exceeded=one, ts_ns=1))

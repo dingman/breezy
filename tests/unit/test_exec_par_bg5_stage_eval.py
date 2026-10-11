@@ -65,6 +65,7 @@ from breezy.runtime.exec_par_stage_eval import (
     fee_stage_tolerance,
     wilson_deff_upper_bound,
 )
+from tests.unit.exec_par_days import UtcDays
 
 NS = 1_000_000_000
 D = Decimal
@@ -79,10 +80,6 @@ def ns_of(day: str, hour: int = 12) -> int:
     parsed = dt.date.fromisoformat(day)
     stamp = dt.datetime(parsed.year, parsed.month, parsed.day, hour, tzinfo=dt.UTC)
     return int(stamp.timestamp()) * NS
-
-
-def day_of_ns(ns: int) -> str:
-    return dt.datetime.fromtimestamp(ns // NS, dt.UTC).date().isoformat()
 
 
 @dataclass
@@ -130,6 +127,7 @@ def fill(
         fee_realized=realized,
         fee_exact=exact,
         fee_theta=theta,
+        station="STN",
     )
 
 
@@ -182,10 +180,14 @@ def build(
     pnl_over: dict[int, str] | None = None,
     **over: object,
 ) -> StageSnapshot:
-    """Stage with ``n`` closed days (d(1)..d(n)) plus today = d(n+1); floor on d(0)."""
+    """Stage with ``n`` closed days (d(1)..d(n)) plus today = d(n+1).
+
+    The floor is the start of d(1), so d(1) is the floor-day stub (every entry on it is
+    post-floor and the stub mirrors its whole-day counters); d(0) is a pre-floor day, needed for
+    s15-cumulative from the first K>1 boot."""
     day_over = day_over or {}
     pnl_over = pnl_over or {}
-    days: list[DayCounters] = [counters(d(0), posted=0)]  # floor day: needed for cumulative
+    days: list[DayCounters] = [counters(d(0), posted=0)]
     pnl: list[DayPnl] = []
     for i in range(1, n + 2):
         kw: dict[str, object] = {"posted": posted}
@@ -200,7 +202,7 @@ def build(
         "today": d(n + 1),
         "configured_k": k,
         "effective_k": k if eff is None else eff,
-        "floor": StageReset(ts=ns_of(d(0)), cause="k_change", halt_ts=None),
+        "floor": StageReset(ts=ns_of(d(1), 0), cause="k_change", halt_ts=None),
         "epochs": (EpochRow("sha", k, None, ns_of(d(0), 10)),),
         "excluded_days": (),
         "days": tuple(days),
@@ -212,10 +214,12 @@ def build(
         "stop_verdicts": (),
         "serial_baseline": None,
         "unattributed_ambiguous": 0,
-        "day_of_ns": day_of_ns,
+        "governed": UtcDays(),
         "predicates": FakePredicates(),
     }
     base.update(over)
+    if "floor_stubs" not in over:
+        base["floor_stubs"] = tuple(x for x in base["days"] if x.day == d(1))  # type: ignore[attr-defined]
     return StageSnapshot(**base)  # type: ignore[arg-type]
 
 
@@ -834,8 +838,9 @@ def test_s15_day_stop_skips_excluded_days_and_the_floor_day() -> None:
 
 
 def test_s15_stage_stop_boundary_minus_0_40_over_the_stage() -> None:
-    each_ok = {i: "-0.0499" for i in range(1, 9)} | {9: "0"}  # -0.3992 total
-    each_trip = {i: "-0.05" for i in range(1, 9)} | {9: "0"}  # -0.40 total
+    # A4: d(1) is the floor-day stub (not stage data); the stage is d(2)..d(8) plus the open d(9)
+    each_ok = {i: "-0.0499" for i in range(2, 10)} | {1: "0"}  # -0.3992 total
+    each_trip = {i: "-0.05" for i in range(2, 10)} | {1: "0"}  # -0.40 total
     ok = evaluate_stage(build(8, pnl_over=each_ok))
     assert STOP_S15_STAGE not in ok.stops
     bad = evaluate_stage(build(8, k=4, pnl_over=each_trip))
@@ -866,7 +871,9 @@ def test_s15_passes_aggregates_and_budget_fractions_to_the_port() -> None:
     assert fractions == {D("0.15"), D("0.40"), D("1.0")}
     assert all(type(a) is Decimal for a, _ in preds.calls)
     stage_total = [a for a, f in preds.calls if f == D("0.40")]
-    assert stage_total == [D("0.07")]  # 7 days of +0.01 and the open day, minus 0.01 on day 2
+    # A4: d(1) is the floor-day stub and its whole-day P&L is skipped: d(2)..d(8) and the open
+    # d(9) are 8 days of +0.01, minus 0.02 on day 2
+    assert stage_total == [D("0.06")]
 
 
 @pytest.mark.parametrize("mode", ["raise", "nonbool"])
@@ -952,7 +959,9 @@ def test_stop_reason_constants_are_distinct_strings() -> None:
 )
 def test_target_k_follows_the_ladder(k: int, outcome: StopOutcome, target: int) -> None:
     reason = STOP_S15_STAGE if outcome is StopOutcome.DOWN_ONE_STAGE else STOP_S15_DAY
-    pnl = {i: "-0.05" for i in range(1, 9)} | {9: "0"} if reason == STOP_S15_STAGE else {3: "-0.2"}
+    # A4: d(1) is the floor-day stub, so its whole-day P&L is not stage data
+    stage = {i: "-0.06" for i in range(2, 9)} | {1: "0", 9: "0"}
+    pnl = stage if reason == STOP_S15_STAGE else {3: "-0.2"}
     v = evaluate_stage(build(8, k=k, pnl_over=pnl))
     assert v.reason == reason and v.outcome is outcome and v.target_k == target
 
@@ -1166,11 +1175,14 @@ def test_importing_the_module_does_not_load_nautilus_or_the_adapters() -> None:
 
 
 def _floor_day_today(pnl: str, *, posted: int = 4) -> StageSnapshot:
-    """``today`` is the floor day itself (a stop_clear on day D)."""
+    """``today`` is the floor day itself (a stop_clear on day D): the floor is d(0) at noon and
+    every entry on d(0) is armed at noon, so the floor-day stub holds all of them (A4)."""
     return build(
         0,
         today=d(0),
+        floor=StageReset(ts=ns_of(d(0)), cause="k_change", halt_ts=None),
         days=(counters(d(0), posted=posted),),
+        floor_stubs=(counters(d(0), posted=posted),),
         pnl_days=(DayPnl(d(0), reading(pnl)),),
     )
 
@@ -1188,7 +1200,9 @@ def test_h1_cumulative_still_trips_on_a_floor_day_loss() -> None:
 
 
 def test_h1_floor_day_counters_are_not_validated_as_stage_data() -> None:
-    snap = build(0, today=d(0), days=(counters(d(0), posted=4, denied=None),),
+    floor = StageReset(ts=ns_of(d(0)), cause="k_change", halt_ts=None)
+    stub = counters(d(0), posted=4, denied=None)
+    snap = build(0, today=d(0), floor=floor, days=(stub,), floor_stubs=(stub,),
                  pnl_days=(DayPnl(d(0), reading("0.01")),))  # fmt: skip
     assert evaluate_stage(snap).kind is VerdictKind.PASS
 
@@ -1210,7 +1224,8 @@ def test_h2_target_k_is_clamped_to_a_forced_effective_k(
 
 
 def test_h2_down_one_stage_is_clamped_too() -> None:
-    each = {i: "-0.05" for i in range(1, 9)} | {9: "0"}
+    # A4: d(1) is the floor-day stub, so its whole-day P&L is not stage data
+    each = {i: "-0.06" for i in range(2, 9)} | {1: "0", 9: "0"}
     v = evaluate_stage(build(8, k=4, eff=1, pnl_over=each))
     assert v.reason == STOP_S15_STAGE and v.target_k == 1
 
@@ -1349,10 +1364,11 @@ def test_h4_pre_floor_day_with_no_entries_needs_no_row() -> None:
 
 
 def test_h5_unexpected_exception_is_a_named_fail_without_its_message() -> None:
-    def boom(_: int) -> str:
-        raise ValueError("secret pnl 1234.56")
+    class Boom(UtcDays):
+        def open_days_at(self, ts_ns: int) -> frozenset[str]:
+            raise ValueError("secret pnl 1234.56")
 
-    v = evaluate_stage(build(8, day_of_ns=boom))
+    v = evaluate_stage(build(8, governed=Boom()))
     assert v.kind is VerdictKind.FAIL and not v.sets_flag
     assert v.reason == "stage_eval_fail:internal:ValueError"
     assert "1234" not in repr(v)
