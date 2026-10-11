@@ -103,12 +103,15 @@ def test_icc_groups_refuse_window_dated_orders(sim: ModuleType, tmp_path: Path) 
         sim.icc_groups_from_orders(tmp_path / "orders-2026-10-09.tsv")
 
 
-def test_icc_report_with_too_few_ambiguous_orders_uses_the_floor(sim: ModuleType) -> None:
-    groups = [(3, 1), (2, 1), (4, 2), (5, 0), (4, 1), (2, 0), (6, 1)]  # 6 AMBIGUOUS
+def test_icc_report_with_too_few_ambiguous_orders_still_uses_the_g6_estimate(
+    sim: ModuleType,
+) -> None:
+    groups = [(3, 3), (3, 0), (4, 0), (2, 2), (5, 0), (4, 0), (6, 0)]  # 5 AMBIGUOUS, clustered
     out = sim.icc_report(groups, boot_runs=300, seed=5)
-    assert out["n_ambiguous"] == 6
+    assert out["n_ambiguous"] == 5
     assert out["too_few_ambiguous"] is True
-    assert out["icc_used"] == 0.1
+    assert out["icc_used"] == pytest.approx(max(0.1, out["estimate_raw"]))  # G6, r4.5 O1
+    assert out["icc_used"] != 0.1
     assert out["min_ambiguous_for_meaningful_icc"] == sim.MIN_AMB_FOR_ICC
     assert set(out["instability"]) >= {"undefined_share", "used_p05", "used_p50", "used_p95"}
     assert out["estimate_raw"] == out["estimate_raw"]  # the estimate is still reported
@@ -390,8 +393,14 @@ def test_end_to_end_tiny_run_records_every_pinned_assumption(
     assert set(res["burst"]["false_alarm_15d"]) == {"rho0.0", "rho0.1"}
     assert set(res["cp_burst"]["power_5d"]) >= {"p0.33", "p0.45"}
     assert res["viability"]["verdict"] in ("VIABLE", "NOT-VIABLE")
+    assert res["verdict"] in ("VIABLE_G6", "NOT_VIABLE_G6")
+    assert res["icc"]["icc_used"] == pytest.approx(max(0.1, res["icc"]["estimate_raw"]))
+    assert res["sensitivity"]["label"] == "not a result"
+    assert res["sensitivity"]["icc"] == 0.1
+    for name in ("v2", "v3"):
+        assert {"bound_90", "bound_95"} <= set(res[name]["at_icc_used"])
     assert "reference_at_level_0.33" in res["v2"] and "reference_at_level_0.33" in res["v3"]
-    assert "sensitivity_icc_estimate" in res
+    assert "sensitivity" in res
     assert "passing_grid_points_above_root" in res["v1_level"]
     assert set(res["meta"]["scripts_sha256"]) == {
         "exec_parallel_dhat_v2.py",
@@ -423,3 +432,36 @@ def test_main_refuses_window_inputs_before_any_work(
         ]
     )
     assert rc == 2
+
+
+# ---------------------------------------------- the committed primary (r4.5 O1/O5)
+RESULTS = EXEC_PAR / "exec_par_bg10_results.json"
+
+
+def test_committed_primary_verdict_is_g6_not_viable_at_icc_0_4147() -> None:
+    res = json.loads(RESULTS.read_text())
+    assert res["verdict"] == "NOT_VIABLE_G6"
+    assert res["icc"]["icc_used"] == pytest.approx(0.4146643858452804)
+    assert res["icc"]["icc_used"] == pytest.approx(0.4147, abs=5e-5)
+    assert res["v2"]["icc_used"] == res["v3"]["icc_used"] == res["icc"]["icc_used"]
+    assert res["v3"]["at_icc_used"]["bound_95"]["overall_pass"]["max"] > 0.20
+    for name in ("v2", "v3"):
+        assert {"bound_90", "bound_95"} <= set(res[name]["at_icc_used"])
+    assert res["v1_level"]["ge_0_33"] is True
+
+
+def test_committed_icc_0_1_run_is_a_labelled_sensitivity_not_a_result() -> None:
+    res = json.loads(RESULTS.read_text())
+    sens = res["sensitivity"]
+    assert sens["label"] == "not a result"
+    assert sens["icc"] == 0.1
+    assert {"v2_bound_90", "v3_bound_90", "v2_bound_95", "v3_bound_95"} <= set(sens)
+    assert "sensitivity_icc_estimate" not in res
+    assert res["viability"]["verdict"] == "NOT-VIABLE"
+    assert "icc_used_0_1" not in json.dumps(res)
+
+
+def test_no_field_says_the_icc_used_is_point_one() -> None:
+    res = json.loads(RESULTS.read_text())
+    assert res["pins"]["icc_model"]["icc_used"] == res["icc"]["icc_used"]
+    assert res["pins"]["icc_model"]["icc_used"] != 0.1
