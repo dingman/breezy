@@ -12,6 +12,7 @@ import inspect
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -587,16 +588,17 @@ def test_boot_raises_settings_error_on_manifest_family_mismatch() -> None:
 def test_o3_promo_violations_k_le_2_clean(tmp_path: Path) -> None:
     from breezy.runtime.exec_par_promo_record import promo_record_problems
 
-    assert promo_record_problems(tmp_path, 2) == []
+    assert promo_record_problems(tmp_path, 2, today=date(2026, 12, 1)) == []
 
 
 def test_o3_promo_violation_at_k3_without_record(tmp_path: Path) -> None:
     from breezy.runtime.exec_par_promo_record import promo_record_problems
 
-    assert promo_record_problems(tmp_path, 3)
+    assert promo_record_problems(tmp_path, 3, today=date(2026, 12, 1))
 
 
 def test_real_repo_o3_promotion_record_enforcement() -> None:
     from breezy.runtime.exec_par_promo_record import promo_record_problems
 
-    assert promo_record_problems(_REPO, EXEC_PAR_MAX_CONCURRENT_INTENTS) == []
+    today = date(2026, 12, 1)  # explicit: the validator is pure
+    assert promo_record_problems(_REPO, EXEC_PAR_MAX_CONCURRENT_INTENTS, today=today) == []

@@ -58,6 +58,8 @@ import os
 import re
 import stat
 from collections.abc import Callable
+from datetime import UTC
+from datetime import datetime as datetime_cls
 from datetime import time as datetime_time
 from decimal import Decimal
 from pathlib import Path
@@ -797,7 +799,8 @@ def force_k1_on_durable_flag(
     sink = resolve_alert_sink() if alert_sink is None else alert_sink
     root = default_repo_root() if repo_root is None else repo_root
     forced = force_k1_at_boot(latch, repo_root=root, alert_sink=sink)
-    return apply_promo_guard(latch, repo_root=root, alert_sink=sink) or forced
+    today = datetime_cls.now(UTC).date()
+    return apply_promo_guard(latch, repo_root=root, alert_sink=sink, today=today) or forced
 
 
 def build_trade_risk_engine_config(
