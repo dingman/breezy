@@ -75,6 +75,7 @@ _LAPSE = LAPSE_KEY_PREFIX
 _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
 _SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"
+_FLOOR_STUB_PNL = EXEC_PAR_PREFIX + "settled_pnl_floor_stub/"
 
 
 class _Store(Protocol):
@@ -417,6 +418,24 @@ class ExecParRecordsMixin:
         self._require_held()
         with self._mutex:
             row = self._er_get(f"{_SETTLED_PNL}{day}", SettledPnlDay)
+            if row is not None and row.day != day:
+                raise self.CorruptError()
+            return row
+
+    def write_floor_stub_pnl_day(self, record: SettledPnlDay) -> None:
+        """BG-5c N-A: settled P&L of ONE floor label's POST-floor entries (monotonic)."""
+        self._require_held()
+        with self._mutex:
+            key = f"{_FLOOR_STUB_PNL}{record.day}"
+            self._er_encode(record)  # validate first
+            check_monotonic(self._er_get(key, SettledPnlDay), record)
+            self._er_put(key, record)
+
+    def read_floor_stub_pnl_day(self, day: str) -> SettledPnlDay | None:
+        """The floor-stub row for the label, or ``None`` when absent (never read as zero)."""
+        self._require_held()
+        with self._mutex:
+            row = self._er_get(f"{_FLOOR_STUB_PNL}{day}", SettledPnlDay)
             if row is not None and row.day != day:
                 raise self.CorruptError()
             return row
