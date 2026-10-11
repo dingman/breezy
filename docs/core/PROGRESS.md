@@ -49,7 +49,6 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 ### LIVE-PROOF owed
 | ID | Proof owed (exact) |
 |---|---|
-| ING-3 | CLOSED 10-10: drop-in removed; 09:45Z post-rotation run exit 0 (627 s, 4 units deferred, drained 10:00Z); residual late-admit timeout risk → r3 candidate |
 | FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
 | R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
 | Failed units | portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09 |
@@ -83,6 +82,13 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 12 | AUT-7 | BUILD 7a gate drill, 7b live drill | 11 | OPEN |
 | 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
 Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
+
+### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 2 wins, −4.63; plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
+| ID | Open work (exact) | Status |
+|---|---|---|
+| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | PLAN |
+| TE-2 | Diagnose FQ 0/25 (LAX heat bust, 1 °F boundary losses) before any re-arm (delta vs F0/F13) | PLAN |
+| TE-3 | NO-side longshot hypothesis (2/3 wins); prereg-only, distinct from M1-v3 | PLAN |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
