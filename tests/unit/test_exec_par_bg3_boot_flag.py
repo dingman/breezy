@@ -232,3 +232,30 @@ def test_a_store_that_cannot_scan_demotions_fails_closed(tmp_path: Path) -> None
     with open_submit_intent_latch(_NoScan(), tmp_path / "s.db", max_slots=2) as latch:
         assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
         assert latch.max_slots() == 1
+
+
+# -- repo root is anchored on the module, never the cwd ---------------------
+
+
+def test_repo_root_is_module_anchored_and_ignores_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from breezy.runtime.exec_par_boot_flag import default_repo_root
+
+    monkeypatch.chdir(tmp_path)
+    amendments = default_repo_root() / AMENDMENT_DIR
+    assert "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04" in amendments.as_posix()
+    assert amendments.is_dir()
+    assert not amendments.is_relative_to(tmp_path)
+
+
+def test_boot_check_without_repo_root_uses_the_anchor_not_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A decoy amendment under the cwd must NOT lift the pause.
+    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n")
+    monkeypatch.chdir(tmp_path)
+    with _latch(tmp_path, k=2) as latch:
+        _demote(latch)
+        assert force_k1_on_durable_flag(latch, alert_sink=_Sink())
+        assert latch.max_slots() == 1
