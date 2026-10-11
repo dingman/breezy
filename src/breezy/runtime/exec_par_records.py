@@ -50,6 +50,8 @@ from typing import Final, TypeVar
 from breezy.runtime.submit_intent_slots import SlotTableError, canonical_text
 
 __all__ = [
+    "AMENDMENT_KEY_PREFIX",
+    "EPOCH_KEY_PREFIX",
     "EXEC_PAR_PREFIX",
     "AmbiguousRow",
     "Amendment",
@@ -82,6 +84,10 @@ __all__ = [
 ]
 
 EXEC_PAR_PREFIX: Final[str] = "exec/polymarket_us/exec_par/"
+#: Key layout of the append-style rows; the one owner, shared by the latch writers
+#: and the read-only ledger reader.
+EPOCH_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
+AMENDMENT_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "amendment/"
 _VERSION: Final[int] = 1
 
 

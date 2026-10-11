@@ -203,3 +203,97 @@ def test_a_parallel_id_for_a_row_not_in_the_tally_is_ignored(
     )
 
     assert tally.epoch_strata == ()
+
+
+# -- review fixes: crash-safe sidecar, strict reader, corrupt ledger ----------------------
+
+
+def test_a_crash_during_the_swap_leaves_the_sidecar_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    append_epoch_strata(tmp_path, {"t1": 5})
+    before = (tmp_path / EPOCH_STRATA_FILENAME).read_bytes()
+
+    def crash(*_args: object, **_kwargs: object) -> None:
+        raise OSError("power cut")
+
+    monkeypatch.setattr("breezy.persistence.epoch_strata.os.replace", crash)
+    with pytest.raises(OSError):
+        append_epoch_strata(tmp_path, {"t2": 6})
+
+    assert (tmp_path / EPOCH_STRATA_FILENAME).read_bytes() == before
+    assert parallel_trial_ids(tmp_path) == frozenset({"t1"})
+    assert [p.name for p in tmp_path.iterdir()] == [EPOCH_STRATA_FILENAME]
+
+
+def test_append_reads_the_sidecar_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    append_epoch_strata(tmp_path, {"t1": 5})
+    reads: list[Path] = []
+    original = Path.read_text
+
+    def counting(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        reads.append(self)
+        return original(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", counting)
+    append_epoch_strata(tmp_path, {"t2": 6})
+
+    assert reads.count(tmp_path / EPOCH_STRATA_FILENAME) == 1
+
+
+@pytest.mark.parametrize(
+    ("line", "field"),
+    [
+        ('{"trial_id": "t1", "stratum": "parallel"}', "filled_at_ns"),
+        ('{"trial_id": "t1", "filled_at_ns": "x", "stratum": "parallel"}', "filled_at_ns"),
+        ('{"trial_id": "t1", "filled_at_ns": true, "stratum": "parallel"}', "filled_at_ns"),
+        ('{"trial_id": "", "filled_at_ns": 5, "stratum": "parallel"}', "trial_id"),
+        ('{"trial_id": "t1", "filled_at_ns": 5, "stratum": "single"}', "stratum"),
+    ],
+)
+def test_a_bad_line_names_the_line_and_the_field(tmp_path: Path, line: str, field: str) -> None:
+    good = '{"trial_id": "t0", "filled_at_ns": 1, "stratum": "parallel"}'
+    (tmp_path / EPOCH_STRATA_FILENAME).write_text(f"{good}\n{line}\n{good}\n")
+
+    with pytest.raises(ValueError, match=rf":2.*{field}"):
+        parallel_trial_ids(tmp_path)
+
+
+def test_a_corrupt_epoch_ledger_stops_scoring_rather_than_skipping(tmp_path: Path) -> None:
+    catalog_base = tmp_path / "catalog"
+    instrument_id = _seed_instrument_and_final(catalog_base)
+    store_path = tmp_path / "state.sqlite"
+    with SqliteStateStore(store_path) as store:
+        _seed_latch(store, ask=Decimal("0.40"), instrument_id=instrument_id)
+        _seed_fill(store, venue_order_id="v1", instrument_id=instrument_id, ts_event=_BASE_NS)
+        store.set(f"{EXEC_PAR_PREFIX}epoch/{_BASE_NS}", b"garbage")
+
+    with pytest.raises(ValueError, match="epoch ledger corrupt; M1-v3 separation"):
+        score_live_trials(**_driver_kwargs(tmp_path, store_path, catalog_base=catalog_base))
+
+
+def test_jsonl_fills_skip_stratification_and_say_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from breezy.persistence.catalog import open_station_catalog, write_records
+    from tests.unit import test_score_live_trials as jsonl_fixtures
+
+    catalog_base = tmp_path / "catalog"
+    catalog = open_station_catalog(catalog_base, jsonl_fixtures._VENUE, jsonl_fixtures._CITY)
+    write_records(catalog, [jsonl_fixtures._climate_day(tmax_f=79)])
+    fills_path = tmp_path / "fills.jsonl"
+    fills_path.write_text(json.dumps(jsonl_fixtures._fill_row()) + "\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        scored, _refused, _excluded = score_live_trials(
+            fills_path=fills_path,
+            catalog_base=catalog_base,
+            venue=jsonl_fixtures._VENUE,
+            city=jsonl_fixtures._CITY,
+            derived_dir=tmp_path / "derived",
+            now_ns=_BASE_NS,
+        )
+
+    assert len(scored) == 1
+    assert any("epoch strata skipped" in r.getMessage() for r in caplog.records)
+    assert not (tmp_path / "derived" / EPOCH_STRATA_FILENAME).exists()

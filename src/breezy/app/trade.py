@@ -59,7 +59,12 @@ from breezy.runtime.breaker_watcher import (
     exec_client_getter,
 )
 from breezy.runtime.build_sha import resolve_build_revision
-from breezy.runtime.exec_par_epochs import record_boot_epoch, record_clean_stop
+from breezy.runtime.exec_par_epochs import (
+    EpochLedgerWriteError,
+    EpochRowWriteError,
+    record_boot_epoch,
+    record_clean_stop,
+)
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.node_config import (
@@ -143,6 +148,8 @@ _FAMILIES_DIR: Final[Path] = Path("deploy/families")
 LIVE_TRADING_PERMIT_REFUSED_EVENT: Final[str] = "LIVE_TRADING_PERMIT_REFUSED"
 LIVE_TRADING_PERMIT_REFUSED_SEVERITY: Final[str] = "WARN"
 LIVE_TRADING_PERMIT_REFUSED_SITE: Final[str] = "global"
+#: EXEC-PAR BG-2: CRITICAL alert for a contained K=1 epoch-row write failure.
+EPOCH_ROW_WRITE_FAILED_EVENT: Final[str] = "EXEC_PAR_EPOCH_ROW_WRITE_FAILED"
 
 #: [A-1, 2026-09-25] A plain, non-negative integer only -- same ASCII/
 #: anchoring discipline as ``safety.py``'s own ``_MONEY_RE``/``_COUNT_RE``.
@@ -990,12 +997,42 @@ def _open_exec_latch(
     )
 
 
+def _record_boot_epoch(latch: SubmitIntentLatch, commit_sha: str) -> None:
+    """EXEC-PAR BG-2: write the boot epoch row (and the `k_change` floor before it).
+
+    Only the epoch ROW write is contained, and only for a plain K=1 boot (no forced
+    reason): a ledger fault must not become a new K=1 outage. It is logged with its
+    traceback and alerted CRITICAL. The `k_change` floor protects the stage verdict and
+    is never swallowed, at any K; at K>1 (or a forced-to-1 boot) the row write fails
+    closed too, as a clean config-error exit via the caller's `EpochLedgerWriteError`.
+    """
+    try:
+        record_boot_epoch(latch, commit_sha=commit_sha, boot_ts=latch.boot_ns)
+    except EpochRowWriteError:
+        if latch.max_slots() > 1 or latch.k_forced_reason is not None:
+            raise
+        _boot_logger.exception("epoch row not written; booting without it")
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity="CRITICAL",
+                event=EPOCH_ROW_WRITE_FAILED_EVENT,
+                site="breezy-trade",
+                detail=f"boot_ts={latch.boot_ns} epoch row write failed; K=1 boot continues",
+            ),
+        )
+
+
 def _close_epoch(latch: SubmitIntentLatch) -> None:
-    """EXEC-PAR BG-2: stamp `stop_ts` once the node has disposed. Never masks the exit code."""
+    """EXEC-PAR BG-2: stamp `stop_ts` once the node has disposed. Never masks the exit code.
+
+    Called only on a NORMAL return of `trade_cli.run`, deliberately not from a `finally`:
+    an exception leaves the epoch unstamped, which is the J2 unclean-shutdown signal.
+    """
     try:
         record_clean_stop(latch, boot_ts=latch.boot_ns, stop_ts=time.time_ns())
-    except Exception as exc:  # noqa: BLE001 - the next boot_ts closes an unstamped epoch
-        _boot_logger.error("epoch stop_ts not written: %s", type(exc).__name__)
+    except Exception:  # the next boot_ts closes an unstamped epoch
+        _boot_logger.exception("epoch stop_ts not written boot_ts=%s", latch.boot_ns)
 
 
 def run(
@@ -1093,7 +1130,7 @@ def run(
             # before `node.run`. `commit_sha` is the identity the supervisor
             # logs as `supervisor_started.revision`. A write failure propagates.
             commit_sha = resolve_build_revision(os.environ)
-            record_boot_epoch(latch, commit_sha=commit_sha, boot_ts=latch.boot_ns)
+            _record_boot_epoch(latch, commit_sha)
             exec_watcher = build_exec_watcher(
                 latch.max_slots(),
                 latch=latch,
@@ -1191,6 +1228,9 @@ def run(
         # already validates this at settings-load time, above; this is
         # defense in depth for the second, real-use load.)
         FamilyManifestError,
+        # EXEC-PAR BG-2: a K>1 (or forced) epoch-row write fault, or any `k_change`
+        # floor fault, fails closed as a clean refusal, not a raw traceback.
+        EpochLedgerWriteError,
         # Defense in depth, not the intended path: `phase0_permit_guard=
         # (sending_permit is None)` above makes this unreachable when
         # `phase1_sending_permit`'s own invariant holds. Kept as a

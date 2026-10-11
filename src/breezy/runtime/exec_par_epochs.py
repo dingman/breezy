@@ -19,15 +19,18 @@ from __future__ import annotations
 
 import bisect
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
+from urllib.parse import quote
 
 from breezy.persistence.epoch_strata import STRATUM_PARALLEL, STRATUM_SINGLE
 from breezy.runtime.exec_par_records import (
-    EXEC_PAR_PREFIX,
+    AMENDMENT_KEY_PREFIX,
+    EPOCH_KEY_PREFIX,
     Amendment,
     EpochRow,
+    ExecParRecordError,
     StageReset,
     decode_record,
 )
@@ -37,7 +40,11 @@ __all__ = [
     "K_FORCED_NOTE_PREFIX",
     "STRATUM_PARALLEL",
     "STRATUM_SINGLE",
+    "EpochFloorWriteError",
     "EpochLedger",
+    "EpochLedgerCorrupt",
+    "EpochLedgerWriteError",
+    "EpochRowWriteError",
     "EpochWritePort",
     "k_forced_amendment",
     "read_epoch_ledger",
@@ -48,9 +55,23 @@ __all__ = [
 K_CHANGE_CAUSE: Final[str] = "k_change"
 K_FORCED_NOTE_PREFIX: Final[str] = "k_forced_to_1:"
 
-_EPOCH_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
-_AMENDMENT_PREFIX: Final[str] = EXEC_PAR_PREFIX + "amendment/"
 _BUSY_TIMEOUT_S: Final[float] = 5.0
+
+
+class EpochLedgerWriteError(Exception):
+    """A boot-time ledger write failed; ``__cause__`` is the underlying error."""
+
+
+class EpochRowWriteError(EpochLedgerWriteError):
+    """The epoch row itself could not be written (the floor, if any, already was)."""
+
+
+class EpochFloorWriteError(EpochLedgerWriteError):
+    """The ``k_change`` ``stage_reset`` could not be written. Never to be swallowed."""
+
+
+class EpochLedgerCorrupt(ValueError):
+    """An epoch or amendment row did not decode; M1-v3 separation cannot be trusted."""
 
 
 class EpochWritePort(Protocol):
@@ -70,7 +91,9 @@ def record_boot_epoch(latch: EpochWritePort, *, commit_sha: str, boot_ts: int) -
 
     The floor goes first so a crash between the two writes cannot lose it: the
     next boot still sees the old K and writes it again. The very first boot has
-    no prior row and so writes no ``stage_reset``. A write failure propagates.
+    no prior row and so writes no ``stage_reset``. A failed floor write raises
+    :class:`EpochFloorWriteError`, a failed row write :class:`EpochRowWriteError`;
+    the caller decides which one it may contain.
     """
     row = EpochRow(
         commit_sha=commit_sha,
@@ -80,8 +103,14 @@ def record_boot_epoch(latch: EpochWritePort, *, commit_sha: str, boot_ts: int) -
     )
     prior = latch.read_latest_epoch_row()
     if prior is not None and prior.effective_k != row.effective_k:
-        latch.write_stage_reset(StageReset(ts=boot_ts, cause=K_CHANGE_CAUSE, halt_ts=None))
-    latch.write_epoch_row(row)
+        try:
+            latch.write_stage_reset(StageReset(ts=boot_ts, cause=K_CHANGE_CAUSE, halt_ts=None))
+        except Exception as exc:
+            raise EpochFloorWriteError("k_change stage_reset write failed") from exc
+    try:
+        latch.write_epoch_row(row)
+    except Exception as exc:
+        raise EpochRowWriteError("epoch row write failed") from exc
     return row
 
 
@@ -101,10 +130,21 @@ class EpochLedger:
 
     epochs: tuple[EpochRow, ...]
     forced_amendment_ts: tuple[int, ...]
+    _boots: tuple[int, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_boots", tuple(row.boot_ts for row in self.epochs))
 
     def stratum_of(self, ts_event_ns: int) -> str:
-        """``parallel`` or ``single`` for a fill at ``ts_event_ns`` (before any epoch: single)."""
-        boots = [row.boot_ts for row in self.epochs]
+        """``parallel`` or ``single`` for a fill at ``ts_event_ns`` (before any epoch: single).
+
+        A missing or late K-force amendment leaves a K=1 epoch classed ``parallel``. That is
+        the safe direction: it only removes fills from M1-v3 separation and can never place a
+        parallel fill in the single stratum. An amendment likewise never retracts the
+        classification of an epoch that ended before it was written (``exec/client.py`` is
+        byte-pinned, so the marker cannot be made more reliable from here).
+        """
+        boots = self._boots
         index = bisect.bisect_right(boots, ts_event_ns) - 1
         if index < 0:
             return STRATUM_SINGLE
@@ -119,31 +159,44 @@ class EpochLedger:
 
 
 def read_epoch_ledger(db_path: Path) -> EpochLedger:
-    """Read the epoch and K-forced amendment rows through a ``mode=ro`` open (never writes)."""
-    uri = f"file:{db_path.as_posix()}?mode=ro"
+    """Read the epoch and K-forced amendment rows through a ``mode=ro`` open (never writes).
+
+    A row that does not decode raises :class:`EpochLedgerCorrupt` naming its key. It is never
+    skipped: a skipped parallel epoch would let parallel fills into M1-v3.
+    """
+    uri = f"file:{quote(db_path.resolve().as_posix())}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_S)
     try:
         conn.execute("PRAGMA query_only=ON")
-        epoch_values = _values_under(conn, _EPOCH_PREFIX)
-        amendment_values = _values_under(conn, _AMENDMENT_PREFIX)
+        epoch_items = _rows_under(conn, EPOCH_KEY_PREFIX)
+        amendment_items = _rows_under(conn, AMENDMENT_KEY_PREFIX)
     finally:
         conn.close()
-    epochs = sorted((decode_record(EpochRow, raw) for raw in epoch_values), key=_boot_ts)
+    epochs = sorted((_decode(EpochRow, k, raw) for k, raw in epoch_items), key=_boot_ts)
     forced = sorted(
         amendment.ts_ns
-        for amendment in (decode_record(Amendment, raw) for raw in amendment_values)
+        for amendment in (_decode(Amendment, k, raw) for k, raw in amendment_items)
         if amendment.note.startswith(K_FORCED_NOTE_PREFIX)
     )
     return EpochLedger(epochs=tuple(epochs), forced_amendment_ts=tuple(forced))
+
+
+def _decode[R](factory: type[R], key: str, raw: bytes) -> R:
+    try:
+        return decode_record(factory, raw)
+    except ExecParRecordError as exc:
+        raise EpochLedgerCorrupt(
+            f"epoch ledger corrupt; M1-v3 separation cannot be guaranteed (key {key})"
+        ) from exc
 
 
 def _boot_ts(row: EpochRow) -> int:
     return row.boot_ts
 
 
-def _values_under(conn: sqlite3.Connection, prefix: str) -> list[bytes]:
+def _rows_under(conn: sqlite3.Connection, prefix: str) -> list[tuple[str, bytes]]:
     rows = conn.execute(
-        "SELECT value FROM state WHERE substr(key, 1, ?) = ? ORDER BY key",
+        "SELECT key, value FROM state WHERE substr(key, 1, ?) = ? ORDER BY key",
         (len(prefix), prefix),
     ).fetchall()
-    return [bytes(value) for (value,) in rows]
+    return [(str(key), bytes(value)) for key, value in rows]

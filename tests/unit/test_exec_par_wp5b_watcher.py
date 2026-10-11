@@ -121,6 +121,9 @@ class _RecordingLatch:
             raise OSError("store down")
         self.halts.append((reason, ts_ns))
 
+    def write_amendment(self, record: object) -> None:
+        """BG-2: a K>1 watcher is wired to a latch that can record amendments."""
+
 
 def _register(actor: Actor, clock: TestClock) -> None:
     actor.register_base(

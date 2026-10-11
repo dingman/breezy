@@ -13,13 +13,17 @@ from breezy.runtime.exec_par_epochs import (
     K_FORCED_NOTE_PREFIX,
     STRATUM_PARALLEL,
     STRATUM_SINGLE,
+    EpochFloorWriteError,
     EpochLedger,
+    EpochLedgerCorrupt,
+    EpochLedgerWriteError,
+    EpochRowWriteError,
     k_forced_amendment,
     read_epoch_ledger,
     record_boot_epoch,
     record_clean_stop,
 )
-from breezy.runtime.exec_par_records import Amendment, EpochRow, StageReset
+from breezy.runtime.exec_par_records import EPOCH_KEY_PREFIX, Amendment, EpochRow, StageReset
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import SubmitIntentLatch, open_submit_intent_latch
 
@@ -141,7 +145,7 @@ def test_the_floor_is_written_before_the_epoch_row(tmp_path: Path) -> None:
     with _latch(db, k=1, boot_ns=100) as latch:
         record_boot_epoch(latch, commit_sha="a", boot_ts=latch.boot_ns)
     with _latch(db, k=2, boot_ns=200) as latch:
-        with pytest.raises(OSError):
+        with pytest.raises(EpochRowWriteError):
             record_boot_epoch(_EpochWriteFails(latch), commit_sha="b", boot_ts=latch.boot_ns)
 
         assert latch.read_stage_reset() is not None
@@ -217,3 +221,68 @@ def test_read_epoch_ledger_of_a_store_without_rows_is_empty(tmp_path: Path) -> N
         store.set("other", b"x")
 
     assert read_epoch_ledger(db) == EpochLedger(epochs=(), forced_amendment_ts=())
+
+
+class _FloorWriteFails(_EpochWriteFails):
+    def write_stage_reset(self, record: StageReset) -> None:
+        raise ValueError("stage_reset ts must be monotonic non-decreasing")
+
+    def write_epoch_row(self, record: EpochRow) -> None:
+        self._latch.write_epoch_row(record)
+
+
+def test_row_and_floor_failures_are_typed_and_keep_their_cause(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with _latch(db, k=1, boot_ns=100) as latch:
+        record_boot_epoch(latch, commit_sha="a", boot_ts=latch.boot_ns)
+    with _latch(db, k=2, boot_ns=200) as latch:
+        with pytest.raises(EpochFloorWriteError) as floor:
+            record_boot_epoch(_FloorWriteFails(latch), commit_sha="b", boot_ts=latch.boot_ns)
+        assert isinstance(floor.value.__cause__, ValueError)
+        with pytest.raises(EpochRowWriteError) as row:
+            record_boot_epoch(_EpochWriteFails(latch), commit_sha="b", boot_ts=latch.boot_ns)
+        assert isinstance(row.value.__cause__, OSError)
+    assert issubclass(EpochRowWriteError, EpochLedgerWriteError)
+    assert issubclass(EpochFloorWriteError, EpochLedgerWriteError)
+
+
+def test_a_late_or_lost_force_marker_classes_a_k1_fill_parallel_the_safe_direction() -> None:
+    """A lost / late K-force amendment leaves a K=1 epoch classed parallel.
+
+    That only REMOVES fills from M1-v3 separation; it can never put a parallel fill
+    into the single-slot stratum, so it never contaminates M1-v3. exec/client.py is
+    byte-pinned, so the marker cannot be made more reliable from here.
+    """
+    ledger = _ledger(EpochRow("a", 2, None, 100))  # the force happened, the marker was lost
+
+    assert ledger.stratum_of(150) == STRATUM_PARALLEL
+
+
+def test_a_later_amendment_does_not_retract_an_earlier_parallel_epoch() -> None:
+    ledger = _ledger(EpochRow("a", 2, None, 100), EpochRow("a", 2, None, 300), forced=(350,))
+
+    assert ledger.stratum_of(150) == STRATUM_PARALLEL
+    assert ledger.stratum_of(350) == STRATUM_SINGLE
+
+
+def test_a_corrupt_epoch_row_fails_hard_naming_the_key(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with SqliteStateStore(db) as store:
+        store.set(EPOCH_KEY_PREFIX + "100", b"{not json")
+
+    with pytest.raises(EpochLedgerCorrupt) as caught:
+        read_epoch_ledger(db)
+
+    message = str(caught.value)
+    assert EPOCH_KEY_PREFIX + "100" in message
+    assert "epoch ledger corrupt; M1-v3 separation cannot be guaranteed" in message
+
+
+def test_read_epoch_ledger_quotes_the_uri(tmp_path: Path) -> None:
+    folder = tmp_path / "a?b#c d"
+    folder.mkdir()
+    db = folder / "s.db"
+    with _latch(db, k=2, boot_ns=100) as latch:
+        record_boot_epoch(latch, commit_sha="a", boot_ts=latch.boot_ns)
+
+        assert read_epoch_ledger(db).epochs == (EpochRow("a", 2, None, 100),)

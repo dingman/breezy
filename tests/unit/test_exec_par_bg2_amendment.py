@@ -15,6 +15,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.runtime.breaker_watcher import (
+    EVENT_AMENDMENT_WRITE_FAILING,
     BreakerWatcherActor,
     ExecRefusalAlertActor,
     build_exec_watcher,
@@ -82,9 +83,15 @@ def _register(actor: Actor) -> None:
 
 
 def _watcher(
-    client: _Client, latch: _Latch, *, commit_sha: str | None = "abc123"
+    client: _Client,
+    latch: _Latch,
+    *,
+    commit_sha: str | None = "abc123",
+    sink: _Sink | None = None,
 ) -> ExecRefusalAlertActor:
-    actor = build_exec_watcher(2, latch=latch, alert_sink=_Sink(), commit_sha=commit_sha)
+    actor = build_exec_watcher(
+        2, latch=latch, alert_sink=sink if sink is not None else _Sink(), commit_sha=commit_sha
+    )
     _register(actor)
     assert isinstance(actor, BreakerWatcherActor)
     actor.bind_client(lambda: client)
@@ -157,3 +164,52 @@ async def test_without_a_commit_sha_the_k_gt_1_watcher_writes_no_amendment() -> 
     assert await actor.tick() is True
 
     assert latch.amendments == []
+
+
+class _NoAmendmentLatch:
+    def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None: ...
+
+    def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None: ...
+
+
+def test_k_gt_1_wiring_without_write_amendment_is_a_type_error() -> None:
+    with pytest.raises(TypeError, match="write_amendment"):
+        build_exec_watcher(2, latch=_NoAmendmentLatch(), alert_sink=_Sink(), commit_sha="abc")
+
+
+def test_k1_wiring_does_not_need_write_amendment() -> None:
+    build_exec_watcher(1, latch=_NoAmendmentLatch(), alert_sink=_Sink(), commit_sha="abc")
+
+
+def _streak_events(sink: _Sink) -> list[AlertPayload]:
+    return [p for p in sink.emitted if p.event == EVENT_AMENDMENT_WRITE_FAILING]
+
+
+@pytest.mark.asyncio
+async def test_five_consecutive_write_failures_alert_once_per_streak() -> None:
+    sink = _Sink()
+    latch = _Latch(fail_amendments=8)
+    actor = _watcher(_Client(k_forced_to_1_reason="r"), latch, sink=sink)
+
+    for _ in range(4):
+        assert await actor.tick() is False
+    assert _streak_events(sink) == []
+    for _ in range(4):
+        assert await actor.tick() is False
+
+    (alert,) = _streak_events(sink)
+    assert alert.severity == "CRITICAL"
+    assert latch.heartbeats == []  # heartbeat withholding is unchanged
+
+
+@pytest.mark.asyncio
+async def test_a_success_before_the_fifth_failure_never_alerts() -> None:
+    sink = _Sink()
+    latch = _Latch(fail_amendments=4)
+    actor = _watcher(_Client(k_forced_to_1_reason="r"), latch, sink=sink)
+
+    for _ in range(5):
+        await actor.tick()  # 4 failures, then a success
+
+    assert len(latch.amendments) == 1
+    assert _streak_events(sink) == []

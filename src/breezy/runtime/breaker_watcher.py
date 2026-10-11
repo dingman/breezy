@@ -67,10 +67,10 @@ from breezy.runtime.exec_par_records import (
     FillRow,
     ForceK1Cleared,
     ForceK1Flag,
-    SettledPnlDay,
     GappyMark,
     OpenCostFlag,
     OrderAnchor,
+    SettledPnlDay,
     StageEvalDry,
     StageReset,
     StopVerdict,
@@ -131,6 +131,9 @@ EVENT_STUCK_ON_HELD: Final[str] = "EXEC_PAR_STUCK_SLOT_ON_HELD_SLUG"
 EVENT_K_FORCED: Final[str] = "EXEC_PAR_K_FORCED_TO_1"
 EVENT_STUCK_REFUSAL: Final[str] = "EXEC_PAR_STUCK_REFUSAL_AFTER_SETTLE_FAILURE"
 EVENT_NO_FILL_REFUSAL: Final[str] = "EXEC_PAR_NO_FILL_RETIRE_REFUSAL"
+EVENT_AMENDMENT_WRITE_FAILING: Final[str] = "EXEC_PAR_AMENDMENT_WRITE_FAILING"
+#: Consecutive K-forced amendment write failures that raise one CRITICAL alert.
+AMENDMENT_FAILURE_ALERT_STREAK: Final[int] = 5
 
 
 class ExecClientView(Protocol):
@@ -538,6 +541,7 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._amendments = amendments if commit_sha is not None else None
         self._commit_sha = commit_sha
         self._k_forced_recorded = False
+        self._amendment_failures = 0
         self._guard = None if counters is None else IngestGuard(counters)
         self._ambiguous_marks = ambiguous_marks
         self._halt_written = False
@@ -638,9 +642,20 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         reason = client.k_forced_to_1_reason
         if amendments is None or commit_sha is None or reason is None or self._k_forced_recorded:
             return
-        amendments.write_amendment(
-            k_forced_amendment(ts_ns=now_ns, commit_sha=commit_sha, reason=reason)
-        )
+        try:
+            amendments.write_amendment(
+                k_forced_amendment(ts_ns=now_ns, commit_sha=commit_sha, reason=reason)
+            )
+        except Exception:
+            self._amendment_failures += 1
+            if self._amendment_failures == AMENDMENT_FAILURE_ALERT_STREAK:
+                self._send(
+                    "CRITICAL",
+                    EVENT_AMENDMENT_WRITE_FAILING,
+                    f"k_forced amendment write failed {self._amendment_failures} consecutive ticks",
+                )
+            raise
+        self._amendment_failures = 0
         self._k_forced_recorded = True
 
     def _collect_conditions(self, client: ExecClientView, now_ns: int) -> None:
@@ -721,11 +736,13 @@ def build_exec_watcher(
     K=1 alert-only watcher never writes.
     """
     if max_slots > 1:
+        if not isinstance(latch, AmendmentPort):
+            raise TypeError("a K>1 watcher needs a latch with write_amendment")
         return BreakerWatcherActor(
             latch=latch,
             alert_sink=alert_sink,
             digest=digest,
-            amendments=latch if isinstance(latch, AmendmentPort) else None,
+            amendments=latch,
             commit_sha=commit_sha,
         )
     return ExecRefusalAlertActor(alert_sink=alert_sink, digest=digest)
