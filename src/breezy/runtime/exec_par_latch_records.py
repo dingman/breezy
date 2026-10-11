@@ -32,6 +32,7 @@ from breezy.runtime.exec_par_records import (
     AMENDMENT_KEY_PREFIX,
     EPOCH_KEY_PREFIX,
     EXEC_PAR_PREFIX,
+    LAPSE_KEY_PREFIX,
     Amendment,
     CleanupDemotion,
     EpochRow,
@@ -41,6 +42,7 @@ from breezy.runtime.exec_par_records import (
     ForceK1Flag,
     ForceK1Kind,
     ForceK1State,
+    HeartbeatLapse,
     SettledPnlDay,
     StageEvalDry,
     StageReset,
@@ -69,6 +71,7 @@ _FORCE_K1_CLEARED = EXEC_PAR_PREFIX + "force_k1_cleared"
 _FORCE_K1_FLAG = EXEC_PAR_PREFIX + "force_k1"
 _EPOCH = EPOCH_KEY_PREFIX
 _AMENDMENT = AMENDMENT_KEY_PREFIX
+_LAPSE = LAPSE_KEY_PREFIX
 _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
 _SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"
@@ -244,6 +247,45 @@ class ExecParRecordsMixin:
         self._require_held()
         with self._mutex:
             return self._er_get(f"{_AMENDMENT}{ts_ns}", Amendment)
+
+    # -- heartbeat-lapse spans (BG-5c R7.3; append-only) -----------------
+
+    def write_heartbeat_lapse(self, record: HeartbeatLapse) -> bool:
+        """Append one span keyed by ``start_ns``. ``True`` if written.
+
+        A re-write of the same span (even after it was stamped marked) is a ``False`` no-op; a
+        different ``end_ns`` or kind at the same start raises ``ValueError`` (never an overwrite).
+        """
+        self._require_held()
+        if record.end_ns <= record.start_ns:
+            raise ValueError("lapse must end after it starts")
+        key = f"{_LAPSE}{record.start_ns}"
+        with self._mutex:
+            existing = self._er_get(key, HeartbeatLapse)
+            if existing is None:
+                self._er_put(key, record)
+                return True
+            if (existing.end_ns, existing.kind) != (record.end_ns, record.kind):
+                raise ValueError(f"conflicting EXEC-PAR row already stored at {key}")
+            return False
+
+    def read_heartbeat_lapses(self) -> tuple[HeartbeatLapse, ...]:
+        self._require_held()
+        with self._mutex:
+            return tuple(self._er_scan(_LAPSE, HeartbeatLapse, lambda r: r.start_ns))
+
+    def set_lapse_marked(self, start_ns: int, marked_ts: int) -> bool:
+        """Stamp ``marked_ts`` once. Absent row raises; already stamped is a ``False`` no-op."""
+        self._require_held()
+        key = f"{_LAPSE}{start_ns}"
+        with self._mutex:
+            row = self._er_get(key, HeartbeatLapse)
+            if row is None:
+                raise ValueError("lapse row absent; cannot stamp it marked")
+            if row.marked_ts is not None:
+                return False
+            self._er_put(key, replace(row, marked_ts=marked_ts))
+            return True
 
     # -- dry evaluation and force-K1 clearance ---------------------------
 
