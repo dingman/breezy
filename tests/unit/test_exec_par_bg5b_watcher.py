@@ -273,3 +273,23 @@ async def test_existing_triggers_still_halt_with_the_evaluator_attached(tmp_path
 def test_actor_subclass_relationship_is_unchanged() -> None:
     assert issubclass(BreakerWatcherActor, Actor)
     assert issubclass(BreakerWatcherActor, ExecRefusalAlertActor)
+
+
+@pytest.mark.asyncio
+async def test_service_runs_even_when_an_earlier_persist_step_raises(tmp_path: Path) -> None:
+    with _rig(tmp_path) as rig:
+
+        class _HaltFails:
+            def __getattr__(self, name: str) -> object:
+                return getattr(rig.latch, name)
+
+            def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None:
+                raise OSError("store down")
+
+        actor, _, _ = _watcher(rig, latch=_HaltFails())
+        actor.bind_client(lambda: _Client(contradiction_events_total=1))
+        assert await actor.tick() is False  # the trigger's halt write raised
+        ev = actor.stage_evaluator
+        assert ev is not None and ev.task is not None  # ...but the evaluator was still serviced
+        await ev.task
+        actor.on_stop()

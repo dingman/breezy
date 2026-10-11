@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from breezy.runtime.exec_par_ingest_guard import IngestGuard
 from breezy.runtime.exec_par_stage_runner import StageEvalPorts, StageEvaluator
 
 __all__ = ["HeartbeatWithheldError", "StageEvalWatcherMixin"]
@@ -37,6 +38,11 @@ class StageEvalWatcherMixin:
     @property
     def stage_evaluator(self) -> StageEvaluator | None:
         return self._stage_eval
+
+    def _stage_eval_bind_guard(self, guard: IngestGuard | None) -> None:
+        """A reconcile must never run over a non-empty ingest retry queue (BG-1b / BG-1d)."""
+        if self._stage_eval is not None and guard is not None:
+            self._stage_eval.bind_ingest_pending(lambda: guard.pending)
 
     def _stage_eval_cancel(self) -> None:
         if self._stage_eval is not None:

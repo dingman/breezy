@@ -13,6 +13,7 @@ import io
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from nautilus_trader.common.component import TestClock
@@ -74,6 +75,9 @@ def test_k_gt_1_with_the_marker_registers_the_breaker_watcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(
+        app_trade, "_build_stage_eval_ports", lambda _latch: SimpleNamespace()
+    )  # BG-5b: opt in to K>1 wiring
     monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
 
     code = run(env=_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())

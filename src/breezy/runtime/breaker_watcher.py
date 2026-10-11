@@ -470,6 +470,7 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         self._k_forced_recorded = False
         self._amendment_failures = 0
         self._guard = None if counters is None else IngestGuard(counters)
+        self._stage_eval_bind_guard(self._guard)
         self._ambiguous_marks = ambiguous_marks
         self._halt_written = False
         self._trip_reason: str | None = None
@@ -535,6 +536,13 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
             logger.error("%s: ingest pass failed: %s", _SITE, type(exc).__name__)
 
     def _persist(self, client: ExecClientView, now_ns: int) -> None:
+        """The trigger halts, then (always, even if they raised) the stage evaluator service."""
+        try:
+            self._persist_triggers(client, now_ns)
+        finally:
+            self._stage_eval_service(now_ns)  # never raises; schedules, never awaits a pass
+
+    def _persist_triggers(self, client: ExecClientView, now_ns: int) -> None:
         """Compute the trip reasons and latch the halt BEFORE anything can fail."""
         ages = client.open_intent_ages
         self._stuck = tuple((iid, slug) for iid, slug, age in ages if age > STUCK_AGE_NS)
@@ -560,7 +568,6 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
         self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
         self._record_k_forced(client, now_ns)
-        self._stage_eval_service(now_ns)
 
     def _record_k_forced(self, client: ExecClientView, now_ns: int) -> None:
         """BG-2: write the amendment once, on the first tick that sees the K=1 force.
