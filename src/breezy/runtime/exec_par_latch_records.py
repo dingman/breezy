@@ -43,6 +43,7 @@ from breezy.runtime.exec_par_records import (
     ForceK1Kind,
     ForceK1State,
     HeartbeatLapse,
+    SettledPnlBasis,
     SettledPnlDay,
     SettledPnlRevision,
     StageEvalDry,
@@ -57,6 +58,7 @@ from breezy.runtime.exec_par_records import (
 )
 from breezy.runtime.exec_par_settled_pnl import (
     PreBootLedger,
+    SettledPnlRegression,
     SettledPnlRevisionUnaudited,
     Timed,
     check_monotonic,
@@ -79,6 +81,7 @@ _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
 _SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"
 _FLOOR_STUB_PNL = EXEC_PAR_PREFIX + "settled_pnl_floor_stub/"
 _REVISION = EXEC_PAR_PREFIX + "settled_pnl_revision/"
+_BASIS = EXEC_PAR_PREFIX + "settled_pnl_basis/"
 
 
 class _Store(Protocol):
@@ -463,6 +466,20 @@ class ExecParRecordsMixin:
         with self._mutex:
             return self._er_get(self._revision_key(day, ts_ns, scope), SettledPnlRevision)
 
+    @staticmethod
+    def _basis_key(day: str, scope: str) -> str:
+        return f"{_BASIS}{day}" if scope == "day" else f"{_BASIS}{day}/stub"
+
+    def write_settled_pnl_basis(self, record: SettledPnlBasis) -> None:
+        self._require_held()
+        with self._mutex:
+            self._er_put(self._basis_key(record.day, record.scope), record)
+
+    def read_settled_pnl_basis(self, day: str, scope: str) -> SettledPnlBasis | None:
+        self._require_held()
+        with self._mutex:
+            return self._er_get(self._basis_key(day, scope), SettledPnlBasis)
+
     def replace_settled_pnl_day_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None:
         """Replace the day's row WITHOUT the monotonic guard, only under a matching audit row."""
         self._replace_audited(f"{_SETTLED_PNL}{record.day}", record, ts_ns, "day")
@@ -482,6 +499,12 @@ class ExecParRecordsMixin:
                 or audit.new_entries != record.total_entries
             ):
                 raise SettledPnlRevisionUnaudited("no matching revision audit row")
+            prior = self._er_get(key, SettledPnlDay)
+            if prior is not None and (
+                record.total_entries < prior.total_entries
+                or record.settled_entries < prior.settled_entries
+            ):  # an audit row licenses a pnl change, never a shrink in entries
+                raise SettledPnlRegression("entry count would shrink", kind="entry_shrink")
             self._er_put(key, record)
 
     def read_settled_pnl_days(self) -> tuple[SettledPnlDay, ...]:
