@@ -338,3 +338,10 @@ def holm_plan(min_ps: Mapping[str, float], *, alpha: float = ALPHA_PRIMARY) -> H
         else:
             statuses[name] = "TESTABLE" if p <= step1 else "TESTABLE-CONDITIONAL"
     return HolmPlan(k=k, alpha_step1=step1, statuses=statuses)
+
+
+def holm_decisions(
+    p_values: Mapping[str, float], plan: HolmPlan, *, alpha: float = ALPHA_PRIMARY
+) -> dict[str, bool]:
+    """Holm-adjusted rejections for the Holm members; NOT-TESTABLE members never reject."""
+    raise NotImplementedError

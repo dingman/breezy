@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from pathlib import Path
 from typing import Final, Literal
 
 from breezy.analysis.labeling.fill_source import FillRead
@@ -152,3 +154,22 @@ def alt_truth_summary(
         k4_status="UNTESTABLE" if k4 is None else "TESTED",
         k4_count=k4,
     )
+
+
+@dataclass(frozen=True)
+class AltSourceDiscovery:
+    """S0-G: which alternative truth sources exist for the FQ window (outcome-blind)."""
+
+    metar_last_valid: Mapping[str, str | None]
+    metar_covers: bool
+    venue_outcomes_present: bool
+
+
+def discover_alt_sources(
+    archive_root: Path,
+    icaos: Sequence[str],
+    last_day: dt.date,
+    *,
+    venue_outcomes: Path | None = None,
+) -> AltSourceDiscovery:
+    raise NotImplementedError

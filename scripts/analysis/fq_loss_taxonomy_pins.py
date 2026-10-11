@@ -46,6 +46,9 @@ class GitPort(Protocol):
     def porcelain_clean(self, paths: Sequence[str]) -> bool: ...
     def is_ancestor(self, ancestor: str, descendant: str) -> bool: ...
     def blob_sha256(self, commit: str, path: str) -> str | None: ...
+    def show_blob(self, commit: str, path: str) -> bytes:
+        """The bytes of ``path`` at ``commit`` (``git show``); raises when absent."""
+        ...
     def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]: ...
     def log_commits(
         self, paths: Sequence[str], until: str, *, since: str | None = None
@@ -86,6 +89,9 @@ class SubprocessGit:
     def blob_sha256(self, commit: str, path: str) -> str | None:
         done = self._run("cat-file", "blob", f"{commit}:{path}", check=False)
         return hashlib.sha256(done.stdout).hexdigest() if done.returncode == 0 else None
+
+    def show_blob(self, commit: str, path: str) -> bytes:
+        raise NotImplementedError
 
     def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]:
         shas = []
