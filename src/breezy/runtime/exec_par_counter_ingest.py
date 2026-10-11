@@ -31,7 +31,7 @@ raise to the integrity halt is BG-6's job.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from decimal import Decimal
 from typing import Any, Final, Protocol
 
@@ -52,11 +52,14 @@ from breezy.runtime.exec_par_records import (
 from breezy.runtime.exec_par_telemetry import WINDOW_NS
 
 __all__ = [
+    "UNATTRIBUTED",
+    "AmbiguousMarkSource",
     "CounterAttributionError",
     "CounterWriteError",
     "CounterWriterPort",
     "ExecParCounterError",
     "ExecParCounterIngest",
+    "IntentView",
     "reason_label",
 ]
 
@@ -82,11 +85,33 @@ def reason_label(reason: str) -> str:
     return _NUMBER_RE.sub("#", reason.strip().lower())[:_REASON_LABEL_MAX] or "unspecified"
 
 
+UNATTRIBUTED: Final[str] = "unattributed"
+
+
+class AmbiguousMarkSource(Protocol):
+    """Runtime-side view of the ledger's ever-ambiguous marks (value-free; no amounts)."""
+
+    def ambiguous_marks_pending(self) -> frozenset[tuple[str, str]]: ...
+    def ack_ambiguous_marks(self, marks: Iterable[tuple[str, str]]) -> None: ...
+
+
+class IntentView(Protocol):
+    """The read-only fields of a ``SubmitIntent`` this layer uses (no submit_intent import)."""
+
+    @property
+    def created_ns(self) -> int: ...
+    @property
+    def slug(self) -> str | None: ...
+    @property
+    def retired_ns(self) -> int | None: ...
+
+
 class CounterWriterPort(Protocol):
     """The latch methods this layer uses (a subset of ``ExecParStorePort`` plus one read)."""
 
     def write_order_anchor(self, record: OrderAnchor) -> bool: ...
     def read_order_anchor(self, client_order_id: str) -> OrderAnchor | None: ...
+    def read_intent(self, intent_id: str) -> IntentView | None: ...
     def write_denial(self, record: DenialRow) -> bool: ...
     def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
     def write_fill(self, record: FillRow) -> bool: ...
@@ -228,14 +253,44 @@ class ExecParCounterIngest:
         created: bool = self._write(lambda: self._store.write_denial(row))
         return created
 
-    def record_ambiguous(self, *, client_order_id: str, ts_ns: int | None) -> bool:
-        """Day and arm time come from the posted-entry anchor, not the detection time."""
-        coid = _need_text(client_order_id, "client order id")
-        detected = _need_ns(ts_ns, "detection time")
-        anchor = self._anchor(coid)
-        row = AmbiguousRow(coid, anchor.day, anchor.arm_ns, detected)
-        created: bool = self._write(lambda: self._store.write_ambiguous(row))
+    def ingest_ambiguous_marks(self, marks: AmbiguousMarkSource, *, now_ns: int | None) -> int:
+        """Count every pending ever-AMBIGUOUS mark once; return how many were newly counted.
+
+        Each mark is acknowledged to its source only AFTER its durable row is written, so a
+        failure leaves it pending and the next tick retries. One failing mark never blocks
+        the others; the first failure is raised after the pass. The row is keyed by
+        ``intent_id`` (idempotent: a re-mark after a restart is not counted twice).
+        """
+        when = _need_ns(now_ns, "tick time")
+        created = 0
+        first_error: ExecParCounterError | None = None
+        for mark in sorted(marks.ambiguous_marks_pending()):
+            try:
+                row = self._ambiguous_row(mark[0], mark[1], when)
+                if self._write_ambiguous(row):
+                    created += 1
+                marks.ack_ambiguous_marks([mark])
+            except ExecParCounterError as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
         return created
+
+    def _write_ambiguous(self, row: AmbiguousRow) -> bool:
+        written: bool = self._write(lambda: self._store.write_ambiguous(row))
+        return written
+
+    def _ambiguous_row(self, intent_id: str, source: str, when: int) -> AmbiguousRow:
+        try:
+            intent = self._store.read_intent(intent_id)
+        except Exception as exc:
+            raise CounterAttributionError("slot table unreadable for attribution") from exc
+        if intent is None:  # neither a slot nor history: counted, never dropped
+            return AmbiguousRow(intent_id, source, UNATTRIBUTED, when, UNATTRIBUTED, when)
+        kind = "slot" if intent.retired_ns is None else "history"
+        slug = _need_text(intent.slug, "slot slug")
+        day = self._day(slug, intent.created_ns)
+        return AmbiguousRow(intent_id, source, day, intent.created_ns, kind, when)
 
     def _anchor(self, coid: str) -> OrderAnchor:
         anchor: OrderAnchor | None = self._write(lambda: self._store.read_order_anchor(coid))

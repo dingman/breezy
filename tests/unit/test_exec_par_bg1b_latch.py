@@ -90,7 +90,7 @@ def test_readers_filter_by_day_and_are_scan_based(tmp_path: Path) -> None:
 def test_denial_ambiguous_fill_rows_round_trip_by_day(tmp_path: Path) -> None:
     with _open(_Store(), tmp_path) as latch:
         d = DenialRow("O-2", "k-full", DAY, 5)
-        a = AmbiguousRow("O-1", DAY, 5, 6)
+        a = AmbiguousRow("a1", "unknown", DAY, 5, "slot", 6)
         f = _fill()
         assert latch.write_denial(d) and latch.write_ambiguous(a) and latch.write_fill(f)
         assert not latch.write_denial(d)

@@ -121,9 +121,9 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
             return self._ec_scan(_DENIAL, DenialRow, lambda r: r.client_order_id, day)
 
     def write_ambiguous(self, record: AmbiguousRow) -> bool:
-        """First detection wins: a later row for the same order is a ``False`` no-op."""
+        """First detection wins: a later row for the same intent is a ``False`` no-op."""
         self._require_held()
-        key = _AMBIGUOUS + _part(record.client_order_id)
+        key = _AMBIGUOUS + _part(record.intent_id)
         with self._mutex:
             if self._store.get(key) is not None:
                 self._er_get(key, AmbiguousRow)  # a garbled existing row still raises
@@ -134,7 +134,7 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
         self._require_held()
         _part(day)
         with self._mutex:
-            return self._ec_scan(_AMBIGUOUS, AmbiguousRow, lambda r: r.client_order_id, day)
+            return self._ec_scan(_AMBIGUOUS, AmbiguousRow, lambda r: r.intent_id, day)
 
     def write_fill(self, record: FillRow) -> bool:
         self._require_held()
