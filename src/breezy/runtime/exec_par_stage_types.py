@@ -247,6 +247,15 @@ class DayStat:
     ambiguous: int
     fills: int
 
+    def to_json_dict(self) -> dict[str, object]:
+        """Every field named explicitly (no ``asdict``; see the credential-serialisation guard)."""
+        return {
+            "day": self.day,
+            "posted": self.posted,
+            "ambiguous": self.ambiguous,
+            "fills": self.fills,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class StageReport:
@@ -289,6 +298,45 @@ class StageReport:
     pnl_ambiguous_unresolved: int
     programme_paused: bool
     notes: tuple[str, ...]
+
+    def to_json_dict(self) -> dict[str, object]:
+        """Every field named explicitly (no ``asdict``; see the credential-serialisation guard)."""
+        return {
+            "stage": self.stage,
+            "configured_k": self.configured_k,
+            "effective_k": self.effective_k,
+            "floor_day": self.floor_day,
+            "today": self.today,
+            "closed_days": self.closed_days,
+            "nonexcluded_days": self.nonexcluded_days,
+            "excluded_days": self.excluded_days,
+            "posted": self.posted,
+            "ambiguous": self.ambiguous,
+            "ambiguous_rate": self.ambiguous_rate,
+            "fills": self.fills,
+            "filled_orders": self.filled_orders,
+            "days_with_fill": self.days_with_fill,
+            "m_bar": self.m_bar,
+            "day_stats": [d.to_json_dict() for d in self.day_stats],
+            "minima_met": self.minima_met,
+            "dropped_share": self.dropped_share,
+            "station_day_flag_days": self.station_day_flag_days,
+            "window_flag_days": self.window_flag_days,
+            "slippage_mean": self.slippage_mean,
+            "slippage_tail_share": self.slippage_tail_share,
+            "parity_diff": self.parity_diff,
+            "fee_unreconciled_share": self.fee_unreconciled_share,
+            "per_fill_fee_mismatches": self.per_fill_fee_mismatches,
+            "section5_halt_in_stage": self.section5_halt_in_stage,
+            "held_days": self.held_days,
+            "promotion_blocked_reason": self.promotion_blocked_reason,
+            "promotion_pending_commit": self.promotion_pending_commit,
+            "pnl_pending": self.pnl_pending,
+            "pnl_overdue": self.pnl_overdue,
+            "pnl_ambiguous_unresolved": self.pnl_ambiguous_unresolved,
+            "programme_paused": self.programme_paused,
+            "notes": self.notes,
+        }
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,7 +8,6 @@ store for BG-10(f) and BG-7 to read (r4.5 O5: the per-day AMBIGUOUS counts are i
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from decimal import Decimal
 from enum import Enum
 
@@ -31,4 +30,4 @@ def _plain(value: object) -> object:
 
 def report_json(report: StageReport) -> str:
     """Deterministic compact JSON of the report."""
-    return json.dumps(_plain(asdict(report)), sort_keys=True, separators=(",", ":"))
+    return json.dumps(_plain(report.to_json_dict()), sort_keys=True, separators=(",", ":"))
