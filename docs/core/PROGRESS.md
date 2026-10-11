@@ -86,9 +86,8 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 4 wins, −2.63 (corrected); plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
 | ID | Open work (exact) | Status |
 |---|---|---|
-| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.3 |
+| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.6 (S0 STOP→R11); WP-A building |
 | TE-2 | Diagnose FQ 2/25, −2.17 (LAX heat bust) before any re-arm (delta vs F0/F13) | READY r3.2 |
-| TE-3 | NO-side longshot hypothesis (1/3 wins); prereg-only, distinct from M1-v3 | RULING r3.1 |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
@@ -116,7 +115,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### WATCH / GATED (no build owed; re-open only on the named trigger)
 - **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
 - **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
-- **Trigger watches:** AMBIG-SIGN-TABLE (extend the no-id manual sign table if `SELL_SHORT` or any unobserved manual shape appears); EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration).
+- **Trigger watches:** AMBIG-SIGN-TABLE (extend the no-id manual sign table if `SELL_SHORT` or any unobserved manual shape appears); EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration). TE-3 RULED (`RULING_TE-3_NO_CHEAP_LONGSHOT_2026-10-11.md` §6).
 - **Rules:** HALT-FSM = accepted cosmetic (Nautilus swallows it; fail-safe; whitelist `InvalidStateTrigger STOPPED->START_COMPLETED` in greps); T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
 
 

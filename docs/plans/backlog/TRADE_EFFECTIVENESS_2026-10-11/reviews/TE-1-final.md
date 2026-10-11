@@ -50,3 +50,8 @@ Build in this order: WP-A → WP-B → WP-D → WP-C → WP-E.
 - **Routing:** Grok → Codex → Claude tdd-guide.
 - **Gate:** the coordinator runs `scripts/ci/run_tests_no_egress.sh` after every WP.
 - **AUT-6 co-sign:** required on the `aut6.health` re-pins.
+
+## Re-convergence after the Stage 0 STOP (2026-10-11 evening)
+- Stage 0 STOP at S0-2 (5 FQ fills on 10-06 vs retroactive terminal 10-05; `te1/TE1_STAGE0_RECORD_2026-10-11.md`). S0-2b PASS.
+- r3.4 (planner, Ruling R11 post-terminal straddle) → round 4: domain 80 RWC, python 84 RWC, architecture 88 RC → r3.5 merge → confirmations domain 90 RWC, python 86 RWC (same control-flow defect) → r3.6 coordinator text pass. Both confirmers: READY once r3.6 text applied. **READY r3.6.** Fallback: Claude reviewers (Grok 402; Codex not used for confirmation).
+- Binding stack: r3.3 + r3.4 + r3.5 + r3.6.
