@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from typing import Final, Protocol
 
 from breezy.runtime.exec_par_days_port import DayConvention
+from breezy.runtime.exec_par_intraday import IntradayPorts
 from breezy.runtime.exec_par_reconcile import (
     RECONCILE_BOUND_NS,
     CounterStorePort,
@@ -91,6 +92,7 @@ from breezy.runtime.exec_par_stage_snapshot import (
 )
 from breezy.runtime.exec_par_stage_types import (
     HOLD_CLEANUP_DEMOTION,
+    STOP_OUTCOMES,
     PnlPredicatePort,
     SerialBaseline,
     StageSnapshot,
@@ -154,6 +156,7 @@ class StageEvalStore(SnapshotReads, Protocol):
     def write_force_k1_flag(self, record: ForceK1Flag) -> None: ...
     def mark_flag_write_failed(self) -> None: ...
     def write_stage_eval_stamp(self, record: StageEvalStamp) -> None: ...
+    def read_stage_eval_stamp(self) -> StageEvalStamp | None: ...
     def write_stage_eval_liveness(self, record: StageEvalLiveness) -> None: ...
     def read_stage_eval_liveness(self) -> StageEvalLiveness | None: ...
     def write_stage_report(self, record: StageReportDoc) -> None: ...
@@ -192,6 +195,9 @@ class StageEvalPorts:
     #: the previous poll triggers a pass (r4 1a / s15: "the tick that first observes a new
     #: settled-P&L value"). ``None`` means no such seam exists yet.
     settled_pnl_seq: Callable[[], int] | None = None
+    #: BG-6: the s9 station-day inputs (open cost per station-day and the ledger port). ``None``
+    #: is NOT "no rule": the intraday monitor then halts ``stage_eval_fail:intraday_unbound``.
+    intraday: IntradayPorts | None = None
     #: Seconds between checks of the ingest retry queue while a pass waits to reconcile.
     ingest_poll_s: float = 0.5
     #: The pure evaluator (BG-5a); injectable so the wiring is testable with canned verdicts.
@@ -591,13 +597,7 @@ class StageEvaluator:
 
     def _apply_stop(self, verdict: Verdict, now: int) -> bool:
         reason = verdict.reason or f"{_FAIL_PREFIX}unknown"
-        marker_ok = self._write_marker(reason, now)
-        if not marker_ok:
-            self._heartbeat_stopped = True  # D3
-            self._emit("CRITICAL", EVENT_INTEGRITY, f"integrity halt reason={REASON_MARKER_FAIL}")
-        self._latch_halt(reason if marker_ok else REASON_MARKER_FAIL, now)
-        if verdict.sets_flag:
-            self._set_flag(reason, now)
+        marker_ok = self._stop_writes(reason, now, sets_flag=verdict.sets_flag)
         outcome = None if verdict.outcome is None else verdict.outcome.value
         self._emit(
             "CRITICAL",
@@ -607,6 +607,38 @@ class StageEvaluator:
         )
         self._write_report(verdict, now)
         return marker_ok
+
+    def _stop_writes(self, reason: str, now: int, *, sets_flag: bool) -> bool:
+        """The M3 write sequence shared by every stop-class verdict, daily or intraday: the
+        ``stop_verdict`` marker FIRST, then the entries-only halt, then (stop-class) the force-K1
+        flag, attempted even if the halt raised. Returns whether the marker was written."""
+        marker_ok = self._write_marker(reason, now)
+        if not marker_ok:
+            self._heartbeat_stopped = True  # D3
+            self._emit("CRITICAL", EVENT_INTEGRITY, f"integrity halt reason={REASON_MARKER_FAIL}")
+        self._latch_halt(reason if marker_ok else REASON_MARKER_FAIL, now)
+        if sets_flag:
+            self._set_flag(reason, now)
+        return marker_ok
+
+    # -- BG-6 entry points (the intraday monitor acts through the same writers) ------------
+
+    def stop_class(self, reason: str, now_ns: int) -> bool:
+        """A stop-class rule that fired intraday (s5 CP / burst, s9 station-day): marker, halt,
+        flag, in the M3 order, plus the STOP alert. Never raises; ``True`` iff the marker landed."""
+        marker_ok = self._stop_writes(reason, now_ns, sets_flag=True)
+        outcome = STOP_OUTCOMES.get(reason)
+        self._emit(
+            "CRITICAL",
+            EVENT_STOP,
+            f"reason={reason} outcome={None if outcome is None else outcome.value} source=intraday",
+        )
+        return marker_ok
+
+    def integrity_halt(self, reason: str) -> None:
+        """An integrity condition found by the intraday monitor: halt (and alert), no flag, no
+        marker. A halt write that raises stays pending and withholds the heartbeat (D3)."""
+        self._integrity(reason)
 
     def _write_marker(self, reason: str, now: int) -> bool:
         try:

@@ -33,6 +33,7 @@ from breezy.runtime.submit_intent import (
     history_key,
     open_submit_intent_latch,
 )
+from tests.unit.exec_par_stamp import fresh_stamp
 from tests.unit.golden_submit_intent_k1 import run_k1_scenario
 
 FP = "9f3ac0de" + "a1b2c3d4" * 7
@@ -168,6 +169,8 @@ def _latch(
         v2_predicate=v2_predicate,
         clock_ns=clk,
     ) as latch:
+        if k > 1:
+            fresh_stamp(latch, clk())  # BG-6: clear the boot-pass gate; this file is about slots
         if breaker and k > 1:
             latch.write_breaker_heartbeat(hb_ns=clk(), resolver_pass_ns=clk())
         store.sets.clear()

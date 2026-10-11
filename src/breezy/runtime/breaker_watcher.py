@@ -59,6 +59,7 @@ from breezy.runtime.exec_par_counter_ingest import (
 )
 from breezy.runtime.exec_par_epochs import k_forced_amendment
 from breezy.runtime.exec_par_ingest_guard import IngestGuard
+from breezy.runtime.exec_par_intraday_rules import CounterIncreaseWatch
 from breezy.runtime.exec_par_stage_runner import StageEvalPorts
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.exec_par_watcher_ports import (
@@ -476,6 +477,8 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         self._trip_reason: str | None = None
         self._seen_contradictions = 0
         self._seen_duplicates = 0
+        self._fault_watch = CounterIncreaseWatch()
+        self._gappy_watch = CounterIncreaseWatch()
         self._stuck: tuple[tuple[str, str], ...] = ()
         self._last_hb_ns: int | None = None
         self._denied_at_last_hb = 0
@@ -557,6 +560,15 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
             reasons.append("contradiction")
         if duplicates > self._seen_duplicates:
             reasons.append("duplicate_suspect")
+        self._latch_trip(reasons, now_ns)
+        self._seen_contradictions = max(self._seen_contradictions, contradictions)
+        self._seen_duplicates = max(self._seen_duplicates, duplicates)
+        self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
+        self._persist_ingest_integrity(now_ns)
+        self._record_k_forced(client, now_ns)
+
+    def _latch_trip(self, reasons: list[str], now_ns: int) -> None:
+        """Latch the sticky entry halt for ``reasons`` (the first latched reason wins)."""
         if reasons and not self._halt_written:
             reason = ",".join(reasons)
             # A raise leaves the seen-counters behind, so the next tick sees the
@@ -564,10 +576,29 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
             self._latch.write_breaker_halt(reason, ts_ns=now_ns)
             self._halt_written = True
             self._trip_reason = reason
-        self._seen_contradictions = max(self._seen_contradictions, contradictions)
-        self._seen_duplicates = max(self._seen_duplicates, duplicates)
-        self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
-        self._record_k_forced(client, now_ns)
+
+    def _persist_ingest_integrity(self, now_ns: int) -> None:
+        """BG-6 (integration note 2): ANY increase of ``ingest_fault_count`` or of
+        ``gappy_write_failures`` is an integrity halt (no flag): a failed gappy write is not
+        retried, so the day it should have marked would otherwise be silently trusted.
+
+        Checked after this tick's ingest, so a fault raised by it halts on the same tick. The
+        value is acknowledged only after the halt write succeeded (a raise retries next tick).
+        """
+        guard = self._guard
+        if guard is None:
+            return
+        faults, gappy = guard.fault_count, guard.gappy_write_failures
+        reasons: list[str] = []
+        if self._fault_watch.increased(faults):
+            reasons.append("ingest_fault")
+        if self._gappy_watch.increased(gappy):
+            reasons.append("gappy_write_failure")
+        if not reasons:
+            return
+        self._latch_trip(reasons, now_ns)
+        self._fault_watch.acknowledge(faults)
+        self._gappy_watch.acknowledge(gappy)
 
     def _record_k_forced(self, client: ExecClientView, now_ns: int) -> None:
         """BG-2: write the amendment once, on the first tick that sees the K=1 force.

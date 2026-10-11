@@ -49,6 +49,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLatch,
     open_submit_intent_latch,
 )
+from tests.unit.exec_par_stamp import fresh_stamp
 
 SEC = 1_000_000_000
 NOW = 1_700_000_000 * SEC
@@ -252,6 +253,7 @@ async def test_contradiction_latches_halt_sticky_until_operator_reset(tmp_path: 
         v2_predicate=lambda: True,
         clock_ns=clock.timestamp_ns,
     ) as latch:
+        fresh_stamp(latch, NOW)  # BG-6 boot gate; this test is about the s4 trips
         client = _Client()
         sink = _Sink()
         actor = BreakerWatcherActor(latch=latch, alert_sink=sink)
@@ -329,6 +331,7 @@ def test_heartbeat_write_does_not_block_arm_slot(tmp_path: Path) -> None:
         v2_predicate=lambda: True,
         clock_ns=lambda: clock_value[0],
     ) as latch:
+        fresh_stamp(latch, NOW)
         latch.write_breaker_heartbeat(hb_ns=NOW, resolver_pass_ns=NOW)
         stop = threading.Event()
 
@@ -360,6 +363,7 @@ def _latch(store: _MemStore, tmp_path: Path, now: list[int]) -> Iterator[SubmitI
     with open_submit_intent_latch(
         store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: now[0]
     ) as latch:
+        fresh_stamp(latch, now[0])  # BG-6 boot gate; these tests are about the heartbeat denials
         yield latch
 
 

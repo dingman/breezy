@@ -1,4 +1,7 @@
-"""EXEC-PAR BG-5b: the stage-evaluator glue of ``BreakerWatcherActor`` (a mixin).
+"""EXEC-PAR BG-5b/BG-6: the stage-evaluator and intraday glue of ``BreakerWatcherActor`` (a mixin).
+
+BG-6: the same ports arm an :class:`~breezy.runtime.exec_par_intraday.IntradayMonitor` that is
+checked on every tick right after the evaluator service and acts through the evaluator's writers.
 
 When the K>1 watcher is given ``stage_eval_ports`` it owns a
 :class:`~breezy.runtime.exec_par_stage_runner.StageEvaluator`. The tick only calls its cheap
@@ -9,11 +12,15 @@ a halt write pending or a marker / flag-mark failure, the heartbeat is withheld 
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from breezy.runtime.exec_par_counter_ingest import AmbiguousMarkSource
 from breezy.runtime.exec_par_ingest_guard import IngestGuard
+from breezy.runtime.exec_par_intraday import IntradayMonitor
 from breezy.runtime.exec_par_stage_runner import StageEvalPorts, StageEvaluator
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["HeartbeatWithheldError", "StageEvalWatcherMixin", "combined_ingest_pending"]
 
@@ -37,6 +44,9 @@ class StageEvalWatcherMixin:
     """Holds the optional evaluator; every method is a no-op when there is none."""
 
     _stage_eval: StageEvaluator | None = None
+    _intraday: IntradayMonitor | None = None
+    _intraday_ports: StageEvalPorts | None = None
+    _intraday_wiring_failed = False
 
     def _init_stage_eval(
         self,
@@ -46,6 +56,9 @@ class StageEvalWatcherMixin:
         alert: Callable[[str, str, str], bool],
     ) -> None:
         self._stage_eval = None if ports is None else StageEvaluator(ports, halt=halt, alert=alert)
+        self._intraday = None
+        self._intraday_ports = ports
+        self._intraday_wiring_failed = False
 
     @property
     def stage_evaluator(self) -> StageEvaluator | None:
@@ -65,8 +78,35 @@ class StageEvalWatcherMixin:
             self._stage_eval.cancel()
 
     def _stage_eval_service(self, now_ns: int) -> None:
-        if self._stage_eval is not None:
-            self._stage_eval.service(now_ns)  # never raises; schedules, never awaits a pass
+        evaluator = self._stage_eval
+        if evaluator is None:
+            return
+        evaluator.service(now_ns)  # never raises; schedules, never awaits a pass
+        self._intraday_check(evaluator, now_ns)
+
+    def _intraday_check(self, evaluator: StageEvaluator, now_ns: int) -> None:
+        """BG-6: the intraday monitor, built on first use and acting through the evaluator's own
+        writers (M3 order, D3). Unusable ports are an integrity halt, never a silent skip."""
+        if self._intraday is None and not self._intraday_wiring_failed:
+            ports = self._intraday_ports
+            try:
+                if ports is None:
+                    raise ValueError("no stage-eval ports")
+                self._intraday = IntradayMonitor(
+                    reads=ports.store,
+                    counters=ports.counters,
+                    governed=ports.governed,
+                    boot_ns=ports.boot_ns,
+                    intraday=ports.intraday,
+                    stop=evaluator.stop_class,
+                    integrity=evaluator.integrity_halt,
+                )
+            except Exception as exc:  # noqa: BLE001 - fail closed, once
+                self._intraday_wiring_failed = True
+                logger.error("exec_par intraday monitor wiring failed: %s", type(exc).__name__)
+                evaluator.integrity_halt(f"stage_eval_fail:intraday_wiring:{type(exc).__name__}")
+        if self._intraday is not None:
+            self._intraday.check(now_ns)  # never raises
 
     def _stage_eval_gate(self) -> None:
         if self._stage_eval is not None and not self._stage_eval.heartbeat_ok:

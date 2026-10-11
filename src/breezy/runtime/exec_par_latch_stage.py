@@ -108,6 +108,10 @@ class ExecParStageRowsMixin(ExecParCounterRowsMixin):
         with self._mutex:
             return self._er_get(_STAMP, StageEvalStamp)
 
+    def _read_stage_eval_stamp_locked(self) -> StageEvalStamp | None:
+        """One ``get`` of the stamp for the breaker denial, which already holds ``_mutex``."""
+        return self._er_get(_STAMP, StageEvalStamp)
+
     def write_stage_eval_liveness(self, record: StageEvalLiveness) -> None:
         self._require_held()
         with self._mutex:

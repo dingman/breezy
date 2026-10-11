@@ -32,6 +32,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatchError,
     open_trial_day_latch,
 )
+from tests.unit.exec_par_stamp import fresh_stamp
 from tests.unit.test_submit_intent_slots import (
     COOLOFF_NS,
     FP,
@@ -69,6 +70,8 @@ def _latches(
         v2_predicate=lambda: True,
         clock_ns=clk,
     ) as intent_latch:
+        if k > 1:
+            fresh_stamp(intent_latch, clk())
         if breaker and k > 1:
             intent_latch.write_breaker_heartbeat(hb_ns=clk(), resolver_pass_ns=clk())
         yield intent_latch, open_trial_day_latch(intent_latch)

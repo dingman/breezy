@@ -30,6 +30,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
+from tests.unit.exec_par_stamp import fresh_stamp
 from tests.unit.test_continuous_rung_hold_strategy import (
     _arm_and_release_stale_intent,
     _register_and_start,
@@ -98,6 +99,7 @@ def _k_factory(store_path: Path, *, k: int) -> Callable[[], AbstractContextManag
             clock_ns=lambda: WINDOW_OPEN_NS,
         ) as intent_latch:
             if k > 1:
+                fresh_stamp(intent_latch, WINDOW_OPEN_NS)
                 intent_latch.write_breaker_heartbeat(
                     hb_ns=WINDOW_OPEN_NS, resolver_pass_ns=WINDOW_OPEN_NS
                 )

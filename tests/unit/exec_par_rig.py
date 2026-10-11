@@ -60,9 +60,11 @@ from breezy.persistence.exit_tags import (
     EXIT_RULE_TAG_PREFIX,
 )
 from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.exec_par_records import StageEvalStamp
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from tests.unit.ambig_latch_rig import _RecordingLog
+from tests.unit.exec_par_stamp import stamp_gate_stood_down
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
     RAW,
@@ -488,8 +490,12 @@ async def build_par_rig(
     connect: bool = True,
     record_writes: bool = False,
     client_kwargs: dict[str, Any] | None = None,
+    stage_stamp: bool = True,
 ) -> ParRig:
     """Build (and by default connect) the full stack at slot count ``max_slots``.
+
+    At ``max_slots > 1`` a fresh stage-eval stamp of THIS boot is written (BG-6: entries are
+    denied with ``stage_eval_boot_pending`` until one exists); ``stage_stamp=False`` omits it.
 
     ``max_slots=1`` with no extra arguments is exactly the shipped K=1 wiring.
     For ``max_slots > 1`` the v2 predicate defaults to True and the frozen bucket
@@ -546,6 +552,8 @@ async def build_par_rig(
 
     latch_cm = open_submit_intent_latch(_open_store(), path, **slot_kwargs)
     latch = latch_cm.__enter__()
+    if max_slots > 1 and stage_stamp:
+        latch.write_stage_eval_stamp(StageEvalStamp(latch.boot_ns, latch.boot_ns))
     the_ledger = ledger if ledger is not None else DailySpendLedger(**(ledger_kwargs or {}))
 
     extra: dict[str, Any] = {}
@@ -743,7 +751,9 @@ def arm_open_intent(
     _FP_COUNTER[0] += 1
     fingerprint = hashlib.sha256(f"hand-{_FP_COUNTER[0]}".encode()).hexdigest()
     if rig.latch.max_slots() > 1:
-        armed = rig.latch.arm_slot(fingerprint, slug=slug, is_exit=False, now_ns=created_ns)
+        # Hand-armed in the PAST (``created_ns`` precedes this boot): see the helper's docstring.
+        with stamp_gate_stood_down(rig.latch):
+            armed = rig.latch.arm_slot(fingerprint, slug=slug, is_exit=False, now_ns=created_ns)
     else:
         armed = rig.latch.arm(fingerprint, now_ns=created_ns)
     if with_context:

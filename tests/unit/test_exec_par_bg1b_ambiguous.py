@@ -27,6 +27,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLatch,
     open_submit_intent_latch,
 )
+from tests.unit.exec_par_stamp import fresh_stamp, stamp_gate_stood_down
 
 SEC = 1_000_000_000
 ARM = 1_700_000_000 * SEC + 123
@@ -58,6 +59,7 @@ def _latch(tmp_path: Path, store: _Store, boot_ns: int = ARM) -> Iterator[Submit
     with open_submit_intent_latch(
         store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: boot_ns
     ) as latch:
+        fresh_stamp(latch)  # BG-6 boot gate; these tests are about AMBIGUOUS attribution
         yield latch
 
 
@@ -172,7 +174,8 @@ def test_no_slot_and_no_history_is_counted_as_unattributed_never_dropped(
 def test_source_is_boot_for_an_intent_armed_before_this_process_started(tmp_path: Path) -> None:
     with _latch(tmp_path, _Store()) as latch:
         assert latch.boot_ns == ARM
-        slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM - 100 * SEC)
+        with stamp_gate_stood_down(latch):  # a slot a previous process left behind
+            slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM - 100 * SEC)
         _ingest(latch).ingest_ambiguous_marks(
             _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + SEC
         )

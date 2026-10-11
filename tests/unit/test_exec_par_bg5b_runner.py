@@ -210,11 +210,12 @@ def make_rig(
     seed: bool = False,
     port_over: dict[str, object] | None = None,
     bind_ingest: bool = True,
+    boot_ns: int = BOOT_NS,
 ) -> Iterator[Rig]:
     store = _Store()
     clock = _Clock(ns_of(d(4)) + 100 if now is None else now)
     with open_submit_intent_latch(
-        store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: BOOT_NS
+        store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: boot_ns
     ) as latch:
         if seed:
             latch.write_epoch_row(EpochRow("sha", 2, None, ns_of(d(0)) + 5))
@@ -239,7 +240,7 @@ def make_rig(
             governed=GOV,
             configured_k=2,
             effective_k=lambda: 2,
-            boot_ns=BOOT_NS,
+            boot_ns=boot_ns,
             wall_ns=clock.wall,
             monotonic_ns=clock.monotonic,
             await_ready=ready,  # type: ignore[arg-type]

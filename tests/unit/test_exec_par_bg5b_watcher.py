@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -17,10 +18,11 @@ from breezy.runtime.breaker_watcher import (
     build_exec_watcher,
 )
 from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
+from breezy.runtime.exec_par_intraday import IntradayPorts
 from breezy.runtime.exec_par_stage_eval import Verdict, VerdictKind
 from breezy.runtime.exec_par_stage_runner import StageEvaluator
 from breezy.runtime.health import AlertPayload
-from tests.unit.test_exec_par_bg5b_runner import NS, Rig, make_rig, verdict
+from tests.unit.test_exec_par_bg5b_runner import NS, Rig, d, make_rig, ns_of, verdict
 
 NOW = 1_800_000_000 * NS
 
@@ -81,8 +83,23 @@ def _watcher(
     return actor, the_sink, clock
 
 
+class _NoCost:
+    def open_cost_exceeds_budget_fraction(
+        self, *, aggregate_open_cost: Decimal, fraction: Decimal
+    ) -> bool:
+        return False
+
+
+def _mk(tmp_path: Path, **kw: object):  # type: ignore[no-untyped-def]
+    # BG-6: a K>1 watcher also runs the intraday monitor, so these fixtures give it its s9 ports
+    # and a boot instant that is recent (a never-written stamp is stale 26 h after boot).
+    kw.setdefault("port_over", {"intraday": IntradayPorts(_NoCost(), dict)})
+    kw.setdefault("boot_ns", ns_of(d(4)))
+    return make_rig(tmp_path, **kw)  # type: ignore[arg-type]
+
+
 def _rig(tmp_path: Path, **kw: object):  # type: ignore[no-untyped-def]
-    return make_rig(tmp_path, evaluate=lambda s: verdict(VerdictKind.PASS), **kw)  # type: ignore[arg-type]
+    return _mk(tmp_path, evaluate=lambda s: verdict(VerdictKind.PASS), **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +232,7 @@ async def test_a_pending_integrity_halt_withholds_the_heartbeat_but_keeps_tickin
     tmp_path: Path,
 ) -> None:
     verdicts: list[Verdict] = [verdict(VerdictKind.FAIL, "stage_eval_fail:gappy")]
-    with make_rig(tmp_path, evaluate=lambda s: verdicts[0]) as rig:
+    with _mk(tmp_path, evaluate=lambda s: verdicts[0]) as rig:
         real_halt = rig.latch.write_breaker_halt
         calls = {"fail": True}
 
@@ -248,7 +265,7 @@ async def test_a_pending_integrity_halt_withholds_the_heartbeat_but_keeps_tickin
 @pytest.mark.asyncio
 async def test_evaluator_alerts_go_through_the_watchers_sink(tmp_path: Path) -> None:
     v = verdict(VerdictKind.PROMOTION_ELIGIBLE, look_number=1)
-    with make_rig(tmp_path, evaluate=lambda s: v) as rig:
+    with _mk(tmp_path, evaluate=lambda s: v) as rig:
         sink = _Sink()
         actor, _, _ = _watcher(rig, sink=sink)
         await actor.tick()

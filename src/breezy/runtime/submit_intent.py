@@ -39,6 +39,7 @@ from typing import Final, Protocol, Self
 
 from breezy.domain.exec_slots import SlotRecord, SlotTableView, Wait, admit
 from breezy.runtime.exec_par_latch_stage import ExecParStageRowsMixin
+from breezy.runtime.exec_par_stamp_gate import REASON_STAMP_UNREADABLE, stamp_denial
 from breezy.runtime.submit_intent_slots import (
     BREAKER_ABSENT_GRACE_NS,
     BREAKER_FUTURE_SKEW_NS,
@@ -1275,7 +1276,9 @@ class SubmitIntentLatch(ExecParStageRowsMixin):
             )
             return "breaker_unreadable"
         if record is None:
-            return "breaker_absent" if now_ns - self._boot_ns > BREAKER_ABSENT_GRACE_NS else None
+            if now_ns - self._boot_ns > BREAKER_ABSENT_GRACE_NS:
+                return "breaker_absent"
+            return self._stage_stamp_denial(now_ns)
         if record.is_halted:
             return "breaker_halted"
         if not -BREAKER_FUTURE_SKEW_NS <= now_ns - record.hb_ns <= BREAKER_HEARTBEAT_MAX_AGE_NS:
@@ -1283,7 +1286,26 @@ class SubmitIntentLatch(ExecParStageRowsMixin):
         age = now_ns - record.resolver_pass_ns
         if not -BREAKER_FUTURE_SKEW_NS <= age <= BREAKER_RESOLVER_PASS_MAX_AGE_NS:
             return "breaker_resolver_stale"
-        return None
+        return self._stage_stamp_denial(now_ns)
+
+    def _stage_stamp_denial(self, now_ns: int) -> str | None:
+        """BG-6: the boot-pass / stale-stamp entry gate (r4 1a), configured K > 1 only.
+
+        Runs after every older check passed, so it adds one ``get`` to an admission that was
+        about to succeed and nothing to any other path. At K=1 it reads nothing. A stamp row that
+        cannot be read denies (fail closed).
+        """
+        if self._k_configured <= 1:
+            return None
+        try:
+            stamp = self._read_stage_eval_stamp_locked()
+        except Exception as exc:  # noqa: BLE001 - an unreadable stamp denies entries
+            _LOG.warning(
+                "stage-eval stamp unreadable (%s); denying entries (fail closed)",
+                type(exc).__name__,
+            )
+            return REASON_STAMP_UNREADABLE
+        return stamp_denial(stamp, boot_ns=self._boot_ns, now_ns=now_ns)
 
     def shared_state_binding(self) -> tuple[StateStore, _HeldSubmitIntentLock]:
         """Return the exact ``(store, lock)`` this latch was opened with.
