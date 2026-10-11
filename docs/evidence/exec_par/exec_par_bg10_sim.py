@@ -128,8 +128,9 @@ def icc_report(groups: Sequence[tuple[int, int]], *, boot_runs: int, seed: int) 
         "n_ambiguous": n_amb,
         "min_ambiguous_for_meaningful_icc": MIN_AMB_FOR_ICC,
         "too_few_ambiguous": too_few,
-        "icc_used": stats.ICC_FLOOR if too_few else est.used,
-        "rule": "one-way ANOVA ICC, n0 weighting, floored at 0.1; ICC = 0.1 when too few AMBIGUOUS",
+        "icc_used": est.used,
+        "rule": "G6 (r4.5 O1): ICC used = max(0.1, one-way ANOVA ICC with n0 weighting); thin data "
+        "does NOT fall back to 0.1, it is reported through the instability block",
         "day_groups": [list(g) for g in groups],
         "instability": {
             "bootstrap_runs": boot_runs,
@@ -552,15 +553,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     # ---- stage pools
     lvl = round(level, 6)
-    sens_icc = _sensitivity_icc(icc)
+    sens_icc = _sensitivity_icc(icc)  # the ICC 0.1 run: a labelled sensitivity, not a result
     gen = min(icc_used, MAX_GEN_RHO)  # generative day-overdispersion; DEFF keeps the exact ICC
     gen_sens = None if sens_icc is None else min(sens_icc, MAX_GEN_RHO)
-    extra = {(P_TRUE, gen), (V1_MIN, gen), (lvl, gen), (lvl, 0.0)}
-    if gen_sens is not None:
-        extra |= {(P_TRUE, gen_sens), (lvl, gen_sens)}
-    scenarios = sorted(
-        {(P_TRUE, r) for r in RHOS} | {(p, r) for p in POWER_PS for r in RHOS} | extra
+    floor = stats.ICC_FLOOR
+    # Scenario order fixes each scenario's RNG stream index. It is kept identical to the pre-r4.5
+    # order so no pinned stream moves; the one new scenario is appended at the end.
+    core = (
+        {(P_TRUE, r) for r in RHOS}
+        | {(p, r) for p in POWER_PS for r in RHOS}
+        | {(P_TRUE, floor), (V1_MIN, floor), (lvl, floor), (lvl, 0.0), (P_TRUE, gen), (lvl, gen)}
     )
+    scenarios = sorted(core) + ([] if (V1_MIN, gen) in core else [(V1_MIN, gen)])
     index = {key: i for i, key in enumerate(scenarios)}
     log(f"stage pools: {len(scenarios)} scenarios x {len(dhat.SEEDS)} seeds, draws={args.draws}")
     pools = build_pools(scenarios, days, args.draws, args.workers)
@@ -646,14 +650,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     v2_90 = promo(P_TRUE, gen, "tl90")
     v3_90 = promo(lvl, gen, "tl90")
     v3_over = _agg_v3(v3_90) > V3_MAX
-    v2_95 = promo(P_TRUE, gen, "tl95") if v3_over else None
-    v3_95 = promo(lvl, gen, "tl95") if v3_over else None
+    v2_95 = promo(P_TRUE, gen, "tl95")  # always recorded (r4.5 O1); the switch is V3-only (K10)
+    v3_95 = promo(lvl, gen, "tl95")
     v2_block: dict[str, Any] = {
         "p_true": P_TRUE,
         "level": level,
         "icc_used": icc_used,
         "generative_rho": gen,
-        "bound_90": v2_90,
+        "at_icc_used": {"bound_90": v2_90, "bound_95": v2_95},
         "sensitivity_iid_rho0": promo(P_TRUE, 0.0, "tl90"),
     }
     v3_block: dict[str, Any] = {
@@ -661,13 +665,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "level": level,
         "icc_used": icc_used,
         "generative_rho": gen,
-        "bound_90": v3_90,
+        "at_icc_used": {"bound_90": v3_90, "bound_95": v3_95},
         "switch_to_95_triggered": v3_over,
         "sensitivity_iid_rho0": promo(lvl, 0.0, "tl90"),
     }
-    if v3_over and v2_95 is not None and v3_95 is not None:
-        v2_block["bound_95"] = v2_95
-        v3_block["bound_95"] = v3_95
     ref_v2 = restage(P_TRUE, gen, level_=V1_MIN, icc_=icc_used)
     ref_v3 = restage(V1_MIN, gen, level_=V1_MIN, icc_=icc_used)
     for block, ref in ((v2_block, ref_v2), (v3_block, ref_v3)):
@@ -676,13 +677,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "bound_90": _promotion_block(ref, "tl90", _halts(ref, threshold)),
             "bound_95": _promotion_block(ref, "tl95", _halts(ref, threshold)),
         }
-    sensitivity_icc: dict[str, Any] | None = None
+    sensitivity: dict[str, Any] | None = None
     if sens_icc is not None and gen_sens is not None:
         s2 = restage(P_TRUE, gen_sens, level_=level, icc_=sens_icc)
         s3 = restage(lvl, gen_sens, level_=level, icc_=sens_icc)
-        sensitivity_icc = {
-            "note": "ICC = the (unreliable) pre-window estimate instead of the floor, for DEFF "
-            "and the generative rho; NOT used for the verdict",
+        sensitivity = {
+            "label": "not a result",
+            "note": "ICC 0.1 (the superseded coordinator fallback, r4.5 disclosure 1) for DEFF "
+            "and the generative rho. It never satisfies V1-V3 and is not the verdict.",
             "icc": sens_icc,
             "v2_bound_90": _promotion_block(s2, "tl90", _halts(s2, threshold)),
             "v3_bound_90": _promotion_block(s3, "tl90", _halts(s3, threshold)),
@@ -693,16 +695,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         level=v1_level,
         v2_90=v2_90["overall_pass_with_no_halt"]["min"],
         v3_90=v3_90["overall_pass"]["max"],
-        v2_95=None if v2_95 is None else v2_95["overall_pass_with_no_halt"]["min"],
-        v3_95=None if v3_95 is None else v3_95["overall_pass"]["max"],
+        v2_95=v2_95["overall_pass_with_no_halt"]["min"],
+        v3_95=v3_95["overall_pass"]["max"],
     )
     viability["basis"] = (
         "V2 = promotion pass with no section 5 halt (worst seed); V3 = bound-only false pass "
         "(worst seed); the bound-only V2 is reported beside it"
     )
 
+    verdict = "VIABLE_G6" if viability["verdict"] == "VIABLE" else "NOT_VIABLE_G6"
     pins = _pins(args, days, res, scenarios, icc_used, level, threshold)
     return {
+        "verdict": verdict,
+        "verdict_basis": "G6: ICC used = max(0.1, pre-window ANOVA estimate) (r4.5 O1/O5)",
         "meta": {
             "task": "EXEC-PAR D-PREREG BG-10 (a)(c)(d)(e)",
             "data_rule": f"every input dated before {dhat.CUTOFF_DAY}; window inputs refused",
@@ -724,7 +729,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "burst": burst_block,
         "cp_burst": cp_block,
         "viability": viability,
-        "sensitivity_icc_estimate": sensitivity_icc,
+        "sensitivity": sensitivity,
         "pins": pins,
     }
 
@@ -736,11 +741,8 @@ def _halts(results: Mapping[int, StageResult], threshold: int) -> dict[int, IntA
 
 
 def _sensitivity_icc(icc: Mapping[str, Any]) -> float | None:
-    """The raw pre-window estimate, when it was set aside as too noisy and exceeds the floor."""
-    est = float(icc["estimate_floored"])
-    if icc["too_few_ambiguous"] and not math.isnan(est) and est > float(icc["icc_used"]):
-        return est
-    return None
+    """The ICC 0.1 run (labelled sensitivity), when the G6 ICC used exceeds the floor."""
+    return stats.ICC_FLOOR if float(icc["icc_used"]) > stats.ICC_FLOOR else None
 
 
 def _agg_v3(block: Mapping[str, Any]) -> float:
