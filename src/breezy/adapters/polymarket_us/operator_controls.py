@@ -106,6 +106,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_UP, Decimal
@@ -185,6 +186,7 @@ COST_BUDGET_BUCKET_ORDER: Final = (
 )
 
 _SELL_SIDE: Final = "SELL"
+_UNKNOWN_MARK_SOURCE: Final = "unknown"
 _BUY_SIDE: Final = "BUY"
 
 #: Process-wide monotonic booking ids so two ledgers cannot collide on the
@@ -385,6 +387,7 @@ class DailySpendLedger:
     """
 
     __slots__ = (
+        "_ambiguous_marks",
         "_bookings",
         "_cross_day_settles",
         "_day",
@@ -415,6 +418,10 @@ class DailySpendLedger:
         )
         self._open: dict[str, _OpenExposure] = {}
         self._unknown_keys: set[str] = set()
+        #: EXEC-PAR BG-1b: every ``(intent_id, source)`` ever marked AMBIGUOUS, kept
+        #: until acknowledged. ``abandon``/``settle``/the day roll never touch it, so a
+        #: with-id entry that resolves between two watcher ticks is still countable.
+        self._ambiguous_marks: set[tuple[str, str]] = set()
         #: High-water clock of registry-driven (settle) activity, so a stale
         #: authorize can never roll the ledger back across a settle's roll.
         self._registry_last_ns = 0
@@ -774,6 +781,28 @@ class DailySpendLedger:
             entry = self._open.get(key)
             if entry is not None:
                 entry.ambiguous = True
+                # The call sites (boot, create, resolver) are not distinguishable here
+                # without editing the pinned client, so the source is always "unknown".
+                self._ambiguous_marks.add((key, _UNKNOWN_MARK_SOURCE))
+
+    def ambiguous_marks_pending(self) -> frozenset[tuple[str, str]]:
+        """Value-free snapshot of unacknowledged ``(intent_id, source)`` AMBIGUOUS marks."""
+        with self._lock:
+            return frozenset(self._ambiguous_marks)
+
+    def ack_ambiguous_marks(self, marks: Iterable[tuple[str, str]]) -> None:
+        """Forget acknowledged marks (unknown marks tolerated); a non-pair raises."""
+        checked = list(marks)
+        for mark in checked:
+            if (
+                type(mark) is not tuple
+                or len(mark) != 2
+                or type(mark[0]) is not str
+                or type(mark[1]) is not str
+            ):
+                raise ValueError("an ambiguous mark is an (intent_id, source) pair of str")
+        with self._lock:
+            self._ambiguous_marks.difference_update(checked)
 
     def abandon_open_exposure(self, key: str) -> bool:
         """Drop ``key``'s entry, adding no spend. Never raises.

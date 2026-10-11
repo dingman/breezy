@@ -49,8 +49,10 @@ from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.symbology import base_slug_of
 from breezy.runtime.exec_par_counter_ingest import (
+    AmbiguousMarkSource,
     ExecParCounterError,
     ExecParCounterIngest,
+    IntentView,
     reason_label,
 )
 from breezy.runtime.exec_par_records import (
@@ -189,6 +191,7 @@ class ExecParStorePort(Protocol):
     # BG-1b per-climate-day counter rows (event-sourced, exclusive, idempotent).
     def write_order_anchor(self, record: OrderAnchor) -> bool: ...
     def read_order_anchor(self, client_order_id: str) -> OrderAnchor | None: ...
+    def read_intent(self, intent_id: str) -> IntentView | None: ...
     def write_denial(self, record: DenialRow) -> bool: ...
     def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
     def write_fill(self, record: FillRow) -> bool: ...
@@ -515,10 +518,12 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         digest: ExecParDigest | None = None,
         interval_seconds: int = WATCHER_INTERVAL_SECONDS,
         counters: ExecParCounterIngest | None = None,
+        ambiguous_marks: AmbiguousMarkSource | None = None,
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
         self._counters = counters
+        self._ambiguous_marks = ambiguous_marks
         self._ingest_fault_count = 0
         self._last_ingest_fault: ExecParCounterError | None = None
         self._halt_written = False
@@ -555,8 +560,21 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
             self._last_ingest_fault = exc
             logger.error("%s: counter ingestion failed: %s", _SITE, type(exc).__name__)
 
+    def _ingest_ambiguous_marks(self, now_ns: int) -> None:
+        """Count pending ever-AMBIGUOUS marks (a fault is counted, never a withheld heartbeat)."""
+        counters, marks = self._counters, self._ambiguous_marks
+        if counters is None or marks is None:
+            return
+        try:
+            counters.ingest_ambiguous_marks(marks, now_ns=now_ns)
+        except ExecParCounterError as exc:
+            self._ingest_fault_count += 1
+            self._last_ingest_fault = exc
+            logger.error("%s: ambiguous-mark ingestion failed: %s", _SITE, type(exc).__name__)
+
     def _persist(self, client: ExecClientView, now_ns: int) -> None:
         """Compute the trip reasons and latch the halt BEFORE anything can fail."""
+        self._ingest_ambiguous_marks(now_ns)
         ages = client.open_intent_ages
         self._stuck = tuple((iid, slug) for iid, slug, age in ages if age > STUCK_AGE_NS)
         contradictions = client.contradiction_events_total

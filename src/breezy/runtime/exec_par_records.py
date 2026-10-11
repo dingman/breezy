@@ -27,7 +27,7 @@ BG-1b counter rows (event-sourced; the id in each key must equal the row's own
 field; ``day`` is the climate-day label of the ARM time, I2):
 
 * ``order/<client_order_id>``  posted entry + the durable DECISION ASK
-* ``denial/<client_order_id>`` and ``ambiguous/<client_order_id>``
+* ``denial/<client_order_id>`` and ``ambiguous/<intent_id>``
 * ``fill/<trade_id>``          per-fill slippage, realized and unrounded fees
 * ``openflag/<station_day>``   value-free "open cost over fraction" flag
 * ``window/<day>/<start_ns>``  per 5 s window order count and notional
@@ -211,9 +211,17 @@ class DenialRow:
 
 @dataclass(frozen=True, slots=True)
 class AmbiguousRow:
-    client_order_id: str
+    """An entry that was ever AMBIGUOUS, keyed by intent id (counted once, kept on resolution).
+
+    ``attribution`` is ``slot`` (open slot), ``history`` (retired slot) or
+    ``unattributed`` (neither found; ``day`` is then ``unattributed``).
+    """
+
+    intent_id: str
+    source: str
     day: str
     arm_ns: int
+    attribution: str
     ts_ns: int
 
 
@@ -315,7 +323,14 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "window_start_ns": "int",
     },
     DenialRow: {"client_order_id": "str", "reason": "str", "day": "str", "arm_ns": "int"},
-    AmbiguousRow: {"client_order_id": "str", "day": "str", "arm_ns": "int", "ts_ns": "int"},
+    AmbiguousRow: {
+        "intent_id": "str",
+        "source": "str",
+        "day": "str",
+        "arm_ns": "int",
+        "attribution": "str",
+        "ts_ns": "int",
+    },
     FillRow: {
         "trade_id": "str",
         "client_order_id": "str",

@@ -46,7 +46,9 @@ FILL = FillRow(
 ROWS = (
     ANCHOR,
     DenialRow(client_order_id="O-2", reason="k-full", day="2026-10-11", arm_ns=7),
-    AmbiguousRow(client_order_id="O-1", day="2026-10-11", arm_ns=5, ts_ns=9),
+    AmbiguousRow(
+        intent_id="a1", source="unknown", day="2026-10-11", arm_ns=5, attribution="slot", ts_ns=9
+    ),
     FILL,
     OpenCostFlag(station_day="NYC@2026-10-11", day="2026-10-11", exceeded=True, ts_ns=3),
     WindowPeak(day="2026-10-11", window_start_ns=5, orders=2, notional="8.00"),

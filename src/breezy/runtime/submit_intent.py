@@ -883,6 +883,27 @@ class SubmitIntentLatch(ExecParCounterRowsMixin):
         with self._mutex:
             return self._read_table().open
 
+    def read_intent(self, intent_id: str) -> SubmitIntent | None:
+        """The OPEN slot for ``intent_id``, else its retired ``history`` record, else ``None``.
+
+        A malformed id raises ``ValueError``; a garbled table or record raises
+        ``SubmitIntentCorrupt`` (never a default).
+        """
+        self._require_held()
+        if _INTENT_ID_RE.fullmatch(intent_id) is None:
+            raise ValueError("invalid intent id")
+        with self._mutex:
+            for slot in self._read_table().open:
+                if slot.intent_id == intent_id:
+                    return slot
+            raw = self._store.get(history_key(intent_id))
+            if raw is None:
+                return None
+            record = SubmitIntent.from_bytes(raw)
+            if record.intent_id != intent_id:
+                raise SubmitIntentCorrupt()
+            return record
+
     def unreadable_slot_keys(self) -> tuple[str, ...]:
         """Keys of unreadable slots, plus ``?:<id>`` for slug-less slots when K > 1."""
         self._require_held()

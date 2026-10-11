@@ -208,7 +208,7 @@ def test_open_cost_flag_raise_or_non_bool_is_a_typed_failure(tmp_path: Path) -> 
         assert latch.read_open_cost_flags(DAY) == ()
 
 
-# -- denial / ambiguous ------------------------------------------------------
+# -- denial ------------------------------------------------------
 
 
 def test_denial_attributed_by_event_time_and_labelled(tmp_path: Path) -> None:
@@ -219,18 +219,6 @@ def test_denial_attributed_by_event_time_and_labelled(tmp_path: Path) -> None:
         assert (row.reason, row.client_order_id, row.arm_ns) == ("k-full", "O-5", ARM + 1)
         with pytest.raises(CounterAttributionError):
             ing.record_denial(client_order_id="O-6", slug=SLUG, reason="", ts_ns=ARM)
-
-
-def test_ambiguous_takes_day_and_arm_time_from_the_anchor(tmp_path: Path) -> None:
-    with _latch(tmp_path) as latch:
-        ing = _ingest(latch)
-        _post(ing)
-        assert ing.record_ambiguous(client_order_id="O-1", ts_ns=ARM + 400 * SEC) is True
-        (row,) = latch.read_ambiguous(DAY)
-        assert (row.arm_ns, row.day) == (ARM, DAY)  # not the later detection time
-        assert ing.record_ambiguous(client_order_id="O-1", ts_ns=ARM + 900 * SEC) is False
-        with pytest.raises(CounterAttributionError):
-            ing.record_ambiguous(client_order_id="O-404", ts_ns=ARM)
 
 
 # -- fills ---------------------------------------------------------------
