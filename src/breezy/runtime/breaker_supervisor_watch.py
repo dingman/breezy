@@ -10,9 +10,12 @@ Episode semantics: an alert fires when its condition becomes true and not again
 until it has been false for one tick, so a stale heartbeat pages once per
 episode, not once per supervisor poll.
 
-At a configured K of 1 nothing here can fire except the unreadable-slot and
-latched-halt alerts, which need a v2 table or a breaker record that only a K>1
-run writes. A K=1 node therefore behaves exactly as today.
+BG-8: the halted, unreadable-slot and probe-unreadable conditions are probed at
+ANY K, read-only, at most every ``PROBE_INTERVAL_NS``. At a configured K of 1
+each fires ONCE per episode (no hourly repeat), so a breaker that is legitimately
+already halted pages a K=1 operator exactly once. The dead-watcher, resolver and
+stage-stamp conditions are K>1 only; the stamp one fires with the node down.
+On every alert the supervisor only alerts: it never respawns or kills the node.
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from breezy.runtime.submit_intent_slots import (
 __all__ = [
     "ABSENT_RECORD_GRACE_NS",
     "BOOT_GRACE_NS",
+    "PROBE_INTERVAL_NS",
     "REALERT_INTERVAL_NS",
+    "STAGE_STAMP_MAX_AGE_NS",
     "BreakerAlertDetail",
     "BreakerAlertSpec",
     "BreakerProbe",
@@ -50,6 +55,12 @@ BOOT_GRACE_NS: Final[int] = 600 * 1_000_000_000
 #: delivered-then-lost page cannot leave the condition silent.
 REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
 
+#: BG-8: the supervisor probes the store no more often than this (read-only).
+PROBE_INTERVAL_NS: Final[int] = 600 * 1_000_000_000
+
+#: Spec 1a: a stage-eval stamp older than 26 h (or never written that long) is stale.
+STAGE_STAMP_MAX_AGE_NS: Final[int] = 26 * 3600 * 1_000_000_000
+
 _CRITICAL: Final[str] = "CRITICAL"
 
 
@@ -67,6 +78,8 @@ class BreakerAlertDetail(str, Enum):
     BREAKER_RESOLVER_PASS_STALE = "breaker_resolver_pass_stale"
     BREAKER_ENTRY_HALT_LATCHED = "breaker_entry_halt_latched"
     SLOT_TABLE_UNREADABLE_SLOT = "slot_table_unreadable_slot"
+    STAGE_STAMP_STALE = "exec_par_stage_stamp_stale"
+    PROBE_UNREADABLE = "breaker_probe_unreadable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +92,10 @@ class BreakerProbe:
     hb_ns: int
     resolver_pass_ns: int
     unreadable_slots: int
+    #: BG-8: the BG-5 stage-eval stamp time; ``None`` = never written.
+    stamp_ts_ns: int | None = None
+    #: ``False`` when the stamp row exists but does not decode.
+    stamp_readable: bool = True
 
     @classmethod
     def absent(cls) -> BreakerProbe:
@@ -115,6 +132,10 @@ class BreakerWatchState:
     active: dict[str, int] = field(default_factory=dict)
     node_pid: int | None = None
     node_first_seen_ns: int | None = None
+    #: BG-8: last store probe (the 10-minute throttle) and the first K>1 sighting
+    #: (the anchor for a never-written stamp).
+    last_probe_ns: int | None = None
+    stamp_watch_since_ns: int | None = None
 
     def delivered(self, spec: BreakerAlertSpec, now_ns: int) -> None:
         self.active[spec.key] = now_ns
@@ -137,6 +158,16 @@ _UNREADABLE = BreakerAlertSpec(
     "TRADE_SUPERVISOR_SLOT_TABLE_UNREADABLE_SLOT",
     _CRITICAL,
     BreakerAlertDetail.SLOT_TABLE_UNREADABLE_SLOT,
+)
+_STAMP_STALE = BreakerAlertSpec(
+    "TRADE_SUPERVISOR_EXEC_PAR_STAGE_STAMP_STALE",
+    _CRITICAL,
+    BreakerAlertDetail.STAGE_STAMP_STALE,
+)
+_PROBE_UNREADABLE = BreakerAlertSpec(
+    "TRADE_SUPERVISOR_BREAKER_PROBE_UNREADABLE",
+    _CRITICAL,
+    BreakerAlertDetail.PROBE_UNREADABLE,
 )
 
 
@@ -172,6 +203,14 @@ def _watcher_conditions(
     return found
 
 
+def _stamp_stale(probe: BreakerProbe, now_ns: int, watch_since_ns: int) -> bool:
+    if not probe.stamp_readable:
+        return True
+    if probe.stamp_ts_ns is None:
+        return now_ns - watch_since_ns >= STAGE_STAMP_MAX_AGE_NS
+    return _stale(probe.stamp_ts_ns, now_ns, STAGE_STAMP_MAX_AGE_NS)
+
+
 def _note_node(state: BreakerWatchState, node_pid: int | None, node_live: bool, now_ns: int) -> int:
     """Remember when this supervisor first saw the current node pid (its boot grace anchor)."""
     if not node_live or node_pid is None:
@@ -202,9 +241,9 @@ def decide_breaker_alerts(
     node with no pid (a test double) anchors its boot grace on the first live
     sighting.
 
-    The supervisor returns before probing at a configured K<=1 (a K=1 node writes
-    no breaker record), so the halted and unreadable-slot alerts are unreachable
-    there BY DESIGN; ``k_configured`` is still honoured here for direct callers.
+    BG-8: the halted, unreadable-slot and probe-unreadable conditions are decided
+    at ANY K; at K<=1 they alert once per episode (no hourly repeat). The stamp
+    condition is K>1 only and does not need a live node.
     """
     conditions: dict[str, BreakerAlertSpec] = {}
     if probe.unreadable_slots > 0:
@@ -212,11 +251,21 @@ def decide_breaker_alerts(
     if probe.halted:
         conditions["halted"] = _keyed(_HALTED, "halted")
     first_seen = _note_node(state, node_pid if node_pid is not None else 0, node_live, now_ns)
-    if k_configured > 1 and node_live:
+    watcher_live = k_configured > 1 and node_live
+    if watcher_live:
         conditions.update(_watcher_conditions(probe, now_ns, first_seen))
+    if not probe.readable and not watcher_live:
+        conditions["probe_unreadable"] = _keyed(_PROBE_UNREADABLE, "probe_unreadable")
+    if k_configured > 1:
+        if state.stamp_watch_since_ns is None:
+            state.stamp_watch_since_ns = now_ns
+        if probe.readable and _stamp_stale(probe, now_ns, state.stamp_watch_since_ns):
+            conditions["stamp_stale"] = _keyed(_STAMP_STALE, "stamp_stale")
+    realert = k_configured > 1
     state.active = {k: t for k, t in state.active.items() if k in conditions}
     return [
         spec
         for key, spec in conditions.items()
-        if key not in state.active or now_ns - state.active[key] >= REALERT_INTERVAL_NS
+        if key not in state.active
+        or (realert and now_ns - state.active[key] >= REALERT_INTERVAL_NS)
     ]

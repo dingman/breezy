@@ -26,6 +26,7 @@ from breezy.runtime.exec_par_records import (
     DAY_CONVENTION_KEY,
     EPOCH_KEY_PREFIX,
     EXEC_PAR_PREFIX,
+    STAGE_EVAL_STAMP_KEY,
     DayCountsDelta,
     EpochRow,
     ExecParRecordError,
@@ -42,7 +43,7 @@ from breezy.runtime.exec_par_records import (
 
 LOOK_OUTCOMES: Final[frozenset[str]] = frozenset({"passed", "failed", "not_taken"})
 
-_STAMP = EXEC_PAR_PREFIX + "stage_eval/stamp"
+_STAMP = STAGE_EVAL_STAMP_KEY
 _LIVENESS = EXEC_PAR_PREFIX + "stage_eval/liveness"
 _RECONCILE_PHASE = EXEC_PAR_PREFIX + "stage_eval/reconcile_phase"
 _REPORT = EXEC_PAR_PREFIX + "stage_eval/report"
