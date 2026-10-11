@@ -39,6 +39,7 @@ from breezy.runtime.exec_par_records import (
     ForceK1Flag,
     ForceK1Kind,
     ForceK1State,
+    SettledPnlDay,
     StageEvalDry,
     StageReset,
     StopVerdict,
@@ -49,8 +50,10 @@ from breezy.runtime.exec_par_records import (
     encode_force_k1_tombstone,
     encode_record,
 )
+from breezy.runtime.exec_par_settled_pnl import Timed, pre_boot_fill_ledger
 
 T = TypeVar("T")
+F = TypeVar("F", bound=Timed)
 
 _STAGE_RESET = EXEC_PAR_PREFIX + "stage_reset"
 _EXCLUDED_DAYS = EXEC_PAR_PREFIX + "excluded_days"
@@ -61,11 +64,29 @@ _EPOCH = EXEC_PAR_PREFIX + "epoch/"
 _AMENDMENT = EXEC_PAR_PREFIX + "amendment/"
 _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
+_SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"
 
 
 class _Store(Protocol):
     def get(self, key: str) -> bytes | None: ...
     def set(self, key: str, value: bytes) -> None: ...
+
+
+class _ScanView:
+    """Read-only get + prefix listing over the host store (no ``set`` is reachable)."""
+
+    def __init__(self, store: _Store) -> None:
+        lister = getattr(store, "keys_with_prefix", None)
+        if lister is None:
+            raise RuntimeError("store has no keys_with_prefix; cannot scan EXEC-PAR rows")
+        self._store = store
+        self._lister: Callable[[str], list[str]] = lister
+
+    def get(self, key: str) -> bytes | None:
+        return self._store.get(key)
+
+    def keys_with_prefix(self, prefix: str) -> list[str]:
+        return self._lister(prefix)
 
 
 class ExecParRecordsMixin:
@@ -322,3 +343,60 @@ class ExecParRecordsMixin:
             if flag is None:
                 return ForceK1State(ForceK1Kind.CLEARED)
             return ForceK1State(ForceK1Kind.SET, flag)
+
+    # -- BG-1c settled P&L per arm-time day (spec 10a, 15) ----------------
+
+    def write_settled_pnl_day(self, record: SettledPnlDay) -> None:
+        """Overwrite the day's row: each write is a full recompute from durable records."""
+        self._require_held()
+        with self._mutex:
+            self._er_put(f"{_SETTLED_PNL}{record.day}", record)
+
+    def read_settled_pnl_day(self, day: str) -> SettledPnlDay | None:
+        """The row, or ``None`` when absent (the consumer treats absent as FAIL, never 0)."""
+        self._require_held()
+        with self._mutex:
+            row = self._er_get(f"{_SETTLED_PNL}{day}", SettledPnlDay)
+            if row is not None and row.day != day:
+                raise self.CorruptError()
+            return row
+
+    def read_settled_pnl_days(self) -> tuple[SettledPnlDay, ...]:
+        """Every stored day ascending; a row under the wrong key is corrupt."""
+        self._require_held()
+        with self._mutex:
+            lister = getattr(self._store, "keys_with_prefix", None)
+            if lister is None:
+                raise RuntimeError("store has no keys_with_prefix; cannot scan EXEC-PAR rows")
+            rows: list[SettledPnlDay] = []
+            for key in lister(_SETTLED_PNL):
+                row = self._er_get(key, SettledPnlDay)
+                if row is None or key != f"{_SETTLED_PNL}{row.day}":
+                    raise self.CorruptError()
+                rows.append(row)
+            return tuple(sorted(rows, key=lambda r: r.day))
+
+    # -- BG-1c K=1 pre-boot fill ledger (spec 7 parity; read-only) --------
+
+    def read_first_k_gt1_boot_ts(self) -> int | None:
+        """``boot_ts`` of the earliest epoch row with ``effective_k`` > 1, else ``None``."""
+        self._require_held()
+        with self._mutex:
+            return self._first_k_gt1_locked()
+
+    def _first_k_gt1_locked(self) -> int | None:
+        epochs = self._er_scan(_EPOCH, EpochRow, lambda r: r.boot_ts)
+        return next((e.boot_ts for e in epochs if e.effective_k > 1), None)
+
+    def read_k1_pre_boot_fills(
+        self, decode: Callable[[bytes], F], in_family: Callable[[F], bool]
+    ) -> tuple[F, ...]:
+        """Same-family durable fills strictly before the first K>1 epoch (no write)."""
+        self._require_held()
+        with self._mutex:
+            return pre_boot_fill_ledger(
+                _ScanView(self._store),
+                first_k_gt1_boot_ts=self._first_k_gt1_locked(),
+                decode=decode,
+                in_family=in_family,
+            )
