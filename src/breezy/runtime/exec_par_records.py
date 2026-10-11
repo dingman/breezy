@@ -199,6 +199,9 @@ class OrderAnchor:
     qty: str
     notional: str
     window_start_ns: int
+    #: How ``arm_ns`` was obtained: ``slot_join`` (the armed slot, joined by coid) or
+    #: ``event_time`` (the ``OrderSubmitted`` ``ts_event``; today's only route).
+    attribution: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +324,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "qty": "str",
         "notional": "str",
         "window_start_ns": "int",
+        "attribution": "str",
     },
     DenialRow: {"client_order_id": "str", "reason": "str", "day": "str", "arm_ns": "int"},
     AmbiguousRow: {

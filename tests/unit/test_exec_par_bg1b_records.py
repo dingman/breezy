@@ -29,6 +29,7 @@ ANCHOR = OrderAnchor(
     qty="10",
     notional="4.00",
     window_start_ns=1_700_000_000_000_000_000,
+    attribution="event_time",
 )
 FILL = FillRow(
     trade_id="TR-1",

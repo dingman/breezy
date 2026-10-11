@@ -54,9 +54,9 @@ class _Store:
 
 
 @contextmanager
-def _latch(tmp_path: Path, store: _Store) -> Iterator[SubmitIntentLatch]:
+def _latch(tmp_path: Path, store: _Store, boot_ns: int = ARM) -> Iterator[SubmitIntentLatch]:
     with open_submit_intent_latch(
-        store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: ARM
+        store, tmp_path / "s.db", max_slots=2, v2_predicate=lambda: True, clock_ns=lambda: boot_ns
     ) as latch:
         yield latch
 
@@ -159,17 +159,40 @@ def test_no_slot_and_no_history_is_counted_as_unattributed_never_dropped(
         assert _ingest(latch).ingest_ambiguous_marks(marks, now_ns=now) == 1
         (row,) = latch.read_ambiguous(UNATTRIBUTED)
         assert (row.attribution, row.day, row.arm_ns) == (UNATTRIBUTED, UNATTRIBUTED, now)
+        assert row.source == "unknown"
         assert marks.marks == set()
 
 
-def test_boot_source_is_stored_verbatim(tmp_path: Path) -> None:
+def test_source_is_boot_for_an_intent_armed_before_this_process_started(tmp_path: Path) -> None:
     with _latch(tmp_path, _Store()) as latch:
-        slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
+        assert latch.boot_ns == ARM
+        slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM - 100 * SEC)
         _ingest(latch).ingest_ambiguous_marks(
-            _FixedMarks({(slot.intent_id, "boot")}), now_ns=ARM + SEC
+            _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + SEC
         )
         (row,) = latch.read_ambiguous(DAY)
         assert row.source == "boot"
+
+
+def test_source_is_live_for_an_intent_armed_at_or_after_boot(tmp_path: Path) -> None:
+    with _latch(tmp_path, _Store()) as latch:
+        slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
+        _ingest(latch).ingest_ambiguous_marks(
+            _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + SEC
+        )
+        (row,) = latch.read_ambiguous(DAY)
+        assert row.source == "live"
+
+
+def test_source_is_live_for_a_history_only_post_boot_intent(tmp_path: Path) -> None:
+    with _latch(tmp_path, _Store()) as latch:
+        slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM + SEC)
+        latch.retire(slot.intent_id, RetirementReason.DEFINITIVE_REJECT, now_ns=ARM + 2 * SEC)
+        _ingest(latch).ingest_ambiguous_marks(
+            _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + 3 * SEC
+        )
+        (row,) = latch.read_ambiguous(DAY)
+        assert (row.source, row.attribution) == ("live", "history")
 
 
 # -- idempotence, restart, acknowledge ------------------------------------
@@ -213,11 +236,11 @@ def test_restart_attributes_a_never_counted_boot_mark_from_the_persisted_slot(
     store = _Store()
     with _latch(tmp_path, store) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-    with _latch(tmp_path, store) as latch:
-        marks = _FixedMarks({(slot.intent_id, "boot")})
+    with _latch(tmp_path, store, boot_ns=ARM + 600 * SEC) as latch:
+        marks = _FixedMarks({(slot.intent_id, "unknown")})
         assert _ingest(latch).ingest_ambiguous_marks(marks, now_ns=ARM + 900 * SEC) == 1
         (row,) = latch.read_ambiguous(DAY)
-        assert (row.arm_ns, row.source) == (ARM, "boot")
+        assert (row.arm_ns, row.source) == (ARM, "boot")  # armed before this process booted
 
 
 def test_write_failure_does_not_acknowledge_and_the_next_tick_retries(tmp_path: Path) -> None:

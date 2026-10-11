@@ -55,7 +55,7 @@ def _open(store: _Store, tmp_path: Path) -> Iterator[SubmitIntentLatch]:
 
 
 def _anchor(coid: str = "O-1", day: str = DAY, ask: str = "0.40") -> OrderAnchor:
-    return OrderAnchor(coid, "slug-a", day, 100, ask, "10", "4.00", 100)
+    return OrderAnchor(coid, "slug-a", day, 100, ask, "10", "4.00", 100, "event_time")
 
 
 def _fill(trade: str = "TR-1", coid: str = "O-1", day: str = DAY) -> FillRow:

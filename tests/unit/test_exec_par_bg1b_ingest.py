@@ -100,6 +100,8 @@ def test_posted_entry_persists_the_decision_ask_and_attributes_by_arm_time(tmp_p
         assert row is not None
         assert (row.decision_ask, row.qty, row.notional) == ("0.40", "10", "4.00")
         assert (row.day, row.arm_ns, row.slug) == (DAY, ARM, SLUG)
+        # R2: no slot is joinable by coid today, so the arm time is the event time, explicitly
+        assert row.attribution == "event_time"
         # the day is the ARM day even when the event arrives long after midnight
         assert _post(ing, "O-0", at=ARM - 10 * SEC * 3600) is True
         anchor = latch.read_order_anchor("O-0")
