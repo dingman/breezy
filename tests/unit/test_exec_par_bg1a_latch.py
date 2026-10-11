@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from breezy.runtime.exec_par_records import (
+    encode_force_k1_tombstone,
     ForceK1Kind,
     ForceK1State,
     EXEC_PAR_PREFIX,
@@ -83,6 +84,7 @@ CLEARED = ForceK1Cleared(ts=8, halt_ts=4, incident_report="docs/r.md")
 STOP = StopVerdict(reason="s5_cp", ts_ns=11)
 DEMO = CleanupDemotion(from_k=4, to_k=2, ts_ns=12, reason="low_volume")
 FLAG = ForceK1Flag(reason="s5_cp", ts_ns=13, set_by="watcher")
+LATE_CLEARED = ForceK1Cleared(ts=20, halt_ts=4, incident_report="docs/r.md")
 AMEND = Amendment(ts_ns=3, commit_sha="abc", note="A1")
 
 Op = Callable[[Any], Any]
@@ -332,7 +334,7 @@ def test_stage_reset_rejects_a_lower_ts_and_allows_equal_or_higher(tmp_path: Pat
         with pytest.raises(ValueError, match="monotonic"):
             latch.write_stage_reset(StageReset(ts=4, cause="k_change", halt_ts=None))
         assert store.data == before
-        latch.write_stage_reset(StageReset(ts=5, cause="k_change", halt_ts=None))
+        latch.write_stage_reset(RESET)  # identical rewrite at an equal ts is idempotent
         latch.write_stage_reset(StageReset(ts=6, cause="k_change", halt_ts=None))
         assert latch.read_stage_reset() == StageReset(ts=6, cause="k_change", halt_ts=None)
         store.data[P + "stage_reset"] = b"junk"
@@ -370,12 +372,12 @@ def test_clear_force_k1_flag_requires_matching_cleared_record_and_positive_ts(
             with pytest.raises(ValueError, match="positive"):
                 latch.clear_force_k1_flag(bad_ts)
         with pytest.raises(ValueError, match="force_k1_cleared"):
-            latch.clear_force_k1_flag(8)  # no cleared record at all
-        latch.write_force_k1_cleared(CLEARED)
+            latch.clear_force_k1_flag(20)  # no cleared record at all
+        latch.write_force_k1_cleared(LATE_CLEARED)
         with pytest.raises(ValueError, match="force_k1_cleared"):
-            latch.clear_force_k1_flag(9)  # ts mismatch
+            latch.clear_force_k1_flag(21)  # ts mismatch
         assert store.data[P + "force_k1"] == flag_bytes
-        latch.clear_force_k1_flag(8)
+        latch.clear_force_k1_flag(20)
         assert latch.read_force_k1_flag().kind is ForceK1Kind.CLEARED
         assert P + "force_k1" in store.data
 
@@ -383,15 +385,15 @@ def test_clear_force_k1_flag_requires_matching_cleared_record_and_positive_ts(
 def test_clear_force_k1_flag_raises_on_garbled_flag_or_cleared_record(tmp_path: Path) -> None:
     store = _Store()
     with _open(store, tmp_path) as latch:
-        latch.write_force_k1_cleared(CLEARED)
+        latch.write_force_k1_cleared(LATE_CLEARED)
         store.data[P + "force_k1"] = b"junk"
         with pytest.raises(SubmitIntentCorrupt):
-            latch.clear_force_k1_flag(8)
+            latch.clear_force_k1_flag(20)
         assert store.data[P + "force_k1"] == b"junk"
         latch.write_force_k1_flag(FLAG)
         store.data[P + "force_k1_cleared"] = b"junk"
         with pytest.raises(SubmitIntentCorrupt):
-            latch.clear_force_k1_flag(8)
+            latch.clear_force_k1_flag(20)
 
 
 def test_boot_ns_is_a_read_only_view_of_the_construction_time_clock(tmp_path: Path) -> None:
@@ -407,3 +409,51 @@ def test_k1_behaviour_untouched_no_exec_par_keys_unless_written(tmp_path: Path) 
         assert latch.current() is None
         latch.arm("f" * 64, now_ns=1)
     assert not [k for k in store.data if k.startswith(P)]
+
+
+def test_stale_clear_record_from_an_earlier_incident_cannot_clear_a_newer_flag(
+    tmp_path: Path,
+) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        latch.write_force_k1_cleared(CLEARED)  # ts 8: the earlier incident
+        latch.write_force_k1_flag(FLAG)  # ts_ns 13: the newer flag
+        before = store.data[P + "force_k1"]
+        with pytest.raises(ValueError, match="newer"):
+            latch.clear_force_k1_flag(8)
+        assert store.data[P + "force_k1"] == before
+        latch.write_force_k1_cleared(LATE_CLEARED)
+        latch.clear_force_k1_flag(20)
+        assert latch.read_force_k1_flag().kind is ForceK1Kind.CLEARED
+
+
+@pytest.mark.parametrize("suffix", ["007", "+7", "-7", " 7", "7 ", "0x7", "\u0667"])
+def test_scan_rejects_non_canonical_decimal_suffixes(tmp_path: Path, suffix: str) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        latch.write_stop_verdict(StopVerdict("a", 7))
+        store.data[P + "stop_verdict/" + suffix] = store.data[P + "stop_verdict/7"]
+        with pytest.raises(SubmitIntentCorrupt):
+            latch.read_latest_stop_verdict()
+
+
+def test_stage_reset_equal_ts_different_content_raises_identical_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        latch.write_stage_reset(RESET)
+        before = dict(store.data)
+        latch.write_stage_reset(RESET)
+        assert store.data == before
+        with pytest.raises(ValueError, match="conflict"):
+            latch.write_stage_reset(StageReset(ts=5, cause="k_change", halt_ts=None))
+        assert store.data == before
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_non_positive_tombstone_reads_back_unreadable(tmp_path: Path, bad: int) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        store.data[P + "force_k1"] = encode_force_k1_tombstone(bad)
+        assert latch.read_force_k1_flag() == ForceK1State(ForceK1Kind.UNREADABLE, None)

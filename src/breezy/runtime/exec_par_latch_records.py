@@ -117,7 +117,7 @@ class ExecParRecordsMixin:
         rows: list[T] = []
         for key in lister(prefix):
             suffix = key[len(prefix) :]
-            if not suffix.isascii() or not suffix.isdigit():
+            if not suffix.isascii() or not suffix.isdigit() or suffix != str(int(suffix)):
                 raise self.CorruptError()
             row = self._er_get(key, cls)
             if row is None or ts_of(row) != int(suffix):
@@ -136,8 +136,11 @@ class ExecParRecordsMixin:
         self._require_held()
         with self._mutex:
             existing = self._er_get(_STAGE_RESET, StageReset)
-            if existing is not None and record.ts < existing.ts:
-                raise ValueError("stage_reset ts must be monotonic non-decreasing")
+            if existing is not None:
+                if record.ts < existing.ts:
+                    raise ValueError("stage_reset ts must be monotonic non-decreasing")
+                if record.ts == existing.ts and record != existing:
+                    raise ValueError("conflicting stage_reset already stored at this ts")
             self._er_put(_STAGE_RESET, record)
 
     def read_stage_reset(self) -> StageReset | None:
@@ -285,21 +288,24 @@ class ExecParRecordsMixin:
         """Tombstone the flag (the store has no delete).
 
         Requires ``cleared_ts_ns > 0`` and a ``force_k1_cleared`` record whose
-        ``ts`` equals it. A garbled flag or garbled cleared record raises.
+        ``ts`` equals it and is newer than a currently SET flag's ``ts_ns``. A garbled flag or garbled cleared record raises.
         """
         self._require_held()
         if cleared_ts_ns <= 0:
             raise ValueError("cleared_ts_ns must be positive")
         with self._mutex:
             raw = self._store.get(_FORCE_K1_FLAG)
+            current: ForceK1Flag | None = None
             if raw is not None:
                 try:
-                    decode_force_k1_flag(raw)
+                    current = decode_force_k1_flag(raw)
                 except ExecParRecordError:
                     raise self.CorruptError() from None
             cleared = self._er_get(_FORCE_K1_CLEARED, ForceK1Cleared)
             if cleared is None or cleared.ts != cleared_ts_ns:
                 raise ValueError("no matching force_k1_cleared record for this clear")
+            if current is not None and cleared.ts <= current.ts_ns:
+                raise ValueError("force_k1_cleared must be newer than the flag it clears")
             self._store.set(_FORCE_K1_FLAG, encode_force_k1_tombstone(cleared_ts_ns))
 
     def read_force_k1_flag(self) -> ForceK1State:

@@ -270,6 +270,8 @@ def decode_force_k1_flag(raw: bytes) -> ForceK1Flag | None:
     """The flag, or ``None`` for a cleared tombstone; anything else raises."""
     payload = _json_object(raw)
     if set(payload) == {"v", "cleared_ts_ns"}:
-        _check(payload["cleared_ts_ns"], "int")
+        cleared = _check(payload["cleared_ts_ns"], "int")
+        if not isinstance(cleared, int) or cleared <= 0:
+            raise ExecParRecordError("tombstone ts must be positive")
         return None
     return decode_record(ForceK1Flag, raw)
