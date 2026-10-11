@@ -41,7 +41,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from datetime import timedelta
 from decimal import Decimal
-from typing import Final, Protocol
+from typing import Final, Protocol, runtime_checkable
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.model.events import OrderDenied, OrderSubmitted
@@ -55,6 +55,7 @@ from breezy.runtime.exec_par_counter_ingest import (
     IntentView,
     reason_label,
 )
+from breezy.runtime.exec_par_epochs import k_forced_amendment
 from breezy.runtime.exec_par_ingest_guard import IngestGuard
 from breezy.runtime.exec_par_records import (
     AmbiguousRow,
@@ -162,6 +163,13 @@ class BreakerLatchPort(Protocol):
 
     def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None: ...
     def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None: ...
+
+
+@runtime_checkable
+class AmendmentPort(Protocol):
+    """BG-2: the one latch method the K>1 watcher uses to record a K-forced amendment."""
+
+    def write_amendment(self, record: Amendment) -> None: ...
 
 
 class ExecParStorePort(Protocol):
@@ -522,9 +530,14 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         interval_seconds: int = WATCHER_INTERVAL_SECONDS,
         counters: ExecParCounterIngest | None = None,
         ambiguous_marks: AmbiguousMarkSource | None = None,
+        amendments: AmendmentPort | None = None,
+        commit_sha: str | None = None,
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
+        self._amendments = amendments if commit_sha is not None else None
+        self._commit_sha = commit_sha
+        self._k_forced_recorded = False
         self._guard = None if counters is None else IngestGuard(counters)
         self._ambiguous_marks = ambiguous_marks
         self._halt_written = False
@@ -611,6 +624,24 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._seen_contradictions = max(self._seen_contradictions, contradictions)
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
         self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
+        self._record_k_forced(client, now_ns)
+
+    def _record_k_forced(self, client: ExecClientView, now_ns: int) -> None:
+        """BG-2: write the amendment once, on the first tick that sees the K=1 force.
+
+        The exec client's bucket guard forces K=1 at ``_connect``, after the boot
+        epoch row was written. A raise leaves the flag unset, so the next tick
+        retries (and this tick's heartbeat is withheld).
+        """
+        amendments = self._amendments
+        commit_sha = self._commit_sha
+        reason = client.k_forced_to_1_reason
+        if amendments is None or commit_sha is None or reason is None or self._k_forced_recorded:
+            return
+        amendments.write_amendment(
+            k_forced_amendment(ts_ns=now_ns, commit_sha=commit_sha, reason=reason)
+        )
+        self._k_forced_recorded = True
 
     def _collect_conditions(self, client: ExecClientView, now_ns: int) -> None:
         super()._collect_conditions(client, now_ns)
@@ -682,10 +713,21 @@ def build_exec_watcher(
     latch: BreakerLatchPort,
     alert_sink: AlertSink,
     digest: ExecParDigest | None = None,
+    commit_sha: str | None = None,
 ) -> ExecRefusalAlertActor:
-    """The watcher for an effective K: the breaker only when K>1, else alerts only."""
+    """The watcher for an effective K: the breaker only when K>1, else alerts only.
+
+    ``commit_sha`` (BG-2) arms the K-forced amendment writer on the K>1 watcher; the
+    K=1 alert-only watcher never writes.
+    """
     if max_slots > 1:
-        return BreakerWatcherActor(latch=latch, alert_sink=alert_sink, digest=digest)
+        return BreakerWatcherActor(
+            latch=latch,
+            alert_sink=alert_sink,
+            digest=digest,
+            amendments=latch if isinstance(latch, AmendmentPort) else None,
+            commit_sha=commit_sha,
+        )
     return ExecRefusalAlertActor(alert_sink=alert_sink, digest=digest)
 
 

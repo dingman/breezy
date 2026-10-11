@@ -58,6 +58,8 @@ from breezy.runtime.breaker_watcher import (
     cross_day_settles_of,
     exec_client_getter,
 )
+from breezy.runtime.build_sha import resolve_build_revision
+from breezy.runtime.exec_par_epochs import record_boot_epoch, record_clean_stop
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.node_config import (
@@ -987,6 +989,14 @@ def _open_exec_latch(
     )
 
 
+def _close_epoch(latch: SubmitIntentLatch) -> None:
+    """EXEC-PAR BG-2: stamp `stop_ts` once the node has disposed. Never masks the exit code."""
+    try:
+        record_clean_stop(latch, boot_ts=latch.boot_ns, stop_ts=time.time_ns())
+    except Exception as exc:  # noqa: BLE001 - the next boot_ts closes an unstamped epoch
+        _boot_logger.error("epoch stop_ts not written: %s", type(exc).__name__)
+
+
 def run(
     *,
     env: Mapping[str, str] | None = None,
@@ -1076,11 +1086,17 @@ def run(
             latch = stack.enter_context(_open_exec_latch(store, store_path))
             # K>1 only does anything: a supervisor that cannot decode v2 forces K=1.
             force_k1_without_supervisor_marker(latch, store_path)
+            # EXEC-PAR BG-2: the K-epoch row, after the forced-to-1 checks and
+            # before `node.run`. `commit_sha` is the identity the supervisor
+            # logs as `supervisor_started.revision`. A write failure propagates.
+            commit_sha = resolve_build_revision(os.environ)
+            record_boot_epoch(latch, commit_sha=commit_sha, boot_ts=latch.boot_ns)
             exec_watcher = build_exec_watcher(
                 latch.max_slots(),
                 latch=latch,
                 alert_sink=resolve_alert_sink(),
                 digest=ExecParDigest(),
+                commit_sha=commit_sha,
             )
             sending_permit = phase1_sending_permit(
                 sending_family_id=settings.sending_family_id,
@@ -1135,7 +1151,7 @@ def run(
                     get_client, cross_day_settles_total=cross_day_settles_of(get_client)
                 )
 
-            return trade_cli.run(
+            exit_code = trade_cli.run(
                 env=env,
                 node_factory=node_factory,
                 stderr=out,
@@ -1158,6 +1174,8 @@ def run(
                 # enforce a permit nobody holds.
                 order_submission_permit=sending_permit,
             )
+            _close_epoch(latch)
+            return exit_code
     except (
         SettingsError,
         OSError,

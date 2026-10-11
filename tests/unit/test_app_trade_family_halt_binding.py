@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from breezy.app.trade import run
+from breezy.runtime.exec_par_records import EXEC_PAR_PREFIX
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -45,10 +46,23 @@ def _fixture_bytes() -> bytes:
     return FIXTURE_PATH.read_bytes()
 
 
+_EPOCH_PREFIX = EXEC_PAR_PREFIX + "epoch/"
+
+
 def _state_snapshot(store_path: Path) -> set[tuple[str, bytes]]:
+    """Every state row except the EXEC-PAR BG-2 epoch ledger.
+
+    The boot epoch row is an accepted K=1 delta (it is written at every boot and
+    touches no family-halt key), so AC-9's "no write" is asserted over all other rows.
+    """
     conn = sqlite3.connect(store_path)
     try:
-        return set(conn.execute("SELECT key, value FROM state").fetchall())
+        return set(
+            conn.execute(
+                "SELECT key, value FROM state WHERE substr(key, 1, ?) != ?",
+                (len(_EPOCH_PREFIX), _EPOCH_PREFIX),
+            ).fetchall()
+        )
     finally:
         conn.close()
 
