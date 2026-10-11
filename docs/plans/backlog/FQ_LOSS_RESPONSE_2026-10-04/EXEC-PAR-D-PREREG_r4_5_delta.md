@@ -37,22 +37,48 @@ This replaces the pre-activation use of V2/V3 in §5 and in §14 / §14.2.
 **Every promotion look (S1→S2 and later).**
 
 1. Before the look, BG-10 is rerun in **promotion-time mode**. It uses the same pinned seeds, resample counts and simulation assumptions as the O1 run. Its data is pre-window plus every non-excluded K > 1 stage day so far.
-2. The rerun computes ICC_v as follows:
-   - **Minimum data met:** at least 30 AMBIGUOUS events, at least 15 non-excluded days, and at least 8 days with two or more events. Then ICC_v = max(0.1, the **80% upper one-sided day-bootstrap bound** of the ANOVA ICC).
-   - **Otherwise:** ICC_v = max(**0.4147**, the ANOVA estimate).
-3. V2 and V3 are recomputed at ICC_v. The 90%→95% switch is triggered by V3 only, exactly as in K10.
-4. The look is **taken only if V1–V3 all pass**. If they do not:
+2. **ICC_v.** The rerun computes ICC_v as the maximum of the terms below. This applies in **every** branch, so ICC_v is never below 0.4147.
+
+   | Term | When it applies |
+   |---|---|
+   | 0.4147 | Always |
+   | the ANOVA estimate | When it is defined |
+   | the **90% upper one-sided day-bootstrap bound** of the ANOVA ICC | When there are at least 40 AMBIGUOUS events and at least 12 days with two or more events |
+
+   - **Undefined terms.** An undefined or NaN term (for example, no multi-event days) is omitted. The 0.4147 floor still applies.
+   - **Lowering the floor.** Taking ICC_v below 0.4147 requires a new amendment, and that amendment needs both of:
+     - at least 60 events;
+     - a 95% upper bound below 0.4147.
+3. **Same value everywhere.** The same ICC_v feeds V2, V3 and the DEFF in item 5. There is no separately floored live value. m̄ (K10) is not floored. V2 and V3 are recomputed at ICC_v, and the 90%→95% switch is triggered by V3 only, exactly as in K10.
+4. **Outcome of a look.** A look is **taken only if V1–V3 all pass**. If they do not:
    - there is no look and no promotion;
    - the stage holds at its K (L3), and the hold is reported;
-   - M5 cleanup demotion applies after 30 held days.
-5. The promotion Wilson-DEFF bound itself (§5, the ICC line) uses **ICC_v** in place of the live floored estimate. A live estimate taken from the tested sample is anti-conservative, and ICC_v is never lower than it.
+   - M5 cleanup demotion still applies. Its 30-day counter runs from the latest `stage_reset` (N4), and a failed look never resets it.
+5. **Promotion bound.** The promotion Wilson-DEFF bound itself (§5, the ICC line) uses **ICC_v** in place of the live floored estimate. An ICC estimated live from the tested sample is anti-conservative.
+6. **One run per look.** Each look gets exactly one BG-10(f) run.
+   - If the run crashes or errors, it may be rerun **with identical inputs only**. The first complete output is the record.
+   - The inputs are snapshotted when the run starts. The snapshot covers the counters and the `excluded_days` set, which is written only by the existing BG-1d/BG-5 rules and never edited by hand. The record carries the snapshot's sha.
+7. **When BG-10(f) fails.** In each of the cases below, the look is not taken, the stage holds (L3), and a CRITICAL alert is raised:
+   - an error with no complete output;
+   - a timeout;
+   - a missing record;
+   - a stale record, meaning older than 24 h at the time of the look;
+   - a record whose stage or date does not match the look.
 
-The upper bootstrap bound and the 0.4147 floor are what make this gate fail closed: thin or unlucky live data can never loosen it.
+This gate fails closed: no amount of live data, thin or plentiful, can lower ICC below the pre-window G6 value without a new amendment.
+
+**S1 exposure before the first look.** This exposure is bounded by the §15 stops (−0.15 of the daily budget per day and −0.40 of it per stage), by the §5 Clopper-Pearson and burst halts, and by the R-7 AMBIGUOUS latch. The CP halt cannot fire before n = 20. The §15 stage stop is the binding bound on loss in clustered-failure scenarios. That residual risk is accepted.
+
+**Relationship to K10.** K10's "nothing else may be tuned after the result is seen" applies to the O1 numbers, and they stand unchanged as NOT VIABLE. O2 and O3 are procedural amendments that are strictly more conservative than G6: they never pass a case that G6 would fail. The freeze-time three-lens review must explicitly confirm or reject this characterisation.
 
 ## O3. A hard K = 2 ceiling until an O2 pass
 
-- **BG-9 config guard.** BG-9 fails when configured K > 2 unless a committed promotion-time record (`docs/evidence/exec_par/exec_par_bg10_promo_<stage>_<date>.json`) exists, is sha-pinned in an amendment, and shows V1–V3 PASS.
-- **BG-3 boot guard.** BG-3 mirrors this check at boot: configured K > 2 without such a record forces K = 1, with a CRITICAL alert.
+- **BG-9 config guard.** BG-9 fails when configured K > 2 unless a committed promotion-time record (`docs/evidence/exec_par/exec_par_bg10_promo_<stage>_<date>.json`) meets all of these:
+  - it is sha-pinned in an amendment;
+  - it shows V1–V3 PASS;
+  - its stage is the stage being promoted from;
+  - it is the latest record for that stage, so it is not superseded by a later failed look.
+- **BG-3 boot guard.** BG-3 mirrors this check at boot. A configured K > 2 with a missing, invalid or non-matching record forces K = 1, with a CRITICAL alert.
 
 ## O4. Additional stop rule rejected
 
