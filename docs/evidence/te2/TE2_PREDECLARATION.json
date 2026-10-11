@@ -1,0 +1,801 @@
+{
+  "alpha_allocation": {
+    "artefact": {
+      "alpha": 0.01,
+      "tests": [
+        "T-ART"
+      ]
+    },
+    "outside_every_family": [
+      "T-WIN leave-one-out",
+      "T-EDGE"
+    ],
+    "overall": "<= 0.05 Bonferroni across three families",
+    "primary": {
+      "alpha": 0.02,
+      "tests": [
+        "T-WIN"
+      ]
+    },
+    "secondary_holm": {
+      "alpha": 0.02,
+      "method": "nbp_calibration.holm_correction",
+      "tests": [
+        "T-LOC",
+        "T-SPREAD"
+      ]
+    }
+  },
+  "artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+  "consumer_map": {
+    "BAND_SELECTION": "T2 take-rule input (minimum-ask filter, consistent with M1).",
+    "BODY_MISS": "Closed 'no action' with the test, p-value, power and the T1-T3 footer.",
+    "BOUNDARY": "T2 input only; T-EDGE is exploratory (within model-expected near-misses).",
+    "FIXABLE_DEFECT": "Bug row against the named module; blocks any FQ re-open (T2).",
+    "INCONCLUSIVE": "Forward-only evidence plan handed to T2, or closed until T1 (12-07).",
+    "K1a": "Bug row against the named module; blocks any FQ re-open (T2).",
+    "K1b": "Closed, no action: incident already fixed (0fe98eb4 + orders-off drop-in).",
+    "K2": "Descriptive only; a feed-latency input to the F13 source review.",
+    "K3": "Descriptive only; F13 US-source list if a route is wanted.",
+    "K4": "Venue-semantics row; settlement alignment fixed before any family trades this venue.",
+    "MODEL_LIMITATION": "PROGRESS row 'F13 r-next / T2-T3 candidate input' (calibration note).",
+    "MODEL_MISCALIBRATED_UNATTRIBUTED": "F13 r-next / T3 input; next evidence is T1 (12-07).",
+    "NOT_TESTABLE_OR_CONDITIONAL": "Feeds the INCONCLUSIVE forward-evidence sizing (route 1).",
+    "SIBLING_WON": "T2 take-rule input (rung stacking).",
+    "TAIL": "PROGRESS row 'F13 r-next / T2-T3 candidate input' (descriptive baseline).",
+    "VARIANCE": "Closed 'no action' with test, p-value, power, qualifier and T1-T3 footer."
+  },
+  "consumer_map_documented": {
+    "BAND_SELECTION (K7)": "T2 take-rule input (minimum-ask filter, consistent with M1)",
+    "BODY_MISS (K9) / VARIANCE verdict": "Closed \"no action\" with test, p-value, power, weak qualifier if present, and the T1-T3 footer",
+    "BOUNDARY (K5)": "T2 input only; T-EDGE exploratory; if it does not reject close \"no action: within model-expected near-misses\"",
+    "INCONCLUSIVE": "Route 1: forward-only evidence plan sized by the power calculation, handed to T2; route 2: closed \"no action\" until T1 (12-07) if infeasible; the report states which",
+    "INCONCLUSIVE_default_route": "route 2: closed 'no action' until T1 (12-07), unless a forward-only plan is sized",
+    "K1a (material)": "Bug row against the named module; blocks any FQ re-open (T2)",
+    "K1b": "Closed - no action, incident already fixed (0fe98eb4 + orders-off drop-in; HALT_POINT_2026-10-06); no new manifest row; never assert_family_only on the batch",
+    "K2": "Descriptive only; feed-latency input to the F13 source review",
+    "K3": "Descriptive only; F13 US-source list if a route is wanted; never CF-2 or CF-7",
+    "K4": "Venue-semantics row; settlement alignment fixed before any family trades this venue",
+    "MODEL_MISCALIBRATED_UNATTRIBUTED": "F13 r-next / T3 input; next evidence is T1 (12-07) or a forward screen",
+    "NOT-TESTABLE / TESTABLE-CONDITIONAL": "Feeds INCONCLUSIVE route 1: forward days required per the minimum-attainable-p calculation",
+    "SIBLING_WON (K10)": "T2 take-rule input (rung stacking)",
+    "TAIL (K6) with LOC_ARTEFACT (T-ART)": "Same PROGRESS row family as a calibration note against nbp_calibration (v5.0 May-June extrapolation to October)",
+    "TAIL (K6) with LOC_SOURCE or SPREAD": "Named PROGRESS row F13 r-next / T2-T3 candidate input; 25 fills are forward data under C4.1, descriptive baseline only"
+  },
+  "cycle_age_maximum": {
+    "comparison": "age > value",
+    "disclosure": "Chosen after Phase A ages 4231-26433 s were visible; the arm is expected vacuous so K2 equals the newest_visible flag; K2 is descriptive and feeds no verdict. The code default 86400 is overridden by this value.",
+    "field": "thresholds.cycle_age_max_s",
+    "rationale": "max scheduled inter-cycle gap 12h (cycles 01,13,19Z) + 2h publication allowance; age arm flags missed publication; disclosed: Phase A ages 4231-26433 s were visible when chosen; arm is expected vacuous so K2 == newest_visible flag; K2 is descriptive and feeds no verdict",
+    "status": "FROZEN",
+    "value_ns": 50400000000000,
+    "value_s": 50400
+  },
+  "disclosed_contamination": "The audit and triage showed the headline direction (low win rate, LAX heat bust, MIA wins). The freeze constrains classification and thresholds, not the prior.",
+  "footer": {
+    "lines": [
+      "diagnostic, post-hoc, n = N station-days in C clusters, non-confirmatory",
+      "This verdict is NOT permission to re-arm. Re-open routes are T1 (M1-v3 CONFIRM, read on or after 12-07), T2 (new family and prereg), T3 (new US source, F13), per RULING_FQ-v2-NO-TRADE_2026-10-08.",
+      "VARIANCE does not imply positive EV."
+    ],
+    "rendered_full": "diagnostic, post-hoc, n = 14 station-days in 7 clusters, non-confirmatory\nThis verdict is NOT permission to re-arm. Re-open routes are T1 (M1-v3 CONFIRM, read on or after 12-07), T2 (new family and prereg), T3 (new US source, F13), per RULING_FQ-v2-NO-TRADE_2026-10-08.\nVARIANCE does not imply positive EV.",
+    "rendered_k1b_excluded": "diagnostic, post-hoc, n = 11 station-days in 6 clusters, non-confirmatory\nThis verdict is NOT permission to re-arm. Re-open routes are T1 (M1-v3 CONFIRM, read on or after 12-07), T2 (new family and prereg), T3 (new US source, F13), per RULING_FQ-v2-NO-TRADE_2026-10-08.\nVARIANCE does not imply positive EV.",
+    "source": "fq_loss_taxonomy_verdict.render_footer"
+  },
+  "forbidden": [
+    "counterfactual P&L (L-18)",
+    "hand arithmetic",
+    "edge-distance or band membership computed other than via bucket_facts_from_instrument_id",
+    "selecting a boot commit by committer time",
+    "touching open_holdout or any M1-v3 path"
+  ],
+  "freeze_order": "land WP1c code; recompute TE2_PINS.head_blob_sha256 over every scripts/analysis/fq_loss_taxonomy_*.py + fq_v1_loss_taxonomy.py at that HEAD; commit this predeclaration; record its commit sha in TE2_PINS.json; commit TE2_PINS.json",
+  "h1_k": {
+    "binding": "fee_net",
+    "fee_theta": 0.0695,
+    "fee_theta_field": "thresholds.fee_theta",
+    "formula": "min(1, sum_fills(a + theta*a*(1-a)))",
+    "sensitivity": "H1-K_ask_only (labelled sensitivity, not binding)"
+  },
+  "honest_expectation": {
+    "expected_verdict": "INCONCLUSIVE unless a positive finding exists (material K1a, K4, a T-WIN rejection, or a T-SPREAD/T-ART rejection)",
+    "floors_immutable": "the 0.8 power floor and alpha values may not be changed after freeze",
+    "inconclusive_means": "uninformative: it neither supports 'no defect' nor 'bad luck'",
+    "not_permission_to_rearm": "INCONCLUSIVE, like every verdict, is NOT permission to re-arm; routes are T1 (12-07), T2, T3 only",
+    "reason": "T-WIN cluster power 0.248 (7 clusters) / 0.341 (6 clusters) under binding H1-K fee_net, below the 0.8 floor; T-SPREAD power 0.091 / 0.140",
+    "variance_reachable": false
+  },
+  "leave_one_out_rule": "Outside the alpha budget. Drop the cluster with the largest P_c (ties to the alphabetically first station). If the dropped cluster is a WIN cluster recompute w_obs on the remaining clusters (w_obs - 1); if a loss cluster w_obs is unchanged. Retest at alpha 0.02. Can only block VARIANCE or add the single-cluster-driven label; a leave-one-out rejection with a full-sample non-rejection routes to INCONCLUSIVE.",
+  "manifest_path": "deploy/families/pm_us_crh_fq_v1.json",
+  "near_boundary_rule": "reflog entry < 120 s before boot: compare widened-path tree shas of pinned commit and reflog predecessor; if they differ the boot is UNTESTABLE unless p-hat reproduces under BOTH | NOTE: for boot 2 the manifest and artefact are byte-identical across 60290e9d and 99067d4a, so the dual reproduction is near-tautological; pin label stays INFERRED",
+  "near_boundary_seconds": 120,
+  "open_items": [
+    "predeclaration_commit (in TE2_PINS.json) is filled only after this file is committed",
+    "head_blob_sha256 in TE2_PINS.json must be recomputed if any pinned module changes before the freeze commit"
+  ],
+  "p_c_rule": {
+    "P_d": "min(1, sum p-hat over the bought rungs of the station-day)",
+    "clamp": 0.999999999,
+    "independent_union_value": "1 - prod(1 - P_d), clamped, used in power only",
+    "print": "p-values below 1e-12 print as \"< 1e-12\"",
+    "rule": "P_c = max over the cluster P_d, clamped to <= 1 - 1e-9"
+  },
+  "per_boot_pin_table": [
+    {
+      "boot": 1,
+      "near_boundary": false,
+      "pinned_commit": "60290e9ddd29",
+      "predecessor": "759911f35430",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 2,
+      "near_boundary": true,
+      "pinned_commit": "99067d4a9e7a",
+      "predecessor": "60290e9ddd29",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 3,
+      "near_boundary": false,
+      "pinned_commit": "99067d4a9e7a",
+      "predecessor": "60290e9ddd29",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 4,
+      "near_boundary": false,
+      "pinned_commit": "7dfd1af114c1",
+      "predecessor": "a15fefd22724",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 5,
+      "near_boundary": true,
+      "pinned_commit": "6e99a7ae2dbe",
+      "predecessor": "62778b4a7ea5",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 6,
+      "near_boundary": true,
+      "pinned_commit": "3eb4a1085dbf",
+      "predecessor": "6e99a7ae2dbe",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 7,
+      "near_boundary": false,
+      "pinned_commit": "f45f5a6558cd",
+      "predecessor": "853a82b9322d",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 8,
+      "near_boundary": false,
+      "pinned_commit": "c893e13e603e",
+      "predecessor": "072dbafc72c8",
+      "reason": null,
+      "state": "PINNED"
+    },
+    {
+      "boot": 9,
+      "near_boundary": false,
+      "pinned_commit": "4ba7f10cd1f6",
+      "predecessor": "fc4426015ea1",
+      "reason": null,
+      "state": "PINNED"
+    }
+  ],
+  "phase_a_table_sha256": "d513445bfbc16bf293a1562d123aee79623af7efc625d15fcfa18d1d6a25b8ae",
+  "phase_b_tie_reevaluation_rule": "After ties are dropped, recompute testability on n-prime clusters with the same rule. A test dropping to a weaker status is reported as such; if NOT-TESTABLE or CONDITIONAL it cannot feed the VARIANCE clause. Shrinking Holm k after ties is acceptable: a member that cannot reject never affects validity.",
+  "pin_label": "INFERRED",
+  "pin_range": [
+    "1d7ea1016d7c",
+    "4ba7f10cd1f6"
+  ],
+  "pin_rule": "last reflog entry <= boot time from the committed snapshot (branch first, HEAD fallback); never committer time; corroborate manifest+artefact blob sha at the pinned commit",
+  "plan": "docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/TE-2_plan_r3_2.md",
+  "reflog_snapshot_path": "docs/evidence/te2/REFLOG_SNAPSHOT_2026-10-01_to_10-06.txt",
+  "reflog_snapshot_sha256": "f359e070c2334a31252782fbf949643dfac84bba1c0992fda73b7ef9094e427d",
+  "s0i": {
+    "H1_K_convention": "BINDING: H1-K_fee_net = min(1, sum_fills(a + 0.0695*a*(1-a))); H1-K_ask_only is a labelled sensitivity",
+    "gate": "outcome-blind; computed from the Phase A table only with scripts/analysis/fq_loss_taxonomy_stats.py",
+    "machine_field": "s0i_statuses = full 7-cluster statuses from battery.s0i_statuses_from_phase_a",
+    "power_definitions": "reject region {W <= w*}, w* the largest w with P_H0(W<=w) <= 0.02; cluster power = min over {max-P_c, independent-union P_c}; T-SPREAD power against H1-S (each q_c doubled, capped at 1); T-LOC and T-ART power not computed (min attainable p is the substitute)",
+    "recomputed_on_phase_a_table_sha256": "d513445bfbc16bf293a1562d123aee79623af7efc625d15fcfa18d1d6a25b8ae",
+    "results": {
+      "full_7_clusters": {
+        "alpha": {
+          "art": 0.01,
+          "primary": 0.02
+        },
+        "holm": {
+          "alpha_step1": 0.01,
+          "k": 2,
+          "members": [
+            "T-LOC",
+            "T-SPREAD"
+          ]
+        },
+        "inputs": {
+          "H1_S_q_c_doubled_capped": [
+            1.0,
+            0.5396253040018497,
+            0.8814527744562652,
+            0.41661442391944126,
+            0.28707516903259683,
+            0.5469225104395291,
+            0.33526695759059294
+          ],
+          "P_c": [
+            0.9924313174096698,
+            0.8292144537405655,
+            0.47154308454725335,
+            0.8795177639778584,
+            0.999999999,
+            0.41155309645139726,
+            0.5124601539834274
+          ],
+          "climate_days": [
+            [
+              "2026-10-02",
+              "2026-10-03",
+              "2026-10-04",
+              "2026-10-05",
+              "2026-10-06"
+            ],
+            [
+              "2026-10-02"
+            ],
+            [
+              "2026-10-04",
+              "2026-10-05",
+              "2026-10-06"
+            ],
+            [
+              "2026-10-03"
+            ],
+            [
+              "2026-10-05"
+            ],
+            [
+              "2026-10-03",
+              "2026-10-04"
+            ],
+            [
+              "2026-10-06"
+            ]
+          ],
+          "pi_max": [
+            0.43403358774527123,
+            0.4016022948972762,
+            0.4200282538279666,
+            0.7272550278949692,
+            0.26819749802195153,
+            0.4413241363609922,
+            0.44605766635483024
+          ],
+          "pi_min": [
+            0.3880711196780898,
+            0.4016022948972762,
+            0.4103376182646826,
+            0.7272550278949692,
+            0.26819749802195153,
+            0.43167627671718595,
+            0.44605766635483024
+          ],
+          "q_c": [
+            0.8361468985050328,
+            0.26981265200092486,
+            0.4407263872281326,
+            0.20830721195972063,
+            0.14353758451629842,
+            0.27346125521976455,
+            0.16763347879529647
+          ],
+          "stations": [
+            "LAX",
+            "MDW",
+            "MDW",
+            "MIA",
+            "MIA",
+            "SFO",
+            "SFO"
+          ]
+        },
+        "min_attainable_p": {
+          "T-ART": 0.0078125,
+          "T-LOC_max_of_two_pi": 0.005622353753606725,
+          "T-SPREAD_union_q_c": 0.00013628261170719387,
+          "T-WIN": 2.3611381349628865e-14,
+          "reference_uniform_0.5_one_sided": 0.0078125,
+          "reference_uniform_0.5_two_sided": 0.015625
+        },
+        "n_clusters": 7,
+        "n_fills": 25,
+        "n_station_days": 14,
+        "power": {
+          "t_spread_power_vs_H1_S": 0.09056909460275198,
+          "t_win": {
+            "H1-K_ask_only": {
+              "alt_day_probs_by_cluster": [
+                [
+                  0.31,
+                  0.2,
+                  0.3,
+                  0.64,
+                  0.14
+                ],
+                [
+                  0.33
+                ],
+                [
+                  0.2,
+                  0.1,
+                  0.1
+                ],
+                [
+                  0.52
+                ],
+                [
+                  0.59
+                ],
+                [
+                  0.2,
+                  0.09
+                ],
+                [
+                  0.25
+                ]
+              ],
+              "power": 0.28513156082242863,
+              "power_independent": 0.28513156082242863,
+              "power_max_pc": 0.4331415360000001,
+              "w_star": 2
+            },
+            "H1-K_fee_net": {
+              "alt_day_probs_by_cluster": [
+                [
+                  0.32742365,
+                  0.21216249999999998,
+                  0.31772249999999996,
+                  0.6560128000000001,
+                  0.14836780000000002
+                ],
+                [
+                  0.34885535
+                ],
+                [
+                  0.21112,
+                  0.1065469,
+                  0.1065469
+                ],
+                [
+                  0.5436161
+                ],
+                [
+                  0.61415125
+                ],
+                [
+                  0.21216249999999998,
+                  0.09569205
+                ],
+                [
+                  0.26511625
+                ]
+              ],
+              "power": 0.24830290471692007,
+              "power_independent": 0.24830290471692007,
+              "power_max_pc": 0.3926493955551896,
+              "w_star": 2
+            }
+          },
+          "t_win_binding_variant": "H1-K_fee_net"
+        },
+        "status": {
+          "T-ART": "TESTABLE",
+          "T-LOC": "TESTABLE",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        },
+        "status_lists": {
+          "NOT-TESTABLE": [],
+          "TESTABLE": [
+            "T-ART",
+            "T-LOC",
+            "T-SPREAD",
+            "T-WIN"
+          ],
+          "TESTABLE-CONDITIONAL": []
+        },
+        "t_win_status_check": "TESTABLE"
+      },
+      "sensitivity_exclude_k1b_6_clusters": {
+        "alpha": {
+          "art": 0.01,
+          "primary": 0.02
+        },
+        "holm": {
+          "alpha_step1": 0.01,
+          "k": 2,
+          "members": [
+            "T-LOC",
+            "T-SPREAD"
+          ]
+        },
+        "inputs": {
+          "H1_S_q_c_doubled_capped": [
+            1.0,
+            0.5396253040018497,
+            0.5305062941820795,
+            0.41661442391944126,
+            0.28707516903259683,
+            0.5469225104395291
+          ],
+          "P_c": [
+            0.9924313174096698,
+            0.8292144537405655,
+            0.47154308454725335,
+            0.8795177639778584,
+            0.999999999,
+            0.41155309645139726
+          ],
+          "climate_days": [
+            [
+              "2026-10-02",
+              "2026-10-03",
+              "2026-10-04",
+              "2026-10-05"
+            ],
+            [
+              "2026-10-02"
+            ],
+            [
+              "2026-10-04",
+              "2026-10-05"
+            ],
+            [
+              "2026-10-03"
+            ],
+            [
+              "2026-10-05"
+            ],
+            [
+              "2026-10-03",
+              "2026-10-04"
+            ]
+          ],
+          "pi_max": [
+            0.43403358774527123,
+            0.4016022948972762,
+            0.4156590003539022,
+            0.7272550278949692,
+            0.26819749802195153,
+            0.4413241363609922
+          ],
+          "pi_min": [
+            0.3880711196780898,
+            0.4016022948972762,
+            0.4103376182646826,
+            0.7272550278949692,
+            0.26819749802195153,
+            0.43167627671718595
+          ],
+          "q_c": [
+            0.7461359196992441,
+            0.26981265200092486,
+            0.26525314709103975,
+            0.20830721195972063,
+            0.14353758451629842,
+            0.27346125521976455
+          ],
+          "stations": [
+            "LAX",
+            "MDW",
+            "MDW",
+            "MIA",
+            "MIA",
+            "SFO"
+          ]
+        },
+        "min_attainable_p": {
+          "T-ART": 0.015625,
+          "T-LOC_max_of_two_pi": 0.012473428547261363,
+          "T-SPREAD_union_q_c": 0.00043662293686272505,
+          "T-WIN": 4.842964435121526e-14,
+          "reference_uniform_0.5_one_sided": 0.015625,
+          "reference_uniform_0.5_two_sided": 0.03125
+        },
+        "n_clusters": 6,
+        "n_fills": 20,
+        "n_station_days": 11,
+        "power": {
+          "t_spread_power_vs_H1_S": 0.1395113350763966,
+          "t_win": {
+            "H1-K_ask_only": {
+              "alt_day_probs_by_cluster": [
+                [
+                  0.31,
+                  0.2,
+                  0.3,
+                  0.64
+                ],
+                [
+                  0.33
+                ],
+                [
+                  0.2,
+                  0.1
+                ],
+                [
+                  0.52
+                ],
+                [
+                  0.59
+                ],
+                [
+                  0.2,
+                  0.09
+                ]
+              ],
+              "power": 0.3806143825004544,
+              "power_independent": 0.3806143825004544,
+              "power_max_pc": 0.5137990400000001,
+              "w_star": 2
+            },
+            "H1-K_fee_net": {
+              "alt_day_probs_by_cluster": [
+                [
+                  0.32742365,
+                  0.21216249999999998,
+                  0.31772249999999996,
+                  0.6560128000000001
+                ],
+                [
+                  0.34885535
+                ],
+                [
+                  0.21112,
+                  0.1065469
+                ],
+                [
+                  0.5436161
+                ],
+                [
+                  0.61415125
+                ],
+                [
+                  0.21216249999999998,
+                  0.09569205
+                ]
+              ],
+              "power": 0.34101436566049287,
+              "power_independent": 0.34101436566049287,
+              "power_max_pc": 0.47449530012034546,
+              "w_star": 2
+            }
+          },
+          "t_win_binding_variant": "H1-K_fee_net"
+        },
+        "status": {
+          "T-ART": "NOT-TESTABLE",
+          "T-LOC": "TESTABLE-CONDITIONAL",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        },
+        "status_lists": {
+          "NOT-TESTABLE": [
+            "T-ART"
+          ],
+          "TESTABLE": [
+            "T-SPREAD",
+            "T-WIN"
+          ],
+          "TESTABLE-CONDITIONAL": [
+            "T-LOC"
+          ]
+        },
+        "t_win_status_check": "TESTABLE"
+      }
+    },
+    "rules": "T-WIN TESTABLE iff min p <= 0.02; T-ART TESTABLE iff min p <= 0.01; Holm members: min p > 0.02 NOT-TESTABLE and dropped before Holm (k shrinks), k = remaining count, step-1 threshold 0.02/k, min p <= 0.02/k TESTABLE, else TESTABLE-CONDITIONAL; same rule in the 6-cluster sensitivity",
+    "script": "s0i_compute.py",
+    "t_spread_power_alpha": 0.02,
+    "t_spread_power_alpha_note": "upper bound on power; at Holm step-1 0.01 power is lower; conclusion unaffected",
+    "theta_fee_coefficient_used_for_H1_K": 0.0695
+  },
+  "s0i_statuses": {
+    "T-ART": "TESTABLE",
+    "T-LOC": "TESTABLE",
+    "T-SPREAD": "TESTABLE",
+    "T-WIN": "TESTABLE"
+  },
+  "schema": "TE2_PREDECLARATION/2",
+  "scope": {
+    "fq_window_start": "2026-10-01",
+    "k1b": "climate day > terminal_climate_day (5 fills, 3 station-days); bookkeeping flag only",
+    "last_climate_day": "2026-10-06",
+    "n_clusters": 7,
+    "n_fills": 25,
+    "n_station_days": 14,
+    "terminal_climate_day": "2026-10-05",
+    "unit": "station-day; cluster = station-event (consecutive climate days at one station, a gap of more than one day splits)"
+  },
+  "sensitivity_rules": {
+    "climate_day_clusters": "descriptive sensitivity only",
+    "k1b_exclusion": "exclude the 5 fills on climate day 10-06 (3 station-days): 6 clusters, 11 station-days, 20 fills; testability recomputed with the identical rule; verdict stays on the full 25 fills",
+    "scope_sensitive": "a decision that flips under the exclusion is reported as scope-sensitive with both results",
+    "station_day_level": "reported as a sensitivity; if its decision differs from the cluster level the verdict is the cluster-level one and the range is stated"
+  },
+  "stores_own_sha": false,
+  "taxonomy": {
+    "classes_precedence": [
+      "WIN",
+      "SIBLING_WON",
+      "BOUNDARY",
+      "TAIL",
+      "BAND_SELECTION",
+      "BODY_MISS"
+    ],
+    "edge_dist_f": "integer degF distance from tmax to the nearest edge of the inclusive interval from bucket_facts_from_instrument_id; 0 inside; open side never nearest; ^no leg uses the YES interval",
+    "flag_rules": {
+      "FLANK_CHEAP": "ask < 0.10",
+      "K1a": "S0-D reproduction miss surviving root cause, or available_at > now_ns, or vector.climate_day != instrument climate day; feeds FIXABLE only if material",
+      "K2": "cycle in use is not the newest visible at now_ns, or age exceeds the cycle-age maximum; descriptive | age arm: cycle_age_maximum (50400 s, age > value)",
+      "K3": "outcome flips when ASOS/METAR max replaces CLI tmax; descriptive, never fixable",
+      "K4": "venue-resolved outcome differs from slug-parsed outcome; uses reconcile.py settlement leg",
+      "LOC_ARTEFACT": "|corrected median error| > |raw median error|; inference only via T-ART",
+      "LOC_SOURCE": "raw NBM median error alone beyond +-1 sd"
+    },
+    "flags": [
+      "K1a",
+      "K1b",
+      "K2",
+      "K3",
+      "K4",
+      "LOC_ARTEFACT",
+      "LOC_SOURCE",
+      "FLANK_CHEAP",
+      "CYCLE_AMBIGUOUS",
+      "UNTESTABLE"
+    ],
+    "k5_k6_k7_k9_k10_note": "no K8; class counts per fill plus a separate station-day-level K7 count",
+    "rules": {
+      "BAND_SELECTION": "loser on a station-day with >= 2 bought rungs all lost, PIT in [0.10, 0.90], not BOUNDARY; needs complete partition else UNTESTABLE for that station-day; applied per fill with that fill own edge_dist_f",
+      "BODY_MISS": "residual loser (edge_dist_f >= 2, none of the above); renamed from K9 VARIANCE",
+      "BOUNDARY": "loser, edge_dist_f == 1, PIT in [0.05, 0.95]",
+      "SIBLING_WON": "losing fill on a station-day containing a winning fill; checked before BOUNDARY/TAIL/BAND_SELECTION/BODY_MISS",
+      "TAIL": "loser, PIT outside [0.05, 0.95]; exclusive with BOUNDARY",
+      "WIN": "fill inclusive interval [lower_f, upper_f] contains tmax; taxonomy applies to losers only"
+    }
+  },
+  "terminal_climate_day": "2026-10-05",
+  "tests": {
+    "T-ART": {
+      "alpha": 0.01,
+      "level": "cluster",
+      "sidedness": "one-sided (H1: corrected worse)",
+      "statistic": "exact paired sign test on d = |corrected error| - |raw error|, null 0.5",
+      "ties": "dropped, n after drops reported"
+    },
+    "T-EDGE": {
+      "statistic": "exact P(X >= k), count of losing fills with edge_dist_f == 1",
+      "status": "exploratory, confirmatory weight zero"
+    },
+    "T-LOC": {
+      "collapse_rule": "cluster statistic S_c = sign of the cluster-mean signed error (tmax - corrected median); p = max of the two-sided exact p under all-pi_min and all-pi_max vectors; bound NOT proven for unequal pmfs",
+      "companions": [
+        "same test on raw NBM median",
+        "unfilled-Take contrast (descriptive)"
+      ],
+      "conditional_on_take": true,
+      "median_cdf_threshold": 0.5,
+      "median_rule": "smallest_integer_with_cdf_at_least_half",
+      "never_alone": [
+        "MODEL_LIMITATION",
+        "FIXABLE",
+        "SOURCE"
+      ],
+      "null": "pi_d = P(tmax > median | tmax != median) from the model discrete pmf of that day EARLIEST fill",
+      "sidedness": "two-sided",
+      "status": "INDICATIVE",
+      "ties": "zero-error clusters dropped, n after drops reported",
+      "two_sided_formula": "doubled_smaller_tail",
+      "two_sided_formula_definition": "p = min(1, 2*min(upper_tail(pis, n_pos), lower_tail(pis, n_pos))) over the Poisson-binomial count of positive cluster signs"
+    },
+    "T-SPREAD": {
+      "attribution": "spread vs location NOT identified; never attributed to spread alone",
+      "conditional_on_take": true,
+      "level": "cluster",
+      "per_cluster": "A_c = 1 if any fill is a tail miss; q_c = min(1, sum q_f over the cluster fills) (union upper bound)",
+      "per_day": "q_d = min(1, sum q_f over the day fills)",
+      "per_fill_rule": "PIT of tmax under the pmf of THAT fill decision cycle; tail miss iff mid-PIT outside [0.05, 0.95]; q_f = null tail probability from the same pmf",
+      "sidedness": "one-sided upper tail",
+      "statistic": "X = sum A_c, Poisson-binomial over q_c; p = P(X >= x_obs)"
+    },
+    "T-WIN": {
+      "companion": "H0-K: ask-implied probability net of theta*p*(1-p) fees, same max-over-cluster rule and clamp",
+      "level": "cluster",
+      "sidedness": "one-sided lower tail",
+      "station_day_level": "reported sensitivity",
+      "statistic": "P(W <= w_obs), W = sum W_c, W_c ~ Bernoulli(P_c) independent (H0-M)"
+    }
+  },
+  "thresholds": {
+    "alpha_art": 0.01,
+    "alpha_primary": 0.02,
+    "audit": {
+      "n_fills": 25,
+      "n_wins": 2,
+      "net_pnl": "-2.17",
+      "tolerance": "0.005"
+    },
+    "cycle_age_max_s": 50400,
+    "delivery_soft_target": "2026-10-20",
+    "fee_theta": 0.0695,
+    "flank_cheap_ask": 0.1,
+    "forward_clusters_feasible": 60,
+    "material_delta_p": 0.01,
+    "p_clamp": 1e-09,
+    "pit_central_high": 0.9,
+    "pit_central_low": 0.1,
+    "pit_tail_high": 0.95,
+    "pit_tail_low": 0.05,
+    "power_floor": 0.8
+  },
+  "thresholds_documented": {
+    "body_miss_edge_dist_min": 2,
+    "boundary_edge_dist": 1,
+    "flank_cheap_ask_below": 0.1,
+    "h1_spread_factor": 2.0,
+    "k1a_materiality_abs_delta_p_hat": 0.01,
+    "k1a_materiality_rule": "material iff it flips the take/no-take decision OR |delta p-hat| > 0.01",
+    "p_clamp": 1e-09,
+    "p_print_floor": 1e-12,
+    "pit_central": [
+      0.1,
+      0.9
+    ],
+    "pit_tail": [
+      0.05,
+      0.95
+    ],
+    "power_floor": 0.8,
+    "s0d_min_match": 23,
+    "s0d_n_fills": 25,
+    "s0d_stop_rule": "STOP if fewer than 23 of 25 p-hat match to 1e-9, counting UNTESTABLE as a non-match",
+    "s0d_tolerance": 1e-09
+  },
+  "tie_handling": "sign tests and T-LOC drop zeros and report n after drops; T-WIN has no ties",
+  "verdict_rules": {
+    "FIXABLE_DEFECT": "any fill carries K4, or any material K1a; K3, K2, K1b, UNTESTABLE, CYCLE_AMBIGUOUS never produce FIXABLE; the statistical label is still reported alongside",
+    "INCONCLUSIVE": "everything else, with the reason stated",
+    "MODEL_LIMITATION": "no material K1a or K4 and at least one Holm- or T-ART-valid rejection among {T-SPREAD, T-ART}; T-LOC rejection reported alongside, never qualifies alone; sublabel ARTEFACT (T-ART), SOURCE (T-SPREAD rejects, T-ART does not), or ARTEFACT+SOURCE",
+    "MODEL_MISCALIBRATED_UNATTRIBUTED": "T-WIN rejects, no qualifying secondary rejects (indicative T-LOC ignored, noted), no material K1a or K4; qualifiers single-cluster-driven (leave-one-out does not reject) and secondaries NOT-TESTABLE",
+    "VARIANCE": "T-WIN fails to reject, T-WIN TESTABLE with cluster power >= 0.8, leave-one-out does not reject, at least one secondary unconditionally TESTABLE after ties (CONDITIONAL, NOT-TESTABLE and indicative T-LOC do not count), no qualifying TESTABLE secondary rejects; label weak unless every unconditionally TESTABLE secondary has computed power >= 0.8",
+    "mixed": "ranked list with share of loss, never one label",
+    "precedence": [
+      "FIXABLE_DEFECT",
+      "MODEL_LIMITATION",
+      "MODEL_MISCALIBRATED_UNATTRIBUTED",
+      "VARIANCE",
+      "INCONCLUSIVE"
+    ],
+    "valid_rejection": "TESTABLE rejecting, or TESTABLE-CONDITIONAL rejecting only after the other Holm member rejected at step 1; NOT-TESTABLE never"
+  },
+  "widened_paths": [
+    "src/breezy/strategy/forecast_quantile_ladder/",
+    "src/breezy/strategy/ladder_ev/",
+    "src/breezy/normalize/climate_day.py",
+    "src/breezy/ingest/nbm_quantile_actor.py",
+    "deploy/families/"
+  ]
+}
