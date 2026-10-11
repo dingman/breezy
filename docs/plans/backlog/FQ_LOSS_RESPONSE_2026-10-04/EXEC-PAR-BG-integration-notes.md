@@ -15,6 +15,7 @@ These are binding inputs for the BG-1 store implementation, BG-5 and BG-6. They 
 5. **Entry and exit discrimination everywhere.** Use the slot `is_exit` flag or the Nautilus `order_side`. Never use `wire*` fields.
 6. **2-of-5 station-day flags (BG-5).** Per-day flags are evaluated against that day's budget. If the operator changes the budget, the flags are not comparable across days, so the stage report must state that.
 7. **Known residual (BG-1b).** A dropped anchor on queue overflow orphans its fills. Each orphan is gappy-marked, and BG-1d reconciliation rebuilds the day from durable fill records.
+8. **Amendment reference convention (BG-3, N4).** A frozen `EXEC-PAR-D-PREREG-A<n>.md` lifts the cleanup-demotion pause only if it is sha-valid against its `.sha256` sibling AND contains a standalone line `cleanup_demotion_ts_ns: <n>` with an exact integer match. A number in prose does not count. Any amendment that re-promotes after a demotion must carry this line.
 
 ## BG-9 freeze-marker convention
 
