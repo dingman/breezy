@@ -1,0 +1,50 @@
+[Unit]
+# EXEC-PAR BG-7 (docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/EXEC-PAR-D-PREREG_draft.md
+# sections 1a, 10, 14 step 12): the READ-ONLY cross-check of the in-node stage evaluator, the
+# stage report and the k_epochs.jsonl export. The script opens the node state store with sqlite
+# mode=ro and never writes it (BREAKER_KEY included); its only writes are the two output files
+# under docs/evidence/exec_par/ (tmp file plus os.replace). Exit 0 AGREE, 1 DISAGREE (alert
+# EXEC_PAR_STAGE_CROSSCHECK_DISAGREE), 2 run failure (alert EXEC_PAR_STAGE_CROSSCHECK_ERROR).
+#
+# Oneshot, no [Install]: started BY the timer. NOT installed or enabled by the build; the
+# coordinator does that (section 14 step 12 needs this unit's FIRST SCHEDULED run to succeed).
+Description=Breezy EXEC-PAR BG-7 read-only stage cross-check and report
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/exec_par_stage_gate.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/EXEC-PAR-D-PREREG_draft.md
+
+# AUD-15a pattern: alert on failure (timeout, OOM-kill, or any non-zero exit, which includes a
+# DISAGREE). A killed process cannot emit its own alert.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Imports the Nautilus-bound domain package (the governed-day convention) and reads a small
+# keyed store: well under the 1G/2G of the JSONL-join units. An engineering containment
+# parameter, not an operator cap; an OOM lands on this unit, never the live node.
+MemoryHigh=1G
+MemoryMax=2G
+UMask=0022
+
+# The ONLY EnvironmentFile=: alerts.env (BREEZY_ALERT_WEBHOOK_URL alone), so the in-process
+# alert is delivered (tests/unit/test_alerts_env_deploy.py). Never polymarket.env /
+# breezy-trade.env / operator.env / breezy.env: this unit holds no venue credential and no
+# operator-reserved value. Consequence: with no daily budget in the environment a P&L predicate
+# raises and the cross-check reports it (see the script docstring); that is deliberate.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# The station set defaults to the four supported stations, identical across every manifest under
+# deploy/families/. K comes from the epoch ledger in the store. The script is NOT run under the
+# bwrap wrapper: its rows belong to the autonomy programme, and sqlite mode=ro plus the absence of
+# any write method on the reader are this unit's read-only control.
+ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.exec_par_stage_gate --db %h/.local/share/breezy/state/exec_polymarket_us.sqlite --out-dir /home/jon/breezy/docs/evidence/exec_par
+
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-exec-par-stage-gate
+
+# NOTE: no [Install] section. This unit is started BY the timer, never enabled directly.

@@ -1,0 +1,21 @@
+[Unit]
+Description=09:35 UTC trigger for the Breezy EXEC-PAR BG-7 read-only stage cross-check
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/exec_par_stage_gate.py
+
+[Timer]
+Unit=breezy-exec-par-stage-gate.service
+
+# 09:35 UTC: after the last governed station's standard-time midnight (UTC-8 = 08:00Z) so the
+# node's DAILY stage pass for the day that just closed has already written its report and
+# stamp, and clear of the 09:00 / 09:20 / 09:25 units; colliding with no other HH:MM tick
+# (tests/unit/test_deploy_timer_hours.py) and outside the 16:30Z-17:10Z launch window.
+OnCalendar=*-*-* 09:35:00 UTC
+
+# A run missed because the host was down fires when the timer is next active.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
