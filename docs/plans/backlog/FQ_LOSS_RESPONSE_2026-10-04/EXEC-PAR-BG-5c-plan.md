@@ -1,88 +1,157 @@
-# EXEC-PAR BG-5c: wiring the stage-evaluator ports into the node (plan r1)
+# EXEC-PAR BG-5c: wiring the stage-evaluator ports into the node (plan r2)
 
-**Status:** PROPOSED, awaiting peer review.
+**Status:** PROPOSED r2. Awaiting confirmation review.
 
-**Base.** The BG-5b blueprint (code-architect, 2026-10-11) over BG-5b `de47430a`. BG-5b is still in its review-fix round. That round adds:
-- the K>1 unwired guard, which forces K=1 and raises `EXEC_PAR_STAGE_EVAL_UNWIRED`;
-- the `settled_pnl_seq` trigger port.
+**Inputs**
+- r1 (3930f19e) peer reviews, all NOT-READY:
+  - architecture: 71
+  - failure-mode: 72
+  - market/stats: 78
+- Every HIGH finding is adopted below. The table at the end lists the dispositions.
 
-**Spec.** D-PREREG r4 + r4.1–r4.5, plus `EXEC-PAR-BG-integration-notes.md`.
+**Spec:** D-PREREG r4 + r4.1–r4.5, plus `EXEC-PAR-BG-integration-notes.md`.
 
-**Scope.** Supply every `stage_eval_ports` member from existing durable sources, at configured K>1 only. K=1 must stay byte-identical: nothing below is constructed or read at K=1.
+**Scope:** supply every `stage_eval_ports` member from durable sources, at configured K>1 only.
 
-## Rulings
+**K=1 must stay byte-identical:**
+- no new module is imported on the K=1 path;
+- nothing is constructed, read or opened (no files, no DB connections) at K=1.
 
-### R1. Day attribution uses one convention
+## R1. Day attribution: one convention, one atomic migration
 
-This addresses blueprint gap 4, which is the highest K>1 risk.
+1. **One module.** `runtime/exec_par_governed_days.py` exports:
+   - `entry_day(station, arm_ns) -> str`: the per-station climate day under the station's **standard-time** offset (`domain/climate_day.py`, `std_utc_offset_hours`; never the DST wall clock).
+   - `open_days_at(ts_ns) -> frozenset[str]`: every governed station's open climate day at `ts`.
+   - `today(ts_ns) = min(open_days_at(ts_ns))`.
+2. **Entries carry their station.** `FillRecord` and `EntryRow`, and any row the evaluator reads, carry `station`. Attribution always goes through `entry_day`.
+3. **Every station-less day function is retyped. No `Callable[[int], str]` remains on an attribution path.** Sites to change:
+   - `exec_par_counter_ingest`;
+   - `exec_par_reconcile.gappy_days` and `entry_counts_by_day`;
+   - `stage_day_labels` and `_first_k_gt1_day`;
+   - `StageSnapshotInputs.day_of_ns` (`exec_par_stage_types.py:226`);
+   - `StageEvalPorts.day_of_ns` (runner);
+   - `exec_par_stage_eval.py:164`;
+   - `exec_par_stage_snapshot.py:137`;
+   - `settled_pnl_by_day`.
 
-1. **Entry day.** Every entry is attributed to `climate_day_for_instant(station_of(entry), arm_ns)`, the per-station climate day of its arm time. The same function is used in all four places:
-   - BG-1b ingest;
-   - BG-1d reconcile;
-   - the BG-5b snapshot;
-   - the settled-P&L driver.
-   The single-argument `day_of_ns` is **removed from attribution paths**.
-2. **`today`.** `today` is the earliest still-open climate day across the governed stations. This is the same notion as the BG-5b daily trigger.
-3. **Floor day.** For a reset at `ts`, the floor day is the earliest open governed day at `ts`.
-4. **One implementation.** `runtime/exec_par_governed_days.py` is the single implementation. A test pins all four call sites to it.
+   **Instant-only callers** (boot, floor, gap span) use `open_days_at`.
+4. **Floor membership** follows the spec, §1: `arm_ns ≥ floor.ts`.
+   - **Floor day:** the snapshot builds it from per-entry rows filtered by `arm_ns`. This is the "floor-day stub". If a counter row lacks `arm_ns`, WP-C adds it.
+   - **Other days:** every other stage day uses whole-day counters.
+   - **Amends BG-5a:** "stage = days strictly after the floor day" becomes "post-floor stub + days after". The stub obeys the same rules, so a pre-floor loss can never re-trip a stop.
+5. **Mixed-offset nights.** An entry whose `entry_day > today()` is open data:
+   - it enters §15 cumulative and the intraday rules;
+   - it never enters closed-day trailing windows, look minima, the cap, or the daily trigger until its day closes.
+6. **Atomic migration.**
+   - Ingest, reconcile, snapshot, evaluator and driver migrate in one merge (WP-C).
+   - A property test over boundary instants pins all of them to `entry_day`: midnight per station, std versus DST, earliest and latest station.
+   - A grep test forbids `day_of_ns` in `runtime/exec_par_*`.
+   - No persisted rows need re-keying: K>1 counters have never been written in production.
+   - The first K>1 boot writes `exec_par/day_convention = {v:2}`.
+   - A boot that finds `v` ≠ 2 refuses K>1: force K=1 and raise a CRITICAL alert.
 
-### R2. AMBIGUOUS count source
+## R2. AMBIGUOUS orders
 
-- **Source.** The count comes from the BG-1b ever-ambiguous mark rows (`ambiguous/<day>/<intent_id>`, with acks). That is the source already ruled for BG-1b.
-- **Rejected source.** It never comes from the resolver context or the retirement reason. The 10-10 BG-1b review found that the resolver context does not discriminate AMBIGUOUS, and a with-id resolve can complete in under 5 s.
+1. **Source.** The BG-1b ever-ambiguous mark rows are the source. Marks are entry-only. The resolver context and retirement reasons are never used.
+2. **Attribution.**
+   - §5 numerator and §5 burst use the mark's stored **arm_ns**, never the write time or the ack time.
+   - §5 denominator = posted entries under the same R1 attribution and stage-window filter.
+3. **§15 full-cost term**, owned by BG-1c `_contribution` (`exec_par_settled_pnl.py:181-183`):
+   - each unresolved AMBIGUOUS entry counts at its **armed notional**;
+   - an intent whose fill already appears in the settled accumulator is dropped from the full-cost term, so nothing is double-counted;
+   - a zero-fill AMBIGUOUS entry counts at armed notional until it is resolved.
+   - WP-B verifies this behaviour with a test, and fixes it if it is not true.
 
-### R3. Ledger spend for reconcile
+## R3. Spend reconciliation
 
-- **Source.** Spend is the sum of entry `cumulative_cost` over the day's durable fill records. The in-memory `DailySpendLedger` is UTC-day-only and not durable.
-- **Known limitation.** This figure is not independent of the fill count. The reconcile spend check is therefore a consistency check (counter versus durable records), not an independent audit. This is recorded in the integration notes.
+1. **Spend** = Σ over entry orders of the cost on the order's **terminal** durable fill record (the one with max `cumulative_qty`), keyed by `entry_day`. Never Σ `cumulative_cost` across partial fills.
+2. **Independent audit.** Spend is compared against the Nautilus cache's order-fill events, the independent source.
+   - If that source is unavailable, or covers the day only partly, the day reports `spend_unaudited`. That status is never green, and it is a look blocker.
+   - A mismatch is a reconcile mismatch, handled through the BG-1d rebuild/exclusion path.
+3. **What this does not catch.** The counter-versus-durable check alone cannot detect a fill that is missing from both. The cache audit exists to cover that case.
 
-### R4. Serial baseline (§7 parity)
+## R4. §7 serial parity
 
-- **In the node.** The node reports `parity_unavailable` (`serial_baseline = None`), and §7 parity becomes a look blocker that is computed **offline** by BG-10(f).
-- **Why this is allowed.** The node never promotes (r4.5 O5), and parity is only a promotion input.
-- **Consequence.** BG-10(f) scope gains the §7 serial-parity computation, from the pre-window K=1 fills plus the decision asks in the existing analysis join. That join is legal offline and banned on the live path.
+1. §7 parity has no halt role. It is "≤ 0.005 when ≥20 K=1 fills, otherwise report-only".
+2. The node reports `parity_unavailable` as **report-only**. It is **never** in `look_blockers`, because blockers record failed looks and two FAILs demote.
+3. BG-10(f) is the sole parity gate before any promotion. It computes parity offline from pre-window K=1 fills and decision asks, using the analysis join, which is legal offline only.
+4. **Spec-delta item:** this goes into the D-PREREG fold as r4.6, with the BG-10(f) scope added.
 
-### R5. Ledger handle
+## R5. Ledger handle
 
-- **At K>1 only.** `app/trade.py` constructs the single `DailySpendLedger` and injects it into the exec-client factory, using an optional config field. This avoids a second ledger instance.
-- **At K=1.** The field is `None`, so the factory builds exactly as it does today.
-- **What uses this handle.** The predicates (§15), the ambiguous-mark recording and the ingest all use it.
+1. Add a public read-only `spend_ledger` property on the exec client. Today the ledger is `self._ledger`.
+2. The watcher reads it lazily through the existing `exec_client_getter` (`breaker_watcher.py:751`).
+3. No factory or config change. K=1 is untouched.
+4. This one ledger serves the §15 predicates, mark recording and ingest. It is the same instance the client admits against.
 
-### R6. Mass-status gate
+## R6. Readiness probe
 
-- **Readiness probe.** `exec_engine.reconciliation is True and watcher.is_running`. Nautilus starts actors only after execution reconciliation returns True (`kernel.py:1027-1040`), so this is the native signal.
-- **No custom wait.** `await_ready` is `None`.
+1. Ready = all three of:
+   - `exec_engine.reconciliation is True`;
+   - `watcher.is_running`;
+   - **no reconciliation refusal latched** on the client, read through the existing `_exec_client_reconciliation_refusal_reader` (`trade_cli.py:460`).
+2. Why the refusal check: `generate_mass_status` (`client.py:5047`) returns an empty status and latches a refusal on error, so the kernel's "reconciled" alone is not evidence.
+3. Not ready past `T_ready` = 300 s after boot raises a CRITICAL alert, and every K>1 pass stays blocked. Readiness never defaults to ready.
+4. Test: `generate_mass_status` raises, and the probe stays not-ready.
 
-### R7. Gap marking
+## R7. Gap marking
 
-`compute_gap_spans` gets a caller in the K>1 boot path. Two inputs feed it:
-- **Prior boot without a `stop_ts`** (BG-2 epoch row). The span from that boot's last heartbeat to now is gappy-marked, which is case (b).
-- **Heartbeat lapses** over the spec bound, which is case (a).
+1. **Two triggers.** Marking runs at **boot** (any prior epoch without `stop_ts` marks its span) **and** on **each reconcile pass**, which covers in-run heartbeat lapses over the bound.
+2. **Gap spans.** Each span marks **every governed open day it overlaps** (`open_days_at` at both ends and every day between).
+3. **Heartbeat history.** It must be an append-only durable series. WP-B verifies this. If it is a single overwritten row, WP-B adds an append-only lapse record, written by the watcher tick when `now − last_tick` exceeds the bound.
+4. **Idempotent and ordered.** Marking is idempotent, and it runs before the first counter ingest at boot.
+5. **Failure handling.**
+   - A marking write failure at boot refuses K>1: force K=1 and raise a CRITICAL alert.
+   - A marking write failure in-run withholds the heartbeat, and the affected days stay non-PASS until the mark lands.
 
-### R8. Settled-P&L driver
+## R8. Settled-P&L driver
 
-- **Inputs.** Outcomes come from the catalog's settled truth (`persistence/catalog.py`). NO legs use the flipped sibling, following the integration notes on entry/exit discrimination.
-- **Caching.** Final outcomes are cached per (station, day), so catalog reads stay off the hot loop. A read is triggered only by `settled_pnl_seq` or the daily pass.
-- **Persistence.** Results are written through `persist_settled_pnl`, the monotonic BG-1c row.
+1. **Truth source.** Final outcomes come only from the NWS CLI-sourced durable truth: the F2 truth store written by the live timers is preferred over the raw catalog.
+   - A void, cancelled, missing or non-final outcome gives `pending`, or `overdue` past `SETTLEMENT_DEADLINE_DAYS`. Never zero.
+   - A revised CLI value invalidates the cache entry.
+2. **Payoff** = `qty · outcome_of_held_side − cost − fee`.
+   - For a NO holding the venue records as SELL/BUY_SHORT of YES, the held-side outcome is `1 − outcome_YES`. Apply the leg sign first, per the venue netting a NO holding as short YES.
+   - A test pins the sign for a YES entry and a NO entry, each settling both ways.
+3. **Execution.**
+   - Truth reads run via `loop.run_in_executor` with their **own read-only connection** (sqlite `mode=ro` via `Path.as_uri()`), posting results back to the loop.
+   - Only final outcomes are cached.
+   - Triggers: `settled_pnl_seq` and the daily pass.
+   - Persistence goes through `persist_settled_pnl`.
 
-## Work packages
+## Port failure contract
 
-| WP | Files | Depends on |
+| Port | Raises / times out | Returns None | Stale |
+|---|---|---|---|
+| Durable-source scan | `counter_missing` → FAIL; look blocked. Never zero. | FAIL `counter_missing` | n/a (read per pass) |
+| Empty scan | Distinguished from failure: the empty result carries `ok=True` | — | — |
+| Truth read | Day `pending` / `overdue`; settled row unwritten | Same | Re-read on trigger; overdue past deadline |
+| Readiness probe | Not ready | Not ready | CRITICAL at `T_ready`; passes blocked |
+| Gap marking | Boot: force K=1 + CRITICAL. In-run: heartbeat withheld. | Same as raise | n/a |
+| Ledger handle | FAIL `ledger_unavailable` | FAIL | n/a |
+| Cache audit (R3) | `spend_unaudited` → look blocker | Same | Same |
+
+Every row also obeys BG-5b's last-resort FAIL.
+
+## Work packages and order
+
+| WP | Content | Depends on |
 |---|---|---|
-| A: ledger injection | `adapters/polymarket_us/factories.py` and a config field | — |
-| B: durable sources | new `runtime/exec_par_durable_sources.py` (entry fill count, slot counts per R2, spend per R3, `counters_expected` from epochs) | — |
-| C: governed days | new `runtime/exec_par_governed_days.py`, plus the R1 call-site migration in ingest, reconcile and snapshot | — |
-| D: settled-P&L driver | new `runtime/exec_par_settled_pnl_driver.py` | B, C |
-| E: integration | `app/trade.py` `_build_stage_eval_ports` (K>1 branch only), the R6 probe, the R7 caller, and `build_exec_watcher` forwarding `counters` and `ambiguous_marks` | A–D |
+| C: governed days + atomic R1 migration | Includes the floor-day stub and the convention row | Merged BG-5b fixes (C rebases onto them) |
+| A: ledger property (R5) | — | — |
+| B: durable sources | R2, R3 with cache audit, R7 lapse record, `counters_expected` from epochs | C |
+| D: settled-P&L driver | R8 | B, C |
+| E: integration | `app/trade.py` `_build_stage_eval_ports` in the K>1 branch only, with lazy imports; R6; R7 caller; `build_exec_watcher` forwards `counters` and `ambiguous_marks` | A–D |
 
-- **Parallelism.** A, B and C are built in parallel. Then D, then E.
-- **Testing.** Each package follows TDD, a review, the full gate, then merge.
-- **Merge.** E is the only package that changes boot. It merges after the BG-5b fixes and before BG-6.
+**E's obligations:**
+- Keep BG-5b's unwired guard **per member**: if any single port is None at K>1, force K=1 and raise `EXEC_PAR_STAGE_EVAL_UNWIRED`. Test it.
+- Add a K=1 test asserting that no new `exec_par_*` module is imported and that no files or DB connections are opened.
 
-## Risks
+**Activation:** BG-6 must be merged before any K>1 operation.
 
-- **K=1 inertness.** A test boots at K=1 and asserts zero new reads and no ledger or mark changes.
-- **Loop blocking.** Catalog reads are cached. The `stage_eval_slow` span covers the whole synchronous pass (BG-5b fix item 7).
-- **Thread confinement.** All reads go through the latch's own store connection.
-- **Exec import pin.** New tests that import `DurableFillRecord` need a WIDENED x1 row.
-- **Activation ordering.** BG-6 must land before any K>1 operation.
+## r1 review dispositions
+
+| Review | Findings | Disposition |
+|---|---|---|
+| Architecture | F1 R6 → R6.1–4; F2 R1 → R1.1–3; F3 R5 → R5 (smaller property route chosen); F4 R8 → R8.3; F5 dependencies → WP table; F6 → R4.4 | All adopted |
+| Failure-mode | F1 R7 → R7; F2 → port contract table; F3 → R1.6; F4 → E obligations; F5 → R3.2–3; F6 → E obligations; F7 → R4.2 | All adopted |
+| Market/stats | R3 → R3.1–2; R2 → R2.2–3; R1 → R1.1, 4, 5; R4 → R4.2; R8 → R8.1–2 | All adopted |
