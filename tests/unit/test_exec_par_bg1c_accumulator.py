@@ -13,11 +13,12 @@ from typing import Any
 import pytest
 
 from breezy.runtime import exec_par_settled_pnl as mod
+from breezy.runtime.exec_par_records import SettledPnlDay
 from breezy.runtime.exec_par_settled_pnl import (
+    SETTLEMENT_DEADLINE_DAYS,
     EntryInput,
     SettledPnlInputError,
     SettledPnlMissing,
-    settled_pnl_by_day,
     settled_pnl_or_fail,
 )
 
@@ -38,6 +39,13 @@ class DurableFillRecord:
     cumulative_fee: Decimal
     fee_reconciled: bool
     ts_event: int
+    fee_coefficient_at_fill: Decimal | None = None
+
+
+def settled_pnl_by_day(
+    entries: Any, outcomes: Any, day_of_ns: Any, today: str = "2026-10-12"
+) -> dict[str, SettledPnlDay]:
+    return mod.settled_pnl_by_day(entries, outcomes, day_of_ns, today=today)
 
 
 def utc_day(ns: int) -> str:
@@ -56,6 +64,8 @@ def fill(
     fee: str = "0.2",
     side: str = "BUY",
     ts_event: int = 1,
+    reconciled: bool = True,
+    theta: str | None = None,
 ) -> DurableFillRecord:
     return DurableFillRecord(
         venue_order_id=f"v-{inst}",
@@ -65,8 +75,9 @@ def fill(
         cumulative_qty=D(qty),
         cumulative_cost=D(cost),
         cumulative_fee=D(fee),
-        fee_reconciled=True,
+        fee_reconciled=reconciled,
         ts_event=ts_event,
+        fee_coefficient_at_fill=None if theta is None else D(theta),
     )
 
 
@@ -198,7 +209,66 @@ def test_settled_pnl_or_fail_treats_missing_as_failure_not_zero() -> None:
     with pytest.raises(SettledPnlMissing):
         settled_pnl_or_fail(None)
     row = settled_pnl_by_day([entry()], {"A": True}, utc_day)["2026-10-12"]
-    assert settled_pnl_or_fail(row) == D("0.8")
+    reading = settled_pnl_or_fail(row)
+    assert reading.pnl == D("0.8")
+    assert (reading.settled, reading.ambiguous, reading.pending, reading.overdue) == (1, 0, 0, 0)
+    assert reading.fee_unreconciled == 0
+
+
+def test_deadline_constant_is_three_climate_days() -> None:
+    assert SETTLEMENT_DEADLINE_DAYS == 3
+
+
+@pytest.mark.parametrize(
+    ("today", "overdue"),
+    [("2026-10-12", False), ("2026-10-14", False), ("2026-10-15", True), ("2026-10-30", True)],
+)
+def test_unsettled_entry_is_pending_until_the_deadline_then_a_full_cost_loss(
+    today: str, overdue: bool
+) -> None:
+    row = settled_pnl_by_day([entry()], {}, utc_day, today=today)["2026-10-12"]
+    if overdue:
+        assert (row.overdue_entries, row.unsettled_entries) == (1, 0)
+        assert row.pnl_decimal == D("-9.2")
+    else:
+        assert (row.overdue_entries, row.unsettled_entries) == (0, 1)
+        assert row.pnl_decimal == D(0)
+
+
+def test_bad_today_fails() -> None:
+    with pytest.raises(SettledPnlInputError):
+        settled_pnl_by_day([entry()], {}, utc_day, today="12/10/2026")
+
+
+def test_unreconciled_fee_uses_the_theta_floor_rounded_up_and_is_counted() -> None:
+    # qty 10, cost 9 -> p 0.9; theta*C*p*(1-p) = 0.0695*10*0.09 = 0.06255 -> 0.07 > recorded 0.01
+    low = fill(fee="0.01", reconciled=False, theta="0.0695")
+    row = settled_pnl_by_day([entry(f=low)], {"A": False}, utc_day)["2026-10-12"]
+    assert row.pnl_decimal == D("-9.07")
+    assert row.fee_unreconciled_entries == 1
+    high = fill(fee="0.2", reconciled=False, theta="0.0695")
+    row = settled_pnl_by_day([entry(f=high)], {"A": False}, utc_day)["2026-10-12"]
+    assert row.pnl_decimal == D("-9.2")
+    assert row.fee_unreconciled_entries == 1
+
+
+def test_unreconciled_fee_without_theta_fails() -> None:
+    with pytest.raises(SettledPnlInputError):
+        settled_pnl_by_day([entry(f=fill(reconciled=False))], {"A": False}, utc_day)
+
+
+def test_reconciled_fee_is_taken_as_recorded() -> None:
+    row = settled_pnl_by_day([entry(f=fill(fee="0.01"))], {"A": False}, utc_day)["2026-10-12"]
+    assert row.pnl_decimal == D("-9.01")
+    assert row.fee_unreconciled_entries == 0
+
+
+def test_no_instrument_whose_yes_sibling_lost_is_a_held_side_win() -> None:
+    # The caller maps instrument -> held-side outcome (YES resolved NO => the NO leg won).
+    no_leg = fill("EVT^no", "10", "6", "0.1")
+    row = settled_pnl_by_day([entry(f=no_leg)], {"EVT^no": True}, utc_day)["2026-10-12"]
+    assert row.pnl_decimal == D("3.9")
+    assert row.pnl_decimal > 0
 
 
 def test_module_never_logs_or_prints() -> None:

@@ -50,7 +50,12 @@ from breezy.runtime.exec_par_records import (
     encode_force_k1_tombstone,
     encode_record,
 )
-from breezy.runtime.exec_par_settled_pnl import Timed, pre_boot_fill_ledger
+from breezy.runtime.exec_par_settled_pnl import (
+    PreBootLedger,
+    Timed,
+    check_monotonic,
+    pre_boot_fill_ledger,
+)
 
 T = TypeVar("T")
 F = TypeVar("F", bound=Timed)
@@ -347,10 +352,13 @@ class ExecParRecordsMixin:
     # -- BG-1c settled P&L per arm-time day (spec 10a, 15) ----------------
 
     def write_settled_pnl_day(self, record: SettledPnlDay) -> None:
-        """Overwrite the day's row: each write is a full recompute from durable records."""
+        """Overwrite the day's row (a full recompute) unless it regresses the prior row (F1)."""
         self._require_held()
         with self._mutex:
-            self._er_put(f"{_SETTLED_PNL}{record.day}", record)
+            key = f"{_SETTLED_PNL}{record.day}"
+            self._er_encode(record)  # validate first
+            check_monotonic(self._er_get(key, SettledPnlDay), record)
+            self._er_put(key, record)
 
     def read_settled_pnl_day(self, day: str) -> SettledPnlDay | None:
         """The row, or ``None`` when absent (the consumer treats absent as FAIL, never 0)."""
@@ -385,18 +393,23 @@ class ExecParRecordsMixin:
             return self._first_k_gt1_locked()
 
     def _first_k_gt1_locked(self) -> int | None:
+        return self._epoch_summary_locked()[1]
+
+    def _epoch_summary_locked(self) -> tuple[bool, int | None]:
         epochs = self._er_scan(_EPOCH, EpochRow, lambda r: r.boot_ts)
-        return next((e.boot_ts for e in epochs if e.effective_k > 1), None)
+        return bool(epochs), next((e.boot_ts for e in epochs if e.effective_k > 1), None)
 
     def read_k1_pre_boot_fills(
         self, decode: Callable[[bytes], F], in_family: Callable[[F], bool]
-    ) -> tuple[F, ...]:
+    ) -> PreBootLedger[F]:
         """Same-family durable fills strictly before the first K>1 epoch (no write)."""
         self._require_held()
         with self._mutex:
+            has_epoch_rows, first_k_gt1 = self._epoch_summary_locked()
             return pre_boot_fill_ledger(
                 _ScanView(self._store),
-                first_k_gt1_boot_ts=self._first_k_gt1_locked(),
+                first_k_gt1_boot_ts=first_k_gt1,
+                has_epoch_rows=has_epoch_rows,
                 decode=decode,
                 in_family=in_family,
             )

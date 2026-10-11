@@ -23,6 +23,7 @@ from breezy.runtime.exec_par_records import (
 from breezy.runtime.exec_par_settled_pnl import (
     FILL_PREFIX,
     FillLedgerCorrupt,
+    SettledPnlRegression,
     persist_settled_pnl,
     pre_boot_fill_ledger,
 )
@@ -154,7 +155,7 @@ def test_latch_writes_reads_and_overwrites_a_day(tmp_path: Path) -> None:
         assert latch.read_settled_pnl_day("2026-10-12") is None
         latch.write_settled_pnl_day(ROW)
         assert latch.read_settled_pnl_day("2026-10-12") == ROW
-        newer = SettledPnlDay("2026-10-12", "3", 3, 0, 0)
+        newer = SettledPnlDay("2026-10-12", "-3", 3, 0, 0)
         latch.write_settled_pnl_day(newer)
         other = SettledPnlDay("2026-10-11", "0.5", 1, 0, 0)
         latch.write_settled_pnl_day(other)
@@ -219,7 +220,7 @@ def test_ledger_returns_only_fills_before_the_first_k_gt1_epoch(tmp_path: Path) 
             latch.write_epoch_row(EpochRow("sha", k, None, boot))
         assert latch.read_first_k_gt1_boot_ts() == 100
         got = latch.read_k1_pre_boot_fills(DurableFillRecord.from_bytes, _all)
-    assert [f.venue_order_id for f in got] == ["o1"]
+    assert [f.venue_order_id for f in got.fills] == ["o1"]
 
 
 def test_ledger_with_no_k_gt1_epoch_is_every_fill(tmp_path: Path) -> None:
@@ -229,7 +230,7 @@ def test_ledger_with_no_k_gt1_epoch_is_every_fill(tmp_path: Path) -> None:
         latch.write_epoch_row(EpochRow("sha", 1, None, 5))
         assert latch.read_first_k_gt1_boot_ts() is None
         got = latch.read_k1_pre_boot_fills(DurableFillRecord.from_bytes, _all)
-    assert [f.venue_order_id for f in got] == ["o1", "o2"]
+    assert [f.venue_order_id for f in got.fills] == ["o1", "o2"]
 
 
 def test_ledger_filters_to_the_family_and_never_writes() -> None:
@@ -239,10 +240,11 @@ def test_ledger_filters_to_the_family_and_never_writes() -> None:
     got = pre_boot_fill_ledger(
         store,
         first_k_gt1_boot_ts=50,
+        has_epoch_rows=True,
         decode=DurableFillRecord.from_bytes,
         in_family=lambda f: f.instrument_id == "A",
     )
-    assert [f.venue_order_id for f in got] == ["o1"]
+    assert [f.venue_order_id for f in got.fills] == ["o1"]
     assert store.sets == 0
 
 
@@ -250,9 +252,13 @@ def test_ledger_boundary_fill_at_the_boot_instant_is_excluded() -> None:
     store = _Store()
     _seed(store, _fill("o1", "A", 49), _fill("o2", "A", 50))
     got = pre_boot_fill_ledger(
-        store, first_k_gt1_boot_ts=50, decode=DurableFillRecord.from_bytes, in_family=_all
+        store,
+        first_k_gt1_boot_ts=50,
+        has_epoch_rows=True,
+        decode=DurableFillRecord.from_bytes,
+        in_family=_all,
     )
-    assert [f.venue_order_id for f in got] == ["o1"]
+    assert [f.venue_order_id for f in got.fills] == ["o1"]
 
 
 def test_ledger_garbled_fill_row_fails_closed_not_skipped() -> None:
@@ -261,7 +267,11 @@ def test_ledger_garbled_fill_row_fails_closed_not_skipped() -> None:
     store.data[f"{FILL_PREFIX}bad"] = b"not a fill"
     with pytest.raises(FillLedgerCorrupt):
         pre_boot_fill_ledger(
-            store, first_k_gt1_boot_ts=None, decode=DurableFillRecord.from_bytes, in_family=_all
+            store,
+            first_k_gt1_boot_ts=None,
+            has_epoch_rows=True,
+            decode=DurableFillRecord.from_bytes,
+            in_family=_all,
         )
 
 
@@ -269,10 +279,113 @@ def test_ledger_is_deterministic_and_empty_store_is_empty() -> None:
     store = _Store()
     decode = DurableFillRecord.from_bytes
     assert (
-        pre_boot_fill_ledger(store, first_k_gt1_boot_ts=None, decode=decode, in_family=_all) == ()
+        pre_boot_fill_ledger(
+            store, first_k_gt1_boot_ts=None, has_epoch_rows=True, decode=decode, in_family=_all
+        ).fills
+        == ()
     )
     _seed(store, _fill("o2", "A", 2), _fill("o1", "A", 1))
-    a = pre_boot_fill_ledger(store, first_k_gt1_boot_ts=None, decode=decode, in_family=_all)
-    b = pre_boot_fill_ledger(store, first_k_gt1_boot_ts=None, decode=decode, in_family=_all)
+    a = pre_boot_fill_ledger(
+        store, first_k_gt1_boot_ts=None, has_epoch_rows=True, decode=decode, in_family=_all
+    )
+    b = pre_boot_fill_ledger(
+        store, first_k_gt1_boot_ts=None, has_epoch_rows=True, decode=decode, in_family=_all
+    )
     assert a == b
-    assert [f.venue_order_id for f in a] == ["o1", "o2"]
+    assert [f.venue_order_id for f in a.fills] == ["o1", "o2"]
+
+
+# -- BG-1c review fixes ---------------------------------------------------------
+
+
+def test_ledger_flags_the_no_epoch_rows_case_distinctly() -> None:
+    store = _Store()
+    decode = DurableFillRecord.from_bytes
+    none_at_all = pre_boot_fill_ledger(
+        store, first_k_gt1_boot_ts=None, has_epoch_rows=False, decode=decode, in_family=_all
+    )
+    no_k_gt1 = pre_boot_fill_ledger(
+        store, first_k_gt1_boot_ts=None, has_epoch_rows=True, decode=decode, in_family=_all
+    )
+    assert none_at_all.no_epoch_rows is True
+    assert no_k_gt1.no_epoch_rows is False
+
+
+def test_latch_ledger_reports_no_epoch_rows(tmp_path: Path) -> None:
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        assert latch.read_k1_pre_boot_fills(DurableFillRecord.from_bytes, _all).no_epoch_rows
+        latch.write_epoch_row(EpochRow("sha", 1, None, 5))
+        assert not latch.read_k1_pre_boot_fills(DurableFillRecord.from_bytes, _all).no_epoch_rows
+
+
+def test_garbled_fill_keeps_its_cause() -> None:
+    store = _Store()
+    store.data[f"{FILL_PREFIX}bad"] = b"not a fill"
+    with pytest.raises(FillLedgerCorrupt) as info:
+        pre_boot_fill_ledger(
+            store,
+            first_k_gt1_boot_ts=None,
+            has_epoch_rows=True,
+            decode=DurableFillRecord.from_bytes,
+            in_family=_all,
+        )
+    assert info.value.__cause__ is not None
+
+
+def _row(pnl: str, settled: int, amb: int = 0, pend: int = 0, over: int = 0) -> SettledPnlDay:
+    return SettledPnlDay("2026-10-12", pnl, settled, amb, pend, over)
+
+
+@pytest.mark.parametrize(
+    ("prior", "new", "ok"),
+    [
+        (_row("-1", 1, 0, 1), _row("-1", 1, 0, 1), True),
+        (_row("0", 0, 0, 1), _row("-5", 0, 1, 0), True),
+        (_row("-5", 0, 1, 0), _row("2", 1, 0, 0), True),
+        (_row("0", 0, 0, 1), _row("0", 0, 0, 0), False),
+        (_row("-5", 0, 1, 0), _row("-5", 0, 0, 0), False),
+        (_row("-5", 0, 1, 0), _row("-4", 0, 1, 0), False),
+        (_row("-5", 1, 0, 0), _row("-4", 1, 0, 0), False),
+        (_row("-5", 1, 1, 0), _row("-6", 1, 1, 0), True),
+    ],
+)
+def test_write_is_monotonic(
+    prior: SettledPnlDay, new: SettledPnlDay, ok: bool, tmp_path: Path
+) -> None:
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        latch.write_settled_pnl_day(prior)
+        if ok:
+            latch.write_settled_pnl_day(new)
+            assert latch.read_settled_pnl_day("2026-10-12") == new
+        else:
+            with pytest.raises(SettledPnlRegression):
+                latch.write_settled_pnl_day(new)
+            assert latch.read_settled_pnl_day("2026-10-12") == prior
+
+
+def test_first_write_for_a_day_is_always_allowed(tmp_path: Path) -> None:
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        latch.write_settled_pnl_day(_row("9", 3))
+        assert latch.read_settled_pnl_day("2026-10-12") == _row("9", 3)
+
+
+def test_persist_writes_ascending_and_a_mid_loop_failure_leaves_later_days_stale() -> None:
+    written: list[str] = []
+
+    class Flaky:
+        def write_settled_pnl_day(self, record: SettledPnlDay) -> None:
+            if record.day == "2026-10-13":
+                raise OSError("disk")
+            written.append(record.day)
+
+    rows = {
+        "2026-10-14": SettledPnlDay("2026-10-14", "1", 1, 0, 0),
+        "2026-10-12": ROW,
+        "2026-10-13": SettledPnlDay("2026-10-13", "1", 1, 0, 0),
+    }
+    with pytest.raises(OSError):
+        persist_settled_pnl(Flaky(), rows)
+    assert written == ["2026-10-12"]
