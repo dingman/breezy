@@ -137,6 +137,10 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # (c) picks it up; tracked, not excluded (WIDENED by this one reviewed row,
     # never relaxed).
     "scripts.ops.ambig_latch_phase_a_check",
+    # EXEC-PAR BG-7: the read-only stage cross-check imports `breezy.runtime.*` (the pure
+    # snapshot builder, evaluator and the alert sink), so source (c) picks it up; tracked, not
+    # excluded (WIDENED by this one reviewed row, never relaxed).
+    "scripts.analysis.exec_par_stage_gate",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

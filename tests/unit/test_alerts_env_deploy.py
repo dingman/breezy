@@ -44,6 +44,10 @@ resolve_alert_sink/emit_alert/alert_ladder calls):
         NO -- scripts/analysis/score_live_trials.py,
         scripts/analysis/structural_dead_stop.py: no alert import
 
+    breezy-exec-par-stage-gate.service
+        YES -- scripts/analysis/exec_par_stage_gate.py (EXEC-PAR BG-7:
+        resolve_alert_sink/emit_alert for EXEC_PAR_STAGE_CROSSCHECK_DISAGREE / _ERROR)
+
 Promoting a unit's script to alert in-process later: add its unit name to
 `_ALERTS_IN_PROCESS` below (and update the audit trace above) -- this test
 then requires `alerts.env` on it without any other change.
@@ -69,6 +73,7 @@ _ALERTS_IN_PROCESS = frozenset(
         "breezy-hypothesis-triage.service",
         "breezy-autonomy-alert-redeliver.service",
         "breezy-autonomy-canary.service",
+        "breezy-exec-par-stage-gate.service",
     }
 )
 

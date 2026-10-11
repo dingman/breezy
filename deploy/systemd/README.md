@@ -1983,3 +1983,26 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 - **Launch window.** 11:40 and 12:40 are outside 16:30-17:10Z
   (`tests/unit/test_launch_window_table.py`) and free of every other timer tick
   (`tests/unit/test_deploy_timer_hours.py`).
+
+## `breezy-exec-par-stage-gate` — EXEC-PAR BG-7 read-only stage cross-check (built, NOT installed)
+
+`breezy-exec-par-stage-gate.service` + `.timer` run `scripts/analysis/exec_par_stage_gate.py` daily at
+09:35 UTC. The coordinator installs and enables the timer; the build does not.
+
+- **Read-only.** The node state store is opened with sqlite `mode=ro` (`Path.as_uri()`,
+  `PRAGMA query_only=ON`) through a reader with no `set`/`delete`. It builds the same `StageSnapshot`
+  as the node and runs the same `evaluate_stage`; it never writes the store, `BREAKER_KEY` included.
+- **Outputs.** `docs/evidence/exec_par/stage_gate_report.json` (verdict comparison, rebuilt and
+  excluded days, pre-reset-armed settlements, per-day AMBIGUOUS counts, looks, holds, spend-deferral
+  status) and `docs/evidence/exec_par/k_epochs.jsonl` (the BG-2 epoch rows). Both are written by tmp
+  file plus `os.replace`. `src` never reads either.
+- **Exit codes.** 0 AGREE, 1 DISAGREE (alert `EXEC_PAR_STAGE_CROSSCHECK_DISAGREE`), 2 the run failed
+  (alert `EXEC_PAR_STAGE_CROSSCHECK_ERROR`). Non-zero also fires `breezy-study-failed@%n.service`.
+  An empty store, or K=1 with no K>1 epoch, is PASS/PASS agreement (D-PREREG r4.1 K8).
+- **Environment.** `EnvironmentFile=-%h/.config/breezy/alerts.env` only. No `operator.env`, so the
+  daily-budget P&L predicate cannot be evaluated at K>1 until the coordinator decides how the cap
+  reaches this unit; the comparison then reports `stage_eval_fail:predicate:*`.
+- **Memory.** `MemoryHigh=1G`, `MemoryMax=2G`. Not run under the autonomy bwrap wrapper (its rows
+  belong to the autonomy programme); `mode=ro` is the read-only control.
+- **Gate.** D-PREREG section 14 step 12 requires the FIRST SCHEDULED run to succeed and agree with
+  the in-node verdict.
