@@ -18,6 +18,8 @@ D-PREREG 1, 1b, 10, 10a, r4.1 K9, r4.3 M3, r4.4 N4):
 * ``stop_verdict/<ts_ns>``     ``{reason, ts_ns}``; ``stop_verdict/latest``
 * ``cleanup_demotion/<ts_ns>`` ``{from_k, to_k, ts_ns, reason}``;
   ``cleanup_demotion/latest`` pointer
+* ``settled_pnl/<YYYY-MM-DD>`` BG-1c per-arm-day settled-P&L row (overwritten on
+  each recompute; pnl is a canonical decimal STRING, never a float)
 * ``force_k1``                 flag ``{reason, ts_ns, set_by}`` or, once
   cleared, the tombstone ``{cleared_ts_ns}``
 
@@ -28,8 +30,10 @@ The store has only ``get``/``set``, so each ``<ts_ns>`` family keeps a
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import Final, TypeVar
 
@@ -46,6 +50,7 @@ __all__ = [
     "ForceK1Flag",
     "ForceK1Kind",
     "ForceK1State",
+    "SettledPnlDay",
     "StageEvalDry",
     "StageReset",
     "StopVerdict",
@@ -132,6 +137,21 @@ class ForceK1Flag:
     set_by: str
 
 
+@dataclass(frozen=True, slots=True)
+class SettledPnlDay:
+    """BG-1c: one arm-time climate day's settled P&L (spec 10a, 15). Currency stays local."""
+
+    day: str
+    pnl: str
+    settled_entries: int
+    ambiguous_entries: int
+    unsettled_entries: int
+
+    @property
+    def pnl_decimal(self) -> Decimal:
+        return Decimal(self.pnl)
+
+
 class ForceK1Kind(Enum):
     """Reading of the durable force-K1 flag. UNREADABLE must be treated as SET."""
 
@@ -168,9 +188,24 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
     StopVerdict: {"reason": "str", "ts_ns": "int"},
     CleanupDemotion: {"from_k": "int", "to_k": "int", "ts_ns": "int", "reason": "str"},
     ForceK1Flag: {"reason": "str", "ts_ns": "int", "set_by": "str"},
+    SettledPnlDay: {
+        "day": "day",
+        "pnl": "dec",
+        "settled_entries": "count",
+        "ambiguous_entries": "count",
+        "unsettled_entries": "count",
+    },
 }
 
+_DAY_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DEC_RE: Final = re.compile(r"-?(0|[1-9]\d*)(\.\d*[1-9])?")
+
 T = TypeVar("T")
+
+
+def _is_canonical_decimal(value: str) -> bool:
+    """Plain decimal text that is its own canonical form (no exponent, no ``-0``)."""
+    return _DEC_RE.fullmatch(value) is not None and value != "-0"
 
 
 def _check(value: object, kind: str) -> object:
@@ -182,6 +217,12 @@ def _check(value: object, kind: str) -> object:
     if base == "int" and isinstance(value, int) and not isinstance(value, bool):
         return value
     if base == "str" and isinstance(value, str) and value:
+        return value
+    if base == "count" and isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if base == "day" and isinstance(value, str) and _DAY_RE.fullmatch(value):
+        return value
+    if base == "dec" and isinstance(value, str) and _is_canonical_decimal(value):
         return value
     if base == "bool" and isinstance(value, bool):
         return value
