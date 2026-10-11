@@ -82,6 +82,27 @@ def test_mark_on_absent_record_and_garbled_record(tmp_path: Path) -> None:
         assert store.data[BREAKER_KEY] == b"garbage"
 
 
+def test_reset_breaker_halt_refuses_a_garbled_record_and_writes_nothing(tmp_path: Path) -> None:
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        store.data[BREAKER_KEY] = b"{garbled"
+        with pytest.raises(SubmitIntentCorrupt):
+            latch.reset_breaker_halt()
+        assert store.data[BREAKER_KEY] == b"{garbled"
+
+
+def test_mark_flag_write_failed_garbled_raise_is_typed_for_the_integrity_stop(
+    tmp_path: Path,
+) -> None:
+    """F8: the caller (BG-5/BG-6) treats this typed raise as an integrity stop (D3)."""
+    store = _Store()
+    with open_submit_intent_latch(store, tmp_path / "s.db") as latch:
+        store.data[BREAKER_KEY] = b"garbage"
+        with pytest.raises(SubmitIntentCorrupt):
+            latch.mark_flag_write_failed()
+    assert "integrity stop" in (SubmitIntentLatch.mark_flag_write_failed.__doc__ or "")
+
+
 def test_store_port_declares_every_record_writer_and_the_latch_satisfies_it() -> None:
     assert hasattr(breaker_watcher, "BreakerLatchPort")
     port = {n for n, _ in inspect.getmembers(ExecParStorePort) if not n.startswith("_")}

@@ -124,3 +124,9 @@ def test_force_k1_flag_set_cleared_and_garbled() -> None:
     for bad in (b"", b'{"v":1}', b'{"v":1,"cleared_ts_ns":"x"}', b"garbage"):
         with pytest.raises(ExecParRecordError):
             decode_force_k1_flag(bad)
+
+
+def test_excluded_days_rows_carrying_their_own_version_are_rejected() -> None:
+    raw = json.dumps({"v": 1, "days": [{"v": 1, "day": "d", "cause": "c", "ts": 1}]}).encode()
+    with pytest.raises(ExecParRecordError):
+        decode_excluded_days(raw)

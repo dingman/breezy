@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Final, TypeVar
 
 from breezy.runtime.submit_intent_slots import SlotTableError, canonical_text
@@ -43,6 +44,8 @@ __all__ = [
     "ExecParRecordError",
     "ForceK1Cleared",
     "ForceK1Flag",
+    "ForceK1Kind",
+    "ForceK1State",
     "StageEvalDry",
     "StageReset",
     "StopVerdict",
@@ -127,6 +130,25 @@ class ForceK1Flag:
     reason: str
     ts_ns: int
     set_by: str
+
+
+class ForceK1Kind(Enum):
+    """Reading of the durable force-K1 flag. UNREADABLE must be treated as SET."""
+
+    SET = "set"
+    CLEARED = "cleared"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True, slots=True)
+class ForceK1State:
+    """Tri-state flag reading; ``record`` is present only for SET.
+
+    CLEARED means no active flag: never set, or overwritten by a tombstone.
+    """
+
+    kind: ForceK1Kind
+    record: ForceK1Flag | None = None
 
 
 #: field name -> kind, per record type. A ``?`` suffix marks a nullable field.
@@ -231,6 +253,8 @@ def decode_excluded_days(raw: bytes) -> tuple[ExcludedDay, ...]:
     for row in rows:
         if not isinstance(row, dict):
             raise ExecParRecordError("excluded_days row")
+        if "v" in row:
+            raise ExecParRecordError("excluded_days row carries its own version")
         keyed: dict[str, object] = {"v": _VERSION, **row}
         out.append(decode_record(ExcludedDay, canonical_text(keyed)))
     if len({d.day for d in out}) != len(out):

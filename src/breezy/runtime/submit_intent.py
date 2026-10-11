@@ -1175,19 +1175,13 @@ class SubmitIntentLatch(ExecParRecordsMixin):
     def reset_breaker_halt(self) -> bool:
         """Operator reset (node down): clear ``halted``, keep the stamps.
 
-        Returns ``False`` when no halted record exists. A garbled record is
-        replaced by a fresh un-halted one (the operator reviewed the positions).
+        Returns ``False`` when no halted record exists. A garbled record
+        raises ``SubmitIntentCorrupt`` and nothing is written: it may hide a
+        halt and a ``flag_write_failed``, so it is never rebuilt silently.
         """
         self._require_held()
         with self._mutex:
-            try:
-                existing = self._read_breaker()
-            except SubmitIntentCorrupt:
-                self._store.set(
-                    BREAKER_KEY,
-                    encode_breaker(BreakerRecord(None, None, hb_ns=0, resolver_pass_ns=0)),
-                )
-                return True
+            existing = self._read_breaker()
             if existing is None or not existing.is_halted:
                 return False
             self._store.set(
@@ -1205,7 +1199,12 @@ class SubmitIntentLatch(ExecParRecordsMixin):
             return True
 
     def mark_flag_write_failed(self) -> None:
-        """M3: record a lost force-K1 flag write on the breaker record (same single writer)."""
+        """M3: record a lost force-K1 flag write on the breaker record (same single writer).
+
+        A garbled breaker record raises ``SubmitIntentCorrupt`` and is left
+        untouched. The caller (BG-5/BG-6) must treat that raise as an
+        integrity stop: stop the heartbeat per D3.
+        """
         self._set_flag_write_failed(True)
 
     def clear_flag_write_failed(self) -> None:

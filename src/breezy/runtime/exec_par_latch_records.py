@@ -7,7 +7,15 @@ A mixin so ``submit_intent.py`` stays small. Every public method:
 * takes ``self._mutex`` exactly once and never calls another method that takes
   it (the mutex is a non-reentrant ``threading.Lock``);
 * raises the latch's own ``CorruptError`` for any unreadable stored record,
-  never a default. An absent record reads as ``None``; store errors propagate.
+  never a default (the one exception is :meth:`read_force_k1_flag`, which
+  returns the fail-closed ``UNREADABLE`` state). An absent record reads as
+  ``None``; store errors propagate.
+
+Keyed families (``epoch``, ``stop_verdict``, ``amendment``, ``cleanup_demotion``)
+have NO ``latest`` pointer: readers scan the ``<prefix>`` rows through the
+store's ``keys_with_prefix`` and take the max ``ts``, so a crash after a row
+write can never leave a reader looking at a stale or missing pointer. Rows are
+exclusive per key: an identical rewrite is a no-op, a different row raises.
 
 Nothing in the node calls these yet (BG-1a is inert); the key layout and the
 record shapes are documented in :mod:`breezy.runtime.exec_par_records`.
@@ -15,6 +23,7 @@ record shapes are documented in :mod:`breezy.runtime.exec_par_records`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from typing import Protocol, TypeVar
@@ -28,16 +37,16 @@ from breezy.runtime.exec_par_records import (
     ExecParRecordError,
     ForceK1Cleared,
     ForceK1Flag,
+    ForceK1Kind,
+    ForceK1State,
     StageEvalDry,
     StageReset,
     StopVerdict,
     decode_excluded_days,
     decode_force_k1_flag,
-    decode_pointer,
     decode_record,
     encode_excluded_days,
     encode_force_k1_tombstone,
-    encode_pointer,
     encode_record,
 )
 
@@ -52,7 +61,6 @@ _EPOCH = EXEC_PAR_PREFIX + "epoch/"
 _AMENDMENT = EXEC_PAR_PREFIX + "amendment/"
 _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
-_LATEST = "latest"
 
 
 class _Store(Protocol):
@@ -81,39 +89,55 @@ class ExecParRecordsMixin:
         except ExecParRecordError:
             raise self.CorruptError() from None
 
-    def _er_put(self, key: str, record: object) -> None:
+    @staticmethod
+    def _er_encode(record: object) -> bytes:
         try:
-            raw = encode_record(record)
+            return encode_record(record)
         except ExecParRecordError:
             raise ValueError("invalid EXEC-PAR record") from None
+
+    def _er_put(self, key: str, record: object) -> None:
+        self._store.set(key, self._er_encode(record))
+
+    def _er_put_exclusive(self, key: str, record: object) -> None:
+        """Write once; an identical rewrite is a no-op, a different row raises."""
+        raw = self._er_encode(record)
+        existing = self._store.get(key)
+        if existing is not None:
+            if existing == raw:
+                return
+            raise ValueError(f"conflicting EXEC-PAR row already stored at {key}")
         self._store.set(key, raw)
 
-    def _er_put_family(self, prefix: str, ts_ns: int, record: object) -> None:
-        """Row first, then the ``latest`` pointer, so a crash never points at nothing."""
-        self._er_put(f"{prefix}{ts_ns}", record)
-        self._store.set(prefix + _LATEST, encode_pointer(ts_ns))
+    def _er_scan(self, prefix: str, cls: type[T], ts_of: Callable[[T], int]) -> list[T]:
+        """All rows under ``prefix``, ascending by ts; any stray/garbled row is corrupt."""
+        lister = getattr(self._store, "keys_with_prefix", None)
+        if lister is None:
+            raise RuntimeError("store has no keys_with_prefix; cannot scan EXEC-PAR rows")
+        rows: list[T] = []
+        for key in lister(prefix):
+            suffix = key[len(prefix) :]
+            if not suffix.isascii() or not suffix.isdigit():
+                raise self.CorruptError()
+            row = self._er_get(key, cls)
+            if row is None or ts_of(row) != int(suffix):
+                raise self.CorruptError()
+            rows.append(row)
+        return sorted(rows, key=ts_of)
 
-    def _er_get_by_ts(self, prefix: str, ts_ns: int, cls: type[T]) -> T | None:
-        return self._er_get(f"{prefix}{ts_ns}", cls)
-
-    def _er_get_latest(self, prefix: str, cls: type[T]) -> T | None:
-        raw = self._store.get(prefix + _LATEST)
-        if raw is None:
-            return None
-        try:
-            ts_ns = decode_pointer(raw)
-        except ExecParRecordError:
-            raise self.CorruptError() from None
-        row = self._er_get_by_ts(prefix, ts_ns, cls)
-        if row is None:
-            raise self.CorruptError()
-        return row
+    def _er_latest(self, prefix: str, cls: type[T], ts_of: Callable[[T], int]) -> T | None:
+        rows = self._er_scan(prefix, cls, ts_of)
+        return rows[-1] if rows else None
 
     # -- stage_reset (the floor) -----------------------------------------
 
     def write_stage_reset(self, record: StageReset) -> None:
+        """Write the floor; a ``ts`` lower than the stored one raises (monotonic)."""
         self._require_held()
         with self._mutex:
+            existing = self._er_get(_STAGE_RESET, StageReset)
+            if existing is not None and record.ts < existing.ts:
+                raise ValueError("stage_reset ts must be monotonic non-decreasing")
             self._er_put(_STAGE_RESET, record)
 
     def read_stage_reset(self) -> StageReset | None:
@@ -130,6 +154,7 @@ class ExecParRecordsMixin:
             existing = self._read_excluded_days_locked()
             if any(d.day == record.day for d in existing):
                 return False
+            self._er_encode(record)  # validate first: ValueError, consistent with _er_put
             self._store.set(_EXCLUDED_DAYS, encode_excluded_days((*existing, record)))
             return True
 
@@ -152,24 +177,26 @@ class ExecParRecordsMixin:
     def write_epoch_row(self, record: EpochRow) -> None:
         self._require_held()
         with self._mutex:
-            self._er_put_family(_EPOCH, record.boot_ts, record)
+            self._er_put_exclusive(f"{_EPOCH}{record.boot_ts}", record)
 
     def read_epoch_row(self, boot_ts: int) -> EpochRow | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_by_ts(_EPOCH, boot_ts, EpochRow)
+            return self._er_get(f"{_EPOCH}{boot_ts}", EpochRow)
 
     def read_latest_epoch_row(self) -> EpochRow | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_latest(_EPOCH, EpochRow)
+            return self._er_latest(_EPOCH, EpochRow, lambda r: r.boot_ts)
 
     def write_epoch_stop_ts(self, boot_ts: int, stop_ts: int) -> bool:
-        """Set ``stop_ts`` once; ``False`` if the row is absent or already stopped."""
+        """Set ``stop_ts`` once. Absent row raises; already stopped is a no-op ``False``."""
         self._require_held()
         with self._mutex:
-            row = self._er_get_by_ts(_EPOCH, boot_ts, EpochRow)
-            if row is None or row.stop_ts is not None:
+            row = self._er_get(f"{_EPOCH}{boot_ts}", EpochRow)
+            if row is None:
+                raise ValueError("epoch row absent; cannot set stop_ts")
+            if row.stop_ts is not None:
                 return False
             self._er_put(f"{_EPOCH}{boot_ts}", replace(row, stop_ts=stop_ts))
             return True
@@ -179,12 +206,12 @@ class ExecParRecordsMixin:
     def write_amendment(self, record: Amendment) -> None:
         self._require_held()
         with self._mutex:
-            self._er_put(f"{_AMENDMENT}{record.ts_ns}", record)
+            self._er_put_exclusive(f"{_AMENDMENT}{record.ts_ns}", record)
 
     def read_amendment(self, ts_ns: int) -> Amendment | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_by_ts(_AMENDMENT, ts_ns, Amendment)
+            return self._er_get(f"{_AMENDMENT}{ts_ns}", Amendment)
 
     # -- dry evaluation and force-K1 clearance ---------------------------
 
@@ -213,32 +240,39 @@ class ExecParRecordsMixin:
     def write_stop_verdict(self, record: StopVerdict) -> None:
         self._require_held()
         with self._mutex:
-            self._er_put_family(_STOP_VERDICT, record.ts_ns, record)
+            self._er_put_exclusive(f"{_STOP_VERDICT}{record.ts_ns}", record)
 
     def read_stop_verdict(self, ts_ns: int) -> StopVerdict | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_by_ts(_STOP_VERDICT, ts_ns, StopVerdict)
+            return self._er_get(f"{_STOP_VERDICT}{ts_ns}", StopVerdict)
 
     def read_latest_stop_verdict(self) -> StopVerdict | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_latest(_STOP_VERDICT, StopVerdict)
+            return self._er_latest(_STOP_VERDICT, StopVerdict, lambda r: r.ts_ns)
+
+    def read_stop_verdicts_since(self, ts_ns: int) -> tuple[StopVerdict, ...]:
+        """Every marker with ``ts_ns`` >= the argument, ascending (N1)."""
+        self._require_held()
+        with self._mutex:
+            rows = self._er_scan(_STOP_VERDICT, StopVerdict, lambda r: r.ts_ns)
+            return tuple(r for r in rows if r.ts_ns >= ts_ns)
 
     def write_cleanup_demotion(self, record: CleanupDemotion) -> None:
         self._require_held()
         with self._mutex:
-            self._er_put_family(_CLEANUP_DEMOTION, record.ts_ns, record)
+            self._er_put_exclusive(f"{_CLEANUP_DEMOTION}{record.ts_ns}", record)
 
     def read_cleanup_demotion(self, ts_ns: int) -> CleanupDemotion | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_by_ts(_CLEANUP_DEMOTION, ts_ns, CleanupDemotion)
+            return self._er_get(f"{_CLEANUP_DEMOTION}{ts_ns}", CleanupDemotion)
 
     def read_latest_cleanup_demotion(self) -> CleanupDemotion | None:
         self._require_held()
         with self._mutex:
-            return self._er_get_latest(_CLEANUP_DEMOTION, CleanupDemotion)
+            return self._er_latest(_CLEANUP_DEMOTION, CleanupDemotion, lambda r: r.ts_ns)
 
     # -- durable force-K1 flag (1b) --------------------------------------
 
@@ -248,19 +282,37 @@ class ExecParRecordsMixin:
             self._er_put(_FORCE_K1_FLAG, record)
 
     def clear_force_k1_flag(self, cleared_ts_ns: int) -> None:
-        """Overwrite the flag with a tombstone (the store has no delete)."""
+        """Tombstone the flag (the store has no delete).
+
+        Requires ``cleared_ts_ns > 0`` and a ``force_k1_cleared`` record whose
+        ``ts`` equals it. A garbled flag or garbled cleared record raises.
+        """
         self._require_held()
+        if cleared_ts_ns <= 0:
+            raise ValueError("cleared_ts_ns must be positive")
         with self._mutex:
+            raw = self._store.get(_FORCE_K1_FLAG)
+            if raw is not None:
+                try:
+                    decode_force_k1_flag(raw)
+                except ExecParRecordError:
+                    raise self.CorruptError() from None
+            cleared = self._er_get(_FORCE_K1_CLEARED, ForceK1Cleared)
+            if cleared is None or cleared.ts != cleared_ts_ns:
+                raise ValueError("no matching force_k1_cleared record for this clear")
             self._store.set(_FORCE_K1_FLAG, encode_force_k1_tombstone(cleared_ts_ns))
 
-    def read_force_k1_flag(self) -> ForceK1Flag | None:
-        """The flag, ``None`` if never set or cleared; unreadable raises (caller: set)."""
+    def read_force_k1_flag(self) -> ForceK1State:
+        """SET(record), CLEARED (no active flag) or UNREADABLE. Corruption never raises."""
         self._require_held()
         with self._mutex:
             raw = self._store.get(_FORCE_K1_FLAG)
             if raw is None:
-                return None
+                return ForceK1State(ForceK1Kind.CLEARED)
             try:
-                return decode_force_k1_flag(raw)
+                flag = decode_force_k1_flag(raw)
             except ExecParRecordError:
-                raise self.CorruptError() from None
+                return ForceK1State(ForceK1Kind.UNREADABLE)
+            if flag is None:
+                return ForceK1State(ForceK1Kind.CLEARED)
+            return ForceK1State(ForceK1Kind.SET, flag)

@@ -430,9 +430,7 @@ class TestBootstrapWitnessAgainstWholeFileDeletion:
 
             reopened_store = SqliteStateStore(path)
             enforce_bootstrap_witness(reopened_store, catalog_base=catalog_base)
-            reopened_gate = SettlementGate(
-                store=reopened_store, clock=_clock, sites=sites
-            )
+            reopened_gate = SettlementGate(store=reopened_store, clock=_clock, sites=sites)
             status = reopened_gate.status(VENUE, CITY)
             assert status.state is GateState.OPEN
             assert status.reason is not GateReason.STATE_STORE_TAMPERED
@@ -468,3 +466,13 @@ class TestBootstrapWitnessAgainstWholeFileDeletion:
         reopened_gate = SettlementGate(store=reopened_store, clock=lambda: 2_000, sites=sites)
         assert reopened_gate.status(VENUE, CITY).state is GateState.OPEN
         reopened_store.close()
+
+
+def test_keys_with_prefix_is_a_sorted_read_only_literal_prefix_scan(tmp_path: Path) -> None:
+    with SqliteStateStore(tmp_path / "s.db") as store:
+        for key in ("a/2", "a/1", "ab/1", "a%/x", "b/1"):
+            store.set(key, b"v")
+        assert store.keys_with_prefix("a/") == ["a/1", "a/2"]
+        assert store.keys_with_prefix("a%") == ["a%/x"]  # no LIKE wildcard semantics
+        assert store.keys_with_prefix("zz") == []
+        assert store.get("a/1") == b"v"

@@ -175,6 +175,18 @@ class SqliteStateStore:
         self._conn.execute(_UPSERT_SQL, (key, value))
         self._conn.commit()
 
+    def keys_with_prefix(self, prefix: str) -> list[str]:
+        """Sorted keys that start with ``prefix`` (literal match, read-only)."""
+        if not isinstance(prefix, str):
+            raise TypeError(f"prefix must be str, was {type(prefix).__name__}")
+        self._check_thread()
+        self._check_open()
+        cursor = self._conn.execute(
+            "SELECT key FROM state WHERE substr(key, 1, ?) = ? ORDER BY key",
+            (len(prefix), prefix),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+
     def close(self) -> None:
         self._check_thread()
         if not self._closed:
