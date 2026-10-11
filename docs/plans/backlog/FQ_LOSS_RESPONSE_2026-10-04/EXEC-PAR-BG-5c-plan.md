@@ -255,3 +255,7 @@ This amends R8.2.
 - **E-6. Day convention.** Covered by N-B: `enforce_day_convention_at_boot` at K>1.
 - **E-7. Persist the per-day spend-audit status.** Each pass, write `SpendAudit` status per day to `exec_par/spend_audit/<label>`, recording `{status, ts_ns}`. Status is FULL_MATCH, UNAUDITED, MISMATCH or DURABLE_UNREADABLE. This lets BG-7's read-only report show the deferrals, which it cannot do from the in-memory Nautilus cache (BG-7 review).
 - **E-8. BG-8 note.** At K>1 with a live node, an unreadable watcher record pages `WATCHER_DEAD` immediately, with no debounce. This is a coordinator ruling: a false page is preferable to a delayed safety alert.
+- **E-9. Wire BG-6's `IntradayPorts` at K>1.** The open-cost input for §9's "station-day 0.25 over all open positions, no floor" comes from the same injected `DailySpendLedger` and its BG-1e `open_cost_exceeds_budget_fraction` predicate. The cost aggregate stays inside the port (K6).
+  - "Open position" means an entry with a fill that is not yet settled, in any station-day, with no floor.
+  - Test that a pre-floor open position counts.
+  - Until this wiring lands, BG-6 halts with `intraday_unbound`. That is fail-closed and intended.
