@@ -144,7 +144,7 @@ def test_unamended_demotion_forces_k1(tmp_path: Path) -> None:
 
 
 def test_valid_amendment_lifts_the_pause(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 1, f"Re-promotes after cleanup demotion {DEMOTION_TS}.\n")
+    _write_amendment(tmp_path, 1, f"Re-promotes.\ncleanup_demotion_ts_ns: {DEMOTION_TS}\n")
     with _latch(tmp_path, k=2) as latch:
         _demote(latch)
         assert not force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
@@ -152,7 +152,7 @@ def test_valid_amendment_lifts_the_pause(tmp_path: Path) -> None:
 
 
 def test_hash_mismatch_keeps_the_pause(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n", digest="0" * 64)
+    _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS}\n", digest="0" * 64)
     with _latch(tmp_path, k=2) as latch:
         _demote(latch)
         assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
@@ -160,7 +160,7 @@ def test_hash_mismatch_keeps_the_pause(tmp_path: Path) -> None:
 
 
 def test_missing_sha_sibling_keeps_the_pause(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n", sidecar=False)
+    _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS}\n", sidecar=False)
     with _latch(tmp_path, k=2) as latch:
         _demote(latch)
         assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
@@ -173,7 +173,7 @@ def test_missing_amendment_directory_keeps_the_pause(tmp_path: Path) -> None:
 
 
 def test_amendment_for_a_different_record_keeps_the_pause(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS + 1}\n")
+    _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS + 1}\n")
     with _latch(tmp_path, k=2) as latch:
         _demote(latch)
         assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
@@ -197,28 +197,28 @@ def test_demotion_at_configured_k1_is_a_noop(tmp_path: Path) -> None:
 
 
 def test_resolver_accepts_a_valid_referencing_amendment(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 7, f"a\n{DEMOTION_TS}\n")
+    _write_amendment(tmp_path, 7, f"a\ncleanup_demotion_ts_ns: {DEMOTION_TS}\n")
     assert has_valid_amendment_for(tmp_path, DEMOTION_TS)
 
 
 def test_resolver_does_not_match_a_digit_substring(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 7, f"ref {DEMOTION_TS}9\n")
+    _write_amendment(tmp_path, 7, f"cleanup_demotion_ts_ns: {DEMOTION_TS}9\n")
     assert not has_valid_amendment_for(tmp_path, DEMOTION_TS)
 
 
 def test_resolver_skips_a_bad_amendment_but_finds_a_good_one(tmp_path: Path) -> None:
-    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n", digest="f" * 64)
-    _write_amendment(tmp_path, 2, f"also ref {DEMOTION_TS}\n")
+    _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS}\n", digest="f" * 64)
+    _write_amendment(tmp_path, 2, f"also\ncleanup_demotion_ts_ns: {DEMOTION_TS}\n")
     assert has_valid_amendment_for(tmp_path, DEMOTION_TS)
 
 
 def test_resolver_treats_an_unreadable_file_as_no_amendment(tmp_path: Path) -> None:
-    path = _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n")
+    path = _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS}\n")
     path.write_bytes(b"\xff\xfe" + str(DEMOTION_TS).encode())  # not utf-8, hash now stale
     assert not has_valid_amendment_for(tmp_path, DEMOTION_TS)
 
 
-def test_a_store_that_cannot_scan_demotions_fails_closed(tmp_path: Path) -> None:
+def test_a_demotion_scan_failure_forces_k1_alerts_then_reraises(tmp_path: Path) -> None:
     class _NoScan:
         def __init__(self) -> None:
             self.data: dict[str, bytes] = {}
@@ -229,9 +229,66 @@ def test_a_store_that_cannot_scan_demotions_fails_closed(tmp_path: Path) -> None
         def set(self, key: str, value: bytes) -> None:
             self.data[key] = value
 
+    sink = _Sink()
     with open_submit_intent_latch(_NoScan(), tmp_path / "s.db", max_slots=2) as latch:
-        assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=_Sink())
+        with pytest.raises(RuntimeError):
+            force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=sink)
         assert latch.max_slots() == 1
+        assert latch.k_forced_reason is not None
+    assert [(p.severity, p.detail) for p in sink.payloads] == [
+        ("CRITICAL", ForceK1BootDetail.DEMOTION_SCAN_FAILED.value)
+    ]
+
+
+def test_a_flag_read_exception_forces_k1_first_then_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink = _Sink()
+    with _latch(tmp_path, k=2) as latch:
+
+        def boom() -> object:
+            raise OSError("db gone")
+
+        monkeypatch.setattr(latch, "read_force_k1_flag", boom)
+        with pytest.raises(OSError, match="db gone"):
+            force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=sink)
+        assert latch.max_slots() == 1
+    assert [p.detail for p in sink.payloads] == [ForceK1BootDetail.FLAG_UNREADABLE.value]
+
+
+def test_unreadable_flag_emits_a_critical_unreadable_alert(tmp_path: Path) -> None:
+    store = _Store()
+    store.data[_FORCE_K1_FLAG] = b"\xff junk"
+    sink = _Sink()
+    with _latch(tmp_path, k=2, store=store) as latch:
+        assert force_k1_on_durable_flag(latch, repo_root=tmp_path, alert_sink=sink)
+    assert [(p.severity, p.event, p.detail) for p in sink.payloads] == [
+        (
+            "CRITICAL",
+            "EXEC_PAR_FORCE_K1_FLAG_UNREADABLE",
+            ForceK1BootDetail.FLAG_UNREADABLE.value,
+        )
+    ]
+
+
+def test_a_bare_number_in_prose_does_not_unlock(tmp_path: Path) -> None:
+    _write_amendment(tmp_path, 1, f"We discuss {DEMOTION_TS} here.\ncleanup_demotion_ts_ns: x\n")
+    assert not has_valid_amendment_for(tmp_path, DEMOTION_TS)
+
+
+def test_the_structured_line_must_stand_alone(tmp_path: Path) -> None:
+    _write_amendment(tmp_path, 1, f"see cleanup_demotion_ts_ns: {DEMOTION_TS} above\n")
+    assert not has_valid_amendment_for(tmp_path, DEMOTION_TS)
+
+
+def test_a_missing_amendment_directory_logs_an_error_with_the_root(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        assert not has_valid_amendment_for(tmp_path, DEMOTION_TS)
+    assert any(
+        r.levelno == logging.ERROR and str(tmp_path) in r.getMessage() for r in caplog.records
+    )
 
 
 # -- repo root is anchored on the module, never the cwd ---------------------
@@ -253,7 +310,7 @@ def test_boot_check_without_repo_root_uses_the_anchor_not_the_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A decoy amendment under the cwd must NOT lift the pause.
-    _write_amendment(tmp_path, 1, f"ref {DEMOTION_TS}\n")
+    _write_amendment(tmp_path, 1, f"cleanup_demotion_ts_ns: {DEMOTION_TS}\n")
     monkeypatch.chdir(tmp_path)
     with _latch(tmp_path, k=2) as latch:
         _demote(latch)

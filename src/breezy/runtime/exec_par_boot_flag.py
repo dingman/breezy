@@ -50,6 +50,8 @@ class ForceK1BootDetail(str, Enum):
     ``AlertDetail`` is byte-pinned; WP5b precedent). Never a flag reason or any raw text."""
 
     FLAG_SET = "EXEC_PAR_FORCE_K1_FLAG_SET"
+    FLAG_UNREADABLE = "EXEC_PAR_FORCE_K1_FLAG_UNREADABLE"
+    DEMOTION_SCAN_FAILED = "EXEC_PAR_DEMOTION_SCAN_FAILED"
 
 
 def default_repo_root() -> Path:
@@ -79,27 +81,37 @@ def _sibling_digest(path: Path) -> str | None:
     return tokens[0].lower()
 
 
+_REFERENCE_KEY: Final[str] = "cleanup_demotion_ts_ns"
+
+
 def _amendment_references(path: Path, ts_ns: int) -> bool:
+    """Hash-valid AND carries the standalone line ``cleanup_demotion_ts_ns: <ts_ns>``."""
     recorded = _sibling_digest(path)
     raw = path.read_bytes()
     if recorded is None or hashlib.sha256(raw).hexdigest() != recorded:
         return False
-    pattern = rf"(?<![0-9]){ts_ns}(?![0-9])"
-    return re.search(pattern, raw.decode("utf-8")) is not None
+    pattern = rf"^{_REFERENCE_KEY}:[ \t]*{ts_ns}[ \t]*\r?$"
+    return re.search(pattern, raw.decode("utf-8"), re.MULTILINE) is not None
 
 
 def has_valid_amendment_for(repo_root: Path, ts_ns: int) -> bool:
-    """True iff a sha-valid ``EXEC-PAR-D-PREREG-A<n>.md`` references ``ts_ns``.
+    """True iff a sha-valid ``EXEC-PAR-D-PREREG-A<n>.md`` has the line
+    ``cleanup_demotion_ts_ns: <ts_ns>`` (exact integer, not prose).
 
-    Pure of side effects. ANY read error on a file (missing sibling, bad
-    encoding, I/O) means that file is not a valid amendment; an unreadable
-    directory means none exists.
+    ANY read error on a file (missing sibling, bad encoding, I/O) means that file
+    is not a valid amendment. A missing/unreadable directory means none exists and
+    is logged at ERROR with the resolved root.
     """
     try:
         candidates = sorted(
             p for p in (repo_root / AMENDMENT_DIR).iterdir() if _AMENDMENT_NAME.fullmatch(p.name)
         )
     except OSError:
+        _LOG.error(
+            "EXEC-PAR amendment directory %s unreadable under root %s; no amendment can unlock",
+            AMENDMENT_DIR,
+            repo_root,
+        )
         return False
     for path in candidates:
         try:
@@ -110,51 +122,62 @@ def has_valid_amendment_for(repo_root: Path, ts_ns: int) -> bool:
     return False
 
 
-def _flag_reason(latch: _Latch) -> tuple[str, bool] | None:
-    """``(reason, is_set)`` when the flag forces K=1, else ``None`` (CLEARED)."""
-    state = latch.read_force_k1_flag()
+def _alert(sink: AlertSink, detail: ForceK1BootDetail) -> None:
+    emit_alert(
+        sink,
+        AlertPayload(
+            severity="CRITICAL", event=detail.value, site=_ALERT_SITE, detail=detail.value
+        ),
+    )
+
+
+def _force(latch: _Latch, reason: str) -> None:
+    _LOG.error("EXEC-PAR boot: %s; forcing K=1", reason)
+    latch.force_k1(reason)
+
+
+def _apply_flag(latch: _Latch, alert_sink: AlertSink) -> bool:
+    """Force K=1 on a SET/UNREADABLE flag. A raising read forces first, then re-raises."""
+    try:
+        state = latch.read_force_k1_flag()
+    except Exception:
+        _force(latch, f"{FLAG_REASON_PREFIX} read raised (treated as set)")
+        _alert(alert_sink, ForceK1BootDetail.FLAG_UNREADABLE)
+        raise
     if state.kind is ForceK1Kind.CLEARED:
-        return None
+        return False
     if state.kind is ForceK1Kind.SET and state.record is not None:
-        return f"{FLAG_REASON_PREFIX} set: {state.record.reason}", True
-    return f"{FLAG_REASON_PREFIX} unreadable (treated as set)", False
+        _force(latch, f"{FLAG_REASON_PREFIX} set: {state.record.reason}")
+        _alert(alert_sink, ForceK1BootDetail.FLAG_SET)
+    else:
+        _force(latch, f"{FLAG_REASON_PREFIX} unreadable (treated as set)")
+        _alert(alert_sink, ForceK1BootDetail.FLAG_UNREADABLE)
+    return True
 
 
-def _demotion_pause(latch: _Latch, repo_root: Path) -> bool:
-    """N4: configured K > 1, latest demotion to K=1, no valid amendment. Fails closed."""
+def _apply_demotion_pause(latch: _Latch, repo_root: Path, alert_sink: AlertSink) -> bool:
+    """N4: configured K > 1, latest demotion to K=1, no valid amendment.
+
+    A raising scan forces K=1 and alerts first, then re-raises.
+    """
     if latch.max_slots() <= 1:
         return False
     try:
         record = latch.read_latest_cleanup_demotion()
-    except Exception:  # noqa: BLE001 - an unreadable record keeps the pause (fail closed)
-        _LOG.error("cleanup_demotion record unreadable at boot; holding K=1", exc_info=False)
-        return True
+    except Exception:
+        _force(latch, "cleanup_demotion scan failed")
+        _alert(alert_sink, ForceK1BootDetail.DEMOTION_SCAN_FAILED)
+        raise
     if record is None or record.to_k != 1:
         return False
-    return not has_valid_amendment_for(repo_root, record.ts_ns)
+    if has_valid_amendment_for(repo_root, record.ts_ns):
+        return False
+    _force(latch, DEMOTION_REASON)
+    return True
 
 
 def force_k1_at_boot(latch: _Latch, *, repo_root: Path, alert_sink: AlertSink) -> bool:
     """Pin K=1 for the durable flag and the N4 demotion pause. ``True`` iff K was forced."""
-    forced = False
-    flag = _flag_reason(latch)
-    if flag is not None:
-        reason, is_set = flag
-        _LOG.error("EXEC-PAR boot: %s; forcing K=1", reason)
-        latch.force_k1(reason)
-        forced = True
-        if is_set:
-            emit_alert(
-                alert_sink,
-                AlertPayload(
-                    severity="CRITICAL",
-                    event=FLAG_SET_EVENT,
-                    site=_ALERT_SITE,
-                    detail=ForceK1BootDetail.FLAG_SET.value,
-                ),
-            )
-    if _demotion_pause(latch, repo_root):
-        _LOG.error("EXEC-PAR boot: %s; forcing K=1", DEMOTION_REASON)
-        latch.force_k1(DEMOTION_REASON)
-        forced = True
-    return forced
+    flagged = _apply_flag(latch, alert_sink)
+    paused = _apply_demotion_pause(latch, repo_root, alert_sink)
+    return flagged or paused
