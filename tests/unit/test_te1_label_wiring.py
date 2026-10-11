@@ -375,7 +375,7 @@ def test_planner_second_fill_claiming_a_consumed_legacy_trial_is_unresolved(worl
 
 
 def legacy_trial_of(fill: Any, legacy: list[Any]) -> str:
-    return next(i.trial_id for i in legacy if i.fill.client_order_id == fill.client_order_id)
+    return str(next(i.trial_id for i in legacy if i.fill.client_order_id == fill.client_order_id))
 
 
 def test_planner_disagreement_fails_the_run_closed(tmp_path: Path) -> None:
@@ -1227,6 +1227,11 @@ def _station_day_of(instrument_id: str) -> tuple[str, str]:
     return m[1].upper(), m[2]
 
 
+def _pnl_of(row: Any) -> Decimal:
+    assert row.realized_pnl is not None, row.client_order_id
+    return Decimal(row.realized_pnl)
+
+
 def _tally(items: list[tuple[Decimal, bool]]) -> tuple[int, int, Decimal]:
     return len(items), sum(1 for _, won in items if won), sum((n for n, _ in items), Decimal(0))
 
@@ -1253,9 +1258,9 @@ def test_labelled_pnl_matches_payout_minus_cost_minus_fee_and_stage0_aggregates(
     assert _tally(sep) == (9, 2, Decimal("-0.46"))
     assert _tally(no) == (3, 1, Decimal("0.65"))
     assert _tally(list(expected.values())) == (34, 4, Decimal("-2.63"))
-    labelled_fq = sum((rows[c].realized_pnl for c in expected if c not in LEGACY_COIDS), Decimal(0))
+    labelled_fq = sum((_pnl_of(rows[c]) for c in expected if c not in LEGACY_COIDS), Decimal(0))
     assert labelled_fq == Decimal("-2.17")
-    scored_sep = sum((rows[c].realized_pnl for c in LEGACY_COIDS[2:]), Decimal(0))
+    scored_sep = sum((_pnl_of(rows[c]) for c in LEGACY_COIDS[2:]), Decimal(0))
     assert scored_sep == Decimal("-0.54")  # the 7 frozen ScoredTrials; residual +0.08 -> -0.46
     wins = {c for c, (_, won) in expected.items() if won}
     assert set(FQ_WIN_COIDS) <= wins
