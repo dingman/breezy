@@ -110,7 +110,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_UP, Decimal
-from typing import Final
+from typing import Final, Protocol, runtime_checkable
 
 from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
@@ -1048,3 +1048,52 @@ class DailySpendLedger:
             if ratio <= upper:
                 return label
         return COST_BUDGET_BUCKET_ABOVE_SENTINEL
+
+
+# ----------------------------------------------------------------------
+# EXEC-PAR BG-5c (A1): read-only ledger view + identity check
+# ----------------------------------------------------------------------
+
+
+@runtime_checkable
+class SpendLedgerView(Protocol):
+    """The read-only surface of :class:`DailySpendLedger` a watcher may hold.
+
+    Deliberately excludes every mutator (authorize / release / true-up /
+    settle / seed): a consumer of this view cannot move money.
+    """
+
+    def spent_today_usd(self, *, now_ns: int) -> Decimal: ...
+
+    def cost_budget_bucket(self) -> str: ...
+
+    def pnl_breaches_budget_fraction(
+        self, *, aggregate_pnl: Decimal, fraction: Decimal
+    ) -> bool: ...
+
+    def open_cost_exceeds_budget_fraction(
+        self, *, aggregate_open_cost: Decimal, fraction: Decimal
+    ) -> bool: ...
+
+
+class LedgerUnavailable(Exception):
+    """The ledger a consumer holds is not the instance the client admits against."""
+
+    reason: Final[str] = "ledger_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.reason)
+
+
+def ledger_view_or_fail(view: object, expected: object) -> SpendLedgerView:
+    """Return ``view`` iff it IS (``is``) the injected ``expected`` instance.
+
+    Raises:
+        LedgerUnavailable: when either side is ``None`` or they are not the
+            identical object (a stale, rebuilt or foreign ledger).
+    """
+    if view is None or expected is None or view is not expected:
+        raise LedgerUnavailable()
+    if not isinstance(view, SpendLedgerView):
+        raise LedgerUnavailable()
+    return view
