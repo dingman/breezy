@@ -277,8 +277,12 @@ def _validate_reading(reading: SettledPnlReading) -> None:
 
 
 def _needs_pnl_row(row: DayCounters) -> bool:
-    """A settled-P&L row must exist for a day with posted entries (ruling item 4)."""
-    return bool(row.posted)
+    """A settled-P&L row exists exactly when the day has an entry fill or an AMBIGUOUS mark.
+
+    That is what BG-1c writes (``exec_par_settled_pnl.py:181-191``, ``_check_fill``): an
+    all-unfilled IOC day (posted but no fill and no AMBIGUOUS mark) has no row and needs none.
+    """
+    return bool(row.fills) or bool(row.ambiguous)
 
 
 def _validate_pre_floor(ctx: StageContext, excluded: set[str]) -> None:
@@ -291,7 +295,7 @@ def _validate_pre_floor(ctx: StageContext, excluded: set[str]) -> None:
         row = ctx.by_day.get(label)
         if row is None:
             raise fail("missing_day")
-        if row.posted is None:
+        if row.fills is None or row.ambiguous is None:
             raise fail("missing_counter")
         if _needs_pnl_row(row) and ctx.pnl.get(label) is None:
             raise fail("missing_pnl_day")
