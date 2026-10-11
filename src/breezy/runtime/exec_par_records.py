@@ -33,6 +33,19 @@ field; ``day`` is the climate-day label of the ARM time, I2):
 * ``window/<day>/<start_ns>``  per 5 s window order count and notional
 * ``gappy/<day>``              gappy-day mark
 
+BG-5b stage-evaluator rows (single writer = the node's loop thread, via the latch):
+
+* ``look/<YYYY-MM-DD>``        promotion look ``{day, outcome, ts_ns}``; outcome is
+  ``passed`` / ``failed`` / ``not_taken``; EXCLUSIVE per day (identical rewrite is a no-op)
+* ``stage_eval/stamp``         ``{ts_ns, boot_ns}`` of the last healthy pass (r4 1a)
+* ``stage_eval/liveness``      ``{stage_eval_last_start_ns, stage_eval_last_ok_ns}`` (N3)
+* ``stage_eval/reconcile_phase`` ``{reconcile_start_ns, reconcile_ok_ns}`` (N3)
+* ``stage_eval/report``        latest ``{ts_ns, verdict, reason, report_json}``; the report
+  carries counts, ratios and flags only
+* ``counts_delta/<day>``       BG-1d rebuild: SIGNED deltas (durable minus the BG-1b row scan at
+  rebuild time) added to the scan, so later events and retried rows keep counting
+* ``rebuild/<day>``            pending BG-1d rebuild note; retired to ``rebuild_log/<day>/<ts_ns>``
+
 The store has only ``get``/``set``, so each ``<ts_ns>`` family keeps a
 ``latest`` pointer ``{"v":1,"ts_ns":N}`` written AFTER the row.
 """
@@ -56,6 +69,7 @@ __all__ = [
     "AmbiguousRow",
     "Amendment",
     "CleanupDemotion",
+    "DayCountsDelta",
     "DenialRow",
     "EpochRow",
     "ExcludedDay",
@@ -65,11 +79,17 @@ __all__ = [
     "ForceK1Flag",
     "ForceK1Kind",
     "ForceK1State",
-    "SettledPnlDay",
     "GappyMark",
+    "LookRow",
     "OpenCostFlag",
     "OrderAnchor",
+    "RebuildRow",
+    "ReconcilePhase",
+    "SettledPnlDay",
     "StageEvalDry",
+    "StageEvalLiveness",
+    "StageEvalStamp",
+    "StageReportDoc",
     "StageReset",
     "StopVerdict",
     "WindowPeak",
@@ -277,6 +297,73 @@ class GappyMark:
     cleared_ts: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class LookRow:
+    """BG-5b: one recorded promotion look; ``outcome`` is passed / failed / not_taken."""
+
+    day: str
+    outcome: str
+    ts_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class StageEvalStamp:
+    """r4 1a stamp: the last healthy pass time and the latch ``boot_ns`` it ran under."""
+
+    ts_ns: int
+    boot_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class StageEvalLiveness:
+    """N3 evaluate-phase liveness; ``None`` until the first pass starts / completes."""
+
+    stage_eval_last_start_ns: int | None
+    stage_eval_last_ok_ns: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcilePhase:
+    """N3 reconcile-phase liveness (``reconcile_ok_ns`` is ``None`` while it runs)."""
+
+    reconcile_start_ns: int
+    reconcile_ok_ns: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class StageReportDoc:
+    """The latest stage report (counts, ratios and flags only; ``report_json`` is canonical)."""
+
+    ts_ns: int
+    verdict: str
+    reason: str | None
+    report_json: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DayCountsDelta:
+    """BG-1d rebuild adjustment for a day: signed counts and a signed canonical decimal spend."""
+
+    day: str
+    posted_entries: int
+    ambiguous: int
+    fills: int
+    spend: str
+
+
+@dataclass(frozen=True, slots=True)
+class RebuildRow:
+    """A pending BG-1d rebuild note: why (comma-joined kinds, never empty) and what was set."""
+
+    day: str
+    ts_ns: int
+    mismatch_kinds: str
+    posted_entries: int
+    ambiguous: int
+    fills: int
+    spend: str
+
+
 class ForceK1Kind(Enum):
     """Reading of the durable force-K1 flag. UNREADABLE must be treated as SET."""
 
@@ -365,6 +452,32 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "coids": "str",
     },
     GappyMark: {"day": "str", "cause": "str", "ts_ns": "int", "cleared_ts": "int?"},
+    LookRow: {"day": "day", "outcome": "str", "ts_ns": "int"},
+    StageEvalStamp: {"ts_ns": "int", "boot_ns": "int"},
+    StageEvalLiveness: {"stage_eval_last_start_ns": "int?", "stage_eval_last_ok_ns": "int?"},
+    ReconcilePhase: {"reconcile_start_ns": "int", "reconcile_ok_ns": "int?"},
+    StageReportDoc: {
+        "ts_ns": "int",
+        "verdict": "str",
+        "reason": "str?",
+        "report_json": "str?",
+    },
+    DayCountsDelta: {
+        "day": "day",
+        "posted_entries": "int",
+        "ambiguous": "int",
+        "fills": "int",
+        "spend": "dec",
+    },
+    RebuildRow: {
+        "day": "day",
+        "ts_ns": "int",
+        "mismatch_kinds": "str",
+        "posted_entries": "count",
+        "ambiguous": "count",
+        "fills": "count",
+        "spend": "dec",
+    },
 }
 
 _DAY_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
