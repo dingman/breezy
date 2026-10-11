@@ -32,7 +32,24 @@ Verdict handling (the node NEVER promotes, r4.5 O5):
   too (a held stage must not look stale after 26 h); FAIL and a slow pass do not.
 
 Every exception ends in a halt (``stage_eval_fail:<kind>`` or ``telemetry_write_fail``); a halt
-write that raises is retried on the next service and withholds the heartbeat (D3). Currency
+write that raises is retried on the next service and withholds the heartbeat (D3).
+``_pending_halt`` keeps only the FIRST reason: the breaker halt is sticky (first reason wins)
+and the durable stop-verdict marker carries the stop reason, so a later one adds nothing.
+A failed ``stop_verdict`` marker write stops the heartbeat until a node restart: fail-closed by
+design (r4.3 M3: "a failed write of that marker is itself the integrity halt
+``stop_marker_write_fail``, and the heartbeat stops (D3)"); it is never retried or cleared here.
+
+Clocks: every integrity AGE (stuck 60 s, reconcile 300 s, slow 2 s) is measured on the ONE
+injected monotonic clock (``ports.monotonic_ns``), so a wall-clock step can neither trip nor
+mask a bound. The wall clock (``ports.wall_ns``, the ``now_ns`` of ``service``) is used only for
+stamps, record timestamps, halt times and climate-day labels. ``stage_eval_slow`` times the
+snapshot build plus the pure evaluation (M4's reconcile exclusion stands: reconciliation has its
+own 300 s bound and is not part of the 2 s span).
+
+Reconcile never runs over a non-empty ingest retry queue (``bind_ingest_pending``): a queued
+event whose row lands after a rebuild would be counted twice. The pass waits for the queue to
+drain; the wait is inside the reconcile phase, so a queue that never drains is
+``reconcile_stuck``. Currency
 values never leave the injected ports: alerts, logs and the report carry reasons, counts,
 ratios and day labels only.
 """
@@ -136,6 +153,7 @@ class StageEvalStore(SnapshotReads, Protocol):
     def mark_flag_write_failed(self) -> None: ...
     def write_stage_eval_stamp(self, record: StageEvalStamp) -> None: ...
     def write_stage_eval_liveness(self, record: StageEvalLiveness) -> None: ...
+    def read_stage_eval_liveness(self) -> StageEvalLiveness | None: ...
     def write_stage_report(self, record: StageReportDoc) -> None: ...
     def add_excluded_day(self, record: ExcludedDay) -> bool: ...
 
@@ -168,6 +186,12 @@ class StageEvalPorts:
     counted_denial: Callable[[str], bool] | None = None
     await_ready: Callable[[], Awaitable[None]] | None = None
     refresh_settled_pnl: Callable[[], Awaitable[None]] | None = None
+    #: Cheap poll of a monotone "settled-P&L seen" counter (BG-5c supplies it). A change since
+    #: the previous poll triggers a pass (r4 1a / s15: "the tick that first observes a new
+    #: settled-P&L value"). ``None`` means no such seam exists yet.
+    settled_pnl_seq: Callable[[], int] | None = None
+    #: Seconds between checks of the ingest retry queue while a pass waits to reconcile.
+    ingest_poll_s: float = 0.5
     #: The pure evaluator (BG-5a); injectable so the wiring is testable with canned verdicts.
     evaluate: Callable[[StageSnapshot], Verdict] = evaluate_stage
 
@@ -208,6 +232,14 @@ class StageEvaluator:
         self._heartbeat_stopped = False
         self._tick_fault = False
         self._outbox: list[tuple[str, str, str]] = []
+        self._ingest_pending: Callable[[], int] = lambda: 0
+        self._liveness_seeded = False
+        self._last_settled_seq: int | None = None
+        self._settled_dirty = False
+
+    def bind_ingest_pending(self, pending: Callable[[], int]) -> None:
+        """Late-bind the ingest guard's retry-queue length (a reconcile waits for zero)."""
+        self._ingest_pending = pending
 
     # -- observability -----------------------------------------------------
 
@@ -230,9 +262,10 @@ class StageEvaluator:
         Synchronous and cheap; never raises (a fault withholds this tick's heartbeat)."""
         self._tick_fault = False
         try:
-            self._check_integrity(now_ns)
+            self._check_integrity()
             self._flush_pending_halt()
             self._flush_outbox()
+            self._poll_settled_seq()
             self._maybe_start(now_ns)
         except Exception as exc:  # noqa: BLE001 - contained; the missing heartbeat is the signal
             self._tick_fault = True
@@ -256,6 +289,17 @@ class StageEvaluator:
 
     # -- scheduling and integrity ---------------------------------------------
 
+    def _poll_settled_seq(self) -> None:
+        read = self._ports.settled_pnl_seq
+        if read is None:
+            return
+        value = read()
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("settled_pnl_seq must return an int")
+        if self._last_settled_seq is not None and value != self._last_settled_seq:
+            self._settled_dirty = True
+        self._last_settled_seq = value
+
     def _maybe_start(self, now_ns: int) -> None:
         if self._stopping:
             return
@@ -263,8 +307,9 @@ class StageEvaluator:
         if task is not None and not task.done():
             return
         today = self._ports.today_of(now_ns)
-        if self._boot_started and today == self._last_attempt_today:
+        if self._boot_started and today == self._last_attempt_today and not self._settled_dirty:
             return
+        self._settled_dirty = False
         self._boot_started = True
         self._last_attempt_today = today
         self._seq += 1
@@ -287,13 +332,13 @@ class StageEvaluator:
         self._death_reported.add(seq)
         self._integrity(REASON_TASK_DIED)
 
-    def _check_integrity(self, now_ns: int) -> None:
+    def _check_integrity(self) -> None:
         task = self._task
         if task is not None and task.done() and not self._stopping:
             self._report_death(self._seq)  # per-tick check, independent of the done-callback
         if task is None or task.done() or self._phase is None:
             return
-        age = now_ns - self._phase_start
+        age = self._ports.monotonic_ns() - self._phase_start
         if self._phase == _PHASE_EVALUATE and age > STAGE_EVAL_STUCK_NS:
             self._report_once(REASON_STUCK)
         elif self._phase == _PHASE_RECONCILE and age > RECONCILE_BOUND_NS:
@@ -373,17 +418,19 @@ class StageEvaluator:
 
     async def _pass(self, today: str) -> None:
         ports = self._ports
+        self._seed_liveness()
         start = ports.wall_ns()
-        self._phase, self._phase_start = _PHASE_RECONCILE, start
+        self._phase, self._phase_start = _PHASE_RECONCILE, ports.monotonic_ns()
         self._telemetry(lambda: ports.counters.write_reconcile_phase(start_ns=start, ok_ns=None))
         if ports.await_ready is not None:
             await ports.await_ready()
-        await asyncio.sleep(0)
-        result = self._reconcile(today)
+        while self._ingest_pending() > 0:  # never reconcile over a queued retry (no double count)
+            await asyncio.sleep(ports.ingest_poll_s)
+        result = self._reconcile(today)  # sync, no await since the queue check
         await asyncio.sleep(0)
 
         eval_start = ports.wall_ns()
-        self._phase, self._phase_start = _PHASE_EVALUATE, eval_start
+        self._phase, self._phase_start = _PHASE_EVALUATE, ports.monotonic_ns()
         previous_ok = self._eval_ok_ns
         self._telemetry(
             lambda: ports.store.write_stage_eval_liveness(
@@ -393,8 +440,7 @@ class StageEvaluator:
         if ports.refresh_settled_pnl is not None:
             await ports.refresh_settled_pnl()
         await asyncio.sleep(0)
-        snapshot = self._snapshot(today, result.status, eval_start)
-        verdict, elapsed = self._timed_evaluate(snapshot)
+        verdict, elapsed = self._timed_evaluate(today, result.status, eval_start)
         self._phase = None
 
         now = ports.wall_ns()
@@ -462,14 +508,33 @@ class StageEvaluator:
                     predicates=ports.predicates,
                     serial_baseline=ports.serial_baseline(),
                     counted_denial=ports.counted_denial,
+                    on_read_error=self._log_read_error,
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a halt reason
             raise _PassFailure(f"{_FAIL_PREFIX}snapshot:{type(exc).__name__}") from None
 
-    def _timed_evaluate(self, snapshot: StageSnapshot) -> tuple[Verdict, int]:
+    def _seed_liveness(self) -> None:
+        """Seed ``previous_ok`` from the store once, so a restart never writes None over it."""
+        if self._liveness_seeded:
+            return
+        try:
+            row = self._ports.store.read_stage_eval_liveness()
+        except Exception as exc:  # noqa: BLE001 - a corrupt row is an integrity failure
+            logger.error("exec_par liveness read failed: %s", type(exc).__name__)
+            raise _PassFailure(f"{_FAIL_PREFIX}liveness_read") from None
+        self._eval_ok_ns = None if row is None else row.stage_eval_last_ok_ns
+        self._liveness_seeded = True
+
+    @staticmethod
+    def _log_read_error(what: str, day: str, exc_type: str) -> None:
+        logger.error("exec_par snapshot read failed: what=%s day=%s exc=%s", what, day, exc_type)
+
+    def _timed_evaluate(self, today: str, status: PassStatus, now_ns: int) -> tuple[Verdict, int]:
+        """The synchronous span (snapshot build + pure evaluation) against the 2 s bound."""
         clock = self._ports.monotonic_ns
         began = clock()
+        snapshot = self._snapshot(today, status, now_ns)
         try:
             verdict = self._ports.evaluate(snapshot)
         except Exception as exc:  # noqa: BLE001 - mapped to a halt reason

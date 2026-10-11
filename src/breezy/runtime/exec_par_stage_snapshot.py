@@ -63,7 +63,9 @@ __all__ = [
     "stage_day_labels",
 ]
 
-#: A day range wider than this is a clock or epoch fault, never walked.
+#: A day range wider than this is a clock or epoch fault, never walked. The range is bounded
+#: by the spec itself: a stage is at most 15 days (+5 extension) plus the days since the first
+#: K>1 boot that s15-cumulative needs, so 400 days is far beyond any real stage.
 MAX_SNAPSHOT_DAYS = 400
 
 
@@ -105,6 +107,8 @@ class SnapshotInputs:
     serial_baseline: SerialBaseline | None
     #: ``None`` means no classification exists yet (BG-11): ``denied_counted`` is then ``None``.
     counted_denial: Callable[[str], bool] | None
+    #: Told ``(what, day, exception_type_name)`` when a per-day read fails; never the message.
+    on_read_error: Callable[[str, str, str], None] | None = None
 
 
 def _first_k_gt1_day(
@@ -139,16 +143,24 @@ def stage_day_labels(
     return _day_range(start, today)
 
 
-def _safe[T](read: Callable[[], T]) -> T | None:
-    """A per-day read: a raise is a missing value (never a default)."""
+def _safe[T](
+    read: Callable[[], T], what: str, day: str, report: Callable[[str, str, str], None] | None
+) -> T | None:
+    """A per-day read: a raise is a missing value (never a default). Only the exception TYPE
+    is reported (the message could carry a currency value)."""
     try:
         return read()
-    except Exception:  # noqa: BLE001 - mapped to None; the evaluator FAILs on a missing value
+    except Exception as exc:  # noqa: BLE001 - mapped to None; the evaluator FAILs on a missing value
+        if report is not None:
+            report(what, day, type(exc).__name__)
         return None
 
 
+Report = Callable[[str, str, str], None] | None
+
+
 def _denied_counted(
-    reads: SnapshotReads, day: str, classify: Callable[[str], bool] | None
+    reads: SnapshotReads, day: str, classify: Callable[[str], bool] | None, report: Report
 ) -> int | None:
     if classify is None:
         return None
@@ -156,11 +168,13 @@ def _denied_counted(
     def count() -> int:
         return sum(1 for row in reads.read_denials(day) if classify(row.reason))
 
-    return _safe(count)
+    return _safe(count, "denied", day, report)
 
 
-def _fill_detail(reads: SnapshotReads, day: str, counted: int | None) -> tuple[FillRow, ...] | None:
-    rows = _safe(lambda: reads.read_fills(day))
+def _fill_detail(
+    reads: SnapshotReads, day: str, counted: int | None, report: Report
+) -> tuple[FillRow, ...] | None:
+    rows = _safe(lambda: reads.read_fills(day), "fills", day, report)
     if rows is None or counted is None:
         return None
     if len({row.client_order_id for row in rows}) != counted:
@@ -171,29 +185,32 @@ def _fill_detail(reads: SnapshotReads, day: str, counted: int | None) -> tuple[F
 def _day_counters(
     reads: SnapshotReads, counters: SnapshotCounters, inputs: SnapshotInputs, day: str
 ) -> DayCounters:
-    counts = _safe(lambda: counters.read_day_counts(day))
+    report = inputs.on_read_error
+    counts = _safe(lambda: counters.read_day_counts(day), "counts", day, report)
     return DayCounters(
         day=day,
         posted=None if counts is None else counts.posted_entries,
         ambiguous=None if counts is None else counts.ambiguous,
-        denied_counted=_denied_counted(reads, day, inputs.counted_denial),
-        fills=_fill_detail(reads, day, None if counts is None else counts.fills),
-        open_flags=_safe(lambda: reads.read_open_cost_flags(day)),
-        windows=_safe(lambda: reads.read_window_peaks(day)),
+        denied_counted=_denied_counted(reads, day, inputs.counted_denial, report),
+        fills=_fill_detail(reads, day, None if counts is None else counts.fills, report),
+        open_flags=_safe(lambda: reads.read_open_cost_flags(day), "open_flags", day, report),
+        windows=_safe(lambda: reads.read_window_peaks(day), "windows", day, report),
     )
 
 
-def _day_pnl(reads: SnapshotReads, day: str) -> DayPnl | None:
+def _day_pnl(reads: SnapshotReads, day: str, report: Report) -> DayPnl | None:
     """``None``: no row (omitted); a ``DayPnl`` with a ``None`` reading: row unreadable."""
     try:
         row = reads.read_settled_pnl_day(day)
         return None if row is None else DayPnl(day, settled_pnl_or_fail(row))
-    except Exception:  # noqa: BLE001 - an unreadable row is FAIL territory, never zero
+    except Exception as exc:  # noqa: BLE001 - an unreadable row is FAIL territory, never zero
+        if report is not None:
+            report("settled_pnl", day, type(exc).__name__)
         return DayPnl(day, None)
 
 
-def _unattributed_ambiguous(reads: SnapshotReads) -> int | None:
-    return _safe(lambda: len(reads.read_ambiguous(UNATTRIBUTED)))
+def _unattributed_ambiguous(reads: SnapshotReads, report: Report) -> int | None:
+    return _safe(lambda: len(reads.read_ambiguous(UNATTRIBUTED)), "unattributed", "-", report)
 
 
 def build_stage_snapshot(
@@ -208,7 +225,9 @@ def build_stage_snapshot(
 
     labels = stage_day_labels(floor, epochs, inputs.day_of_ns, inputs.today)
 
-    pnl = tuple(row for day in labels if (row := _day_pnl(reads, day)) is not None)
+    pnl = tuple(
+        row for day in labels if (row := _day_pnl(reads, day, inputs.on_read_error)) is not None
+    )
     gappy = counters.read_gappy_days()
     pending = frozenset(day for day in labels if counters.read_pending_rebuild(day) is not None)
     return StageSnapshot(
@@ -226,7 +245,7 @@ def build_stage_snapshot(
         looks=looks,
         stop_verdicts=verdicts,
         serial_baseline=inputs.serial_baseline,
-        unattributed_ambiguous=_unattributed_ambiguous(reads),
+        unattributed_ambiguous=_unattributed_ambiguous(reads, inputs.on_read_error),
         day_of_ns=inputs.day_of_ns,
         predicates=inputs.predicates,
     )

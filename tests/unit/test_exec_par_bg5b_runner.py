@@ -8,6 +8,7 @@ verdict-path tests and left real for the end-to-end ones.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import logging
 import threading
@@ -207,6 +208,7 @@ def make_rig(
     refresh: Callable[[], object] | None = None,
     mass_status: bool = True,
     seed: bool = False,
+    port_over: dict[str, object] | None = None,
 ) -> Iterator[Rig]:
     store = _Store()
     clock = _Clock(ns_of(d(4)) + 100 if now is None else now)
@@ -244,6 +246,8 @@ def make_rig(
             refresh_settled_pnl=refresh,  # type: ignore[arg-type]
             **({} if evaluate is None else {"evaluate": evaluate}),  # type: ignore[arg-type]
         )
+        if port_over:
+            ports = dataclasses.replace(ports, **port_over)  # type: ignore[arg-type]
 
         def alert(severity: str, event: str, detail: str) -> bool:
             alerts.append((severity, event, detail))
@@ -641,9 +645,12 @@ async def test_await_hung_evaluate_phase_is_stage_eval_stuck_after_60s_not_befor
     with make_rig(tmp_path, evaluate=lambda s: verdict(VerdictKind.PASS), refresh=refresh) as rig:
         rig.ev.service(rig.clock.ns)
         await asyncio.sleep(0.05)
-        rig.ev.service(rig.clock.ns + STAGE_EVAL_STUCK_NS - NS)
+        rig.clock.ns += 10_000 * NS  # a wall-clock jump alone never trips an age bound
+        rig.clock.mono += STAGE_EVAL_STUCK_NS - NS
+        rig.ev.service(rig.clock.ns)
         assert rig.breaker() is None
-        rig.ev.service(rig.clock.ns + STAGE_EVAL_STUCK_NS + NS)
+        rig.clock.mono += 2 * NS
+        rig.ev.service(rig.clock.ns)
         record = rig.breaker()
         assert record is not None and record.halted_reason == "stage_eval_stuck"
         assert rig.events("EXEC_PAR_STAGE_EVAL_STUCK")
@@ -661,9 +668,12 @@ async def test_await_hung_reconcile_phase_is_reconcile_stuck_after_300s(tmp_path
     with make_rig(tmp_path, evaluate=lambda s: verdict(VerdictKind.PASS), ready=ready) as rig:
         rig.ev.service(rig.clock.ns)
         await asyncio.sleep(0.05)
-        rig.ev.service(rig.clock.ns + 299 * NS)
+        rig.clock.ns += 10_000 * NS
+        rig.clock.mono += 299 * NS
+        rig.ev.service(rig.clock.ns)
         assert rig.breaker() is None
-        rig.ev.service(rig.clock.ns + 301 * NS)
+        rig.clock.mono += 2 * NS
+        rig.ev.service(rig.clock.ns)
         record = rig.breaker()
         assert record is not None and record.halted_reason == "reconcile_stuck"
         rig.ev.cancel()

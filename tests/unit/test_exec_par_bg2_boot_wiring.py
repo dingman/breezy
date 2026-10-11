@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -93,6 +94,9 @@ def test_an_unclean_prior_is_closed_by_the_next_boot_and_a_same_k_reboot_resets_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(
+        app_trade, "_build_stage_eval_ports", lambda _latch: SimpleNamespace()
+    )  # BG-5b: opt in to K>1 wiring
     monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
     env = _env(tmp_path)
     _InspectingNode.env = env
@@ -130,6 +134,9 @@ def test_a_k_change_boot_writes_the_k_change_stage_reset(
     env = _env(tmp_path)
     run(env=env, node_factory=RecordingNode, stderr=io.StringIO())  # K=1
     monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(
+        app_trade, "_build_stage_eval_ports", lambda _latch: SimpleNamespace()
+    )  # BG-5b: opt in to K>1 wiring
     monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
 
     run(env=env, node_factory=RecordingNode, stderr=io.StringIO())  # K=2
@@ -160,6 +167,9 @@ def test_the_k_gt_1_watcher_is_armed_with_the_build_revision(
     from breezy.runtime.breaker_watcher import BreakerWatcherActor
 
     monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(
+        app_trade, "_build_stage_eval_ports", lambda _latch: SimpleNamespace()
+    )  # BG-5b: opt in to K>1 wiring
     monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
 
     run(env=_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
@@ -246,6 +256,9 @@ def test_the_k_change_floor_failure_is_never_swallowed_at_k1(
     env = _env(tmp_path)
     with monkeypatch.context() as first:
         first.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+        first.setattr(
+            app_trade, "_build_stage_eval_ports", lambda _latch: SimpleNamespace()
+        )  # BG-5b: opt in to K>1 wiring
         first.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
         run(env=env, node_factory=RecordingNode, stderr=io.StringIO())  # K=2 epoch
     RecordingNode.instances.clear()
