@@ -35,7 +35,9 @@ __all__ = [
     "BOOT_GRACE_NS",
     "PROBE_INTERVAL_NS",
     "REALERT_INTERVAL_NS",
+    "RETRY_INTERVAL_NS",
     "STAGE_STAMP_MAX_AGE_NS",
+    "UNREADABLE_DEBOUNCE_PROBES",
     "BreakerAlertDetail",
     "BreakerAlertSpec",
     "BreakerProbe",
@@ -57,6 +59,14 @@ REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
 
 #: BG-8: the supervisor probes the store no more often than this (read-only).
 PROBE_INTERVAL_NS: Final[int] = 600 * 1_000_000_000
+
+#: BG-8: a lost send (raised or non-durable) is retried on this throttle, from the
+#: cached probe; it never reopens the 10-minute store-probe throttle.
+RETRY_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
+
+#: A store read can fail transiently (sqlite busy/locked): only this many
+#: CONSECUTIVE unreadable probes (10 min apart) page ``PROBE_UNREADABLE``.
+UNREADABLE_DEBOUNCE_PROBES: Final[int] = 2
 
 #: Spec 1a: a stage-eval stamp older than 26 h (or never written that long) is stale.
 STAGE_STAMP_MAX_AGE_NS: Final[int] = 26 * 3600 * 1_000_000_000
@@ -80,6 +90,9 @@ class BreakerAlertDetail(str, Enum):
     SLOT_TABLE_UNREADABLE_SLOT = "slot_table_unreadable_slot"
     STAGE_STAMP_STALE = "exec_par_stage_stamp_stale"
     PROBE_UNREADABLE = "breaker_probe_unreadable"
+    #: Stamp never written and the clock anchored on this supervisor's first
+    #: K>1 sighting (no K>1 epoch row exists yet).
+    STAGE_STAMP_STALE_FIRST_SIGHTING = "exec_par_stage_stamp_stale_anchor=first_sighting"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +109,9 @@ class BreakerProbe:
     stamp_ts_ns: int | None = None
     #: ``False`` when the stamp row exists but does not decode.
     stamp_readable: bool = True
+    #: BG-8: min ``boot_ts`` (ns) of the BG-2 epoch rows with ``effective_k > 1``;
+    #: ``None`` = the node has never booted at K>1.
+    k_anchor_ns: int | None = None
 
     @classmethod
     def absent(cls) -> BreakerProbe:
@@ -136,6 +152,10 @@ class BreakerWatchState:
     #: (the anchor for a never-written stamp).
     last_probe_ns: int | None = None
     stamp_watch_since_ns: int | None = None
+    #: Consecutive unreadable probes; the last probe and when a lost send may retry.
+    unreadable_streak: int = 0
+    last_probe: BreakerProbe | None = None
+    last_send_fail_ns: int | None = None
 
     def delivered(self, spec: BreakerAlertSpec, now_ns: int) -> None:
         self.active[spec.key] = now_ns
@@ -231,6 +251,7 @@ def decide_breaker_alerts(
     now_ns: int,
     state: BreakerWatchState,
     node_pid: int | None = None,
+    fresh: bool = True,
 ) -> list[BreakerAlertSpec]:
     """The alerts due this tick: conditions true now that are not yet CONFIRMED
     delivered, or were last delivered at least ``REALERT_INTERVAL_NS`` ago.
@@ -244,6 +265,11 @@ def decide_breaker_alerts(
     BG-8: the halted, unreadable-slot and probe-unreadable conditions are decided
     at ANY K; at K<=1 they alert once per episode (no hourly repeat). The stamp
     condition is K>1 only and does not need a live node.
+
+    ``fresh`` is ``False`` when ``probe`` is the cached reading re-decided for a
+    lost-send retry: it must not advance the unreadable-probe streak.
+    ``PROBE_UNREADABLE`` needs ``UNREADABLE_DEBOUNCE_PROBES`` consecutive fresh
+    unreadable probes (one busy/locked read must not page); any good read resets.
     """
     conditions: dict[str, BreakerAlertSpec] = {}
     if probe.unreadable_slots > 0:
@@ -254,13 +280,24 @@ def decide_breaker_alerts(
     watcher_live = k_configured > 1 and node_live
     if watcher_live:
         conditions.update(_watcher_conditions(probe, now_ns, first_seen))
-    if not probe.readable and not watcher_live:
+    if fresh:
+        state.unreadable_streak = 0 if probe.readable else state.unreadable_streak + 1
+    if (
+        not probe.readable
+        and not watcher_live
+        and state.unreadable_streak >= UNREADABLE_DEBOUNCE_PROBES
+    ):
         conditions["probe_unreadable"] = _keyed(_PROBE_UNREADABLE, "probe_unreadable")
     if k_configured > 1:
         if state.stamp_watch_since_ns is None:
             state.stamp_watch_since_ns = now_ns
-        if probe.readable and _stamp_stale(probe, now_ns, state.stamp_watch_since_ns):
-            conditions["stamp_stale"] = _keyed(_STAMP_STALE, "stamp_stale")
+        durable_anchor = probe.k_anchor_ns is not None
+        since = probe.k_anchor_ns if probe.k_anchor_ns is not None else state.stamp_watch_since_ns
+        if probe.readable and _stamp_stale(probe, now_ns, since):
+            spec = _STAMP_STALE
+            if probe.stamp_ts_ns is None and probe.stamp_readable and not durable_anchor:
+                spec = replace(spec, detail=BreakerAlertDetail.STAGE_STAMP_STALE_FIRST_SIGHTING)
+            conditions["stamp_stale"] = _keyed(spec, "stamp_stale")
     realert = k_configured > 1
     state.active = {k: t for k, t in state.active.items() if k in conditions}
     return [

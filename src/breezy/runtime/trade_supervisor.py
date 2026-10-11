@@ -49,6 +49,7 @@ from breezy.runtime.alert_proof import COUNTERS as _ALERT_COUNTERS
 from breezy.runtime.alert_proof import deliver_with_proof
 from breezy.runtime.breaker_supervisor_watch import (
     PROBE_INTERVAL_NS,
+    RETRY_INTERVAL_NS,
     BreakerProbe,
     BreakerWatchState,
     decide_breaker_alerts,
@@ -62,7 +63,9 @@ from breezy.runtime.build_sha import (
 from breezy.runtime.build_sha import resolve_build_revision as _resolve_build_revision_impl
 from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
 from breezy.runtime.exec_par_records import (
+    EPOCH_KEY_PREFIX,
     STAGE_EVAL_STAMP_KEY,
+    EpochRow,
     ExecParRecordError,
     StageEvalStamp,
     decode_record,
@@ -587,15 +590,21 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         # No store yet (a node that has not created it): "absent", not a fault.
         return BreakerProbe.absent()
     try:
-        values = _read_only_values(
-            store_path, (BREAKER_KEY, CURRENT_INTENT_KEY, STAGE_EVAL_STAMP_KEY)
+        values, epoch_rows = _read_only_probe_rows(
+            store_path, (BREAKER_KEY, CURRENT_INTENT_KEY, STAGE_EVAL_STAMP_KEY), EPOCH_KEY_PREFIX
         )
+        k_anchor_ns = _k_gt_1_anchor_ns(epoch_rows)
     except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
         logger.warning("breaker_record_probe_failed error_type=%s", type(exc).__name__)
         return replace(BreakerProbe.absent(), readable=False)
     raw_record, raw_table = values[BREAKER_KEY], values[CURRENT_INTENT_KEY]
     stamp_ts_ns, stamp_readable = _decode_stamp(values[STAGE_EVAL_STAMP_KEY])
-    base = replace(BreakerProbe.absent(), stamp_ts_ns=stamp_ts_ns, stamp_readable=stamp_readable)
+    base = replace(
+        BreakerProbe.absent(),
+        stamp_ts_ns=stamp_ts_ns,
+        stamp_readable=stamp_readable,
+        k_anchor_ns=k_anchor_ns,
+    )
     unreadable = 0
     if raw_table is not None:
         try:
@@ -616,6 +625,42 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         resolver_pass_ns=record.resolver_pass_ns,
         unreadable_slots=unreadable,
     )
+
+
+def _read_only_probe_rows(
+    store_path: Path, keys: tuple[str, ...], prefix: str
+) -> tuple[dict[str, bytes | None], list[tuple[str, bytes]]]:
+    """:func:`_read_only_values` plus a prefix scan, over ONE ``mode=ro`` connection."""
+    escaped = str(store_path).replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+    conn = sqlite3.connect(f"file:{escaped}?mode=ro", uri=True, timeout=1.0)
+    try:
+        found: dict[str, bytes | None] = {}
+        for key in keys:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+            found[key] = None if row is None else bytes(row[0])
+        rows = conn.execute(
+            "SELECT key, value FROM state WHERE substr(key, 1, ?) = ? ORDER BY key",
+            (len(prefix), prefix),
+        ).fetchall()
+        return found, [(str(key), bytes(value)) for key, value in rows]
+    finally:
+        conn.close()
+
+
+def _k_gt_1_anchor_ns(rows: list[tuple[str, bytes]]) -> int | None:
+    """Minimum ``boot_ts`` (ns) over BG-2 epoch rows with ``effective_k > 1``.
+
+    A ``latest`` pointer row is skipped and key order is not relied on. A row that
+    does not decode raises (the caller's probe-failure path makes it unreadable).
+    """
+    boots = [
+        row.boot_ts
+        for key, raw in rows
+        if key != EPOCH_KEY_PREFIX + "latest"
+        for row in (decode_record(EpochRow, raw),)
+        if row.effective_k > 1
+    ]
+    return min(boots) if boots else None
 
 
 def _decode_stamp(raw: bytes | None) -> tuple[int | None, bool]:
@@ -3177,13 +3222,27 @@ def _do_breaker_watch(
     it, so a lost send is retried on the next tick.
     """
     now_ns = int(now.timestamp() * 1e9)
-    if watch.last_probe_ns is not None and 0 <= now_ns - watch.last_probe_ns < PROBE_INTERVAL_NS:
+    probe_due = (
+        watch.last_probe_ns is None
+        or watch.last_probe is None
+        or not 0 <= now_ns - watch.last_probe_ns < PROBE_INTERVAL_NS
+    )
+    retry_due = (
+        watch.last_send_fail_ns is not None
+        and not 0 <= now_ns - watch.last_send_fail_ns < RETRY_INTERVAL_NS
+    )
+    if not probe_due and not retry_due:
         return
-    watch.last_probe_ns = now_ns
     k = ports.configured_exec_par_k()
-    probe = ports.probe_breaker_record(store_path)
-    if not probe.readable:
-        log_decision("breaker_probe_unreadable", k_configured=k)
+    if probe_due:
+        probe = ports.probe_breaker_record(store_path)
+        watch.last_probe_ns = now_ns
+        watch.last_probe = probe
+        if not probe.readable:
+            log_decision("breaker_probe_unreadable", k_configured=k)
+    else:
+        assert watch.last_probe is not None  # probe_due is True when it is None
+        probe = watch.last_probe  # a retry re-decides the cached reading: no store read
     pid: int | None = None
     node_live = False
     if k > 1:
@@ -3193,10 +3252,16 @@ def _do_breaker_watch(
         probe=probe,
         k_configured=k,
         node_live=node_live,
-        now_ns=int(now.timestamp() * 1e9),
+        now_ns=now_ns,
         state=watch,
         node_pid=pid,
+        fresh=probe_due,
     )
+    # A send that raises may have written the outbox entry first, and the port
+    # cannot say. durable_alert_send itself contains its errors and reports
+    # non-durable only when the outbox refused AND the POST failed, so a raise is
+    # a defect path: retry it on the 60 s throttle only, never every poll.
+    watch.last_send_fail_ns = None
     for spec in specs:
         payload = AlertPayload(
             severity=spec.severity, event=spec.event, site="trade_node", detail=spec.detail.value
@@ -3207,12 +3272,12 @@ def _do_breaker_watch(
             log_decision(
                 "breaker_watch_alert_send_raised", alert=spec.event, error_type=type(exc).__name__
             )
-            watch.last_probe_ns = None  # a lost send is retried next poll, not in 10 min
+            watch.last_send_fail_ns = now_ns
             continue
         if durable:
-            watch.delivered(spec, int(now.timestamp() * 1e9))
+            watch.delivered(spec, now_ns)
         else:
-            watch.last_probe_ns = None
+            watch.last_send_fail_ns = now_ns
             log_decision("breaker_watch_alert_not_durable", alert=spec.event)
 
 
