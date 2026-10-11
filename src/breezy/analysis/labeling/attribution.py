@@ -8,6 +8,11 @@
   C5 CHAMPION on the venue at ``ts_event``, and rule (c), the bridge: the base-slug grammar, the
   stored latch key, and exactly one manifest matching kind, venue, station and date window. (b) and
   (c) disagreeing, or neither naming exactly one family, is UNRESOLVED.
+  Rule (c'), the post-terminal straddle (TE-1 R11), applies only when the strict bridge names no
+  family: a fill for the day after a manifest's declared terminal day, sent while that terminal day
+  was still running in UTC, is stored under that family with ``BridgeBasis.BRIDGE_POST_TERMINAL``.
+  The terminal key's purpose is statistical (it keeps a successor's rows out of a tally); a
+  pre-epoch row never feeds a statistic, so the straddle cannot breach it.
 
 No rule here reads a manifest's ``trial_id_prefix``: two families can share one, and the stored
 latch key is not derived from it (G35).
@@ -15,11 +20,13 @@ latch key is not derived from it (G35).
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import os
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -27,6 +34,7 @@ from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFi
 from breezy.analysis.labeling.epoch import EpochClass, EpochOutcome, EpochReader, fill_epoch_class
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
+from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 from breezy.persistence.autonomy.canonical import canonical_json
 from breezy.persistence.autonomy.capture_reader import DecisionView, OrderLinkView
 from breezy.persistence.autonomy.label_schema import ExcludedReason, PSource
@@ -41,6 +49,7 @@ __all__ = [
     "UNRESOLVED_JOURNAL_DIR",
     "Attribution",
     "BackfillRefused",
+    "BridgeBasis",
     "C1Lookup",
     "PreEpochAttribution",
     "Unresolved",
@@ -54,6 +63,7 @@ __all__ = [
     "label_family_of",
     "label_family_set",
     "latch_key_exists",
+    "post_terminal_straddle",
     "unresolved_row_of",
     "write_unresolved_journal",
 ]
@@ -63,6 +73,9 @@ _JOURNAL_FILE_MODE: Final[int] = 0o600
 _FQ_KIND: Final[str] = "forecast_quantile_ladder"
 _TAKE: Final[str] = "Take"
 _FOLD_DISAGREEMENT: Final[str] = "c1_fold_disagreement"
+_STRADDLE_CONFLICT: Final[str] = "straddle_successor_conflict"
+_NS_PER_S: Final[int] = 1_000_000_000
+_NS_PER_DAY: Final[int] = 86_400 * _NS_PER_S
 
 #: ``(venue, ts_event_ns) -> the CHAMPION family on that venue then, or None``: the C5 fold query.
 ChampionAt = Callable[[str, int], str | None]
@@ -108,6 +121,15 @@ class Attribution:
         return None
 
 
+class BridgeBasis(StrEnum):
+    """How a PRE_EPOCH storage key was reached (R11): the C5 fold, the strict bridge, or the
+    disclosed post-terminal straddle."""
+
+    FOLD = "fold"
+    BRIDGE = "bridge"
+    BRIDGE_POST_TERMINAL = "bridge_post_terminal"
+
+
 @dataclass(frozen=True)
 class PreEpochAttribution:
     """A PRE_EPOCH fill: ``storage_key`` names the label file only. It is never an attribution."""
@@ -117,6 +139,7 @@ class PreEpochAttribution:
     admissible: bool = False
     excluded_reason: ExcludedReason = ExcludedReason.UNATTRIBUTED
     allowed_p_sources: tuple[PSource, ...] = (PSource.ARTEFACT_RECOMPUTE, PSource.NONE)
+    basis: BridgeBasis = BridgeBasis.BRIDGE
 
 
 def attribute_post_epoch(
@@ -236,6 +259,86 @@ def _bridge_family(
     return next(iter(matching)) if len(matching) == 1 else None
 
 
+def _day_start_ns(day: dt.date) -> int:
+    return int(dt.datetime(day.year, day.month, day.day, tzinfo=dt.UTC).timestamp()) * _NS_PER_S
+
+
+def post_terminal_straddle(manifest: FamilyManifest, climate_day: str, ts_event_ns: int) -> bool:
+    """Whether a fill for ``climate_day`` straddles ``manifest``'s declared terminal day (R11).
+
+    Covers the DATE and TIMESTAMP conditions only, not kind, venue, station or the stored latch
+    key: ``climate_day`` is exactly the terminal day plus one, and the fill was sent inside the
+    terminal day's UTC span (``terminal 00:00Z <= ts < (terminal + 1 day) 00:00Z``). UTC midnight
+    precedes local midnight at every US station (UTC-4..UTC-10), so the bound is conservative. An
+    open manifest or a malformed date never straddles (fail closed).
+    """
+    if manifest.terminal_climate_day is None:
+        return False
+    try:
+        terminal = dt.date.fromisoformat(manifest.terminal_climate_day)
+        day = dt.date.fromisoformat(climate_day)
+    except ValueError:
+        return False
+    if day != terminal + dt.timedelta(days=1):
+        return False
+    start = _day_start_ns(terminal)
+    return start <= ts_event_ns < start + _NS_PER_DAY
+
+
+def _trial_key_of(fill: DurableFillRecord) -> tuple[WeatherBucketFacts, str] | None:
+    """``(facts, stored latch key)`` of an FQ-shaped fill, or ``None`` when it is not bridgeable."""
+    facts = bucket_facts_from_instrument_id(fill.instrument_id)
+    if facts is None:
+        return None
+    rung_id = fq_rung_id(facts.lower_f, facts.upper_f)
+    if rung_id is None:
+        return None
+    leg = "no" if symbol_of_instrument_id(fill.instrument_id).endswith("^no") else "yes"
+    key = fq_trial_id(facts.settlement_station, facts.climate_day.isoformat(), rung_id, leg)
+    return facts, key
+
+
+def _straddle_family(
+    fill: DurableFillRecord,
+    manifests: Sequence[FamilyManifest],
+    climate_day: str,
+    trial_key_exists: Callable[[str], bool],
+    venue: str,
+) -> str | None:
+    """Rule (c'): the one manifest whose terminal day this fill straddles, else ``None``.
+
+    Evaluated whenever a fill is bridgeable, USED only when the strict bridge names no family; a
+    strict set of two or more never falls through. The stored latch key is checked last, and only
+    when exactly one candidate survives.
+    """
+    parsed = _trial_key_of(fill)
+    if parsed is None:
+        return None
+    facts, key = parsed
+    station = facts.settlement_station
+    scoped = [
+        m
+        for m in manifests
+        if m.composition_kind == _FQ_KIND
+        and m.venue == venue
+        and station in m.stations
+        and m.d0_climate_day <= climate_day
+    ]
+    strict = {
+        m.family_id
+        for m in scoped
+        if m.terminal_climate_day is None or climate_day <= m.terminal_climate_day
+    }
+    if len(strict) >= 2:
+        return None
+    candidates = {
+        m.family_id for m in scoped if post_terminal_straddle(m, climate_day, fill.ts_event)
+    }
+    if len(candidates) != 1 or not trial_key_exists(key):
+        return None
+    return next(iter(candidates))
+
+
 def backfill_family(
     fill: DurableFillRecord,
     manifests: Sequence[FamilyManifest],
@@ -250,12 +353,27 @@ def backfill_family(
         raise BackfillRefused("backfill rules never run on a post-epoch fill")
     by_fold = champion_at(venue, fill.ts_event) if champion_at is not None else None
     by_bridge = _bridge_family(fill, manifests, trial_key_exists, venue)
-    if by_fold is not None and by_bridge is not None and by_fold != by_bridge:
+    facts = bucket_facts_from_instrument_id(fill.instrument_id)
+    by_straddle = (
+        None
+        if facts is None
+        else _straddle_family(
+            fill, manifests, facts.climate_day.isoformat(), trial_key_exists, venue
+        )
+    )
+    bridge, basis = by_bridge, BridgeBasis.BRIDGE
+    if by_bridge is None and by_straddle is not None:
+        bridge, basis = by_straddle, BridgeBasis.BRIDGE_POST_TERMINAL
+    elif by_bridge is not None and by_straddle is not None and by_bridge != by_straddle:
+        return Unresolved(_STRADDLE_CONFLICT)
+    if by_fold is not None and bridge is not None and by_fold != bridge:
         return Unresolved("backfill_disagreement")
-    chosen = by_fold if by_fold is not None else by_bridge
+    chosen = by_fold if by_fold is not None else bridge
     if chosen is None:
         return Unresolved("no_backfill_family")
-    return PreEpochAttribution(storage_key=chosen)
+    return PreEpochAttribution(
+        storage_key=chosen, basis=BridgeBasis.FOLD if by_fold is not None else basis
+    )
 
 
 class _Evidence(EpochReader, C1Lookup, Protocol):

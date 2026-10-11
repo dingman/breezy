@@ -578,17 +578,24 @@ def test_record_skip_cli_write_failure_exits_one(tmp_path: Path) -> None:
     assert rc == 1
 
 
-def test_default_mode_without_a_deps_wiring_fails_closed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_default_mode_with_an_unpinned_producer_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The production planner and settlement source are wired by the coordinator at promotion;
-    until then the default run refuses with exit 2 rather than label from a guess."""
+    """The default mode composes production deps through ``unit_factory_default``; while
+    ``aut2.label`` is not pinned to the ``label_run`` closure it refuses (exit 2) rather than label
+    from an unaudited build, and writes nothing. The factory must reach ``producer_pin_state``
+    through the ``unit_wiring`` module attribute, or this substitution is bypassed."""
+    from breezy.analysis.labeling import unit_wiring
+
+    monkeypatch.setattr(unit_wiring, "producer_pin_state", lambda: (False, "0" * 64))
+
     rc = main(
         ["--data-root", str(tmp_path / "d"), "--exec-db", str(tmp_path / "e")],
         unit_context=_IN_UNIT,
     )
 
-    assert rc == 2 and "LABEL_OUTCOMES REFUSED reason=not_wired" in capsys.readouterr().out
+    assert rc == 2 and "LABEL_OUTCOMES REFUSED reason=producer_unpinned" in capsys.readouterr().out
+    assert not (tmp_path / "d").exists()
 
 
 # -- measure-peak ----------------------------------------------------------------------------------

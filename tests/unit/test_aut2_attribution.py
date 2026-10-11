@@ -8,6 +8,7 @@ consistency check, never an attribution source.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import json
 import re
 from dataclasses import replace
@@ -21,6 +22,7 @@ from breezy.analysis.labeling import attribution
 from breezy.analysis.labeling.attribution import (
     Attribution,
     BackfillRefused,
+    BridgeBasis,
     PreEpochAttribution,
     Unresolved,
     UnresolvedRow,
@@ -46,6 +48,7 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     PersistentQuantileLadderLatch,
 )
 from tests.support.aut2_fixtures import NO, TS, VENUE, durable_fill, make_decision, make_link
+from tests.support.te1_fixtures import day_start_ns, load_repo_manifests, slug
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _decision = make_decision
@@ -417,3 +420,179 @@ def test_equal_timestamps_are_accepted() -> None:
     c1 = _c1(_link(ts_ns=TS - 10), decisions=(_decision(ts_ns=TS - 10),))
 
     assert isinstance(attribute_post_epoch(_fill(), c1, venue=VENUE), Attribution)
+
+
+# -- TE-1 R11: the post-terminal straddle ---------------------------------------------------------
+# Latch keys come from the real writer (L-42) and the key check is the production
+# ``latch_key_exists`` against a real SQLite store (L-55), never a lambda.
+
+_P_DAY = "2026-10-06"  # the climate day after pm_us_crh_fq_v1's terminal day 2026-10-05
+_P_KEY = ("LAX", _P_DAY, "89_90", "yes")
+_P_TS = day_start_ns("2026-10-05", 17)
+
+
+def _latch_store(tmp_path: Path, keys: tuple[tuple[str, str, str, str], ...]) -> Path:
+    store_path = tmp_path / "state.db"
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+        trial_latch = open_trial_day_latch(
+            intent_latch, key_prefix=FORECAST_QUANTILE_TRIAL_KEY_PREFIX, family_id="pm_us_fq_test"
+        )
+        writer = PersistentQuantileLadderLatch(trial_latch)
+        for station, day, rung_id, side in keys:
+            writer.latch(
+                station=station,
+                climate_day=date.fromisoformat(day),
+                rung_id=rung_id,
+                side=side,  # type: ignore[arg-type]
+            )
+    return store_path
+
+
+def _p_fill(day: str = _P_DAY, ts: int = _P_TS) -> Any:
+    return durable_fill(
+        venue_order_id="vo-p",
+        client_order_id="O-p",
+        instrument_id=slug("LAX", day, 89),
+        ts_event=ts,
+    )
+
+
+def _v1(**over: Any) -> FamilyManifest:
+    return _manifest(terminal_climate_day="2026-10-05", **over)
+
+
+def _backfill_p(
+    tmp_path: Path,
+    manifests: tuple[FamilyManifest, ...],
+    *,
+    fill: Any = None,
+    keys: tuple[tuple[str, str, str, str], ...] = (_P_KEY,),
+    champion_at: Any = None,
+) -> Any:
+    store = _latch_store(tmp_path, keys)
+    return backfill_family(
+        fill if fill is not None else _p_fill(),
+        manifests,
+        epoch_class=EpochClass.PRE_EPOCH,
+        champion_at=champion_at,
+        trial_key_exists=lambda key: latch_key_exists(store, key),
+        venue=VENUE,
+    )
+
+
+def test_post_terminal_straddle_bridges_with_basis(tmp_path: Path) -> None:
+    result = _backfill_p(tmp_path, (_v1(),))
+
+    assert result == PreEpochAttribution(
+        storage_key="pm_us_crh_fq_v1", basis=BridgeBasis.BRIDGE_POST_TERMINAL
+    )
+
+
+def test_post_terminal_fill_after_terminal_day_end_is_unresolved(tmp_path: Path) -> None:
+    fill = _p_fill(ts=day_start_ns("2026-10-06"))  # 00:00:00Z of the straddle day: bound is open
+
+    assert _backfill_p(tmp_path, (_v1(),), fill=fill) == Unresolved("no_backfill_family")
+
+
+def test_post_terminal_fill_before_terminal_day_start_is_unresolved(tmp_path: Path) -> None:
+    fill = _p_fill(ts=day_start_ns("2026-10-05") - 1)  # one ns before the terminal day began
+
+    assert _backfill_p(tmp_path, (_v1(),), fill=fill) == Unresolved("no_backfill_family")
+
+
+def test_post_terminal_two_days_past_is_unresolved(tmp_path: Path) -> None:
+    fill = _p_fill(day="2026-10-07")
+    keys = (("LAX", "2026-10-07", "89_90", "yes"),)
+
+    assert _backfill_p(tmp_path, (_v1(),), fill=fill, keys=keys) == Unresolved("no_backfill_family")
+
+
+def test_post_terminal_relaxed_ambiguity_is_unresolved(tmp_path: Path) -> None:
+    twin = _v1(family_id="pm_us_crh_fq_v1b")  # a second manifest with the same straddle shape
+
+    assert _backfill_p(tmp_path, (_v1(), twin)) == Unresolved("no_backfill_family")
+
+
+def test_strict_ambiguity_never_falls_through_to_straddle(tmp_path: Path) -> None:
+    open_a = _manifest(family_id="pm_us_crh_fq_a", d0_climate_day=_P_DAY)
+    open_b = _manifest(family_id="pm_us_crh_fq_b", d0_climate_day=_P_DAY)
+
+    assert _backfill_p(tmp_path, (_v1(), open_a, open_b)) == Unresolved("no_backfill_family")
+
+
+def test_post_terminal_requires_stored_latch_key(tmp_path: Path) -> None:
+    keys = (("LAX", _P_DAY, "88_89", "yes"),)  # a different rung is latched, not this one
+
+    assert _backfill_p(tmp_path, (_v1(),), keys=keys) == Unresolved("no_backfill_family")
+
+
+def test_open_manifest_never_takes_straddle_branch(tmp_path: Path) -> None:
+    result = _backfill_p(tmp_path, (_manifest(),))  # no terminal: the strict rule names it
+
+    assert isinstance(result, PreEpochAttribution)
+    assert result.basis is BridgeBasis.BRIDGE
+
+
+def test_strict_single_match_wins_when_no_straddle_candidate(tmp_path: Path) -> None:
+    successor = _manifest(family_id="pm_us_crh_fq_v2", d0_climate_day=_P_DAY)
+    late = _p_fill(ts=day_start_ns(_P_DAY, 1))  # after 00:00Z: the predecessor cannot straddle
+
+    result = _backfill_p(tmp_path, (_v1(), successor), fill=late)
+
+    assert result == PreEpochAttribution(storage_key="pm_us_crh_fq_v2", basis=BridgeBasis.BRIDGE)
+
+
+def test_straddle_successor_conflict_is_unresolved(tmp_path: Path) -> None:
+    successor = _manifest(family_id="pm_us_crh_fq_v2", d0_climate_day=_P_DAY)
+
+    result = _backfill_p(tmp_path, (_v1(), successor))
+
+    assert result == Unresolved("straddle_successor_conflict")
+
+
+def test_post_terminal_row_still_unattributed_and_inadmissible(tmp_path: Path) -> None:
+    result = _backfill_p(tmp_path, (_v1(),))
+
+    assert isinstance(result, PreEpochAttribution)  # guard first: fails on assertion, not attribute
+    assert result.excluded_reason is ExcludedReason.UNATTRIBUTED
+    assert result.admissible is False and result.decision_id is None
+
+
+def test_backfill_fold_basis_is_fold(tmp_path: Path) -> None:
+    fill = _fill()  # climate day 2026-10-02: inside the manifest window
+    key = (("LAX", "2026-10-02", "89_90", "yes"),)
+
+    result = _backfill_p(
+        tmp_path,
+        (_manifest(),),
+        fill=fill,
+        keys=key,
+        champion_at=lambda venue, ts: "pm_us_crh_fq_v1",
+    )
+
+    assert result == PreEpochAttribution(storage_key="pm_us_crh_fq_v1", basis=BridgeBasis.FOLD)
+
+
+def test_station_utc_offsets_within_straddle_assumption() -> None:
+    """R11.4: UTC midnight precedes local midnight at every station an FQ manifest names."""
+    from zoneinfo import ZoneInfo
+
+    tz = {
+        "LAX": "America/Los_Angeles",
+        "SFO": "America/Los_Angeles",
+        "MDW": "America/Chicago",
+        "MIA": "America/New_York",
+        "NYC": "America/New_York",
+    }
+    stations = {
+        s
+        for m in load_repo_manifests()
+        if m.composition_kind == "forecast_quantile_ladder" and m.venue == VENUE
+        for s in m.stations
+    }
+    assert stations and stations <= set(tz)
+    for station in stations:
+        for month in (1, 7):  # two of the five straddle fills are in DST
+            moment = dt.datetime(2026, month, 15, 12, tzinfo=ZoneInfo(tz[station]))
+            hours = moment.utcoffset().total_seconds() / 3600  # type: ignore[union-attr]
+            assert -10 <= hours <= -4, (station, month, hours)

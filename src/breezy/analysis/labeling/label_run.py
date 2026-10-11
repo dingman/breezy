@@ -3,8 +3,9 @@
 Modes (all production writes refuse outside ``breezy-label-outcomes.service``, plan Q1):
 
 * default: ``run_unit`` takes the studies flock, applies the memory gate, runs ``run_labels`` and,
-  after a marker, the proof-window hook. Its production deps (planner, settlement catalog) are wired
-  by the coordinator at promotion; until then the default mode refuses (``reason=not_wired``).
+  after a marker, the proof-window hook. Its production deps (planner, settlement catalog) come from
+  ``unit_factory_default`` (lazily imported by ``_resolve_factory``); the mode refuses
+  (``reason=producer_unpinned``, exit 2) while ``aut2.label`` is not pinned to this closure.
 * ``--record-skip``: the lock-skip journal (L1).
 * ``--canary`` and ``--proof-window``: WP8.
 * ``--measure-peak --output-root <dir>``: a measurement that writes only under ``<dir>``.
@@ -827,6 +828,33 @@ def _record_skip_main(args: argparse.Namespace) -> int:
     return rc
 
 
+def _resolve_factory(unit_factory: UnitFactory | None) -> UnitFactory:
+    """The injected factory unchanged, else the production default.
+
+    The default is imported here, not at module level: ``unit_factory_default`` imports
+    ``UnitWiring`` and ``StudiesFlock`` from this module, so a top-level import would be a cycle.
+    """
+    if unit_factory is not None:
+        return unit_factory
+    from breezy.analysis.labeling.unit_factory_default import factory
+
+    return factory
+
+
+def _build_wiring(args: argparse.Namespace, unit_factory: UnitFactory | None) -> UnitWiring | None:
+    """The unit wiring, or ``None`` after printing the refusal: ``aut2.label`` is not pinned, or
+    the production host seams were asked for outside the real unit."""
+    from breezy.analysis.labeling.unit_wiring import HostSeamsRefused, ProducerUnpinned
+
+    try:
+        return _resolve_factory(unit_factory)(args)
+    except ProducerUnpinned:
+        print("LABEL_OUTCOMES REFUSED reason=producer_unpinned")
+    except HostSeamsRefused:
+        print("LABEL_OUTCOMES REFUSED reason=not_under_unit")
+    return None
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -854,10 +882,9 @@ def main(
         return _proof_window_main(args)
     if args.record_skip:
         return _record_skip_main(args)
-    if unit_factory is None:
-        print("LABEL_OUTCOMES REFUSED reason=not_wired")
+    wiring = _build_wiring(args, unit_factory)
+    if wiring is None:
         return _RC_REFUSED
-    wiring = unit_factory(args)
     result = run_unit(
         wiring.deps,
         lock=wiring.lock,
@@ -889,10 +916,9 @@ def _measure_main(
     if _mem_available_bytes(chosen.meminfo_path) < floor:
         print("LABEL_OUTCOMES MEASURE_ABORTED reason=memavailable")
         return _RC_REFUSED
-    if unit_factory is None:
-        print("LABEL_OUTCOMES REFUSED reason=not_wired")
+    wiring = _build_wiring(args, unit_factory)
+    if wiring is None:
         return _RC_REFUSED
-    wiring = unit_factory(args)
     result = measure_peak(
         wiring.deps,
         output_root=args.output_root,

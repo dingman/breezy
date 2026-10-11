@@ -71,6 +71,7 @@ __all__ = [
     "admissible_rows",
     "label_relative_path",
     "labels_consumable",
+    "oldest_marker_ns",
     "read_labels",
     "read_newest_marker",
     "write_labels",
@@ -607,3 +608,22 @@ def read_newest_marker(data_root: Path, *, day: str | None = None) -> RunMarker 
         return _decode_marker(raw, ns)
     finally:
         os.close(rootfd)
+
+
+def oldest_marker_ns(data_root: Path) -> int | None:
+    """The ``now_ns`` of the OLDEST run marker across every day, or ``None`` when there is none.
+
+    The first-activation instant of a label unit (TE-1 R4). Parsed through :func:`_marker_ns`, so
+    a file in a marker directory that is not a marker raises :class:`MarkerCorrupt`: a corrupt name
+    never lets a later start silently pass for the first one.
+    """
+    rootfd = open_root(data_root)
+    try:
+        stamps = [
+            _marker_ns(name)
+            for day in _list_or_empty(rootfd, MARKER_DIR)
+            for name in _list_or_empty(rootfd, (*MARKER_DIR, day))
+        ]
+    finally:
+        os.close(rootfd)
+    return min(stamps, default=None)
