@@ -26,6 +26,7 @@ from breezy.runtime.exec_par_records import ExcludedDay
 S = 1_000_000_000
 D1 = "2026-10-08"
 D2 = "2026-10-09"
+WALL = 7_000_000
 
 
 def _counts(posted: int = 3, amb: int = 1, fills: int = 2, spend: str = "12.50") -> DayCounts:
@@ -44,7 +45,7 @@ class FakeSources:
         self.slots[day] = SlotDayCounts(posted_entries=c.posted_entries, ambiguous=c.ambiguous)
         self.spend[day] = c.spend_usd
 
-    def fill_count(self, day: str) -> int | None:
+    def entry_fill_count(self, day: str) -> int | None:
         self.reads.append("fills")
         return self.fills.get(day)
 
@@ -62,6 +63,10 @@ class FakeCounters:
     counts: dict[str, DayCounts] = field(default_factory=dict)
     gappy: set[str] = field(default_factory=set)
     rebuilds: list[RebuildRecord] = field(default_factory=list)
+    pending: dict[str, RebuildRecord] = field(default_factory=dict)
+    marks: list[tuple[str, str]] = field(default_factory=list)
+    fail_replace_once: bool = False
+    fail_clear_once: bool = False
     phases: list[tuple[int, int | None]] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
 
@@ -70,6 +75,9 @@ class FakeCounters:
         return self.counts.get(day)
 
     def replace_day_counts(self, day: str, counts: DayCounts) -> None:
+        if self.fail_replace_once:
+            self.fail_replace_once = False
+            raise OSError("crash before replace")
         self.log.append("replace")
         self.counts[day] = counts
 
@@ -77,10 +85,24 @@ class FakeCounters:
         return frozenset(self.gappy)
 
     def clear_gappy_mark(self, day: str) -> None:
+        if self.fail_clear_once:
+            self.fail_clear_once = False
+            raise OSError("crash before clear")
+        self.log.append("clear")
         self.gappy.discard(day)
+        self.pending.pop(day, None)  # clearing the mark completes the rebuild
+
+    def mark_gappy_day(self, day: str, kind: str) -> None:
+        self.marks.append((day, kind))
+        self.gappy.add(day)
+
+    def read_pending_rebuild(self, day: str) -> RebuildRecord | None:
+        return self.pending.get(day)
 
     def write_rebuild_record(self, record: RebuildRecord) -> None:
+        self.log.append("record")
         self.rebuilds.append(record)
+        self.pending[record.day] = record
 
     def write_reconcile_phase(self, *, start_ns: int, ok_ns: int | None) -> None:
         self.phases.append((start_ns, ok_ns))
@@ -115,7 +137,14 @@ def _ticker(*times: int) -> Callable[[], int]:
 def test_matching_non_gappy_day_is_unchanged() -> None:
     c = _counts()
     verdict = reconcile_day(
-        D1, stored=c, fills=2, slots=SlotDayCounts(3, 1), spend=Decimal("12.50"), gappy=False
+        D1,
+        stored=c,
+        fills=2,
+        slots=SlotDayCounts(3, 1),
+        spend=Decimal("12.50"),
+        gappy=False,
+        expected_counters=True,
+        pending=None,
     )
     assert verdict.kind is DayOutcomeKind.UNCHANGED
     assert verdict.mismatch_kinds == ()
@@ -124,27 +153,48 @@ def test_matching_non_gappy_day_is_unchanged() -> None:
 def test_mismatch_reports_each_kind_sorted_and_rebuilds_from_durable() -> None:
     stored = _counts(posted=2, amb=0, fills=1, spend="1")
     verdict = reconcile_day(
-        D1, stored=stored, fills=2, slots=SlotDayCounts(3, 1), spend=Decimal("12.50"), gappy=False
+        D1,
+        stored=stored,
+        fills=2,
+        slots=SlotDayCounts(3, 1),
+        spend=Decimal("12.50"),
+        gappy=False,
+        expected_counters=True,
+        pending=None,
     )
     assert verdict.kind is DayOutcomeKind.REBUILT
     assert verdict.mismatch_kinds == ("ambiguous", "fills", "posted_entries", "spend")
     assert verdict.rebuilt == _counts()
 
 
-def test_missing_counters_rebuild_with_missing_kind() -> None:
+def test_missing_counters_rebuild_with_counter_missing_kind() -> None:
     verdict = reconcile_day(
-        D1, stored=None, fills=2, slots=SlotDayCounts(3, 1), spend=Decimal("12.50"), gappy=False
+        D1,
+        stored=None,
+        fills=2,
+        slots=SlotDayCounts(3, 1),
+        spend=Decimal("12.50"),
+        gappy=False,
+        expected_counters=True,
+        pending=None,
     )
     assert verdict.kind is DayOutcomeKind.REBUILT
-    assert verdict.mismatch_kinds == ("missing",)
+    assert verdict.mismatch_kinds == ("counter_missing",)
 
 
-def test_gappy_day_with_matching_counters_still_rebuilds_with_no_mismatch() -> None:
+def test_gappy_day_with_matching_counters_rebuilds_with_a_non_empty_kind() -> None:
     verdict = reconcile_day(
-        D1, stored=_counts(), fills=2, slots=SlotDayCounts(3, 1), spend=Decimal("12.50"), gappy=True
+        D1,
+        stored=_counts(),
+        fills=2,
+        slots=SlotDayCounts(3, 1),
+        spend=Decimal("12.50"),
+        gappy=True,
+        expected_counters=True,
+        pending=None,
     )
     assert verdict.kind is DayOutcomeKind.REBUILT
-    assert verdict.mismatch_kinds == ()
+    assert verdict.mismatch_kinds == ("gappy_verified",)
 
 
 @pytest.mark.parametrize(
@@ -164,7 +214,16 @@ def test_gappy_day_with_matching_counters_still_rebuilds_with_no_mismatch() -> N
 def test_inconsistent_durable_sources_are_unreconcilable(
     fills: int | None, slots: SlotDayCounts | None, spend: Decimal | None, reason: str
 ) -> None:
-    verdict = reconcile_day(D1, stored=_counts(), fills=fills, slots=slots, spend=spend, gappy=True)
+    verdict = reconcile_day(
+        D1,
+        stored=_counts(),
+        fills=fills,
+        slots=slots,
+        spend=spend,
+        gappy=True,
+        expected_counters=True,
+        pending=None,
+    )
     assert verdict.kind is DayOutcomeKind.DAY_EXCLUDED
     assert verdict.reason == reason
     assert verdict.rebuilt is None
@@ -180,6 +239,8 @@ def _run(
     excluded: FakeExcluded,
     clock: Callable[[], int],
     ingested: Callable[[], bool] = lambda: True,
+    wall: Callable[[], int] = lambda: WALL,
+    expected: Callable[[str], bool] = lambda _day: True,
 ) -> PassResult:
     return run_reconcile_pass(
         days,
@@ -187,7 +248,9 @@ def _run(
         counters=counters,
         sources=sources,
         excluded=excluded,
-        clock_ns=clock,
+        monotonic_ns=clock,
+        wall_ns=wall,
+        counters_expected=expected,
     )
 
 
@@ -204,6 +267,7 @@ def test_rebuild_case_rewrites_counters_clears_gappy_records_and_emits_event() -
     assert counters.gappy == set()
     assert [r.day for r in counters.rebuilds] == [D1]
     assert counters.rebuilds[0].mismatch_kinds == ("posted_entries",)
+    assert counters.log == ["read", "record", "replace", "clear"]
     assert [(e.day, e.mismatch_kinds) for e in result.rebuild_events] == [(D1, ("posted_entries",))]
     assert result.excluded_events == ()
     assert excluded.rows == []
@@ -221,7 +285,7 @@ def test_exclusion_case_adds_excluded_day_and_leaves_counters_and_mark_alone() -
 
     assert [o.kind for o in result.outcomes] == [DayOutcomeKind.DAY_EXCLUDED]
     assert [(r.day, r.cause, r.ts) for r in excluded.rows] == [
-        (D1, "unreconcilable:fills_unreadable", 110)
+        (D1, "unreconcilable:fills_unreadable", WALL)
     ]
     assert [e.day for e in result.excluded_events] == [D1]
     assert counters.counts[D1] == _counts()
@@ -249,7 +313,14 @@ def test_phase_timestamps_are_recorded_start_then_ok() -> None:
     sources = FakeSources()
     sources.set_day(D1, _counts())
 
-    result = _run((D1,), counters, sources, FakeExcluded(), _ticker(1_000, 1_500, 2_000))
+    result = _run(
+        (D1,),
+        counters,
+        sources,
+        FakeExcluded(),
+        _ticker(10, 20, 30),
+        wall=_ticker(1_000, 2_000),
+    )
 
     assert result.reconcile_start_ns == 1_000
     assert result.reconcile_ok_ns == 2_000
@@ -278,8 +349,9 @@ def test_ordering_guard_that_raises_is_treated_as_not_ingested() -> None:
         raise RuntimeError("probe failed")
 
     counters = FakeCounters()
-    with pytest.raises(ReconcileOrderingError):
+    with pytest.raises(ReconcileOrderingError) as info:
         _run((D1,), counters, FakeSources(), FakeExcluded(), _ticker(1), ingested=boom)
+    assert isinstance(info.value.__cause__, RuntimeError)
     assert counters.phases == []
 
 
@@ -315,7 +387,7 @@ def test_exceeding_300s_returns_reconcile_stuck_without_halting_and_stops_early(
     assert [o.day for o in result.outcomes] == [D1]
     assert result.unprocessed_days == (D2,)
     assert counters.gappy == {D2}
-    assert counters.phases == [(0, None)]
+    assert counters.phases == [(WALL, None)]
 
 
 def test_exactly_300s_is_not_stuck() -> None:
@@ -326,7 +398,7 @@ def test_exactly_300s_is_not_stuck() -> None:
     result = _run((D1,), counters, sources, FakeExcluded(), _ticker(0, 150 * S, 300 * S))
 
     assert result.status is PassStatus.OK
-    assert result.reconcile_ok_ns == 300 * S
+    assert result.reconcile_ok_ns == WALL
 
 
 def test_finishing_past_the_bound_is_stuck_and_ok_is_not_recorded() -> None:
@@ -338,7 +410,7 @@ def test_finishing_past_the_bound_is_stuck_and_ok_is_not_recorded() -> None:
 
     assert result.status is PassStatus.RECONCILE_STUCK
     assert result.reconcile_ok_ns is None
-    assert counters.phases == [(0, None)]
+    assert counters.phases == [(WALL, None)]
 
 
 def test_pass_is_deterministic_and_order_independent() -> None:
@@ -359,3 +431,127 @@ def test_pass_is_deterministic_and_order_independent() -> None:
     assert a_c.counts == b_c.counts
     assert a_e.rows == b_e.rows
     assert [o.day for o in first.outcomes] == [D1, D2]
+
+
+# -- R3: rebuild ordering and crash safety ------------------------------------
+
+
+def _rebuild_world() -> tuple[FakeCounters, FakeSources]:
+    counters = FakeCounters(counts={D1: _counts(posted=1)}, gappy={D1})
+    sources = FakeSources()
+    sources.set_day(D1, _counts())
+    return counters, sources
+
+
+def test_crash_between_record_and_replace_preserves_kinds_on_rerun() -> None:
+    counters, sources = _rebuild_world()
+    counters.fail_replace_once = True
+    with pytest.raises(OSError, match="before replace"):
+        _run((D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3))
+    assert counters.pending[D1].mismatch_kinds == ("posted_entries",)
+    assert counters.counts[D1] == _counts(posted=1)
+
+    result = _run((D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3))
+
+    assert [e.mismatch_kinds for e in result.rebuild_events] == [("posted_entries",)]
+    assert counters.counts[D1] == _counts()
+    assert counters.gappy == set()
+    assert counters.pending == {}
+
+
+def test_crash_between_replace_and_clear_completes_idempotently_with_kinds() -> None:
+    counters, sources = _rebuild_world()
+    counters.fail_clear_once = True
+    with pytest.raises(OSError, match="before clear"):
+        _run((D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3))
+    assert counters.counts[D1] == _counts()  # replace landed
+    assert counters.gappy == {D1}
+
+    result = _run((D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3))
+
+    # stored now equals durable, yet the pending record keeps the real kinds
+    assert [e.mismatch_kinds for e in result.rebuild_events] == [("posted_entries",)]
+    assert counters.gappy == set()
+    assert counters.pending == {}
+    assert len(counters.rebuilds) == 1  # the pending record was not rewritten
+
+
+def test_pending_record_with_stale_counts_is_ignored() -> None:
+    verdict = reconcile_day(
+        D1,
+        stored=_counts(),
+        fills=2,
+        slots=SlotDayCounts(3, 1),
+        spend=Decimal("12.50"),
+        gappy=True,
+        expected_counters=True,
+        pending=RebuildRecord(D1, 5, ("fills",), _counts(fills=1)),
+    )
+    assert verdict.mismatch_kinds == ("gappy_verified",)
+
+
+# -- R4: missing counters -----------------------------------------------------
+
+
+def test_missing_counters_are_marked_gappy_then_rebuilt_with_visible_kind() -> None:
+    counters = FakeCounters()
+    sources = FakeSources()
+    sources.set_day(D1, _counts())
+
+    result = _run((D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3))
+
+    assert counters.marks == [(D1, "counter_missing")]
+    assert [(e.day, e.mismatch_kinds) for e in result.rebuild_events] == [
+        (D1, ("counter_missing",))
+    ]
+    assert counters.counts[D1] == _counts()
+    assert counters.gappy == set()
+
+
+def test_missing_counters_with_inconsistent_sources_exclude_and_stay_gappy() -> None:
+    counters = FakeCounters()
+    sources = FakeSources()
+    sources.set_day(D1, _counts())
+    sources.spend[D1] = None
+    excluded = FakeExcluded()
+
+    result = _run((D1,), counters, sources, excluded, _ticker(1, 2, 3))
+
+    assert [o.kind for o in result.outcomes] == [DayOutcomeKind.DAY_EXCLUDED]
+    assert counters.gappy == {D1}
+    assert [r.day for r in excluded.rows] == [D1]
+
+
+def test_missing_counters_on_a_day_without_an_up_epoch_are_not_a_failure() -> None:
+    counters = FakeCounters()
+    sources = FakeSources()
+    sources.set_day(D1, _counts(0, 0, 0, "0"))
+
+    result = _run(
+        (D1,), counters, sources, FakeExcluded(), _ticker(1, 2, 3), expected=lambda _d: False
+    )
+
+    assert [o.kind for o in result.outcomes] == [DayOutcomeKind.UNCHANGED]
+    assert counters.marks == []
+    assert counters.rebuilds == []
+
+
+# -- R5: the bound uses the monotonic clock only --------------------------------
+
+
+def test_wall_clock_jump_does_not_trip_the_bound() -> None:
+    counters = FakeCounters(counts={D1: _counts()})
+    sources = FakeSources()
+    sources.set_day(D1, _counts())
+
+    result = _run(
+        (D1,),
+        counters,
+        sources,
+        FakeExcluded(),
+        _ticker(0, 1 * S, 2 * S),
+        wall=_ticker(0, 10_000 * S),
+    )
+
+    assert result.status is PassStatus.OK
+    assert isinstance(result.status, PassStatus)

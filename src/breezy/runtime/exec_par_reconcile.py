@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from itertools import pairwise
@@ -43,6 +42,7 @@ __all__ = [
     "DurableDaySources",
     "ExcludedDayWriter",
     "ExcludedEvent",
+    "FillRecord",
     "GapKind",
     "GapSpan",
     "PassResult",
@@ -51,7 +51,9 @@ __all__ = [
     "RebuildRecord",
     "ReconcileOrderingError",
     "SlotDayCounts",
+    "UnattributableFill",
     "compute_gap_spans",
+    "entry_fills_by_day",
     "gappy_days",
     "reconcile_day",
     "run_reconcile_pass",
@@ -123,14 +125,12 @@ def compute_gap_spans(
     return tuple(sorted(spans, key=lambda s: (s.start_ns, s.end_ns, s.kind.value)))
 
 
-def _utc_day(ns: int) -> str:
-    return datetime.fromtimestamp(ns // _NS, UTC).date().isoformat()
+def gappy_days(spans: Iterable[GapSpan], *, day_of: Callable[[int], str]) -> frozenset[str]:
+    """Every climate day a gap span touches.
 
-
-def gappy_days(
-    spans: Iterable[GapSpan], *, day_of: Callable[[int], str] = _utc_day
-) -> frozenset[str]:
-    """Every climate day a gap span touches (``day_of`` maps ns to a day key)."""
+    ``day_of`` must be injected and must be the climate-day function (never a
+    UTC-date default): it maps a timestamp in ns to the day key.
+    """
     days: set[str] = set()
     for span in spans:
         cursor = span.start_ns
@@ -169,15 +169,27 @@ class CounterStorePort(Protocol):
     def read_day_counts(self, day: str) -> DayCounts | None: ...
     def replace_day_counts(self, day: str, counts: DayCounts) -> None: ...
     def read_gappy_days(self) -> frozenset[str]: ...
-    def clear_gappy_mark(self, day: str) -> None: ...
+    def mark_gappy_day(self, day: str, kind: str) -> None: ...
+    def clear_gappy_mark(self, day: str) -> None:
+        """Clear the mark. MUST also retire the day's pending rebuild record."""
+
+    def read_pending_rebuild(self, day: str) -> RebuildRecord | None: ...
     def write_rebuild_record(self, record: RebuildRecord) -> None: ...
     def write_reconcile_phase(self, *, start_ns: int, ok_ns: int | None) -> None: ...
 
 
 class DurableDaySources(Protocol):
-    """Durable reads for a day; ``None`` means unreadable (never zero)."""
+    """Durable reads for a day; ``None`` means unreadable (never zero).
 
-    def fill_count(self, day: str) -> int | None: ...
+    ``entry_fill_count`` is the number of DISTINCT filled ENTRY orders (BUY,
+    not SELL) attributed to ``day`` by the entry's arm-time climate day (I2),
+    never by the fill's ``ts_event`` UTC day. Build it with
+    :func:`entry_fills_by_day`. Slot counts are likewise entry-only and keyed
+    by arm day, so AMBIGUOUS (always an armed entry slot: ``arm_slot`` runs
+    before the POST, including no-id outcomes) is a subset of posted entries.
+    """
+
+    def entry_fill_count(self, day: str) -> int | None: ...
     def slot_counts(self, day: str) -> SlotDayCounts | None: ...
     def ledger_spend(self, day: str) -> Decimal | None: ...
 
@@ -186,6 +198,47 @@ class ExcludedDayWriter(Protocol):
     """The BG-1a ``add_excluded_day`` writer; ``False`` if already excluded."""
 
     def add_excluded_day(self, record: ExcludedDay) -> bool: ...
+
+
+# -- entry-fill attribution (pure) --------------------------------------------
+
+
+class UnattributableFill(ValueError):
+    """A fill record cannot be placed on a climate day; treat the source as unreadable."""
+
+
+@dataclass(frozen=True, slots=True)
+class FillRecord:
+    """One fill-index record: venue order id, side, and the entry's arm time."""
+
+    order_id: str
+    side: str
+    arm_ns: int | None
+
+
+def entry_fills_by_day(
+    records: Iterable[FillRecord], *, day_of: Callable[[int], str]
+) -> dict[str, int]:
+    """Distinct filled entry orders per arm-time climate day.
+
+    SELL (exit) records are skipped: they have no posted entry and no ledger
+    spend. Repeated partial fills of one order id count once. An entry with no
+    arm time, an unknown side, or one order id mapping to two days raises
+    :class:`UnattributableFill` (fail closed).
+    """
+    day_by_order: dict[str, str] = {}
+    for record in records:
+        if record.side == "SELL":
+            continue
+        if record.side != "BUY" or record.arm_ns is None or not record.order_id:
+            raise UnattributableFill("fill record is not attributable")
+        day = day_of(record.arm_ns)
+        if day_by_order.setdefault(record.order_id, day) != day:
+            raise UnattributableFill("order id maps to two arm days")
+    counts: dict[str, int] = {}
+    for day in day_by_order.values():
+        counts[day] = counts.get(day, 0) + 1
+    return counts
 
 
 # -- per-day decision (pure) --------------------------------------------------
@@ -232,7 +285,7 @@ def _inconsistency(
 
 def _mismatch_kinds(stored: DayCounts | None, durable: DayCounts) -> tuple[str, ...]:
     if stored is None:
-        return ("missing",)
+        return ("counter_missing",)
     pairs = (
         ("ambiguous", stored.ambiguous, durable.ambiguous),
         ("fills", stored.fills, durable.fills),
@@ -250,17 +303,30 @@ def reconcile_day(
     slots: SlotDayCounts | None,
     spend: Decimal | None,
     gappy: bool,
+    expected_counters: bool,
+    pending: RebuildRecord | None,
 ) -> DayVerdict:
-    """Decide one day. Unreadable or self-contradictory sources exclude it."""
+    """Decide one day. Unreadable or self-contradictory sources exclude it.
+
+    ``expected_counters`` is whether the day's epoch was up; counters missing
+    for such a day are a ``counter_missing`` rebuild, never a silent one. A
+    ``pending`` rebuild record whose counts equal the durable counts supplies
+    the mismatch kinds (crash recovery). A rebuild's kinds are never empty.
+    """
     reason = _inconsistency(fills, slots, spend)
     if reason is not None:
         return DayVerdict(day, DayOutcomeKind.DAY_EXCLUDED, reason=reason)
     if fills is None or slots is None or spend is None:  # unreachable; narrows types
         return DayVerdict(day, DayOutcomeKind.DAY_EXCLUDED, reason="sources_unreadable")
     durable = DayCounts(slots.posted_entries, slots.ambiguous, fills, spend)
+    if stored is None and not expected_counters and pending is None:
+        return DayVerdict(day, DayOutcomeKind.UNCHANGED)
     kinds = _mismatch_kinds(stored, durable)
+    if pending is not None and pending.counts == durable:
+        kinds = pending.mismatch_kinds
     if not kinds and not gappy:
         return DayVerdict(day, DayOutcomeKind.UNCHANGED)
+    kinds = kinds or ("gappy_verified",)
     return DayVerdict(day, DayOutcomeKind.REBUILT, mismatch_kinds=kinds, rebuilt=durable)
 
 
@@ -324,8 +390,8 @@ class PassResult:
 def _require_ingested(probe: Callable[[], bool]) -> None:
     try:
         ready = probe()
-    except Exception:  # noqa: BLE001 - any probe failure means not provably ingested
-        raise ReconcileOrderingError("mass-status ingest probe failed") from None
+    except Exception as exc:
+        raise ReconcileOrderingError("mass-status ingest probe failed") from exc
     if ready is not True:
         raise ReconcileOrderingError("reconcile must run after the mass-status ingest")
 
@@ -337,54 +403,78 @@ def run_reconcile_pass(
     counters: CounterStorePort,
     sources: DurableDaySources,
     excluded: ExcludedDayWriter,
-    clock_ns: Callable[[], int],
+    monotonic_ns: Callable[[], int],
+    wall_ns: Callable[[], int],
+    counters_expected: Callable[[str], bool],
 ) -> PassResult:
     """Reconcile ``days`` (deduplicated, ascending) once.
 
     Raises :class:`ReconcileOrderingError`, before any read or write, unless
     ``mass_status_ingested()`` is exactly ``True``. Past 300 s the pass stops
     and returns ``reconcile_stuck``; it never halts (BG-6 wires that).
+
+    ``monotonic_ns`` (inject ``time.monotonic_ns``) alone drives the bound;
+    ``wall_ns`` only stamps records. The bound is checked between days, so one
+    slow source read is bounded by the caller's watchdog (BG-6
+    ``reconcile_stuck``, N3), not by this function. Callers must match on
+    :class:`PassStatus`.
     """
     _require_ingested(mass_status_ingested)
     ordered = tuple(sorted(set(days)))
     gappy = counters.read_gappy_days()
-    start = clock_ns()
-    counters.write_reconcile_phase(start_ns=start, ok_ns=None)
+    start = monotonic_ns()
+    wall_start = wall_ns()
+    counters.write_reconcile_phase(start_ns=wall_start, ok_ns=None)
 
     outcomes: list[DayOutcome] = []
     rebuilds: list[RebuildEvent] = []
     exclusions: list[ExcludedEvent] = []
     for index, day in enumerate(ordered):
-        now = clock_ns()
-        if now - start > RECONCILE_BOUND_NS:
+        if monotonic_ns() - start > RECONCILE_BOUND_NS:
             return _result(
-                PassStatus.RECONCILE_STUCK, outcomes, rebuilds, exclusions, ordered[index:], start
+                PassStatus.RECONCILE_STUCK,
+                outcomes,
+                rebuilds,
+                exclusions,
+                ordered[index:],
+                wall_start,
             )
+        stored = counters.read_day_counts(day)
+        expected = counters_expected(day)
+        if stored is None and expected and day not in gappy:
+            counters.mark_gappy_day(day, "counter_missing")
+            gappy = gappy | {day}
         verdict = reconcile_day(
             day,
-            stored=counters.read_day_counts(day),
-            fills=sources.fill_count(day),
+            stored=stored,
+            fills=sources.entry_fill_count(day),
             slots=sources.slot_counts(day),
             spend=sources.ledger_spend(day),
             gappy=day in gappy,
+            expected_counters=expected,
+            pending=counters.read_pending_rebuild(day),
         )
         outcomes.append(DayOutcome(day, verdict.kind, verdict.mismatch_kinds, verdict.reason))
         if verdict.kind is DayOutcomeKind.REBUILT and verdict.rebuilt is not None:
-            record = RebuildRecord(day, now, verdict.mismatch_kinds, verdict.rebuilt)
+            # Record first (it carries the mismatch kinds), then the counters,
+            # then the mark: a crash at any point re-runs to the same result.
+            pending = counters.read_pending_rebuild(day)
+            if pending is None or pending.counts != verdict.rebuilt:
+                record = RebuildRecord(day, wall_ns(), verdict.mismatch_kinds, verdict.rebuilt)
+                counters.write_rebuild_record(record)
             counters.replace_day_counts(day, verdict.rebuilt)
-            counters.write_rebuild_record(record)
-            counters.clear_gappy_mark(day)  # last: a crash before this re-reconciles
+            counters.clear_gappy_mark(day)
             rebuilds.append(RebuildEvent(day, verdict.mismatch_kinds))
         elif verdict.kind is DayOutcomeKind.DAY_EXCLUDED:
             cause = f"unreconcilable:{verdict.reason}"
-            if excluded.add_excluded_day(ExcludedDay(day=day, cause=cause, ts=now)):
+            if excluded.add_excluded_day(ExcludedDay(day=day, cause=cause, ts=wall_ns())):
                 exclusions.append(ExcludedEvent(day, cause))
 
-    ok = clock_ns()
-    if ok - start > RECONCILE_BOUND_NS:
-        return _result(PassStatus.RECONCILE_STUCK, outcomes, rebuilds, exclusions, (), start)
-    counters.write_reconcile_phase(start_ns=start, ok_ns=ok)
-    return _result(PassStatus.OK, outcomes, rebuilds, exclusions, (), start, ok)
+    if monotonic_ns() - start > RECONCILE_BOUND_NS:
+        return _result(PassStatus.RECONCILE_STUCK, outcomes, rebuilds, exclusions, (), wall_start)
+    wall_ok = wall_ns()
+    counters.write_reconcile_phase(start_ns=wall_start, ok_ns=wall_ok)
+    return _result(PassStatus.OK, outcomes, rebuilds, exclusions, (), wall_start, wall_ok)
 
 
 def _result(
