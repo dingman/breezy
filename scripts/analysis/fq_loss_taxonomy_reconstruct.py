@@ -20,28 +20,10 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
-from breezy.normalize.climate_day import local_standard_date
-from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition
 from breezy.registry.sites import default_registry
-from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
-from breezy.strategy.forecast_quantile_ladder.decision import Refuse, SidedAsk, Take, evaluate
-from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
-from breezy.strategy.forecast_quantile_ladder.margin import hours_to_settlement
-from breezy.strategy.ladder_ev.config import LadderEvConfig
-from breezy.strategy.ladder_ev.forecast_state import (
-    NBP_QUANTILE_VARIABLES,
-    ForecastQuantileState,
-    ForecastQuantileVector,
-)
-from breezy.strategy.ladder_ev.quantile_density import (
-    Percentiles,
-    Rung,
-    rung_probability_interval,
-)
 from scripts.analysis.fq_loss_taxonomy_classify import (
     S0D_MIN_MATCH,
     S0D_TOLERANCE,
@@ -52,6 +34,17 @@ from scripts.analysis.fq_loss_taxonomy_classify import (
 )
 from scripts.analysis.fq_loss_taxonomy_pins import Boot, BootPin, GitPort
 from scripts.analysis.fq_loss_taxonomy_verdict import is_material_k1a
+
+if TYPE_CHECKING:
+    # Type-only: the runtime imports of the strategy/persistence stacks (scipy, pandas, nautilus)
+    # are deferred into the functions that need them to keep this entry module's import cheap.
+    from breezy.persistence.nbp_derived_store import DerivedNbpRow
+    from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
+    from breezy.strategy.ladder_ev.forecast_state import (
+        ForecastQuantileState,
+        ForecastQuantileVector,
+    )
+    from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung
 
 #: A cycle published this soon AFTER a decision may already have been visible to the live node
 #: (the log line follows the bus push), so the cycle in use cannot be decided.
@@ -110,6 +103,8 @@ class PinnedModel:
 
 def load_derived_cycles(root: Path) -> dict[int, tuple[DerivedNbpRow, ...]]:
     """Every ``nbp_*.parquet`` the ``nbp_backfill.py`` derived store holds, by cycle (read-only)."""
+    from breezy.persistence.nbp_derived_store import read_partition
+
     grouped: dict[int, list[DerivedNbpRow]] = {}
     for path in sorted(root.rglob("nbp_*.parquet")):
         for row in read_partition(path):
@@ -119,6 +114,9 @@ def load_derived_cycles(root: Path) -> dict[int, tuple[DerivedNbpRow, ...]]:
 
 def load_pinned_model(git: GitPort, commit: str, manifest_path: str, workdir: Path) -> PinnedModel:
     """Manifest and artefact AT ``commit`` (via ``git show``); the artefact sha is verified."""
+    from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
+    from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
+
     manifest = json.loads(git.show_blob(commit, manifest_path))
     target = workdir / commit / "artefact.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +139,8 @@ def _nearest(rows: Sequence[DerivedNbpRow]) -> list[DerivedNbpRow]:
 
 
 def _percentiles(vector: ForecastQuantileVector) -> Percentiles:
+    from breezy.strategy.ladder_ev.quantile_density import Percentiles
+
     return Percentiles(
         q10=vector.q10, q25=vector.q25, q50=vector.q50, q75=vector.q75, q90=vector.q90,
         mean=vector.mean, sd=vector.sd,
@@ -148,6 +148,8 @@ def _percentiles(vector: ForecastQuantileVector) -> Percentiles:
 
 
 def _complement_ladder(lower: int | None, upper: int | None) -> list[Rung]:
+    from breezy.strategy.ladder_ev.quantile_density import Rung
+
     ladder = [Rung("target", lower, upper)]
     if lower is not None:
         ladder.append(Rung("below", None, lower - 1))
@@ -194,6 +196,12 @@ class Reconstructor:
 
     def _state(self, icao: str, offset: float) -> ForecastQuantileState:
         if icao not in self._states:
+            from breezy.normalize.climate_day import local_standard_date
+            from breezy.strategy.ladder_ev.forecast_state import (
+                NBP_QUANTILE_VARIABLES,
+                ForecastQuantileState,
+            )
+
             state = ForecastQuantileState()
             for cycle_ns, visible_ns in sorted(self._published.items()):
                 for row in _nearest(self._icao_rows(icao, cycle_ns)):
@@ -236,6 +244,16 @@ class Reconstructor:
         site: tuple[float, float],
     ) -> tuple[float | None, str | None, bool]:
         """``(p_hat, refusal_reason, take_reproduced)`` through the production ``evaluate``."""
+        from breezy.strategy.forecast_quantile_ladder.decision import (
+            Refuse,
+            SidedAsk,
+            Take,
+            evaluate,
+        )
+        from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
+        from breezy.strategy.forecast_quantile_ladder.margin import hours_to_settlement
+        from breezy.strategy.ladder_ev.config import LadderEvConfig
+
         facts = bucket_facts_from_instrument_id(spec.instrument_id)
         assert facts is not None
         offset, latitude = site
@@ -272,6 +290,8 @@ class Reconstructor:
         self, model: PinnedModel, vector: ForecastQuantileVector, latitude: float
     ) -> dict[int, float] | None:
         """The model's own integer-degF pmf for this vector (same draws, mean over draws)."""
+        from breezy.strategy.ladder_ev.quantile_density import Rung, rung_probability_interval
+
         try:
             resolved = model.calibration.resolve(
                 vector.model_version, latitude_deg=latitude, climate_day=vector.climate_day

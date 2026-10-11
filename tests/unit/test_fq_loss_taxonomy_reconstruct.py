@@ -173,7 +173,7 @@ def test_reconstruct_all_assigns_boots_by_time_and_respects_untestable_pins(
         for i, s in enumerate(BOOT_STAMPS)
     ]
     pins = [BootPin(b.number, world.commit, False, "PINNED", None) for b in boots]
-    pins[8] = BootPin(9, world.commit, False, "UNTESTABLE", None)  # type: ignore[arg-type]
+    pins[8] = BootPin(9, world.commit, False, "UNTESTABLE", None)
     specs = _specs(world)
     rec = _reconstructor(world, tmp_path / "wd")
 

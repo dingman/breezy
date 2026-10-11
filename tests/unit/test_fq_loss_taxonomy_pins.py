@@ -90,6 +90,9 @@ class _FakeGit:
     def blob_sha256(self, commit: str, path: str) -> str | None:
         return "bad" if commit == self.bad else {"m": "logged-m", "a": "logged-a"}[path]
 
+    def show_blob(self, commit: str, path: str) -> bytes:
+        raise AssertionError("not used")
+
     def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]:
         return (_TREES.get(commit, "T2"),)
 

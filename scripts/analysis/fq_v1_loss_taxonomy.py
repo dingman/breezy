@@ -171,6 +171,17 @@ def _fq_only(fills: FillRead) -> FillRead:
     return FillRead(fills=october, n_keys=len(october), n_undecodable=0)
 
 
+def _fields_dict(obj: Any) -> Any:
+    """Explicit field-by-field JSON mapping (recursive); replaces ``dataclasses.asdict``."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {f.name: _fields_dict(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+    if isinstance(obj, (list, tuple)):
+        return [_fields_dict(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _fields_dict(v) for k, v in obj.items()}
+    return obj
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
@@ -242,9 +253,9 @@ def _phase_a(args: argparse.Namespace, policy: PinPolicy) -> int:
     days, clusters = day_and_cluster_rows(rows, results, union)
     p_c = [c["P_c"] for c in clusters]
     payload = {
-        "phase": "A", "outcome_blind": True, "s0a": dataclasses.asdict(counts),
-        "s0c": dataclasses.asdict(attribution.report),
-        "s0d": {**dataclasses.asdict(gate), "semantics": SEMANTICS_NOTE,
+        "phase": "A", "outcome_blind": True, "s0a": _fields_dict(counts),
+        "s0c": _fields_dict(attribution.report),
+        "s0d": {**_fields_dict(gate), "semantics": SEMANTICS_NOTE,
                 "vectors": vector_table(results)},
         "s0g": _s0g(args, sorted({r["station"] for r in rows})),
         "per_fill": rows, "station_days": days, "clusters": clusters,
@@ -252,8 +263,8 @@ def _phase_a(args: argparse.Namespace, policy: PinPolicy) -> int:
             "testability": t_win_testability(p_c),
             "min_attainable_p": lower_tail(p_c, 0),
         },
-        "pins": [dataclasses.asdict(p) for p in pins],
-        "pin_table": [dataclasses.asdict(p) for p in pins], "pin_label": label,
+        "pins": [_fields_dict(p) for p in pins],
+        "pin_table": [_fields_dict(p) for p in pins], "pin_label": label,
         "truth_projection": _truth_projection(
             args.catalog_root, [(d["station"], d["climate_day"]) for d in days]
         ),
@@ -285,7 +296,7 @@ def _phase_b(args: argparse.Namespace) -> int:
     )
     _write_json(
         args.output_dir / "phase_b_audit.json",
-        {"phase": "B", "audit_fq": dataclasses.asdict(oct_audit)},
+        {"phase": "B", "audit_fq": _fields_dict(oct_audit)},
     )
     if not ok:
         sys.stderr.write("STOP: the corrected audit (25 fills, 2 wins, -2.17) did not reproduce\n")
