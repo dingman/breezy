@@ -312,18 +312,27 @@ def test_dispatch_marks_delivered_only_after_the_durable_send_confirms() -> None
         sent.append(payload)
         return next(outcomes)
 
+    elapsed_s = [0]
+
+    def probe(_p: Path) -> BreakerProbe:
+        # the resolver stamp keeps pace with the clock so only the heartbeat is stale
+        shift = elapsed_s[0] * SEC
+        return replace(STALE_HB, resolver_pass_ns=FRESH.resolver_pass_ns + shift)
+
     ports = _ports(
         sink,
-        probe_breaker_record=lambda _p: STALE_HB,
+        probe_breaker_record=probe,
         configured_exec_par_k=_k(2),
         send_alert_durable=durable,
     )
     watch = _seasoned()
     _run(ports, watch)  # outbox refused: not delivered
     assert watch.active == {}
+    elapsed_s[0] = 61
     _run(ports, watch, after_s=61)  # retried on the 60 s throttle, confirmed
     assert set(watch.active) == {"heartbeat_stale"}
-    _run(ports, watch, after_s=122)  # now deduped: no third send
+    elapsed_s[0] = 610
+    _run(ports, watch, after_s=610)  # probe due again: only `active` dedup stops a third send
     assert len(sent) == 2
 
 

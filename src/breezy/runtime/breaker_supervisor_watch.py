@@ -93,6 +93,8 @@ class BreakerAlertDetail(str, Enum):
     #: Stamp never written and the clock anchored on this supervisor's first
     #: K>1 sighting (no K>1 epoch row exists yet).
     STAGE_STAMP_STALE_FIRST_SIGHTING = "exec_par_stage_stamp_stale_anchor=first_sighting"
+    #: Stamp never written and a corrupt epoch row hides the K>1 anchor.
+    STAGE_STAMP_STALE_ANCHOR_UNREADABLE = "exec_par_stage_stamp_stale_anchor=unreadable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +114,9 @@ class BreakerProbe:
     #: BG-8: min ``boot_ts`` (ns) of the BG-2 epoch rows with ``effective_k > 1``;
     #: ``None`` = the node has never booted at K>1.
     k_anchor_ns: int | None = None
+    #: ``False`` when an epoch row did not decode (the anchor is unknown, the
+    #: probe is still readable: a corrupt epoch must never hide a halt reading).
+    anchor_readable: bool = True
 
     @classmethod
     def absent(cls) -> BreakerProbe:
@@ -296,7 +301,14 @@ def decide_breaker_alerts(
         if probe.readable and _stamp_stale(probe, now_ns, since):
             spec = _STAMP_STALE
             if probe.stamp_ts_ns is None and probe.stamp_readable and not durable_anchor:
-                spec = replace(spec, detail=BreakerAlertDetail.STAGE_STAMP_STALE_FIRST_SIGHTING)
+                spec = replace(
+                    spec,
+                    detail=(
+                        BreakerAlertDetail.STAGE_STAMP_STALE_FIRST_SIGHTING
+                        if probe.anchor_readable
+                        else BreakerAlertDetail.STAGE_STAMP_STALE_ANCHOR_UNREADABLE
+                    ),
+                )
             conditions["stamp_stale"] = _keyed(spec, "stamp_stale")
     realert = k_configured > 1
     state.active = {k: t for k, t in state.active.items() if k in conditions}
