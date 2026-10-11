@@ -96,10 +96,12 @@ def test_pins_has_no_self_heal_constants_and_no_operator_control_names() -> None
 
 def test_empty_pins_at_arch0() -> None:
     assert pins.ENGINE_SOURCE_SHA256 == frozenset()
-    # One reviewed row: AUT-6 WP3 S6 pins the health producer (P6-13); its value is checked
-    # against the closure by ``test_code_identity_pins_cover_import_closure``.
-    assert set(pins.PRODUCER_SOURCE_SHA256) == {"aut6.health"}
+    # Two reviewed rows: AUT-6 WP3 S6 pins the health producer (P6-13) and TE-1 WP-A pins the label
+    # run (R2); each value is checked against its closure by
+    # ``test_code_identity_pins_cover_import_closure``.
+    assert set(pins.PRODUCER_SOURCE_SHA256) == {"aut6.health", "aut2.label"}
     assert len(pins.PRODUCER_SOURCE_SHA256["aut6.health"]) == 64
+    assert len(pins.PRODUCER_SOURCE_SHA256["aut2.label"]) == 64
     assert isinstance(pins.PRODUCER_SOURCE_SHA256, MappingProxyType)
     assert pins.REVOKED_SOURCE_SHA256 == frozenset()
     assert pins.ENABLED_WIDENING_KINDS == frozenset()

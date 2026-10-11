@@ -32,6 +32,7 @@ from breezy.adapters.polymarket_us.signing import (
     Ed25519RequestSigner,
 )
 from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO, VenueResponse
+from tests.support.closure_manifest_literal import assert_pure_literal
 from tests.unit.test_polymarket_us_readonly_guard import (
     B4_EXEMPT_PATHS,
     BARRED_CALLEES,
@@ -420,10 +421,16 @@ def test_write_transport_has_exactly_one_importer_and_it_does_not_re_export() ->
     B4 exemption for that script exists: it is a genuinely write-capable
     module, reviewed here rather than routed around."""
     importers = scan_write_transport_importers()
+    # TE-1 WP-A (R2): the GENERATED label-run closure manifest names the exec client's closure
+    # (this module included) as plain strings. It is a pure literal (asserted), so it imports
+    # nothing -- a FOURTH row, WIDENED not relaxed.
+    manifest = "src/breezy/persistence/autonomy/closure_manifest.py"
+    assert_pure_literal(REPO_ROOT / manifest)
     assert {v.path for v in importers} == {
         _FACTORIES_PATH,
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "scripts/analysis/capture_no_side_preview.py",
+        manifest,
     }
 
     factories_source = (REPO_ROOT / _FACTORIES_PATH).read_text(encoding="utf-8")

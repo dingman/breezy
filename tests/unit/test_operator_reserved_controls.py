@@ -40,6 +40,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
 )
 from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError
 from breezy.strategy.weather_common.risk import RiskLimits
+from tests.support.closure_manifest_literal import assert_pure_literal
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 
 _NS: Final[int] = 1_000_000_000
@@ -744,10 +745,16 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     client's and the strategy's `utc_day_for_ns` rows above. This scan is a
     SUBSTRING scan, so the module is also matched by that script's explanatory
     docstring citations; those are documentation, not calls.
+    Eighth, declared 2026-10-11 (TE-1 WP-A, R2): the GENERATED
+    `persistence/autonomy/closure_manifest.py` lists every module of the label
+    run's import closure (which includes the exec client, hence this module) as
+    a string. It is a pure literal -- asserted below -- so it imports nothing
+    and reads no control; WIDENED, not relaxed (L-12).
     """
     from pathlib import Path
 
     repo_root = Path(__file__).resolve().parents[2]
+    assert_pure_literal(repo_root / "src/breezy/persistence/autonomy/closure_manifest.py")
     importers = sorted(
         path.relative_to(repo_root).as_posix()
         for root in ("src", "scripts")
@@ -762,6 +769,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/factories.py",
         "src/breezy/adapters/polymarket_us/safety.py",
+        "src/breezy/persistence/autonomy/closure_manifest.py",
         "src/breezy/runtime/order_enablement.py",
         "src/breezy/strategy/current_rung_hold/continuous_no_side.py",
         "src/breezy/strategy/current_rung_hold/continuous_strategy.py",

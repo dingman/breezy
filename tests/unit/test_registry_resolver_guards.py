@@ -11,6 +11,7 @@ import pytest
 from breezy.persistence.autonomy.byte_binding import (
     CHILD_MANIFEST_ALLOWLIST,
 )
+from tests.support.closure_manifest_literal import assert_pure_literal
 from tests.support.entry_points import REPO_ROOT, SRC_DIR
 
 AUTONOMY_SRC: Final = SRC_DIR / "breezy" / "persistence" / "autonomy"
@@ -213,8 +214,11 @@ def test_exit_gate_stays_code_only() -> None:
     }
     assert imported == {"breezy.persistence.family_manifest"}
     assert "_EXIT_RULE_REGISTERED_FAMILIES: Final[frozenset[str]]" in gate
+    manifest = AUTONOMY_SRC / "closure_manifest.py"  # a generated literal list of module names
+    assert_pure_literal(manifest)
     for path in AUTONOMY_SRC.glob("*.py"):
-        assert "exit_gate" not in path.read_text(encoding="utf-8"), path.name
+        if path != manifest:
+            assert "exit_gate" not in path.read_text(encoding="utf-8"), path.name
     assert "exit_rule" not in CHILD_MANIFEST_ALLOWLIST
     assert "no_leg_exit" not in CHILD_MANIFEST_ALLOWLIST
 

@@ -34,6 +34,7 @@ from breezy.persistence.autonomy.canary_store import (
 from breezy.persistence.autonomy.label_schema import ExcludedReason
 from breezy.persistence.autonomy.label_store import admissible_rows, read_labels
 from tests.support.aut2_fixtures import durable_fill, seed_fills
+from tests.support.closure_manifest_literal import assert_pure_literal, is_pure_literal
 
 _VENUE = "polymarket_us"
 _FAMILY = "pm_us_crh_fq_v1"
@@ -57,6 +58,9 @@ _ALLOWED_READERS = frozenset(
         _SRC / "analysis" / "labeling" / "proof_source.py",
         # declares the canary writer's own binds; it opens nothing
         _SRC / "runtime" / "autonomy_sandbox" / "table.py",
+        # the generated closure manifest lists the label run's import closure as module-name
+        # strings (it includes the canary store); a pure literal, checked below, so it reads nothing
+        _SRC / "persistence" / "autonomy" / "closure_manifest.py",
     }
 )
 
@@ -154,6 +158,17 @@ def test_reconciliation_and_entry_guard_never_read_canary_store(tmp_path: Path) 
     with canary_open_guard() as tripped:
         read = read_durable_fills(db)
     assert read.n_keys == 1 and tripped == []
+
+
+def test_closure_manifest_allowance_is_a_pure_literal_and_the_scan_still_flags_code() -> None:
+    """The one allowance for the generated manifest holds only while the file is data."""
+    assert_pure_literal(_SRC / "persistence" / "autonomy" / "closure_manifest.py")
+    planted = (
+        '"""m."""\nfrom types import MappingProxyType\nfrom typing import Final\n'
+        'X: Final = MappingProxyType({"a": ("breezy.persistence.autonomy.canary_store",)})\n'
+        "read_canary_fills()\n"
+    )
+    assert not is_pure_literal(planted) and _canary_references(planted)
 
 
 def test_canary_ast_scanner_flags_planted_reader() -> None:

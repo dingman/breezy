@@ -41,6 +41,7 @@ from breezy.runtime.submit_intent_slots import (
 from breezy.runtime.submit_intent_slots import (
     BREAKER_RESOLVER_PASS_MAX_AGE_NS as LATCH_RESOLVER_PASS_MAX_AGE_NS,
 )
+from tests.support.closure_manifest_literal import assert_pure_literal
 from tests.unit.test_runtime_trade_node_config import (
     make_data_client_config,
     make_exec_client_config,
@@ -277,6 +278,9 @@ _IMPORTER_PIN = [
     "src/breezy/adapters/polymarket_us/exec/client.py",
     "src/breezy/adapters/polymarket_us/factories.py",
     "src/breezy/adapters/polymarket_us/safety.py",
+    # the GENERATED label-run closure manifest lists the exec client's closure as strings; a pure
+    # literal (asserted in the test), so it imports nothing -- WIDENED, not relaxed (TE-1 WP-A, R2)
+    "src/breezy/persistence/autonomy/closure_manifest.py",
     "src/breezy/runtime/order_enablement.py",
     "src/breezy/strategy/current_rung_hold/continuous_no_side.py",
     "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
@@ -284,6 +288,7 @@ _IMPORTER_PIN = [
 
 
 def test_no_operator_controls_importer_added() -> None:
+    assert_pure_literal(_REPO / "src/breezy/persistence/autonomy/closure_manifest.py")
     importers = sorted(
         path.relative_to(_REPO).as_posix()
         for root in ("src", "scripts")

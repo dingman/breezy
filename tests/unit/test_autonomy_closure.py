@@ -86,8 +86,11 @@ def test_unknown_component_is_refused(tmp_path: Path) -> None:
 
 
 def test_manifest_holds_only_the_reviewed_components_and_refuses_the_rest() -> None:
-    """One reviewed row so far: the ``aut6.health`` producer entry (WP3 S6, P6-13)."""
-    assert set(closure_manifest.CLOSURE_MODULES) == {"breezy.runtime.autonomy_health_cli"}
+    """Two reviewed rows: the ``aut6.health`` entry (WP3 S6, P6-13) and ``aut2.label`` (TE-1 R2)."""
+    assert set(closure_manifest.CLOSURE_MODULES) == {
+        "breezy.runtime.autonomy_health_cli",
+        "breezy.analysis.labeling.label_run",
+    }
     with pytest.raises(ClosureUnavailable):
         closure_sha256(f"{PKG}.veto")
 

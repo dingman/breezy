@@ -16,8 +16,15 @@ ENGINE_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 # aut6.health (P6-13, plan r15 section 3.4.1): sha256 of the import closure of
 # ``breezy.runtime.autonomy_health_cli`` (``closure_manifest``). Any change to a closure module
 # makes ``test_code_identity_pins_cover_import_closure`` fail until a reviewed commit re-pins it.
+# aut2.label (TE-1 WP-A, R2): the same for ``breezy.analysis.labeling.label_run``; the label unit's
+# default mode refuses ``reason=producer_unpinned`` while this does not match. The two closures
+# share ``closure_manifest``, ``autonomy_sandbox.table`` and ``registry.sites``, so a change to any
+# shared module re-pins BOTH.
 PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
-    {"aut6.health": "339fe06743e0da5ac01c4e34229f4d1d8552982f6226469cf939afcdc23c9a18"}
+    {
+        "aut2.label": "11359b0ae1c20603a7ae0dafbc501e65421359f9128724f16ca2334fbf2d9921",
+        "aut6.health": "b6df288bed4bb34fcd77e2b39629b50431fc790fa0c0ae7b4ff599a8fe4ab17a",
+    }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 
