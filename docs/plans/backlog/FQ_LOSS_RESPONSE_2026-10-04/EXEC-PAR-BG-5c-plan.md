@@ -259,3 +259,6 @@ This amends R8.2.
   - "Open position" means an entry with a fill that is not yet settled, in any station-day, with no floor.
   - Test that a pre-floor open position counts.
   - Until this wiring lands, BG-6 halts with `intraday_unbound`. That is fail-closed and intended.
+  - **E-9 additions (from the BG-6 stats confirm review).**
+    - The §9 station-day key is the **market's** climate day, not the arm day.
+    - The open cost includes AMBIGUOUS entries that may have filled, valued at armed notional. This is the conservative choice.
