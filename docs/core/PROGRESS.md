@@ -86,7 +86,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 4 wins, −2.63 (corrected); plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
 | ID | Open work (exact) | Status |
 |---|---|---|
-| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.3 |
+| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.6 (S0 STOP→R11); WP-A building |
 | TE-2 | Diagnose FQ 2/25, −2.17 (LAX heat bust) before any re-arm (delta vs F0/F13) | READY r3.2 |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
