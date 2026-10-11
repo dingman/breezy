@@ -109,6 +109,7 @@ from breezy.runtime.exec_par_boot_flag import default_repo_root, force_k1_at_boo
 from breezy.runtime.exec_par_constants import (
     EXEC_PAR_MAX_CONCURRENT_INTENTS,  # noqa: F401 - re-exported: existing importers keep working
 )
+from breezy.runtime.exec_par_promo_record import apply_promo_guard
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.runtime.settings import (
     BreezyRuntimeSettings,
@@ -788,13 +789,15 @@ def force_k1_on_durable_flag(
     """Force the slot latch to K=1 when the durable force-K1 flag is SET or UNREADABLE.
 
     Also holds K=1 at a configured K>1 while an un-amended ``cleanup_demotion`` to
-    K=1 stands (N4). A CLEARED flag does nothing; at configured K=1 forcing is
+    K=1 stands (N4), or at a configured K>2 without a valid O3 promotion record.
+    A CLEARED flag does nothing; at configured K=1 forcing is
     harmless. ``repo_root`` defaults to the module-anchored root, never the cwd.
     The latch already carries the store, so none is passed. Returns ``True`` iff K was forced.
     """
     sink = resolve_alert_sink() if alert_sink is None else alert_sink
     root = default_repo_root() if repo_root is None else repo_root
-    return force_k1_at_boot(latch, repo_root=root, alert_sink=sink)
+    forced = force_k1_at_boot(latch, repo_root=root, alert_sink=sink)
+    return apply_promo_guard(latch, repo_root=root, alert_sink=sink) or forced
 
 
 def build_trade_risk_engine_config(
