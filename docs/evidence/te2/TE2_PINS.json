@@ -1,0 +1,25 @@
+{
+  "computed_at_head": "669106ecd4c0a12fdde0e1829fd314143d37b243",
+  "head_blob_sha256": {
+    "scripts/analysis/fq_loss_taxonomy_battery.py": "e0b81590b429594cf1065dbf7408dde5ee736c220fd781e775bc252960b8d317",
+    "scripts/analysis/fq_loss_taxonomy_classify.py": "388d3bcf0172515b5c6e81813069c23d0186be069eb9a48c058dd2a52f68c9ca",
+    "scripts/analysis/fq_loss_taxonomy_core.py": "e67352852c938672b68580bc201e80a84820160e3d5e563bec02a858a0b5b783",
+    "scripts/analysis/fq_loss_taxonomy_fills.py": "5b4edd430c14e0f492fbfad8d97d4b67952ad10eff4b7eed551d9305a841985e",
+    "scripts/analysis/fq_loss_taxonomy_guard.py": "f7e90fa1018deba8f16738b181963e6fa0ae4612d16f7ca6b8108f5185f50fe9",
+    "scripts/analysis/fq_loss_taxonomy_inputs.py": "f6932aab7e8a5e7cb5d8be9a4942afb98ec4c27bf884cf7c087fb9f6025eee62",
+    "scripts/analysis/fq_loss_taxonomy_logs.py": "37748ea1ebe06ce409479a860019a40fc6936d7d1425eced2ffc62ebc328982a",
+    "scripts/analysis/fq_loss_taxonomy_phase_b.py": "08fc7e90a0771e4b23345c3742480ac660a0cfabe8c1ecdf7a3bac5a5932217a",
+    "scripts/analysis/fq_loss_taxonomy_pins.py": "a75a965c3b1dbeef5c93e939e785ada38c2219e8b9db46193c49792f7ee8aad3",
+    "scripts/analysis/fq_loss_taxonomy_predecl.py": "42cc3c4be1cf815935324e54880696cb8502c7ffddc98fb4d8381f605096bd05",
+    "scripts/analysis/fq_loss_taxonomy_reconstruct.py": "6b571f25aa06d0044858a6b31dbe45bfac0b507455221624d9f13580c6996693",
+    "scripts/analysis/fq_loss_taxonomy_report.py": "d9c32256275819a024de63dcda46498662de50cd7d77aac257356712a12f5651",
+    "scripts/analysis/fq_loss_taxonomy_stats.py": "5d8fcb3ecf98b1fd4b6a19c02cd428d8adbce96068cf3600fffcf9c567faedbe",
+    "scripts/analysis/fq_loss_taxonomy_table.py": "18674c1bc4931c963fa28cc1676b4c63b4d7afd8207d6b8f9a8dedd9c7572aeb",
+    "scripts/analysis/fq_loss_taxonomy_truth.py": "bc1a3999ec2705ae0e3b18d697f20bd2eb14c54cf6edc838d5e83c7d86170e37",
+    "scripts/analysis/fq_loss_taxonomy_verdict.py": "df81ab091a17d17ba61501af4dfd11c02dba51b1f10d565c05cfeddfefdfc43d",
+    "scripts/analysis/fq_v1_loss_taxonomy.py": "ba70ad9ffa76564857ee9da435879c70c0499b3e938402fd2a2c63bc20f51d0d"
+  },
+  "predeclaration_commit": "b0fe067cb6e0902d39cf8ff8e41ad3f2c22bbc8f",
+  "reflog_snapshot_path": "docs/evidence/te2/REFLOG_SNAPSHOT_2026-10-01_to_10-06.txt",
+  "reflog_snapshot_sha256": "f359e070c2334a31252782fbf949643dfac84bba1c0992fda73b7ef9094e427d"
+}
