@@ -11,6 +11,9 @@ from breezy.runtime.exec_par_intraday import IntradayMonitor
 from breezy.runtime.exec_par_records import (
     AmbiguousRow,
     DayCountsDelta,
+    EpochRow,
+    GappyMark,
+    StageEvalStamp,
     StageReset,
     StopVerdict,
 )
@@ -240,14 +243,56 @@ def test_rows_plus_the_rebuild_delta_matching_the_counts_is_no_halt(tmp_path: Pa
         assert rig.spy.calls == [] and rig.breaker() is None
 
 
-def test_a_rebuilt_day_with_five_effective_and_missing_arm_times_is_burst_incomplete(
+def _known_pair(rig: Rig, day_index: int) -> None:
+    """Five posted entries on a day, two AMBIGUOUS ones ten minutes apart (known arm times)."""
+    for i in range(5):
+        base = ns_of(d(day_index)) + 5
+        _post(rig, base + i * 3 * HOUR, ambiguous=False)
+    for i in range(2):
+        _post(rig, ns_of(d(day_index)) + 20 * HOUR + i * 10 * 60 * NS, ambiguous=True)
+
+
+def _delta_only_day(rig: Rig, day_index: int, delta: int) -> None:
+    for i in range(5):
+        _post(rig, ns_of(d(day_index)) + 5 + i * HOUR, ambiguous=False)
+    rig.latch.write_counts_delta(DayCountsDelta(d(day_index), 0, delta, 0, "0"))
+
+
+def test_missing_marks_plus_known_arms_on_another_day_reaching_five_is_burst_incomplete(
     tmp_path: Path,
 ) -> None:
     with make_rig(tmp_path, seed=True) as rig:
-        _rebuilt_day(rig, rows=4, delta=1)  # effective 5, the 4 rows are 2 h apart
+        _delta_only_day(rig, 1, 3)  # 3 arm times missing on d1
+        _known_pair(rig, 2)  # 2 known arm times inside 10 minutes on d2
         _ready(rig).check(rig.clock.ns)
         assert _halt_reason(rig) == f"burst_incomplete_rebuilt_day:{d(1)}"
         assert "write_force_k1_flag" not in rig.spy.calls  # integrity class: no flag
+
+
+def test_missing_marks_that_cannot_reach_five_do_not_halt(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        _delta_only_day(rig, 1, 2)  # 2 missing + at most 2 known in any hour = 4 < 5
+        _known_pair(rig, 2)
+        _ready(rig).check(rig.clock.ns)
+        assert rig.spy.calls == [] and rig.breaker() is None
+
+
+def test_every_rebuilt_day_is_named(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        _delta_only_day(rig, 1, 2)
+        _known_pair(rig, 2)
+        _delta_only_day(rig, 3, 1)  # total missing 3 + 2 known = 5
+        _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == f"burst_incomplete_rebuilt_day:{d(1)},{d(3)}"
+
+
+def test_the_old_per_day_test_is_gone_four_spread_rows_plus_one_missing_is_fine(
+    tmp_path: Path,
+) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        _rebuilt_day(rig, rows=4, delta=1)  # 1 missing + 1 per hour = 2 < 5
+        _ready(rig).check(rig.clock.ns)
+        assert rig.spy.calls == [] and rig.breaker() is None
 
 
 def test_burst_incomplete_is_silent_when_the_available_rows_already_trip(tmp_path: Path) -> None:
@@ -361,3 +406,109 @@ def test_a_still_true_stop_fires_again_after_a_stage_reset(tmp_path: Path) -> No
         rig.latch.write_stage_reset(StageReset(ns_of(d(1)), "stop_clear", None))
         monitor.check(rig.clock.ns + 5 * NS)  # the burst (d2) is after the new floor: still true
         assert len(rig.latch.read_stop_verdicts_since(0)) == 2
+
+
+# -- floor-label rebuilt day ---------------------------------------------------------------
+
+
+def test_a_floor_label_rebuild_delta_feeds_the_cp_numerator(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        for i in range(12):  # post-floor entries on the floor label d0, 1.9 h apart
+            _post(rig, FLOOR + 1 + i * 7_000 * NS, ambiguous=False)
+        for i in range(8):  # d1: 8 posted, all AMBIGUOUS, 2 h apart
+            _post(rig, ns_of(d(1)) + 1 + i * 2 * HOUR, ambiguous=True)
+        rig.latch.write_counts_delta(DayCountsDelta(d(0), 0, 1, 0, "0"))  # +1 on the floor label
+        _ready(rig).check(rig.clock.ns)  # 8 + 1 = 9 of 20: the rows alone (8) would not trip
+        assert _halt_reason(rig) == "s5_clopper_pearson"
+
+
+def test_a_floor_label_rebuild_delta_counts_as_missing_arm_times(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        for i in range(5):
+            _post(rig, FLOOR + 1 + i * HOUR, ambiguous=False)
+        rig.latch.write_counts_delta(DayCountsDelta(d(0), 0, 5, 0, "0"))
+        _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == f"burst_incomplete_rebuilt_day:{d(0)}"
+
+
+# -- negative delta ---------------------------------------------------------------------------
+
+
+def test_a_negative_delta_means_rows_count_and_is_no_halt(tmp_path: Path) -> None:
+    from breezy.runtime.exec_par_intraday import gather_intraday_inputs
+
+    with make_rig(tmp_path, seed=True) as rig:
+        for i in range(3):
+            _post(rig, ns_of(d(1)) + 5 + i * 2 * HOUR, ambiguous=True)
+        rig.latch.write_counts_delta(DayCountsDelta(d(1), 0, -1, 0, "0"))
+        inputs = gather_intraday_inputs(
+            reads=rig.ports.store,
+            counters=rig.ports.counters,
+            governed=rig.ports.governed,
+            intraday=_ports(),
+            now_ns=rig.clock.ns,
+        )
+        assert inputs.findings == ()  # counts - delta == rows
+        assert inputs.ambiguous == 2  # the effective count (3 rows - 1)
+        assert len(inputs.ambiguous_arm_ns) == 3
+
+
+# -- unattributed marks with no stage_reset ---------------------------------------------------
+
+
+def test_with_no_floor_only_marks_after_the_first_k_gt_1_epoch_count(tmp_path: Path) -> None:
+    with make_rig(tmp_path) as rig:  # no stage_reset
+        boot = ns_of(d(0)) + 5
+        rig.latch.write_epoch_row(EpochRow("sha", 2, None, boot))
+        for i in range(4):
+            _unattributed(rig, boot + 10 + i, i)
+        _unattributed(rig, boot - 1, 9)  # before the stage began
+        _ready(rig).check(rig.clock.ns)
+        assert rig.spy.calls == []
+    with make_rig(_sub(tmp_path, "b")) as rig:
+        boot = ns_of(d(0)) + 5
+        rig.latch.write_epoch_row(EpochRow("sha", 2, None, boot))
+        for i in range(5):
+            _unattributed(rig, boot + 10 + i, i)
+        _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == "s5_burst"
+
+
+# -- gappy bypass evicts ---------------------------------------------------------------------
+
+
+def test_a_gappy_day_is_evicted_so_a_later_clear_cannot_serve_a_stale_scan(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        monitor = _ready(rig)
+        monitor.check(rig.clock.ns)  # d2 scanned empty and cached
+        rig.latch.write_gappy_mark(GappyMark(d(2), "test", rig.clock.ns, None))
+        monitor.check(rig.clock.ns + 5 * NS)  # gappy: bypassed AND evicted
+        _burst(rig, [ns_of(d(2)) + i for i in range(5)])
+        rig.latch.delete_gappy_mark(d(2))
+        monitor.check(rig.clock.ns + 10 * NS)
+        assert _halt_reason(rig) == "s5_burst"
+
+
+# -- a raising stop still lets the integrity loop run ----------------------------------------
+
+
+def test_a_raising_stop_does_not_skip_the_integrity_conditions(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        seen: list[str] = []
+
+        def bad_stop(reason: str, ts: int) -> bool:
+            raise RuntimeError("stop broke")
+
+        _burst(rig, [ns_of(d(2)) + i for i in range(5)])
+        rig.latch.write_stage_eval_stamp(StageEvalStamp(rig.clock.ns - 27 * HOUR, 12345))
+        monitor = IntradayMonitor(
+            reads=rig.ports.store,
+            counters=rig.ports.counters,
+            governed=rig.ports.governed,
+            boot_ns=rig.ports.boot_ns,
+            intraday=_ports(),
+            stop=bad_stop,
+            integrity=seen.append,
+        )
+        monitor.check(rig.clock.ns)
+        assert seen == ["stage_eval_stamp_stale", "intraday_check_raised"]

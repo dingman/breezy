@@ -49,6 +49,7 @@ __all__ = [
     "clopper_pearson_exceeds",
     "cp_rule_trips",
     "intraday_stop_reasons",
+    "max_in_window",
     "station_days_over_open_cost",
 ]
 
@@ -129,6 +130,18 @@ def burst_trips(
     return any(
         times[i] - times[i - min_count + 1] <= window_ns for i in range(min_count - 1, len(times))
     )
+
+
+def max_in_window(arm_times_ns: Iterable[int], *, window_ns: int = BURST_WINDOW_NS) -> int:
+    """The largest number of arm times inside any span of ``window_ns`` (inclusive), any order."""
+    times = sorted(_arm_time(t) for t in arm_times_ns)
+    best = 0
+    start = 0
+    for end, moment in enumerate(times):
+        while moment - times[start] > window_ns:
+            start += 1
+        best = max(best, end - start + 1)
+    return best
 
 
 def _arm_time(value: object) -> int:

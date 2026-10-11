@@ -477,6 +477,7 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         self._trip_reason: str | None = None
         self._seen_contradictions = 0
         self._seen_duplicates = 0
+        self._ingest_seen: tuple[int, int, int, bool] | None = None
         self._fault_watch = CounterIncreaseWatch()
         self._gappy_watch = CounterIncreaseWatch()
         self._stuck: tuple[tuple[str, str], ...] = ()
@@ -540,16 +541,28 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         guard = self._guard
         if guard is None:
             return
+        marks = self._ambiguous_marks
         try:
-            marks = self._ambiguous_marks
-            late = guard.pending > 0 or self._marks_pending(marks)
             guard.retry(self.cache.order, now_ns)
             if marks is not None:
                 guard.ingest_marks(marks, now_ns)
-            if late:
-                self._intraday_invalidate()  # BG-6: rows may have landed on a closed day
         except Exception as exc:  # noqa: BLE001 - belt and braces: ingest cannot stop the tick
             logger.error("%s: ingest pass failed: %s", _SITE, type(exc).__name__)
+            self._ingest_seen = None  # force the invalidation below
+        finally:
+            self._invalidate_if_ingest_moved(guard, marks)
+
+    def _invalidate_if_ingest_moved(
+        self, guard: IngestGuard, marks: AmbiguousMarkSource | None
+    ) -> None:
+        """BG-6: drop the intraday closed-day scans whenever ingest moved (rows written, a fault,
+        a queue or pending marks left), sampled AFTER the pass so marks that arrived mid-pass and
+        an ingest that raised are both covered; a quiet tick keeps the cache."""
+        seen = (guard.write_count, guard.fault_count, guard.pending, self._marks_pending(marks))
+        moved = seen != self._ingest_seen or seen[2] > 0 or seen[3]
+        self._ingest_seen = seen
+        if moved:
+            self._intraday_invalidate()
 
     def _persist(self, client: ExecClientView, now_ns: int) -> None:
         """The trigger halts, then (always, even if they raised) the stage evaluator service."""

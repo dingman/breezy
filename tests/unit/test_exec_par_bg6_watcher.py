@@ -293,3 +293,90 @@ async def test_k1_watcher_has_no_monitor_and_never_touches_ports_or_the_guard() 
     )
     watcher.bind_client(lambda: _Client())
     assert await watcher.tick() is True  # a K=1 tick reads nothing new and writes nothing
+
+
+# ---------------------------------------------------------------------------
+# the intraday cache is invalidated AFTER the ingest pass (mid-pass arrivals, a raise)
+# ---------------------------------------------------------------------------
+
+
+class _Marks:
+    def __init__(self) -> None:
+        self.marks: set[tuple[str, str]] = set()
+
+    def ambiguous_marks_pending(self) -> frozenset[tuple[str, str]]:
+        return frozenset(self.marks)
+
+    def ack_ambiguous_marks(self, marks: Any) -> None:
+        self.marks -= set(marks)
+
+
+def _marked_actor(tmp_path: Path, marks: _Marks) -> tuple[Any, list[int]]:
+    ev = _Events()
+    store_latch_cm = _latch(tmp_path, _SelStore())
+    store_latch = store_latch_cm.__enter__()
+    actor = BreakerWatcherActor(
+        latch=_Latch(),
+        alert_sink=_Sink(),
+        counters=_ingest(store_latch),
+        ambiguous_marks=marks,
+    )
+    actor.register_base(
+        portfolio=TestComponentStubs.portfolio(),
+        msgbus=TestComponentStubs.msgbus(),
+        cache=ev.rig.cache,
+        clock=ev.rig.clock,
+    )
+    actor.bind_client(lambda: _Client())
+    calls: list[int] = []
+    actor._intraday_invalidate = lambda: calls.append(1)  # type: ignore[method-assign]
+    actor._cm = store_latch_cm  # keep the latch open for the test
+    return actor, calls
+
+
+@pytest.mark.asyncio
+async def test_marks_arriving_mid_pass_invalidate_the_cache_and_a_quiet_tick_does_not(
+    tmp_path: Path,
+) -> None:
+    marks = _Marks()
+    actor, calls = _marked_actor(tmp_path, marks)
+    try:
+        await actor.tick()  # baseline
+        calls.clear()
+        await actor.tick()  # quiet: nothing moved, the cache is kept
+        assert calls == []
+        guard = actor.ingest_guard
+        real_retry = guard.retry
+
+        def retry_then_arrive(*args: Any, **kwargs: Any) -> None:
+            real_retry(*args, **kwargs)
+            marks.marks.add(("unknown-intent", "unknown"))  # arrives AFTER any pre-sample
+
+        guard.retry = retry_then_arrive
+        await actor.tick()  # the mark is pending after the pass
+        assert calls != []
+        calls.clear()
+        guard.retry = real_retry
+        await actor.tick()  # ingested within the pass, then acknowledged
+        assert calls != []  # write_count moved
+    finally:
+        actor._cm.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_an_ingest_pass_that_raises_still_invalidates(tmp_path: Path) -> None:
+    marks = _Marks()
+    actor, calls = _marked_actor(tmp_path, marks)
+    try:
+        await actor.tick()
+        await actor.tick()
+        calls.clear()
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("retry broke")
+
+        actor.ingest_guard.retry = boom
+        await actor.tick()
+        assert calls != []
+    finally:
+        actor._cm.__exit__(None, None, None)

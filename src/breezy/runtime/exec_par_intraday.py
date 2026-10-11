@@ -43,6 +43,7 @@ from breezy.runtime.exec_par_intraday_rules import (
     OpenCostPort,
     burst_trips,
     intraday_stop_reasons,
+    max_in_window,
 )
 from breezy.runtime.exec_par_reconcile import DayCounts
 from breezy.runtime.exec_par_records import (
@@ -126,9 +127,9 @@ class _DayScan:
     ambiguous: int
     arm_ns: tuple[int, ...]
     findings: tuple[str, ...]
-    #: A rebuilt day whose AMBIGUOUS rows are fewer than its effective count: some arm times are
-    #: missing. The effective count is carried so the burst can be judged over the whole window.
-    incomplete_effective: int | None = None
+    #: A rebuilt day whose AMBIGUOUS rows are fewer than its effective count: this many arm times
+    #: are missing (the positive BG-1d delta). The burst is judged over the whole window.
+    missing: int = 0
 
 
 class DayScanCache:
@@ -159,18 +160,26 @@ class DayScanCache:
 
 
 def _scan_floor_day(reads: IntradayReads, day: str, cutoff: int) -> _DayScan:
+    """A floor label: post-floor rows only, plus the day's positive rebuild delta. A rebuild
+    restores whole-day counts, not rows, so the delta cannot be split at the floor; it is added in
+    full to the numerator (conservative) and counted as missing arm times."""
     anchors = reads.read_order_anchors(day)
     marks = tuple(r for r in _ambiguous_rows(reads.read_ambiguous(day)) if r.arm_ns >= cutoff)
+    delta = reads.read_counts_delta(day)
+    missing = 0 if delta is None else max(delta.ambiguous, 0)
+    posted_allowance = 0 if delta is None else max(delta.posted_entries, 0)
     posted = sum(1 for a in anchors if a.arm_ns >= cutoff)
-    findings = (f"ambiguous_exceeds_posted:{day}",) if len(marks) > posted else ()
-    return _DayScan(posted, len(marks), tuple(r.arm_ns for r in marks), findings)
+    ambiguous = len(marks) + missing
+    findings = (f"ambiguous_exceeds_posted:{day}",) if ambiguous > posted + posted_allowance else ()
+    return _DayScan(posted, ambiguous, tuple(r.arm_ns for r in marks), findings, missing)
 
 
 def _scan_plain_day(reads: IntradayReads, counters: IntradayCounts, day: str) -> _DayScan:
     """A whole-day scan. ``counts`` are EFFECTIVE (rows plus the day's BG-1d rebuild delta); a
     rebuild restores counts, not rows, so rows are compared with ``counts - delta`` and only a
     mismatch the delta does not explain is an integrity finding. A positive delta means arm times
-    are missing for that many marks (the CP numerator still uses the effective count)."""
+    are missing for that many marks (the CP numerator still uses the effective count). A negative
+    delta needs no special case: rows count, so ``counts - delta == rows`` still holds."""
     counts = counters.read_day_counts(day)
     if counts is None:
         raise IntradayInputError("day counts missing")
@@ -187,14 +196,23 @@ def _scan_plain_day(reads: IntradayReads, counters: IntradayCounts, day: str) ->
         counts.ambiguous,
         tuple(r.arm_ns for r in rows),
         tuple(findings),
-        incomplete_effective=counts.ambiguous if missing > 0 else None,
+        missing=max(missing, 0),
     )
 
 
-def _unattributed(reads: IntradayReads, floor: StageReset | None) -> _DayScan:
+def _stage_start(floor: StageReset | None, epochs: tuple[EpochRow, ...]) -> int | None:
+    """The instant the window opens: the latest ``stage_reset``, else the first K>1 epoch's boot.
+    ``None``: no K>1 epoch exists, so nothing can belong to a K>1 stage."""
+    if floor is not None:
+        return floor.ts
+    boots = [e.boot_ts for e in epochs if e.effective_k > 1]
+    return min(boots) if boots else None
+
+
+def _unattributed(reads: IntradayReads, start: int | None) -> _DayScan:
     """AMBIGUOUS marks BG-1b could not place on a day (arm time = the ingest instant). Those at
-    or after the floor count in the numerator and the burst; one with no usable arm time cannot
-    be windowed, which is an integrity finding, never a silent drop."""
+    or after the stage start count in the numerator and the burst; one with no usable arm time
+    cannot be windowed, which is an integrity finding, never a silent drop."""
     arms: list[int] = []
     findings: list[str] = []
     for row in _ambiguous_rows(reads.read_ambiguous(UNATTRIBUTED)):
@@ -202,7 +220,7 @@ def _unattributed(reads: IntradayReads, floor: StageReset | None) -> _DayScan:
         if isinstance(arm, bool) or not isinstance(arm, int) or arm <= 0:
             if "ambiguous_unattributable" not in findings:
                 findings.append("ambiguous_unattributable")
-        elif floor is None or arm >= floor.ts:
+        elif start is not None and arm >= start:
             arms.append(arm)
     return _DayScan(0, len(arms), tuple(arms), tuple(findings))
 
@@ -236,6 +254,8 @@ def gather_intraday_inputs(
     for day in labels:
         if day in excluded:
             continue
+        if cache is not None and day in gappy:
+            cache.invalidate([day])  # never serve a scan taken before a later gappy clear
         cacheable = cache is not None and day < first_open and day not in gappy
         hit = cache.get(day, floor_ts) if cache is not None and cacheable else None
         if hit is None:
@@ -247,17 +267,16 @@ def gather_intraday_inputs(
                 cache.put(day, floor_ts, hit)
         scans.append(hit)
         scan_days.append(day)
-    scans.append(_unattributed(reads, floor))
+    scans.append(_unattributed(reads, _stage_start(floor, epochs)))
     scan_days.append(UNATTRIBUTED)
     arm_times = tuple(t for x in scans for t in x.arm_ns)
     findings = [f for scan in scans for f in scan.findings]
     if not burst_trips(arm_times):  # missing arm times only matter if the rows do not trip it
-        findings.extend(
-            f"burst_incomplete_rebuilt_day:{day}"
-            for day, scan in zip(scan_days, scans, strict=True)
-            if scan.incomplete_effective is not None
-            and scan.incomplete_effective >= BURST_MIN_AMBIGUOUS
-        )
+        rebuilt = sorted(day for day, scan in zip(scan_days, scans, strict=True) if scan.missing)
+        total_missing = sum(scan.missing for scan in scans)
+        # Sound bound: every missing mark could fall inside the busiest known 60 minutes.
+        if rebuilt and total_missing + max_in_window(arm_times) >= BURST_MIN_AMBIGUOUS:
+            findings.append(f"burst_incomplete_rebuilt_day:{','.join(rebuilt)}")
     return IntradayInputs(
         posted=sum(x.posted for x in scans),
         ambiguous=sum(x.ambiguous for x in scans),
@@ -341,17 +360,23 @@ class IntradayMonitor:
             if self._floor is not _UNSET and floor != self._floor:
                 self._active_stops = frozenset()
             self._floor = floor
+        stop_error: Exception | None = None
         if stops is not None:
             self._active_stops &= frozenset(stops)
             fresh = [reason for reason in stops if reason not in self._active_stops]
-            for reason in fresh[:1]:
-                self._stop(reason, now_ns)
-                self._active_stops |= {reason}
+            try:
+                for reason in fresh[:1]:
+                    self._stop(reason, now_ns)
+                    self._active_stops |= {reason}
+            except Exception as exc:  # noqa: BLE001 - the integrity loop still runs this tick
+                stop_error = exc
             self._active_integrity &= frozenset(integrity)
         for reason in integrity:
             if reason not in self._active_integrity:
                 self._integrity(reason)
                 self._active_integrity |= {reason}
+        if stop_error is not None:
+            raise stop_error
 
     def _evaluate(self, now_ns: int) -> tuple[tuple[str, ...] | None, tuple[str, ...], object]:
         stops: tuple[str, ...] | None = None

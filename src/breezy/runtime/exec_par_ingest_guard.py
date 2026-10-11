@@ -59,6 +59,7 @@ class IngestGuard:
         self._fault_count = 0
         self._gappy_write_failures = 0
         self._overflow_count = 0
+        self._write_count = 0
 
     # -- observability ------------------------------------------------------
 
@@ -69,6 +70,12 @@ class IngestGuard:
     @property
     def gappy_write_failures(self) -> int:
         return self._gappy_write_failures
+
+    @property
+    def write_count(self) -> int:
+        """Counter rows this guard has written (events, retried events, AMBIGUOUS marks); BG-6
+        compares it between ticks to know a closed day's scan may have gone stale."""
+        return self._write_count
 
     @property
     def overflow_count(self) -> int:
@@ -88,6 +95,7 @@ class IngestGuard:
         """Ingest one event; on any failure count, gappy-mark and queue it."""
         try:
             self._ingest.on_event(event, order_of)
+            self._write_count += 1
         except Exception as exc:  # noqa: BLE001 - total by contract
             self._note_fault(exc)
             self._gappy(event, now_ns)
@@ -101,6 +109,7 @@ class IngestGuard:
         for event in batch:
             try:
                 self._ingest.on_event(event, order_of)
+                self._write_count += 1
             except Exception:  # noqa: BLE001 - total by contract
                 survivors.append(event)
         self._queue.extendleft(reversed(survivors))
@@ -108,7 +117,7 @@ class IngestGuard:
     def ingest_marks(self, marks: AmbiguousMarkSource, now_ns: int) -> None:
         """Ingest the ledger's pending AMBIGUOUS marks (they stay pending on a failure)."""
         try:
-            self._ingest.ingest_ambiguous_marks(marks, now_ns=now_ns)
+            self._write_count += self._ingest.ingest_ambiguous_marks(marks, now_ns=now_ns)
         except Exception as exc:  # noqa: BLE001 - total by contract
             self._note_fault(exc)
 
