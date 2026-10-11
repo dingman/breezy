@@ -182,8 +182,10 @@ class LedgerPredicatePort(Protocol):
     The caller (loop thread) passes already-aggregated Decimals; the port
     compares them against budget fractions and returns a bool. Currency
     values never leave the port's caller and are never logged. A raise or a
-    non-bool return counts as tripped. BG-1e implements this; BG-1a declares
-    the signatures only.
+    non-bool return counts as tripped. ``DailySpendLedger`` implements this
+    structurally (BG-1e). The 5 s window share and the 2-of-5 day counts are
+    pure ratios / counts that need no budget, so the caller compares them
+    itself and they are deliberately not on this port.
     """
 
     def pnl_breaches_budget_fraction(
@@ -191,12 +193,6 @@ class LedgerPredicatePort(Protocol):
     ) -> bool: ...
     def open_cost_exceeds_budget_fraction(
         self, *, aggregate_open_cost: Decimal, fraction: Decimal
-    ) -> bool: ...
-    def window_cost_exceeds_budget_fraction(
-        self, *, aggregate_window_cost: Decimal, fraction: Decimal
-    ) -> bool: ...
-    def loss_days_breach(
-        self, *, day_pnls: tuple[Decimal, ...], fraction: Decimal, min_days: int
     ) -> bool: ...
 
 
