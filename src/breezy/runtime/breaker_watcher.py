@@ -49,6 +49,17 @@ from nautilus_trader.model.events import OrderDenied, OrderSubmitted
 from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.symbology import base_slug_of
+from breezy.runtime.exec_par_records import (
+    Amendment,
+    CleanupDemotion,
+    EpochRow,
+    ExcludedDay,
+    ForceK1Cleared,
+    ForceK1Flag,
+    StageEvalDry,
+    StageReset,
+    StopVerdict,
+)
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, AlertSink
 from breezy.runtime.submit_intent_slots import BREAKER_HEARTBEAT_MAX_AGE_NS
@@ -138,6 +149,55 @@ class BreakerLatchPort(Protocol):
 
     def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None: ...
     def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None: ...
+
+
+class ExecParStorePort(Protocol):
+    """BG-1a store writer: the durable D-PREREG records (spec 10a, K9, M3, N4).
+
+    Implemented by single-writer ``SubmitIntentLatch`` methods that each run
+    under ``_require_held()`` and never nest the latch ``_mutex``. Readers on
+    the latch (``read_*``) are not part of this write port. A write failure
+    propagates (the caller maps it to ``telemetry_write_fail`` or, for the
+    marker, ``stop_marker_write_fail``).
+    """
+
+    def write_stage_reset(self, record: StageReset) -> None: ...
+    def add_excluded_day(self, record: ExcludedDay) -> bool: ...
+    def write_epoch_row(self, record: EpochRow) -> None: ...
+    def write_epoch_stop_ts(self, boot_ts: int, stop_ts: int) -> bool: ...
+    def write_amendment(self, record: Amendment) -> None: ...
+    def write_stage_eval_dry(self, record: StageEvalDry) -> None: ...
+    def write_force_k1_cleared(self, record: ForceK1Cleared) -> None: ...
+    def write_stop_verdict(self, record: StopVerdict) -> None: ...
+    def write_cleanup_demotion(self, record: CleanupDemotion) -> None: ...
+    def write_force_k1_flag(self, record: ForceK1Flag) -> None: ...
+    def clear_force_k1_flag(self, cleared_ts_ns: int) -> None: ...
+    def mark_flag_write_failed(self) -> None: ...
+    def clear_flag_write_failed(self) -> None: ...
+
+
+class LedgerPredicatePort(Protocol):
+    """Value-free ledger predicates (K6): aggregates in, ``bool`` only out.
+
+    The caller (loop thread) passes already-aggregated Decimals; the port
+    compares them against budget fractions and returns a bool. Currency
+    values never leave the port's caller and are never logged. A raise or a
+    non-bool return counts as tripped. BG-1e implements this; BG-1a declares
+    the signatures only.
+    """
+
+    def pnl_breaches_budget_fraction(
+        self, *, aggregate_pnl: Decimal, fraction: Decimal
+    ) -> bool: ...
+    def open_cost_exceeds_budget_fraction(
+        self, *, aggregate_open_cost: Decimal, fraction: Decimal
+    ) -> bool: ...
+    def window_cost_exceeds_budget_fraction(
+        self, *, aggregate_window_cost: Decimal, fraction: Decimal
+    ) -> bool: ...
+    def loss_days_breach(
+        self, *, day_pnls: tuple[Decimal, ...], fraction: Decimal, min_days: int
+    ) -> bool: ...
 
 
 def _reason_label(reason: str) -> str:

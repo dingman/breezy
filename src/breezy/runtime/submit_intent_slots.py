@@ -182,6 +182,9 @@ class BreakerRecord:
     halted_ts_ns: int | None
     hb_ns: int
     resolver_pass_ns: int
+    #: M3: a failed force-K1 flag write. Encoded only when True, so records
+    #: that never set it stay byte-identical and old records decode False.
+    flag_write_failed: bool = False
 
     @property
     def is_halted(self) -> bool:
@@ -192,14 +195,15 @@ def encode_breaker(record: BreakerRecord) -> bytes:
     halted: dict[str, object] | None = None
     if record.halted_reason is not None:
         halted = {"reason": record.halted_reason, "ts_ns": record.halted_ts_ns}
-    return canonical_text(
-        {
-            "v": 1,
-            "halted": halted,
-            "hb_ns": record.hb_ns,
-            "resolver_pass_ns": record.resolver_pass_ns,
-        }
-    )
+    document: dict[str, object] = {
+        "v": 1,
+        "halted": halted,
+        "hb_ns": record.hb_ns,
+        "resolver_pass_ns": record.resolver_pass_ns,
+    }
+    if record.flag_write_failed:
+        document["flag_write_failed"] = True
+    return canonical_text(document)
 
 
 def parse_breaker(raw: bytes) -> BreakerRecord:
@@ -217,9 +221,13 @@ def parse_breaker(raw: bytes) -> BreakerRecord:
             raise SlotTableError("breaker halted reason")
         reason = raw_reason
         ts_ns = _int_of(halted.get("ts_ns"))
+    flag_failed = payload.get("flag_write_failed", False)
+    if not isinstance(flag_failed, bool):
+        raise SlotTableError("breaker flag_write_failed")
     return BreakerRecord(
         halted_reason=reason,
         halted_ts_ns=ts_ns,
         hb_ns=_int_of(payload.get("hb_ns")),
         resolver_pass_ns=_int_of(payload.get("resolver_pass_ns")),
+        flag_write_failed=flag_failed,
     )

@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Final, Protocol, Self
 
 from breezy.domain.exec_slots import SlotRecord, SlotTableView, Wait, admit
+from breezy.runtime.exec_par_latch_records import ExecParRecordsMixin
 from breezy.runtime.submit_intent_slots import (
     BREAKER_ABSENT_GRACE_NS,
     BREAKER_FUTURE_SKEW_NS,
@@ -523,7 +524,7 @@ def decode_slot_table(raw: bytes | None) -> SlotTable:
     )
 
 
-class SubmitIntentLatch:
+class SubmitIntentLatch(ExecParRecordsMixin):
     """One-at-a-time submit latch persisted through ``StateStore.get``/``set``.
 
     Constructed only by :func:`open_submit_intent_latch`, which binds this
@@ -574,6 +575,11 @@ class SubmitIntentLatch:
     def opening_thread_ident(self) -> int:
         """The ``threading.get_ident()`` value of the thread that opened this latch."""
         return self._opening_thread_ident
+
+    @property
+    def boot_ns(self) -> int:
+        """The clock reading taken when this latch was constructed (read-only)."""
+        return self._boot_ns
 
     def _require_held(self) -> None:
         if not self._lock.held:
@@ -1091,6 +1097,7 @@ class SubmitIntentLatch:
                         halted_ts_ns=None if existing is None else existing.halted_ts_ns,
                         hb_ns=hb_ns,
                         resolver_pass_ns=resolver_pass_ns,
+                        flag_write_failed=existing is not None and existing.flag_write_failed,
                     )
                 ),
             )
@@ -1113,6 +1120,7 @@ class SubmitIntentLatch:
                         halted_ts_ns=ts_ns,
                         hb_ns=0 if existing is None else existing.hb_ns,
                         resolver_pass_ns=0 if existing is None else existing.resolver_pass_ns,
+                        flag_write_failed=existing is not None and existing.flag_write_failed,
                     )
                 ),
             )
@@ -1186,11 +1194,41 @@ class SubmitIntentLatch:
                 BREAKER_KEY,
                 encode_breaker(
                     BreakerRecord(
-                        None, None, hb_ns=existing.hb_ns, resolver_pass_ns=existing.resolver_pass_ns
+                        None,
+                        None,
+                        hb_ns=existing.hb_ns,
+                        resolver_pass_ns=existing.resolver_pass_ns,
+                        flag_write_failed=existing.flag_write_failed,
                     )
                 ),
             )
             return True
+
+    def mark_flag_write_failed(self) -> None:
+        """M3: record a lost force-K1 flag write on the breaker record (same single writer)."""
+        self._set_flag_write_failed(True)
+
+    def clear_flag_write_failed(self) -> None:
+        """Clear the M3 field (N2: only ``--clear-force-k1`` calls this). Garbled raises."""
+        self._set_flag_write_failed(False)
+
+    def _set_flag_write_failed(self, value: bool) -> None:
+        self._require_held()
+        with self._mutex:
+            # A garbled record raises: overwriting it would silently drop a halt.
+            existing = self._read_breaker()
+            self._store.set(
+                BREAKER_KEY,
+                encode_breaker(
+                    BreakerRecord(
+                        halted_reason=None if existing is None else existing.halted_reason,
+                        halted_ts_ns=None if existing is None else existing.halted_ts_ns,
+                        hb_ns=0 if existing is None else existing.hb_ns,
+                        resolver_pass_ns=0 if existing is None else existing.resolver_pass_ns,
+                        flag_write_failed=value,
+                    )
+                ),
+            )
 
     def _read_breaker(self) -> BreakerRecord | None:
         raw = self._store.get(BREAKER_KEY)
