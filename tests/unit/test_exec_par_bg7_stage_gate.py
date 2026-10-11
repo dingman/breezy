@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -45,11 +47,6 @@ def ns_of(day: str) -> int:
 
 FLOOR_TS = ns_of(d(0)) + 5
 NOW = ns_of(d(3)) + 3_600 * NS
-
-
-class _Preds:
-    def pnl_breaches_budget_fraction(self, *, aggregate_pnl: Decimal, fraction: Decimal) -> bool:
-        return aggregate_pnl <= -fraction
 
 
 @dataclass
@@ -103,7 +100,6 @@ def run(
         db_path=db,
         out_dir=out_dir,
         governed=UtcDays(),
-        predicates=_Preds(),
         now_ns=now_ns,
         configured_k=configured_k,
         sink=sink if sink is not None else _Sink(),
@@ -483,3 +479,165 @@ def test_nothing_under_src_reads_the_export_or_imports_the_script() -> None:
         text = path.read_text(encoding="utf-8")
         assert "k_epochs.jsonl" not in text, path
         assert "exec_par_stage_gate" not in text, path
+
+
+# -- rulings: s15 not evaluated, cheap import, stations from the node's source, limitations ----
+
+
+def _with_in_node(
+    tmp_path: Path, name: str, probe: gate.CrossCheckResult, verdict: str, reason: str | None
+) -> Path:
+    sub = tmp_path / name
+    sub.mkdir()
+
+    def writer(latch: SubmitIntentLatch) -> None:
+        k2_stage(latch)
+        latch.write_stage_report(
+            StageReportDoc(NOW - 60 * NS, verdict, reason, probe.stage_report_json)
+        )
+        latch.write_stage_eval_stamp(StageEvalStamp(NOW - 60 * NS, 777))
+
+    return seed(sub, writer)
+
+
+def test_the_script_never_touches_the_spend_ledger_or_operator_caps() -> None:
+    source = Path(gate.__file__).read_text()
+    for banned in ("operator_controls", "DailySpendLedger", "MAX_DAILY_BUDGET"):
+        assert banned not in source, banned
+
+
+def test_the_predicate_port_reports_not_evaluated_and_never_trips() -> None:
+    port = gate.NotEvaluatedPredicates()
+    assert port.evaluated is False
+    assert (
+        port.pnl_breaches_budget_fraction(aggregate_pnl=Decimal(-1000000), fraction=Decimal("0.15"))
+        is False
+    )
+    assert port.evaluated is True
+
+
+def test_an_in_node_s15_stop_is_agree_except_s15_not_evaluated(tmp_path: Path) -> None:
+    db = _with_in_node(tmp_path, "s", gate_probe(tmp_path), "stop", "s15_day")
+    sink = _Sink()
+    result = run(db, tmp_path / "out", sink=sink)
+    assert result.agreement == "AGREE_EXCEPT_S15_NOT_EVALUATED"
+    assert result.exit_code == 0
+    assert sink.sent == []
+    report = json.loads((tmp_path / "out" / gate.REPORT_NAME).read_text())
+    assert report["s15"] == {
+        "status": "not_evaluated",
+        "in_node_only": {"verdict": "stop", "reason": "s15_day", "is_s15_stop": True},
+    }
+
+
+def gate_probe(tmp_path: Path) -> gate.CrossCheckResult:
+    sub = tmp_path / "probe"
+    sub.mkdir(exist_ok=True)
+    return run(seed(sub, k2_stage), sub / "o")
+
+
+def test_an_in_node_s15_stop_with_a_closed_day_mismatch_still_disagrees(tmp_path: Path) -> None:
+    probe = gate_probe(tmp_path)
+    sub = tmp_path / "m"
+    sub.mkdir()
+    closed = d(1)
+
+    def writer(latch: SubmitIntentLatch) -> None:
+        k2_stage(latch)
+        latch.write_order_anchor(anchor("coid-9", closed, ns_of(closed) + 99 * NS))
+        latch.write_stage_report(
+            StageReportDoc(NOW - 60 * NS, "stop", "s15_stage", probe.stage_report_json)
+        )
+        latch.write_stage_eval_stamp(StageEvalStamp(NOW - 60 * NS, 777))
+
+    result = run(seed(sub, writer), sub / "out")
+    assert result.agreement == "DISAGREE"
+    assert f"day_stats:{closed}" in result.reasons
+
+
+def test_an_in_node_non_s15_stop_is_a_disagreement(tmp_path: Path) -> None:
+    probe = gate_probe(tmp_path)
+    db = _with_in_node(tmp_path, "n", probe, "stop", "s6_dropped_share")
+    result = run(db, tmp_path / "out")
+    assert result.agreement == "DISAGREE"
+    assert any(r.startswith("verdict:") for r in result.reasons)
+
+
+def test_an_in_node_pass_agrees_and_the_s15_section_echoes_it(tmp_path: Path) -> None:
+    probe = gate_probe(tmp_path)
+    db = _with_in_node(tmp_path, "a", probe, "pass", None)
+    result = run(db, tmp_path / "out")
+    assert result.agreement == "AGREE"
+    report = json.loads((tmp_path / "out" / gate.REPORT_NAME).read_text())
+    assert report["s15"]["status"] == "not_evaluated"
+    assert report["s15"]["in_node_only"] == {
+        "verdict": "pass",
+        "reason": None,
+        "is_s15_stop": False,
+    }
+
+
+def test_importing_the_script_loads_no_breezy_or_network_module() -> None:
+    root = Path(__file__).resolve().parents[2]
+    code = (
+        "import sys; import scripts.analysis.exec_par_stage_gate; "
+        "bad = sorted(m for m in sys.modules if m.split('.')[0] in "
+        "('breezy', 'httpx', 'nautilus_trader', 'pyarrow')); print(bad)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": f"{root / 'src'}{os.pathsep}{root}"},
+    )
+    assert out.stdout.strip() == "[]", out.stdout
+
+
+def test_stations_come_from_the_family_manifest_in_supported_order() -> None:
+    from breezy.persistence.family_manifest import load_family_manifest
+    from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
+
+    root = Path(__file__).resolve().parents[2]
+    manifest = load_family_manifest(root / "deploy/families/pm_us_crh_fq_v1.json")
+    expected = tuple(x for x in SUPPORTED_STATIONS if x in set(manifest.stations))
+    assert gate.resolve_stations("pm_us_crh_fq_v1", root / "deploy/families") == expected
+
+
+def test_an_unknown_family_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        gate.resolve_stations("no_such_family", tmp_path)
+
+
+def test_no_station_literal_is_hardcoded_in_the_script() -> None:
+    source = Path(gate.__file__).read_text()
+    for station in ("LAX", "MDW", "MIA", "SFO"):
+        assert station not in source, station
+
+
+def test_main_resolves_stations_from_a_family_id(tmp_path: Path) -> None:
+    db = seed(tmp_path)
+    code = gate.main(
+        ["--db", str(db), "--out-dir", str(tmp_path / "out"), "--family-id", "pm_us_crh_fq_v1"]
+    )
+    assert code == 0
+
+
+def test_main_without_stations_or_family_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BREEZY_SENDING_FAMILY_ID", raising=False)
+    monkeypatch.setattr(gate, "resolve_alert_sink", lambda *a, **k: _Sink())
+    db = seed(tmp_path)
+    assert gate.main(["--db", str(db), "--out-dir", str(tmp_path / "out")]) == 2
+
+
+def test_the_report_states_its_limitations(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    run(seed(tmp_path), out)
+    limitations = json.loads((out / gate.REPORT_NAME).read_text())["limitations"]
+    joined = " ".join(limitations)
+    assert "spend" in joined and "audit" in joined
+    assert "settlement" in joined and "pre-reset" in joined
+    assert "s15" in joined

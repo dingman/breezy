@@ -1999,9 +1999,10 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 - **Exit codes.** 0 AGREE, 1 DISAGREE (alert `EXEC_PAR_STAGE_CROSSCHECK_DISAGREE`), 2 the run failed
   (alert `EXEC_PAR_STAGE_CROSSCHECK_ERROR`). Non-zero also fires `breezy-study-failed@%n.service`.
   An empty store, or K=1 with no K>1 epoch, is PASS/PASS agreement (D-PREREG r4.1 K8).
-- **Environment.** `EnvironmentFile=-%h/.config/breezy/alerts.env` only. No `operator.env`, so the
-  daily-budget P&L predicate cannot be evaluated at K>1 until the coordinator decides how the cap
-  reaches this unit; the comparison then reports `stage_eval_fail:predicate:*`.
+- **Environment.** `EnvironmentFile=-%h/.config/breezy/alerts.env` only; no `operator.env`. The s15
+  P&L stops are therefore `not_evaluated` here, the in-node s15 outcome is echoed as `in_node_only`,
+  and an in-node s15 STOP with no other difference is `AGREE_EXCEPT_S15_NOT_EVALUATED` (exit 0).
+  Governed stations come from `--family-id` (keep it equal to the sending family).
 - **Memory.** `MemoryHigh=1G`, `MemoryMax=2G`. Not run under the autonomy bwrap wrapper (its rows
   belong to the autonomy programme); `mode=ro` is the read-only control.
 - **Gate.** D-PREREG section 14 step 12 requires the FIRST SCHEDULED run to succeed and agree with

@@ -16,8 +16,9 @@ Outputs (default ``docs/evidence/exec_par/``):
 * ``k_epochs.jsonl``: one line per BG-2 epoch row (spec 10: "BG-7 exports the rows"). ``src``
   never reads it.
 
-Comparison (``AGREE`` / ``DISAGREE``). The in-node verdict is the ``stage_eval/report`` row
-(``stage_eval/stamp`` for health). It disagrees when the verdict kind or reason differs, when a
+Comparison (``AGREE`` / ``AGREE_EXCEPT_S15_NOT_EVALUATED`` / ``DISAGREE``). The in-node verdict is
+the ``stage_eval/report`` row (``stage_eval/stamp`` for health). It disagrees when the verdict
+kind or reason differs, when a
 K>1 stage has no (or a stale, or an unreadable) in-node report or no stamp, or when a CLOSED day's
 posted / AMBIGUOUS / fill counts differ between the two. With no epoch rows, or at K=1, the node
 runs no K>1 pass and writes no report: the in-node verdict is then taken as ``PASS`` (K8: a
@@ -33,18 +34,26 @@ What this run cannot reproduce, stated rather than hidden:
   false`` and lists only the days the node already excluded with an audit cause.
 * The serial baseline and the BG-11 denial classifier are not wired in the node either (integration
   notes 16); both are passed as ``None``.
-* The ``DailySpendLedger`` predicate reads the operator daily budget from the environment exactly
-  as the node does. The unit loads no ``operator.env``: with no budget in the environment a P&L
-  predicate raises, the evaluator FAILs ``predicate:*`` and the comparison reports it.
+* The s15 P&L predicates need the operator caps, which exist only in the launch shell. The
+  predicate port here (``NotEvaluatedPredicates``) never trips, the report states s15 as
+  ``not_evaluated`` and echoes the in-node s15 outcome as ``in_node_only``. Everything else is
+  compared; an in-node s15 STOP with no other difference is ``AGREE_EXCEPT_S15_NOT_EVALUATED``.
+* Governed stations come from the sending family's manifest (``--family-id`` or
+  ``$BREEZY_SENDING_FAMILY_ID``) as the node's ``_composable_stations`` does, with offsets from
+  the site registry. ``--stations`` overrides for tests.
 
-Exit status: 0 AGREE, 1 DISAGREE (alert ``EXEC_PAR_STAGE_CROSSCHECK_DISAGREE``), 2 the run itself
-failed (alert ``EXEC_PAR_STAGE_CROSSCHECK_ERROR``).
+Every ``limitations`` entry in the report restates these gaps.
+
+Exit status: 0 AGREE or AGREE_EXCEPT_S15_NOT_EVALUATED, 1 DISAGREE (alert
+``EXEC_PAR_STAGE_CROSSCHECK_DISAGREE``), 2 the run itself failed (alert
+``EXEC_PAR_STAGE_CROSSCHECK_ERROR``).
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -52,41 +61,21 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
-from typing import Final, Self
+from typing import TYPE_CHECKING, Final, Self
 
-from breezy.adapters.polymarket_us.operator_controls import DailySpendLedger
-from breezy.registry.sites import default_registry
-from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
-from breezy.runtime.exec_par_counter_store import LatchCounterStore
-from breezy.runtime.exec_par_days_port import DayConvention
-from breezy.runtime.exec_par_governed_days import governed_days_for
-from breezy.runtime.exec_par_latch_stage import ExecParStageRowsMixin
-from breezy.runtime.exec_par_reconcile import RECONCILE_BOUND_NS, PassStatus
-from breezy.runtime.exec_par_records import (
-    AMENDMENT_KEY_PREFIX,
-    EXEC_PAR_PREFIX,
-    Amendment,
-    EpochRow,
-    ExecParRecordError,
-    RebuildRow,
-    StageReportDoc,
-    decode_record,
-)
-from breezy.runtime.exec_par_stage_eval import evaluate_stage
-from breezy.runtime.exec_par_stage_report import report_json
-from breezy.runtime.exec_par_stage_snapshot import SnapshotInputs, build_stage_snapshot
-from breezy.runtime.exec_par_stage_types import (
-    PnlPredicatePort,
-    StageSnapshot,
-    Verdict,
-    VerdictKind,
-)
-from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
-from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
+# Every breezy import below is deferred into the function that uses it, so importing this module
+# costs the standard library only (the persistence entry-smoke budget counts this unit's module).
+if TYPE_CHECKING:
+    from breezy.runtime.exec_par_days_port import DayConvention
+    from breezy.runtime.exec_par_latch_stage import ExecParStageRowsMixin
+    from breezy.runtime.exec_par_records import EpochRow, StageReportDoc
+    from breezy.runtime.exec_par_stage_types import StageSnapshot, Verdict
+    from breezy.runtime.health import AlertSink
 
 __all__ = [
     "EPOCHS_NAME",
@@ -94,9 +83,12 @@ __all__ = [
     "EVENT_ERROR",
     "REPORT_NAME",
     "CrossCheckResult",
+    "NotEvaluatedPredicates",
     "ReadOnlyState",
     "atomic_write_text",
     "main",
+    "resolve_alert_sink",
+    "resolve_stations",
     "run_cross_check",
 ]
 
@@ -115,8 +107,14 @@ _NS_PER_HOUR: Final[int] = 3_600 * 1_000_000_000
 #: The stamp is "stale after 26 h" (integration notes): a daily pass plus two hours of slack.
 DEFAULT_MAX_REPORT_AGE_HOURS: Final[int] = 26
 _BUSY_TIMEOUT_S: Final[float] = 5.0
-_REBUILD_PENDING: Final[str] = EXEC_PAR_PREFIX + "rebuild/"
-_REBUILD_LOG: Final[str] = EXEC_PAR_PREFIX + "rebuild_log/"
+_REBUILD_PENDING_SUFFIX: Final[str] = "rebuild/"
+_REBUILD_LOG_SUFFIX: Final[str] = "rebuild_log/"
+SENDING_FAMILY_ENV_VAR: Final[str] = "BREEZY_SENDING_FAMILY_ID"
+DEFAULT_FAMILIES_DIR: Final[Path] = Path(__file__).resolve().parents[2] / "deploy" / "families"
+S15_STATUS_NOT_EVALUATED: Final[str] = "not_evaluated"
+AGREE: Final[str] = "AGREE"
+AGREE_EXCEPT_S15: Final[str] = "AGREE_EXCEPT_S15_NOT_EVALUATED"
+DISAGREE: Final[str] = "DISAGREE"
 _AUDIT_CAUSES: Final[frozenset[str]] = frozenset({"spend_unaudited", "spend_audit_mismatch"})
 _K_FORCED_NOTE_PREFIX: Final[str] = "k_forced_to_1:"
 _HEALTHY_KINDS: Final[frozenset[str]] = frozenset({"pass", "hold", "promotion_eligible"})
@@ -191,21 +189,46 @@ class ReadOnlyState:
         self.close()
 
 
-class _ReadOnlyLatch(ExecParStageRowsMixin):
-    """The node's own record readers over a store that cannot write.
+@functools.cache
+def _latch_class() -> type[ExecParStageRowsMixin]:
+    """The node's own record readers over a store that cannot write (built on first use so the
+    mixin import stays off the module import path).
 
     The mixin's writers are inherited but unreachable: they call ``self._store.set`` /
     ``delete``, which :class:`ReadOnlyState` does not have.
     """
+    from breezy.runtime.exec_par_latch_stage import ExecParStageRowsMixin
 
-    CorruptError = StoreCorrupt
+    class ReadOnlyLatch(ExecParStageRowsMixin):
+        CorruptError = StoreCorrupt
 
-    def __init__(self, store: ReadOnlyState) -> None:
-        self._store = store  # type: ignore[assignment]  # read-only: no set()
-        self._mutex = threading.Lock()
+        def __init__(self, store: ReadOnlyState) -> None:
+            self._store = store  # type: ignore[assignment]  # read-only: no set()
+            self._mutex = threading.Lock()
 
-    def _require_held(self) -> None:
-        """No process lock is needed (or taken) to read."""
+        def _require_held(self) -> None:
+            """No process lock is needed (or taken) to read."""
+
+    return ReadOnlyLatch
+
+
+def _open_latch(store: ReadOnlyState) -> ExecParStageRowsMixin:
+    return _latch_class()(store)  # type: ignore[call-arg]  # the dynamic class takes the store
+
+
+class NotEvaluatedPredicates:
+    """The s15 P&L predicate port of the cross-check: it never trips.
+
+    The budget-fraction predicates need the operator caps, which exist only in the launch shell,
+    so this run does not evaluate s15. ``evaluated`` records that the evaluator reached a P&L
+    predicate; the report states s15 as ``not_evaluated`` and echoes the in-node outcome."""
+
+    def __init__(self) -> None:
+        self.evaluated = False
+
+    def pnl_breaches_budget_fraction(self, *, aggregate_pnl: Decimal, fraction: Decimal) -> bool:
+        self.evaluated = True
+        return False
 
 
 # -- inputs derived from the store -----------------------------------------
@@ -219,6 +242,13 @@ class _KView:
 
 
 def _forced_amendment_ts(store: ReadOnlyState) -> tuple[int, ...]:
+    from breezy.runtime.exec_par_records import (
+        AMENDMENT_KEY_PREFIX,
+        Amendment,
+        ExecParRecordError,
+        decode_record,
+    )
+
     found: list[int] = []
     for key in store.keys_with_prefix(AMENDMENT_KEY_PREFIX):
         raw = store.get(key)
@@ -241,6 +271,8 @@ def _derive_k(
     No epoch rows: the node never booted a K>1 epoch, so K=1. The configured K is the last
     UNFORCED epoch's K (a forced row only records the K it was forced to); the effective K is the
     last row's, or 1 when a K-forced amendment landed since that boot."""
+    from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
+
     if not epochs:
         return _KView(1 if override is None else override, 1, "no_epochs")
     last = epochs[-1]
@@ -252,7 +284,9 @@ def _derive_k(
     return _KView(configured, effective, "epoch_ledger")
 
 
-def _pass_status(latch: _ReadOnlyLatch, now_ns: int) -> tuple[PassStatus, dict[str, object]]:
+def _pass_status(latch: ExecParStageRowsMixin, now_ns: int) -> tuple[object, dict[str, object]]:
+    from breezy.runtime.exec_par_reconcile import RECONCILE_BOUND_NS, PassStatus
+
     phase = latch.read_reconcile_phase()
     if phase is None:
         return PassStatus.OK, {"present": False}
@@ -280,20 +314,26 @@ class _Mine:
 
 
 def _fail_verdict(reason: str) -> Verdict:
+    from breezy.runtime.exec_par_stage_types import Verdict, VerdictKind
+
     return Verdict(VerdictKind.FAIL, reason=reason)
 
 
 def _rebuild(
-    latch: _ReadOnlyLatch,
+    latch: ExecParStageRowsMixin,
     store: ReadOnlyState,
     *,
     governed: DayConvention,
-    predicates: PnlPredicatePort,
+    predicates: NotEvaluatedPredicates,
     now_ns: int,
     configured_k: int | None,
 ) -> _Mine:
     """Build the node's snapshot and evaluate it; a stage-level read failure is a FAIL verdict
     (``stage_eval_fail:snapshot:<type>``, as in the node), never a crash."""
+    from breezy.runtime.exec_par_counter_store import LatchCounterStore
+    from breezy.runtime.exec_par_stage_eval import evaluate_stage
+    from breezy.runtime.exec_par_stage_snapshot import SnapshotInputs, build_stage_snapshot
+
     k = _KView(1, 1, "unread")
     epochs: tuple[EpochRow, ...] | None = None
     reconcile: dict[str, object] = {"present": False}
@@ -309,7 +349,7 @@ def _rebuild(
                 today=governed.today(now_ns),
                 configured_k=k.configured,
                 effective_k=k.effective,
-                pass_status=status,
+                pass_status=status,  # type: ignore[arg-type]  # a PassStatus
                 governed=governed,
                 predicates=predicates,
                 serial_baseline=None,
@@ -337,6 +377,29 @@ class _Compared:
     in_node_verdict: str
     in_node_reason: str | None
     reasons: tuple[str, ...]
+    #: The in-node verdict is an s15 STOP this run cannot evaluate; every other part agrees.
+    s15_excepted: bool = False
+
+
+#: Mine kinds under which an in-node s15 STOP can legitimately differ (mine cannot see s15). A
+#: FAIL is an integrity problem of this run and is never excused.
+_S15_EXCUSABLE_KINDS: Final[frozenset[str]] = frozenset(
+    {"pass", "hold", "promotion_eligible", "stop"}
+)
+
+
+def _s15_reasons() -> frozenset[str]:
+    from breezy.runtime.exec_par_stage_types import (
+        STOP_S15_CUMULATIVE,
+        STOP_S15_DAY,
+        STOP_S15_STAGE,
+    )
+
+    return frozenset({STOP_S15_DAY, STOP_S15_STAGE, STOP_S15_CUMULATIVE})
+
+
+def _is_s15_stop(doc: StageReportDoc | None) -> bool:
+    return doc is not None and doc.verdict == "stop" and doc.reason in _s15_reasons()
 
 
 def _day_stat_rows(raw: object) -> dict[str, tuple[object, object, object]]:
@@ -393,6 +456,9 @@ def _compare(
     if k_gt1 and doc.verdict in _HEALTHY_KINDS and not stamp_present:
         reasons.append("in_node_stamp_missing")
     reasons.extend(_closed_day_mismatches(mine, doc, today))
+    if _is_s15_stop(doc) and mine_kind in _S15_EXCUSABLE_KINDS:
+        kept = tuple(r for r in reasons if not r.startswith(("verdict:", "reason:")))
+        return _Compared(doc.verdict.upper(), doc.reason, kept, s15_excepted=True)
     return _Compared(doc.verdict.upper(), doc.reason, tuple(reasons))
 
 
@@ -400,9 +466,16 @@ def _compare(
 
 
 def _scan_rebuilds(store: ReadOnlyState) -> list[dict[str, object]]:
+    from breezy.runtime.exec_par_records import (
+        EXEC_PAR_PREFIX,
+        ExecParRecordError,
+        RebuildRow,
+        decode_record,
+    )
+
     rows: list[tuple[str, RebuildRow]] = []
-    for prefix, status in ((_REBUILD_PENDING, "pending"), (_REBUILD_LOG, "retired")):
-        for key in store.keys_with_prefix(prefix):
+    for suffix, status in ((_REBUILD_PENDING_SUFFIX, "pending"), (_REBUILD_LOG_SUFFIX, "retired")):
+        for key in store.keys_with_prefix(EXEC_PAR_PREFIX + suffix):
             raw = store.get(key)
             if raw is None:
                 continue
@@ -424,7 +497,9 @@ def _scan_rebuilds(store: ReadOnlyState) -> list[dict[str, object]]:
     ]
 
 
-def _pre_reset_rows(latch: _ReadOnlyLatch, governed: DayConvention) -> list[dict[str, object]]:
+def _pre_reset_rows(
+    latch: ExecParStageRowsMixin, governed: DayConvention
+) -> list[dict[str, object]]:
     """Entries armed before the reset, by arm-time day (counts only; the settlement instant is
     not stored). Days before the floor label are wholly pre-reset; a floor label is split by its
     post-floor stub row."""
@@ -469,17 +544,17 @@ def _per_day(snapshot: StageSnapshot | None) -> list[dict[str, object]]:
     ]
 
 
-def _looks_section(latch: _ReadOnlyLatch, verdict: Verdict) -> dict[str, object]:
+def _looks_section(latch: ExecParStageRowsMixin, verdict: Verdict) -> dict[str, object]:
     return {
         "recorded": [{"day": x.day, "outcome": x.outcome} for x in latch.read_looks()],
         "look_number": verdict.look_number,
         "look_blockers": list(verdict.look_blockers),
-        "eligible": verdict.kind is VerdictKind.PROMOTION_ELIGIBLE,
+        "eligible": verdict.kind.value == "promotion_eligible",
     }
 
 
 def _holds_section(verdict: Verdict) -> dict[str, object]:
-    held = verdict.kind is VerdictKind.HOLD
+    held = verdict.kind.value == "hold"
     return {
         "active": held,
         "reason": verdict.reason if held else None,
@@ -501,7 +576,19 @@ def _deferral_section(excluded: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _stage_section(mine: _Mine, latch: _ReadOnlyLatch, today: str) -> dict[str, object]:
+def _s15_section(doc: StageReportDoc | None, *, k_gt1: bool) -> dict[str, object]:
+    """s15 is not evaluated here (no operator caps outside the launch shell). The in-node
+    outcome is echoed, never recomputed."""
+    in_node: dict[str, object] | None = None
+    if doc is not None:
+        in_node = {"verdict": doc.verdict, "reason": doc.reason, "is_s15_stop": _is_s15_stop(doc)}
+    return {
+        "status": S15_STATUS_NOT_EVALUATED if k_gt1 else "not_applicable",
+        "in_node_only": in_node,
+    }
+
+
+def _stage_section(mine: _Mine, latch: ExecParStageRowsMixin, today: str) -> dict[str, object]:
     stamp = latch.read_stage_eval_stamp()
     floor = latch.read_stage_reset()
     return {
@@ -514,18 +601,42 @@ def _stage_section(mine: _Mine, latch: _ReadOnlyLatch, today: str) -> dict[str, 
         "epoch_rows": None if mine.epochs is None else len(mine.epochs),
         "in_node_stamp_ts": None if stamp is None else stamp.ts_ns,
         "reconcile_phase": mine.reconcile,
-        "stage_report": None if mine.verdict.report is None else report_json(mine.verdict.report),
+        "stage_report": _report_json_of(mine.verdict),
     }
 
 
-def _excluded_rows(latch: _ReadOnlyLatch) -> list[dict[str, object]]:
+def _report_json_of(verdict: Verdict) -> str | None:
+    if verdict.report is None:
+        return None
+    from breezy.runtime.exec_par_stage_report import report_json
+
+    return report_json(verdict.report)
+
+
+def _excluded_rows(latch: ExecParStageRowsMixin) -> list[dict[str, object]]:
     return [{"day": x.day, "cause": x.cause, "ts": x.ts} for x in latch.read_excluded_days()]
 
 
-_NOTES: Final[tuple[str, ...]] = (
-    "read-only: no reconcile ran; counters are as the node's last reconcile left them",
-    "serial baseline and the BG-11 denial classifier are not supplied (as in the node)",
-    "pre-reset settlements are listed by arm-time day; settlement instants are not stored",
+#: What this run cannot reproduce, stated in every report (the coordinator's ruling: state the
+#: gaps, do not paper over them).
+LIMITATIONS: Final[tuple[str, ...]] = (
+    (
+        "spend audit: spend_unaudited / spend_audit_mismatch come from the Nautilus cache audit, "
+        "which runs in the node only and is not persisted; cache_audit_available is false and only "
+        "days the node already excluded with an audit cause are listed (per-day audit status "
+        "persistence is pending in BG-5c WP-E)"
+    ),
+    (
+        "pre-reset settlements: settlement instants are not stored, so entries armed before the "
+        "reset are listed by arm-time day as counts only, not by when they settled"
+    ),
+    (
+        "s15: the P&L budget-fraction stops are not evaluated here (operator caps exist only "
+        "in the launch shell); the in-node s15 outcome is echoed as in_node_only and an "
+        "in-node s15 STOP is AGREE_EXCEPT_S15_NOT_EVALUATED"
+    ),
+    ("read-only: no reconcile ran; counters are as the node's last reconcile left them"),
+    ("serial baseline and the BG-11 denial classifier are not supplied (as in the node)"),
 )
 
 
@@ -567,6 +678,21 @@ def _epochs_jsonl(epochs: tuple[EpochRow, ...]) -> str:
     return "".join(line + "\n" for line in lines)
 
 
+# -- alerts (deferred imports: the sink pulls in the HTTP client) ----------
+
+
+def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
+    from breezy.runtime.health import resolve_alert_sink as resolve
+
+    return resolve(env)
+
+
+def _alert(sink: AlertSink, severity: str, event: str, detail: str) -> None:
+    from breezy.runtime.health import AlertPayload, emit_alert
+
+    emit_alert(sink, AlertPayload(severity=severity, event=event, site=ALERT_SITE, detail=detail))
+
+
 # -- the run ---------------------------------------------------------------
 
 
@@ -584,8 +710,10 @@ class CrossCheckResult:
     epochs_path: Path | None
 
 
-def _alert(sink: AlertSink, severity: str, event: str, detail: str) -> None:
-    emit_alert(sink, AlertPayload(severity=severity, event=event, site=ALERT_SITE, detail=detail))
+def _agreement(compared: _Compared) -> str:
+    if compared.reasons:
+        return DISAGREE
+    return AGREE_EXCEPT_S15 if compared.s15_excepted else AGREE
 
 
 def run_cross_check(
@@ -593,7 +721,6 @@ def run_cross_check(
     db_path: Path,
     out_dir: Path,
     governed: DayConvention,
-    predicates: PnlPredicatePort,
     now_ns: int,
     configured_k: int | None = None,
     max_report_age_hours: int = DEFAULT_MAX_REPORT_AGE_HOURS,
@@ -604,12 +731,12 @@ def run_cross_check(
     Raises on a store that cannot be opened or read at the stage level of the REPORT sections
     (the caller maps that to exit 2); a failing snapshot is a FAIL verdict, not a raise."""
     with ReadOnlyState(db_path) as store:
-        latch = _ReadOnlyLatch(store)
+        latch = _open_latch(store)
         mine = _rebuild(
             latch,
             store,
             governed=governed,
-            predicates=predicates,
+            predicates=NotEvaluatedPredicates(),
             now_ns=now_ns,
             configured_k=configured_k,
         )
@@ -618,10 +745,11 @@ def run_cross_check(
             doc, report_unreadable = latch.read_stage_report(), False
         except StoreCorrupt:
             doc, report_unreadable = None, True
+        k_gt1 = mine.k.configured > 1
         compared = _compare(
             mine.verdict,
             today=today,
-            k_gt1=mine.k.configured > 1,
+            k_gt1=k_gt1,
             doc=doc,
             doc_unreadable=report_unreadable,
             stamp_present=_stamp_present(latch),
@@ -649,12 +777,13 @@ def run_cross_check(
             ),
             "holds": _holds_section(mine.verdict),
             "spend_deferrals": _deferral_section(excluded),
+            "s15": _s15_section(doc, k_gt1=k_gt1),
             "stage": _section(
                 "stage", lambda: _stage_section(mine, latch, today), _no_doc(), unreadable
             ),
             "unreadable_sections": unreadable,
         }
-    agreement = "AGREE" if not compared.reasons else "DISAGREE"
+    agreement = _agreement(compared)
     report: dict[str, object] = {
         "generated_ns": now_ns,
         "verdict_compare": {
@@ -664,7 +793,7 @@ def run_cross_check(
             "in_node": {"verdict": compared.in_node_verdict, "reason": compared.in_node_reason},
         },
         **sections,
-        "notes": list(_NOTES),
+        "limitations": list(LIMITATIONS),
     }
     report_path = out_dir / REPORT_NAME
     atomic_write_text(report_path, json.dumps(report, sort_keys=True, indent=2) + "\n")
@@ -672,7 +801,7 @@ def run_cross_check(
     if mine.epochs is not None:
         epochs_path = out_dir / EPOCHS_NAME
         atomic_write_text(epochs_path, _epochs_jsonl(mine.epochs))
-    if agreement == "DISAGREE":
+    if agreement == DISAGREE:
         _alert(sink, "CRITICAL", EVENT_DISAGREE, "reasons=" + ",".join(compared.reasons))
     return CrossCheckResult(
         mine_verdict=mine.verdict.kind.value.upper(),
@@ -681,8 +810,8 @@ def run_cross_check(
         in_node_reason=compared.in_node_reason,
         agreement=agreement,
         reasons=compared.reasons,
-        exit_code=_EXIT_AGREE if agreement == "AGREE" else _EXIT_DISAGREE,
-        stage_report_json=None if mine.verdict.report is None else report_json(mine.verdict.report),
+        exit_code=_EXIT_DISAGREE if agreement == DISAGREE else _EXIT_AGREE,
+        stage_report_json=_report_json_of(mine.verdict),
         report_path=report_path,
         epochs_path=epochs_path,
     )
@@ -691,6 +820,8 @@ def run_cross_check(
 def _section[T](name: str, build: Callable[[], T], default: T, unreadable: list[str]) -> T:
     """One report section: an unreadable row leaves the default and names the section (the
     verdict comparison already FAILs on the same row; the report must still be written)."""
+    from breezy.runtime.exec_par_records import ExecParRecordError
+
     try:
         return build()
     except (StoreCorrupt, ExecParRecordError) as exc:
@@ -707,14 +838,38 @@ def _no_doc() -> dict[str, object]:
     return {}
 
 
-def _stamp_present(latch: _ReadOnlyLatch) -> bool:
+def _stamp_present(latch: ExecParStageRowsMixin) -> bool:
     try:
         return latch.read_stage_eval_stamp() is not None
     except StoreCorrupt:
         return False
 
 
-# -- CLI -------------------------------------------------------------------
+# -- stations and CLI ------------------------------------------------------
+
+
+def resolve_stations(family_id: str, families_dir: Path) -> tuple[str, ...]:
+    """The governed stations, from the same source the node uses (``app/trade.py``
+    ``_composable_stations``): the family manifest's stations in ``SUPPORTED_STATIONS`` order.
+    An unsupported station or an empty intersection refuses (never dropped)."""
+    from breezy.persistence.family_manifest import load_family_manifest
+    from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
+
+    if not family_id or "/" in family_id or family_id.startswith("."):
+        raise ValueError("invalid family id")
+    path = families_dir / f"{family_id}.json"
+    if not path.is_file():
+        raise ValueError("unknown family")
+    manifest = load_family_manifest(path)
+    if manifest.family_id != family_id:
+        raise ValueError("manifest family_id does not match the requested family")
+    declared = set(manifest.stations)
+    if declared - set(SUPPORTED_STATIONS):
+        raise ValueError("manifest names a station outside SUPPORTED_STATIONS")
+    allowed = tuple(x for x in SUPPORTED_STATIONS if x in declared)
+    if not allowed:
+        raise ValueError("no composable station")
+    return allowed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -730,16 +885,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument(
+        "--family-id",
+        default=None,
+        help=f"sending family whose manifest names the governed stations (default: "
+        f"${SENDING_FAMILY_ENV_VAR})",
+    )
+    parser.add_argument("--families-dir", type=Path, default=DEFAULT_FAMILIES_DIR)
+    parser.add_argument(
         "--stations",
-        default=",".join(SUPPORTED_STATIONS),
-        help="governed stations, comma separated (default: the supported four)",
+        default=None,
+        help="override: governed stations, comma separated (tests); wins over --family-id",
     )
     parser.add_argument("--configured-k", type=int, default=None)
     parser.add_argument("--max-report-age-hours", type=int, default=DEFAULT_MAX_REPORT_AGE_HOURS)
     return parser
 
 
+def _stations_from(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.stations is not None:
+        return tuple(s.strip() for s in str(args.stations).split(",") if s.strip())
+    family = args.family_id or os.environ.get(SENDING_FAMILY_ENV_VAR)
+    if not family:
+        raise ValueError(f"no --stations, no --family-id and ${SENDING_FAMILY_ENV_VAR} is unset")
+    return resolve_stations(str(family), args.families_dir)
+
+
 def _governed(stations: Sequence[str]) -> DayConvention:
+    from breezy.registry.sites import default_registry
+    from breezy.runtime.exec_par_governed_days import governed_days_for
+
     registry = default_registry()
     return governed_days_for(
         stations, lambda s: registry.climate_day_window(VENUE, s).std_utc_offset_hours
@@ -754,12 +928,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if db is None:
             raise ValueError(f"no --db and ${DB_ENV_VAR} is unset")
-        stations = tuple(s.strip() for s in str(args.stations).split(",") if s.strip())
         result = run_cross_check(
             db_path=db,
             out_dir=args.out_dir,
-            governed=_governed(stations),
-            predicates=DailySpendLedger(),
+            governed=_governed(_stations_from(args)),
             now_ns=time.time_ns(),
             configured_k=args.configured_k,
             max_report_age_hours=args.max_report_age_hours,

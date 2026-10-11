@@ -30,6 +30,7 @@ def test_the_service_runs_the_script_as_a_module_under_the_repo_working_director
     exec_start = _value(_SERVICE, "ExecStart")
     assert exec_start.startswith("/home/jon/breezy/.venv/bin/python -m ")
     assert "scripts.analysis.exec_par_stage_gate" in exec_start
+    assert "--family-id pm_us_crh_fq_v1" in exec_start
     assert "--db %h/.local/share/breezy/state/exec_polymarket_us.sqlite" in exec_start
 
 
