@@ -5,7 +5,8 @@ stage being promoted from is a sha-pinned PASS with ``icc_v`` >= the G6 floor. T
 validator is pure (reads only under ``repo_root``); BG-3 applies it at boot
 (:func:`apply_promo_guard`) and BG-9 applies it to the committed config.
 
-Record: ``docs/evidence/exec_par/exec_par_bg10_promo_<stage>_<YYYY-MM-DD>.json``; fields in
+Record: ``docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/promo/``
+``exec_par_bg10_promo_<stage>_<YYYY-MM-DD>.json``; fields in
 ``EXEC-PAR-BG-integration-notes.md`` item 9. The pin is a standalone line
 ``bg10_promo_record_sha256: <hex>`` in a sha-valid frozen amendment.
 """
@@ -36,7 +37,7 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
-PROMO_RECORD_DIR: Final[Path] = Path("docs/evidence/exec_par")
+PROMO_RECORD_DIR: Final[Path] = Path("docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/promo")
 #: Highest K reachable without a record (O3 ceiling).
 UNGUARDED_K_CEILING: Final[int] = 2
 ICC_V_FLOOR: Final[float] = 0.4147
