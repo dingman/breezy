@@ -27,6 +27,7 @@ __all__ = [
     "AMENDMENT_DIR",
     "FLAG_SET_EVENT",
     "ForceK1BootDetail",
+    "default_repo_root",
     "force_k1_at_boot",
     "has_valid_amendment_for",
 ]
@@ -49,6 +50,14 @@ class ForceK1BootDetail(str, Enum):
     ``AlertDetail`` is byte-pinned; WP5b precedent). Never a flag reason or any raw text."""
 
     FLAG_SET = "EXEC_PAR_FORCE_K1_FLAG_SET"
+
+
+def default_repo_root() -> Path:
+    """The repo root, anchored on this file (``<root>/src/breezy/runtime/``), never the cwd.
+
+    The supervisor-launched node's working directory is not guaranteed to be the repo.
+    """
+    return Path(__file__).resolve().parents[3]
 
 
 class _Latch(Protocol):

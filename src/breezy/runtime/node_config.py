@@ -105,7 +105,7 @@ from breezy.adapters.polymarket_us.tape_records import (
 )
 from breezy.persistence.catalog import CatalogPathError
 from breezy.persistence.family_manifest import FamilyManifest
-from breezy.runtime.exec_par_boot_flag import force_k1_at_boot
+from breezy.runtime.exec_par_boot_flag import default_repo_root, force_k1_at_boot
 from breezy.runtime.exec_par_constants import (
     EXEC_PAR_MAX_CONCURRENT_INTENTS,  # noqa: F401 - re-exported: existing importers keep working
 )
@@ -782,18 +782,19 @@ def force_k1_without_supervisor_marker(
 def force_k1_on_durable_flag(
     latch: SubmitIntentLatch,
     *,
-    repo_root: Path,
+    repo_root: Path | None = None,
     alert_sink: AlertSink | None = None,
 ) -> bool:
     """Force the slot latch to K=1 when the durable force-K1 flag is SET or UNREADABLE.
 
     Also holds K=1 at a configured K>1 while an un-amended ``cleanup_demotion`` to
     K=1 stands (N4). A CLEARED flag does nothing; at configured K=1 forcing is
-    harmless. The latch already carries the store, so none is passed. Returns
-    ``True`` iff K was forced.
+    harmless. ``repo_root`` defaults to the module-anchored root, never the cwd.
+    The latch already carries the store, so none is passed. Returns ``True`` iff K was forced.
     """
     sink = resolve_alert_sink() if alert_sink is None else alert_sink
-    return force_k1_at_boot(latch, repo_root=repo_root, alert_sink=sink)
+    root = default_repo_root() if repo_root is None else repo_root
+    return force_k1_at_boot(latch, repo_root=root, alert_sink=sink)
 
 
 def build_trade_risk_engine_config(

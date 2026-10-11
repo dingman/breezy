@@ -1078,7 +1078,7 @@ def run(
             # K>1 only does anything: a supervisor that cannot decode v2 forces K=1.
             force_k1_without_supervisor_marker(latch, store_path)
             # BG-3: a SET/UNREADABLE durable flag, or an un-amended demotion, pins K=1.
-            force_k1_on_durable_flag(latch, repo_root=Path.cwd())
+            force_k1_on_durable_flag(latch)
             exec_watcher = build_exec_watcher(
                 latch.max_slots(),
                 latch=latch,
