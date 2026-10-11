@@ -18,7 +18,11 @@ from typing import Any
 
 from scripts.analysis import fq_v1_loss_taxonomy as cli
 from scripts.analysis.fq_loss_taxonomy_battery import s0i_statuses_from_phase_a
-from scripts.analysis.fq_loss_taxonomy_predecl import default_consumer_map, thresholds_block
+from scripts.analysis.fq_loss_taxonomy_predecl import (
+    SRC_DEPENDENCIES,
+    default_consumer_map,
+    thresholds_block,
+)
 from tests.support.te2_cli_fixtures import World, utc_ns
 from tests.support.te2_fixtures import git_cmd
 
@@ -28,12 +32,20 @@ FAMILY = (
     "scripts/analysis/fq_v1_loss_taxonomy.py",
 )
 PRE_REL = "docs/evidence/te2/TE2_PREDECLARATION.json"
+PINS_REL = "docs/evidence/te2/TE2_PINS.json"
+#: Where the (patched) running-module locator believes the code runs from: the frozen tmp tree.
+RUNNING_ROOT: list[Path] = []
 NOW_NS = utc_ns(dt.date(2026, 10, 12), 10.0)
 RESULT_NAME = "fq_v1_loss_taxonomy_2026-10-12"
 
 
 def sha256_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def faithful_locate(rel: str) -> Path | None:
+    """A stand-in for ``locate_running``: the stub tree IS the code that runs (set by build)."""
+    return RUNNING_ROOT[-1] / rel if RUNNING_ROOT else None
 
 
 @dataclass(frozen=True)
@@ -74,7 +86,7 @@ def build_phase_b(
     """Copy the world repo, commit family + predeclaration, write pins. Returns the paths."""
     repo = tmp / "repo"
     shutil.copytree(world.repo_root, repo)
-    for index, rel in enumerate(FAMILY):
+    for index, rel in enumerate((*FAMILY, *SRC_DEPENDENCIES)):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(f"# frozen stub {index}\nX = {index}\n")
     table_payload = json.loads(table.read_text())
@@ -91,17 +103,30 @@ def build_phase_b(
     pre_path = repo / PRE_REL
     pre_path.parent.mkdir(parents=True, exist_ok=True)
     pre_path.write_text(json.dumps(predeclaration, indent=2, sort_keys=True) + "\n")
-    git_cmd(repo, "add", PRE_REL, *FAMILY)
+    git_cmd(repo, "add", PRE_REL, *FAMILY, *SRC_DEPENDENCIES)
     git_cmd(repo, "commit", "-q", "-m", "freeze: predeclaration + family")
     pre_commit = git_cmd(repo, "rev-parse", "HEAD")
-    pins = tmp / "TE2_PINS.json"
+    pins = repo / PINS_REL
     pins.write_text(
         json.dumps(
             {
                 "head_blob_sha256": {rel: sha256_path(repo / rel) for rel in FAMILY},
+                "src_dependency_sha256": {rel: sha256_path(repo / rel) for rel in SRC_DEPENDENCIES},
                 "predeclaration_commit": pre_commit,
                 "reflog_snapshot_sha256": world.snapshot_sha256,
             }
         )
     )
+    git_cmd(repo, "add", PINS_REL)
+    git_cmd(repo, "commit", "-q", "-m", "freeze: pins")
+    RUNNING_ROOT.append(repo)
     return BPaths(repo, table, pre_path, pins, pre_commit, tmp / "out", world)
+
+
+def rewrite_pins(b: BPaths, mutate: Any) -> None:
+    """Edit the pins file and COMMIT it, so only the edited content (not dirtiness) is under test."""
+    payload = json.loads(b.pins.read_text())
+    mutate(payload)
+    b.pins.write_text(json.dumps(payload))
+    git_cmd(b.repo, "add", PINS_REL)
+    git_cmd(b.repo, "commit", "-q", "-m", "freeze: pins edit")

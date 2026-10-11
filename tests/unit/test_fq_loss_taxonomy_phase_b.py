@@ -19,9 +19,10 @@ import pytest
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.persistence.catalog import open_station_catalog, write_records
+from scripts.analysis import fq_loss_taxonomy_provenance as prov
 from scripts.analysis import fq_v1_loss_taxonomy as cli
 from scripts.analysis.fq_loss_taxonomy_battery import DayRecord, run_battery
-from scripts.analysis.fq_loss_taxonomy_fills import metar_daily_max
+from scripts.analysis.fq_loss_taxonomy_fills import k3_flips, k4_mismatches, metar_daily_max
 from scripts.analysis.fq_loss_taxonomy_predecl import (
     PredeclarationError,
     load_predeclaration,
@@ -48,6 +49,7 @@ from tests.support.te2_phase_b_fixtures import (
     PRE_REL,
     BPaths,
     build_phase_b,
+    faithful_locate,
     sha256_path,
 )
 
@@ -80,6 +82,12 @@ def _router(
     return _Router
 
 
+@pytest.fixture(autouse=True)
+def _running_code_is_the_frozen_tmp_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stub family in the tmp repo stands in for the running code (H1 is tested elsewhere)."""
+    monkeypatch.setattr(prov, "locate_running", faithful_locate)
+
+
 def _policy(world: World) -> cli.PinPolicy:
     return cli.PinPolicy((world.commit[:12],) * 9, (world.first_commit, world.commit))
 
@@ -101,6 +109,7 @@ def completed(
     b = build_phase_b(tmp_path_factory.mktemp("b_ok"), world, table)
     asked: list[dt.date] = []
     mp = pytest.MonkeyPatch()
+    mp.setattr(prov, "locate_running", faithful_locate)
     mp.setattr(cli, "_CatalogRouter", _router(_records(), asked))
     try:
         assert cli.main(b.argv()) == 0
@@ -278,7 +287,8 @@ def test_audit_mismatch_is_a_stop_with_no_result_artefact(
 
     assert cli.main(b.argv()) == cli.EXIT_STOP
     assert "STOP" in capsys.readouterr().err
-    assert (b.out / "phase_b_audit.json").exists() and not b.result_json.exists()
+    assert (b.out / "phase_b_audit_STOP.json").exists() and not b.result_json.exists()
+    assert not (b.out / "phase_b_audit.json").exists()  # M8: only a PASSED audit is recorded
 
 
 def test_phase_b_runs_the_production_catalog_router_once(
@@ -400,12 +410,8 @@ def _git_repo_with_artefact(tmp: Path, *, same_commit: bool) -> tuple[Path, Path
     return repo, pins
 
 
-def test_verify_passes_when_the_artefact_commit_follows_the_predeclaration(tmp_path: Path) -> None:
-    repo, pins = _git_repo_with_artefact(tmp_path, same_commit=False)
-    argv = ["verify", "--repo-root", str(repo), "--pins-json", str(pins), "--artefact",
-            str(repo / "docs/evidence/te2/fq_v1_loss_taxonomy_2026-10-12.json")]  # fmt: skip
-
-    assert cli.main(argv) == 0
+# The passing verify path (artefact + pins + siblings committed) is exercised end to end in
+# test_fq_loss_taxonomy_prefreeze.py (verify now also binds every pinned blob and the siblings).
 
 
 def test_verify_fails_when_the_artefact_shares_the_predeclaration_commit_or_is_uncommitted(
@@ -472,12 +478,180 @@ def test_metar_daily_max_uses_the_local_standard_day_window(tmp_path: Path) -> N
     assert metar_daily_max(tmp_path, "KMIA", dt.date(2026, 10, 2), -5.0) is None
 
 
+def test_metar_daily_max_mirrors_the_fq_window_and_ignores_days_outside_it(tmp_path: Path) -> None:
+    station = tmp_path / "metar-routine" / "KLAX"
+    station.mkdir(parents=True)
+    (station / "2026.csv").write_text(
+        _METAR_HEADER + "".join(
+            f"KLAX,{d}T20:00Z,80,,3,x,x\n" for d in ("2026-09-30", "2026-10-01", "2026-10-07")
+        )
+    )  # fmt: skip
+
+    assert metar_daily_max(tmp_path, "KLAX", dt.date(2026, 9, 30), -8.0) is None  # holdout side
+    assert metar_daily_max(tmp_path, "KLAX", dt.date(2026, 10, 7), -8.0) is None  # after the clip
+    assert metar_daily_max(tmp_path, "KLAX", dt.date(2026, 10, 1), -8.0) == 80
+
+
+def _fake_records(days: list[tuple[str, str]]) -> list[Any]:
+    from types import SimpleNamespace
+
+    return [
+        SimpleNamespace(
+            fill_id=f"f{i}", station=st, climate_day=dt.date.fromisoformat(day), won=False,
+            instrument_id=f"tc-temp-{st.lower()}high-{day}-gte80lt81f.POLYMARKET_US",
+        )
+        for i, (st, day) in enumerate(days)
+    ]  # fmt: skip
+
+
+def test_k3_flips_streams_and_reads_each_station_csv_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stations = {"LAX": "KLAX", "MDW": "KMDW", "MIA": "KMIA", "SFO": "KSFO"}
+    archive = tmp_path / "archive"
+    for icao in stations.values():
+        folder = archive / "metar-routine" / icao
+        folder.mkdir(parents=True)
+        rows = "".join(f"{icao},2026-10-0{d}T20:00Z,80,,3,x,x\n" for d in (2, 3, 4))
+        (folder / "2026.csv").write_text(_METAR_HEADER + rows)
+    recs = _fake_records([(st, f"2026-10-0{d}") for st in stations for d in (2, 3, 4)])
+    opened: list[str] = []
+    real_open = Path.open
+
+    def spy(self: Path, *a: Any, **k: Any) -> Any:
+        if self.suffix == ".csv":
+            opened.append(str(self))
+        return real_open(self, *a, **k)
+
+    def boom(*_a: Any, **_k: Any) -> str:
+        raise AssertionError("read_text loads the whole CSV; stream it")
+
+    monkeypatch.setattr(Path, "open", spy)
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    flips = k3_flips(recs, archive, present=True)
+
+    assert flips is not None and len(flips) == 12
+    assert len(opened) == 4  # once per station file, not once per record
+
+
+def test_k4_is_untestable_unless_phase_a_found_the_source_present(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    rec = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
+    venue = tmp_path / "venue.json"
+    venue.write_text(json.dumps({"i1": False}))
+
+    assert k4_mismatches([rec], venue, present=False) is None  # file exists; Phase A: UNTESTABLE
+    assert k4_mismatches([rec], venue, present=True) == {"f1": True}
+    assert k4_mismatches([rec], None, present=True) is None
+
+
+@pytest.mark.parametrize("bad", ['{"i1": "false"}', '{"i1": 0}', '{"i1": null}', "[1]"])
+def test_k4_rejects_non_boolean_or_non_object_venue_outcomes(tmp_path: Path, bad: str) -> None:
+    from types import SimpleNamespace
+
+    rec = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
+    venue = tmp_path / "venue.json"
+    venue.write_text(bad)
+
+    with pytest.raises(ValueError, match="venue"):
+        k4_mismatches([rec], venue, present=True)
+
+
+def _with_k4_present(table: Path, tmp: Path) -> Path:
+    patched = json.loads(table.read_text())
+    patched["s0g"]["k4_status"] = "SOURCE_PRESENT"
+    out = tmp / "t_k4.json"
+    out.write_text(json.dumps(patched))
+    return out
+
+
+def test_phase_b_ignores_a_venue_file_when_phase_a_did_not_find_the_source(
+    phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, table = phase_a
+    assert json.loads(table.read_text())["s0g"]["k4_status"] == "UNTESTABLE"
+    flipped = next(i for i in fq_instrument_ids() if "miahigh-2026-10-03-gte86lt87" in i)
+    venue = tmp_path / "venue.json"
+    venue.write_text(json.dumps({flipped: False}))
+    b = build_phase_b(tmp_path / "b", world, table)
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    assert cli.main(b.argv(extra=["--venue-outcomes", str(venue)])) == 0
+    payload = json.loads(b.result_json.read_text())
+    alt = payload["alt_truth"]
+    assert alt["k4_status"] == "UNTESTABLE" and alt["k4_count"] is None
+    assert payload["provenance"]["venue_outcomes_sha256"] is None
+
+
+def test_phase_b_records_the_venue_file_hash_when_k4_is_tested(
+    phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, table = phase_a
+    venue = tmp_path / "venue.json"
+    venue.write_text(json.dumps({fq_instrument_ids()[0]: True}))
+    b = build_phase_b(tmp_path / "b", world, _with_k4_present(table, tmp_path))
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    assert cli.main(b.argv(extra=["--venue-outcomes", str(venue)])) == 0
+    prov_block = json.loads(b.result_json.read_text())["provenance"]
+    assert prov_block["venue_outcomes_sha256"] == sha256_path(venue)
+
+
+def test_a_non_boolean_venue_outcome_is_a_stop_with_no_result(
+    phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    world, table = phase_a
+    venue = tmp_path / "venue.json"
+    venue.write_text(json.dumps({fq_instrument_ids()[0]: "false"}))
+    b = build_phase_b(tmp_path / "b", world, _with_k4_present(table, tmp_path))
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    assert cli.main(b.argv(extra=["--venue-outcomes", str(venue)])) == cli.EXIT_STOP
+    assert "venue" in capsys.readouterr().err and not b.result_json.exists()
+
+
+def test_a_passed_audit_is_recorded_as_phase_b_audit_json(
+    completed: tuple[BPaths, dict[str, Any], str],
+) -> None:
+    b, _payload, _md = completed
+
+    assert (b.out / "phase_b_audit.json").exists()
+    assert not (b.out / "phase_b_audit_STOP.json").exists()
+
+
+def test_the_cli_wires_both_clipping_sites_with_the_fq_window_start(
+    phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.analysis.fq_loss_taxonomy_truth import ClippingSettlementSource
+
+    seen: list[dt.date | None] = []
+
+    class _Recording(ClippingSettlementSource):
+        def __init__(self, inner: Any, last_day: dt.date, first_day: dt.date | None = None) -> None:
+            seen.append(first_day)
+            super().__init__(inner, last_day, first_day=first_day)
+
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    monkeypatch.setattr(cli, "ClippingSettlementSource", _Recording)
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    assert cli.main(b.argv()) == 0  # the Phase B site
+    cli._truth_projection(tmp_path / "cat", [("LAX", dt.date(2026, 10, 2))])  # the Phase A site
+
+    assert seen == [dt.date(2026, 10, 1)] * 2
+
+
 def test_alternative_sources_flag_k3_and_k4_and_k4_makes_the_verdict_fixable(
     phase_a: tuple[World, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world, table = phase_a
     patched = json.loads(table.read_text())
     patched["s0g"]["k3_status"] = "SOURCE_PRESENT"
+    patched["s0g"]["k4_status"] = "SOURCE_PRESENT"
     table2 = tmp_path / "table_k3.json"
     table2.write_text(json.dumps(patched))
     archive = tmp_path / "archive"

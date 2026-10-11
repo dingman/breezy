@@ -84,6 +84,16 @@ def test_derived_store_reader_groups_rows_by_cycle(world: World) -> None:
     assert len(rows) == 4 * 2 * 7 and {r.station for r in rows} == set(ICAO.values())
 
 
+def test_derived_store_reader_loads_only_the_published_cycles(world: World) -> None:
+    keep = world.cycle_ns_by_day[dt.date(2026, 10, 3)]
+
+    cycles = load_derived_cycles(world.derived_root, published={keep: 0})
+
+    assert set(cycles) == {keep}
+    assert len(cycles[keep]) == 4 * 2 * 7
+    assert load_derived_cycles(world.derived_root, published={}) == {}
+
+
 def test_every_fill_reconstructs_with_the_d_plus_1_window_and_the_cycle_facts(
     world: World, tmp_path: Path
 ) -> None:

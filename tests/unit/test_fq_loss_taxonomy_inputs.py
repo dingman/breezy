@@ -115,6 +115,40 @@ def test_clipping_wrapper_implements_settlement_source_and_clips_after_2026_10_0
     assert real.record("LAX", _D7) is None
 
 
+def test_clipping_wrapper_clips_below_first_day_without_asking_the_inner_source() -> None:
+    first, before = dt.date(2026, 10, 1), dt.date(2026, 9, 30)
+    inner = _Src(
+        {("LAX", before): nws_record("LAX", before, 80), ("LAX", first): nws_record("LAX", first, 81),
+         ("LAX", _D6): nws_record("LAX", _D6, 90)}
+    )  # fmt: skip
+    clip = ClippingSettlementSource(inner, _D6, first_day=first)
+
+    assert clip.record("LAX", before) is None  # holdout side: never reaches the inner source
+    assert before not in inner.asked
+    assert clip.record("LAX", first) is inner.records[("LAX", first)]
+    assert clip.record("LAX", _D6) is inner.records[("LAX", _D6)]
+    assert clip.record("LAX", _D7) is None
+
+
+def test_last_valid_day_streams_the_csv_instead_of_loading_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.analysis import fq_loss_taxonomy_truth as truth
+
+    folder = tmp_path / "metar-routine" / "KLAX"
+    folder.mkdir(parents=True)
+    (folder / "2026.csv").write_text(
+        "station,valid_utc,tmpf\nKLAX,2026-10-02T07:53Z,70\nKLAX,2026-10-09T01:00Z,71\n"
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> str:
+        raise AssertionError("read_text loads the whole file; stream it")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+
+    assert truth._last_valid_day(folder) == "2026-10-09"
+
+
 class _Explosive:
     station, climate_day = "LAX", _D6
     is_final, is_superseded, correction_flag, revision_seq = True, False, False, 1
