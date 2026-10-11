@@ -46,6 +46,7 @@ __all__ = [
     "SettledPnlMissing",
     "SettledPnlReading",
     "SettledPnlRegression",
+    "SettledPnlRevisionUnaudited",
     "Timed",
     "check_monotonic",
     "persist_settled_pnl",
@@ -83,6 +84,10 @@ class SettledPnlMissing(RuntimeError):
 
 class SettledPnlRegression(ValueError):
     """A settled-P&L write would shrink the entry count or raise pnl without a new settlement."""
+
+
+class SettledPnlRevisionUnaudited(RuntimeError):
+    """A non-monotonic replacement was attempted without a matching revision audit row."""
 
 
 class FillLedgerCorrupt(RuntimeError):
