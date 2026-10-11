@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from breezy.domain.exec_intent import (
+    FILL_BY_DAY_KEY_PREFIX,
     FILL_BY_FINGERPRINT_KEY_PREFIX,
     FILL_KEY_PREFIX,
     utc_day_for_ns,
@@ -22,10 +23,15 @@ from breezy.runtime.exec_par_durable_sources import (
     AuditStatus,
     CacheFill,
     DurableSources,
+    SourceReadError,
+    SpendAudit,
+    SpendAuditMonitor,
     SpendAuditor,
     StoreIntentSource,
     counters_expected_from,
     day_bounds_from_offsets,
+    earliest_day_start_ns,
+    entry_inputs_from,
     terminal_fill,
 )
 from breezy.runtime.exec_par_governed_days import governed_days_for
@@ -74,6 +80,10 @@ class Rec:
     order_side: str
     cumulative_qty: Decimal
     cumulative_cost: Decimal
+    instrument_id: str = "INST"
+    cumulative_fee: Decimal = Decimal("0.1")
+    fee_reconciled: bool = True
+    fee_coefficient_at_fill: Decimal | None = None
 
 
 def decode_rec(raw: bytes) -> Rec:
@@ -96,10 +106,14 @@ class Store:
     def __init__(self) -> None:
         self.data: dict[str, bytes] = {}
         self.error: Exception | None = None
+        self.fail_first = 0  # raise on the first N reads, then recover (a transient fault)
         self.reads = 0
 
     def get(self, key: str) -> bytes | None:
         self.reads += 1
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            raise OSError("transient")
         if self.error is not None:
             raise self.error
         return self.data.get(key)
@@ -109,8 +123,12 @@ class Marks:
     def __init__(self) -> None:
         self.rows: dict[str, list[AmbiguousRow]] = {}
         self.error: Exception | None = None
+        self.fail_first = 0
 
     def read_ambiguous(self, day: str) -> tuple[AmbiguousRow, ...]:
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            raise OSError("transient")
         if self.error is not None:
             raise self.error
         return tuple(self.rows.get(day, ()))
@@ -120,8 +138,12 @@ class Anchors:
     def __init__(self) -> None:
         self.rows: dict[str, list[OrderAnchor]] = {}
         self.error: Exception | None = None
+        self.fail_first = 0
 
     def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]:
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            raise OSError("transient")
         if self.error is not None:
             raise self.error
         return tuple(self.rows.get(day, ()))
@@ -133,7 +155,15 @@ class World:
     store: Store = field(default_factory=Store)
     marks: Marks = field(default_factory=Marks)
     anchors: Anchors = field(default_factory=Anchors)
+    alerts: list[SpendAudit] = field(default_factory=list)
     n: int = 0
+
+    def __post_init__(self) -> None:
+        self.monitor = SpendAuditMonitor(alert_sink=self._sink)
+
+    def _sink(self, audit: SpendAudit) -> bool:
+        self.alerts.append(audit)
+        return True
 
     def entry(
         self,
@@ -178,6 +208,20 @@ class World:
         )
         body = {"v": vid, "c": f"c-{intent.intent_id}", "s": side, "q": qty, "k": cost}
         self.store.data[f"{FILL_KEY_PREFIX}{vid}"] = json.dumps(body).encode()
+        self.index_fill_day(day, vid)
+
+    def index_fill_day(self, day: str, vid: str) -> None:
+        key = f"{FILL_BY_DAY_KEY_PREFIX}{day}"
+        listed = json.loads(self.store.data.get(key, b"[]").decode())
+        if vid not in listed:
+            listed.append(vid)
+        self.store.data[key] = json.dumps(listed).encode()
+
+    def orphan_fill(self, created_ns: int, vid: str = "v-orphan", side: str = "BUY") -> None:
+        """A durable fill row no slot fingerprint reaches."""
+        body = {"v": vid, "c": "c-orphan", "s": side, "q": "5", "k": "2"}
+        self.store.data[f"{FILL_KEY_PREFIX}{vid}"] = json.dumps(body).encode()
+        self.index_fill_day(utc_day_for_ns(created_ns).isoformat(), vid)
 
     def mark(
         self, intent: Intent, *, day: str, station: str = "KNYC", arm_ns: int | None = None
@@ -202,6 +246,7 @@ class World:
             station_of=station_of,
             ambiguous=self.marks,
             anchors=self.anchors,
+            monitor=self.monitor,
             auditor=auditor,
         )
 
@@ -303,24 +348,60 @@ def test_an_unattributable_entry_only_poisons_the_days_open_at_its_arm_time() ->
     assert src.slot_counts("2026-09-01") is None
 
 
-def test_a_store_or_slot_read_failure_is_a_typed_failure_never_zero() -> None:
+def test_a_persistent_read_failure_is_a_typed_fail_never_zero_and_never_an_exclusion() -> None:
     w = World()
     w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
     w.store.error = OSError("disk")
     src = w.sources()
-    assert src.entry_fill_count(DAY1) is None
-    assert src.slot_counts(DAY1) is None
-    assert src.filled_spend_reading(DAY1).ok is False
-    failure = src.fills_reading(DAY1).failure
+    with pytest.raises(SourceReadError) as fills:
+        src.entry_fill_count(DAY1)
+    assert fills.value.name == "fills"
+    with pytest.raises(SourceReadError) as slots:
+        src.slot_counts(DAY1)
+    assert slots.value.name == "slots"
+    failure = src.fills_reading(DAY1).failure  # the typed reading still reports, without raising
     assert failure is not None and failure.reason == "read_error"
-    assert {f.source for f in src.failures} >= {"fills"}
+    assert src.filled_spend_reading(DAY1).ok is False
 
     w2 = World()
     w2.intents.error = TimeoutError("slow")
-    src2 = w2.sources()
-    assert src2.entry_fill_count(DAY1) is None
-    assert src2.slot_counts(DAY1) is None
-    assert src2.filled_spend_reading(DAY1).ok is False
+    with pytest.raises(SourceReadError):
+        w2.sources().entry_fill_count(DAY1)
+
+
+def test_a_transient_read_failure_is_retried_once_and_does_not_exclude() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.store.fail_first = 1
+    src = w.sources()
+    assert src.entry_fill_count(DAY1) == 1
+    w.anchors.fail_first = 1
+    assert w.sources().ledger_spend(DAY1) == D(10)
+    w2 = World()
+    w2.entry("m-nyc", ns_at(DAY1))
+    w2.marks.fail_first = 1
+    assert w2.sources().slot_counts(DAY1) == SlotDayCounts(1, 0)
+
+
+def test_two_consecutive_failures_exceed_the_single_retry() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.store.fail_first = 2
+    with pytest.raises(SourceReadError):
+        w.sources().entry_fill_count(DAY1)
+
+
+def test_every_source_failure_is_logged_by_name_and_type_never_by_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.store.error = OSError("secret-9.99")
+    with caplog.at_level("ERROR"):
+        w.sources().fills_reading(DAY1)
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "fills" in text and "read_error" in text and "OSError" in text
+    assert "secret-9.99" not in text
 
 
 def test_a_fingerprint_index_without_a_fill_record_is_corrupt_not_a_missing_fill() -> None:
@@ -328,7 +409,8 @@ def test_a_fingerprint_index_without_a_fill_record_is_corrupt_not_a_missing_fill
     intent = w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
     del w.store.data[f"{FILL_KEY_PREFIX}v-{intent.intent_id}"]
     src = w.sources()
-    assert src.entry_fill_count(DAY1) is None
+    with pytest.raises(SourceReadError):
+        src.entry_fill_count(DAY1)
     failure = src.fills_reading(DAY1).failure
     assert failure is not None and failure.reason == "corrupt"
 
@@ -380,9 +462,16 @@ def test_the_join_is_exact_on_the_fingerprint_and_the_utc_day_of_the_intent() ->
     intent = w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
     day = utc_day_for_ns(intent.created_ns).isoformat()
     other = f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent.fingerprint}"
-    # move the index to a different fingerprint: the intent no longer joins to any fill
+    # move the index to a different fingerprint: the intent no longer joins to its fill, which is
+    # now an unreachable (orphan) fill row, so the day fails closed rather than counting zero
     w.store.data[f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:zz"] = w.store.data.pop(other)
-    assert w.sources().entry_fill_count(DAY1) == 0
+    with pytest.raises(SourceReadError):
+        w.sources().entry_fill_count(DAY1)
+    # an intent whose own fingerprint has no index entry joins to nothing: exact, not fuzzy
+    w2 = World()
+    w2.entry("m-nyc", ns_at(DAY1))
+    w2.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    assert w2.sources().entry_fill_count(DAY1) == 1
 
 
 # -- spend (item 3, R3) ----------------------------------------------------------
@@ -435,7 +524,8 @@ def test_an_unattributed_or_unknown_station_mark_is_unattributable() -> None:
 def test_ambiguous_read_failure_is_a_failure_and_unattributed_marks_are_counted_apart() -> None:
     w = World()
     w.marks.error = OSError("db")
-    assert w.sources().slot_counts(DAY1) is None
+    with pytest.raises(SourceReadError):
+        w.sources().slot_counts(DAY1)
     w2 = World()
     ghost = Intent("ghost", "fpg", 5, None)
     w2.marks.rows["unattributed"] = [
@@ -478,7 +568,6 @@ def auditor(cache: Cache | None, *, boot: int = BOOT, lookback: int = LOOKBACK) 
         station_of=station_of,
         boot_ts_ns=boot,
         lookback_ns=lookback,
-        day_start_ns=day_start,
     )
 
 
@@ -527,7 +616,8 @@ def test_audit_mismatch_is_reported_and_never_green() -> None:
     assert result.status is AuditStatus.MISMATCH
     assert result.defers_look is True
     assert result.alerts is True
-    assert result.excludes_day("2099-01-01") is False
+    assert result.excludes_day("2099-01-01") is True  # a mismatch is bounded by the deadline
+    assert result.excludes_day(DAY1) is False
 
 
 def test_a_fill_missing_from_durable_but_present_in_the_cache_is_a_mismatch() -> None:
@@ -645,22 +735,26 @@ def test_a_partially_filled_day_reconciles_clean_on_spend_usd() -> None:
     assert src.filled_spend_reading(DAY1).value == Dec("1.2")  # the separate metric
 
 
-def test_ledger_spend_failures_are_none_never_zero() -> None:
+def test_ledger_spend_failures_raise_typed_never_zero_or_none() -> None:
     w = World()
     w.entry("m-nyc", ns_at(DAY1), notional="10")
     w.anchors.error = OSError("db")
     src = w.sources()
-    assert src.ledger_spend(DAY1) is None
+    with pytest.raises(SourceReadError) as info:
+        src.ledger_spend(DAY1)
+    assert info.value.name == "armed_spend"
     assert any(f.source == "armed_spend" for f in src.failures)
     w2 = World()
     w2.entry("m-nyc", ns_at(DAY1), notional="-1")
-    assert w2.sources().ledger_spend(DAY1) is None
+    with pytest.raises(SourceReadError):
+        w2.sources().ledger_spend(DAY1)
     w3 = World()
     w3.entry("m-nyc", ns_at(DAY1), notional="10")
     w3.anchors.rows[DAY1][0] = OrderAnchor(
         "c", "m-nyc", DAY2, 1, "0.5", "20", "10", 1, "event_time", "KNYC"
     )
-    assert w3.sources().ledger_spend(DAY1) is None  # an anchor stored under another day
+    with pytest.raises(SourceReadError):
+        w3.sources().ledger_spend(DAY1)  # an anchor stored under another day
 
 
 def test_audit_spend_is_durable_unreadable_when_the_durable_side_fails() -> None:
@@ -693,17 +787,8 @@ def test_sources_satisfy_the_reconcile_day_contract() -> None:
     assert verdict.kind.value == "unchanged"
     w.store.error = OSError("x")
     broken = w.sources()
-    verdict2 = reconcile_day(
-        DAY1,
-        stored=None,
-        fills=broken.entry_fill_count(DAY1),
-        slots=broken.slot_counts(DAY1),
-        spend=broken.ledger_spend(DAY1),
-        gappy=False,
-        expected_counters=False,
-        pending=None,
-    )
-    assert verdict2.kind.value == "day_excluded"
+    with pytest.raises(SourceReadError):  # a FAIL for the runner, never a day exclusion
+        broken.entry_fill_count(DAY1)
 
 
 # -- counters_expected (item 4) --------------------------------------------------------
@@ -837,3 +922,189 @@ def test_new_modules_import_no_network_no_evidence_and_never_asdict(name: str) -
     assert "docs/evidence" not in source and "docs.evidence" not in source
     assert "asdict" not in source
     assert "exec.client" not in source and "adapters.polymarket_us.exec" not in source
+
+
+# -- review fixes: blocks_pass, bounded mismatch, monitor, earliest start, orphans, cent ----------
+
+
+def _old(day: str = DAY1) -> str:
+    return (dt.date.fromisoformat(day) + dt.timedelta(days=SETTLEMENT_DEADLINE_DAYS)).isoformat()
+
+
+def test_blocks_pass_is_true_for_every_status_except_a_full_match() -> None:
+    expected_block = {
+        AuditStatus.FULL_MATCH: False,
+        AuditStatus.MISMATCH: True,
+        AuditStatus.UNAUDITED: True,
+        AuditStatus.DURABLE_UNREADABLE: True,
+    }
+    assert set(expected_block) == set(AuditStatus)
+    for status, blocks in expected_block.items():
+        assert SpendAudit(DAY1, status).blocks_pass is blocks
+
+
+def test_a_mismatch_defers_with_an_alert_then_excludes_past_the_deadline() -> None:
+    audit = SpendAudit(DAY1, AuditStatus.MISMATCH, "spend_audit_mismatch")
+    young = dt.date.fromisoformat(DAY1) + dt.timedelta(days=SETTLEMENT_DEADLINE_DAYS - 1)
+    assert audit.excludes_day(young.isoformat()) is False
+    assert audit.excludes_day(_old()) is True
+    assert SpendAudit(DAY1, AuditStatus.DURABLE_UNREADABLE).excludes_day(_old()) is False
+
+
+def test_the_alert_sink_is_a_required_argument_of_the_audit_consumer() -> None:
+    with pytest.raises(TypeError):
+        SpendAuditMonitor()  # type: ignore[call-arg]
+    w = World()
+    with pytest.raises(TypeError):
+        DurableSources(  # type: ignore[call-arg]
+            intents=w.intents,
+            store=w.store,
+            decode_fill=decode_rec,
+            governed=GOV,
+            station_of=station_of,
+            ambiguous=w.marks,
+            anchors=w.anchors,
+        )
+
+
+def test_a_mismatch_alerts_once_per_transition_not_on_every_pass() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    boot = earliest_day_start_ns(DAY1, GOV) + LOOKBACK
+    bad = auditor(Cache([cfill("m-nyc", ns_at(DAY1), "5")]), boot=boot)
+    for _ in range(3):  # three passes, a fresh DurableSources each, one shared monitor
+        w.sources(bad).audit_spend(DAY1)
+    assert len(w.alerts) == 1 and w.alerts[0].status is AuditStatus.MISMATCH
+    good = auditor(Cache([cfill("m-nyc", ns_at(DAY1), "4")]), boot=boot)
+    w.sources(good).audit_spend(DAY1)
+    assert len(w.alerts) == 1  # recovery is not an alert
+    w.sources(bad).audit_spend(DAY1)
+    assert len(w.alerts) == 2  # a new transition into MISMATCH alerts again
+
+
+def test_an_undelivered_alert_is_retried_on_the_next_pass() -> None:
+    delivered: list[SpendAudit] = []
+    results: Iterator[bool | Exception] = iter([False, RuntimeError("sink down"), True])
+
+    def sink(audit: SpendAudit) -> bool:
+        outcome = next(results)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome:
+            delivered.append(audit)
+        return outcome
+
+    monitor = SpendAuditMonitor(alert_sink=sink)
+    mismatch = SpendAudit(DAY1, AuditStatus.MISMATCH, "spend_audit_mismatch")
+    for _ in range(3):
+        monitor.observe(mismatch)
+    monitor.observe(mismatch)  # delivered already: silent
+    assert len(delivered) == 1
+
+
+def test_earliest_day_start_is_the_minimum_over_two_offset_stations() -> None:
+    east, west = ns_at(DAY1, 0) + 5 * H, ns_at(DAY1, 0) + 8 * H
+    assert earliest_day_start_ns(DAY1, GOV) == east  # UTC-5 rolls first
+    assert earliest_day_start_ns(DAY1, GOV) < west
+    swapped = governed_days_for(["KSFO", "KNYC"], OFFSETS.__getitem__)
+    assert earliest_day_start_ns(DAY1, swapped) == east  # order independent
+
+
+def test_coverage_rule_uses_the_earliest_station_start() -> None:
+    start = earliest_day_start_ns(DAY1, GOV)
+    cache = Cache([])
+    assert auditor(cache, boot=start + LOOKBACK).audit(DAY1, D(0)).status is AuditStatus.FULL_MATCH
+    # the LATER station's start (3 h on) would wrongly pass this boot
+    late_boot = start + LOOKBACK + 1
+    assert auditor(cache, boot=late_boot).audit(DAY1, D(0)).status is AuditStatus.UNAUDITED
+
+
+def test_audit_compares_at_cent_precision_not_exact_decimal_equality() -> None:
+    boot = earliest_day_start_ns(DAY1, GOV) + LOOKBACK
+    near = Cache([cfill("m-nyc", ns_at(DAY1), "4.004")])
+    assert auditor(near, boot=boot).audit(DAY1, D("4.0")).status is AuditStatus.FULL_MATCH
+    off_by_a_cent = Cache([cfill("m-nyc", ns_at(DAY1), "4.02")])
+    assert auditor(off_by_a_cent, boot=boot).audit(DAY1, D("4.0")).status is AuditStatus.MISMATCH
+
+
+def test_an_orphan_fill_row_unreachable_from_any_slot_fingerprint_fails_the_day() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.orphan_fill(ns_at(DAY1))
+    src = w.sources()
+    reading = src.fills_reading(DAY1)
+    assert reading.ok is False and reading.failure is not None
+    assert reading.failure.reason == "corrupt"
+    with pytest.raises(SourceReadError):
+        src.entry_fill_count(DAY1)
+    assert src.filled_spend_reading(DAY1).ok is False
+
+
+def test_reachable_fills_and_unreachable_exits_are_not_orphans() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "9"), is_exit=True, side="SELL")
+    w.orphan_fill(ns_at(DAY1), vid="v-op-exit", side="SELL")
+    src = w.sources()
+    assert src.entry_fill_count(DAY1) == 1
+
+
+def test_an_orphan_on_another_day_does_not_fail_this_day() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    w.orphan_fill(ns_at("2026-10-20"))
+    assert w.sources().entry_fill_count(DAY1) == 1
+
+
+# -- entry_inputs_from (item 3) ------------------------------------------------------------
+
+
+def test_a_marked_intent_yields_ever_ambiguous_true_and_an_unmarked_one_false() -> None:
+    w = World()
+    marked = w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
+    plain = w.entry("m-sfo", ns_at(DAY1), fill=("5", "2"))
+    w.mark(marked, day=DAY1)
+    inputs = entry_inputs_from(
+        w.sources(), [DAY1], unresolved_intent_ids=frozenset(), armed_cost_of=lambda _i: None
+    )
+    flags = {i.arm_ns: i.ever_ambiguous for i in inputs}
+    assert len(inputs) == 2
+    assert flags[marked.created_ns] is True or flags[plain.created_ns] is False
+    by_station = {i.station: i.ever_ambiguous for i in inputs}
+    assert by_station == {"KNYC": True, "KSFO": False}
+
+
+def test_entry_inputs_skip_exits_and_unfilled_unambiguous_and_cost_unresolved_zero_fills() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("10", "9"), is_exit=True, side="SELL")
+    w.entry("m-nyc", ns_at(DAY1))  # posted, never filled, never ambiguous
+    ghost = w.entry("m-sfo", ns_at(DAY1))  # ambiguous, unresolved, zero fill
+    w.mark(ghost, day=DAY1, station="KSFO")
+    inputs = entry_inputs_from(
+        w.sources(),
+        [DAY1],
+        unresolved_intent_ids=frozenset({ghost.intent_id}),
+        armed_cost_of=lambda i: D("7.5") if i == ghost.intent_id else None,
+    )
+    (only,) = inputs
+    assert only.fill is None and only.ever_ambiguous is True
+    assert only.ambiguous_unresolved is True and only.ambiguous_cost == D("7.5")
+
+
+def test_entry_inputs_fail_closed_on_a_missing_armed_cost_or_station() -> None:
+    w = World()
+    ghost = w.entry("m-sfo", ns_at(DAY1))
+    w.mark(ghost, day=DAY1, station="KSFO")
+    with pytest.raises(SourceReadError):
+        entry_inputs_from(
+            w.sources(),
+            [DAY1],
+            unresolved_intent_ids=frozenset({ghost.intent_id}),
+            armed_cost_of=lambda _i: None,
+        )
+    w2 = World()
+    w2.entry("m-unknown", ns_at(DAY1), fill=("1", "1"))
+    with pytest.raises(UnattributableFill):
+        entry_inputs_from(
+            w2.sources(), [DAY1], unresolved_intent_ids=frozenset(), armed_cost_of=lambda _i: None
+        )

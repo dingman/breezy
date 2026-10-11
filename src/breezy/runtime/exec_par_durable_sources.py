@@ -42,13 +42,16 @@ Use a FRESH :class:`DurableSources` per reconcile pass: the slot/fill join is re
 from __future__ import annotations
 
 import datetime as dt
+import json
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from enum import Enum
 from typing import Final, Protocol
 
 from breezy.domain.exec_intent import (
+    FILL_BY_DAY_KEY_PREFIX,
     FILL_BY_FINGERPRINT_KEY_PREFIX,
     FILL_KEY_PREFIX,
     utc_day_for_ns,
@@ -61,7 +64,12 @@ from breezy.runtime.exec_par_reconcile import (
     entry_fills_by_day,
 )
 from breezy.runtime.exec_par_records import AmbiguousRow, EpochRow, OrderAnchor
-from breezy.runtime.exec_par_settled_pnl import SETTLEMENT_DEADLINE_DAYS
+from breezy.runtime.exec_par_settled_pnl import (
+    CENT,
+    SETTLEMENT_DEADLINE_DAYS,
+    EntryInput,
+    FillLike,
+)
 
 __all__ = [
     "HISTORY_KEY_PREFIX",
@@ -74,14 +82,19 @@ __all__ = [
     "DurableSources",
     "FillStoreReader",
     "IntentSource",
+    "OffsetDayConvention",
     "SlotView",
     "SourceFailure",
+    "SourceReadError",
     "SourceReading",
     "SpendAudit",
+    "SpendAuditMonitor",
     "SpendAuditor",
     "StoreIntentSource",
     "counters_expected_from",
     "day_bounds_from_offsets",
+    "earliest_day_start_ns",
+    "entry_inputs_from",
     "terminal_fill",
 ]
 
@@ -90,6 +103,7 @@ HISTORY_KEY_PREFIX: Final[str] = "exec/polymarket_us/intent/history/"
 #: Restated from ``exec_par_counter_ingest.UNATTRIBUTED`` (a test pins equality) so this module
 #: never loads the ingest layer's Nautilus imports.
 UNATTRIBUTED: Final[str] = "unattributed"
+_LOG = logging.getLogger(__name__)
 _ENTRY_SIDE: Final[str] = "BUY"
 _HOUR_NS: Final[int] = 3_600 * 1_000_000_000
 _DAY_NS: Final[int] = 24 * _HOUR_NS
@@ -131,7 +145,7 @@ class FillStoreReader(Protocol):
     def get(self, key: str) -> bytes | None: ...
 
 
-class FillRecordLike(Protocol):
+class FillRecordLike(FillLike, Protocol):
     @property
     def venue_order_id(self) -> str: ...
     @property
@@ -182,6 +196,20 @@ class SourceFailure:
 
     source: str
     reason: str
+    exc_type: str | None = None
+
+
+class SourceReadError(Exception):
+    """A durable read failed twice within the pass (``name`` says which source).
+
+    Not an exclusion: the runner maps it to FAIL ``stage_eval_fail:source_read:<name>`` (an
+    integrity halt, retried on the next pass). ``None`` / ``day_excluded`` stays reserved for a
+    genuine counter-vs-durable mismatch. The message carries the name only, never a value.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"durable source read failed: {name}")
+        self.name = name
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,8 +256,19 @@ def terminal_fill[R: FillRecordLike](records: Sequence[R]) -> R:
 # -- the slot/fill join (read once) ------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Entry:
+    intent_id: str
+    arm_ns: int
+    station: str | None
+    day: str | None
+    fill: FillRecordLike | None
+
+
 @dataclass(slots=True)
 class _Joined:
+    entries: list[_Entry] = field(default_factory=list)
+    reachable: set[str] = field(default_factory=set)
     posted: dict[str, int] = field(default_factory=dict)
     fills: dict[str, int] = field(default_factory=dict)
     spend: dict[str, Decimal] = field(default_factory=dict)
@@ -262,14 +301,18 @@ class _Join:
             if intent.intent_id in seen:
                 continue
             seen.add(intent.intent_id)
+            vid = self._vid_of(intent)
+            if vid is not None:
+                joined.reachable.add(vid)
             if intent.is_exit:
                 continue
-            fill = self._fill_of(intent)
+            fill = None if vid is None else self._record_of(vid)
             if fill is not None:
                 _check_amounts(fill)
             filled = fill is not None and fill.cumulative_qty > 0
             station = self._station(intent.slug)
             day = self._day(station, intent.created_ns)
+            joined.entries.append(_Entry(intent.intent_id, intent.created_ns, station, day, fill))
             if station is None or day is None:
                 self._poison(joined, intent.created_ns, filled)
                 continue
@@ -314,21 +357,49 @@ class _Join:
         if filled:
             joined.fill_poison |= days
 
-    def _fill_of(self, intent: SlotView) -> FillRecordLike | None:
+    def _vid_of(self, intent: SlotView) -> str | None:
         try:
             day = utc_day_for_ns(intent.created_ns).isoformat()
         except ValueError:
             raise _Corrupt from None
         raw_id = self._store.get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent.fingerprint}")
-        if raw_id is None:
-            return None
-        raw = self._store.get(f"{FILL_KEY_PREFIX}{raw_id.decode('utf-8', 'replace')}")
+        return None if raw_id is None else raw_id.decode("utf-8", "replace")
+
+    def _record_of(self, vid: str) -> FillRecordLike:
+        raw = self._store.get(f"{FILL_KEY_PREFIX}{vid}")
         if raw is None:
             raise _Corrupt
         try:
             return terminal_fill([self._decode(raw)])
         except Exception as exc:
             raise _Corrupt from exc
+
+    def orphan_check(self, day: str, reachable: set[str]) -> None:
+        """Raise :class:`_Corrupt` for an entry-side fill row no slot fingerprint reaches.
+
+        Looks at the ``fill_by_day`` UTC indexes the day can touch (its label +-1 day). An
+        unreachable SELL (an operator exit with no slot) is not an entry and is ignored.
+        """
+        centre = dt.date.fromisoformat(day)
+        for offset in (-1, 0, 1):
+            utc_day = (centre + dt.timedelta(days=offset)).isoformat()
+            raw_index = self._store.get(f"{FILL_BY_DAY_KEY_PREFIX}{utc_day}")
+            if raw_index is None:
+                continue
+            try:
+                listed = json.loads(raw_index.decode("utf-8"))
+            except ValueError:
+                raise _Corrupt from None
+            if not isinstance(listed, list):
+                raise _Corrupt
+            for vid in listed:
+                if not isinstance(vid, str):
+                    raise _Corrupt
+                if vid in reachable:
+                    continue
+                fill = self._record_of(vid)
+                if fill.order_side == _ENTRY_SIDE and fill.cumulative_qty > 0:
+                    raise _Corrupt
 
 
 def _check_amounts(fill: FillRecordLike) -> None:
@@ -363,16 +434,65 @@ class SpendAudit:
         return self.status in (AuditStatus.UNAUDITED, AuditStatus.MISMATCH)
 
     @property
+    def blocks_pass(self) -> bool:
+        """Only a full-coverage match lets the day pass; every other status blocks it."""
+        return self.status is not AuditStatus.FULL_MATCH
+
+    @property
     def alerts(self) -> bool:
         """A full-coverage mismatch raises an alert; it never excludes the day."""
         return self.status is AuditStatus.MISMATCH
 
     def excludes_day(self, today: str) -> bool:
-        """An unaudited day at least ``SETTLEMENT_DEADLINE_DAYS`` old becomes ``day_excluded``."""
-        if self.status is not AuditStatus.UNAUDITED:
+        """An unaudited OR mismatched day at least ``SETTLEMENT_DEADLINE_DAYS`` old becomes
+        ``day_excluded`` (§10a); before that it defers (a mismatch with an alert)."""
+        if self.status not in (AuditStatus.UNAUDITED, AuditStatus.MISMATCH):
             return False
         age = (dt.date.fromisoformat(today) - dt.date.fromisoformat(self.day)).days
         return age >= SETTLEMENT_DEADLINE_DAYS
+
+
+class OffsetDayConvention(DayConvention, Protocol):
+    """A day convention that also exposes each governed station's standard UTC offset (hours)."""
+
+    @property
+    def std_offsets(self) -> Mapping[str, float]: ...
+
+
+def earliest_day_start_ns(day: str, governed: OffsetDayConvention) -> int:
+    """The earliest instant any governed station's ``day`` can start (min over stations).
+
+    The A2 coverage rule needs the earliest start: the day is only fully audited if the cache
+    reaches back to the first station that rolled onto it.
+    """
+    return day_bounds_from_offsets(governed.std_offsets)(day)[0]
+
+
+class SpendAuditMonitor:
+    """Alerts once per (day, status) transition into a MISMATCH, never on every pass.
+
+    Long-lived (one per node, shared by the per-pass :class:`DurableSources`). ``alert_sink`` is
+    REQUIRED, so an audit consumer cannot be built unwired. A sink that returns ``False`` or raises
+    leaves the transition undelivered, so the next observation retries it.
+    """
+
+    def __init__(self, *, alert_sink: Callable[[SpendAudit], bool]) -> None:
+        self._sink = alert_sink
+        self._seen: dict[str, AuditStatus] = {}
+
+    def observe(self, audit: SpendAudit) -> None:
+        previous = self._seen.get(audit.day)
+        if audit.status is previous:
+            return
+        if audit.alerts:
+            try:
+                delivered = self._sink(audit)
+            except Exception as exc:  # noqa: BLE001 - an alert failure must not break the pass
+                _LOG.error("spend audit alert not delivered: %s", type(exc).__name__)
+                return
+            if not delivered:
+                return
+        self._seen[audit.day] = audit.status
 
 
 class SpendAuditor:
@@ -382,21 +502,19 @@ class SpendAuditor:
         self,
         *,
         cache: CacheFillPort | None,
-        governed: DayConvention,
+        governed: OffsetDayConvention,
         station_of: Callable[[str], str | None],
         boot_ts_ns: int,
         lookback_ns: int,
-        day_start_ns: Callable[[str], int],
     ) -> None:
         self._cache = cache
         self._governed = governed
         self._station_of = station_of
         self._boot = boot_ts_ns
         self._lookback = lookback_ns
-        self._day_start = day_start_ns
 
     def audit(self, day: str, durable: Decimal) -> SpendAudit:
-        if self._day_start(day) < self._boot - self._lookback:
+        if earliest_day_start_ns(day, self._governed) < self._boot - self._lookback:
             return SpendAudit(day, AuditStatus.UNAUDITED, "partial_coverage")
         if self._cache is None:
             return SpendAudit(day, AuditStatus.UNAUDITED, "cache_unavailable")
@@ -412,7 +530,7 @@ class SpendAuditor:
             return SpendAudit(day, AuditStatus.UNAUDITED, "cache_error")
         if unattributable:
             return SpendAudit(day, AuditStatus.UNAUDITED, "cache_unattributable")
-        if cache_total == durable:
+        if cache_total.quantize(CENT, ROUND_HALF_EVEN) == durable.quantize(CENT, ROUND_HALF_EVEN):
             return SpendAudit(day, AuditStatus.FULL_MATCH, None, durable, cache_total)
         return SpendAudit(day, AuditStatus.MISMATCH, REASON_AUDIT_MISMATCH, durable, cache_total)
 
@@ -438,7 +556,12 @@ class SpendAuditor:
 
 
 class DurableSources:
-    """The BG-1d ``DurableDaySources`` over the slot table, durable fills and mark rows."""
+    """The BG-1d ``DurableDaySources`` over the slot table, durable fills and mark rows.
+
+    A read failure is retried ONCE within the pass; a second failure raises
+    :class:`SourceReadError` (a FAIL, never an exclusion). ``None`` / ``UnattributableFill`` are
+    reserved for data that is genuinely unplaceable.
+    """
 
     def __init__(
         self,
@@ -450,15 +573,18 @@ class DurableSources:
         station_of: Callable[[str], str | None],
         ambiguous: AmbiguousRowsPort,
         anchors: AnchorRowsPort,
+        monitor: SpendAuditMonitor,
         auditor: SpendAuditor | None = None,
     ) -> None:
         self._join = _Join(intents, store, decode_fill, governed, station_of)
         self._governed = governed
         self._ambiguous = ambiguous
         self._anchors = anchors
+        self._monitor = monitor
         self._auditor = auditor
         self._built: _Joined | None = None
-        self._build_failure: str | None = None
+        self._build_failure: tuple[str, str | None] | None = None
+        self._orphan_ok: set[str] = set()
         self._failures: list[SourceFailure] = []
 
     @property
@@ -469,92 +595,165 @@ class DurableSources:
 
     def fills_reading(self, day: str) -> SourceReading[int]:
         joined = self._joined()
-        if isinstance(joined, str):
-            return self._fail("fills", joined)
+        if isinstance(joined, SourceFailure):
+            return self._fail("fills", joined.reason, joined.exc_type)
         if joined.all_fills_poisoned or day in joined.fill_poison:
             return self._fail("fills", REASON_UNATTRIBUTABLE)
+        orphan = self._orphan_failure(day, joined)
+        if orphan is not None:
+            return self._fail("fills", orphan.reason, orphan.exc_type)
         return SourceReading.success(joined.fills.get(day, 0))
 
     def filled_spend_reading(self, day: str) -> SourceReading[Decimal]:
         joined = self._joined()
-        if isinstance(joined, str):
-            return self._fail("spend", joined)
+        if isinstance(joined, SourceFailure):
+            return self._fail("spend", joined.reason, joined.exc_type)
         if joined.all_fills_poisoned or day in joined.fill_poison:
             return self._fail("spend", REASON_UNATTRIBUTABLE)
+        orphan = self._orphan_failure(day, joined)
+        if orphan is not None:
+            return self._fail("spend", orphan.reason, orphan.exc_type)
         return SourceReading.success(joined.spend.get(day, Decimal(0)))
 
     def slots_reading(self, day: str) -> SourceReading[SlotDayCounts]:
         joined = self._joined()
-        if isinstance(joined, str):
-            return self._fail("slots", joined)
+        if isinstance(joined, SourceFailure):
+            return self._fail("slots", joined.reason, joined.exc_type)
         if joined.all_posted_poisoned or day in joined.posted_poison:
             return self._fail("slots", REASON_UNATTRIBUTABLE)
         try:
-            marks = self._marks(day)
+            marks = self._retry_once(lambda: self._marks(day))
         except _Unattributable:
             return self._fail("slots", REASON_UNATTRIBUTABLE)
-        except Exception:  # noqa: BLE001 - mapped to a typed failure, never a zero
-            return self._fail("slots", REASON_READ_ERROR)
+        except Exception as exc:  # noqa: BLE001 - mapped to a typed failure, never a zero
+            return self._fail("slots", REASON_READ_ERROR, type(exc).__name__)
         return SourceReading.success(SlotDayCounts(joined.posted.get(day, 0), marks))
 
     def unattributed_ambiguous_reading(self) -> SourceReading[int]:
         """Marks BG-1b could not place on a day (kept apart; never folded into a day)."""
         try:
-            return SourceReading.success(len(self._ambiguous.read_ambiguous(UNATTRIBUTED)))
-        except Exception:  # noqa: BLE001 - mapped to a typed failure, never a zero
-            return self._fail("unattributed_ambiguous", REASON_READ_ERROR)
+            rows = self._retry_once(lambda: self._ambiguous.read_ambiguous(UNATTRIBUTED))
+        except Exception as exc:  # noqa: BLE001 - mapped to a typed failure, never a zero
+            return self._fail("unattributed_ambiguous", REASON_READ_ERROR, type(exc).__name__)
+        return SourceReading.success(len(rows))
+
+    def marked_intent_ids(self, days: Iterable[str]) -> frozenset[str]:
+        """Intent ids with an ever-ambiguous mark on ``days`` (and the unattributed bucket)."""
+        ids: set[str] = set()
+        try:
+            for day in (*sorted(set(days)), UNATTRIBUTED):
+                ids |= self._mark_ids(day)
+        except Exception as exc:
+            self._fail("marks", REASON_READ_ERROR, type(exc).__name__)
+            raise SourceReadError("marks") from exc
+        return frozenset(ids)
+
+    def _mark_ids(self, day: str) -> set[str]:
+        def read() -> set[str]:
+            return {row.intent_id for row in self._ambiguous.read_ambiguous(day)}
+
+        return self._retry_once(read)
 
     def audit_spend(self, day: str) -> SpendAudit:
         reading = self.filled_spend_reading(day)
         if not reading.ok or reading.value is None:
-            return SpendAudit(day, AuditStatus.DURABLE_UNREADABLE)
-        if self._auditor is None:
-            return SpendAudit(day, AuditStatus.UNAUDITED, "cache_unavailable")
-        return self._auditor.audit(day, reading.value)
+            audit = SpendAudit(day, AuditStatus.DURABLE_UNREADABLE)
+        elif self._auditor is None:
+            audit = SpendAudit(day, AuditStatus.UNAUDITED, "cache_unavailable")
+        else:
+            audit = self._auditor.audit(day, reading.value)
+        self._monitor.observe(audit)
+        return audit
 
     # DurableDaySources ---------------------------------------------------------------------
 
     def entry_fill_count(self, day: str) -> int | None:
         reading = self.fills_reading(day)
-        if reading.failure is not None and reading.failure.reason == REASON_UNATTRIBUTABLE:
-            raise UnattributableFill("fill record is not attributable")
+        failure = reading.failure
+        if failure is not None:
+            if failure.reason == REASON_UNATTRIBUTABLE:
+                raise UnattributableFill("fill record is not attributable")
+            raise SourceReadError("fills")
         return reading.value
 
     def slot_counts(self, day: str) -> SlotDayCounts | None:
-        return self.slots_reading(day).value
+        reading = self.slots_reading(day)
+        failure = reading.failure
+        if failure is not None and failure.reason != REASON_UNATTRIBUTABLE:
+            raise SourceReadError("slots")
+        return reading.value
 
     def ledger_spend(self, day: str) -> Decimal | None:
         """Σ armed notional of the day's durable entry anchors: the SAME definition as the counter
         store's ``spend_usd`` (BG-1d compares like with like, so a partial fill never mismatches).
-        The separate filled-spend metric (:meth:`filled_spend_reading`) is what the cache audits."""
+        The separate filled-spend metric (:meth:`filled_spend_reading`) is what the cache audits.
+        A read failure is retried once, then raises :class:`SourceReadError`."""
         try:
-            total = Decimal(0)
-            for anchor in self._anchors.read_order_anchors(day):
-                notional = Decimal(anchor.notional)
-                if anchor.day != day or not notional.is_finite() or notional < 0:
-                    raise _Corrupt
-                total += notional
-        except Exception:  # noqa: BLE001 - mapped to a typed failure, never a zero
-            self._failures.append(SourceFailure("armed_spend", REASON_READ_ERROR))
-            return None
-        return total
+            return self._retry_once(lambda: self._armed_spend(day))
+        except Exception as exc:
+            self._fail("armed_spend", REASON_READ_ERROR, type(exc).__name__)
+            raise SourceReadError("armed_spend") from exc
+
+    def joined_entries(self) -> tuple[_Entry, ...]:
+        joined = self._joined()
+        if isinstance(joined, SourceFailure):
+            self._fail("entries", joined.reason, joined.exc_type)
+            if joined.reason == REASON_UNATTRIBUTABLE:
+                raise UnattributableFill("fill record is not attributable")
+            raise SourceReadError("entries")
+        if joined.all_fills_poisoned:
+            raise UnattributableFill("fill record is not attributable")
+        return tuple(joined.entries)
 
     # internals -------------------------------------------------------------------------------
 
-    def _joined(self) -> _Joined | str:
+    def _armed_spend(self, day: str) -> Decimal:
+        total = Decimal(0)
+        for anchor in self._anchors.read_order_anchors(day):
+            notional = Decimal(anchor.notional)
+            if anchor.day != day or not notional.is_finite() or notional < 0:
+                raise _Corrupt
+            total += notional
+        return total
+
+    @staticmethod
+    def _retry_once[T](read: Callable[[], T]) -> T:
+        try:
+            return read()
+        except _Unattributable:
+            raise
+        except Exception:  # noqa: BLE001 - one retry within the pass, then the caller raises
+            return read()
+
+    def _joined(self) -> _Joined | SourceFailure:
         if self._built is not None:
             return self._built
-        if self._build_failure is not None:
-            return self._build_failure
+        if self._build_failure is None:
+            for _attempt in range(2):
+                try:
+                    self._built = self._join.build()
+                    return self._built
+                except UnattributableFill as exc:
+                    self._build_failure = (REASON_UNATTRIBUTABLE, type(exc).__name__)
+                    break
+                except _Corrupt as exc:
+                    self._build_failure = (REASON_CORRUPT, type(exc).__name__)
+                except Exception as exc:  # noqa: BLE001 - mapped to a typed failure
+                    self._build_failure = (REASON_READ_ERROR, type(exc).__name__)
+        reason, exc_type = self._build_failure or (REASON_READ_ERROR, None)
+        return SourceFailure("join", reason, exc_type)
+
+    def _orphan_failure(self, day: str, joined: _Joined) -> SourceFailure | None:
+        if day in self._orphan_ok:
+            return None
         try:
-            self._built = self._join.build()
-        except UnattributableFill:
-            self._build_failure = REASON_UNATTRIBUTABLE
-        except _Corrupt:
-            self._build_failure = REASON_CORRUPT
-        except Exception:  # noqa: BLE001 - mapped to a typed failure, never a zero
-            self._build_failure = REASON_READ_ERROR
-        return self._built if self._built is not None else str(self._build_failure)
+            self._retry_once(lambda: self._join.orphan_check(day, joined.reachable))
+        except _Corrupt as exc:
+            return SourceFailure("orphan", REASON_CORRUPT, type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - mapped to a typed failure
+            return SourceFailure("orphan", REASON_READ_ERROR, type(exc).__name__)
+        self._orphan_ok.add(day)
+        return None
 
     def _marks(self, day: str) -> int:
         rows = self._ambiguous.read_ambiguous(day)
@@ -569,11 +768,16 @@ class DurableSources:
                 raise _Unattributable
         return len(rows)
 
-    def _fail[T](self, source: str, reason: str) -> SourceReading[T]:
-        reading: SourceReading[T] = SourceReading.failed(source, reason)
-        if reading.failure is not None:
-            self._failures.append(reading.failure)
-        return reading
+    def _fail[T](self, source: str, reason: str, exc_type: str | None = None) -> SourceReading[T]:
+        failure = SourceFailure(source, reason, exc_type)
+        self._failures.append(failure)
+        _LOG.error(
+            "exec_par durable source failure: source=%s reason=%s exc=%s",
+            source,
+            reason,
+            exc_type or "-",
+        )
+        return SourceReading(False, None, failure)
 
 
 class _Unattributable(Exception):
@@ -671,3 +875,49 @@ def counters_expected_from(
         return False
 
     return expected
+
+
+def entry_inputs_from(
+    sources: DurableSources,
+    days: Iterable[str],
+    *,
+    unresolved_intent_ids: frozenset[str],
+    armed_cost_of: Callable[[str], Decimal | None],
+) -> tuple[EntryInput, ...]:
+    """BG-1c ``EntryInput`` rows for the entries on ``days`` (entries only, exits never).
+
+    ``ever_ambiguous`` is true iff a BG-1b mark row exists for the intent id. An entry is an input
+    when it has a confirmed fill or is an unresolved AMBIGUOUS one; the latter with no fill needs
+    its armed notional from ``armed_cost_of`` (missing raises :class:`SourceReadError`). An input
+    that cannot be placed on a station raises ``UnattributableFill``. ``unresolved_intent_ids``
+    comes from venue-evidenced resolution, never from the mark.
+    """
+    wanted = frozenset(days)
+    marked = sources.marked_intent_ids(wanted)
+    inputs: list[EntryInput] = []
+    for entry in sources.joined_entries():
+        filled = entry.fill is not None and entry.fill.cumulative_qty > 0
+        unresolved = entry.intent_id in unresolved_intent_ids
+        if not (filled or unresolved):
+            continue
+        if entry.station is None or entry.day is None:
+            raise UnattributableFill("fill record is not attributable")
+        if entry.day not in wanted:
+            continue
+        fill = entry.fill if filled else None
+        cost: Decimal | None = None
+        if fill is None:
+            cost = armed_cost_of(entry.intent_id)
+            if cost is None:
+                raise SourceReadError("armed_cost")
+        inputs.append(
+            EntryInput(
+                arm_ns=entry.arm_ns,
+                station=entry.station,
+                fill=fill,
+                ever_ambiguous=entry.intent_id in marked,
+                ambiguous_unresolved=unresolved,
+                ambiguous_cost=cost,
+            )
+        )
+    return tuple(inputs)

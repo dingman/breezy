@@ -12,6 +12,8 @@ import datetime as dt
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from breezy.runtime import exec_par_settled_pnl as mod
 from breezy.runtime.exec_par_records import SettledPnlDay
 from breezy.runtime.exec_par_settled_pnl import EntryInput
@@ -69,7 +71,7 @@ def test_ever_ambiguous_leaves_the_full_cost_term_once_settled() -> None:
 
 
 def test_ordinary_unsettled_entry_is_still_pending_not_a_loss() -> None:
-    entry = EntryInput(arm_ns=arm(), station="STN", fill=Fill())
+    entry = EntryInput(arm_ns=arm(), station="STN", fill=Fill(), ever_ambiguous=False)
     row = row_for(entry, {})
     assert row.pnl_decimal == D("0")
     assert (row.ambiguous_entries, row.unsettled_entries) == (0, 1)
@@ -96,3 +98,8 @@ def test_unresolved_with_a_confirmed_fill_counts_at_cost_plus_fee_even_if_it_win
     row = row_for(entry, {"A": True})
     assert row.pnl_decimal == D("-9.2")
     assert (row.ambiguous_entries, row.settled_entries) == (1, 0)
+
+
+def test_ever_ambiguous_is_required_with_no_default() -> None:
+    with pytest.raises(TypeError):
+        EntryInput(arm_ns=arm(), station="STN", fill=Fill())  # type: ignore[call-arg]

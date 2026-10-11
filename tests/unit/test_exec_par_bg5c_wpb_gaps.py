@@ -13,6 +13,7 @@ from breezy.runtime.exec_par_gap_marking import (
     GapReadError,
     LapseWriteError,
     mark_gaps,
+    record_final_lapse_before_stop,
     record_lapse_if_any,
     record_unclean_shutdowns,
     unclean_shutdown_lapses,
@@ -48,31 +49,36 @@ class _Ledger:
     """In-memory ``GapLedgerPort``."""
 
     def __init__(self) -> None:
-        self.rows: dict[int, HeartbeatLapse] = {}
+        self.rows: dict[tuple[int, int], HeartbeatLapse] = {}
         self.fail_write = False
         self.fail_read = False
         self.fail_stamp = False
 
+    def by_start(self, start_ns: int) -> HeartbeatLapse:
+        (row,) = [r for r in self.rows.values() if r.start_ns == start_ns]
+        return row
+
     def write_heartbeat_lapse(self, record: HeartbeatLapse) -> bool:
         if self.fail_write:
             raise OSError("write failed")
-        if record.start_ns in self.rows:
+        key = (record.start_ns, record.end_ns)
+        if key in self.rows:
             return False
-        self.rows[record.start_ns] = record
+        self.rows[key] = record
         return True
 
     def read_heartbeat_lapses(self) -> tuple[HeartbeatLapse, ...]:
         if self.fail_read:
             raise OSError("read failed")
-        return tuple(sorted(self.rows.values(), key=lambda r: r.start_ns))
+        return tuple(sorted(self.rows.values(), key=lambda r: (r.start_ns, r.end_ns)))
 
-    def set_lapse_marked(self, start_ns: int, marked_ts: int) -> bool:
+    def set_lapse_marked(self, start_ns: int, end_ns: int, marked_ts: int) -> bool:
         if self.fail_stamp:
             raise OSError("stamp failed")
-        row = self.rows[start_ns]
+        row = self.rows[(start_ns, end_ns)]
         if row.marked_ts is not None:
             return False
-        self.rows[start_ns] = HeartbeatLapse(row.start_ns, row.end_ns, row.kind, marked_ts)
+        self.rows[(start_ns, end_ns)] = HeartbeatLapse(start_ns, end_ns, row.kind, marked_ts)
         return True
 
 
@@ -151,43 +157,67 @@ def test_heartbeat_history_is_a_single_overwritten_row_and_lapses_are_append_onl
         assert [r.start_ns for r in latch.read_heartbeat_lapses()] == [D0, D0 + 900 * S]
 
 
-def test_latch_lapse_write_is_idempotent_and_conflicts_raise(tmp_path: Path) -> None:
+def test_latch_lapse_write_is_idempotent_and_overlapping_spans_coexist(tmp_path: Path) -> None:
     store = _Store()
     with _latch(store, tmp_path) as latch:
         row = HeartbeatLapse(D0, D0 + 100 * S, LAPSE)
         assert latch.write_heartbeat_lapse(row) is True
         assert latch.write_heartbeat_lapse(row) is False
-        with pytest.raises(ValueError):
-            latch.write_heartbeat_lapse(HeartbeatLapse(D0, D0 + 200 * S, LAPSE))
+        # same start, different end (HIGH 1): both spans are kept, nothing raises
+        assert latch.write_heartbeat_lapse(HeartbeatLapse(D0, D0 + 200 * S, UNCLEAN)) is True
+        assert [(r.start_ns, r.end_ns) for r in latch.read_heartbeat_lapses()] == [
+            (D0, D0 + 100 * S),
+            (D0, D0 + 200 * S),
+        ]
         with pytest.raises(ValueError):
             latch.write_heartbeat_lapse(HeartbeatLapse(D0, D0, LAPSE))
 
 
-def test_latch_marked_stamp_is_set_once_and_a_rewrite_of_the_span_stays_a_no_op(
+def test_crash_between_the_inrun_lapse_and_the_boot_unclean_span_never_refuses_boot(
+    tmp_path: Path,
+) -> None:
+    """First-beat case: the in-run lapse starts at boot_ts, and so does the unclean span."""
+    store = _Store()
+    with _latch(store, tmp_path) as latch:
+        boot = D0
+        in_run = record_lapse_if_any(latch, last_hb_ns=boot, now_ns=boot + 5 * HEARTBEAT_LAPSE_NS)
+        assert in_run is not None and in_run.start_ns == boot
+        # node crashes; next boot finds the epoch without stop_ts and no usable heartbeat
+        epochs = (_epoch(boot), _epoch(boot + 10 * H))
+        rows = record_unclean_shutdowns(latch, epochs, None)  # raised LapseWriteError before
+        assert rows[0].start_ns == boot
+        # a repeat of both writes is an idempotent no-op
+        record_lapse_if_any(latch, last_hb_ns=boot, now_ns=boot + 5 * HEARTBEAT_LAPSE_NS)
+        record_unclean_shutdowns(latch, epochs, None)
+        assert len(latch.read_heartbeat_lapses()) == 2
+
+
+def test_latch_marked_stamp_is_set_once_per_span_and_a_rewrite_stays_a_no_op(
     tmp_path: Path,
 ) -> None:
     store = _Store()
     with _latch(store, tmp_path) as latch:
         row = HeartbeatLapse(D0, D0 + 100 * S, LAPSE)
+        other = HeartbeatLapse(D0, D0 + 200 * S, UNCLEAN)
         latch.write_heartbeat_lapse(row)
-        assert latch.set_lapse_marked(D0, 5) is True
-        assert latch.set_lapse_marked(D0, 9) is False
+        latch.write_heartbeat_lapse(other)
+        assert latch.set_lapse_marked(D0, D0 + 100 * S, 5) is True
+        assert latch.set_lapse_marked(D0, D0 + 100 * S, 9) is False
         assert latch.write_heartbeat_lapse(row) is False  # same span, already stamped
-        (stored,) = latch.read_heartbeat_lapses()
-        assert stored.marked_ts == 5
+        stamped = {r.end_ns: r.marked_ts for r in latch.read_heartbeat_lapses()}
+        assert stamped == {D0 + 100 * S: 5, D0 + 200 * S: None}
         with pytest.raises(ValueError):
-            latch.set_lapse_marked(D0 + 1, 5)  # absent row
+            latch.set_lapse_marked(D0 + 1, D0 + 2, 5)  # absent row
 
 
 def test_latch_lapse_reader_raises_on_a_garbled_or_mis_keyed_row(tmp_path: Path) -> None:
     store = _Store()
     with _latch(store, tmp_path) as latch:
-        store.data[f"{EXEC_PAR_PREFIX}lapse/{D0}"] = b"not json"
+        key = f"{EXEC_PAR_PREFIX}lapse/{D0}/{D0 + 5}"
+        store.data[key] = b"not json"
         with pytest.raises(SubmitIntentCorrupt):
             latch.read_heartbeat_lapses()
-        store.data[f"{EXEC_PAR_PREFIX}lapse/{D0}"] = encode_record(
-            HeartbeatLapse(D0 + 1, D0 + 2, LAPSE)
-        )
+        store.data[key] = encode_record(HeartbeatLapse(D0 + 1, D0 + 2, LAPSE))
         with pytest.raises(SubmitIntentCorrupt):
             latch.read_heartbeat_lapses()
 
@@ -285,7 +315,7 @@ def test_mark_gaps_marks_every_open_day_of_a_multi_day_span_with_its_kind() -> N
         "2024-10-06": UNCLEAN,
     }
     assert result.marked_days == ("2024-10-04", "2024-10-05", "2024-10-06")
-    assert ledger.rows[D0 + 12 * H].marked_ts == 42
+    assert ledger.by_start(D0 + 12 * H).marked_ts == 42
 
 
 def test_mark_gaps_marks_every_governed_stations_open_day() -> None:
@@ -318,7 +348,7 @@ def test_mark_gaps_skips_a_day_that_is_already_marked() -> None:
     assert counters.attempts == []
     assert counters.gappy["2024-10-04"] == "counter_missing"
     assert result.marked_days == ()
-    assert ledger.rows[D0 + H].marked_ts == 1  # the span is satisfied, so it is stamped
+    assert ledger.by_start(D0 + H).marked_ts == 1  # the span is satisfied, so it is stamped
 
 
 def test_mark_gaps_with_nothing_pending_writes_nothing() -> None:
@@ -335,11 +365,11 @@ def test_mark_gaps_write_failure_raises_typed_names_the_pending_days_and_retries
         mark_gaps(ledger=ledger, counters=counters, open_days_at=_utc_open, wall_ns=lambda: 1)
     assert info.value.pending_days == frozenset({"2024-10-05"})
     assert "2024-10-04" in counters.gappy  # the other day still landed
-    assert ledger.rows[D0 + 12 * H].marked_ts is None  # not stamped, so it retries
+    assert ledger.by_start(D0 + 12 * H).marked_ts is None  # not stamped, so it retries
     counters.fail_days = set()
     result = mark_gaps(ledger=ledger, counters=counters, open_days_at=_utc_open, wall_ns=lambda: 2)
     assert result.marked_days == ("2024-10-05",)
-    assert ledger.rows[D0 + 12 * H].marked_ts == 2
+    assert ledger.by_start(D0 + 12 * H).marked_ts == 2
 
 
 def test_mark_gaps_stamp_failure_is_typed() -> None:
@@ -371,4 +401,58 @@ def test_mark_gaps_open_days_failure_is_a_write_error_for_that_span() -> None:
 
     with pytest.raises(GapMarkWriteError):
         mark_gaps(ledger=ledger, counters=counters, open_days_at=boom, wall_ns=lambda: 1)
-    assert ledger.rows[D0 + H].marked_ts is None
+    assert ledger.by_start(D0 + H).marked_ts is None
+
+
+def test_mark_gaps_unions_overlapping_spans_that_share_a_start() -> None:
+    ledger, counters = _Ledger(), _Counters()
+    ledger.write_heartbeat_lapse(HeartbeatLapse(D0 + H, D0 + 2 * H, LAPSE))
+    ledger.write_heartbeat_lapse(HeartbeatLapse(D0 + H, D0 + DAY + 2 * H, UNCLEAN))
+    result = mark_gaps(ledger=ledger, counters=counters, open_days_at=_utc_open, wall_ns=lambda: 7)
+    assert set(counters.gappy) == {"2024-10-04", "2024-10-05"}
+    assert result.spans_stamped == 2
+    assert all(r.marked_ts == 7 for r in ledger.rows.values())
+
+
+def test_pending_days_are_failed_minus_marked_and_a_stamp_failure_names_its_days() -> None:
+    ledger, counters = _Ledger(), _Counters()
+    ledger.write_heartbeat_lapse(HeartbeatLapse(D0 + H, D0 + DAY + 2 * H, LAPSE))
+    ledger.write_heartbeat_lapse(HeartbeatLapse(D0 + 2 * H, D0 + 3 * H, LAPSE))
+    counters.fail_days = {"2024-10-05"}
+    with pytest.raises(GapMarkWriteError) as info:
+        mark_gaps(ledger=ledger, counters=counters, open_days_at=_utc_open, wall_ns=lambda: 1)
+    assert info.value.pending_days == frozenset({"2024-10-05"})  # 10-04 landed via both spans
+
+    ledger2, counters2 = _Ledger(), _Counters()
+    ledger2.write_heartbeat_lapse(HeartbeatLapse(D0 + H, D0 + DAY + 2 * H, LAPSE))
+    ledger2.fail_stamp = True
+    with pytest.raises(GapMarkWriteError) as info2:
+        mark_gaps(ledger=ledger2, counters=counters2, open_days_at=_utc_open, wall_ns=lambda: 1)
+    assert info2.value.pending_days == frozenset({"2024-10-04", "2024-10-05"})
+
+
+def test_pending_days_include_the_days_of_a_span_whose_day_computation_fails() -> None:
+    ledger, counters = _Ledger(), _Counters()
+    start = D0 + H
+    ledger.write_heartbeat_lapse(HeartbeatLapse(start, start + 3 * H, LAPSE))
+
+    def flaky(ns: int) -> frozenset[str]:
+        if ns == start + H:  # one interior instant fails; the endpoints still resolve
+            raise ValueError("bad instant")
+        return _utc_open(ns)
+
+    with pytest.raises(GapMarkWriteError) as info:
+        mark_gaps(ledger=ledger, counters=counters, open_days_at=flaky, wall_ns=lambda: 1)
+    assert info.value.pending_days == frozenset({"2024-10-04"})
+    assert ledger.by_start(start).marked_ts is None
+
+
+def test_record_final_lapse_before_stop_records_the_tail_and_is_typed_on_failure() -> None:
+    ledger = _Ledger()
+    stop = D0 + 5 * HEARTBEAT_LAPSE_NS
+    row = record_final_lapse_before_stop(ledger, last_hb_ns=D0, stop_ts_ns=stop)
+    assert row == HeartbeatLapse(D0, stop, LAPSE)
+    assert record_final_lapse_before_stop(ledger, last_hb_ns=stop - S, stop_ts_ns=stop) is None
+    ledger.fail_write = True
+    with pytest.raises(LapseWriteError):
+        record_final_lapse_before_stop(ledger, last_hb_ns=D0, stop_ts_ns=D0 + 9 * H)

@@ -42,11 +42,13 @@ __all__ = [
     "GapReadError",
     "LapseWriteError",
     "mark_gaps",
+    "record_final_lapse_before_stop",
     "record_lapse_if_any",
     "record_unclean_shutdowns",
     "unclean_shutdown_lapses",
 ]
 
+_HOUR_NS: Final[int] = 3_600 * 1_000_000_000
 _KIND_BY_VALUE: Final[dict[str, GapKind]] = {kind.value: kind for kind in GapKind}
 
 
@@ -75,7 +77,7 @@ class GapLedgerPort(Protocol):
 
     def write_heartbeat_lapse(self, record: HeartbeatLapse) -> bool: ...
     def read_heartbeat_lapses(self) -> tuple[HeartbeatLapse, ...]: ...
-    def set_lapse_marked(self, start_ns: int, marked_ts: int) -> bool: ...
+    def set_lapse_marked(self, start_ns: int, end_ns: int, marked_ts: int) -> bool: ...
 
 
 class GapMarkPort(Protocol):
@@ -114,6 +116,19 @@ def record_lapse_if_any(
     row = HeartbeatLapse(start_ns=last_hb_ns, end_ns=now_ns, kind=GapKind.HEARTBEAT_LAPSE.value)
     _write(ledger, row)
     return row
+
+
+def record_final_lapse_before_stop(
+    ledger: GapLedgerPort, *, last_hb_ns: int | None, stop_ts_ns: int
+) -> HeartbeatLapse | None:
+    """Run the lapse check for the tail ``(last_hb_ns, stop_ts)`` BEFORE ``stop_ts`` is written.
+
+    A clean stop closes the epoch, so a stall that ends in a clean stop would otherwise leave no
+    span. WP-E calls this from ``_close_epoch`` ahead of ``record_clean_stop``; a
+    :class:`LapseWriteError` must not block the stop itself (log it; the unclean path is the
+    fallback).
+    """
+    return record_lapse_if_any(ledger, last_hb_ns=last_hb_ns, now_ns=stop_ts_ns)
 
 
 def unclean_shutdown_lapses(
@@ -187,9 +202,10 @@ def mark_gaps(
         raise GapReadError("gap ledger or gappy marks unreadable") from exc
     marked: set[str] = set()
     failed: set[str] = set()
+    unstamped_days: set[str] = set()
     stamped = 0
     first_error: Exception | None = None
-    for row in sorted(pending, key=lambda r: r.start_ns):
+    for row in sorted(pending, key=lambda r: (r.start_ns, r.end_ns)):
         span_failed = False
         try:
             days = gappy_days(
@@ -198,7 +214,8 @@ def mark_gaps(
         except Exception as exc:  # noqa: BLE001 - typed GapMarkError below
             first_error = first_error or exc
             span_failed = True
-            days = frozenset()
+            days = _resolvable_days(row, open_days_at)
+            unstamped_days |= days  # the span is incomplete, so its resolvable days stay pending
         for day in sorted(days - existing - marked):
             try:
                 counters.mark_gappy_day(day, row.kind)
@@ -211,15 +228,35 @@ def mark_gaps(
         if span_failed:
             continue
         try:
-            ledger.set_lapse_marked(row.start_ns, wall_ns())
+            ledger.set_lapse_marked(row.start_ns, row.end_ns, wall_ns())
             stamped += 1
         except Exception as exc:  # noqa: BLE001 - typed GapMarkError below
             first_error = first_error or exc
+            unstamped_days |= days
     if first_error is not None:
         raise GapMarkWriteError(
-            "gappy mark write failed", pending_days=frozenset(failed)
+            "gappy mark write failed",
+            pending_days=frozenset((failed - marked - existing) | unstamped_days),
         ) from first_error
     return GapMarkResult(marked_days=tuple(sorted(marked)), spans_stamped=stamped)
+
+
+def _resolvable_days(
+    row: HeartbeatLapse, open_days_at: Callable[[int], frozenset[str]]
+) -> frozenset[str]:
+    """Best effort when ``gappy_days`` itself failed: every instant that still resolves."""
+    found: set[str] = set()
+    cursor = row.start_ns
+    instants = [row.start_ns, row.end_ns]
+    while cursor < row.end_ns:
+        instants.append(cursor)
+        cursor += _HOUR_NS
+    for instant in instants:
+        try:
+            found |= open_days_at(instant)
+        except Exception:  # noqa: BLE001, S112 - an unresolvable instant stays pending via the span
+            continue
+    return frozenset(found)
 
 
 def _kind_of(row: HeartbeatLapse) -> GapKind:
