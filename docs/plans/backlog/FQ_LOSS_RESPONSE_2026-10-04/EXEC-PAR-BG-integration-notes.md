@@ -25,3 +25,10 @@ BG-9 (`tests/unit/test_exec_par_wp5b_config.py`, `freeze_violations`) reads the 
 - **Status.** The doc's `Status:` line must read FROZEN.
 - **Hash.** `EXEC-PAR-D-PREREG.sha256` holds the sha256 hex of the doc bytes (optionally `sha256sum` style, followed by the filename).
 - **Freeze step.** Add the marker to the doc before the §13 freeze commit.
+
+9. **O3 promotion record format (r4.5; BG-3 boot guard, BG-9 config guard, BG-10(f) emitter).**
+   - **Path.** `docs/evidence/exec_par/exec_par_bg10_promo_<stage>_<YYYY-MM-DD>.json`. The stage is the one being promoted FROM: `S1` (K=2) for configured K 3-4, `S2` (K=4) for K 5-6. A configured K above 6 never validates.
+   - **Fields (all required).** `stage` and `look_date` must equal the file name. `verdict` and each of `v1`, `v2`, `v3` are the string `PASS` or `FAIL`; all four must be `PASS`. `icc_v` is a finite number >= 0.4147. `bound_level` is 90 or 95. `input_snapshot_sha256` is 64-char hex. `created_ts_ns` is a positive integer.
+   - **Pin.** A sha-valid frozen `EXEC-PAR-D-PREREG-A<n>.md` carries the standalone line `bg10_promo_record_sha256: <sha256 of the record file bytes>`. Prose mentions do not count; editing the record after pinning invalidates it.
+   - **Latest wins.** Only the record with the latest `look_date` for the stage is considered. A later FAIL, an unpinned record or an unparseable file supersedes an earlier PASS; there is no fallback.
+   - **Guards.** `runtime/exec_par_promo_record.py`: `promo_record_problems(repo_root, k)` is pure and does zero reads at K <= 2. BG-3 (`apply_promo_guard`, called from `force_k1_on_durable_flag`) forces K=1 and raises a CRITICAL alert on any problem at K > 2. BG-9 (`test_real_repo_o3_promotion_record_enforcement`) fails on any problem at the configured K.

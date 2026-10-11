@@ -579,3 +579,24 @@ def test_boot_raises_settings_error_on_manifest_family_mismatch() -> None:
     assert raised[0] in guards[0].body
     assert isinstance(raised[0].exc, ast.Call)
     assert ast.unparse(raised[0].exc.func) == "SettingsError"
+
+
+# -- O3: configured K > 2 needs a valid promotion record (r4.5) ---------------
+
+
+def test_o3_promo_violations_k_le_2_clean(tmp_path: Path) -> None:
+    from breezy.runtime.exec_par_promo_record import promo_record_problems
+
+    assert promo_record_problems(tmp_path, 2) == []
+
+
+def test_o3_promo_violation_at_k3_without_record(tmp_path: Path) -> None:
+    from breezy.runtime.exec_par_promo_record import promo_record_problems
+
+    assert promo_record_problems(tmp_path, 3)
+
+
+def test_real_repo_o3_promotion_record_enforcement() -> None:
+    from breezy.runtime.exec_par_promo_record import promo_record_problems
+
+    assert promo_record_problems(_REPO, EXEC_PAR_MAX_CONCURRENT_INTENTS) == []
