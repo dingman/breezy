@@ -1678,3 +1678,17 @@ When a function takes an injectable dependency with a production default, at lea
 - Briefs that add an injectable seam say: "one test runs the real default."
 - Reviewers grep new tests: if every call site passes the seam, that is a finding.
 - Related: L-42 (fixtures through the real writer path), L-28 (defaults are part of what is measured).
+
+## L-56 — A hypothesis picked from a handful of fills cannot be powered by them, and its re-score must use the bot's own band function (2026-10-11)
+
+### What happened
+- The trade-effectiveness audit picked "cheap NO longshots win" from 3 live NO fills. A hand re-score treated `gte{A}lt{B}` as half-open and reported the wrong wins (corrected: 4 wins / −2.63 overall, NO side 1/3, P(≥1 | 0.12) = 0.32 — no anomaly).
+- The recompute needs n = 1486 station-days (1743 at FWER 0.025) against a PM.us ceiling of 490; TE-3 closed as UNDERPOWERED_NOT_REGISTERED (`RULING_TE-3_NO_CHEAP_LONGSHOT_2026-10-11.md`).
+
+### The rule
+Before planning a test of a hypothesis chosen from live fills: (1) re-score every fill only through `bucket_facts_from_instrument_id` (with `leg_of_symbol` for `^no`); (2) compute the fill-count probability under the null; (3) run `recompute_mde` against the venue's station-day ceiling. A "structural" infeasibility claim must also hold across its own sensitivity table (rate low/central/high, α) before it is written as a ruling.
+
+### How to apply
+- Audit and plan briefs that score outcomes name `bucket_facts_from_instrument_id`; a hand-rolled band is a review finding.
+- The SEARCH fills that motivated a hypothesis are premises only; they never count toward its n.
+- Related: L-44 (NO-leg buy semantics), L-55.
