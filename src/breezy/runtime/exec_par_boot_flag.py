@@ -30,6 +30,8 @@ __all__ = [
     "default_repo_root",
     "force_k1_at_boot",
     "has_valid_amendment_for",
+    "list_amendments",
+    "read_sha_valid_amendment",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -84,14 +86,33 @@ def _sibling_digest(path: Path) -> str | None:
 _REFERENCE_KEY: Final[str] = "cleanup_demotion_ts_ns"
 
 
-def _amendment_references(path: Path, ts_ns: int) -> bool:
-    """Hash-valid AND carries the standalone line ``cleanup_demotion_ts_ns: <ts_ns>``."""
+def read_sha_valid_amendment(path: Path) -> str | None:
+    """The amendment text iff its bytes match the ``.sha256`` sibling, else ``None``.
+
+    Raises ``OSError``/``ValueError`` on a missing sibling or undecodable bytes; callers
+    treat that as "not a valid amendment".
+    """
     recorded = _sibling_digest(path)
     raw = path.read_bytes()
     if recorded is None or hashlib.sha256(raw).hexdigest() != recorded:
+        return None
+    return raw.decode("utf-8")
+
+
+def _amendment_references(path: Path, ts_ns: int) -> bool:
+    """Hash-valid AND carries the standalone line ``cleanup_demotion_ts_ns: <ts_ns>``."""
+    text = read_sha_valid_amendment(path)
+    if text is None:
         return False
     pattern = rf"^{_REFERENCE_KEY}:[ \t]*{ts_ns}[ \t]*\r?$"
-    return re.search(pattern, raw.decode("utf-8"), re.MULTILINE) is not None
+    return re.search(pattern, text, re.MULTILINE) is not None
+
+
+def list_amendments(repo_root: Path) -> list[Path]:
+    """Sorted ``EXEC-PAR-D-PREREG-A<n>.md`` paths; ``OSError`` if the directory is unreadable."""
+    return sorted(
+        p for p in (repo_root / AMENDMENT_DIR).iterdir() if _AMENDMENT_NAME.fullmatch(p.name)
+    )
 
 
 def has_valid_amendment_for(repo_root: Path, ts_ns: int) -> bool:
@@ -103,9 +124,7 @@ def has_valid_amendment_for(repo_root: Path, ts_ns: int) -> bool:
     is logged at ERROR with the resolved root.
     """
     try:
-        candidates = sorted(
-            p for p in (repo_root / AMENDMENT_DIR).iterdir() if _AMENDMENT_NAME.fullmatch(p.name)
-        )
+        candidates = list_amendments(repo_root)
     except OSError:
         _LOG.error(
             "EXEC-PAR amendment directory %s unreadable under root %s; no amendment can unlock",
