@@ -131,6 +131,10 @@ class SnapshotInputs:
     counted_denial: Callable[[str], bool] | None
     #: Told ``(what, day, exception_type_name)`` when a per-day read fails; never the message.
     on_read_error: Callable[[str, str, str], None] | None = None
+    #: BG-5c N-A: reads one floor label's post-floor settled-P&L row (WP-D writes it). ``None``
+    #: (not wired) leaves ``floor_stub_pnl`` empty, so a stub with fills FAILs
+    #: ``settled_pnl_missing``.
+    read_stub_pnl: Callable[[str], SettledPnlDay | None] | None = None
 
 
 def _first_k_gt1_day(epochs: tuple[EpochRow, ...], governed: DayConvention, today: str) -> str:
@@ -363,6 +367,21 @@ def _day_pnl(reads: SnapshotReads, day: str, report: Report) -> DayPnl | None:
         return DayPnl(day, None)
 
 
+def _stub_pnl(
+    read: Callable[[str], SettledPnlDay | None] | None, day: str, report: Report
+) -> DayPnl | None:
+    """The floor stub's P&L row: ``None`` when absent, a ``None`` reading when unreadable."""
+    if read is None:
+        return None
+    try:
+        row = read(day)
+        return None if row is None else DayPnl(day, settled_pnl_or_fail(row))
+    except Exception as exc:  # noqa: BLE001 - an unreadable row is FAIL territory, never zero
+        if report is not None:
+            report("settled_pnl_stub", day, type(exc).__name__)
+        return DayPnl(day, None)
+
+
 def _unattributed_ambiguous(reads: SnapshotReads, report: Report) -> int | None:
     return _safe(lambda: len(reads.read_ambiguous(UNATTRIBUTED)), "unattributed", "-", report)
 
@@ -415,4 +434,9 @@ def build_stage_snapshot(
         governed=governed,
         predicates=inputs.predicates,
         floor_stubs=stubs,
+        floor_stub_pnl=tuple(
+            row
+            for stub in stubs
+            if (row := _stub_pnl(inputs.read_stub_pnl, stub.day, inputs.on_read_error)) is not None
+        ),
     )
