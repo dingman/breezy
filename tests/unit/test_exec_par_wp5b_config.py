@@ -7,7 +7,9 @@ shipped K=1 the node config, the ledger and the latch are the K=1 ones.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -353,3 +355,210 @@ def test_frozen_label_and_guard_share_cap_over_budget_units() -> None:
     # ... and the frozen label is a member of that same ordered label set
     assert EXEC_PAR_FROZEN_BUCKET in oc.COST_BUDGET_BUCKET_ORDER
     assert oc.cost_budget_bucket_rank("0.05") < oc.cost_budget_bucket_rank("0.10")
+
+
+# ---------------------------------------------------------------------------
+# BG-9: EXEC-PAR D-PREREG freeze enforcement and the single-family boot invariant
+# ---------------------------------------------------------------------------
+#
+# Marker convention (the prereg doc is not frozen yet, so this defines it): the
+# frozen doc carries, anywhere in its body, one machine-readable line
+#
+#     <!-- EXEC_PAR_FROZEN_BUCKET: 0.05 -->
+#
+# That marker is authoritative. If it is absent the parse falls back to the
+# prose line "**Frozen label `0.05`.**" (§3). If both exist and disagree, or
+# the marker appears twice with different values, the label is unparseable and
+# the check fails. "Status:" is read from the doc's "- **Status:** FROZEN" /
+# "Status: FROZEN" line. The sibling EXEC-PAR-D-PREREG.sha256 holds the sha256
+# hex of the doc bytes (optionally followed by "  <filename>", sha256sum style).
+# At configured K=1 the real-repo check is skipped; the checks themselves are
+# pure functions over (repo_root, K, frozen_bucket) so K>1 is testable here.
+
+
+_PREREG_DIR = Path("docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04")
+_PREREG_DOC = "EXEC-PAR-D-PREREG.md"
+_PREREG_SHA = "EXEC-PAR-D-PREREG.sha256"
+_MARKER_RE = re.compile(r"<!--\s*EXEC_PAR_FROZEN_BUCKET:\s*([^\s>]+)\s*-->")
+_LABEL_LINE_RE = re.compile(r"\*\*Frozen label\s+`([^`]+)`\.?\*\*")
+_STATUS_RE = re.compile(r"^\s*(?:[-*]\s*)?\**Status:\**\s*([A-Za-z]+)", re.MULTILINE)
+
+
+def parse_frozen_label(text: str) -> str | None:
+    """The §3 frozen label: the marker if present, else the prose label line.
+    None when absent or ambiguous (conflicting values)."""
+    marked = set(_MARKER_RE.findall(text))
+    prose = set(_LABEL_LINE_RE.findall(text))
+    found = marked or prose
+    if marked and prose and marked != prose:
+        return None
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def parse_status(text: str) -> str | None:
+    match = _STATUS_RE.search(text)
+    return match.group(1).upper() if match else None
+
+
+def freeze_violations(repo_root: Path, k: int, frozen_bucket: str) -> list[str]:
+    """Every freeze-enforcement failure at this K; empty at K<=1 (skipped)."""
+    if k <= 1:
+        return []
+    base = repo_root / _PREREG_DIR
+    doc = base / _PREREG_DOC
+    if not doc.is_file():
+        return [f"frozen doc missing: {doc}"]
+    doc_bytes = doc.read_bytes()
+    problems: list[str] = []
+    sha_file = base / _PREREG_SHA
+    if not sha_file.is_file():
+        problems.append(f"sha256 sibling missing: {sha_file}")
+    else:
+        tokens = sha_file.read_text(encoding="utf-8").split()
+        recorded = tokens[0].lower() if tokens else ""
+        if recorded != hashlib.sha256(doc_bytes).hexdigest():
+            problems.append("sha256 sibling does not match the doc bytes")
+    text = doc_bytes.decode("utf-8", errors="replace")
+    status = parse_status(text)
+    if status != "FROZEN":
+        problems.append(f"doc Status is {status!r}, not 'FROZEN'")
+    label = parse_frozen_label(text)
+    if label != frozen_bucket:
+        problems.append(f"doc frozen label {label!r} != EXEC_PAR_FROZEN_BUCKET {frozen_bucket!r}")
+    return problems
+
+
+def _write_prereg(
+    root: Path,
+    *,
+    status: str = "FROZEN",
+    marker: str | None = "0.05",
+    sha: str | None = "auto",
+    write_doc: bool = True,
+) -> None:
+    base = root / _PREREG_DIR
+    base.mkdir(parents=True)
+    body = f"# EXEC-PAR D-PREREG\n\n- **Status:** {status}\n\n"
+    if marker is not None:
+        body += f"<!-- EXEC_PAR_FROZEN_BUCKET: {marker} -->\n"
+    if write_doc:
+        (base / _PREREG_DOC).write_text(body, encoding="utf-8")
+    if sha == "auto":
+        sha = hashlib.sha256(body.encode()).hexdigest() + f"  {_PREREG_DOC}\n"
+    if sha is not None:
+        (base / _PREREG_SHA).write_text(sha, encoding="utf-8")
+
+
+def test_freeze_checks_are_skipped_at_k1(tmp_path: Path) -> None:
+    # nothing on disk at all: K=1 must not care
+    assert freeze_violations(tmp_path, 1, "0.05") == []
+
+
+def test_freeze_valid_doc_passes_at_k_gt_1(tmp_path: Path) -> None:
+    _write_prereg(tmp_path)
+    assert freeze_violations(tmp_path, 6, "0.05") == []
+
+
+def test_freeze_missing_doc_fails_at_k_gt_1(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, write_doc=False)
+    problems = freeze_violations(tmp_path, 2, "0.05")
+    assert len(problems) == 1 and "doc missing" in problems[0]
+
+
+def test_freeze_missing_sha_sibling_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, sha=None)
+    assert any("sibling missing" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_freeze_bad_hash_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, sha="0" * 64 + "\n")
+    assert any("does not match" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_freeze_empty_sha_file_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, sha="")
+    assert any("does not match" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_freeze_not_frozen_status_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, status="DRAFT, not frozen")
+    problems = freeze_violations(tmp_path, 2, "0.05")
+    assert any("not 'FROZEN'" in p for p in problems)
+
+
+def test_freeze_label_mismatch_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, marker="0.10")
+    assert any("!= EXEC_PAR_FROZEN_BUCKET" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_freeze_missing_label_fails(tmp_path: Path) -> None:
+    _write_prereg(tmp_path, marker=None)
+    assert any("None" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_parse_frozen_label_marker_prose_and_conflict() -> None:
+    assert parse_frozen_label("<!-- EXEC_PAR_FROZEN_BUCKET: 0.05 -->") == "0.05"
+    assert parse_frozen_label("- **Frozen label `0.05`.** The unit") == "0.05"
+    both_ok = "<!-- EXEC_PAR_FROZEN_BUCKET: 0.05 -->\n**Frozen label `0.05`.**"
+    assert parse_frozen_label(both_ok) == "0.05"
+    both_bad = "<!-- EXEC_PAR_FROZEN_BUCKET: 0.10 -->\n**Frozen label `0.05`.**"
+    assert parse_frozen_label(both_bad) is None
+    two_markers = "<!-- EXEC_PAR_FROZEN_BUCKET: 0.10 -->\n<!-- EXEC_PAR_FROZEN_BUCKET: 0.05 -->"
+    assert parse_frozen_label(two_markers) is None
+    assert parse_frozen_label("nothing here") is None
+
+
+def test_parse_status_variants() -> None:
+    assert parse_status("- **Status:** FROZEN") == "FROZEN"
+    assert parse_status("Status: frozen") == "FROZEN"
+    assert parse_status("- **Status:** DRAFT, not frozen") == "DRAFT"
+    assert parse_status("no status") is None
+
+
+def test_real_repo_freeze_enforcement() -> None:
+    if EXEC_PAR_MAX_CONCURRENT_INTENTS <= 1:
+        pytest.skip("configured K=1: D-PREREG freeze checks apply at K>1 only")
+    assert freeze_violations(_REPO, EXEC_PAR_MAX_CONCURRENT_INTENTS, EXEC_PAR_FROZEN_BUCKET) == []
+
+
+def _trade_run_ast() -> ast.FunctionDef:
+    from breezy.app import trade
+
+    tree = ast.parse(inspect.getsource(trade))
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "run")
+
+
+def test_boot_loads_only_the_settings_sending_family() -> None:
+    """Single-family invariant (any K): every manifest load in `run` is keyed on
+    `settings.sending_family_id` and nothing else."""
+    run = _trade_run_ast()
+    loads = [
+        n
+        for n in ast.walk(run)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "load_family_manifest"
+    ]
+    assert len(loads) == 1
+    arg_names = {ast.unparse(n) for n in ast.walk(loads[0].args[0]) if isinstance(n, ast.Attribute)}
+    assert "settings.sending_family_id" in arg_names
+    assert not any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "glob"
+        for n in ast.walk(run)
+    )
+
+
+def test_boot_raises_settings_error_on_manifest_family_mismatch() -> None:
+    run = _trade_run_ast()
+    guards = [
+        n
+        for n in ast.walk(run)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Compare)
+        and ast.unparse(n.test) == "manifest.family_id != settings.sending_family_id"
+    ]
+    assert len(guards) == 1
+    raised = [n for n in ast.walk(guards[0]) if isinstance(n, ast.Raise)]
+    assert len(raised) == 1
+    assert isinstance(raised[0].exc, ast.Call)
+    assert ast.unparse(raised[0].exc.func) == "SettingsError"

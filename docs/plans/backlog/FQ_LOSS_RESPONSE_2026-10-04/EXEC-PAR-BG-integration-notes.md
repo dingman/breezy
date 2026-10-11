@@ -15,3 +15,12 @@ These are binding inputs for the BG-1 store implementation, BG-5 and BG-6. They 
 5. **Entry and exit discrimination everywhere.** Use the slot `is_exit` flag or the Nautilus `order_side`. Never use `wire*` fields.
 6. **2-of-5 station-day flags (BG-5).** Per-day flags are evaluated against that day's budget. If the operator changes the budget, the flags are not comparable across days, so the stage report must state that.
 7. **Known residual (BG-1b).** A dropped anchor on queue overflow orphans its fills. Each orphan is gappy-marked, and BG-1d reconciliation rebuilds the day from durable fill records.
+
+## BG-9 freeze-marker convention
+
+BG-9 (`tests/unit/test_exec_par_wp5b_config.py`, `freeze_violations`) reads the frozen `EXEC-PAR-D-PREREG.md` at configured K>1 only (skipped at K=1).
+
+- **Marker.** The frozen doc must carry the line `<!-- EXEC_PAR_FROZEN_BUCKET: 0.05 -->`, which must equal `node_config.EXEC_PAR_FROZEN_BUCKET`. If the marker is absent the parse falls back to the §3 prose line ``**Frozen label `0.05`.**``. Conflicting or duplicate values fail the check.
+- **Status.** The doc's `Status:` line must read FROZEN.
+- **Hash.** `EXEC-PAR-D-PREREG.sha256` holds the sha256 hex of the doc bytes (optionally `sha256sum` style, followed by the filename).
+- **Freeze step.** Add the marker to the doc before the §13 freeze commit.
