@@ -225,3 +225,14 @@ This amends R8.2.
 ### Status
 
 **READY** for build once the A1–A7 amendments are folded in. A further review round is not required unless a build contradicts this text, in which case the builder STOPs and reports.
+
+## r2.2 build-time notes (from the WP-C reviews; binding)
+
+- **N-A. WP-D: write stub settled-P&L rows.** WP-D writes a settled-P&L row for each per-station floor stub, covering post-floor entries only, alongside the whole-day rows.
+  - Until that lands, the evaluator FAILs `settled_pnl_missing` on any floor stub that has post-floor fills or AMBIGUOUS orders. This is fail-closed and intended.
+  - The s15 day and stage checks skip floor labels. They may only skip a label once its stub row exists.
+- **N-B. WP-E: call the day-convention check at boot.** At K>1, WP-E calls `enforce_day_convention_at_boot` on the boot path and adds a test showing that a K>1 boot calls it.
+- **N-C. A5 deviation: intraday halts stay with BG-6.** The §5 Clopper-Pearson, §5 burst and §9 intraday halts stay with BG-6, per the spec's BUILD-GAP table. The daily evaluator feeds open days only into the s7 and s15 checks.
+  - BG-6 must evaluate open days immediately.
+  - BG-4's `--dry-eval` recomputes the intraday rules (L1) through BG-6's pure predicates.
+- **N-D. Name mapping.** The plan's `entry_counts_by_day` and `EntryRow` correspond to `entry_fills_by_day` and `EntryInput`/`OrderAnchor` in the code.
