@@ -236,3 +236,20 @@ This amends R8.2.
   - BG-6 must evaluate open days immediately.
   - BG-4's `--dry-eval` recomputes the intraday rules (L1) through BG-6's pure predicates.
 - **N-D. Name mapping.** The plan's `entry_counts_by_day` and `EntryRow` correspond to `entry_fills_by_day` and `EntryInput`/`OrderAnchor` in the code.
+
+## r2.3 WP-E obligations (from the WP-A/WP-B reviews; binding)
+
+- **E-1. Ledger construction.** Construct the injected ledger with `spend_ledger_for(config)`, using the exact factory arguments. Add a test that the injected ledger's admission/breaker fractions equal the factory's (WP-A review LOW).
+- **E-2. Final lapse before stop.** Wire `record_final_lapse_before_stop` into `_close_epoch` before `stop_ts` is written. If the lapse write fails:
+  - gappy-mark the affected days directly, or retry;
+  - only then write `stop_ts`;
+  - log at ERROR.
+  A clean `stop_ts` must never hide an unrecorded gap. Also fix the helper's docstring (WP-B confirm MEDIUM).
+- **E-3. Spend-audit gating.** The evaluator/runner must honour `SpendAudit.blocks_pass`. Add a test that a non-FULL_MATCH status cannot yield PASS (WP-B confirm LOW).
+- **E-4. Durable sources.** Construct `DurableSources` with:
+  - `monitor=SpendAuditMonitor(alert_sink=…)`;
+  - the latch `anchors` port;
+  - a `GovernedDays` that exposes `std_offsets`.
+  Map `SourceReadError` to FAIL `stage_eval_fail:source_read:<name>`.
+- **E-5. Heartbeat lapses.** Call `record_lapse_if_any(last_hb_ns=…)` before every heartbeat write. The first beat uses the epoch's `boot_ts`.
+- **E-6. Day convention.** Covered by N-B: `enforce_day_convention_at_boot` at K>1.
