@@ -253,3 +253,5 @@ This amends R8.2.
   Map `SourceReadError` to FAIL `stage_eval_fail:source_read:<name>`.
 - **E-5. Heartbeat lapses.** Call `record_lapse_if_any(last_hb_ns=…)` before every heartbeat write. The first beat uses the epoch's `boot_ts`.
 - **E-6. Day convention.** Covered by N-B: `enforce_day_convention_at_boot` at K>1.
+- **E-7. Persist the per-day spend-audit status.** Each pass, write `SpendAudit` status per day to `exec_par/spend_audit/<label>`, recording `{status, ts_ns}`. Status is FULL_MATCH, UNAUDITED, MISMATCH or DURABLE_UNREADABLE. This lets BG-7's read-only report show the deferrals, which it cannot do from the in-memory Nautilus cache (BG-7 review).
+- **E-8. BG-8 note.** At K>1 with a live node, an unreadable watcher record pages `WATCHER_DEAD` immediately, with no debounce. This is a coordinator ruling: a false page is preferable to a delayed safety alert.
