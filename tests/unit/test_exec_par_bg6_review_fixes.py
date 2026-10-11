@@ -223,16 +223,79 @@ def test_closed_days_are_rescanned_only_after_an_invalidation(tmp_path: Path) ->
         assert _halt_reason(rig) == "s5_burst"
 
 
-# -- 5. counts versus rows -------------------------------------------------------------------
+# -- 5. counts versus rows (a BG-1d rebuild restores counts, not rows) -----------------------
 
 
-def test_counts_that_disagree_with_the_rows_are_an_integrity_halt_naming_the_day(
+def _rebuilt_day(rig: Rig, rows: int, delta: int, *, spacing: int = 2 * HOUR) -> None:
+    """Five posted entries on d1, ``rows`` of them AMBIGUOUS (spread out), plus a rebuild delta."""
+    for i in range(5):
+        _post(rig, ns_of(d(1)) + 5 + i * spacing, ambiguous=i < rows)
+    rig.latch.write_counts_delta(DayCountsDelta(d(1), 0, delta, 0, "0"))
+
+
+def test_rows_plus_the_rebuild_delta_matching_the_counts_is_no_halt(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        _rebuilt_day(rig, rows=3, delta=1)  # effective 4 < 5: the burst cannot trip
+        _ready(rig).check(rig.clock.ns)
+        assert rig.spy.calls == [] and rig.breaker() is None
+
+
+def test_a_rebuilt_day_with_five_effective_and_missing_arm_times_is_burst_incomplete(
     tmp_path: Path,
 ) -> None:
     with make_rig(tmp_path, seed=True) as rig:
-        _post(rig, ns_of(d(1)) + 5)
+        _rebuilt_day(rig, rows=4, delta=1)  # effective 5, the 4 rows are 2 h apart
+        _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == f"burst_incomplete_rebuilt_day:{d(1)}"
+        assert "write_force_k1_flag" not in rig.spy.calls  # integrity class: no flag
+
+
+def test_burst_incomplete_is_silent_when_the_available_rows_already_trip(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        _rebuilt_day(rig, rows=5, delta=1, spacing=1)  # five rows inside one hour + delta
+        _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == "s5_burst"
+        details = [a[2] for a in rig.alerts if a[1] == "EXEC_PAR_STAGE_INTEGRITY_HALT"]
+        assert not any("burst_incomplete" in x or "rows_mismatch" in x for x in details)
+
+
+def test_the_rebuilt_days_effective_count_feeds_the_cp_numerator(tmp_path: Path) -> None:
+    with make_rig(tmp_path, seed=True) as rig:
+        for i in range(20):  # 20 posted, 2 h apart; 8 AMBIGUOUS rows + a delta of 1 = 9
+            _post(rig, ns_of(d(1)) + 5 + i * 2 * HOUR, ambiguous=i < 8)
         rig.latch.write_counts_delta(DayCountsDelta(d(1), 0, 1, 0, "0"))
         _ready(rig).check(rig.clock.ns)
+        assert _halt_reason(rig) == "s5_clopper_pearson"
+
+
+def test_a_mismatch_the_delta_does_not_explain_still_halts(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    with make_rig(tmp_path, seed=True) as rig:
+        for i in range(3):
+            _post(rig, ns_of(d(1)) + 5 + i * 2 * HOUR, ambiguous=i < 1)
+        _fresh_stamp(rig)
+        inner = rig.ports.counters
+
+        class _Counters:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(inner, name)
+
+            def read_day_counts(self, day: str) -> Any:
+                counts = inner.read_day_counts(day)
+                assert counts is not None
+                return replace(counts, ambiguous=counts.ambiguous + 1)  # no delta behind it
+
+        monitor = IntradayMonitor(
+            reads=rig.ports.store,
+            counters=cast("Any", _Counters()),
+            governed=rig.ports.governed,
+            boot_ns=rig.ports.boot_ns,
+            intraday=_ports(),
+            stop=rig.ev.stop_class,
+            integrity=rig.ev.integrity_halt,
+        )
+        monitor.check(rig.clock.ns)
         assert _halt_reason(rig) == f"ambiguous_rows_mismatch:{d(1)}"
 
 

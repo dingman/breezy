@@ -36,15 +36,18 @@ from typing import Final, Protocol
 from breezy.runtime.exec_par_counter_ingest import UNATTRIBUTED
 from breezy.runtime.exec_par_days_port import DayConvention
 from breezy.runtime.exec_par_intraday_rules import (
+    BURST_MIN_AMBIGUOUS,
     IntradayInputError,
     IntradayInputs,
     IntradayPredicateError,
     OpenCostPort,
+    burst_trips,
     intraday_stop_reasons,
 )
 from breezy.runtime.exec_par_reconcile import DayCounts
 from breezy.runtime.exec_par_records import (
     AmbiguousRow,
+    DayCountsDelta,
     EpochRow,
     ExcludedDay,
     OrderAnchor,
@@ -84,6 +87,7 @@ class IntradayReads(Protocol):
     def read_excluded_days(self) -> tuple[ExcludedDay, ...]: ...
     def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]: ...
     def read_ambiguous(self, day: str) -> tuple[object, ...]: ...
+    def read_counts_delta(self, day: str) -> DayCountsDelta | None: ...
     def read_stage_eval_stamp(self) -> StageEvalStamp | None: ...
 
 
@@ -122,6 +126,9 @@ class _DayScan:
     ambiguous: int
     arm_ns: tuple[int, ...]
     findings: tuple[str, ...]
+    #: A rebuilt day whose AMBIGUOUS rows are fewer than its effective count: some arm times are
+    #: missing. The effective count is carried so the burst can be judged over the whole window.
+    incomplete_effective: int | None = None
 
 
 class DayScanCache:
@@ -160,17 +167,27 @@ def _scan_floor_day(reads: IntradayReads, day: str, cutoff: int) -> _DayScan:
 
 
 def _scan_plain_day(reads: IntradayReads, counters: IntradayCounts, day: str) -> _DayScan:
+    """A whole-day scan. ``counts`` are EFFECTIVE (rows plus the day's BG-1d rebuild delta); a
+    rebuild restores counts, not rows, so rows are compared with ``counts - delta`` and only a
+    mismatch the delta does not explain is an integrity finding. A positive delta means arm times
+    are missing for that many marks (the CP numerator still uses the effective count)."""
     counts = counters.read_day_counts(day)
     if counts is None:
         raise IntradayInputError("day counts missing")
     rows = _ambiguous_rows(reads.read_ambiguous(day))
+    delta = reads.read_counts_delta(day)
+    missing = 0 if delta is None else delta.ambiguous
     findings: list[str] = []
     if counts.ambiguous > counts.posted_entries:
         findings.append(f"ambiguous_exceeds_posted:{day}")
-    if len(rows) != counts.ambiguous:
+    if len(rows) != counts.ambiguous - missing:
         findings.append(f"ambiguous_rows_mismatch:{day}")
     return _DayScan(
-        counts.posted_entries, counts.ambiguous, tuple(r.arm_ns for r in rows), tuple(findings)
+        counts.posted_entries,
+        counts.ambiguous,
+        tuple(r.arm_ns for r in rows),
+        tuple(findings),
+        incomplete_effective=counts.ambiguous if missing > 0 else None,
     )
 
 
@@ -215,6 +232,7 @@ def gather_intraday_inputs(
     first_open = min(open_labels)
     gappy = frozenset() if cache is None else counters.read_gappy_days()
     scans: list[_DayScan] = []
+    scan_days: list[str] = []
     for day in labels:
         if day in excluded:
             continue
@@ -228,14 +246,24 @@ def gather_intraday_inputs(
             if cache is not None and cacheable:
                 cache.put(day, floor_ts, hit)
         scans.append(hit)
+        scan_days.append(day)
     scans.append(_unattributed(reads, floor))
-    findings = tuple(dict.fromkeys(f for scan in scans for f in scan.findings))
+    scan_days.append(UNATTRIBUTED)
+    arm_times = tuple(t for x in scans for t in x.arm_ns)
+    findings = [f for scan in scans for f in scan.findings]
+    if not burst_trips(arm_times):  # missing arm times only matter if the rows do not trip it
+        findings.extend(
+            f"burst_incomplete_rebuilt_day:{day}"
+            for day, scan in zip(scan_days, scans, strict=True)
+            if scan.incomplete_effective is not None
+            and scan.incomplete_effective >= BURST_MIN_AMBIGUOUS
+        )
     return IntradayInputs(
         posted=sum(x.posted for x in scans),
         ambiguous=sum(x.ambiguous for x in scans),
-        ambiguous_arm_ns=tuple(t for x in scans for t in x.arm_ns),
+        ambiguous_arm_ns=arm_times,
         open_cost_by_station_day=dict(intraday.open_cost_by_station_day()),
-        findings=findings,
+        findings=tuple(dict.fromkeys(findings)),
         floor_ts=floor_ts,
     )
 
