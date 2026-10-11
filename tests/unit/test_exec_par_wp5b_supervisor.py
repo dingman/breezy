@@ -3,8 +3,9 @@
 The supervisor cannot read the node's in-memory counters; it sees what the node
 persists. ``probe_breaker_record`` is a read-only (``mode=ro``) read of the
 breaker record and the slot table, run from the existing per-iteration tick.
-K is read first: at the configured K=1 the tick returns before any store is
-opened, because a K=1 node writes v1 bytes and never a breaker record.
+Since BG-8 the probe also runs at K=1 (read-only, see
+test_exec_par_bg8_supervisor_probes.py); a K=1 tick on a store that does not
+exist opens nothing.
 """
 
 from __future__ import annotations

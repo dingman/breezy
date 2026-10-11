@@ -48,6 +48,7 @@ from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, defau
 from breezy.runtime.alert_proof import COUNTERS as _ALERT_COUNTERS
 from breezy.runtime.alert_proof import deliver_with_proof
 from breezy.runtime.breaker_supervisor_watch import (
+    PROBE_INTERVAL_NS,
     BreakerProbe,
     BreakerWatchState,
     decide_breaker_alerts,
@@ -60,6 +61,12 @@ from breezy.runtime.build_sha import (
 )
 from breezy.runtime.build_sha import resolve_build_revision as _resolve_build_revision_impl
 from breezy.runtime.exec_par_constants import EXEC_PAR_MAX_CONCURRENT_INTENTS
+from breezy.runtime.exec_par_records import (
+    STAGE_EVAL_STAMP_KEY,
+    ExecParRecordError,
+    StageEvalStamp,
+    decode_record,
+)
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import (
     AlertPayload,
@@ -580,11 +587,15 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         # No store yet (a node that has not created it): "absent", not a fault.
         return BreakerProbe.absent()
     try:
-        values = _read_only_values(store_path, (BREAKER_KEY, CURRENT_INTENT_KEY))
+        values = _read_only_values(
+            store_path, (BREAKER_KEY, CURRENT_INTENT_KEY, STAGE_EVAL_STAMP_KEY)
+        )
     except Exception as exc:  # noqa: BLE001 -- an unreadable store is reported, not raised
         logger.warning("breaker_record_probe_failed error_type=%s", type(exc).__name__)
         return replace(BreakerProbe.absent(), readable=False)
     raw_record, raw_table = values[BREAKER_KEY], values[CURRENT_INTENT_KEY]
+    stamp_ts_ns, stamp_readable = _decode_stamp(values[STAGE_EVAL_STAMP_KEY])
+    base = replace(BreakerProbe.absent(), stamp_ts_ns=stamp_ts_ns, stamp_readable=stamp_readable)
     unreadable = 0
     if raw_table is not None:
         try:
@@ -592,19 +603,29 @@ def probe_breaker_record(store_path: Path) -> BreakerProbe:
         except SubmitIntentCorrupt:
             unreadable = 0
     if raw_record is None:
-        return replace(BreakerProbe.absent(), unreadable_slots=unreadable)
+        return replace(base, unreadable_slots=unreadable)
     try:
         record = parse_breaker(raw_record)
     except SlotTableError:
-        return replace(BreakerProbe.absent(), readable=False, unreadable_slots=unreadable)
-    return BreakerProbe(
-        readable=True,
+        return replace(base, readable=False, unreadable_slots=unreadable)
+    return replace(
+        base,
         present=True,
         halted=record.is_halted,
         hb_ns=record.hb_ns,
         resolver_pass_ns=record.resolver_pass_ns,
         unreadable_slots=unreadable,
     )
+
+
+def _decode_stamp(raw: bytes | None) -> tuple[int | None, bool]:
+    """``(ts_ns or None if never written, decodable)`` of the BG-5 stamp row."""
+    if raw is None:
+        return None, True
+    try:
+        return decode_record(StageEvalStamp, raw).ts_ns, True
+    except ExecParRecordError:
+        return None, False
 
 
 def configured_exec_par_k() -> int:
@@ -3146,23 +3167,31 @@ def _do_breaker_watch(
 ) -> None:
     """[EXEC-PAR WP5b] One breaker-watch tick: probe, decide, alert durably.
 
-    K is read first and a K<=1 tick returns before ANY store is opened: at K=1
-    the node writes v1 bytes and never a breaker record, so there is nothing to
-    watch. At K>1 the probe opens the store read-only. Each alert goes through
+    [BG-8] Probes at ANY K, read-only (``mode=ro``), at most every
+    ``PROBE_INTERVAL_NS``: halted, unreadable slot, probe failure; at K>1 also the
+    dead watcher and the stage-eval stamp (which needs no live node). The probe
+    never writes and never raises; a failure is logged and alerted once per
+    episode. The supervisor only alerts: it never respawns or kills the node.
+    Each alert goes through
     ``ports.send_alert_durable`` and is marked delivered only when that confirms
     it, so a lost send is retried on the next tick.
     """
-    if ports.configured_exec_par_k() <= 1:
-        watch.active.clear()
-        watch.node_pid = None
-        watch.node_first_seen_ns = None
+    now_ns = int(now.timestamp() * 1e9)
+    if watch.last_probe_ns is not None and 0 <= now_ns - watch.last_probe_ns < PROBE_INTERVAL_NS:
         return
+    watch.last_probe_ns = now_ns
+    k = ports.configured_exec_par_k()
     probe = ports.probe_breaker_record(store_path)
-    pid = tracked_pid if tracked_pid is not None else ports.find_node_pid()
-    node_live = pid is not None and ports.process_alive(pid)
+    if not probe.readable:
+        log_decision("breaker_probe_unreadable", k_configured=k)
+    pid: int | None = None
+    node_live = False
+    if k > 1:
+        pid = tracked_pid if tracked_pid is not None else ports.find_node_pid()
+        node_live = pid is not None and ports.process_alive(pid)
     specs = decide_breaker_alerts(
         probe=probe,
-        k_configured=ports.configured_exec_par_k(),
+        k_configured=k,
         node_live=node_live,
         now_ns=int(now.timestamp() * 1e9),
         state=watch,
@@ -3178,10 +3207,12 @@ def _do_breaker_watch(
             log_decision(
                 "breaker_watch_alert_send_raised", alert=spec.event, error_type=type(exc).__name__
             )
+            watch.last_probe_ns = None  # a lost send is retried next poll, not in 10 min
             continue
         if durable:
             watch.delivered(spec, int(now.timestamp() * 1e9))
         else:
+            watch.last_probe_ns = None
             log_decision("breaker_watch_alert_not_durable", alert=spec.event)
 
 

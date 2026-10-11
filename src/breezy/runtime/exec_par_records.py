@@ -82,6 +82,7 @@ __all__ = [
     "EPOCH_KEY_PREFIX",
     "EXEC_PAR_PREFIX",
     "LAPSE_KEY_PREFIX",
+    "STAGE_EVAL_STAMP_KEY",
     "AmbiguousRow",
     "Amendment",
     "CleanupDemotion",
@@ -126,6 +127,9 @@ __all__ = [
 ]
 
 EXEC_PAR_PREFIX: Final[str] = "exec/polymarket_us/exec_par/"
+#: BG-5 stage-eval stamp row; the one owner, shared by the latch writer and the
+#: supervisor's read-only BG-8 stamp probe.
+STAGE_EVAL_STAMP_KEY: Final[str] = EXEC_PAR_PREFIX + "stage_eval/stamp"
 #: Key layout of the append-style rows; the one owner, shared by the latch writers
 #: and the read-only ledger reader.
 EPOCH_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
