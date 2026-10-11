@@ -118,6 +118,11 @@ class EntryInput:
 
     ``ambiguous_unresolved`` scores the entry as a full-cost loss whatever the outcome.
     With no fill, ``ambiguous_cost`` (cost plus fee, declared by the caller) is required.
+
+    ``ever_ambiguous`` (BG-5c A3) is the BG-1b ever-ambiguous mark. A RESOLVED entry
+    (``ambiguous_unresolved`` False, venue-evidenced) with a confirmed fill keeps counting at
+    ``cumulative_cost + fee`` until its settlement outcome exists, then scores as an ordinary
+    settled fill: the full-cost term is left only on settlement, never on resolution alone.
     """
 
     arm_ns: int
@@ -125,6 +130,7 @@ class EntryInput:
     fill: FillLike | None
     ambiguous_unresolved: bool = False
     ambiguous_cost: Decimal | None = None
+    ever_ambiguous: bool = False
 
 
 def _money(value: object) -> Decimal:
@@ -188,9 +194,12 @@ def _contribution(
         return
     fill = _check_fill(entry.fill)
     if fill.instrument_id not in outcomes:
-        if overdue:
+        if overdue or entry.ever_ambiguous:
             day.contributions.append(-_entry_cost(entry, day))
-            day.overdue += 1
+            if overdue:
+                day.overdue += 1
+            else:
+                day.ambiguous += 1
         else:
             day.unsettled += 1
         return

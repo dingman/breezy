@@ -35,6 +35,9 @@ field; ``day`` is the climate-day label of the ARM time, I2, and equals
 * ``openflag/<day>/<station_day>`` value-free "open cost over fraction" flag
 * ``window/<day>/<start_ns>``  per 5 s window order count and notional
 * ``gappy/<day>``              gappy-day mark
+* ``lapse/<start_ns>``         BG-5c R7.3 append-only heartbeat-lapse / unclean-shutdown span
+  ``{start_ns, end_ns, kind, marked_ts}``; exclusive per start (the breaker heartbeat itself is ONE
+  overwritten row, so it keeps no history); ``marked_ts`` is set once when its days are gappy-marked
 
 BG-5b stage-evaluator rows (single writer = the node's loop thread, via the latch):
 
@@ -71,6 +74,7 @@ __all__ = [
     "DAY_CONVENTION_VERSION",
     "EPOCH_KEY_PREFIX",
     "EXEC_PAR_PREFIX",
+    "LAPSE_KEY_PREFIX",
     "AmbiguousRow",
     "Amendment",
     "CleanupDemotion",
@@ -85,6 +89,7 @@ __all__ = [
     "ForceK1Kind",
     "ForceK1State",
     "GappyMark",
+    "HeartbeatLapse",
     "LookRow",
     "OpenCostFlag",
     "OrderAnchor",
@@ -116,6 +121,8 @@ EXEC_PAR_PREFIX: Final[str] = "exec/polymarket_us/exec_par/"
 #: and the read-only ledger reader.
 EPOCH_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
 AMENDMENT_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "amendment/"
+#: BG-5c R7.3: the append-only watcher-lapse / unclean-shutdown spans (``lapse/<start_ns>``).
+LAPSE_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "lapse/"
 _VERSION: Final[int] = 1
 #: ``exec_par/day_convention`` row version: 2 = per-station standard-time ``entry_day`` (BG-5c R1).
 DAY_CONVENTION_VERSION: Final[int] = 2
@@ -315,6 +322,21 @@ class GappyMark:
 
 
 @dataclass(frozen=True, slots=True)
+class HeartbeatLapse:
+    """BG-5c R7.3: one span the node was not provably healthy (``kind`` is a ``GapKind`` value).
+
+    Append-only: ``start_ns`` keys the row and the span never changes. ``marked_ts`` is stamped once
+    when every governed open day the span overlaps carries its gappy mark, so a later rebuild that
+    deletes a mark is never undone by re-marking an already-handled span.
+    """
+
+    start_ns: int
+    end_ns: int
+    kind: str
+    marked_ts: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LookRow:
     """BG-5b: one recorded promotion look; ``outcome`` is passed / failed / not_taken."""
 
@@ -478,6 +500,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "coids": "str",
     },
     GappyMark: {"day": "str", "cause": "str", "ts_ns": "int", "cleared_ts": "int?"},
+    HeartbeatLapse: {"start_ns": "int", "end_ns": "int", "kind": "str", "marked_ts": "int?"},
     LookRow: {"day": "day", "outcome": "str", "ts_ns": "int"},
     StageEvalStamp: {"ts_ns": "int", "boot_ns": "int"},
     StageEvalLiveness: {"stage_eval_last_start_ns": "int?", "stage_eval_last_ok_ns": "int?"},
