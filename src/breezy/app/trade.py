@@ -62,6 +62,7 @@ from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.node_config import (
     EXEC_PAR_MAX_CONCURRENT_INTENTS,
+    force_k1_on_durable_flag,
     force_k1_without_supervisor_marker,
 )
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
@@ -1076,6 +1077,8 @@ def run(
             latch = stack.enter_context(_open_exec_latch(store, store_path))
             # K>1 only does anything: a supervisor that cannot decode v2 forces K=1.
             force_k1_without_supervisor_marker(latch, store_path)
+            # BG-3: a SET/UNREADABLE durable flag, or an un-amended demotion, pins K=1.
+            force_k1_on_durable_flag(latch, repo_root=Path.cwd())
             exec_watcher = build_exec_watcher(
                 latch.max_slots(),
                 latch=latch,

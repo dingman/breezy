@@ -105,10 +105,11 @@ from breezy.adapters.polymarket_us.tape_records import (
 )
 from breezy.persistence.catalog import CatalogPathError
 from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.exec_par_boot_flag import force_k1_at_boot
 from breezy.runtime.exec_par_constants import (
     EXEC_PAR_MAX_CONCURRENT_INTENTS,  # noqa: F401 - re-exported: existing importers keep working
 )
-from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.runtime.settings import (
     BreezyRuntimeSettings,
     BreezyTradeSettings,
@@ -776,6 +777,23 @@ def force_k1_without_supervisor_marker(
         return False
     latch.force_k1(EXEC_PAR_MARKER_ABSENT_REASON)
     return True
+
+
+def force_k1_on_durable_flag(
+    latch: SubmitIntentLatch,
+    *,
+    repo_root: Path,
+    alert_sink: AlertSink | None = None,
+) -> bool:
+    """Force the slot latch to K=1 when the durable force-K1 flag is SET or UNREADABLE.
+
+    Also holds K=1 at a configured K>1 while an un-amended ``cleanup_demotion`` to
+    K=1 stands (N4). A CLEARED flag does nothing; at configured K=1 forcing is
+    harmless. The latch already carries the store, so none is passed. Returns
+    ``True`` iff K was forced.
+    """
+    sink = resolve_alert_sink() if alert_sink is None else alert_sink
+    return force_k1_at_boot(latch, repo_root=repo_root, alert_sink=sink)
 
 
 def build_trade_risk_engine_config(
