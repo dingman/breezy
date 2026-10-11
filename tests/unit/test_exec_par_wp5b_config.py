@@ -381,7 +381,7 @@ _PREREG_DOC = "EXEC-PAR-D-PREREG.md"
 _PREREG_SHA = "EXEC-PAR-D-PREREG.sha256"
 _MARKER_RE = re.compile(r"<!--\s*EXEC_PAR_FROZEN_BUCKET:\s*([^\s>]+)\s*-->")
 _LABEL_LINE_RE = re.compile(r"\*\*Frozen label\s+`([^`]+)`\.?\*\*")
-_STATUS_RE = re.compile(r"^\s*(?:[-*]\s*)?\**Status:\**\s*([A-Za-z]+)", re.MULTILINE)
+_STATUS_RE = re.compile(r"^\s*(?:[-*]\s*)?\**Status:\**\s*([A-Za-z]+)[.*]*\s*$", re.MULTILINE)
 
 
 def parse_frozen_label(text: str) -> str | None:
@@ -511,8 +511,25 @@ def test_parse_frozen_label_marker_prose_and_conflict() -> None:
 def test_parse_status_variants() -> None:
     assert parse_status("- **Status:** FROZEN") == "FROZEN"
     assert parse_status("Status: frozen") == "FROZEN"
-    assert parse_status("- **Status:** DRAFT, not frozen") == "DRAFT"
+    assert parse_status("- **Status:** FROZEN.") == "FROZEN"
+    assert parse_status("- **Status:** FROZEN**") == "FROZEN"
+    assert parse_status("- **Status:** DRAFT, not frozen") is None
     assert parse_status("no status") is None
+
+
+@pytest.mark.parametrize("status", ["FROZEN-PENDING", "FROZEN, not yet", "FROZEN soon"])
+def test_status_must_be_the_whole_token(status: str) -> None:
+    assert parse_status(f"- **Status:** {status}") is None
+
+
+@pytest.mark.parametrize("status", ["FROZEN-PENDING", "FROZEN, not yet"])
+def test_freeze_partial_status_token_fails(tmp_path: Path, status: str) -> None:
+    _write_prereg(tmp_path, status=status)
+    assert any("not 'FROZEN'" in p for p in freeze_violations(tmp_path, 2, "0.05"))
+
+
+def test_prereg_directory_exists() -> None:
+    assert (_REPO / _PREREG_DIR).is_dir()
 
 
 def test_real_repo_freeze_enforcement() -> None:
@@ -540,8 +557,7 @@ def test_boot_loads_only_the_settings_sending_family() -> None:
         and n.func.id == "load_family_manifest"
     ]
     assert len(loads) == 1
-    arg_names = {ast.unparse(n) for n in ast.walk(loads[0].args[0]) if isinstance(n, ast.Attribute)}
-    assert "settings.sending_family_id" in arg_names
+    assert ast.unparse(loads[0].args[0]) == "_FAMILIES_DIR / f'{settings.sending_family_id}.json'"
     assert not any(
         isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "glob"
         for n in ast.walk(run)
@@ -560,5 +576,6 @@ def test_boot_raises_settings_error_on_manifest_family_mismatch() -> None:
     assert len(guards) == 1
     raised = [n for n in ast.walk(guards[0]) if isinstance(n, ast.Raise)]
     assert len(raised) == 1
+    assert raised[0] in guards[0].body
     assert isinstance(raised[0].exc, ast.Call)
     assert ast.unparse(raised[0].exc.func) == "SettingsError"
