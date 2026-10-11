@@ -91,12 +91,20 @@ def _breaches(port: PnlPredicatePort, name: str, aggregate: Decimal, fraction: D
 
 
 def s15_findings(ctx: StageContext) -> list[str]:
-    """Day, stage and cumulative stops, all through the predicate port."""
+    """Day, stage and cumulative stops, all through the predicate port.
+
+    ``ctx.live`` includes the OPEN labels (A5), so a loss on an open day trips a stop on the
+    first pass that sees it. A floor label's settled-P&L row is a WHOLE-day row that carries
+    pre-floor entries, so the day and stage stops skip it (a pre-floor loss can never re-trip a
+    stop, A4); the never-floored cumulative stop reads it.
+    """
     port = ctx.snap.predicates
     found: list[str] = []
     stage_total = Decimal(0)
     day_hit = False
     for label in ctx.live:
+        if label in ctx.floor_days:
+            continue
         reading = ctx.pnl.get(label)
         if reading is None:
             continue
@@ -110,7 +118,7 @@ def s15_findings(ctx: StageContext) -> list[str]:
         (
             r.pnl
             for day, r in ctx.pnl.items()
-            if r is not None and ctx.first_k_day <= day <= ctx.today
+            if r is not None and ctx.first_k_day <= day <= ctx.horizon
         ),
         Decimal(0),
     )

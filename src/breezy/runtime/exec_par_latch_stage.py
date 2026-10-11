@@ -23,10 +23,12 @@ from typing import Final
 
 from breezy.runtime.exec_par_latch_counters import ExecParCounterRowsMixin, _part
 from breezy.runtime.exec_par_records import (
+    DAY_CONVENTION_KEY,
     EPOCH_KEY_PREFIX,
     EXEC_PAR_PREFIX,
     DayCountsDelta,
     EpochRow,
+    ExecParRecordError,
     GappyMark,
     LookRow,
     RebuildRow,
@@ -34,6 +36,8 @@ from breezy.runtime.exec_par_records import (
     StageEvalLiveness,
     StageEvalStamp,
     StageReportDoc,
+    decode_day_convention,
+    encode_day_convention,
 )
 
 LOOK_OUTCOMES: Final[frozenset[str]] = frozenset({"passed", "failed", "not_taken"})
@@ -63,6 +67,34 @@ class ExecParStageRowsMixin(ExecParCounterRowsMixin):
     def _es_require_delete(self) -> None:
         if getattr(self._store, "delete", None) is None:
             raise RuntimeError("store has no delete; cannot remove an EXEC-PAR row")
+
+    # -- the climate-day convention (BG-5c R1) ----------------------------
+
+    def read_day_convention(self) -> int | None:
+        """The stored ``exec_par/day_convention`` version, or ``None`` when never written."""
+        self._require_held()
+        with self._mutex:
+            raw = self._store.get(DAY_CONVENTION_KEY)
+            if raw is None:
+                return None
+            try:
+                return decode_day_convention(raw)
+            except ExecParRecordError:
+                raise self.CorruptError() from None
+
+    def write_day_convention(self) -> bool:
+        """Write ``{"v": 2}`` once: ``True`` if newly written, ``False`` for the identical row;
+        any other stored row raises (the boot check refuses K>1 on it before this is reached)."""
+        self._require_held()
+        raw = encode_day_convention()
+        with self._mutex:
+            existing = self._store.get(DAY_CONVENTION_KEY)
+            if existing is not None:
+                if existing == raw:
+                    return False
+                raise ValueError("conflicting EXEC-PAR day_convention row already stored")
+            self._store.set(DAY_CONVENTION_KEY, raw)
+            return True
 
     # -- stamp, liveness, reconcile phase, report -------------------------
 

@@ -50,6 +50,7 @@ from breezy.runtime.submit_intent import (
     open_submit_intent_latch,
 )
 from breezy.runtime.submit_intent_slots import BreakerRecord, parse_breaker
+from tests.unit.exec_par_days import UtcDays
 
 P = EXEC_PAR_PREFIX
 NS = 1_000_000_000
@@ -65,8 +66,7 @@ def ns_of(day: str) -> int:
     return int(dt.datetime.fromisoformat(day).replace(tzinfo=dt.UTC).timestamp()) * NS
 
 
-def day_of_ns(ns: int) -> str:
-    return dt.datetime.fromtimestamp(ns // NS, dt.UTC).date().isoformat()
+GOV = UtcDays()
 
 
 class _Store:
@@ -236,8 +236,7 @@ def make_rig(
             counters_expected=lambda day: False,
             predicates=_Preds(),
             serial_baseline=lambda: None,
-            today_of=day_of_ns,
-            day_of_ns=day_of_ns,
+            governed=GOV,
             configured_k=2,
             effective_k=lambda: 2,
             boot_ns=BOOT_NS,
@@ -889,7 +888,16 @@ async def test_real_evaluator_stop_on_a_day_loss_runs_the_full_ordered_response(
         order_id = "O-1"
         rig.latch.write_order_anchor(
             OrderAnchor(
-                order_id, "slug", d(1), ns_of(d(1)), "0.40", "10", "4", ns_of(d(1)), "event_time"
+                order_id,
+                "slug",
+                d(1),
+                ns_of(d(1)),
+                "0.40",
+                "10",
+                "4",
+                ns_of(d(1)),
+                "event_time",
+                "STN",
             )
         )
         rig.latch.write_fill(
@@ -905,6 +913,7 @@ async def test_real_evaluator_stop_on_a_day_loss_runs_the_full_ordered_response(
                 "0.17",
                 "0.17",
                 "0.0695",
+                "STN",
             )
         )
         rig.sources.counts[d(1)] = DayCounts(1, 0, 1, Decimal(4))

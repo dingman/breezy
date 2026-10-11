@@ -58,18 +58,20 @@ def _open(tmp_path: Path) -> Iterator[tuple[SubmitIntentLatch, _Store]]:
 
 
 def _anchor(coid: str, notional: str = "4", day: str = DAY) -> OrderAnchor:
-    return OrderAnchor(coid, "slug", day, 100, "0.40", "10", notional, 100, "event_time")
+    return OrderAnchor(coid, "slug", day, 100, "0.40", "10", notional, 100, "event_time", "STN")
 
 
 def _fill(trade: str, coid: str, day: str = DAY) -> FillRow:
-    return FillRow(trade, coid, day, 100, "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695")
+    return FillRow(
+        trade, coid, day, 100, "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695", "STN"
+    )
 
 
 def _seed(latch: SubmitIntentLatch) -> None:
     latch.write_order_anchor(_anchor("O-1", "4"))
     latch.write_order_anchor(_anchor("O-2", "2.5"))
     latch.write_order_anchor(_anchor("O-3", "1", day="2026-12-01"))
-    latch.write_ambiguous(AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6))
+    latch.write_ambiguous(AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6, "STN"))
     latch.write_fill(_fill("T-1", "O-1"))
     latch.write_fill(_fill("T-2", "O-1"))  # partial fills of one order count once
 

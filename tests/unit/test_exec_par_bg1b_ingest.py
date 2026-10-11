@@ -74,7 +74,7 @@ def _day_of(slug: str, ns: int) -> str:
 
 
 def _ingest(latch: SubmitIntentLatch, **kw: Any) -> ExecParCounterIngest:
-    kw.setdefault("climate_day_of", _day_of)
+    kw.setdefault("entry_day", _day_of)
     kw.setdefault("theta_of", lambda ts: THETA)
     return ExecParCounterIngest(store=latch, **kw)
 
@@ -160,10 +160,10 @@ def test_missing_arm_time_qty_or_day_is_a_typed_failure(tmp_path: Path) -> None:
             with pytest.raises(CounterAttributionError):
                 ing.record_posted(**args)
         for bad_day in (None, "", 5):
-            broken = _ingest(latch, climate_day_of=lambda s, n, d=bad_day: d)
+            broken = _ingest(latch, entry_day=lambda s, n, d=bad_day: d)
             with pytest.raises(CounterAttributionError):
                 _post(broken)
-        raising = _ingest(latch, climate_day_of=lambda s, n: (_ for _ in ()).throw(KeyError(s)))
+        raising = _ingest(latch, entry_day=lambda s, n: (_ for _ in ()).throw(KeyError(s)))
         with pytest.raises(CounterAttributionError):
             _post(raising)
         assert latch.read_order_anchors(DAY) == ()

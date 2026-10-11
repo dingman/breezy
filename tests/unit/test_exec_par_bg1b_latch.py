@@ -55,11 +55,13 @@ def _open(store: _Store, tmp_path: Path) -> Iterator[SubmitIntentLatch]:
 
 
 def _anchor(coid: str = "O-1", day: str = DAY, ask: str = "0.40") -> OrderAnchor:
-    return OrderAnchor(coid, "slug-a", day, 100, ask, "10", "4.00", 100, "event_time")
+    return OrderAnchor(coid, "slug-a", day, 100, ask, "10", "4.00", 100, "event_time", "STN")
 
 
 def _fill(trade: str = "TR-1", coid: str = "O-1", day: str = DAY) -> FillRow:
-    return FillRow(trade, coid, day, 100, "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695")
+    return FillRow(
+        trade, coid, day, 100, "10", "0.41", "0.40", "0.01", "0.17", "0.168", "0.0695", "STN"
+    )
 
 
 def test_anchor_is_exclusive_idempotent_and_keyed_by_client_order_id(tmp_path: Path) -> None:
@@ -89,8 +91,8 @@ def test_readers_filter_by_day_and_are_scan_based(tmp_path: Path) -> None:
 
 def test_denial_ambiguous_fill_rows_round_trip_by_day(tmp_path: Path) -> None:
     with _open(_Store(), tmp_path) as latch:
-        d = DenialRow("O-2", "k-full", DAY, 5)
-        a = AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6)
+        d = DenialRow("O-2", "k-full", DAY, 5, "STN")
+        a = AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6, "STN")
         f = _fill()
         assert latch.write_denial(d) and latch.write_ambiguous(a) and latch.write_fill(f)
         assert not latch.write_denial(d)
@@ -138,8 +140,8 @@ def test_per_day_rows_are_keyed_by_day_so_reads_are_prefix_scoped(tmp_path: Path
     store = _Store()
     with _open(store, tmp_path) as latch:
         latch.write_fill(_fill())
-        latch.write_denial(DenialRow("O-2", "k-full", DAY, 5))
-        latch.write_ambiguous(AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6))
+        latch.write_denial(DenialRow("O-2", "k-full", DAY, 5, "STN"))
+        latch.write_ambiguous(AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6, "STN"))
         latch.write_open_cost_flag(OpenCostFlag("NYC@" + DAY, DAY, True, 1))
         latch.write_order_anchor(_anchor())
     assert f"{P}fill/{DAY}/TR-1" in store.data

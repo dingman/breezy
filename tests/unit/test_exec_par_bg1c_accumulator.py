@@ -43,12 +43,12 @@ class DurableFillRecord:
 
 
 def settled_pnl_by_day(
-    entries: Any, outcomes: Any, day_of_ns: Any, today: str = "2026-10-12"
+    entries: Any, outcomes: Any, entry_day: Any, today: str = "2026-10-12"
 ) -> dict[str, SettledPnlDay]:
-    return mod.settled_pnl_by_day(entries, outcomes, day_of_ns, today=today)
+    return mod.settled_pnl_by_day(entries, outcomes, entry_day, today=today)
 
 
-def utc_day(ns: int) -> str:
+def utc_day(station: str, ns: int) -> str:
     return dt.datetime.fromtimestamp(ns / NS, tz=dt.UTC).strftime("%Y-%m-%d")
 
 
@@ -84,7 +84,9 @@ def fill(
 def entry(
     day: str = "2026-10-12", f: DurableFillRecord | None = None, ambiguous: bool = False
 ) -> EntryInput:
-    return EntryInput(arm_ns=at(day), fill=f or fill(), ambiguous_unresolved=ambiguous)
+    return EntryInput(
+        station="STN", arm_ns=at(day), fill=f or fill(), ambiguous_unresolved=ambiguous
+    )
 
 
 def test_win_pays_one_per_contract_net_of_cost_and_fee() -> None:
@@ -113,13 +115,17 @@ def test_unresolved_ambiguous_is_full_cost_loss_even_if_the_outcome_wins() -> No
 
 def test_unresolved_ambiguous_without_a_fill_uses_declared_cost() -> None:
     e = EntryInput(
-        arm_ns=at("2026-10-12"), fill=None, ambiguous_unresolved=True, ambiguous_cost=D("5")
+        station="STN",
+        arm_ns=at("2026-10-12"),
+        fill=None,
+        ambiguous_unresolved=True,
+        ambiguous_cost=D("5"),
     )
     assert settled_pnl_by_day([e], {}, utc_day)["2026-10-12"].pnl_decimal == D("-5")
 
 
 def test_unresolved_ambiguous_without_any_cost_fails() -> None:
-    e = EntryInput(arm_ns=at("2026-10-12"), fill=None, ambiguous_unresolved=True)
+    e = EntryInput(station="STN", arm_ns=at("2026-10-12"), fill=None, ambiguous_unresolved=True)
     with pytest.raises(SettledPnlInputError):
         settled_pnl_by_day([e], {}, utc_day)
 
@@ -131,9 +137,11 @@ def test_resolved_ambiguous_is_scored_as_an_ordinary_fill() -> None:
 
 def test_attribution_is_by_arm_time_across_a_day_boundary() -> None:
     late_arm = EntryInput(
-        arm_ns=at("2026-10-12", 23) + 59 * 60 * NS, fill=fill("A", ts_event=at("2026-10-13"))
+        station="STN",
+        arm_ns=at("2026-10-12", 23) + 59 * 60 * NS,
+        fill=fill("A", ts_event=at("2026-10-13")),
     )
-    early_next = EntryInput(arm_ns=at("2026-10-13", 0), fill=fill("B"))
+    early_next = EntryInput(station="STN", arm_ns=at("2026-10-13", 0), fill=fill("B"))
     out = settled_pnl_by_day([late_arm, early_next], {"A": False, "B": False}, utc_day)
     assert set(out) == {"2026-10-12", "2026-10-13"}
     assert out["2026-10-12"].pnl_decimal == D("-9.2")
@@ -141,7 +149,7 @@ def test_attribution_is_by_arm_time_across_a_day_boundary() -> None:
 
 
 def test_day_is_never_taken_from_fill_time() -> None:
-    e = EntryInput(arm_ns=at("2026-10-12"), fill=fill(ts_event=at("2026-10-20")))
+    e = EntryInput(station="STN", arm_ns=at("2026-10-12"), fill=fill(ts_event=at("2026-10-20")))
     assert set(settled_pnl_by_day([e], {"A": True}, utc_day)) == {"2026-10-12"}
 
 
@@ -171,7 +179,7 @@ def test_none_money_fails_never_zero() -> None:
         ts_event = 1
 
     bare: Any = Bare()
-    e = EntryInput(arm_ns=at("2026-10-12"), fill=bare)
+    e = EntryInput(station="STN", arm_ns=at("2026-10-12"), fill=bare)
     with pytest.raises(SettledPnlInputError):
         settled_pnl_by_day([e], {"A": True}, utc_day)
 
@@ -184,12 +192,16 @@ def test_none_outcome_for_a_listed_instrument_fails() -> None:
 @pytest.mark.parametrize("arm", [0, -1, True, 1.5])
 def test_bad_arm_time_fails(arm: Any) -> None:
     with pytest.raises(SettledPnlInputError):
-        settled_pnl_by_day([EntryInput(arm_ns=arm, fill=fill())], {"A": True}, utc_day)
+        settled_pnl_by_day(
+            [EntryInput(station="STN", arm_ns=arm, fill=fill())], {"A": True}, utc_day
+        )
 
 
 def test_missing_fill_for_a_non_ambiguous_entry_fails() -> None:
     with pytest.raises(SettledPnlInputError):
-        settled_pnl_by_day([EntryInput(arm_ns=at("2026-10-12"), fill=None)], {}, utc_day)
+        settled_pnl_by_day(
+            [EntryInput(station="STN", arm_ns=at("2026-10-12"), fill=None)], {}, utc_day
+        )
 
 
 def test_result_is_deterministic_and_order_independent() -> None:

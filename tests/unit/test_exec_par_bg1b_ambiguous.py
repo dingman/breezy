@@ -64,7 +64,7 @@ def _latch(tmp_path: Path, store: _Store, boot_ns: int = ARM) -> Iterator[Submit
 def _ingest(latch: SubmitIntentLatch) -> ExecParCounterIngest:
     return ExecParCounterIngest(
         store=latch,
-        climate_day_of=lambda slug, ns: DAY,
+        entry_day=lambda slug, ns: DAY,
         theta_of=lambda ts: Decimal("0.0695"),
     )
 
@@ -275,7 +275,7 @@ def test_one_failing_mark_does_not_lose_the_ones_already_written(tmp_path: Path)
         no_slug = latch.arm_slot("b" * 64, slug="other-slug", is_exit=False, now_ns=ARM)
         failing = ExecParCounterIngest(
             store=latch,
-            climate_day_of=lambda slug, ns: (
+            entry_day=lambda slug, ns: (
                 (_ for _ in ()).throw(KeyError(slug)) if slug == "other-slug" else DAY
             ),
             theta_of=lambda ts: Decimal("0.0695"),

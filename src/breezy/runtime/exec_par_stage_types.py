@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from types import MappingProxyType
 from typing import Final, Protocol
 
+from breezy.runtime.exec_par_days_port import DayConvention
 from breezy.runtime.exec_par_reconcile import PassStatus
 from breezy.runtime.exec_par_records import (
     EpochRow,
@@ -44,6 +45,9 @@ MIN_FILL_DAYS: Final[int] = 5  # s1 table: climate days with >=1 entry fill
 CLEANUP_HOLD_DAYS: Final[int] = 30  # M5
 MAX_EXCLUDED_DAYS: Final[int] = 2  # 10a cap
 TRAILING_DAYS: Final[int] = 5  # s6, s9 windows
+#: A5: an entry's day may lead ``today`` (the earliest open day) by at most this many days; an
+#: entry further ahead is a convention or clock fault, reported as ``counter_missing``.
+MAX_OPEN_DAYS_AHEAD: Final[int] = 2
 
 S6_SHARE_LIMIT: Final[Decimal] = Decimal("0.30")
 S9_MIN_FLAG_DAYS: Final[int] = 2
@@ -174,6 +178,9 @@ class DayCounters:
     ``denied_counted`` is the s6 numerator (OpenExposureBoundExceeded, K-full, cool-off,
     throttle, free balance, BG-11 pre-filter WAITs; breaker and stale excluded). It may be
     ``None`` before S3 (K7).
+
+    ``pre_floor_unknown`` marks a FLOOR-day stub whose counts cannot be split into pre-floor and
+    post-floor entries (A4): the evaluator FAILs on it, never counts or drops it silently.
     """
 
     day: str
@@ -183,6 +190,7 @@ class DayCounters:
     fills: tuple[FillRow, ...] | None
     open_flags: tuple[OpenCostFlag, ...] | None
     windows: tuple[WindowPeak, ...] | None
+    pre_floor_unknown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,10 +205,18 @@ class DayPnl:
 class StageSnapshot:
     """Everything one pass reads. The caller (loop thread) builds it from the BG-1 ports.
 
-    ``days`` carries the counters of every non-excluded stage day plus ``today`` (when it is
-    strictly after the floor day), and, for s15-cumulative, of every day from the first K>1
-    boot through the floor day (their ``posted`` decides whether a settled-P&L row is
-    required). Other days are ignored. ``pnl_days`` lists every day with a settled-P&L row (and
+    Days are per-station standard-time labels (``governed.entry_day``, BG-5c R1). ``today`` is
+    the EARLIEST still-open label (``governed.today``): a station further east may already be on
+    a later label, whose data is OPEN data (A5).
+
+    ``days`` carries the WHOLE-DAY counters of every label from the first K>1 boot (or the floor)
+    through the latest open label, and, for s15-cumulative, of every day from the first K>1
+    boot through the floor days (their ``posted`` decides whether a settled-P&L row is
+    required). ``floor_stubs`` holds, for each station's floor-day label
+    (``open_days_at(floor.ts)``), the counters of ONLY the entries armed at or after ``floor.ts``
+    (A4); a floor label with no stub is read as an empty stub only when its whole-day counters are
+    empty, else the stage FAILs
+    (``pre_floor_unknown``). ``pnl_days`` lists every day with a settled-P&L row (and
     ``None`` readings for expected-but-unreadable rows) since the first K>1 boot, for
     s15-cumulative. ``gappy_days`` and ``pending_rebuild_days`` are the still-unreconciled
     days after the BG-1d pass whose ``pass_status`` is given. ``looks`` are the recorded
@@ -223,8 +239,9 @@ class StageSnapshot:
     stop_verdicts: tuple[StopVerdict, ...]
     serial_baseline: SerialBaseline | None
     unattributed_ambiguous: int | None
-    day_of_ns: Callable[[int], str]
+    governed: DayConvention
     predicates: PnlPredicatePort
+    floor_stubs: tuple[DayCounters, ...] = ()
 
 
 # -- public output types ---------------------------------------------------------
@@ -402,15 +419,26 @@ def check_count(value: object) -> int:
 
 @dataclass(frozen=True, slots=True)
 class StageContext:
+    """``by_day`` is the STAGE view (a floor label holds its post-floor stub); ``whole_day`` is the
+    whole-day counters, used only where the data is never floored (settled-P&L row requirements,
+    s15-cumulative). ``floor_days`` are the stations' floor labels (``floor_day`` is the earliest,
+    ``floor_last`` the latest); ``open_days`` are the open labels (``today`` and any later label
+    with data, A5) and ``horizon`` is the last label the cumulative stop reads."""
+
     snap: StageSnapshot
     floor: StageReset
     floor_day: str
+    floor_last: str
+    floor_days: frozenset[str]
     today: str
+    horizon: str
     closed: tuple[str, ...]
     eligible: tuple[str, ...]
     live: tuple[str, ...]
+    open_days: tuple[str, ...]
     excluded_in_stage: tuple[str, ...]
     by_day: Mapping[str, DayCounters]
+    whole_day: Mapping[str, DayCounters]
     pnl: Mapping[str, SettledPnlReading | None]
     first_k_day: str
     stage_k: int

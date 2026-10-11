@@ -11,10 +11,11 @@ writer, and no ingest pipeline is invented.
 
 **How BG-5 calls it** (on the daily pass, after settlement ingest)::
 
-    entries  = [EntryInput(arm_ns=slot.created_ns, fill=record, ambiguous_unresolved=...)
+    entries  = [EntryInput(arm_ns=slot.created_ns, station=..., fill=record,
+                           ambiguous_unresolved=...)
                 for each entry slot joined to its DurableFillRecord]   # entries only
     outcomes = {instrument_id: held_side_won}   # CLI-final; absent = not settled yet
-    rows     = settled_pnl_by_day(entries, outcomes, day_of_ns)        # day of ARM time
+    rows     = settled_pnl_by_day(entries, outcomes, governed.entry_day, today=...)  # ARM day
     persist_settled_pnl(latch, rows)                                   # ExecParStorePort
     # consumers read via latch.read_settled_pnl_day(d) and settled_pnl_or_fail(...)
 
@@ -108,6 +109,8 @@ class FillLike(Protocol):
 class EntryInput:
     """One ENTRY: ``arm_ns`` is the ``arm_slot`` ``created_ns``; exits are not entries.
 
+    ``station`` is the entry's own station: its day is ``entry_day(station, arm_ns)`` (BG-5c R1).
+
     ``fill.instrument_id`` is looked up in the caller's ``outcomes`` map, which must hold the
     HELD-SIDE outcome for that instrument: for a NO instrument the caller flips the YES
     sibling's resolution (YES resolved NO => the NO instrument won). This module never
@@ -118,6 +121,7 @@ class EntryInput:
     """
 
     arm_ns: int
+    station: str
     fill: FillLike | None
     ambiguous_unresolved: bool = False
     ambiguous_cost: Decimal | None = None
@@ -201,7 +205,7 @@ def _contribution(
 def settled_pnl_by_day(
     entries: Iterable[EntryInput],
     outcomes: Mapping[str, bool | None],
-    day_of_ns: Callable[[int], str],
+    entry_day: Callable[[str, int], str],
     *,
     today: str,
 ) -> dict[str, SettledPnlDay]:
@@ -214,7 +218,8 @@ def settled_pnl_by_day(
     entry whose instrument has no outcome yet is PENDING (counted, not summed) until its
     arm-day is ``SETTLEMENT_DEADLINE_DAYS`` old relative to ``today`` (ISO date), then
     OVERDUE: a full-cost loss.
-    The day is ``day_of_ns(arm_ns)`` only, never fill or settlement time. Pure and
+    The day is ``entry_day(station, arm_ns)`` only (the entry's own station, standard time),
+    never fill or settlement time. Pure and
     order-independent (exact decimal arithmetic).
     """
     try:
@@ -228,11 +233,13 @@ def settled_pnl_by_day(
             arm = entry.arm_ns
             if isinstance(arm, bool) or not isinstance(arm, int) or arm <= 0:
                 raise SettledPnlInputError("arm time must be a positive int")
-            arm_day = day_of_ns(arm)
+            if not isinstance(entry.station, str) or not entry.station:
+                raise SettledPnlInputError("entry has no station")
+            arm_day = entry_day(entry.station, arm)
             try:
                 age = (today_date - dt.date.fromisoformat(arm_day)).days
-            except ValueError:
-                raise SettledPnlInputError("day_of_ns returned a non-ISO day") from None
+            except (TypeError, ValueError):
+                raise SettledPnlInputError("entry_day returned a non-ISO day") from None
             _contribution(
                 entry, outcomes, days.setdefault(arm_day, _Day()), age >= SETTLEMENT_DEADLINE_DAYS
             )

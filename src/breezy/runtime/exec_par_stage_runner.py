@@ -7,8 +7,9 @@ thread. Everything runs on the loop thread (K5: inline, no executor), so the sin
 latch methods are never touched from another thread.
 
 Schedule (r4 1a "Scheduling"): a BOOT pass on the first service, then a DAILY pass on the first
-service after ``today_of(now)`` changes (``today_of`` is the earliest still-open climate day
-over the governed stations, so a change means every governed station's day has closed).
+service after ``governed.today(now)`` changes (the earliest still-open climate day over the
+governed stations, so a change means every governed station's day has closed; a station that is
+already on the next label does not trigger one, BG-5c A5).
 The settled-P&L-triggered pass of 1a is not scheduled: nothing in the node observes a
 settlement ingest (BG-1c seam); the daily pass reads whatever rows exist, and the optional
 ``refresh_settled_pnl`` hook is where that driver plugs in.
@@ -62,6 +63,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Protocol
 
+from breezy.runtime.exec_par_days_port import DayConvention
 from breezy.runtime.exec_par_reconcile import (
     RECONCILE_BOUND_NS,
     CounterStorePort,
@@ -162,8 +164,9 @@ class StageEvalStore(SnapshotReads, Protocol):
 class StageEvalPorts:
     """Every injected dependency of a pass (K6: reads, predicates and the clock are injected).
 
-    ``today_of`` maps a timestamp to the EARLIEST still-open climate day over the governed
-    stations; ``day_of_ns`` is the climate-day label function the counters use (I2).
+    ``governed`` is the one day convention (BG-5c R1): ``governed.today(ts)`` is the EARLIEST
+    still-open climate day over the governed stations and ``governed.entry_day(station, arm_ns)``
+    is the label every counter, reconcile and settled-P&L path attributes by (I2).
     ``await_ready`` (optional) is awaited before the reconcile (the boot pass waits here for the
     Nautilus mass-status ingest, spec 10a); ``refresh_settled_pnl`` (optional) is awaited before
     the snapshot (the BG-1c accumulator driver after a settlement ingest).
@@ -176,8 +179,7 @@ class StageEvalPorts:
     counters_expected: Callable[[str], bool]
     predicates: PnlPredicatePort
     serial_baseline: Callable[[], SerialBaseline | None]
-    today_of: Callable[[int], str]
-    day_of_ns: Callable[[int], str]
+    governed: DayConvention
     configured_k: int
     effective_k: Callable[[], int]
     boot_ns: int
@@ -314,7 +316,7 @@ class StageEvaluator:
         task = self._task
         if task is not None and not task.done():
             return
-        today = self._ports.today_of(now_ns)
+        today = self._ports.governed.today(now_ns)
         if self._boot_started and today == self._last_attempt_today and not self._settled_dirty:
             return
         self._settled_dirty = False
@@ -471,11 +473,13 @@ class StageEvaluator:
     def _reconcile(self, today: str) -> PassResult:
         ports = self._ports
         try:
+            through = max({today, *ports.governed.open_days_at(ports.wall_ns())})
             labels = stage_day_labels(
                 ports.store.read_stage_reset(),
                 ports.store.read_epoch_rows(),
-                ports.day_of_ns,
+                ports.governed,
                 today,
+                through,
             )
             result = run_reconcile_pass(
                 labels,
@@ -515,7 +519,7 @@ class StageEvaluator:
                     configured_k=ports.configured_k,
                     effective_k=ports.effective_k(),
                     pass_status=status,
-                    day_of_ns=ports.day_of_ns,
+                    governed=ports.governed,
                     predicates=ports.predicates,
                     serial_baseline=ports.serial_baseline(),
                     counted_denial=ports.counted_denial,

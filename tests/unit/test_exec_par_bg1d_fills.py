@@ -26,8 +26,12 @@ def _utc_day(ns: int) -> str:
     return datetime.fromtimestamp(ns // S, UTC).date().isoformat()
 
 
+def _entry_day(station: str, ns: int) -> str:
+    return _utc_day(ns)
+
+
 def _buy(order_id: str, arm_ns: int | None) -> FillRecord:
-    return FillRecord(order_id=order_id, side="BUY", arm_ns=arm_ns)
+    return FillRecord(order_id=order_id, side="BUY", arm_ns=arm_ns, station="STN")
 
 
 def _sell(order_id: str) -> FillRecord:
@@ -35,7 +39,7 @@ def _sell(order_id: str) -> FillRecord:
 
 
 def test_exit_only_day_has_no_entry_fills_and_is_not_excluded() -> None:
-    counts = entry_fills_by_day([_sell("x1"), _sell("x2")], day_of=_utc_day)
+    counts = entry_fills_by_day([_sell("x1"), _sell("x2")], entry_day=_entry_day)
     assert counts == {}
     verdict = reconcile_day(
         "2024-10-04",
@@ -53,47 +57,52 @@ def test_exit_only_day_has_no_entry_fills_and_is_not_excluded() -> None:
 
 def test_fill_after_midnight_is_attributed_to_its_arm_day() -> None:
     arm = D0 + 23 * H + 59 * 60 * S  # armed 23:59Z; the fill lands after midnight
-    counts = entry_fills_by_day([_buy("o1", arm)], day_of=_utc_day)
+    counts = entry_fills_by_day([_buy("o1", arm)], entry_day=_entry_day)
     assert counts == {"2024-10-04": 1}
 
 
 def test_repeated_partial_fills_of_one_order_count_once() -> None:
     records = [_buy("o1", D0 + H), _buy("o1", D0 + H), _buy("o1", D0 + H), _buy("o2", D0 + 2 * H)]
-    assert entry_fills_by_day(records, day_of=_utc_day) == {"2024-10-04": 2}
+    assert entry_fills_by_day(records, entry_day=_entry_day) == {"2024-10-04": 2}
 
 
 def test_sell_records_never_count_even_with_an_arm_time() -> None:
     records = [FillRecord(order_id="o9", side="SELL", arm_ns=D0), _buy("o1", D0)]
-    assert entry_fills_by_day(records, day_of=_utc_day) == {"2024-10-04": 1}
+    assert entry_fills_by_day(records, entry_day=_entry_day) == {"2024-10-04": 1}
 
 
 def test_entry_fill_without_arm_time_is_unattributable() -> None:
     with pytest.raises(UnattributableFill):
-        entry_fills_by_day([_buy("o1", None)], day_of=_utc_day)
+        entry_fills_by_day([_buy("o1", None)], entry_day=_entry_day)
 
 
 def test_same_order_with_two_arm_days_is_unattributable() -> None:
     with pytest.raises(UnattributableFill):
-        entry_fills_by_day([_buy("o1", D0), _buy("o1", D0 + DAY)], day_of=_utc_day)
+        entry_fills_by_day([_buy("o1", D0), _buy("o1", D0 + DAY)], entry_day=_entry_day)
 
 
 def test_unknown_side_is_unattributable() -> None:
     with pytest.raises(UnattributableFill):
-        entry_fills_by_day([FillRecord(order_id="o1", side="HOLD", arm_ns=D0)], day_of=_utc_day)
+        entry_fills_by_day(
+            [FillRecord(order_id="o1", side="HOLD", arm_ns=D0, station="STN")], entry_day=_entry_day
+        )
 
 
 def test_no_instrument_buy_fill_counts_as_an_entry() -> None:
     # A NO-side entry is Nautilus BUY on the NO instrument (the wire shows
     # SELL/BUY_SHORT, which must never be consulted).
-    record = FillRecord(order_id="no1", side="BUY", arm_ns=D0 + H)
-    assert entry_fills_by_day([record], day_of=_utc_day) == {"2024-10-04": 1}
+    record = FillRecord(order_id="no1", side="BUY", arm_ns=D0 + H, station="STN")
+    assert entry_fills_by_day([record], entry_day=_entry_day) == {"2024-10-04": 1}
 
 
 def test_slot_is_exit_flag_is_preferred_over_side() -> None:
-    exit_fill = FillRecord(order_id="e1", side="BUY", arm_ns=D0, is_exit=True)
-    entry_fill = FillRecord(order_id="n1", side="BUY", arm_ns=D0, is_exit=False)
-    assert entry_fills_by_day([exit_fill, entry_fill], day_of=_utc_day) == {"2024-10-04": 1}
+    exit_fill = FillRecord(order_id="e1", side="BUY", arm_ns=D0, station="STN", is_exit=True)
+    entry_fill = FillRecord(order_id="n1", side="BUY", arm_ns=D0, station="STN", is_exit=False)
+    assert entry_fills_by_day([exit_fill, entry_fill], entry_day=_entry_day) == {"2024-10-04": 1}
 
 
 def test_fill_record_has_no_wire_or_leg_fields() -> None:
-    assert set(FillRecord.__dataclass_fields__) == {"order_id", "side", "arm_ns", "is_exit"}
+    fields = set(FillRecord.__dataclass_fields__)
+    # BG-5c R1 adds ``station`` (the entry's own station, for ``entry_day``); still no wire or leg.
+    assert fields == {"order_id", "side", "arm_ns", "station", "is_exit"}
+    assert not any(name.startswith("wire") or "leg" in name for name in fields)

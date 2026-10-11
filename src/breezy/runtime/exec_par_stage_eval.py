@@ -16,15 +16,25 @@ which dominates every STOP and carries the halt reason). Unexpected
 exceptions are not caught here: the wiring maps them to
 ``stage_eval_fail:<kind>``.
 
-Day model. A "climate day" is the ISO label the BG-1 counters use (arm time,
-I2). ``floor_day = day_of_ns(floor.ts)``; the stage covers the days strictly
-after it (a day cannot be split, and a stop computed on pre-floor data must
-not re-trip). *Closed* days are ``floor_day < d < today``; the open ``today``
-joins the closed days only for the P&L stops and the fee checks (s7, s15),
-which act on the first pass after the data lands. Promotion looks, the cap, the
-minima, s6 and s9 use closed days. Excluded days are skipped by every window,
-so a trailing window of 5 reaches further back past them; they count toward
-the 15-day cap and, for s15-cumulative, their settled P&L still counts.
+Day model (BG-5c R1, A4, A5). A "climate day" is the ISO label of an entry's ARM time under its
+OWN station's standard time (``snap.governed.entry_day``); stations roll over at different
+instants, so ``today`` is the EARLIEST still-open label and a label after it is OPEN data.
+
+* *Floor (A4).* Each station's floor day is ``entry_day(station, floor.ts)``; ``floor_days =
+  open_days_at(floor.ts)``. A floor label's stage counters are its post-floor STUB (only entries
+  armed at or after ``floor.ts``), supplied in ``snap.floor_stubs``; the stub is a stage day and
+  obeys the same rules, so a pre-floor loss can never re-trip a stop. A stub that cannot split
+  pre- from post-floor entries FAILs (``pre_floor_unknown``); a floor label with no stub is an
+  empty stub only when its whole-day counters are empty. Every other label uses whole-day
+  counters. The floor labels' settled-P&L rows are WHOLE-day (they carry pre-floor entries), so
+  s15-day and s15-stage skip them; s15-cumulative, never floored, reads them.
+* *Closed* days are ``floor_day <= d < today``. *Open* days are ``today`` and any later label that
+  carries data (A5), up to ``MAX_OPEN_DAYS_AHEAD`` ahead; an entry further ahead is
+  ``counter_missing``. Open days join the closed days for the halt rules that act on the first
+  pass after data lands (s7 fees, s15-day, s15-stage, s15-cumulative); the look minima, the
+  trailing windows (s6, s9), the cap and the daily trigger use closed days only.
+* Excluded days are skipped by every window, so a trailing window of 5 reaches further back past
+  them; they count toward the 15-day cap and, for s15-cumulative, their settled P&L still counts.
 
 Stop reasons for the intraday rules (s5 Clopper-Pearson, burst, s9 station-day
 0.25) are exported as constants only: BG-6 evaluates those.
@@ -33,11 +43,13 @@ Stop reasons for the intraday rules (s5 Clopper-Pearson, burst, s9 station-day
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from itertools import pairwise
 
 from breezy.runtime.exec_par_reconcile import PassStatus
+from breezy.runtime.exec_par_records import ExcludedDay
 from breezy.runtime.exec_par_settled_pnl import SettledPnlReading
 from breezy.runtime.exec_par_stage_fees import (
     ParsedFill,
@@ -67,6 +79,7 @@ from breezy.runtime.exec_par_stage_types import (
     HOLD_LOOK_NOT_TAKEN,
     HOLD_LOOK_WINDOW_CLOSED,
     MAX_EXCLUDED_DAYS,
+    MAX_OPEN_DAYS_AHEAD,
     MIN_FILL_DAYS,
     MIN_NONEXCLUDED_DAYS,
     MIN_POSTED_ORDERS,
@@ -160,10 +173,6 @@ __all__ = [
 ]
 
 
-def _day_label(snap: StageSnapshot, ns: int) -> str:
-    return snap.day_of_ns(ns)
-
-
 def _validate_k(snap: StageSnapshot) -> None:
     k, eff = snap.configured_k, snap.effective_k
     ints = all(isinstance(v, int) and not isinstance(v, bool) for v in (k, eff))
@@ -171,12 +180,23 @@ def _validate_k(snap: StageSnapshot) -> None:
         raise fail("invalid_k")
 
 
+def _open_days_at(snap: StageSnapshot, ts_ns: int) -> frozenset[str]:
+    """Instant-only lookup (boot, floor): every governed station's open day at ``ts_ns``.
+
+    An exception from the injected convention is not caught here: ``evaluate_stage`` maps it to
+    the named last-resort ``stage_eval_fail:internal:<type>`` (no message)."""
+    days = snap.governed.open_days_at(ts_ns)
+    if not days:
+        raise fail("bad_day")
+    return days
+
+
 def _first_k_gt1_day(snap: StageSnapshot) -> str:
     if any(later.boot_ts <= earlier.boot_ts for earlier, later in pairwise(snap.epochs)):
         raise fail("non_monotonic")
     for epoch in snap.epochs:
         if epoch.effective_k > 1:
-            return _day_label(snap, epoch.boot_ts)
+            return min(_open_days_at(snap, epoch.boot_ts))
     return snap.today  # forced to K=1 from its first boot: legitimately serial, cumulative empty
 
 
@@ -186,11 +206,46 @@ def _span(after: dt.date, before: dt.date) -> tuple[str, ...]:
     return tuple((after + dt.timedelta(days=i)).isoformat() for i in range(1, count + 1))
 
 
+def _is_empty(row: DayCounters) -> bool:
+    """No entry at all (a ``None`` count is NOT empty: it is unknown)."""
+    return row.posted == 0 and row.ambiguous == 0 and not row.fills
+
+
+def _stage_view(
+    floor_days: frozenset[str],
+    whole: Mapping[str, DayCounters],
+    stubs: Mapping[str, DayCounters],
+) -> dict[str, DayCounters]:
+    """Whole-day counters, with each floor label replaced by its post-floor stub (A4)."""
+    view = dict(whole)
+    for label in floor_days:
+        stub = stubs.get(label)
+        row = whole.get(label)
+        if stub is not None:
+            view[label] = stub
+        elif row is not None:
+            # No stub: whole-day counters are trustworthy as post-floor only if empty.
+            view[label] = row if _is_empty(row) else replace(row, pre_floor_unknown=True)
+    return view
+
+
+def _counter_missing_ahead(rows: tuple[DayCounters, ...], today: dt.date) -> None:
+    """A5: an entry further than ``MAX_OPEN_DAYS_AHEAD`` days after ``today`` has no counter row
+    in any window the evaluator reads, so it is ``counter_missing``."""
+    limit = today + dt.timedelta(days=MAX_OPEN_DAYS_AHEAD)
+    for row in rows:
+        if parse_day(row.day) > limit and not _is_empty(row):
+            raise fail("counter_missing")
+
+
 def _build_ctx(snap: StageSnapshot) -> StageContext:
     if snap.floor is None:
         raise fail("floor_missing")
     today = parse_day(snap.today)
-    floor_day = _day_label(snap, snap.floor.ts)
+    floor_days = _open_days_at(snap, snap.floor.ts)
+    for label in floor_days:
+        parse_day(label)
+    floor_day, floor_last = min(floor_days), max(floor_days)
     floor_date = parse_day(floor_day)
     if today < floor_date:
         raise fail("non_monotonic")
@@ -203,18 +258,32 @@ def _build_ctx(snap: StageSnapshot) -> StageContext:
         parse_day(label)
     for look in snap.looks:
         parse_day(look.day)
-    closed = _span(floor_date, today)
-    eligible = tuple(x for x in closed if x not in excluded)
-    # The open today joins only when it is strictly after the floor day (item H1).
-    open_today = snap.today not in excluded and today > floor_date
-    live = (*eligible, snap.today) if open_today else eligible
-    in_stage = tuple(sorted(x for x in excluded if floor_day < x <= snap.today))
-    by_day: dict[str, DayCounters] = {}
+    _counter_missing_ahead(snap.days, today)
+    ahead_limit = today + dt.timedelta(days=MAX_OPEN_DAYS_AHEAD)
+    open_days = (
+        snap.today,
+        *sorted(x.day for x in snap.days if today < parse_day(x.day) <= ahead_limit),
+    )
+    stage_excluded = {
+        x.day
+        for x in snap.excluded_days
+        if x.day <= max(open_days) and _excluded_in_stage(x, snap, floor_day, floor_last)
+    }
+    closed = _span(floor_date - dt.timedelta(days=1), today)
+    eligible = tuple(x for x in closed if x not in stage_excluded)
+    live = (*eligible, *(x for x in open_days if x not in stage_excluded))
+    whole: dict[str, DayCounters] = {}
     for row in snap.days:
         parse_day(row.day)
-        if row.day in by_day:
+        if row.day in whole:
             raise fail("duplicate_day")
-        by_day[row.day] = row
+        whole[row.day] = row
+    stubs: dict[str, DayCounters] = {}
+    for row in snap.floor_stubs:
+        parse_day(row.day)
+        if row.day in stubs:
+            raise fail("duplicate_day")
+        stubs[row.day] = row
     pnl: dict[str, SettledPnlReading | None] = {}
     for entry in snap.pnl_days:
         parse_day(entry.day)
@@ -225,16 +294,48 @@ def _build_ctx(snap: StageSnapshot) -> StageContext:
         snap,
         snap.floor,
         floor_day,
+        floor_last,
+        floor_days,
         snap.today,
+        max(open_days),
         closed,
         eligible,
         live,
-        in_stage,
-        by_day,
+        open_days,
+        tuple(sorted(stage_excluded)),
+        _stage_view(floor_days, whole, stubs),
+        whole,
         pnl,
         first_k_day,
         snap.configured_k,
     )
+
+
+def _excluded_in_stage(
+    row: ExcludedDay, snap: StageSnapshot, floor_day: str, floor_last: str
+) -> bool:
+    """An exclusion belongs to this stage when its label is a stage label and, on a floor label,
+    it was recorded at or after the floor (an older one belonged to the previous stage)."""
+    if row.day < floor_day:
+        return False
+    if row.day > floor_last:
+        return True
+    return snap.floor is not None and row.ts >= snap.floor.ts
+
+
+def _fill_attribution_ok(ctx: StageContext, label: str, row: DayCounters) -> bool:
+    """Each fill row sits on ``entry_day(its station, its arm time)``, and a floor stub holds no
+    pre-floor entry (A4): a leak either way is a bad counter."""
+    gov = ctx.snap.governed
+    for fill_row in row.fills or ():
+        try:
+            if gov.entry_day(fill_row.station, fill_row.arm_ns) != label:
+                return False
+        except Exception:  # noqa: BLE001 - an unmappable row is a bad counter
+            return False
+        if label in ctx.floor_days and fill_row.arm_ns < ctx.floor.ts:
+            return False
+    return True
 
 
 def _validate_counters(ctx: StageContext) -> None:
@@ -242,6 +343,8 @@ def _validate_counters(ctx: StageContext) -> None:
         row = ctx.by_day.get(label)
         if row is None:
             raise fail("missing_day")
+        if row.pre_floor_unknown:
+            raise fail("pre_floor_unknown")
         if (
             row.posted is None
             or row.ambiguous is None
@@ -255,6 +358,8 @@ def _validate_counters(ctx: StageContext) -> None:
         if row.denied_counted is not None:
             check_count(row.denied_counted)
         if any(r.day != label for rows in (row.fills, row.open_flags, row.windows) for r in rows):
+            raise fail("bad_counter")
+        if not _fill_attribution_ok(ctx, label, row):
             raise fail("bad_counter")
         for window in row.windows:
             check_count(window.orders)
@@ -290,20 +395,21 @@ def _needs_pnl_row(row: DayCounters) -> bool:
 def _validate_cumulative_rows(ctx: StageContext, unreconciled: frozenset[str]) -> None:
     """s15-cumulative is never floored: every day since the first K>1 boot needs its row.
 
-    Covers the pre-floor days and the excluded stage days (live stage days are checked by the
-    caller). An excluded day is exempt only while it is not yet reconciled (10a): once its
-    counters reconcile it counts, so a fill or AMBIGUOUS mark with no row is a FAIL.
+    Covers the pre-floor days, the floor labels (judged on their WHOLE-day counters: the row
+    carries pre-floor entries too) and the excluded stage days (the other live stage days are
+    checked by the caller). An excluded day is exempt only while it is not yet reconciled (10a):
+    once its counters reconcile it counts, so a fill or AMBIGUOUS mark with no row is a FAIL.
     """
     first = parse_day(ctx.first_k_day)
     labels = [
         (first + dt.timedelta(days=offset)).isoformat()
-        for offset in range((parse_day(ctx.floor_day) - first).days + 1)
+        for offset in range((parse_day(ctx.floor_last) - first).days + 1)
     ]
     excluded = {x.day for x in ctx.snap.excluded_days}
     for label in (*labels, *ctx.excluded_in_stage):
         if label in excluded and label in unreconciled:
             continue
-        row = ctx.by_day.get(label)
+        row = ctx.whole_day.get(label)
         if row is None:
             raise fail("missing_day")
         if row.fills is None or row.ambiguous is None:
@@ -320,6 +426,8 @@ def _validate_pnl(ctx: StageContext) -> None:
     # BG-1c writes a row per arm day with entries (exec_par_settled_pnl.py:234-244), settled
     # or not, so today needs its row like every closed day.
     for label in ctx.live:
+        if label in ctx.floor_days:
+            continue  # judged on whole-day counters by the cumulative check below
         if _needs_pnl_row(ctx.by_day[label]) and ctx.pnl.get(label) is None:
             raise fail("settled_pnl_missing")
     _validate_cumulative_rows(ctx, unreconciled)
@@ -334,7 +442,8 @@ def _validate_pnl(ctx: StageContext) -> None:
 
 
 def _stage_looks(ctx: StageContext) -> list[LookRecord]:
-    return sorted((x for x in ctx.snap.looks if x.day > ctx.floor_day), key=lambda x: x.day)
+    # A look on a floor label may predate the reset: only labels after every floor label count.
+    return sorted((x for x in ctx.snap.looks if x.day > ctx.floor_last), key=lambda x: x.day)
 
 
 @dataclass(frozen=True, slots=True)

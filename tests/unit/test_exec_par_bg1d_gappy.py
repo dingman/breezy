@@ -26,6 +26,10 @@ def _utc_day(ns: int) -> str:
     return datetime.fromtimestamp(ns // S, UTC).date().isoformat()
 
 
+def _utc_open(ns: int) -> frozenset[str]:
+    return frozenset({_utc_day(ns)})
+
+
 def _epoch(boot: int, stop: int | None = None) -> EpochRow:
     return EpochRow(commit_sha="abc", effective_k=1, force_reason=None, boot_ts=boot, stop_ts=stop)
 
@@ -40,7 +44,7 @@ def test_recorded_outage_between_stop_and_next_boot_is_not_a_gap() -> None:
     beats = _beats(D0, D0 + 2 * H) + _beats(D0 + 10 * H, D0 + 11 * H)
     spans = compute_gap_spans((e1, e2), beats, now_ns=D0 + 11 * H)
     assert spans == ()
-    assert gappy_days(spans, day_of=_utc_day) == frozenset()
+    assert gappy_days(spans, open_days_at=_utc_open) == frozenset()
 
 
 def test_heartbeat_lapse_over_60s_while_up_is_a_gap() -> None:
@@ -50,7 +54,7 @@ def test_heartbeat_lapse_over_60s_while_up_is_a_gap() -> None:
     assert [(s.kind, s.start_ns, s.end_ns) for s in spans] == [
         (GapKind.HEARTBEAT_LAPSE, D0 + H, D0 + H + 61 * S)
     ]
-    assert gappy_days(spans, day_of=_utc_day) == frozenset({"2024-10-04"})
+    assert gappy_days(spans, open_days_at=_utc_open) == frozenset({"2024-10-04"})
 
 
 def test_lapse_of_exactly_60s_is_not_a_gap() -> None:
@@ -81,7 +85,7 @@ def test_gap_spanning_midnight_marks_every_touched_day() -> None:
     e2 = _epoch(D0 + DAY + 2 * H, None)
     beats = _beats(D0, D0 + 22 * H) + _beats(D0 + DAY + 2 * H, D0 + DAY + 3 * H)
     spans = compute_gap_spans((e1, e2), beats, now_ns=D0 + DAY + 3 * H)
-    assert gappy_days(spans, day_of=_utc_day) == frozenset({"2024-10-04", "2024-10-05"})
+    assert gappy_days(spans, open_days_at=_utc_open) == frozenset({"2024-10-04", "2024-10-05"})
 
 
 def test_unclean_epoch_without_any_heartbeat_gaps_from_its_boot() -> None:

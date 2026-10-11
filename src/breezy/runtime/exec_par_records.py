@@ -22,9 +22,12 @@ D-PREREG 1, 1b, 10, 10a, r4.1 K9, r4.3 M3, r4.4 N4):
   each recompute; pnl is a canonical decimal STRING, never a float)
 * ``force_k1``                 flag ``{reason, ts_ns, set_by}`` or, once
   cleared, the tombstone ``{cleared_ts_ns}``
+* ``day_convention``           ``{"v": 2}`` (BG-5c R1): per-station standard-time ``entry_day``;
+  written by the first K>1 boot, any other ``v`` refuses K>1
 
 BG-1b counter rows (event-sourced; the id in each key must equal the row's own
-field; ``day`` is the climate-day label of the ARM time, I2):
+field; ``day`` is the climate-day label of the ARM time, I2, and equals
+``entry_day(station, arm_ns)`` of the row's own ``station``, BG-5c R1):
 
 * ``order/<client_order_id>``  posted entry + the durable DECISION ASK
 * ``denial/<day>/<client_order_id>`` and ``ambiguous/<day>/<intent_id>``
@@ -64,6 +67,8 @@ from breezy.runtime.submit_intent_slots import SlotTableError, canonical_text
 
 __all__ = [
     "AMENDMENT_KEY_PREFIX",
+    "DAY_CONVENTION_KEY",
+    "DAY_CONVENTION_VERSION",
     "EPOCH_KEY_PREFIX",
     "EXEC_PAR_PREFIX",
     "AmbiguousRow",
@@ -94,10 +99,12 @@ __all__ = [
     "StopVerdict",
     "WindowPeak",
     "canonical_decimal",
+    "decode_day_convention",
     "decode_excluded_days",
     "decode_force_k1_flag",
     "decode_pointer",
     "decode_record",
+    "encode_day_convention",
     "encode_excluded_days",
     "encode_force_k1_tombstone",
     "encode_pointer",
@@ -110,6 +117,9 @@ EXEC_PAR_PREFIX: Final[str] = "exec/polymarket_us/exec_par/"
 EPOCH_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
 AMENDMENT_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "amendment/"
 _VERSION: Final[int] = 1
+#: ``exec_par/day_convention`` row version: 2 = per-station standard-time ``entry_day`` (BG-5c R1).
+DAY_CONVENTION_VERSION: Final[int] = 2
+DAY_CONVENTION_KEY: Final[str] = EXEC_PAR_PREFIX + "day_convention"
 
 
 class ExecParRecordError(SlotTableError):
@@ -229,6 +239,8 @@ class OrderAnchor:
     #: How ``arm_ns`` was obtained: ``slot_join`` (the armed slot, joined by coid) or
     #: ``event_time`` (the ``OrderSubmitted`` ``ts_event``; today's only route).
     attribution: str
+    #: The entry's station: ``day`` is ``entry_day(station, arm_ns)`` (BG-5c R1).
+    station: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +249,7 @@ class DenialRow:
     reason: str
     day: str
     arm_ns: int
+    station: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +266,8 @@ class AmbiguousRow:
     arm_ns: int
     attribution: str
     ts_ns: int
+    #: The mark's station, or ``unattributed`` when neither slot nor history was found.
+    station: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +285,7 @@ class FillRow:
     fee_realized: str
     fee_exact: str
     fee_theta: str
+    station: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,8 +437,15 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "notional": "str",
         "window_start_ns": "int",
         "attribution": "str",
+        "station": "str",
     },
-    DenialRow: {"client_order_id": "str", "reason": "str", "day": "str", "arm_ns": "int"},
+    DenialRow: {
+        "client_order_id": "str",
+        "reason": "str",
+        "day": "str",
+        "arm_ns": "int",
+        "station": "str",
+    },
     AmbiguousRow: {
         "intent_id": "str",
         "source": "str",
@@ -430,6 +453,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "arm_ns": "int",
         "attribution": "str",
         "ts_ns": "int",
+        "station": "str",
     },
     FillRow: {
         "trade_id": "str",
@@ -443,6 +467,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "fee_realized": "str",
         "fee_exact": "str",
         "fee_theta": "str",
+        "station": "str",
     },
     OpenCostFlag: {"station_day": "str", "day": "str", "exceeded": "bool", "ts_ns": "int"},
     WindowPeak: {
@@ -592,6 +617,29 @@ def decode_excluded_days(raw: bytes) -> tuple[ExcludedDay, ...]:
     if len({d.day for d in out}) != len(out):
         raise ExecParRecordError("excluded_days duplicate day")
     return tuple(out)
+
+
+def encode_day_convention() -> bytes:
+    """The ``exec_par/day_convention`` row: ``{"v": 2}`` (v1 was the station-less UTC-label era)."""
+    return canonical_text({"v": DAY_CONVENTION_VERSION})
+
+
+def decode_day_convention(raw: bytes) -> int:
+    """The stored convention version. Strict shape; a foreign version is RETURNED, not hidden.
+
+    The caller (the boot check) refuses K>1 on any version other than
+    :data:`DAY_CONVENTION_VERSION`.
+    """
+    try:
+        decoded: object = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise ExecParRecordError("not UTF-8 JSON") from None
+    if not isinstance(decoded, dict) or set(decoded) != {"v"}:
+        raise ExecParRecordError("day_convention shape")
+    version = decoded["v"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ExecParRecordError("day_convention version")
+    return version
 
 
 def encode_force_k1_tombstone(cleared_ts_ns: int) -> bytes:
