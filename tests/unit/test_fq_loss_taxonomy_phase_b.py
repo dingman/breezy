@@ -1,0 +1,440 @@
+"""TE-2 WP1c (RED then GREEN): the Phase B pipeline, pin coverage, boot-2 transparency, verifier.
+
+End to end over a fully synthetic tree: the Phase A world and table, a copied tmp git repo holding
+a committed predeclaration and a stub frozen family, a real durable fill store and a catalog that
+is clipped at 10-06. Nothing real is read: no real settlement, no holdout, no M1-v3, no network.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import json
+from collections import Counter
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.persistence.catalog import open_station_catalog, write_records
+from scripts.analysis import fq_v1_loss_taxonomy as cli
+from scripts.analysis.fq_loss_taxonomy_battery import DayRecord, run_battery
+from scripts.analysis.fq_loss_taxonomy_predecl import (
+    PredeclarationError,
+    load_predeclaration,
+    thresholds_block,
+    unpinned_family_modules,
+)
+from scripts.analysis.fq_loss_taxonomy_verdict import (
+    VerdictInputs,
+    VerdictLabel,
+    decide_verdict,
+    render_footer,
+)
+from tests.support.te2_cli_fixtures import World, build_world
+from tests.support.te2_fixtures import fq_settlement_records, git_cmd, nws_record
+from tests.support.te2_phase_b_fixtures import (
+    FAMILY,
+    PRE_REL,
+    BPaths,
+    build_phase_b,
+    sha256_path,
+)
+
+_CLASSES = {"WIN", "SIBLING_WON", "BOUNDARY", "TAIL", "BAND_SELECTION", "BODY_MISS", "UNTESTABLE"}
+_TOP_KEYS = {
+    "phase", "provenance", "predeclaration", "audit", "fills", "class_counts", "ranked_classes",
+    "flag_counts", "tests", "sensitivity", "downgrade", "testability", "tie_reevaluation",
+    "verdict", "report_phrases", "footer", "consumers", "delivery", "te1_cross_check",
+    "alt_truth", "t_edge", "h0k", "caveats",
+}  # fmt: skip
+
+
+def _records() -> dict[tuple[str, dt.date], NwsClimateDay]:
+    return {(r.station, r.climate_day): r for r in fq_settlement_records()}
+
+
+def _router(
+    records: Mapping[tuple[str, dt.date], NwsClimateDay], asked: list[dt.date] | None = None
+) -> type:
+    class _Router:
+        def __init__(self, base: Path) -> None:
+            pass
+
+        def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
+            assert climate_day >= dt.date(2026, 10, 1), "pre-October (holdout) truth was read"
+            if asked is not None:
+                asked.append(climate_day)
+            return records.get((station, climate_day))
+
+    return _Router
+
+
+def _policy(world: World) -> cli.PinPolicy:
+    return cli.PinPolicy((world.commit[:12],) * 9, (world.first_commit, world.commit))
+
+
+@pytest.fixture(scope="module")
+def phase_a(tmp_path_factory: pytest.TempPathFactory) -> tuple[World, Path]:
+    root = tmp_path_factory.mktemp("phase_a_for_b")
+    world = build_world(root / "w")
+    out = root / "out"
+    assert cli.main(world.phase_a_argv(out), policy=_policy(world)) == 0
+    return world, out / "phase_a_table.json"
+
+
+@pytest.fixture(scope="module")
+def completed(
+    phase_a: tuple[World, Path], tmp_path_factory: pytest.TempPathFactory
+) -> tuple[BPaths, dict[str, Any], str]:
+    world, table = phase_a
+    b = build_phase_b(tmp_path_factory.mktemp("b_ok"), world, table)
+    asked: list[dt.date] = []
+    mp = pytest.MonkeyPatch()
+    mp.setattr(cli, "_CatalogRouter", _router(_records(), asked))
+    try:
+        assert cli.main(b.argv()) == 0
+    finally:
+        mp.undo()
+    assert asked and min(asked) >= dt.date(2026, 10, 1)  # never a pre-October (holdout) day
+    return b, json.loads(b.result_json.read_text()), b.result_md.read_text()
+
+
+def test_phase_a_rows_carry_the_pmf_and_raw_vector_inputs_phase_b_needs(
+    phase_a: tuple[World, Path],
+) -> None:
+    _world, table = phase_a
+    rows = json.loads(table.read_text())["per_fill"]
+
+    assert all(r["pmf"] and r["raw_q50"] is not None and r["raw_sd"] for r in rows)
+    assert all("p_hat_predecessor" in r and "predecessor_commit" in r for r in rows)
+
+
+def test_phase_b_writes_json_and_md_with_every_section(
+    completed: tuple[BPaths, dict[str, Any], str],
+) -> None:
+    b, payload, md = completed
+
+    assert _TOP_KEYS <= set(payload), _TOP_KEYS - set(payload)
+    assert payload["phase"] == "B"
+    assert payload["audit"]["n_fills"] == 25 and payload["audit"]["n_wins"] == 2
+    assert abs(float(payload["audit"]["net_pnl"]) + 2.17) <= 0.005
+    assert len(payload["fills"]) == 25
+    assert all(f["class"] in _CLASSES and isinstance(f["flags"], list) for f in payload["fills"])
+    wins = [f for f in payload["fills"] if f["class"] == "WIN"]
+    assert sorted((f["tmax_f"], f["instrument_id"][-12:-1]) for f in wins) == [
+        (87, "gte86lt87"), (90, "gte89lt90")
+    ]  # fmt: skip
+    counts = Counter(f["class"] for f in payload["fills"])
+    assert counts["WIN"] == 2 and counts["SIBLING_WON"] == 2
+    assert sum(payload["class_counts"].values()) == 25
+    assert abs(sum(r["share_of_loss"] for r in payload["ranked_classes"]) - 1.0) < 1e-9
+    assert "TE-1 cross-check pending" in md and b.pre_commit in md
+    assert payload["verdict"]["label"] in {v.value for v in VerdictLabel}
+
+
+def test_phase_b_reports_every_test_with_status_power_loo_and_sensitivities(
+    completed: tuple[BPaths, dict[str, Any], str],
+) -> None:
+    _b, payload, _md = completed
+    tests = payload["tests"]
+
+    assert {"T-WIN", "T-LOC", "T-SPREAD", "T-ART"} <= set(tests)
+    win = tests["T-WIN"]
+    assert win["w_obs"] == 2 and win["n_units"] == 7
+    assert 0.0 <= win["p_value"] <= 1.0 and 0.0 <= win["power"]["power"] <= 1.0
+    assert win["status"] in {"TESTABLE", "TESTABLE-CONDITIONAL", "NOT-TESTABLE"}
+    assert "dropped_station" in win["leave_one_out"] and "rejects" in win["leave_one_out"]
+    assert "power" in tests["T-SPREAD"] and "n_after_drops" in tests["T-ART"]
+    assert "n_after_drops" in tests["T-LOC"] and "p_at_pi_min" in tests["T-LOC"]
+    assert payload["sensitivity"]["six_cluster"]["T-WIN"]["n_units"] == 6
+    assert payload["sensitivity"]["station_day"]["T-WIN"]["n_units"] == 14
+    assert set(payload["downgrade"]) >= {"decisions", "range_notes", "scope_sensitive"}
+    assert set(payload["testability"]) >= {"predeclared", "after_ties"}
+    assert set(payload["tie_reevaluation"]) >= {"downgraded", "variance_eligible"}
+    assert payload["h0k"]["p_value"] is not None and payload["t_edge"]["confirmatory_weight"] == 0
+
+
+def test_phase_b_footer_consumers_delivery_and_provenance(
+    completed: tuple[BPaths, dict[str, Any], str],
+) -> None:
+    b, payload, md = completed
+
+    assert payload["footer"] == render_footer(14, 7) and payload["footer"] in md
+    assert payload["consumers"] and all(
+        c["finding"] and c["consumer"] for c in payload["consumers"]
+    )
+    assert payload["verdict"]["label"] in {c["finding"] for c in payload["consumers"]}
+    assert payload["delivery"] == {"soft_target": "2026-10-20", "slip": None}
+    assert payload["te1_cross_check"]["status"] == "TE-1 cross-check pending"
+    assert (
+        payload["alt_truth"]["k3_status"] == "UNTESTABLE"
+        and payload["alt_truth"]["k3_count"] is None
+    )
+    prov = payload["provenance"]
+    assert prov["pins_json_sha256"] == sha256_path(b.pins)
+    assert prov["script_sha256"] == sha256_path(b.repo / FAMILY[2])
+    assert prov["reflog_snapshot_sha256"] == b.world.snapshot_sha256
+    assert prov["phase_a_table_sha256"] == sha256_path(b.table)
+    assert payload["predeclaration"]["commit"] == b.pre_commit
+
+
+def test_a_predeclared_threshold_is_what_phase_b_uses(
+    phase_a: tuple[World, Path],
+    tmp_path: Path,
+    completed: tuple[BPaths, dict[str, Any], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, table = phase_a
+    _b0, default_payload, _md = completed
+    assert not any("FLANK_CHEAP" in f["flags"] for f in default_payload["fills"])
+    b = build_phase_b(tmp_path, world, table, thresholds_patch={"flank_cheap_ask": 0.99})
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records()))
+
+    assert cli.main(b.argv()) == 0
+    patched = json.loads(b.result_json.read_text())
+    assert all("FLANK_CHEAP" in f["flags"] for f in patched["fills"])
+
+
+def test_phase_b_refuses_when_a_frozen_constant_drifted_from_the_predeclaration(
+    phase_a: tuple[World, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table, thresholds_patch={"alpha_primary": 0.05})
+
+    assert cli.main(b.argv()) == cli.EXIT_STOP
+    assert "alpha_primary" in capsys.readouterr().err
+    assert not b.result_json.exists()
+
+
+def test_phase_b_refuses_on_phase_a_table_sha_mismatch_before_reading_any_truth(
+    phase_a: tuple[World, Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    tampered = tmp_path / "tampered_table.json"
+    tampered.write_text(table.read_text() + "\n")
+    asked: list[dt.date] = []
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(_records(), asked))
+    argv = [str(tampered) if a == str(table) else a for a in b.argv()]
+
+    assert cli.main(argv) == cli.EXIT_STOP
+    assert "phase_a_table_sha256" in capsys.readouterr().err
+    assert not asked and not b.result_json.exists()
+
+
+def test_phase_b_refuses_an_unpinned_family_module_even_untracked(
+    phase_a: tuple[World, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    (b.repo / "scripts/analysis/fq_loss_taxonomy_extra.py").write_text("Y = 1\n")
+
+    assert cli.main(b.argv()) == cli.EXIT_STOP
+    err = capsys.readouterr().err
+    assert "unpinned_family_module" in err and "fq_loss_taxonomy_extra.py" in err
+    assert not b.result_json.exists()
+
+
+def test_phase_b_refuses_a_predeclaration_edited_after_its_commit(
+    phase_a: tuple[World, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    b.predeclaration.write_text(b.predeclaration.read_text() + "\n")
+
+    assert cli.main(b.argv()) == cli.EXIT_STOP
+    assert "predeclaration_modified" in capsys.readouterr().err
+
+
+def test_audit_mismatch_is_a_stop_with_no_result_artefact(
+    phase_a: tuple[World, Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    records = _records()
+    records[("MIA", dt.date(2026, 10, 3))] = nws_record("MIA", dt.date(2026, 10, 3), 60)
+    monkeypatch.setattr(cli, "_CatalogRouter", _router(records))
+
+    assert cli.main(b.argv()) == cli.EXIT_STOP
+    assert "STOP" in capsys.readouterr().err
+    assert (b.out / "phase_b_audit.json").exists() and not b.result_json.exists()
+
+
+def test_phase_b_runs_the_production_catalog_router_once(
+    phase_a: tuple[World, Path], tmp_path: Path
+) -> None:
+    """L-55: no router is injected; a real station catalog written by the real writer is read."""
+    world, table = phase_a
+    b = build_phase_b(tmp_path, world, table)
+    base = b.out / "catalog"
+    for station in ("LAX", "MDW", "MIA", "SFO"):
+        rows = [r for r in fq_settlement_records() if r.station == station]
+        write_records(open_station_catalog(base, "polymarket_us", station), rows)
+
+    assert cli.main(b.argv()) == 0
+    payload = json.loads(b.result_json.read_text())
+    assert payload["audit"]["n_fills"] == 25 and payload["audit"]["n_wins"] == 2
+
+
+def test_unpinned_family_modules_lists_every_family_file_absent_from_the_pins(
+    tmp_path: Path,
+) -> None:
+    analysis = tmp_path / "scripts" / "analysis"
+    analysis.mkdir(parents=True)
+    for name in ("fq_loss_taxonomy_a.py", "fq_loss_taxonomy_b.py", "fq_v1_loss_taxonomy.py",
+                 "unrelated_tool.py"):  # fmt: skip
+        (analysis / name).write_text("x = 1\n")
+    pinned = ["scripts/analysis/fq_loss_taxonomy_a.py"]
+
+    assert unpinned_family_modules(tmp_path, pinned) == (
+        "scripts/analysis/fq_loss_taxonomy_b.py",
+        "scripts/analysis/fq_v1_loss_taxonomy.py",
+    )
+    assert (
+        unpinned_family_modules(tmp_path, [*pinned, *unpinned_family_modules(tmp_path, pinned)])
+        == ()
+    )
+
+
+def test_load_predeclaration_rejects_missing_keys_and_wrong_phase_a_sha(tmp_path: Path) -> None:
+    table = tmp_path / "t.json"
+    table.write_text("{}")
+    good = {
+        "phase_a_table_sha256": sha256_path(table), "thresholds": thresholds_block(),
+        "consumer_map": {}, "s0i_statuses": {}, "terminal_climate_day": "2026-10-05",
+    }  # fmt: skip
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps(good))
+    assert load_predeclaration(path, table).phase_a_table_sha256 == sha256_path(table)
+    path.write_text(json.dumps({**good, "phase_a_table_sha256": "0" * 64}))
+    with pytest.raises(PredeclarationError, match="phase_a_table_sha256"):
+        load_predeclaration(path, table)
+    path.write_text(json.dumps({**good, "thresholds": {}}))
+    with pytest.raises(PredeclarationError, match="missing"):
+        load_predeclaration(path, table)
+
+
+def _day(station: str, tail: bool = False, *, corr: float = 3.0, raw: float = 1.0) -> DayRecord:
+    return DayRecord(
+        station=station, climate_day=dt.date(2026, 10, 2), p_d=0.5, won=False, ask_prob=0.5,
+        fill_qs=(0.9,), tail_flags=(tail,), pi=0.5, corr_err=corr, raw_err=raw,
+    )  # fmt: skip
+
+
+def test_ties_downgrade_t_art_and_a_downgraded_test_cannot_feed_variance() -> None:
+    days = [_day(f"S{i}") for i in range(6)] + [_day("S6", corr=1.0, raw=1.0)]  # one d == 0
+    result = run_battery(days, level="cluster", alpha_primary=0.02, alpha_art=0.01)
+
+    assert result.report["T-ART"]["n_after_drops"] == 6 and result.report["T-ART"]["n_dropped"] == 1
+    assert result.report["testability"]["pre_ties"]["T-ART"] == "TESTABLE"
+    assert result.after_ties["T-ART"] == "NOT-TESTABLE"
+    assert result.report["tie_reevaluation"]["variance_eligible"]["T-ART"] is False
+    verdict = decide_verdict(
+        VerdictInputs(
+            t_win=dataclasses.replace(result.outcomes["T-WIN"], power=0.95),
+            loo_rejects=False,
+            t_loc=result.outcomes["T-LOC"],
+            t_spread=result.outcomes["T-SPREAD"],
+            t_art=result.outcomes["T-ART"],
+        )  # fmt: skip
+    )
+    assert verdict.label is VerdictLabel.INCONCLUSIVE
+    assert "no unconditionally TESTABLE secondary" in (verdict.reason or "")
+
+
+def test_battery_t_win_matches_the_exact_lower_tail() -> None:
+    days = [_day(f"S{i}") for i in range(7)]
+    result = run_battery(days, level="cluster", alpha_primary=0.02, alpha_art=0.01)
+
+    # 7 clusters, P_c = 0.5, w_obs = 0: P(W <= 0) = 0.5**7.
+    assert result.report["T-WIN"]["p_value"] == pytest.approx(0.5**7)
+    assert result.outcomes["T-WIN"].rejects is True and result.report["T-WIN"]["w_obs"] == 0
+
+
+def _git_repo_with_artefact(tmp: Path, *, same_commit: bool) -> tuple[Path, Path]:
+    repo = tmp / "r"
+    repo.mkdir()
+    git_cmd(repo, "init", "-q", "-b", "main")
+    (repo / "docs/evidence/te2").mkdir(parents=True)
+    pre = repo / PRE_REL
+    pre.write_text("{}\n")
+    artefact = repo / "docs/evidence/te2/fq_v1_loss_taxonomy_2026-10-12.json"
+    if same_commit:
+        artefact.write_text("{}\n")
+        git_cmd(repo, "add", "docs")
+        git_cmd(repo, "commit", "-q", "-m", "pre+artefact")
+        first = git_cmd(repo, "rev-parse", "HEAD")
+    else:
+        git_cmd(repo, "add", "docs")
+        git_cmd(repo, "commit", "-q", "-m", "pre")
+        first = git_cmd(repo, "rev-parse", "HEAD")
+        artefact.write_text("{}\n")
+        git_cmd(repo, "add", "docs")
+        git_cmd(repo, "commit", "-q", "-m", "artefact")
+    pins = tmp / "pins.json"
+    pins.write_text(json.dumps({"head_blob_sha256": {PRE_REL: sha256_path(pre)},
+                                "predeclaration_commit": first}))  # fmt: skip
+    return repo, pins
+
+
+def test_verify_passes_when_the_artefact_commit_follows_the_predeclaration(tmp_path: Path) -> None:
+    repo, pins = _git_repo_with_artefact(tmp_path, same_commit=False)
+    argv = ["verify", "--repo-root", str(repo), "--pins-json", str(pins), "--artefact",
+            str(repo / "docs/evidence/te2/fq_v1_loss_taxonomy_2026-10-12.json")]  # fmt: skip
+
+    assert cli.main(argv) == 0
+
+
+def test_verify_fails_when_the_artefact_shares_the_predeclaration_commit_or_is_uncommitted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo, pins = _git_repo_with_artefact(tmp_path / "a", same_commit=True)
+    path = repo / "docs/evidence/te2/fq_v1_loss_taxonomy_2026-10-12.json"
+    base = ["verify", "--repo-root", str(repo), "--pins-json", str(pins)]
+
+    assert cli.main([*base, "--artefact", str(path)]) == cli.EXIT_STOP
+    assert "artefact_not_after_predeclaration" in capsys.readouterr().err
+    loose = repo / "docs/evidence/te2/never_committed.json"
+    loose.write_text("{}\n")
+    assert cli.main([*base, "--artefact", str(loose)]) == cli.EXIT_STOP
+    assert "artefact" in capsys.readouterr().err
+
+
+def test_near_boundary_boot_rows_carry_the_predecessor_p_hat_and_commit(tmp_path: Path) -> None:
+    world = build_world(tmp_path / "w")
+    git_cmd(world.repo_root, "commit", "--allow-empty", "-q", "-m", "c2")
+    c2 = git_cmd(world.repo_root, "rev-parse", "HEAD")
+    first = f"2026-09-30T00:00:00+00:00 old={'0' * 12} new={world.commit} commit: c1\n"
+    second = f"2026-10-01T16:50:00+00:00 old={world.commit} new={c2} commit: c2\n"
+    body = f"# Captured\n# source: .git/logs/HEAD\n{first}{second}"
+    body += f"# source: .git/logs/refs/heads/main\n{first}{second}"
+    snapshot = tmp_path / "reflog2.txt"
+    snapshot.write_text(body)
+    import hashlib
+
+    sha = hashlib.sha256(body.encode()).hexdigest()
+    world2 = dataclasses.replace(world, snapshot=snapshot, snapshot_sha256=sha)
+    policy = cli.PinPolicy(
+        (world.commit[:12],) * 2 + (c2[:12],) * 7, (world.first_commit, c2)
+    )  # fmt: skip
+
+    assert cli.main(world2.phase_a_argv(tmp_path / "out"), policy=policy) == 0
+    table = json.loads((tmp_path / "out" / "phase_a_table.json").read_text())
+    near = [r for r in table["per_fill"] if r["boot"] == 3]
+    other = [r for r in table["per_fill"] if r["boot"] != 3]
+    assert near and other
+    for row in near:
+        assert row["predecessor_commit"] == world.commit
+        assert row["p_hat_predecessor"] == pytest.approx(row["p_hat_reconstructed"], abs=1e-12)
+    assert all(r["predecessor_commit"] is None and r["p_hat_predecessor"] is None for r in other)
+    boot3 = next(p for p in table["pin_table"] if p["boot_number"] == 3)
+    assert boot3["near_boundary"] is True and boot3["predecessor"] == world.commit

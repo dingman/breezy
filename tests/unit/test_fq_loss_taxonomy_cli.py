@@ -21,8 +21,6 @@ from tests.support.te2_cli_fixtures import World, build_world
 from tests.support.te2_fixtures import (
     fq_durable_fills,
     fq_september_fills,
-    fq_settlement_records,
-    nws_record,
     sha256_text,
     tmp_git_repo,
 )
@@ -228,6 +226,7 @@ def _phase_b_argv(repo: Path, pins: Path, store: Path, out: Path) -> list[str]:
     return [
         "phase-b", "--fills-db", str(store), "--output-dir", str(out), "--repo-root", str(repo),
         "--catalog-root", str(out), "--pins-json", str(pins), "--now-ns", "1800000000000000000",
+        "--predeclaration", str(out / "p.json"), "--phase-a-table", str(out / "t.json"),
     ]  # fmt: skip
 
 
@@ -241,30 +240,8 @@ def test_phase_b_refuses_without_pins(tmp_path: Path, capsys: pytest.CaptureFixt
     assert "PHASE B REFUSED" in capsys.readouterr().err
 
 
-def test_phase_b_reproduces_only_the_25_fq_fills_and_never_reads_pre_october_truth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, pins, store = _phase_b_inputs(tmp_path)
-    records = {(r.station, r.climate_day): r for r in fq_settlement_records()}
-    asked: list[dt.date] = []
-
-    class _Router:
-        def __init__(self, base: Path) -> None:
-            pass
-
-        def record(self, station: str, climate_day: dt.date) -> Any:
-            asked.append(climate_day)
-            assert climate_day >= dt.date(2026, 10, 1), "pre-October (holdout) truth was read"
-            return records.get((station, climate_day)) or nws_record(station, climate_day, 0)
-
-    monkeypatch.setattr(cli, "_CatalogRouter", _Router)
-    out = tmp_path / "out"
-
-    assert cli.main(_phase_b_argv(repo, pins, store, out)) == 0
-    payload = json.loads((out / "phase_b_audit.json").read_text())
-    assert "audit_all" not in payload
-    assert payload["audit_fq"]["n_fills"] == 25 and payload["audit_fq"]["n_wins"] == 2
-    assert asked and min(asked) >= dt.date(2026, 10, 1)
+# test_phase_b_reproduces_only_the_25_fq_fills_and_never_reads_pre_october_truth moved to
+# test_fq_loss_taxonomy_phase_b.py (the full pipeline needs a Phase A table and a predeclaration).
 
 
 def test_unparseable_instrument_is_a_stop_not_a_bare_assert() -> None:
