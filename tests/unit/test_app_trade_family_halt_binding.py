@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -65,6 +66,18 @@ def _state_snapshot(store_path: Path) -> set[tuple[str, bytes]]:
         )
     finally:
         conn.close()
+
+
+def _epoch_keys(store_path: Path) -> list[str]:
+    conn = sqlite3.connect(store_path)
+    try:
+        rows = conn.execute(
+            "SELECT key FROM state WHERE substr(key, 1, ?) = ?",
+            (len(_EPOCH_PREFIX), _EPOCH_PREFIX),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [key for (key,) in rows]
 
 
 def _seed_legacy(store_path: Path, raw: bytes) -> None:
@@ -163,6 +176,9 @@ def test_v4_boot_with_pinned_legacy_reads_halted_before_composition_and_writes_n
     assert code == EXIT_OK
     after = _state_snapshot(store_path)
     assert before == after, "AC-9: no write at the first new-code boot"
+    # The exclusion is exactly one epoch row: nothing else hides behind it.
+    (epoch_key,) = _epoch_keys(store_path)
+    assert re.fullmatch(re.escape(_EPOCH_PREFIX) + r"\d+", epoch_key)
 
     halt_lines = [r.message for r in caplog.records if "family_halt_state" in r.message]
     assert len(halt_lines) == 1

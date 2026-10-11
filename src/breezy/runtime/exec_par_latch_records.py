@@ -29,6 +29,8 @@ from dataclasses import replace
 from typing import Protocol, TypeVar
 
 from breezy.runtime.exec_par_records import (
+    AMENDMENT_KEY_PREFIX,
+    EPOCH_KEY_PREFIX,
     EXEC_PAR_PREFIX,
     Amendment,
     CleanupDemotion,
@@ -65,8 +67,8 @@ _EXCLUDED_DAYS = EXEC_PAR_PREFIX + "excluded_days"
 _STAGE_EVAL_DRY = EXEC_PAR_PREFIX + "stage_eval_dry"
 _FORCE_K1_CLEARED = EXEC_PAR_PREFIX + "force_k1_cleared"
 _FORCE_K1_FLAG = EXEC_PAR_PREFIX + "force_k1"
-_EPOCH = EXEC_PAR_PREFIX + "epoch/"
-_AMENDMENT = EXEC_PAR_PREFIX + "amendment/"
+_EPOCH = EPOCH_KEY_PREFIX
+_AMENDMENT = AMENDMENT_KEY_PREFIX
 _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
 _SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"

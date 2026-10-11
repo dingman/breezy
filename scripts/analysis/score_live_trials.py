@@ -137,7 +137,7 @@ from breezy.persistence.residual_fills import (  # noqa: F401
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import default_registry
-from breezy.runtime.exec_par_epochs import STRATUM_PARALLEL, read_epoch_ledger
+from breezy.runtime.exec_par_epochs import STRATUM_PARALLEL, EpochLedger, read_epoch_ledger
 from breezy.runtime.exec_state_db_path import (
     ExecStateDbNotConfiguredError,
     node_store_path_check,
@@ -662,6 +662,7 @@ def score_live_trials(
     fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]] = {}
     no_side_residual_by_trial_id: Mapping[str, bool] = {}
     unresolved_takes: tuple[UnresolvedTake, ...] = ()
+    epoch_ledger: EpochLedger | None = None
 
     if fills_path is not None:
         filled_trials, jsonl_refusals = read_filled_trials_jsonl(fills_path)
@@ -724,6 +725,10 @@ def score_live_trials(
         assert fill_source_path is not None
         assert family_prefix is not None
         assert since_climate_day is not None
+        # EXEC-PAR BG-2 (J1): read BEFORE any write. A corrupt ledger raises
+        # `EpochLedgerCorrupt` ("epoch ledger corrupt; M1-v3 separation cannot be
+        # guaranteed"); it is never skipped, which could admit parallel fills.
+        epoch_ledger = read_epoch_ledger(fill_source_path)
         unresolved_takes = find_unresolved_takes(
             fill_source_path,
             family_prefix=family_prefix,
@@ -877,11 +882,16 @@ def score_live_trials(
                 for row in stamped_scored
             ],
         )
-        if fills_path is None and fill_source_path is not None:
+        if epoch_ledger is not None:
             _append_parallel_epoch_strata(
                 derived_dir,
-                fill_source_path,
+                epoch_ledger,
                 {row.trial_id: filled_at_ns_by_trial_id[row.trial_id] for row in stamped_scored},
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                "epoch strata skipped: fills came from --fills (no exec state DB), so "
+                "parallel-epoch fills cannot be identified"
             )
         write_scored_trials(derived_dir, stamped_scored, now_ns=now_ns)
     # I4 defect fix: written unconditionally (idempotent, empty-safe, mirrors
@@ -895,14 +905,13 @@ def score_live_trials(
 
 
 def _append_parallel_epoch_strata(
-    derived_dir: Path, fill_source_path: Path, filled_at_ns_by_trial_id: Mapping[str, int]
+    derived_dir: Path, ledger: EpochLedger, filled_at_ns_by_trial_id: Mapping[str, int]
 ) -> None:
     """EXEC-PAR BG-2 (J1): record the fills whose `ts_event` is in a parallel K-epoch.
 
     Single-slot fills are not recorded, so a store that only ever ran at K=1
-    gains no file. The epoch ledger is read through a `mode=ro` open.
+    gains no file. `ledger` was read through a `mode=ro` open before scoring began.
     """
-    ledger = read_epoch_ledger(fill_source_path)
     append_epoch_strata(
         derived_dir,
         {

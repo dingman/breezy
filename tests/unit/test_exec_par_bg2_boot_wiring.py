@@ -12,11 +12,13 @@ from pathlib import Path
 import pytest
 
 from breezy.app import trade as app_trade
-from breezy.app.trade import run
-from breezy.runtime import node_config
+from breezy.app.trade import EPOCH_ROW_WRITE_FAILED_EVENT, run
+from breezy.runtime import node_config, trade_cli
 from breezy.runtime.build_sha import BUILD_REVISION_ENV_VAR
 from breezy.runtime.exec_par_epochs import EpochLedger, read_epoch_ledger
-from breezy.runtime.trade_cli import EXIT_OK
+from breezy.runtime.health import AlertPayload
+from breezy.runtime.submit_intent import SubmitIntentLatch
+from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_OK
 from tests.unit.test_exec_par_wp5b_wiring import _env
 from tests.unit.test_trade_cli_current_rung_hold import (
     RecordingNode,
@@ -167,3 +169,127 @@ def test_the_k_gt_1_watcher_is_armed_with_the_build_revision(
     ]
     assert len(watchers) == 1
     assert watchers[0]._commit_sha == REVISION
+
+
+# -- review fixes: failure containment ------------------------------------------------
+
+
+class _AlertSink:
+    def __init__(self) -> None:
+        self.payloads: list[AlertPayload] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.payloads.append(payload)
+
+
+def _capture_alerts(monkeypatch: pytest.MonkeyPatch) -> _AlertSink:
+    sink = _AlertSink()
+    monkeypatch.setattr(app_trade, "resolve_alert_sink", lambda: sink)
+    return sink
+
+
+def _fail_epoch_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(self: object, record: object) -> None:
+        raise OSError("store down")
+
+    monkeypatch.setattr(SubmitIntentLatch, "write_epoch_row", boom)
+
+
+def test_k1_epoch_row_failure_logs_alerts_and_the_boot_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    sink = _capture_alerts(monkeypatch)
+    _fail_epoch_write(monkeypatch)
+    env = _env(tmp_path)
+
+    with caplog.at_level("ERROR"):
+        code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert "run" in RecordingNode.instances[-1].calls
+    assert any(r.exc_info for r in caplog.records if "epoch" in r.getMessage())
+    critical = [p for p in sink.payloads if p.event == EPOCH_ROW_WRITE_FAILED_EVENT]
+    assert len(critical) == 1 and critical[0].severity == "CRITICAL"
+
+
+def test_k_gt_1_epoch_row_failure_exits_two_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
+    _fail_epoch_write(monkeypatch)
+    err = io.StringIO()
+    RecordingNode.instances.clear()
+
+    code = run(env=_env(tmp_path), node_factory=RecordingNode, stderr=err)
+
+    assert code == EXIT_CONFIG_ERROR
+    assert "Traceback" not in err.getvalue()
+    assert RecordingNode.instances == []
+
+
+def test_a_forced_to_1_epoch_row_failure_is_fatal_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+    monkeypatch.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: False)
+    _fail_epoch_write(monkeypatch)
+
+    code = run(env=_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_CONFIG_ERROR
+
+
+def test_the_k_change_floor_failure_is_never_swallowed_at_k1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path)
+    with monkeypatch.context() as first:
+        first.setattr(app_trade, "EXEC_PAR_MAX_CONCURRENT_INTENTS", 2)
+        first.setattr(node_config, "supervisor_admits_slot_schema", lambda _path: True)
+        run(env=env, node_factory=RecordingNode, stderr=io.StringIO())  # K=2 epoch
+    RecordingNode.instances.clear()
+
+    def boom(self: object, record: object) -> None:
+        raise OSError("store down")
+
+    monkeypatch.setattr(SubmitIntentLatch, "write_stage_reset", boom)
+    code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())  # K=1: a K change
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
+def test_stop_ts_failure_is_logged_with_traceback_and_boot_ts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(self: object, boot_ts: int, stop_ts: int) -> bool:
+        raise OSError("store down")
+
+    monkeypatch.setattr(SubmitIntentLatch, "write_epoch_stop_ts", boom)
+
+    with caplog.at_level("ERROR"):
+        code = run(env=_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    (record,) = [r for r in caplog.records if "stop_ts" in r.getMessage()]
+    assert record.exc_info
+    assert "boot_ts=" in record.getMessage()
+
+
+def test_stop_ts_is_written_only_on_a_normal_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception out of trade_cli.run leaves the epoch unstamped (the J2 unclean signal)."""
+
+    def explode(**_kwargs: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(trade_cli, "run", explode)
+    env = _env(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+
+    (row,) = _ledger(env).epochs
+    assert row.stop_ts is None
