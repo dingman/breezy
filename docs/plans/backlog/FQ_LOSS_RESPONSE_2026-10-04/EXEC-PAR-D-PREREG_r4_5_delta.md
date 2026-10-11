@@ -73,7 +73,7 @@ This gate fails closed: no amount of live data, thin or plentiful, can lower ICC
 
 ## O3. A hard K = 2 ceiling until an O2 pass
 
-- **BG-9 config guard.** BG-9 fails when configured K > 2 unless a committed promotion-time record (`docs/evidence/exec_par/exec_par_bg10_promo_<stage>_<date>.json`) meets all of these:
+- **BG-9 config guard.** BG-9 fails when configured K > 2 unless a committed promotion-time record (`docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/promo/exec_par_bg10_promo_<stage>_<date>.json`, beside the amendments that pin it; never under `docs/evidence`, which `src` may not read — `test_no_module_under_src_reads_docs_evidence`) meets all of these:
   - it is sha-pinned in an amendment;
   - it shows V1–V3 PASS;
   - its stage is the stage being promoted from;
