@@ -15,6 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -375,7 +376,7 @@ def test_cap_counts_excluded_days() -> None:
 
 def test_minima_that_become_true_only_after_the_cap_never_unhold() -> None:
     # day 15 has 0 posted; days 16+ would add orders: minima judged over the first 15 days
-    over = {i: {"posted": 0} for i in range(1, 16)}
+    over: dict[int, dict[str, object]] = {i: {"posted": 0} for i in range(1, 16)}
     over.update({16: {"posted": 40}, 17: {"posted": 40}})
     v = evaluate_stage(build(17, posted=0, day_over=over))
     assert v.kind is VerdictKind.HOLD and v.reason == HOLD_CAP_MINIMA_UNMET
@@ -532,7 +533,7 @@ def test_s6_share_exactly_0_30_does_not_stop_above_does_at_s3() -> None:
 
 
 def test_s6_needs_two_consecutive_daily_evaluations() -> None:
-    over = {i: {"posted": 4, "denied": 0} for i in range(1, 10)}
+    over: dict[int, dict[str, object]] = {i: {"posted": 4, "denied": 0} for i in range(1, 10)}
     over[8] = {"posted": 4, "denied": 100}  # only the last closed day's window is high
     v = evaluate_stage(build(8, k=6, day_over=over))
     assert v.kind is not VerdictKind.STOP
@@ -542,7 +543,7 @@ def test_s6_needs_two_consecutive_daily_evaluations() -> None:
 
 
 def test_s6_uses_the_trailing_5_eligible_days_only() -> None:
-    over = {i: {"posted": 4, "denied": 0} for i in range(1, 10)}
+    over: dict[int, dict[str, object]] = {i: {"posted": 4, "denied": 0} for i in range(1, 10)}
     over[1] = {"posted": 4, "denied": 1000}  # outside the trailing-5 windows
     over[2] = {"posted": 4, "denied": 1000}
     v = evaluate_stage(build(8, k=6, day_over=over))
@@ -651,7 +652,7 @@ def test_s7_missing_decision_ask_is_fail() -> None:
 
 
 def _slip_snapshot(
-    slow: int = 0, *, slip: str = "0.03", base: str = "0", unrec: int = 0, **kw: object
+    slow: int = 0, *, slip: str = "0.03", base: str = "0", unrec: int = 0, **kw: Any
 ) -> StageSnapshot:
     over: dict[int, dict[str, object]] = {}
     count = 0
@@ -713,7 +714,7 @@ def test_parity_baseline_with_20_fills_but_no_mean_is_fail() -> None:
 
 
 def test_look_blocked_when_fewer_than_5_days_have_a_fill() -> None:
-    over = {i: {"fills": ()} for i in range(1, 6)}
+    over: dict[int, dict[str, object]] = {i: {"fills": ()} for i in range(1, 6)}
     v = evaluate_stage(build(8, day_over=over))
     assert v.kind is VerdictKind.PROMOTION_ELIGIBLE
     assert "fill_days_below_5" in v.look_blockers and "no_fills" not in v.look_blockers
@@ -905,7 +906,6 @@ def test_unreadable_pnl_reading_is_fail() -> None:
 def test_a_day_without_entries_needs_no_pnl_row() -> None:
     v = evaluate_stage(build(8, day_over={2: {"posted": 0}}, posted=5))
     assert v.kind is VerdictKind.PROMOTION_ELIGIBLE or v.kind is VerdictKind.PASS
-    assert v.kind is not VerdictKind.FAIL
 
 
 # -- outcomes and precedence ("After a halt", N5) ------------------------------------------
@@ -1017,9 +1017,8 @@ def test_missing_todays_counters_are_fail() -> None:
 @pytest.mark.parametrize("field_name", ["posted", "ambiguous", "fills", "open_flags", "windows"])
 def test_none_counter_field_is_fail_not_zero(field_name: str) -> None:
     snap = build(8)
-    broken = tuple(
-        dataclasses.replace(x, **{field_name: None}) if x.day == d(3) else x for x in snap.days
-    )
+    changes: dict[str, Any] = {field_name: None}
+    broken = tuple(dataclasses.replace(x, **changes) if x.day == d(3) else x for x in snap.days)
     v = evaluate_stage(dataclasses.replace(snap, days=broken))
     assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_counter"
 
@@ -1227,7 +1226,8 @@ def test_h3_non_finite_pnl_is_fail(bad: str) -> None:
 @pytest.mark.parametrize("field_name", ["fee_realized", "fee_exact"])
 @pytest.mark.parametrize("bad", ["NaN", "Infinity"])
 def test_h3_non_finite_fee_is_fail(field_name: str, bad: str) -> None:
-    row = dataclasses.replace(fill(d(2), "c1"), **{field_name: bad})
+    changes: dict[str, Any] = {field_name: bad}
+    row = dataclasses.replace(fill(d(2), "c1"), **changes)
     v = evaluate_stage(build(8, day_over=_one_day_fills(d(2), row)))
     assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:pnl_nonfinite"
 
@@ -1237,7 +1237,10 @@ def test_h3_non_finite_fee_is_fail(field_name: str, bad: str) -> None:
 )
 def test_h3_negative_reading_counts_are_fail(field_name: str) -> None:
     snap = build(8)
-    broken = dataclasses.replace(snap.pnl_days[2].reading, **{field_name: -1})
+    reading_2 = snap.pnl_days[2].reading
+    assert reading_2 is not None
+    changes: dict[str, Any] = {field_name: -1}
+    broken = dataclasses.replace(reading_2, **changes)
     pnl = tuple(DayPnl(p.day, broken) if p is snap.pnl_days[2] else p for p in snap.pnl_days)
     v = evaluate_stage(dataclasses.replace(snap, pnl_days=pnl))
     assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:bad_counter"
@@ -1254,14 +1257,15 @@ def test_h3_negative_reading_counts_are_fail(field_name: str) -> None:
         ({"qty": 10}, "fill_decimal"),
     ],
 )
-def test_h3_fill_sanity_and_no_float_input(changes: dict[str, object], reason: str) -> None:
+def test_h3_fill_sanity_and_no_float_input(changes: dict[str, Any], reason: str) -> None:
     row = dataclasses.replace(fill(d(2), "c1", ask="0.9"), **changes)
     v = evaluate_stage(build(8, day_over=_one_day_fills(d(2), row)))
     assert v.kind is VerdictKind.FAIL and v.reason == f"stage_eval_fail:{reason}"
 
 
 def test_h3_decimal_objects_are_accepted_as_fill_input() -> None:
-    row = dataclasses.replace(fill(d(2), "c1"), qty=D("10"))
+    # deliberately a Decimal where FillRow.qty is typed str: the evaluator must accept it
+    row = dataclasses.replace(fill(d(2), "c1"), qty=cast("str", D("10")))
     assert evaluate_stage(build(8, day_over=_one_day_fills(d(2), row))).kind is not VerdictKind.FAIL
 
 
@@ -1546,7 +1550,8 @@ def test_f2_pre_floor_excluded_day_is_exempt_only_while_unreconciled(unreconcile
 
 @pytest.mark.parametrize("which", ["gappy_days", "pending_rebuild_days"])
 def test_f2_stage_excluded_day_is_exempt_while_gappy_or_pending_rebuild(which: str) -> None:
-    snap = build(8, excluded_days=excl(3), **{which: frozenset({d(3)})})
+    flagged: dict[str, Any] = {which: frozenset({d(3)})}
+    snap = build(8, excluded_days=excl(3), **flagged)
     assert evaluate_stage(_without_row(snap, d(3))).kind is not VerdictKind.FAIL
 
 
