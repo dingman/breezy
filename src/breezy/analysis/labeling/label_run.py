@@ -842,8 +842,8 @@ def _resolve_factory(unit_factory: UnitFactory | None) -> UnitFactory:
 
 
 def _build_wiring(args: argparse.Namespace, unit_factory: UnitFactory | None) -> UnitWiring | None:
-    """The unit wiring, or ``None`` after printing the refusal: ``aut2.label`` is not pinned, or
-    the production host seams were asked for outside the real unit."""
+    """The unit wiring, or ``None`` after printing the refusal: ``aut2.label`` is not pinned, the
+    production host seams were asked for outside the real unit, or a run marker is corrupt."""
     from breezy.analysis.labeling.unit_wiring import HostSeamsRefused, ProducerUnpinned
 
     try:
@@ -852,6 +852,8 @@ def _build_wiring(args: argparse.Namespace, unit_factory: UnitFactory | None) ->
         print("LABEL_OUTCOMES REFUSED reason=producer_unpinned")
     except HostSeamsRefused:
         print("LABEL_OUTCOMES REFUSED reason=not_under_unit")
+    except MarkerCorrupt:  # the lag anchor reads every marker name: a corrupt one is untrusted
+        print("LABEL_OUTCOMES REFUSED reason=marker_corrupt")
     return None
 
 

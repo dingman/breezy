@@ -16,6 +16,9 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import json
+import os
+import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -47,7 +50,7 @@ from breezy.runtime.autonomy_sandbox.bwrap import default_roots
 from breezy.runtime.autonomy_sandbox.run_mounts import STUDIES_LOCK_NAME
 from breezy.runtime.health import resolve_alert_sink
 
-__all__ = ["FactorySeams", "default_seams", "factory"]
+__all__ = ["FactorySeams", "context_allows", "default_seams", "factory"]
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _PROC_CGROUP = Path("/proc/self/cgroup")
@@ -72,16 +75,32 @@ class FactorySeams:
     snapshot: Callable[[Path, Path], AbstractContextManager[Path]]
 
 
-def default_seams() -> FactorySeams:
-    """The live host's seams. Only the label unit (or its measurement unit) may read them.
+def context_allows(context: UnitContext, *, measure: bool) -> bool:
+    """Default mode needs the label unit itself. ``--measure-peak`` additionally accepts the
+    transient measurement unit: its ``run-r<hex>.service`` name is what ``systemd-run`` gives ANY
+    transient unit (a unit-launched gate included), so it must never unlock the default path."""
+    if context.is_label_unit():
+        return True
+    return measure and context.is_measure_unit()
+
+
+def _under_pytest() -> bool:
+    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def default_seams(measure: bool = False) -> FactorySeams:
+    """The live host's seams. Only the label unit (or, for ``--measure-peak``, its measurement
+    unit) may read them, and never a test run.
 
     ``main`` already refuses outside the unit, but it takes its context as an argument; this check
     reads the REAL process context, so a caller that injects an in-unit context (a test, a stray
     import) still cannot make the production factory touch the live data root, the host studies
-    flock or the alert outbox.
+    flock or the alert outbox. A process that has imported pytest is refused outright: tests inject
+    their own seams, and a perfect context must not turn a test into a live run.
     """
-    context = UnitContext.current()
-    if not (context.is_label_unit() or context.is_measure_unit()):
+    if _under_pytest():
+        raise unit_wiring.HostSeamsRefused("the production seams are never read under pytest")
+    if not context_allows(UnitContext.current(), measure=measure):
         raise unit_wiring.HostSeamsRefused("the production seams are read only inside the unit")
     return _host_seams()
 
@@ -112,14 +131,37 @@ def _host_seams() -> FactorySeams:  # pragma: no cover - reads the live host
     )
 
 
+#: Manifest kinds whose loss would silently shrink the attribution: FQ and the retired CRH pair.
+_REQUIRED_KINDS = frozenset(
+    {"forecast_quantile_ladder", "current_rung_hold", "continuous_rung_hold"}
+)
+
+
+def _composition_kind_of(path: Path) -> str | None:
+    """The raw ``composition_kind`` of a json file, ``None`` for a non-manifest artefact."""
+    try:
+        wire = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FamilyManifestError(f"{path.name} is not readable json") from exc
+    kind = wire.get("composition_kind") if isinstance(wire, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
 def _load_manifests(families_dir: Path) -> tuple[FamilyManifest, ...]:
-    """Every family manifest under ``families_dir``; a non-manifest json (a boundary artefact) is
-    skipped as the report's own enumeration skips it. The bootstrap families are all required by
-    :func:`unit_wiring.family_infos`, so a broken manifest that matters fails the factory."""
+    """Every family manifest under ``families_dir``.
+
+    A json that is not a manifest (a boundary artefact) is skipped, as the report's own
+    enumeration skips it, but never silently: ``AUT2 MANIFEST_SKIPPED path=<file>`` is printed. A
+    file that fails to load and is (or cannot be shown not to be) an FQ or CRH manifest raises,
+    because attribution would otherwise lose a family without any signal."""
     manifests: list[FamilyManifest] = []
     for path in sorted(families_dir.glob("*.json")):
-        with contextlib.suppress(FamilyManifestError):
+        try:
             manifests.append(load_family_manifest(path, allow_draft=True))
+        except FamilyManifestError:
+            print(f"AUT2 MANIFEST_SKIPPED path={path}")
+            if _composition_kind_of(path) in _REQUIRED_KINDS:
+                raise
     return tuple(manifests)
 
 
@@ -141,7 +183,9 @@ def factory(args: argparse.Namespace, seams: FactorySeams | None = None) -> Unit
     pinned, code_sha = unit_wiring.producer_pin_state()
     if not pinned:
         raise unit_wiring.ProducerUnpinned("aut2.label is not pinned to the label_run closure")
-    chosen = seams if seams is not None else default_seams()
+    chosen = (
+        seams if seams is not None else default_seams(bool(getattr(args, "measure_peak", False)))
+    )
     now_ns = args.now_ns if args.now_ns is not None else chosen.time_ns()
     data_root = Path(args.data_root) if args.data_root is not None else chosen.data_root
     exec_db = _exec_db_of(args, chosen, data_root)

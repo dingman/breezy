@@ -1,16 +1,19 @@
-"""The TE-1 world: the 34-fill ledger of 2026-10-11 rebuilt on real writers (L-42, L-55).
+"""The TE-1 world: the REAL 34-fill ledger of 2026-10-11 rebuilt on real writers (L-42, L-55).
 
 25 FQ fills (20 inside ``pm_us_crh_fq_v1``'s window, 5 straddling its terminal day) and 9 legacy CRH
-fills (7 with a frozen ``ScoredTrial``, 2 residual). Fills are written with ``seed_fills``; every
-latch key is written by the real ``PersistentQuantileLadderLatch`` / ``TrialDayLatch`` writers, and
-the 7 scored trials by the real ``write_scored_trials``. Nothing here imports the exec client (the
-x1 pin names ``tests/support/aut2_fixtures.py``) and nothing touches the network or the host.
+fills (7 with a frozen ``ScoredTrial``, 2 residual). Instruments, prices, fees, timestamps and the
+settled highs are the venue's own (``tests/support/te1_real_ledger.py``, constants copied from a
+read-only look at the exec store). Fills are written with ``seed_fills``; every latch key is
+written by the real ``PersistentQuantileLadderLatch`` / ``TrialDayLatch`` writers, and the 7 scored
+trials by the real ``write_scored_trials``. Nothing here imports the exec client (the x1 pin names
+``tests/support/aut2_fixtures.py``) and nothing touches the network or the host.
 """
 
 from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -37,10 +40,13 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
 )
 from tests.contract.test_catalog_nws_records import make_climate_day
 from tests.support.aut2_fixtures import DurableFillRecord, durable_fill, seed_fills
+from tests.support.te1_real_ledger import FQ_RUNG_IDS, REAL_FILLS, REAL_TMAX
 
 __all__ = [
     "FAMILIES_DIR",
     "FQ_POST_TERMINAL_IDS",
+    "FQ_WIN_COIDS",
+    "LEGACY_COIDS",
     "MapSettlements",
     "World",
     "build_world",
@@ -54,8 +60,28 @@ FAMILIES_DIR = REPO_ROOT / "deploy" / "families"
 VENUE = "polymarket_us"
 _NS = 1_000_000_000
 _FQ_KEY_PREFIX = FORECAST_QUANTILE_TRIAL_KEY_PREFIX
-#: The five fills of climate day 2026-10-06 sent on 2026-10-05 (R11): ``client_order_id`` set.
-FQ_POST_TERMINAL_IDS = frozenset(f"O-FQ-1006-{i}" for i in range(5))
+_SLUG_RE = re.compile(r"^tc-temp-(?P<station>[a-z]+)high-(?P<day>\d{4}-\d{2}-\d{2})-")
+_N_LEGACY = 9
+#: The nine legacy CRH fills' client order ids, in fill order (the first two are the RESIDUALS).
+LEGACY_COIDS: tuple[str, ...] = tuple(row[0] for row in REAL_FILLS[:_N_LEGACY])
+_LAST_WINDOW_DAY = "2026-10-05"  # pm_us_crh_fq_v1's terminal climate day (R11)
+
+
+def _station_day(instrument_id: str) -> tuple[str, str]:
+    m = _SLUG_RE.match(instrument_id)
+    assert m is not None, instrument_id
+    return m["station"].upper(), m["day"]
+
+
+#: The five fills of climate day 2026-10-06 sent on 2026-10-05 (R11): real client order ids.
+FQ_POST_TERMINAL_IDS = frozenset(
+    row[0] for row in REAL_FILLS[_N_LEGACY:] if _station_day(row[1])[1] > _LAST_WINDOW_DAY
+)
+#: The two FQ winners (MIA 10-03 gte86lt87 tmax 87 +0.88; MIA 10-05 gte89lt90 tmax 90 +0.50).
+FQ_WIN_COIDS = (
+    "O-20261003-021031-L001-MIA-1",
+    "O-20261004-165019-L001-MIA-1",
+)
 
 
 def day_start_ns(day: str, hour: int = 0) -> int:
@@ -101,52 +127,24 @@ class World:
     post_terminal_ids: frozenset[str]
 
 
-# (station, day, lower, no, scored?, fee_reconciled) of the nine legacy fills.
-_LEGACY: tuple[tuple[str, str, int, bool, bool, bool], ...] = (
-    ("SFO", "2026-09-11", 73, False, False, False),  # v2 station-day key, RESIDUAL
-    ("MIA", "2026-09-13", 92, False, False, False),  # cont station-day key, RESIDUAL
-    ("MDW", "2026-09-15", 85, False, True, True),
-    ("MIA", "2026-09-15", 93, True, True, True),
-    ("MDW", "2026-09-15", 84, False, True, True),
-    ("SFO", "2026-09-15", 73, False, True, True),
-    ("MIA", "2026-09-21", 88, True, True, True),
-    ("SFO", "2026-09-21", 68, False, True, True),
-    ("MDW", "2026-09-22", 62, True, True, True),
-)
-_FQ_STATIONS = ("LAX", "MDW", "MIA", "SFO")
-_FQ_DAYS = ("2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05")
-_POST_TERMINAL = (("SFO", 81), ("MDW", 69), ("MDW", 70), ("LAX", 91), ("SFO", 83))
-
-
 def _legacy_prefix(day: str) -> str:
     if day < "2026-09-12":
         return "current_rung_hold/trial/"
     return "continuous_rung_hold/trial/"
 
 
-def _fq_specs() -> list[tuple[str, str, str, int]]:
-    """``(client_order_id, station, climate_day, lower)``: 20 inside the window, 5 straddling."""
-    specs: list[tuple[str, str, str, int]] = []
-    for d, day in enumerate(_FQ_DAYS):
-        for k in range(5):
-            station = _FQ_STATIONS[k % 4]
-            specs.append((f"O-FQ-{day[-2:]}-{k}", station, day, 60 + 5 * k + d))
-    for i, (station, lower) in enumerate(_POST_TERMINAL):
-        specs.append((f"O-FQ-1006-{i}", station, "2026-10-06", lower))
-    return specs
-
-
-def _write_fq_latches(store_path: Path, specs: list[tuple[str, str, str, int]]) -> None:
+def _write_fq_latches(store_path: Path, fills: list[DurableFillRecord]) -> None:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent:
         trial = open_trial_day_latch(
             intent, key_prefix=_FQ_KEY_PREFIX, family_id="pm_us_fq_te1_fixture"
         )
         latch = PersistentQuantileLadderLatch(trial)
-        for _coid, station, day, lower in specs:
+        for fill in fills:
+            station, day = _station_day(fill.instrument_id)
             latch.latch(
                 station=station,
                 climate_day=dt.date.fromisoformat(day),
-                rung_id=f"{lower}_{lower + 1}",
+                rung_id=FQ_RUNG_IDS[fill.client_order_id],
                 side="yes",
             )
 
@@ -204,56 +202,47 @@ def _scored_trial(fill: Any, station: str, day: str, key: str, tmax: int) -> Sco
     )
 
 
+def _real_fill(row: tuple[str, str, str, str, int, bool]) -> DurableFillRecord:
+    coid, instrument_id, cost, fee, ts_event, reconciled = row
+    return durable_fill(
+        venue_order_id=f"vo-{coid}",
+        client_order_id=coid,
+        instrument_id=instrument_id,
+        cost=Decimal(cost),
+        fee=Decimal(fee),
+        fee_reconciled=reconciled,
+        ts_event=ts_event,
+        trade_id=f"T-{coid}",
+    )
+
+
 def build_world(tmp_path: Path, *, with_post_terminal: bool = True) -> World:
     """Seed the 34-fill ledger (or the 29 without the five straddle fills) under ``tmp_path``."""
     exec_db = tmp_path / "exec.sqlite"
     data_root = tmp_path / "data"
     data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     scored_dir = tmp_path / "scored_trials"
-    tmax: dict[tuple[str, str], int] = {}
-    fills: list[DurableFillRecord] = []
-    fq_specs = _fq_specs()
-    if not with_post_terminal:
-        fq_specs = [s for s in fq_specs if s[0] not in FQ_POST_TERMINAL_IDS]
-    for n, (coid, station, day, lower) in enumerate(fq_specs):
-        ts = day_start_ns(day, 14) if day != "2026-10-06" else day_start_ns("2026-10-05", 17)
-        fills.append(
-            durable_fill(
-                venue_order_id=f"vo-{coid}",
-                client_order_id=coid,
-                instrument_id=slug(station, day, lower),
-                cost=Decimal("0.20"),
-                fee=Decimal("0.01"),
-                ts_event=ts + n,
-                trade_id=f"T-{coid}",
-            )
-        )
-        tmax[(station, day)] = lower + 1 if n % 5 == 0 else lower + 6
+    legacy = [_real_fill(r) for r in REAL_FILLS[:_N_LEGACY]]
+    fq = [
+        _real_fill(r)
+        for r in REAL_FILLS[_N_LEGACY:]
+        if with_post_terminal or r[0] not in FQ_POST_TERMINAL_IDS
+    ]
     legacy_pairs: list[tuple[DurableFillRecord, bool, str, str]] = []
     scored: dict[str, ScoredTrial] = {}
     scored_rows: list[ScoredTrial] = []
-    for n, (station, day, lower, no, is_scored, reconciled) in enumerate(_LEGACY):
-        fill = durable_fill(
-            venue_order_id=f"vo-L{n}",
-            client_order_id=f"O-L{n}",
-            instrument_id=slug(station, day, lower, no=no),
-            cost=Decimal("0.30"),
-            fee=Decimal("0.02"),
-            fee_reconciled=reconciled,
-            ts_event=day_start_ns(day, 15) + n,
-            trade_id=f"T-L{n}",
-        )
-        fills.append(fill)
-        station_day_key = n < 2
+    for n, fill in enumerate(legacy):
+        station, day = _station_day(fill.instrument_id)
+        station_day_key = n < 2  # SFO 09-11 and MIA 09-13: no instrument in the latch key
         legacy_pairs.append((fill, station_day_key, station, day))
-        tmax[(station, day)] = lower + 1
-        if is_scored:
+        if not station_day_key:  # the seven frozen ScoredTrials; the two residuals have none
             key = trial_id_for(_legacy_prefix(day), station, day, fill.instrument_id)
-            row = _scored_trial(fill, station, day, key, lower + 1)
+            row = _scored_trial(fill, station, day, key, REAL_TMAX[(station, day)])
             scored[key] = row
             scored_rows.append(row)
+    fills = [*legacy, *fq]
     seed_fills(exec_db, fills)
-    _write_fq_latches(exec_db, fq_specs)
+    _write_fq_latches(exec_db, fq)
     _write_legacy_latches(exec_db, legacy_pairs)
     write_scored_trials(
         scored_dir / "pm_us_crh_cont", scored_rows, now_ns=day_start_ns("2026-10-01")
@@ -265,7 +254,7 @@ def build_world(tmp_path: Path, *, with_post_terminal: bool = True) -> World:
         scored_dir=scored_dir,
         fills=tuple(sorted(fills, key=lambda f: f.ts_event)),
         scored=scored,
-        settlements=MapSettlements(tmax),
+        settlements=MapSettlements(dict(REAL_TMAX)),
         now_ns=now,
         post_terminal_ids=FQ_POST_TERMINAL_IDS if with_post_terminal else frozenset(),
     )

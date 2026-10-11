@@ -25,6 +25,7 @@ from typing import Any, Final
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
 from breezy.analysis.labeling.attribution import (
+    AttributionEvidence,
     BridgeBasis,
     PreEpochAttribution,
     Unresolved,
@@ -39,6 +40,7 @@ from breezy.analysis.labeling.delivery import DeliveryProof as LabelDeliveryProo
 from breezy.analysis.labeling.fq_scorer import FqFillInput
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.labeling.label_core import FamilyInfo, InputPlan, Planner
+from breezy.analysis.labeling.legacy_crh_scorer import LegacyFillInput
 from breezy.analysis.labeling.legacy_join import legacy_join
 from breezy.analysis.labeling.settlement_source import (
     RefusingSettlementSource,
@@ -46,6 +48,7 @@ from breezy.analysis.labeling.settlement_source import (
     settlement_source_for,
 )
 from breezy.analysis.labeling.verdicts import lag_start_ns as plain_lag_start_ns
+from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.persistence.autonomy import pins
 from breezy.persistence.autonomy.closure import ClosureUnavailable, closure_sha256
 from breezy.persistence.autonomy.label_store import LabelRow, oldest_marker_ns
@@ -80,6 +83,7 @@ ENTRY_MODULE: Final = "breezy.analysis.labeling.label_run"
 _UNPINNED_PLACEHOLDER: Final = "0" * 64
 _FQ_KIND: Final = "forecast_quantile_ladder"
 _NO_BACKFILL: Final = "no_backfill_family"
+_DOUBLE_CLAIM: Final = "legacy_trial_double_claim"
 _RETIRED: Final = "RETIRED"
 _DELIVERY_WRITER: Final = "aut2_label"
 _DELIVERY_DETAIL: Final = "label_run"
@@ -136,7 +140,9 @@ def activation_ns(data_root: Path, now_ns: int) -> int:
     """The unit's first activation: its oldest run marker under the LIVE root, else this run.
 
     A ``--measure-peak`` run writes its markers under its own output root, never here, so it can
-    neither start nor move this anchor.
+    neither start nor move this anchor. Once a marker exists the anchor only ever moves BACK (an
+    older marker), never forward. Before the first marker every run anchors at its own clock: a run
+    that writes no marker leaves the next one its own ``now`` (a later start, lenient toward pass).
     """
     oldest = oldest_marker_ns(data_root)
     return now_ns if oldest is None else oldest
@@ -149,6 +155,10 @@ class LagRule:
     The plain rule is ``min(first settlement record, settlement deadline)``. A fill that predates
     ``activation_ns`` could not have been labelled before the unit existed, so its clock starts at
     ``max(plain rule, activation_ns)``; a later fill keeps the plain rule.
+
+    ``first_record_ns`` is ``None`` by design: the unit reads no per-fill settlement-record time, so
+    the plain rule is the settlement deadline alone (``min(None, deadline)``): a deadline-only
+    start, never earlier than the true first record, conservative toward pass.
     """
 
     activation_ns: int
@@ -181,13 +191,23 @@ def family_infos(manifests: Sequence[FamilyManifest]) -> tuple[FamilyInfo, ...]:
     return tuple(infos)
 
 
+@dataclass(frozen=True)
+class _Classified:
+    """What the planner decided for one fill: a planned input, or why it cannot be planned."""
+
+    kind: str | None = None
+    fill_input: FqFillInput | LegacyFillInput | None = None
+    reason: str | None = None
+    straddle: bool = False
+
+
 def build_planner(
     *,
     exec_db: Path,
     venue: str,
     manifests: Sequence[FamilyManifest],
     families: Sequence[FamilyInfo],
-    evidence: Any,
+    evidence: AttributionEvidence,
     scored_trials: Mapping[str, ScoredTrial],
     release_ns: Callable[[DurableFillRecord], int],
     lag_rule: LagRule,
@@ -203,43 +223,51 @@ def build_planner(
     kind_of = {m.family_id: m.composition_kind for m in manifests}
     lag_kinds = frozenset(f.kind for f in families if not f.retired)
 
+    def _classify(fill: DurableFillRecord) -> _Classified:
+        outcome = attribute_fill(fill, evidence, manifests, venue=venue, trial_key_exists=exists)
+        if isinstance(outcome, Unresolved) and outcome.reason == _NO_BACKFILL:
+            joined = legacy_join(
+                fill, manifests, exec_db=exec_db, venue=venue, scored_by_trial_id=scored_trials
+            )
+            if joined is not None:
+                return _Classified(kind=joined.kind, fill_input=joined.fill_input)
+        if isinstance(outcome, Unresolved):
+            return _Classified(reason=outcome.reason)
+        if kind_of.get(label_family_of(outcome)) != _FQ_KIND:
+            return _Classified(reason="family_kind_not_fq")
+        straddle = (
+            isinstance(outcome, PreEpochAttribution)
+            and outcome.basis is BridgeBasis.BRIDGE_POST_TERMINAL
+        )
+        fq_input = FqFillInput(
+            fill=fill, attribution=outcome, scheduled_release_at_ns=release_ns(fill)
+        )
+        return _Classified(kind=_FQ_KIND, fill_input=fq_input, straddle=straddle)
+
     def plan(fills: Sequence[DurableFillRecord]) -> InputPlan:
-        inputs: dict[str, list[Any]] = {}
+        inputs: dict[str, list[FqFillInput | LegacyFillInput]] = {}
         fill_kinds: dict[str, str] = {}
         unresolved = []
         unresolved_keys: set[str] = set()
+        consumed: set[str] = set()  # legacy trial ids already claimed by a fill of this run
         straddle = 0
         for fill in fills:
-            outcome = attribute_fill(
-                fill, evidence, manifests, venue=venue, trial_key_exists=exists
-            )
-            if isinstance(outcome, Unresolved) and outcome.reason == _NO_BACKFILL:
-                joined = legacy_join(
-                    fill, manifests, exec_db=exec_db, venue=venue, scored_by_trial_id=scored_trials
-                )
-                if joined is not None:
-                    inputs.setdefault(joined.kind, []).append(joined.fill_input)
-                    fill_kinds[fill.client_order_id] = joined.kind
-                    continue
-            if isinstance(outcome, Unresolved):
-                unresolved.append(unresolved_row_of(fill, None, (outcome.reason,)))
+            result = _classify(fill)
+            planned = result.fill_input
+            reason = result.reason
+            if isinstance(planned, LegacyFillInput):
+                if planned.trial_id in consumed:
+                    # one legacy trial is ONE fill's P&L: a second claimant would count twice
+                    reason = _DOUBLE_CLAIM
+                else:
+                    consumed.add(planned.trial_id)
+            if reason is not None or planned is None or result.kind is None:
+                unresolved.append(unresolved_row_of(fill, None, (reason or _NO_BACKFILL,)))
                 unresolved_keys.add(fill.venue_order_id)
                 continue
-            if kind_of.get(label_family_of(outcome)) != _FQ_KIND:
-                unresolved.append(unresolved_row_of(fill, None, ("family_kind_not_fq",)))
-                unresolved_keys.add(fill.venue_order_id)
-                continue
-            if (
-                isinstance(outcome, PreEpochAttribution)
-                and outcome.basis is BridgeBasis.BRIDGE_POST_TERMINAL
-            ):
-                straddle += 1
-            inputs.setdefault(_FQ_KIND, []).append(
-                FqFillInput(
-                    fill=fill, attribution=outcome, scheduled_release_at_ns=release_ns(fill)
-                )
-            )
-            fill_kinds[fill.client_order_id] = _FQ_KIND
+            straddle += result.straddle
+            inputs.setdefault(result.kind, []).append(planned)
+            fill_kinds[fill.client_order_id] = result.kind
         backlog = sum(
             1
             for f in fills
@@ -283,7 +311,7 @@ class StationCatalogSettlements:
             source = self._sources[station] = settlement_source_for(self._venue, catalog)
         return source
 
-    def record(self, station: str, climate_day: dt.date) -> Any:
+    def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
         probe = settlement_source_for(self._venue, None)
         if isinstance(probe, RefusingSettlementSource):
             return probe.record(station, climate_day)  # raises SettlementSourceRefused

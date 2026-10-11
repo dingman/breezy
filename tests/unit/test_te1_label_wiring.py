@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import dataclasses
 import datetime as dt
+import json
 import os
 import re
 import subprocess
@@ -26,7 +28,12 @@ import pytest
 
 from breezy.analysis.autonomy.offline_plugins import OFFLINE_PLUGINS
 from breezy.analysis.labeling import settlement_source, unit_factory_default, unit_wiring
-from breezy.analysis.labeling.attribution import BridgeBasis, PreEpochAttribution
+from breezy.analysis.labeling.attribution import (
+    BridgeBasis,
+    PreEpochAttribution,
+    fq_rung_id,
+    latch_key_exists,
+)
 from breezy.analysis.labeling.constants import LABEL_MEMORY_TARGET_GIB
 from breezy.analysis.labeling.epoch import C1Epoch
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
@@ -45,6 +52,7 @@ from breezy.analysis.labeling.legacy_join import (
     legacy_join,
 )
 from breezy.analysis.labeling.memory_gate import label_slot_held
+from breezy.analysis.labeling.proof_source import collect_day_evidence
 from breezy.analysis.labeling.settlement_source import NwsCliFinal, RefusingSettlementSource
 from breezy.analysis.labeling.unit_factory_default import FactorySeams
 from breezy.analysis.labeling.unit_wiring import (
@@ -67,9 +75,11 @@ from breezy.persistence.autonomy.label_store import (
     admissible_rows,
     oldest_marker_ns,
     read_labels,
+    write_labels,
     write_marker,
 )
 from breezy.persistence.catalog import station_catalog_path
+from breezy.persistence.family_manifest import FamilyManifestError
 from breezy.runtime.health import LoggingAlertSink
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
@@ -78,11 +88,13 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
 )
-from tests.support.aut2_fixtures import durable_fill, seed_fills
+from tests.support.aut2_fixtures import durable_fill, make_label_row, seed_fills
 from tests.support.aut2_run_fixtures import Sink, verdict_wires
 from tests.support.te1_fixtures import (
     FAMILIES_DIR,
     FQ_POST_TERMINAL_IDS,
+    FQ_WIN_COIDS,
+    LEGACY_COIDS,
     MapSettlements,
     World,
     build_world,
@@ -90,6 +102,7 @@ from tests.support.te1_fixtures import (
     load_repo_manifests,
     slug,
 )
+from tests.support.te1_real_ledger import FQ_RUNG_IDS, REAL_FILLS, REAL_TMAX
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _IN_UNIT = UnitContext(invocation_id="inv-1", cgroup_path=f"/user.slice/{LABEL_UNIT}.service")
@@ -215,7 +228,7 @@ def _patch_production_seams(
     monkeypatch: pytest.MonkeyPatch, world: World, tmp_path: Path, **over: Any
 ) -> FactorySeams:
     seams = _seams(world, tmp_path, **over)
-    monkeypatch.setattr(unit_factory_default, "default_seams", lambda: seams)
+    monkeypatch.setattr(unit_factory_default, "default_seams", lambda measure=False: seams)
     monkeypatch.setattr(
         settlement_source, "read_climate_day_including_corrections", _CatalogReader(world)
     )
@@ -234,6 +247,17 @@ def _run_args(world: World) -> list[str]:
 
 
 # -- the planner (R11, legacy join) ---
+
+
+def test_production_evidence_satisfies_the_c1_lookup_the_attribution_calls(
+    world: World,
+) -> None:
+    """The production ``C1Epoch`` is what ``attribute_fill`` is handed; a POST_EPOCH fill calls
+    ``order_links`` on it, so it must exist (a missing method would crash the first live
+    post-epoch fill, never a pre-epoch ledger)."""
+    evidence = C1Epoch(world.data_root, venue=_VENUE, family_id=_FQ_FAMILY)
+
+    assert evidence.order_links("O-unknown") == ()
 
 
 def test_planner_pre_epoch_fq_fill_bridges_to_v1(tmp_path: Path) -> None:
@@ -274,11 +298,17 @@ def test_planner_legacy_crh_fill_joins_frozen_scored_trial(world: World) -> None
     ]
     by_coid = {i.fill.client_order_id: i for i in legacy}
     assert len(legacy) == 9
-    mdw = by_coid["O-L2"]  # MDW 2026-09-15: inside pm_us_crh_cont's window, instrument-keyed latch
+    mdw = by_coid[
+        LEGACY_COIDS[2]
+    ]  # MDW 2026-09-15: inside pm_us_crh_cont's window, instrument-keyed latch
     assert mdw.label_family == "pm_us_crh_cont"
     assert mdw.scored is world.scored[mdw.trial_id]
-    assert by_coid["O-L5"].trial_id.startswith("continuous_rung_hold/trial/SFO/2026-09-15/")
-    assert by_coid["O-L7"].label_family == "pm_us_crh_v4"  # 2026-09-21: after pm_us_crh_cont ended
+    assert by_coid[LEGACY_COIDS[5]].trial_id.startswith(
+        "continuous_rung_hold/trial/SFO/2026-09-15/"
+    )
+    assert (
+        by_coid[LEGACY_COIDS[7]].label_family == "pm_us_crh_v4"
+    )  # 2026-09-21: after pm_us_crh_cont ended
     assert sum(1 for i in legacy if i.scored is not None) == 7
 
 
@@ -287,11 +317,14 @@ def test_planner_residual_fill_gets_null_pnl_legacy_row_not_missing(world: World
 
     assert result.coverage is not None and result.coverage.missing_label == 0
     rows = {r.client_order_id: r for r in read_labels(world.data_root)}
-    for coid in ("O-L0", "O-L1"):  # the two residual fills: station-day keys, no ScoredTrial
+    for coid in (
+        LEGACY_COIDS[0],
+        LEGACY_COIDS[1],
+    ):  # the two residual fills: station-day keys, no ScoredTrial
         assert rows[coid].scorer_id == "legacy_crh/v1"
         assert rows[coid].realized_pnl is None
         assert rows[coid].excluded_reason is ExcludedReason.UNATTRIBUTED
-    assert rows["O-L2"].realized_pnl is not None
+    assert rows[LEGACY_COIDS[2]].realized_pnl is not None
 
 
 def test_planner_unbridgeable_fill_is_unresolved(tmp_path: Path) -> None:
@@ -309,6 +342,40 @@ def test_planner_unbridgeable_fill_is_unresolved(tmp_path: Path) -> None:
     assert [r.rule_outcomes for r in plan.unresolved] == [("no_backfill_family",)]
     assert plan.unresolved_fill_keys == frozenset({"vo-stray"})
     assert "O-stray" not in plan.fill_kinds
+
+
+def test_planner_second_fill_claiming_a_consumed_legacy_trial_is_unresolved(world: World) -> None:
+    """D4: a legacy trial is the P&L of ONE fill. A second fill of the same station-day-keyed
+    trial (null latch venueOrderId, same instrument) is marked, never labelled a second time."""
+    first = next(f for f in world.fills if f.client_order_id == LEGACY_COIDS[0])
+    twin = durable_fill(
+        venue_order_id="vo-twin",
+        client_order_id="O-twin",
+        instrument_id=first.instrument_id,
+        cost=first.cumulative_cost,
+        fee=first.cumulative_fee,
+        ts_event=first.ts_event + 60 * 1_000_000_000,
+    )
+    seed_fills(world.exec_db, [twin])
+
+    plan = _planner(world)((*world.fills, twin))
+
+    legacy = [
+        i
+        for k in ("current_rung_hold", "continuous_rung_hold")
+        for i in plan.inputs_by_kind.get(k, ())
+    ]
+    claimed = [
+        i.fill.client_order_id for i in legacy if i.trial_id == legacy_trial_of(first, legacy)
+    ]
+    assert claimed == [LEGACY_COIDS[0]]
+    assert [r.rule_outcomes for r in plan.unresolved] == [("legacy_trial_double_claim",)]
+    assert plan.unresolved_fill_keys == frozenset({"vo-twin"})
+    assert "O-twin" not in plan.fill_kinds
+
+
+def legacy_trial_of(fill: Any, legacy: list[Any]) -> str:
+    return next(i.trial_id for i in legacy if i.fill.client_order_id == fill.client_order_id)
 
 
 def test_planner_disagreement_fails_the_run_closed(tmp_path: Path) -> None:
@@ -367,7 +434,9 @@ def _legacy_fill_with_latch(
 
 
 def test_legacy_join_matches_latch_row_with_null_venue_order_id(world: World) -> None:
-    fill = next(f for f in world.fills if f.client_order_id == "O-L0")  # SFO 2026-09-11 shape
+    fill = next(
+        f for f in world.fills if f.client_order_id == LEGACY_COIDS[0]
+    )  # SFO 2026-09-11 shape
 
     joined = legacy_join(
         fill,
@@ -420,8 +489,28 @@ def test_legacy_join_refuses_when_non_null_venue_order_id_disagrees(tmp_path: Pa
         )
 
 
+def test_legacy_join_reads_a_store_whose_path_needs_uri_escaping(tmp_path: Path) -> None:
+    """P2: the read-only URI is built with ``Path.as_uri()``, so ``#``, ``?`` and spaces in the
+    path cannot truncate or re-interpret it."""
+    awkward = tmp_path / "a#b ?c"
+    awkward.mkdir()
+    world = build_world(awkward)
+    fill = next(f for f in world.fills if f.client_order_id == LEGACY_COIDS[0])
+
+    joined = legacy_join(
+        fill,
+        load_repo_manifests(),
+        exec_db=world.exec_db,
+        venue=_VENUE,
+        scored_by_trial_id=world.scored,
+    )
+
+    assert joined is not None
+    assert joined.fill_input.trial_id == "current_rung_hold/trial/SFO/2026-09-11"
+
+
 def test_legacy_join_returns_none_for_a_fill_with_no_legacy_latch(world: World) -> None:
-    fill = next(f for f in world.fills if f.client_order_id == "O-FQ-03-0")
+    fill = next(f for f in world.fills if f.client_order_id == FQ_WIN_COIDS[0])
 
     assert (
         legacy_join(
@@ -613,22 +702,69 @@ def test_unpinned_producer_refuses_with_exit_2(
         unit_factory_default.factory(_args(world), _seams(world, tmp_path))
 
 
-def test_default_mode_outside_the_real_unit_never_touches_the_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def _families_dir_with(tmp_path: Path, *, break_fq: bool = False, junk: str | None = None) -> Path:
+    target = tmp_path / "families"
+    target.mkdir()
+    for path in FAMILIES_DIR.glob("*.json"):
+        text = path.read_text(encoding="utf-8")
+        if break_fq and path.name == "pm_us_crh_fq_v1.json":
+            text = json.dumps({k: v for k, v in json.loads(text).items() if k != "stations"})
+        (target / path.name).write_text(text, encoding="utf-8")
+    if junk is not None:
+        (target / "zz_junk.json").write_text(junk, encoding="utf-8")
+    return target
+
+
+def test_load_manifests_skips_a_boundary_artefact_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An injected in-unit context cannot make the production host seams readable: the default
-    seams re-check the REAL process context, and this process is a test, not the label unit.
+    manifests = unit_factory_default._load_manifests(_families_dir_with(tmp_path))
 
-    Without the check, a pinned ``label_run`` run from a test would take the host studies flock,
-    write a hold journal into the live data root and page the operator (it did, once, in the
-    gate): the tripwire below fails the test BEFORE any such write if the check is ever dropped.
-    """
-    monkeypatch.setattr(unit_wiring, "producer_pin_state", lambda: _PINNED)
+    assert "pm_us_crh_fq_v1" in {m.family_id for m in manifests}
+    assert "AUT2 MANIFEST_SKIPPED path=" in capsys.readouterr().out
 
+
+def test_load_manifests_refuses_a_broken_fq_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = _families_dir_with(tmp_path, break_fq=True)
+
+    with pytest.raises(FamilyManifestError):
+        unit_factory_default._load_manifests(broken)
+    assert "AUT2 MANIFEST_SKIPPED path=" in capsys.readouterr().out
+
+
+def test_load_manifests_refuses_an_unparseable_json(tmp_path: Path) -> None:
+    with pytest.raises(FamilyManifestError):
+        unit_factory_default._load_manifests(_families_dir_with(tmp_path, junk="{not json"))
+
+
+_NOT_A_UNIT = UnitContext(invocation_id=None, cgroup_path="/user.slice/session-1.scope")
+_TRANSIENT = UnitContext(invocation_id="inv-9", cgroup_path="/user.slice/run-rabc.service")
+
+
+def _tripwire_flock(monkeypatch: pytest.MonkeyPatch) -> None:
     def tripwire(self: StudiesFlock, wait_s: float) -> bool:
         raise AssertionError("the production factory reached the host studies flock")
 
     monkeypatch.setattr(StudiesFlock, "acquire", tripwire)
+
+
+@pytest.mark.parametrize("real", [_NOT_A_UNIT, _TRANSIENT], ids=["login-scope", "run-transient"])
+def test_default_mode_outside_the_real_unit_never_touches_the_host(
+    real: UnitContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An injected in-unit context cannot make the production host seams readable. The real
+    process context is pinned here (host independent): neither a login scope nor a systemd-run
+    ``run-r<hex>.service`` transient unit (a unit-launched gate) is the label unit, so default
+    mode refuses before any host read; the tripwire fails the test BEFORE a live write."""
+    monkeypatch.setattr(unit_wiring, "producer_pin_state", lambda: _PINNED)
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: real))
+    monkeypatch.setenv("INVOCATION_ID", "inv-9")
+    _tripwire_flock(monkeypatch)
     data_root = tmp_path / "d"
     data_root.mkdir(mode=0o700)
 
@@ -638,8 +774,77 @@ def test_default_mode_outside_the_real_unit_never_touches_the_host(
 
     assert rc == 2 and "LABEL_OUTCOMES REFUSED reason=not_under_unit" in capsys.readouterr().out
     assert list(data_root.iterdir()) == []
+
+
+def test_context_allows_label_unit_in_default_mode_and_transient_only_for_measure() -> None:
+    allows = unit_factory_default.context_allows
+    assert allows(_IN_UNIT, measure=False)
+    assert allows(_IN_UNIT, measure=True)
+    assert not allows(_TRANSIENT, measure=False)
+    assert allows(_TRANSIENT, measure=True)
+    assert not allows(_NOT_A_UNIT, measure=False)
+    assert not allows(_NOT_A_UNIT, measure=True)
+
+
+@pytest.mark.parametrize("measure", [False, True])
+def test_default_seams_refuse_under_pytest_even_in_the_label_unit(
+    measure: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a (patched) perfect unit context cannot unlock the host seams inside a test run."""
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _IN_UNIT))
+    with pytest.raises(HostSeamsRefused):
+        unit_factory_default.default_seams(measure)
+
+
+def test_default_seams_check_the_real_context_before_reading_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the pytest guard lifted (the unit case), the context decides; the host read is a
+    sentinel so nothing live is touched."""
+    sentinel = object()
+    monkeypatch.setattr(unit_factory_default, "_under_pytest", lambda: False)
+    monkeypatch.setattr(unit_factory_default, "_host_seams", lambda: sentinel)
+
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _TRANSIENT))
     with pytest.raises(HostSeamsRefused):
         unit_factory_default.default_seams()
+    assert unit_factory_default.default_seams(True) is sentinel
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _NOT_A_UNIT))
+    with pytest.raises(HostSeamsRefused):
+        unit_factory_default.default_seams(True)
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _IN_UNIT))
+    assert unit_factory_default.default_seams() is sentinel
+
+
+def test_default_seams_refuse_on_pytest_env_marker_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _IN_UNIT))
+    monkeypatch.delitem(sys.modules, "pytest")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "x::y (call)")
+    with pytest.raises(HostSeamsRefused):
+        unit_factory_default.default_seams()
+
+
+def test_measure_path_refuses_host_seams_under_pytest(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(unit_wiring, "producer_pin_state", lambda: _PINNED)
+    monkeypatch.setattr(UnitContext, "current", staticmethod(lambda: _TRANSIENT))
+    _tripwire_flock(monkeypatch)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemAvailable:   40000000 kB\n")
+    seams = MeasureSeams(meminfo, lambda: 0, "0::/user.slice/run-rabc.service\n", tmp_path / "cg")
+
+    rc = main(
+        ["--measure-peak", "--output-root", str(tmp_path / "out"), *_run_args(world)],
+        unit_context=_TRANSIENT,
+        measure_seams=seams,
+    )
+
+    assert rc == 2
+    assert "LABEL_OUTCOMES REFUSED reason=not_under_unit" in capsys.readouterr().out
 
 
 def test_measure_peak_with_unpinned_producer_fails_closed(
@@ -695,6 +900,27 @@ def test_main_under_unit_runs_production_factory(
     lag = [v for v in verdict_wires(world.data_root) if v.get("detector") == "aut2.label_lag"]
     assert lag and {v["outcome"] for v in lag} == {"PASS"}
     assert {v["producer_code_sha"] for v in lag} == {"ab" * 32}
+
+
+def test_corrupt_marker_directory_refuses_with_marker_corrupt(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P4: an unparseable marker name makes the lag anchor untrustworthy; the unit refuses
+    (exit 2, ``reason=marker_corrupt``) instead of crashing or taking this run's clock."""
+    _patch_production_seams(monkeypatch, world, tmp_path)
+    monkeypatch.setattr(unit_wiring, "producer_pin_state", lambda: _PINNED)
+    bad = world.data_root / "derived" / "label_outcomes" / "2026-10-05" / "marker_notanumber.json"
+    bad.parent.mkdir(parents=True, mode=0o700)
+    bad.write_text("{}")
+
+    rc = main(_run_args(world), unit_context=_IN_UNIT)
+
+    assert rc == 2
+    assert "LABEL_OUTCOMES REFUSED reason=marker_corrupt" in capsys.readouterr().out
+    assert read_labels(world.data_root) == ()
 
 
 def test_label_run_unit_wiring_and_factory_import_standalone() -> None:
@@ -761,6 +987,35 @@ def test_lag_anchor_ignores_measure_output_root_markers(tmp_path: Path) -> None:
     fresh = tmp_path / "fresh"
     fresh.mkdir(mode=0o700)
     assert activation_ns(fresh, now_ns=10_000) == 10_000  # no marker yet: this run's own clock
+
+
+def test_lag_anchor_never_moves_forward_once_a_marker_exists(tmp_path: Path) -> None:
+    """D5: the anchor is the OLDEST marker ever written; later runs and later markers (any day,
+    any write order) cannot move it, and only an older marker could move it back."""
+    marker = RunMarker(RunOutcome.LABELLED, 1, None, 1, 0, 0, 0, 0, 0, 0, 0, 0)
+    write_marker(tmp_path, marker, day="2026-10-07", now_ns=900)
+    seen = [activation_ns(tmp_path, now_ns=50_000)]
+    write_marker(tmp_path, marker, day="2026-10-05", now_ns=500)
+    seen.append(activation_ns(tmp_path, now_ns=60_000))
+    write_marker(tmp_path, marker, day="2026-10-06", now_ns=700)
+    write_marker(tmp_path, marker, day="2026-10-11", now_ns=2_000)
+    seen.append(activation_ns(tmp_path, now_ns=70_000))
+
+    assert seen == [900, 500, 500]
+    assert seen == sorted(seen, reverse=True)  # never forward
+
+
+def test_lag_rule_without_a_first_record_starts_at_the_deadline(world: World) -> None:
+    """``first_record_ns=None`` is deliberate: the unit has no per-fill settlement-record timestamp
+    to read, so the plain rule degrades to ``min(None, deadline) == deadline`` (deadline-only start,
+    which can only start a clock later than the true first record: lenient toward pass)."""
+    fill = world.fills[-1]
+    deadline = fill_deadline_ns(_VENUE)(fill)
+
+    rule = LagRule(activation_ns=0, deadline_of=fill_deadline_ns(_VENUE))
+
+    assert rule.first_record_ns(fill) is None
+    assert rule(fill) == deadline
 
 
 def test_oldest_marker_ns_raises_on_corrupt_name(tmp_path: Path) -> None:
@@ -860,22 +1115,184 @@ def _portfolio_roi_module() -> Any:
     return portfolio_roi_module()
 
 
-def test_post_terminal_rows_excluded_from_every_label_consumer(tmp_path: Path) -> None:
-    """Adding the five straddle fills moves the P&L consumer and nothing else: no row of them is
-    admissible, so ``admissible_rows`` (the only statistics selector) is unchanged."""
+_FQ_FAMILY = "pm_us_crh_fq_v1"
+_CONTROL_COID = "O-CONTROL"
+_STRADDLE_UTC_DAY = "2026-10-05"  # the five 2026-10-06 fills were sent on this UTC day
+
+
+def _seed_admissible_control(world: World) -> None:
+    """One ADMISSIBLE entry row (a C1-decision FQ label) next to the run's own rows."""
+    control = make_label_row(
+        label_id="9" * 32, client_order_id=_CONTROL_COID, trade_id="T-CONTROL", family_id=_FQ_FAMILY
+    )
+    write_labels(world.data_root, _FQ_FAMILY, [control], now_ns=world.now_ns + 1)
+
+
+def _labelled_worlds(tmp_path: Path) -> tuple[World, World]:
     with_five = build_world(tmp_path / "a")
     without = build_world(tmp_path / "b", with_post_terminal=False)
+    for world in (with_five, without):
+        run_labels(_deps(world))
+        _seed_admissible_control(world)
+    return with_five, without
 
-    run_labels(_deps(with_five))
-    run_labels(_deps(without))
 
+def _assert_selector_returns_only_the_control(rows: tuple[Any, ...]) -> None:
+    assert [r.client_order_id for r in admissible_rows(rows)] == [_CONTROL_COID]
+
+
+def test_post_terminal_rows_excluded_from_every_label_consumer(tmp_path: Path) -> None:
+    """Adding the five straddle fills moves coverage and nothing else: the one admissible control
+    row is the whole P&L input in BOTH worlds, through the selector and through the report's
+    ``_LabelView``; ``proof_source`` counts the five only as coverage."""
+    with_five, without = _labelled_worlds(tmp_path)
     rows_with = read_labels(with_five.data_root)
     rows_without = read_labels(without.data_root)
+
     five = [r for r in rows_with if r.client_order_id in FQ_POST_TERMINAL_IDS]
     assert len(five) == 5 and len(rows_with) - len(rows_without) == 5
     assert all(not r.admissible and r.excluded_reason is ExcludedReason.UNATTRIBUTED for r in five)
     assert all(r.decision_id is None for r in five)
-    assert admissible_rows(rows_with) == admissible_rows(rows_without) == ()
+    # 1. the one statistics selector: exactly the control, with and without the five
+    _assert_selector_returns_only_the_control(rows_with)
+    _assert_selector_returns_only_the_control(rows_without)
+    assert admissible_rows(rows_with) == admissible_rows(rows_without)
+    # 2. the report's label view: the five are rows (coverage) but never a C2 P&L row
+    prr = _portfolio_roi_module()
+    for world in (with_five, without):
+        view = prr._read_label_view(world.data_root, world.now_ns)
+        assert [r.client_order_id for r in view.c2_rows()] == [_CONTROL_COID]
+    view = prr._read_label_view(with_five.data_root, with_five.now_ns)
+    assert FQ_POST_TERMINAL_IDS <= {r.client_order_id for r in view.rows}
+    assert FQ_POST_TERMINAL_IDS <= view.final_client_orders
+    assert not FQ_POST_TERMINAL_IDS & {r.client_order_id for r in view.c2_rows()}
+    # 3. proof_source: coverage only (final_labelled / non_c1_entry_rows), never admissible input
+    evidence = {
+        label: collect_day_evidence(
+            w.data_root,
+            exec_db=w.exec_db,
+            venue=_VENUE,
+            family_id=_FQ_FAMILY,
+            day=_STRADDLE_UTC_DAY,
+            lag_start_ns=lambda f: f.ts_event,
+            now_ns=w.now_ns,
+        )
+        for label, w in (("with", with_five), ("without", without))
+    }
+    assert (evidence["without"].real_fills, evidence["without"].final_labelled) == (0, 0)
+    assert evidence["without"].non_c1_entry_rows == 0
+    assert evidence["with"].real_fills == evidence["with"].final_labelled == 5
+    assert evidence["with"].non_c1_entry_rows == 5
+    assert evidence["with"].no_leg_fills == evidence["with"].exit_fills == 0
+    day_coids = {
+        f.client_order_id for f in with_five.fills if f.client_order_id in FQ_POST_TERMINAL_IDS
+    }
+    assert not day_coids & {r.client_order_id for r in admissible_rows(rows_with)}
+
+
+def test_negative_control_an_admissible_straddle_row_fails_the_exclusion_check(
+    tmp_path: Path,
+) -> None:
+    """The mutation evidence for the test above: flip ONE straddle row to admissible and the same
+    assertions must fail on the selector, the C2 view and the evidence cross-check."""
+    with_five, _ = _labelled_worlds(tmp_path)
+    rows = read_labels(with_five.data_root)
+    victim = next(r for r in rows if r.client_order_id in FQ_POST_TERMINAL_IDS)
+    flipped = tuple(
+        dataclasses.replace(r, admissible=True, excluded_reason=None) if r is victim else r
+        for r in rows
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_selector_returns_only_the_control(flipped)
+    prr = _portfolio_roi_module()
+    view = prr._LabelView(gate_status=None, rows=flipped, final_client_orders=frozenset())
+    assert victim.client_order_id in {r.client_order_id for r in view.c2_rows()}
+
+
+def _expected_net(fill: Any) -> tuple[Decimal, bool]:
+    """``(payout - cost - fee, won)`` from the rung grammar and the settled high (L-44)."""
+    station, day = _station_day_of(fill.instrument_id)
+    facts = bucket_facts_from_instrument_id(fill.instrument_id)
+    assert facts is not None
+    inside = facts.contains(REAL_TMAX[(station, day)])
+    won = (not inside) if "^no" in fill.instrument_id else inside
+    payout = Decimal(1) if won else Decimal(0)
+    return payout - fill.cumulative_cost - fill.cumulative_fee, won
+
+
+def _station_day_of(instrument_id: str) -> tuple[str, str]:
+    m = re.match(r"tc-temp-([a-z]+)high-(\d{4}-\d{2}-\d{2})-", instrument_id)
+    assert m is not None
+    return m[1].upper(), m[2]
+
+
+def _tally(items: list[tuple[Decimal, bool]]) -> tuple[int, int, Decimal]:
+    return len(items), sum(1 for _, won in items if won), sum((n for n, _ in items), Decimal(0))
+
+
+def test_labelled_pnl_matches_payout_minus_cost_minus_fee_and_stage0_aggregates(
+    world: World,
+) -> None:
+    """D3: every label row's P&L is the independent settlement arithmetic, and the real ledger's
+    aggregates reproduce (FQ 25/2/-2.17, Sep 9/2/-0.46, NO 3/1/+0.65, total 34/4/-2.63)."""
+    run_labels(_deps(world))
+    rows = {r.client_order_id: r for r in read_labels(world.data_root)}
+    expected = {f.client_order_id: _expected_net(f) for f in world.fills}
+
+    assert set(rows) == set(expected) and len(rows) == 34
+    for coid, (net, _won) in expected.items():
+        if coid in LEGACY_COIDS[:2]:  # residual legacy fills carry no P&L (no ScoredTrial)
+            assert rows[coid].realized_pnl is None, coid
+        else:
+            assert rows[coid].realized_pnl == net, coid
+    fq = [expected[c] for c in expected if c not in LEGACY_COIDS]
+    sep = [expected[c] for c in LEGACY_COIDS]
+    no = [expected[f.client_order_id] for f in world.fills if "^no" in f.instrument_id]
+    assert _tally(fq) == (25, 2, Decimal("-2.17"))
+    assert _tally(sep) == (9, 2, Decimal("-0.46"))
+    assert _tally(no) == (3, 1, Decimal("0.65"))
+    assert _tally(list(expected.values())) == (34, 4, Decimal("-2.63"))
+    labelled_fq = sum((rows[c].realized_pnl for c in expected if c not in LEGACY_COIDS), Decimal(0))
+    assert labelled_fq == Decimal("-2.17")
+    scored_sep = sum((rows[c].realized_pnl for c in LEGACY_COIDS[2:]), Decimal(0))
+    assert scored_sep == Decimal("-0.54")  # the 7 frozen ScoredTrials; residual +0.08 -> -0.46
+    wins = {c for c, (_, won) in expected.items() if won}
+    assert set(FQ_WIN_COIDS) <= wins
+    assert [expected[c][0] for c in FQ_WIN_COIDS] == [Decimal("0.88"), Decimal("0.50")]
+
+
+def test_fq_rung_ids_of_the_real_ledger_match_the_production_grammar() -> None:
+    """D2: the hard-coded latch rung ids are what ``fq_rung_id`` derives; the open-lower rungs
+    are ``lt_<N-1>`` (lt70f -> lt_69, lt92f -> lt_91), the real latch keys of 2026-10-06."""
+    for row in REAL_FILLS:
+        coid, instrument_id = row[0], row[1]
+        if coid not in FQ_RUNG_IDS:
+            continue
+        facts = bucket_facts_from_instrument_id(instrument_id)
+        assert facts is not None
+        assert FQ_RUNG_IDS[coid] == fq_rung_id(facts.lower_f, facts.upper_f), instrument_id
+    by_slug = {row[1]: FQ_RUNG_IDS[row[0]] for row in REAL_FILLS if row[0] in FQ_RUNG_IDS}
+    assert by_slug["tc-temp-mdwhigh-2026-10-06-lt70f.POLYMARKET_US"] == "lt_69"
+    assert by_slug["tc-temp-laxhigh-2026-10-06-lt92f.POLYMARKET_US"] == "lt_91"
+
+
+def test_open_lower_straddle_fills_are_latched_and_bridge_post_terminal(world: World) -> None:
+    plan = _planner(world)(world.fills)
+
+    straddle = {
+        i.fill.instrument_id: i
+        for i in plan.inputs_by_kind.get(_FQ_KIND, ())
+        if isinstance(i.attribution, PreEpochAttribution)
+        and i.attribution.basis is BridgeBasis.BRIDGE_POST_TERMINAL
+    }
+    for station, threshold in (("mdw", 70), ("lax", 92)):
+        found = straddle[f"tc-temp-{station}high-2026-10-06-lt{threshold}f.POLYMARKET_US"]
+        assert found.attribution.storage_key == _FQ_FAMILY
+        day_key = f"forecast_quantile_ladder/trial/{station.upper()}/2026-10-06"
+        assert latch_key_exists(world.exec_db, f"{day_key}/lt_{threshold - 1}:yes.POLYMARKET_US")
+        assert not latch_key_exists(world.exec_db, f"{day_key}/lt_{threshold}:yes.POLYMARKET_US")
+    assert len(straddle) == 5
 
 
 def test_not_wired_refusal_is_gone_from_src_and_tests() -> None:

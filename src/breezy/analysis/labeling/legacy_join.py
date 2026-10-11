@@ -60,7 +60,7 @@ class LegacyJoin:
 
 def _read_latches(exec_db: Path, keys: Sequence[str]) -> dict[str, TrialDayRecord]:
     """The taken latch records among ``keys``, read through a ``mode=ro`` URI."""
-    conn = sqlite3.connect(f"file:{exec_db.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"{exec_db.absolute().as_uri()}?mode=ro", uri=True)
     try:
         conn.execute("PRAGMA query_only=ON")
         found: dict[str, TrialDayRecord] = {}

@@ -48,6 +48,7 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
 __all__ = [
     "UNRESOLVED_JOURNAL_DIR",
     "Attribution",
+    "AttributionEvidence",
     "BackfillRefused",
     "BridgeBasis",
     "C1Lookup",
@@ -268,9 +269,8 @@ def post_terminal_straddle(manifest: FamilyManifest, climate_day: str, ts_event_
 
     Covers the DATE and TIMESTAMP conditions only, not kind, venue, station or the stored latch
     key: ``climate_day`` is exactly the terminal day plus one, and the fill was sent inside the
-    terminal day's UTC span (``terminal 00:00Z <= ts < (terminal + 1 day) 00:00Z``). UTC midnight
-    precedes local midnight at every US station (UTC-4..UTC-10), so the bound is conservative. An
-    open manifest or a malformed date never straddles (fail closed).
+    terminal day's UTC span (``terminal 00:00Z <= ts < (terminal + 1 day) 00:00Z``). An open
+    manifest or a malformed date never straddles (fail closed).
     """
     if manifest.terminal_climate_day is None:
         return False
@@ -285,23 +285,19 @@ def post_terminal_straddle(manifest: FamilyManifest, climate_day: str, ts_event_
     return start <= ts_event_ns < start + _NS_PER_DAY
 
 
-def _trial_key_of(fill: DurableFillRecord) -> tuple[WeatherBucketFacts, str] | None:
-    """``(facts, stored latch key)`` of an FQ-shaped fill, or ``None`` when it is not bridgeable."""
-    facts = bucket_facts_from_instrument_id(fill.instrument_id)
-    if facts is None:
-        return None
+def _trial_key_of(fill: DurableFillRecord, facts: WeatherBucketFacts) -> str | None:
+    """The stored latch key of an FQ-shaped fill, or ``None`` when its rung is not bridgeable."""
     rung_id = fq_rung_id(facts.lower_f, facts.upper_f)
     if rung_id is None:
         return None
     leg = "no" if symbol_of_instrument_id(fill.instrument_id).endswith("^no") else "yes"
-    key = fq_trial_id(facts.settlement_station, facts.climate_day.isoformat(), rung_id, leg)
-    return facts, key
+    return fq_trial_id(facts.settlement_station, facts.climate_day.isoformat(), rung_id, leg)
 
 
 def _straddle_family(
     fill: DurableFillRecord,
+    facts: WeatherBucketFacts,
     manifests: Sequence[FamilyManifest],
-    climate_day: str,
     trial_key_exists: Callable[[str], bool],
     venue: str,
 ) -> str | None:
@@ -311,11 +307,11 @@ def _straddle_family(
     strict set of two or more never falls through. The stored latch key is checked last, and only
     when exactly one candidate survives.
     """
-    parsed = _trial_key_of(fill)
-    if parsed is None:
+    key = _trial_key_of(fill, facts)
+    if key is None:
         return None
-    facts, key = parsed
     station = facts.settlement_station
+    climate_day = facts.climate_day.isoformat()
     scoped = [
         m
         for m in manifests
@@ -355,11 +351,7 @@ def backfill_family(
     by_bridge = _bridge_family(fill, manifests, trial_key_exists, venue)
     facts = bucket_facts_from_instrument_id(fill.instrument_id)
     by_straddle = (
-        None
-        if facts is None
-        else _straddle_family(
-            fill, manifests, facts.climate_day.isoformat(), trial_key_exists, venue
-        )
+        None if facts is None else _straddle_family(fill, facts, manifests, trial_key_exists, venue)
     )
     bridge, basis = by_bridge, BridgeBasis.BRIDGE
     if by_bridge is None and by_straddle is not None:
@@ -376,13 +368,13 @@ def backfill_family(
     )
 
 
-class _Evidence(EpochReader, C1Lookup, Protocol):
+class AttributionEvidence(EpochReader, C1Lookup, Protocol):
     """Epoch reader and C1 lookup in one object (the production ``C1Epoch``)."""
 
 
 def attribute_fill(
     fill: DurableFillRecord,
-    evidence: _Evidence,
+    evidence: AttributionEvidence,
     manifests: Sequence[FamilyManifest],
     *,
     venue: str,

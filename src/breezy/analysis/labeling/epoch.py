@@ -201,6 +201,9 @@ class C1Epoch:
     def order_link(self, client_order_id: str) -> OrderLinkView | None:
         return self.c1().order_link(client_order_id)
 
+    def order_links(self, client_order_id: str) -> tuple[OrderLinkView, ...]:
+        return self.c1().order_links(client_order_id)
+
     def decision(self, decision_id: str) -> DecisionView | None:
         return self.c1().decision(decision_id)
 

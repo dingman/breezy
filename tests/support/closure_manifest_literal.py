@@ -15,7 +15,8 @@ __all__ = ["assert_pure_literal", "is_pure_literal"]
 
 
 def is_pure_literal(source: str) -> bool:
-    """A docstring, two ``from`` imports and ONE annotated ``MappingProxyType`` literal."""
+    """A docstring, two ``from`` imports and ONE annotated ``MappingProxyType`` literal whose keys
+    are strings and whose values are tuples of strings (data only, never an expression)."""
     body = ast.parse(source).body
     if [type(n) for n in body] != [ast.Expr, ast.ImportFrom, ast.ImportFrom, ast.AnnAssign]:
         return False
@@ -34,10 +35,15 @@ def is_pure_literal(source: str) -> bool:
     ):
         return False
     try:
-        ast.literal_eval(value.args[0])
+        data = ast.literal_eval(value.args[0])
     except ValueError:
         return False
-    return True
+    return isinstance(data, dict) and all(
+        isinstance(key, str)
+        and isinstance(names, tuple)
+        and all(isinstance(name, str) for name in names)
+        for key, names in data.items()
+    )
 
 
 def assert_pure_literal(path: Path) -> None:

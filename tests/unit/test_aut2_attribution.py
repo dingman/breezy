@@ -596,3 +596,20 @@ def test_station_utc_offsets_within_straddle_assumption() -> None:
             moment = dt.datetime(2026, month, 15, 12, tzinfo=ZoneInfo(tz[station]))
             hours = moment.utcoffset().total_seconds() / 3600  # type: ignore[union-attr]
             assert -10 <= hours <= -4, (station, month, hours)
+
+
+def test_straddle_family_differing_from_the_fold_champion_is_backfill_disagreement(
+    tmp_path: Path,
+) -> None:
+    """The straddle names pm_us_crh_fq_v1 while the champion fold says another family: refused."""
+    result = _backfill_p(tmp_path, (_v1(),), champion_at=lambda venue, ts: "pm_us_crh_someone_else")
+
+    assert result == Unresolved("backfill_disagreement")
+
+
+def test_straddle_family_agreeing_with_the_fold_champion_is_a_fold_attribution(
+    tmp_path: Path,
+) -> None:
+    result = _backfill_p(tmp_path, (_v1(),), champion_at=lambda venue, ts: "pm_us_crh_fq_v1")
+
+    assert result == PreEpochAttribution(storage_key="pm_us_crh_fq_v1", basis=BridgeBasis.FOLD)

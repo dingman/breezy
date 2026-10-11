@@ -9,6 +9,7 @@ import pytest
 from breezy.analysis.labeling import unit_wiring
 from breezy.persistence.autonomy import pins
 from breezy.persistence.autonomy.closure import closure_sha256
+from tests.support.closure_manifest_literal import is_pure_literal
 
 
 def test_aut2_label_is_pinned_to_its_own_closure() -> None:
@@ -27,3 +28,31 @@ def test_a_stale_aut2_label_pin_reads_as_unpinned(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(pins, "PRODUCER_SOURCE_SHA256", stale)
 
     assert unit_wiring.producer_pin_state()[0] is False
+
+
+_LITERAL_HEAD = '"""d."""\nfrom types import MappingProxyType\nfrom typing import Final\n'
+
+
+def _source(literal: str) -> str:
+    return (
+        f"{_LITERAL_HEAD}X: Final[MappingProxyType[str, tuple[str, ...]]] = "
+        f"MappingProxyType({literal})\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ['{"a": ("b",)}', '{"a": ("b", "c")}', "{}"],
+)
+def test_pure_literal_accepts_str_keys_and_tuple_of_str_values(literal: str) -> None:
+    src = _source(literal)
+    assert is_pure_literal(src)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["{1: ('b',)}", '{"a": ["b"]}', '{"a": (1,)}', '{"a": "b"}', '{"a": ("b", None)}', "[1]"],
+)
+def test_pure_literal_rejects_other_shapes(literal: str) -> None:
+    src = _source(literal)
+    assert not is_pure_literal(src)
