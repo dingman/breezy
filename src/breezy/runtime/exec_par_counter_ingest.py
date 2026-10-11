@@ -22,11 +22,18 @@ denial has no armed slot, so it is attributed by its own event time; the
 resolver's no-id ADOPT path emits a late ``OrderSubmitted``, which would carry
 the adoption time rather than the arm time.
 
+**Wiring.** This package is deliberately NOT wired: the production node passes no ``counters``
+and no ``ambiguous_marks`` to the watcher, and the ledger's mark recording stays off, so K=1 is
+inert and byte-identical. Wiring (and mapping ``ingest_fault_count`` increases to the integrity
+halt) is BG-5/BG-6's job.
+
 **AMBIGUOUS origin.** The ledger cannot say where a mark came from (that needs the pinned
-client), so the row's origin field is derived: ``boot`` when the intent's arm time is earlier
-than ``latch.boot_ns`` (armed before this process started), else ``live``; ``unknown`` when
-neither slot nor history is found. A pre-crash entry already counted is never counted twice
-(rows are idempotent by ``intent_id``).
+client), so the row's origin field is derived: ``armed_pre_boot`` when the intent's arm time is
+earlier than ``latch.boot_ns``, else ``armed_post_boot``; ``unknown`` when neither slot nor
+history is found. ``armed_pre_boot`` covers BOTH the H6 boot marks and live-resolver marks on
+pre-boot intents: a conservative reporting label, not a claim about who marked it.
+A pre-crash entry already counted is never counted twice (rows are idempotent by
+``intent_id``).
 
 Known limits, both accepted: (1) restart window: a mark made less than 5 s before a crash,
 on an intent that also resolved before that crash, can be lost from memory. Negligible; the
@@ -135,7 +142,9 @@ class CounterWriterPort(Protocol):
     def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
     def write_fill(self, record: FillRow) -> bool: ...
     def write_open_cost_flag(self, record: OpenCostFlag) -> OpenCostFlag: ...
-    def add_window_order(self, day: str, window_start_ns: int, notional: Decimal) -> WindowPeak: ...
+    def add_window_order(
+        self, day: str, window_start_ns: int, notional: Decimal, client_order_id: str
+    ) -> WindowPeak: ...
     def write_gappy_mark(self, record: GappyMark) -> bool: ...
 
 
@@ -235,12 +244,11 @@ class ExecParCounterIngest:
             attribution=ARM_EVENT_TIME,
         )
         created: bool = self._write(lambda: self._store.write_order_anchor(anchor))
-        if created:
-            # Windows are derivable from the anchors; a crash between the two writes
-            # under-counts one window and BG-1d's rebuild recomputes it.
-            self._write(
-                lambda: self._store.add_window_order(day, anchor.window_start_ns, ask * quantity)
-            )
+        # Idempotent per client order id, so a replay after a failed window write repairs it
+        # (and a replay after a clean one counts nothing twice).
+        self._write(
+            lambda: self._store.add_window_order(day, anchor.window_start_ns, ask * quantity, coid)
+        )
         if flag is not None:
             self._write(lambda: self._store.write_open_cost_flag(flag))
         return created
@@ -310,7 +318,7 @@ class ExecParCounterIngest:
         kind = "slot" if intent.retired_ns is None else "history"
         slug = _need_text(intent.slug, "slot slug")
         day = self._day(slug, intent.created_ns)
-        origin = "boot" if intent.created_ns < self._store.boot_ns else "live"
+        origin = "armed_pre_boot" if intent.created_ns < self._store.boot_ns else "armed_post_boot"
         return AmbiguousRow(intent_id, origin, day, intent.created_ns, kind, when)
 
     def _anchor(self, coid: str) -> OrderAnchor:
@@ -361,6 +369,21 @@ class ExecParCounterIngest:
         return created
 
     # -- gappy marks ------------------------------------------------------
+
+    def gappy_day_of_event(self, event: object) -> str | None:
+        """Best-effort day of an order event (its anchor's day, else its event-time day)."""
+        try:
+            if not isinstance(event, OrderSubmitted | OrderFilled | OrderDenied):
+                return None
+            if isinstance(event, OrderFilled):
+                anchor = self._store.read_order_anchor(str(event.client_order_id))
+                if anchor is not None:
+                    return anchor.day
+            return _need_text(
+                self._climate_day_of(self._slug_of(event.instrument_id), event.ts_event), "day"
+            )
+        except Exception:  # noqa: BLE001 - best effort by design
+            return None
 
     def mark_gappy(self, *, day: str, cause: str, ts_ns: int | None) -> bool:
         row = GappyMark(

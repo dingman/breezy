@@ -72,7 +72,10 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
     def _ec_scan(
         self, prefix: str, cls: type[T], id_of: Callable[[T], str], day: str | None
     ) -> tuple[T, ...]:
-        """Rows under ``prefix`` (key suffix must equal the row's id), optionally of one day."""
+        """Rows under ``prefix`` (key suffix must equal the row's id), optionally of one day.
+
+        Day-scoped families pass a ``.../<day>/`` prefix and ``day=None``; each row's own
+        ``day`` field is then checked against the prefix by the caller."""
         lister = getattr(self._store, "keys_with_prefix", None)
         if lister is None:
             raise RuntimeError("store has no keys_with_prefix; cannot scan EXEC-PAR rows")
@@ -84,6 +87,18 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
             if day is None or getattr(row, "day", None) == day:
                 rows.append(row)
         return tuple(sorted(rows, key=id_of))
+
+    def _ec_day_rows(
+        self, family: str, cls: type[T], id_of: Callable[[T], str], day: str
+    ) -> tuple[T, ...]:
+        """Rows of one day of a day-scoped family: a prefix scan, other days never decoded."""
+        self._require_held()
+        scoped = f"{family}{_part(day)}/"
+        with self._mutex:
+            rows = self._ec_scan(scoped, cls, id_of, None)
+        if any(getattr(row, "day", None) != day for row in rows):
+            raise self.CorruptError()
+        return rows
 
     # -- posted entries (carry the durable decision ask) ------------------
 
@@ -110,20 +125,17 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
 
     def write_denial(self, record: DenialRow) -> bool:
         self._require_held()
-        key = _DENIAL + _part(record.client_order_id)
+        key = f"{_DENIAL}{_part(record.day)}/{_part(record.client_order_id)}"
         with self._mutex:
             return self._er_put_exclusive(key, record)
 
     def read_denials(self, day: str) -> tuple[DenialRow, ...]:
-        self._require_held()
-        _part(day)
-        with self._mutex:
-            return self._ec_scan(_DENIAL, DenialRow, lambda r: r.client_order_id, day)
+        return self._ec_day_rows(_DENIAL, DenialRow, lambda r: r.client_order_id, day)
 
     def write_ambiguous(self, record: AmbiguousRow) -> bool:
         """First detection wins: a later row for the same intent is a ``False`` no-op."""
         self._require_held()
-        key = _AMBIGUOUS + _part(record.intent_id)
+        key = f"{_AMBIGUOUS}{_part(record.day)}/{_part(record.intent_id)}"
         with self._mutex:
             if self._store.get(key) is not None:
                 self._er_get(key, AmbiguousRow)  # a garbled existing row still raises
@@ -131,59 +143,61 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
             return self._er_put_exclusive(key, record)
 
     def read_ambiguous(self, day: str) -> tuple[AmbiguousRow, ...]:
-        self._require_held()
-        _part(day)
-        with self._mutex:
-            return self._ec_scan(_AMBIGUOUS, AmbiguousRow, lambda r: r.intent_id, day)
+        return self._ec_day_rows(_AMBIGUOUS, AmbiguousRow, lambda r: r.intent_id, day)
 
     def write_fill(self, record: FillRow) -> bool:
         self._require_held()
-        key = _FILL + _part(record.trade_id)
+        key = f"{_FILL}{_part(record.day)}/{_part(record.trade_id)}"
         with self._mutex:
             return self._er_put_exclusive(key, record)
 
     def read_fills(self, day: str) -> tuple[FillRow, ...]:
-        self._require_held()
-        _part(day)
-        with self._mutex:
-            return self._ec_scan(_FILL, FillRow, lambda r: r.trade_id, day)
+        return self._ec_day_rows(_FILL, FillRow, lambda r: r.trade_id, day)
 
     # -- open-cost fraction flag (value-free; BG-1e predicates supply it) -
 
     def write_open_cost_flag(self, record: OpenCostFlag) -> OpenCostFlag:
         """Monotone within a station-day: once ``exceeded`` it never reads False again."""
         self._require_held()
-        key = _OPEN_FLAG + _part(record.station_day)
+        key = f"{_OPEN_FLAG}{_part(record.day)}/{_part(record.station_day)}"
         with self._mutex:
             existing = self._er_get(key, OpenCostFlag)
-            merged = record
-            if existing is not None and existing.exceeded:
-                merged = replace(record, exceeded=True, ts_ns=existing.ts_ns)
-            if existing != merged:
-                self._er_put(key, merged)
-            return merged
+            if existing is not None and (existing.exceeded or not record.exceeded):
+                return existing  # unchanged value (or never a downgrade): no write
+            self._er_put(key, record)
+            return record
 
     def read_open_cost_flags(self, day: str) -> tuple[OpenCostFlag, ...]:
-        self._require_held()
-        _part(day)
-        with self._mutex:
-            return self._ec_scan(_OPEN_FLAG, OpenCostFlag, lambda r: r.station_day, day)
+        return self._ec_day_rows(_OPEN_FLAG, OpenCostFlag, lambda r: r.station_day, day)
 
     # -- 5 s window peaks ---------------------------------------------------
 
-    def add_window_order(self, day: str, window_start_ns: int, notional: Decimal) -> WindowPeak:
-        """Count one entry (and its notional) into its fixed 5 s window; one call, one lock."""
+    def add_window_order(
+        self, day: str, window_start_ns: int, notional: Decimal, client_order_id: str
+    ) -> WindowPeak:
+        """Count one entry into its fixed 5 s window, once per client order id (replay-safe)."""
         self._require_held()
         if not isinstance(notional, Decimal) or not notional.is_finite() or notional < 0:
             raise ValueError("window notional must be a finite non-negative Decimal")
+        coid = _part(client_order_id)
+        if "," in coid:
+            raise ValueError("invalid EXEC-PAR counter key component")
         key = f"{_WINDOW}{_part(day)}/{window_start_ns}"
         with self._mutex:
             existing = self._er_get(key, WindowPeak)
             if existing is None:
-                row = WindowPeak(day, window_start_ns, 1, str(notional))
+                row = WindowPeak(day, window_start_ns, 1, str(notional), coid)
             else:
+                members = existing.coids.split(",")
+                if coid in members:
+                    return existing  # replay: already counted
                 total = _decimal(existing.notional) + notional
-                row = replace(existing, orders=existing.orders + 1, notional=str(total))
+                row = replace(
+                    existing,
+                    orders=existing.orders + 1,
+                    notional=str(total),
+                    coids=",".join((*members, coid)),
+                )
             self._er_put(key, row)
             return row
 

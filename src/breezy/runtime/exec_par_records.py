@@ -27,9 +27,9 @@ BG-1b counter rows (event-sourced; the id in each key must equal the row's own
 field; ``day`` is the climate-day label of the ARM time, I2):
 
 * ``order/<client_order_id>``  posted entry + the durable DECISION ASK
-* ``denial/<client_order_id>`` and ``ambiguous/<intent_id>``
-* ``fill/<trade_id>``          per-fill slippage, realized and unrounded fees
-* ``openflag/<station_day>``   value-free "open cost over fraction" flag
+* ``denial/<day>/<client_order_id>`` and ``ambiguous/<day>/<intent_id>``
+* ``fill/<day>/<trade_id>``    per-fill slippage, realized and unrounded fees
+* ``openflag/<day>/<station_day>`` value-free "open cost over fraction" flag
 * ``window/<day>/<start_ns>``  per 5 s window order count and notional
 * ``gappy/<day>``              gappy-day mark
 
@@ -259,6 +259,8 @@ class WindowPeak:
     window_start_ns: int
     orders: int
     notional: str
+    #: Comma-joined client order ids counted in this window (idempotent replay).
+    coids: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +351,13 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "fee_theta": "str",
     },
     OpenCostFlag: {"station_day": "str", "day": "str", "exceeded": "bool", "ts_ns": "int"},
-    WindowPeak: {"day": "str", "window_start_ns": "int", "orders": "int", "notional": "str"},
+    WindowPeak: {
+        "day": "str",
+        "window_start_ns": "int",
+        "orders": "int",
+        "notional": "str",
+        "coids": "str",
+    },
     GappyMark: {"day": "str", "cause": "str", "ts_ns": "int", "cleared_ts": "int?"},
 }
 

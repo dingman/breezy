@@ -55,6 +55,7 @@ from breezy.runtime.exec_par_counter_ingest import (
     IntentView,
     reason_label,
 )
+from breezy.runtime.exec_par_ingest_guard import IngestGuard
 from breezy.runtime.exec_par_records import (
     AmbiguousRow,
     Amendment,
@@ -196,7 +197,9 @@ class ExecParStorePort(Protocol):
     def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
     def write_fill(self, record: FillRow) -> bool: ...
     def write_open_cost_flag(self, record: OpenCostFlag) -> OpenCostFlag: ...
-    def add_window_order(self, day: str, window_start_ns: int, notional: Decimal) -> WindowPeak: ...
+    def add_window_order(
+        self, day: str, window_start_ns: int, notional: Decimal, client_order_id: str
+    ) -> WindowPeak: ...
     def write_gappy_mark(self, record: GappyMark) -> bool: ...
 
 
@@ -522,10 +525,8 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
-        self._counters = counters
+        self._guard = None if counters is None else IngestGuard(counters)
         self._ambiguous_marks = ambiguous_marks
-        self._ingest_fault_count = 0
-        self._last_ingest_fault: ExecParCounterError | None = None
         self._halt_written = False
         self._trip_reason: str | None = None
         self._seen_contradictions = 0
@@ -538,43 +539,55 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
 
     @property
     def ingest_fault_count(self) -> int:
-        """Typed counter-ingestion failures seen so far (BG-6 turns these into a halt)."""
-        return self._ingest_fault_count
+        """Monotonic for the process lifetime; BG-6 raises an integrity halt on any increase."""
+        return 0 if self._guard is None else self._guard.fault_count
 
     @property
     def last_ingest_fault(self) -> ExecParCounterError | None:
-        return self._last_ingest_fault
+        faults = self.recent_ingest_faults
+        return faults[-1] if faults else None
+
+    @property
+    def recent_ingest_faults(self) -> tuple[ExecParCounterError, ...]:
+        """The last 20 faults, oldest first."""
+        return () if self._guard is None else self._guard.recent_faults
+
+    @property
+    def ingest_guard(self) -> IngestGuard | None:
+        return self._guard
 
     def _wants_order_events(self) -> bool:
-        return self._digest is not None or self._counters is not None
+        return self._digest is not None or self._guard is not None
 
     def _on_order_event(self, event: object) -> None:
-        super()._on_order_event(event)
-        counters = self._counters
-        if counters is None:
+        """Never raises: nothing may reach the msgbus from the order-event handler."""
+        try:
+            super()._on_order_event(event)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break the bus
+            logger.error("%s: digest order-event failed: %s", _SITE, type(exc).__name__)
+        guard = self._guard
+        if guard is None:
             return
         try:
-            counters.on_event(event, self.cache.order)
-        except ExecParCounterError as exc:
-            self._ingest_fault_count += 1
-            self._last_ingest_fault = exc
-            logger.error("%s: counter ingestion failed: %s", _SITE, type(exc).__name__)
+            guard.handle(event, self.cache.order, self.clock.timestamp_ns())
+        except Exception as exc:  # noqa: BLE001 - the guard is total; this is belt and braces
+            logger.error("%s: ingest guard failed: %s", _SITE, type(exc).__name__)
 
-    def _ingest_ambiguous_marks(self, now_ns: int) -> None:
-        """Count pending ever-AMBIGUOUS marks (a fault is counted, never a withheld heartbeat)."""
-        counters, marks = self._counters, self._ambiguous_marks
-        if counters is None or marks is None:
+    def _run_ingest(self, now_ns: int) -> None:
+        """Retry failed events, then ingest AMBIGUOUS marks; faults are counted, never raised."""
+        guard = self._guard
+        if guard is None:
             return
         try:
-            counters.ingest_ambiguous_marks(marks, now_ns=now_ns)
-        except ExecParCounterError as exc:
-            self._ingest_fault_count += 1
-            self._last_ingest_fault = exc
-            logger.error("%s: ambiguous-mark ingestion failed: %s", _SITE, type(exc).__name__)
+            guard.retry(self.cache.order, now_ns)
+            marks = self._ambiguous_marks
+            if marks is not None:
+                guard.ingest_marks(marks, now_ns)
+        except Exception as exc:  # noqa: BLE001 - belt and braces: ingest cannot stop the tick
+            logger.error("%s: ingest pass failed: %s", _SITE, type(exc).__name__)
 
     def _persist(self, client: ExecClientView, now_ns: int) -> None:
         """Compute the trip reasons and latch the halt BEFORE anything can fail."""
-        self._ingest_ambiguous_marks(now_ns)
         ages = client.open_intent_ages
         self._stuck = tuple((iid, slug) for iid, slug, age in ages if age > STUCK_AGE_NS)
         contradictions = client.contradiction_events_total
@@ -597,6 +610,7 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
             self._trip_reason = reason
         self._seen_contradictions = max(self._seen_contradictions, contradictions)
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
+        self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
 
     def _collect_conditions(self, client: ExecClientView, now_ns: int) -> None:
         super()._collect_conditions(client, now_ns)

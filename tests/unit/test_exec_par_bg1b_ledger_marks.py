@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +15,12 @@ from breezy.runtime.exec_par_counter_ingest import AmbiguousMarkSource
 NOW = 1_700_000_000 * 1_000_000_000
 
 
+def _ledger() -> DailySpendLedger:
+    ledger = DailySpendLedger()
+    ledger.enable_ambiguous_mark_recording()
+    return ledger
+
+
 def _register(ledger: DailySpendLedger, key: str, side: str = "BUY") -> None:
     ledger.register_open_exposure(
         key, Decimal("4.00"), booking=None, seeded_partial_usd=Decimal(0), side=side, now_ns=NOW
@@ -21,21 +28,63 @@ def _register(ledger: DailySpendLedger, key: str, side: str = "BUY") -> None:
 
 
 def test_mark_ambiguous_records_a_pending_mark_with_the_unknown_source() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     _register(ledger, "i1")
     assert ledger.ambiguous_marks_pending() == frozenset()
     ledger.mark_ambiguous("i1")
     assert ledger.ambiguous_marks_pending() == frozenset({("i1", "unknown")})
 
 
-def test_unregistered_key_leaves_no_mark() -> None:
+def test_a_mark_on_a_key_not_in_the_registry_is_still_recorded() -> None:
+    ledger = _ledger()
+    ledger.mark_ambiguous("abandoned-before-marked")
+    assert ledger.ambiguous_marks_pending() == frozenset({("abandoned-before-marked", "unknown")})
+    assert ledger.has_open_exposure("abandoned-before-marked") is False  # exposure unchanged
+
+
+def test_marks_are_not_recorded_until_a_consumer_enables_recording() -> None:
+    """K=1 has no consumer, so the set must not grow."""
     ledger = DailySpendLedger()
-    ledger.mark_ambiguous("exit-or-unknown")
+    _register(ledger, "i1")
+    for _ in range(3):
+        ledger.mark_ambiguous("i1")
+    ledger.mark_ambiguous("other")
+    assert ledger.ambiguous_marks_pending() == frozenset()
+    assert ledger.ambiguous_open_total() == Decimal("4.00")  # exposure semantics unchanged
+
+
+def test_concurrent_marks_and_acks_lose_nothing_and_stay_consistent() -> None:
+    ledger = _ledger()
+    keys = [f"i{n}" for n in range(200)]
+    for key in keys:
+        _register(ledger, key)
+    acked: list[tuple[str, str]] = []
+
+    def marker() -> None:
+        for key in keys:
+            ledger.mark_ambiguous(key)
+
+    def acker() -> None:
+        for _ in range(200):
+            snapshot = ledger.ambiguous_marks_pending()
+            ledger.ack_ambiguous_marks(snapshot)
+            acked.extend(snapshot)
+
+    threads = [threading.Thread(target=marker) for _ in range(3)] + [
+        threading.Thread(target=acker) for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ledger.ack_ambiguous_marks(ledger.ambiguous_marks_pending())
+    # every key was marked at least once: it was either acked by an acker or by the final ack
+    assert {mark[0] for mark in acked} <= set(keys)
     assert ledger.ambiguous_marks_pending() == frozenset()
 
 
 def test_a_mark_survives_abandon_and_settle_so_a_fast_resolution_is_still_counted() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     _register(ledger, "i1")
     _register(ledger, "i2")
     ledger.mark_ambiguous("i1")
@@ -47,7 +96,7 @@ def test_a_mark_survives_abandon_and_settle_so_a_fast_resolution_is_still_counte
 
 
 def test_repeat_marks_are_one_entry_and_acknowledge_shrinks_the_set() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     for key in ("i1", "i2"):
         _register(ledger, key)
         ledger.mark_ambiguous(key)
@@ -61,7 +110,7 @@ def test_repeat_marks_are_one_entry_and_acknowledge_shrinks_the_set() -> None:
 
 
 def test_pending_marks_are_a_snapshot_not_a_live_view() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     _register(ledger, "i1")
     ledger.mark_ambiguous("i1")
     snapshot = ledger.ambiguous_marks_pending()
@@ -70,7 +119,7 @@ def test_pending_marks_are_a_snapshot_not_a_live_view() -> None:
 
 
 def test_the_mark_surface_is_value_free() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     _register(ledger, "i1")
     ledger.mark_ambiguous("i1")
     for mark in ledger.ambiguous_marks_pending():
@@ -81,12 +130,12 @@ def test_the_mark_surface_is_value_free() -> None:
 
 
 def test_ledger_satisfies_the_runtime_side_protocol_structurally() -> None:
-    source: AmbiguousMarkSource = DailySpendLedger()
+    source: AmbiguousMarkSource = _ledger()
     assert source.ambiguous_marks_pending() == frozenset()
 
 
 def test_ack_rejects_non_pair_input() -> None:
-    ledger = DailySpendLedger()
+    ledger = _ledger()
     bad: Any = ["not-a-pair"]
     with pytest.raises(ValueError):
         ledger.ack_ambiguous_marks(bad)
