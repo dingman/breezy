@@ -193,7 +193,7 @@ def test_every_migrated_site_agrees_with_entry_day_on_boundary_instants() -> Non
 
         # settled P&L: the arm-day key
         rows = settled_pnl_by_day(
-            [EntryInput(arm_ns=ns, station=station, fill=_Fill())],
+            [EntryInput(arm_ns=ns, station=station, fill=_Fill(), ever_ambiguous=False)],
             {"A": True},
             days.entry_day,
             today=expected,

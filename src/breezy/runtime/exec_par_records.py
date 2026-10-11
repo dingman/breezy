@@ -35,9 +35,10 @@ field; ``day`` is the climate-day label of the ARM time, I2, and equals
 * ``openflag/<day>/<station_day>`` value-free "open cost over fraction" flag
 * ``window/<day>/<start_ns>``  per 5 s window order count and notional
 * ``gappy/<day>``              gappy-day mark
-* ``lapse/<start_ns>``         BG-5c R7.3 append-only heartbeat-lapse / unclean-shutdown span
-  ``{start_ns, end_ns, kind, marked_ts}``; exclusive per start (the breaker heartbeat itself is ONE
-  overwritten row, so it keeps no history); ``marked_ts`` is set once when its days are gappy-marked
+* ``lapse/<start_ns>/<end_ns>`` BG-5c R7.3 append-only lapse / unclean-shutdown span
+  ``{start_ns, end_ns, kind, marked_ts}``; exclusive per (start, end), overlaps coexist (the
+  heartbeat is ONE overwritten row, so it keeps no history); ``marked_ts`` is set once when its
+  days are gappy-marked
 
 BG-5b stage-evaluator rows (single writer = the node's loop thread, via the latch):
 
@@ -121,7 +122,7 @@ EXEC_PAR_PREFIX: Final[str] = "exec/polymarket_us/exec_par/"
 #: and the read-only ledger reader.
 EPOCH_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "epoch/"
 AMENDMENT_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "amendment/"
-#: BG-5c R7.3: the append-only watcher-lapse / unclean-shutdown spans (``lapse/<start_ns>``).
+#: BG-5c R7.3: append-only lapse / unclean-shutdown spans (``lapse/<start_ns>/<end_ns>``).
 LAPSE_KEY_PREFIX: Final[str] = EXEC_PAR_PREFIX + "lapse/"
 _VERSION: Final[int] = 1
 #: ``exec_par/day_convention`` row version: 2 = per-station standard-time ``entry_day`` (BG-5c R1).
@@ -325,9 +326,9 @@ class GappyMark:
 class HeartbeatLapse:
     """BG-5c R7.3: one span the node was not provably healthy (``kind`` is a ``GapKind`` value).
 
-    Append-only: ``start_ns`` keys the row and the span never changes. ``marked_ts`` is stamped once
-    when every governed open day the span overlaps carries its gappy mark, so a later rebuild that
-    deletes a mark is never undone by re-marking an already-handled span.
+    Append-only: ``(start_ns, end_ns)`` keys the row and the span never changes. ``marked_ts`` is
+    stamped once when every governed open day the span overlaps carries its gappy mark, so a
+    later rebuild that deletes a mark is never undone by re-marking a handled span.
     """
 
     start_ns: int

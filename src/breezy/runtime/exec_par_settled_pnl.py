@@ -35,6 +35,7 @@ from typing import Final, Protocol
 from breezy.runtime.exec_par_records import SettledPnlDay, canonical_decimal
 
 __all__ = [
+    "CENT",
     "FILL_PREFIX",
     "SETTLEMENT_DEADLINE_DAYS",
     "EntryInput",
@@ -58,7 +59,9 @@ __all__ = [
 FILL_PREFIX: Final[str] = "exec/polymarket_us/fill/"
 _PAYOUT_PER_CONTRACT: Final[Decimal] = Decimal(1)
 _PRECISION: Final[int] = 60
-_CENT: Final[Decimal] = Decimal("0.01")
+#: The venue's cent (USD currency precision 2, as ``fees._round_bankers`` quantises to).
+CENT: Final[Decimal] = Decimal("0.01")
+_CENT: Final[Decimal] = CENT
 
 #: An unsettled entry whose arm-time climate day is at least this many days old is
 #: OVERDUE: scored as a full-cost loss like an AMBIGUOUS entry (review F2).
@@ -119,7 +122,9 @@ class EntryInput:
     ``ambiguous_unresolved`` scores the entry as a full-cost loss whatever the outcome.
     With no fill, ``ambiguous_cost`` (cost plus fee, declared by the caller) is required.
 
-    ``ever_ambiguous`` (BG-5c A3) is the BG-1b ever-ambiguous mark. A RESOLVED entry
+    ``ever_ambiguous`` (BG-5c A3, REQUIRED: no default, so it cannot be forgotten) is the BG-1b
+    ever-ambiguous mark; ``exec_par_durable_sources.entry_inputs_from`` sets it from the mark
+    rows. A RESOLVED entry
     (``ambiguous_unresolved`` False, venue-evidenced) with a confirmed fill keeps counting at
     ``cumulative_cost + fee`` until its settlement outcome exists, then scores as an ordinary
     settled fill: the full-cost term is left only on settlement, never on resolution alone.
@@ -128,9 +133,9 @@ class EntryInput:
     arm_ns: int
     station: str
     fill: FillLike | None
+    ever_ambiguous: bool
     ambiguous_unresolved: bool = False
     ambiguous_cost: Decimal | None = None
-    ever_ambiguous: bool = False
 
 
 def _money(value: object) -> Decimal:
