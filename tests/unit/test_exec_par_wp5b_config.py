@@ -272,10 +272,6 @@ def test_subscribe_trades_off_and_inflight_interval_zero() -> None:
 # ---------------------------------------------------------------------------
 
 _IMPORTER_PIN = [
-    # EXEC-PAR BG-7 (reviewed widening, never relaxed): the read-only stage cross-check builds
-    # the node's own `DailySpendLedger` ONLY as the evaluator's P&L predicate port (K6). It
-    # reads no operator control itself, assigns none, and the unit loads no `operator.env`.
-    "scripts/analysis/exec_par_stage_gate.py",
     "scripts/analysis/portfolio_roi_report.py",
     "scripts/operator/print_operator_controls.py",
     "src/breezy/adapters/polymarket_us/exec/client.py",

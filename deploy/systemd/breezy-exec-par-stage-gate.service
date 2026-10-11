@@ -31,15 +31,15 @@ UMask=0022
 # The ONLY EnvironmentFile=: alerts.env (BREEZY_ALERT_WEBHOOK_URL alone), so the in-process
 # alert is delivered (tests/unit/test_alerts_env_deploy.py). Never polymarket.env /
 # breezy-trade.env / operator.env / breezy.env: this unit holds no venue credential and no
-# operator-reserved value. Consequence: with no daily budget in the environment a P&L predicate
-# raises and the cross-check reports it (see the script docstring); that is deliberate.
+# operator-reserved value, so the s15 P&L stops are reported not_evaluated (see the script).
 EnvironmentFile=-%h/.config/breezy/alerts.env
 
-# The station set defaults to the four supported stations, identical across every manifest under
-# deploy/families/. K comes from the epoch ledger in the store. The script is NOT run under the
+# The governed stations come from the family manifest named by --family-id (the node's own
+# _composable_stations rule); K comes from the epoch ledger in the store. The coordinator keeps
+# --family-id equal to the sending family. The script is NOT run under the
 # bwrap wrapper: its rows belong to the autonomy programme, and sqlite mode=ro plus the absence of
 # any write method on the reader are this unit's read-only control.
-ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.exec_par_stage_gate --db %h/.local/share/breezy/state/exec_polymarket_us.sqlite --out-dir /home/jon/breezy/docs/evidence/exec_par
+ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.exec_par_stage_gate --db %h/.local/share/breezy/state/exec_polymarket_us.sqlite --family-id pm_us_crh_fq_v1 --out-dir /home/jon/breezy/docs/evidence/exec_par
 
 TimeoutStartSec=300
 
