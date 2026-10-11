@@ -11,10 +11,22 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from breezy.runtime.exec_par_counter_ingest import AmbiguousMarkSource
 from breezy.runtime.exec_par_ingest_guard import IngestGuard
 from breezy.runtime.exec_par_stage_runner import StageEvalPorts, StageEvaluator
 
-__all__ = ["HeartbeatWithheldError", "StageEvalWatcherMixin"]
+__all__ = ["HeartbeatWithheldError", "StageEvalWatcherMixin", "combined_ingest_pending"]
+
+
+def combined_ingest_pending(
+    guard: IngestGuard, marks: AmbiguousMarkSource | None
+) -> Callable[[], int]:
+    """Queued ingest events plus durable AMBIGUOUS marks not yet ingested (both must drain)."""
+
+    def pending() -> int:
+        return guard.pending + (0 if marks is None else len(marks.ambiguous_marks_pending()))
+
+    return pending
 
 
 class HeartbeatWithheldError(RuntimeError):
@@ -39,10 +51,14 @@ class StageEvalWatcherMixin:
     def stage_evaluator(self) -> StageEvaluator | None:
         return self._stage_eval
 
-    def _stage_eval_bind_guard(self, guard: IngestGuard | None) -> None:
-        """A reconcile must never run over a non-empty ingest retry queue (BG-1b / BG-1d)."""
+    def _stage_eval_bind_guard(
+        self, guard: IngestGuard | None, marks: AmbiguousMarkSource | None
+    ) -> None:
+        """A reconcile never runs over queued events or pending AMBIGUOUS marks (BG-1b / BG-1d).
+
+        Without a guard nothing is bound, and the pass fails closed (``ingest_unbound``)."""
         if self._stage_eval is not None and guard is not None:
-            self._stage_eval.bind_ingest_pending(lambda: guard.pending)
+            self._stage_eval.bind_ingest_pending(combined_ingest_pending(guard, marks))
 
     def _stage_eval_cancel(self) -> None:
         if self._stage_eval is not None:
