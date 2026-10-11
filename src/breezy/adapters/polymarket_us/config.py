@@ -626,6 +626,12 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
         here, never a factory. This increment stores it; R-7's ``_connect``
         is what will consume it. The exec client NEVER calls
         ``open_submit_intent_latch``.
+    spend_ledger : object | None
+        BG-5c (A1): an already-built ``DailySpendLedger`` the composition root
+        injects, the SAME way ``submit_intent_latch`` is. Typed ``object`` so
+        this module takes no ledger-module import; the factory checks
+        the type. When set, the exec client admits against exactly this
+        instance; ``None`` (default) builds the ledger as it always has.
     instrument_wait_timeout_s, account_registration_timeout_s : float
         Forwarded verbatim to :class:`PolymarketUSExecutionClient`.
     submit_veto : Callable[[], str | None] | None
@@ -670,6 +676,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     state_store_path: str | None = None
     state_store_opener: StateStoreOpener | None = None
     submit_intent_latch: object | None = None
+    spend_ledger: object | None = None
     instrument_wait_timeout_s: float = 30.0
     account_registration_timeout_s: float = 30.0
     live_trading_permit: object | None = None

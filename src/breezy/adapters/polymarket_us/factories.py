@@ -378,7 +378,7 @@ def exec_config_from_env(
     )
 
 
-def _spend_ledger_for(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
+def spend_ledger_for(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
     """The client's spend ledger, with the EXEC-PAR bounds only when K > 1.
 
     At an effective K of 1 the open-exposure bound and the AMBIGUOUS-notional
@@ -393,6 +393,25 @@ def _spend_ledger_for(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
         f_adm=config.open_exposure_bound_fraction,
         f_breaker=config.breaker_open_ambiguous_fraction,
     )
+
+
+def _client_ledger(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
+    """The ledger the client admits against: the injected one, else a fresh build.
+
+    BG-5c (A1): ``config.spend_ledger`` is handed through unchanged (same
+    object), so a composition root that built it with :func:`spend_ledger_for`
+    can hold the very instance the client admits against. ``None`` builds
+    exactly as before.
+    """
+    injected = config.spend_ledger
+    if injected is None:
+        return spend_ledger_for(config)
+    if not isinstance(injected, DailySpendLedger):
+        raise SettingsError(
+            "PolymarketUSExecClientConfig.spend_ledger must be a DailySpendLedger "
+            f"(or None); got {type(injected).__name__}"
+        )
+    return injected
 
 
 def _required(
@@ -876,7 +895,7 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             order_sender=order_sender,
             write_signer=write_signer,
             live_trading_permit=config.live_trading_permit,
-            spend_ledger=_spend_ledger_for(config),
+            spend_ledger=_client_ledger(config),
             submit_intent_latch=config.submit_intent_latch,
             credentials=credentials,
             api_base_url=stripped_api_base_url,

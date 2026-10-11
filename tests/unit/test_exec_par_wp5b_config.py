@@ -247,14 +247,14 @@ def test_trade_node_config_carries_the_latch_k_when_it_exceeds_one(tmp_path: Pat
 
 
 def test_k1_ledger_has_no_bounds_and_k_gt_1_ledger_has_the_constants() -> None:
-    k1 = factories._spend_ledger_for(make_exec_client_config())
+    k1 = factories.spend_ledger_for(make_exec_client_config())
     assert k1._f_adm is None and k1._f_breaker is None
     wired = make_exec_client_config(
         max_concurrent_intents=2,
         open_exposure_bound_fraction=OPEN_EXPOSURE_BOUND_FRACTION,
         breaker_open_ambiguous_fraction=BREAKER_OPEN_AMBIGUOUS_FRACTION,
     )
-    k2 = factories._spend_ledger_for(wired)
+    k2 = factories.spend_ledger_for(wired)
     assert k2._f_adm == OPEN_EXPOSURE_BOUND_FRACTION
     assert k2._f_breaker == BREAKER_OPEN_AMBIGUOUS_FRACTION
 
