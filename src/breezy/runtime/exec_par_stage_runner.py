@@ -232,7 +232,7 @@ class StageEvaluator:
         self._heartbeat_stopped = False
         self._tick_fault = False
         self._outbox: list[tuple[str, str, str]] = []
-        self._ingest_pending: Callable[[], int] = lambda: 0
+        self._ingest_pending: Callable[[], int] | None = None
         self._liveness_seeded = False
         self._last_settled_seq: int | None = None
         self._settled_dirty = False
@@ -265,7 +265,15 @@ class StageEvaluator:
             self._check_integrity()
             self._flush_pending_halt()
             self._flush_outbox()
+        except Exception as exc:  # noqa: BLE001 - contained; the missing heartbeat is the signal
+            self._tick_fault = True
+            logger.error("exec_par stage evaluator service failed: %s", type(exc).__name__)
+        try:
             self._poll_settled_seq()
+        except Exception as exc:  # noqa: BLE001 - isolated: a bad poll never blocks scheduling
+            self._tick_fault = True
+            logger.error("exec_par settled_pnl_seq poll failed: %s", type(exc).__name__)
+        try:
             self._maybe_start(now_ns)
         except Exception as exc:  # noqa: BLE001 - contained; the missing heartbeat is the signal
             self._tick_fault = True
@@ -424,7 +432,10 @@ class StageEvaluator:
         self._telemetry(lambda: ports.counters.write_reconcile_phase(start_ns=start, ok_ns=None))
         if ports.await_ready is not None:
             await ports.await_ready()
-        while self._ingest_pending() > 0:  # never reconcile over a queued retry (no double count)
+        pending = self._ingest_pending
+        if pending is None:  # unbound is NOT "nothing queued": fail closed
+            raise _PassFailure(f"{_FAIL_PREFIX}ingest_unbound")
+        while pending() > 0:  # never reconcile over a queued retry (no double count)
             await asyncio.sleep(ports.ingest_poll_s)
         result = self._reconcile(today)  # sync, no await since the queue check
         await asyncio.sleep(0)

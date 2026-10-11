@@ -209,6 +209,7 @@ def make_rig(
     mass_status: bool = True,
     seed: bool = False,
     port_over: dict[str, object] | None = None,
+    bind_ingest: bool = True,
 ) -> Iterator[Rig]:
     store = _Store()
     clock = _Clock(ns_of(d(4)) + 100 if now is None else now)
@@ -254,6 +255,8 @@ def make_rig(
             return True
 
         ev = StageEvaluator(ports, halt=halt, alert=alert)
+        if bind_ingest:
+            ev.bind_ingest_pending(lambda: 0)
         yield Rig(store, latch, spy, clock, alerts, sources, ev, halts, ports)
 
 

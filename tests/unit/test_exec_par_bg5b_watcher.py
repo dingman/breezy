@@ -76,6 +76,8 @@ def _watcher(
         clock=clock,
     )
     actor.bind_client(lambda: _Client())
+    assert actor.stage_evaluator is not None
+    actor.stage_evaluator.bind_ingest_pending(lambda: 0)  # no ingest guard in these doubles
     return actor, the_sink, clock
 
 

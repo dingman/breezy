@@ -810,7 +810,9 @@ def _compose_forecast_quantile_ladder(
     )
     fq_loss_stop_probe.probe_once()
     fq_parity_cache = (
-        fq_bridge.ParityFileCache(catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid())
+        fq_bridge.ParityFileCache(
+            catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid()
+        )
         if manifest.family_id == fq_bridge.PARITY_SUBJECT
         else None
     )

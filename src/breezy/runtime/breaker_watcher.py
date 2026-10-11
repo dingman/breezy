@@ -470,7 +470,7 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         self._k_forced_recorded = False
         self._amendment_failures = 0
         self._guard = None if counters is None else IngestGuard(counters)
-        self._stage_eval_bind_guard(self._guard)
+        self._stage_eval_bind_guard(self._guard, ambiguous_marks)
         self._ambiguous_marks = ambiguous_marks
         self._halt_written = False
         self._trip_reason: str | None = None

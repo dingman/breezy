@@ -208,3 +208,105 @@ async def test_a_bad_settled_pnl_seq_withholds_the_heartbeat(tmp_path: Path, bad
     with _pass_rig(tmp_path, port_over={"settled_pnl_seq": lambda: bad}) as rig:
         rig.ev.service(rig.clock.ns)
         assert not rig.ev.heartbeat_ok
+
+
+# -- confirm round -----------------------------------------------------------------------
+
+
+class _Marks:
+    def __init__(self, pending: set[tuple[str, str]]) -> None:
+        self.pending = pending
+
+    def ambiguous_marks_pending(self) -> frozenset[tuple[str, str]]:
+        return frozenset(self.pending)
+
+
+class _Guard:
+    def __init__(self, n: int) -> None:
+        self.pending = n
+
+
+def test_combined_ingest_pending_counts_the_event_queue_and_pending_marks() -> None:
+    from breezy.runtime.exec_par_watcher_stage import combined_ingest_pending
+
+    marks = _Marks({("i1", "slug")})
+    guard = _Guard(2)
+    pending = combined_ingest_pending(guard, marks)  # type: ignore[arg-type]
+    assert pending() == 3
+    guard.pending = 0
+    assert pending() == 1
+    marks.pending.clear()
+    assert pending() == 0
+    assert combined_ingest_pending(guard, None)() == 0  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_ambiguous_mark_is_ingested_before_the_rebuild_so_it_counts_once(
+    tmp_path: Path,
+) -> None:
+    from breezy.runtime.exec_par_records import AmbiguousRow
+    from breezy.runtime.exec_par_watcher_stage import combined_ingest_pending
+
+    marks = _Marks({("a1", "slug")})
+    with _pass_rig(tmp_path, seed=True, port_over={"ingest_poll_s": 0.001}) as rig:
+        rig.ev.bind_ingest_pending(combined_ingest_pending(_Guard(0), marks))  # type: ignore[arg-type]
+        rig.latch.write_order_anchor(_anchor("O-1", d(1)))
+        rig.sources.counts[d(1)] = DayCounts(1, 1, 0, Decimal(4))  # the durable side has the mark
+        rig.ev.service(rig.clock.ns)
+        await asyncio.sleep(0.05)
+        assert rig.events("EXEC_PAR_COUNTER_REBUILT") == []  # no rebuild over a pending mark
+        rig.latch.write_ambiguous(
+            AmbiguousRow("a1", "armed_pre_boot", d(1), ns_of(d(1)), "slot", 1)
+        )
+        marks.pending.clear()  # the tick ingested it
+        task = rig.ev.task
+        assert task is not None
+        await asyncio.wait_for(task, 5)
+        counts = rig.ports.counters.read_day_counts(d(1))
+        assert counts is not None and counts.ambiguous == 1  # once, never 2
+        assert rig.events("EXEC_PAR_COUNTER_REBUILT") == []
+        assert rig.latch.read_counts_delta(d(1)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_mark_that_never_drains_is_reconcile_stuck(tmp_path: Path) -> None:
+    from breezy.runtime.exec_par_watcher_stage import combined_ingest_pending
+
+    with _pass_rig(tmp_path, seed=True, port_over={"ingest_poll_s": 0.001}) as rig:
+        rig.ev.bind_ingest_pending(combined_ingest_pending(_Guard(0), _Marks({("a", "s")})))  # type: ignore[arg-type]
+        rig.ev.service(rig.clock.ns)
+        await asyncio.sleep(0.05)
+        rig.clock.mono += 301 * NS
+        rig.ev.service(rig.clock.ns)
+        record = rig.breaker()
+        assert record is not None and record.halted_reason == "reconcile_stuck"
+        rig.ev.cancel()
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_ingest_pending_fails_closed_not_zero(tmp_path: Path) -> None:
+    with _pass_rig(tmp_path, seed=True, bind_ingest=False) as rig:
+        await rig.run_pass()
+        record = rig.breaker()
+        assert record is not None and record.halted_reason == "stage_eval_fail:ingest_unbound"
+        assert rig.latch.read_stage_eval_stamp() is None
+
+
+@pytest.mark.asyncio
+async def test_a_raising_settled_seq_poll_does_not_block_the_pass_but_withholds_heartbeat(
+    tmp_path: Path,
+) -> None:
+    def boom() -> int:
+        raise RuntimeError("poll down")
+
+    with _pass_rig(tmp_path, port_over={"settled_pnl_seq": boom}) as rig:
+        rig.ev.service(rig.clock.ns)
+        assert rig.ev.task is not None  # the boot pass still started
+        assert not rig.ev.heartbeat_ok  # ...and the heartbeat is withheld for the raise
+        await rig.ev.task
+        assert rig.latch.read_stage_eval_stamp() is not None
+        rig.clock.ns = ns_of(d(5)) + 10  # the daily pass is not blocked either
+        rig.ev.service(rig.clock.ns)
+        assert rig.ev.task is not None and not rig.ev.task.done()
+        await rig.ev.task
