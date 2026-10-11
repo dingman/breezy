@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import cast
+
+import pytest
+
 from breezy.runtime.exec_par_reconcile import (
     HEARTBEAT_LAPSE_NS,
     GapKind,
@@ -14,6 +20,10 @@ S = 1_000_000_000
 H = 3_600 * S
 DAY = 24 * H
 D0 = 20_000 * DAY  # 2024-10-04T00:00Z
+
+
+def _utc_day(ns: int) -> str:
+    return datetime.fromtimestamp(ns // S, UTC).date().isoformat()
 
 
 def _epoch(boot: int, stop: int | None = None) -> EpochRow:
@@ -30,7 +40,7 @@ def test_recorded_outage_between_stop_and_next_boot_is_not_a_gap() -> None:
     beats = _beats(D0, D0 + 2 * H) + _beats(D0 + 10 * H, D0 + 11 * H)
     spans = compute_gap_spans((e1, e2), beats, now_ns=D0 + 11 * H)
     assert spans == ()
-    assert gappy_days(spans) == frozenset()
+    assert gappy_days(spans, day_of=_utc_day) == frozenset()
 
 
 def test_heartbeat_lapse_over_60s_while_up_is_a_gap() -> None:
@@ -40,7 +50,7 @@ def test_heartbeat_lapse_over_60s_while_up_is_a_gap() -> None:
     assert [(s.kind, s.start_ns, s.end_ns) for s in spans] == [
         (GapKind.HEARTBEAT_LAPSE, D0 + H, D0 + H + 61 * S)
     ]
-    assert gappy_days(spans) == frozenset({"2024-10-04"})
+    assert gappy_days(spans, day_of=_utc_day) == frozenset({"2024-10-04"})
 
 
 def test_lapse_of_exactly_60s_is_not_a_gap() -> None:
@@ -71,7 +81,7 @@ def test_gap_spanning_midnight_marks_every_touched_day() -> None:
     e2 = _epoch(D0 + DAY + 2 * H, None)
     beats = _beats(D0, D0 + 22 * H) + _beats(D0 + DAY + 2 * H, D0 + DAY + 3 * H)
     spans = compute_gap_spans((e1, e2), beats, now_ns=D0 + DAY + 3 * H)
-    assert gappy_days(spans) == frozenset({"2024-10-04", "2024-10-05"})
+    assert gappy_days(spans, day_of=_utc_day) == frozenset({"2024-10-04", "2024-10-05"})
 
 
 def test_unclean_epoch_without_any_heartbeat_gaps_from_its_boot() -> None:
@@ -103,3 +113,10 @@ def test_unsorted_inputs_give_identical_output_and_inputs_are_not_mutated() -> N
 
 def test_no_epochs_means_no_gaps() -> None:
     assert compute_gap_spans((), [D0], now_ns=D0 + H) == ()
+
+
+def test_day_of_must_be_injected() -> None:
+    spans = compute_gap_spans((_epoch(D0, None),), [D0], now_ns=D0 + H)
+    with pytest.raises(TypeError):
+        untyped = cast("Callable[..., object]", gappy_days)
+        untyped(spans)
