@@ -220,6 +220,13 @@ def build(
     base.update(over)
     if "floor_stubs" not in over:
         base["floor_stubs"] = tuple(x for x in base["days"] if x.day == d(1))  # type: ignore[attr-defined]
+    if "floor_stub_pnl" not in over:  # the stub's post-floor P&L row mirrors its whole-day row
+        stub_days = {x.day for x in base["floor_stubs"] if x.fills or x.ambiguous}  # type: ignore[attr-defined]
+        base["floor_stub_pnl"] = tuple(
+            x
+            for x in base["pnl_days"]  # type: ignore[attr-defined]
+            if x.day in stub_days
+        )
     return StageSnapshot(**base)  # type: ignore[arg-type]
 
 
@@ -871,9 +878,9 @@ def test_s15_passes_aggregates_and_budget_fractions_to_the_port() -> None:
     assert fractions == {D("0.15"), D("0.40"), D("1.0")}
     assert all(type(a) is Decimal for a, _ in preds.calls)
     stage_total = [a for a, f in preds.calls if f == D("0.40")]
-    # A4: d(1) is the floor-day stub and its whole-day P&L is skipped: d(2)..d(8) and the open
-    # d(9) are 8 days of +0.01, minus 0.02 on day 2
-    assert stage_total == [D("0.06")]
+    # d(1) is the floor-day stub (its post-floor P&L row mirrors the whole-day row here), so
+    # all of d(1)..d(8) and the open d(9) count: 9 days of +0.01, minus 0.02 on day 2
+    assert stage_total == [D("0.07")]
 
 
 @pytest.mark.parametrize("mode", ["raise", "nonbool"])
@@ -1183,6 +1190,8 @@ def _floor_day_today(pnl: str, *, posted: int = 4) -> StageSnapshot:
         floor=StageReset(ts=ns_of(d(0)), cause="k_change", halt_ts=None),
         days=(counters(d(0), posted=posted),),
         floor_stubs=(counters(d(0), posted=posted),),
+        # the whole-day row carries the (pre-floor) loss; the post-floor stub row is calm
+        floor_stub_pnl=(DayPnl(d(0), reading("0.01")),),
         pnl_days=(DayPnl(d(0), reading(pnl)),),
     )
 
@@ -1203,6 +1212,7 @@ def test_h1_floor_day_counters_are_not_validated_as_stage_data() -> None:
     floor = StageReset(ts=ns_of(d(0)), cause="k_change", halt_ts=None)
     stub = counters(d(0), posted=4, denied=None)
     snap = build(0, today=d(0), floor=floor, days=(stub,), floor_stubs=(stub,),
+                 floor_stub_pnl=(DayPnl(d(0), reading("0.01")),),
                  pnl_days=(DayPnl(d(0), reading("0.01")),))  # fmt: skip
     assert evaluate_stage(snap).kind is VerdictKind.PASS
 

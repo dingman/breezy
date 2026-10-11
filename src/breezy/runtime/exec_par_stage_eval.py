@@ -26,8 +26,10 @@ instants, so ``today`` is the EARLIEST still-open label and a label after it is 
   obeys the same rules, so a pre-floor loss can never re-trip a stop. A stub that cannot split
   pre- from post-floor entries FAILs (``pre_floor_unknown``); a floor label with no stub is an
   empty stub only when its whole-day counters are empty. Every other label uses whole-day
-  counters. The floor labels' settled-P&L rows are WHOLE-day (they carry pre-floor entries), so
-  s15-day and s15-stage skip them; s15-cumulative, never floored, reads them.
+  counters. The floor labels' settled-P&L rows are WHOLE-day (they carry pre-floor entries): s15-day
+  and s15-stage read the post-floor STUB row (``snap.floor_stub_pnl``, required whenever the stub
+  has fills or AMBIGUOUS marks; WP-D writes it) and s15-cumulative, never floored, the whole-day
+  row.
 * *Closed* days are ``floor_day <= d < today``. *Open* days are ``today`` and any later label that
   carries data (A5), up to ``MAX_OPEN_DAYS_AHEAD`` ahead; an entry further ahead is
   ``counter_missing``. Open days join the closed days for the halt rules that act on the first
@@ -207,8 +209,16 @@ def _span(after: dt.date, before: dt.date) -> tuple[str, ...]:
 
 
 def _is_empty(row: DayCounters) -> bool:
-    """No entry at all (a ``None`` count is NOT empty: it is unknown)."""
-    return row.posted == 0 and row.ambiguous == 0 and not row.fills
+    """No activity at all: no entry, AMBIGUOUS mark, fill, denial, open-cost flag or window (a
+    ``None`` entry count is NOT empty: it is unknown)."""
+    return (
+        row.posted == 0
+        and row.ambiguous == 0
+        and not row.fills
+        and not row.denied_counted
+        and not row.open_flags
+        and not row.windows
+    )
 
 
 def _stage_view(
@@ -290,6 +300,12 @@ def _build_ctx(snap: StageSnapshot) -> StageContext:
         if entry.day in pnl:
             raise fail("duplicate_day")
         pnl[entry.day] = entry.reading
+    stub_pnl: dict[str, SettledPnlReading | None] = {}
+    for entry in snap.floor_stub_pnl:
+        parse_day(entry.day)
+        if entry.day in stub_pnl:
+            raise fail("duplicate_day")
+        stub_pnl[entry.day] = entry.reading
     return StageContext(
         snap,
         snap.floor,
@@ -306,6 +322,7 @@ def _build_ctx(snap: StageSnapshot) -> StageContext:
         _stage_view(floor_days, whole, stubs),
         whole,
         pnl,
+        stub_pnl,
         first_k_day,
         snap.configured_k,
     )
@@ -420,14 +437,19 @@ def _validate_cumulative_rows(ctx: StageContext, unreconciled: frozenset[str]) -
 
 def _validate_pnl(ctx: StageContext) -> None:
     unreconciled = ctx.snap.gappy_days | ctx.snap.pending_rebuild_days
-    for reading in ctx.pnl.values():
+    for reading in (*ctx.pnl.values(), *ctx.stub_pnl.values()):
         if reading is not None:
             _validate_reading(reading)
     # BG-1c writes a row per arm day with entries (exec_par_settled_pnl.py:234-244), settled
     # or not, so today needs its row like every closed day.
     for label in ctx.live:
         if label in ctx.floor_days:
-            continue  # judged on whole-day counters by the cumulative check below
+            # A floor stub with post-floor fills or AMBIGUOUS marks needs its own settled-P&L
+            # row (WP-D writes it, plan r2.2); never lean on s15-cumulative alone. The whole-day
+            # row is judged by the cumulative check below.
+            if _needs_pnl_row(ctx.by_day[label]) and ctx.stub_pnl.get(label) is None:
+                raise fail("settled_pnl_missing")
+            continue
         if _needs_pnl_row(ctx.by_day[label]) and ctx.pnl.get(label) is None:
             raise fail("settled_pnl_missing")
     _validate_cumulative_rows(ctx, unreconciled)

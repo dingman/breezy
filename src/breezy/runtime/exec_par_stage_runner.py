@@ -430,6 +430,8 @@ class StageEvaluator:
         ports = self._ports
         self._seed_liveness()
         start = ports.wall_ns()
+        # ONE label horizon per pass: reconcile and the snapshot read the same days.
+        through = max({today, *ports.governed.open_days_at(start)})
         self._phase, self._phase_start = _PHASE_RECONCILE, ports.monotonic_ns()
         self._telemetry(lambda: ports.counters.write_reconcile_phase(start_ns=start, ok_ns=None))
         if ports.await_ready is not None:
@@ -439,7 +441,7 @@ class StageEvaluator:
             raise _PassFailure(f"{_FAIL_PREFIX}ingest_unbound")
         while pending() > 0:  # never reconcile over a queued retry (no double count)
             await asyncio.sleep(ports.ingest_poll_s)
-        result = self._reconcile(today)  # sync, no await since the queue check
+        result = self._reconcile(today, through)  # sync, no await since the queue check
         await asyncio.sleep(0)
 
         eval_start = ports.wall_ns()
@@ -453,7 +455,7 @@ class StageEvaluator:
         if ports.refresh_settled_pnl is not None:
             await ports.refresh_settled_pnl()
         await asyncio.sleep(0)
-        verdict, elapsed = self._timed_evaluate(today, result.status, eval_start)
+        verdict, elapsed = self._timed_evaluate(today, result.status, start)
         self._phase = None
 
         now = ports.wall_ns()
@@ -470,10 +472,9 @@ class StageEvaluator:
                 lambda: ports.store.write_stage_eval_liveness(StageEvalLiveness(eval_start, now))
             )
 
-    def _reconcile(self, today: str) -> PassResult:
+    def _reconcile(self, today: str, through: str) -> PassResult:
         ports = self._ports
         try:
-            through = max({today, *ports.governed.open_days_at(ports.wall_ns())})
             labels = stage_day_labels(
                 ports.store.read_stage_reset(),
                 ports.store.read_epoch_rows(),

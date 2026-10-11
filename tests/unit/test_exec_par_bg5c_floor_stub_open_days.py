@@ -187,6 +187,10 @@ def build(
         "governed": GOV,
         "predicates": Preds(),
         "floor_stubs": tuple(stubs.values()),
+        # a post-floor P&L row for every stub that holds fills (WP-D writes them)
+        "floor_stub_pnl": tuple(
+            DayPnl(x.day, reading()) for x in stubs.values() if x.fills or x.ambiguous
+        ),
     }
     base.update(over)
     return StageSnapshot(**base)
@@ -386,6 +390,15 @@ class Reads:
 
     def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]:
         return self.anchors.get(day, ())
+
+    def read_latest_entry_day(self) -> str | None:
+        families: tuple[dict[str, Any], ...] = (
+            self.anchors,
+            self.ambiguous,
+            self.denials,
+            self.fills,
+        )
+        return max((day for fam in families for day, rows in fam.items() if rows), default=None)
 
 
 @dataclass

@@ -33,6 +33,7 @@ classifier it is ``None`` (report-only before S3, a FAIL at S3: K7).
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -103,6 +104,7 @@ class SnapshotReads(Protocol):
     def read_window_peaks(self, day: str) -> tuple[WindowPeak, ...]: ...
     def read_ambiguous(self, day: str) -> tuple[object, ...]: ...
     def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]: ...
+    def read_latest_entry_day(self) -> str | None: ...
 
 
 class SnapshotCounters(Protocol):
@@ -305,14 +307,28 @@ def _anchors_at(reads: SnapshotReads, day: str, report: Report) -> tuple[OrderAn
     return _safe(lambda: reads.read_order_anchors(day), "anchors", day, report)
 
 
+def _activity(reads: SnapshotReads, day: str, report: Report) -> tuple[int, int, int] | None:
+    """(anchors, AMBIGUOUS marks, denials) on ``day``; ``None`` if a read failed. An AMBIGUOUS
+    mark can exist without an anchor, so anchors alone do not prove a day is quiet."""
+    anchors = _anchors_at(reads, day, report)
+    ambiguous = _safe(lambda: reads.read_ambiguous(day), "ambiguous", day, report)
+    denials = _safe(lambda: reads.read_denials(day), "denials", day, report)
+    if anchors is None or ambiguous is None or denials is None:
+        return None
+    return len(anchors), len(ambiguous), len(denials)
+
+
 def _ahead_tail(
     reads: SnapshotReads,
     counters: SnapshotCounters,
     inputs: SnapshotInputs,
     covered_through: str,
 ) -> tuple[DayCounters, ...]:
-    """Entries past the covered labels: within the allowance they are open data, beyond it the
-    evaluator reports ``counter_missing``. A label with no posted entry is not added."""
+    """Activity past the covered labels. Within the allowance it is open data; beyond it the
+    evaluator reports ``counter_missing``. A bounded day probe covers the next
+    ``AHEAD_PROBE_DAYS`` days past the allowance; ANY row dated later than that is found by a
+    key-prefix scan (``read_latest_entry_day``) and fails closed. A label with no activity is
+    not added."""
     today = dt.date.fromisoformat(inputs.today)
     covered = dt.date.fromisoformat(covered_through)
     rows: list[DayCounters] = []
@@ -321,11 +337,18 @@ def _ahead_tail(
         if day_date <= covered:
             continue
         day = day_date.isoformat()
-        anchors = _anchors_at(reads, day, inputs.on_read_error)
-        if anchors is None:
+        seen = _activity(reads, day, inputs.on_read_error)
+        if seen is None:
             rows.append(DayCounters(day, None, None, None, None, None, None))
-        elif anchors:
-            rows.append(_day_counters(reads, counters, inputs, day))
+        elif any(seen):
+            row = _day_counters(reads, counters, inputs, day)
+            # Counts that under-report the rows actually present are unknown, never a quiet day.
+            under = (row.posted or 0) < seen[0] or (row.ambiguous or 0) < seen[1]
+            rows.append(dataclasses.replace(row, posted=None) if under else row)
+    probed_to = today + dt.timedelta(days=MAX_OPEN_DAYS_AHEAD + AHEAD_PROBE_DAYS)
+    latest = reads.read_latest_entry_day()  # a stage-level read: a failure propagates
+    if latest is not None and dt.date.fromisoformat(latest) > probed_to:
+        rows.append(DayCounters(latest, None, None, None, None, None, None))
     return tuple(rows)
 
 

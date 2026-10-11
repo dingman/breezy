@@ -53,22 +53,35 @@ class _Latch(Protocol):
 
 def _force_and_alert(
     latch: _Latch, alert_sink: AlertSink, reason: str, detail: DayConventionDetail
-) -> None:
+) -> Exception | None:
+    """Try to force K=1, then alert whether or not forcing worked.
+
+    Returns the force failure (``None`` on success) instead of raising it, so a caller that is
+    already re-raising an original error keeps that error, and no failure can swallow the alert.
+    """
     _LOG.error("EXEC-PAR boot: %s; forcing K=1", reason)
-    latch.force_k1(reason)
+    force_error: Exception | None = None
+    try:
+        latch.force_k1(reason)
+    except Exception as exc:  # noqa: BLE001 - alert regardless, then surface it
+        force_error = exc
+        _LOG.error("EXEC-PAR boot: forcing K=1 failed (%s)", type(exc).__name__)
     emit_alert(
         alert_sink,
         AlertPayload(
             severity="CRITICAL", event=detail.value, site=_ALERT_SITE, detail=detail.value
         ),
     )
+    return force_error
 
 
 def enforce_day_convention_at_boot(latch: _Latch, *, alert_sink: AlertSink) -> bool:
     """Write the v2 row on the first K>1 boot; refuse K>1 on any other state.
 
     Returns ``True`` iff K was forced for a version mismatch. A read or write that raises forces
-    K=1 and alerts first, then re-raises. Configured K=1 does nothing.
+    K=1 and alerts first (the alert is sent even if forcing fails), then re-raises the ORIGINAL
+    error. A mismatch whose forcing fails raises the force failure after alerting. Configured K=1
+    does nothing.
     """
     if latch.max_slots() <= 1:
         return False
@@ -88,5 +101,9 @@ def enforce_day_convention_at_boot(latch: _Latch, *, alert_sink: AlertSink) -> b
         return False
     if version == DAY_CONVENTION_VERSION:
         return False
-    _force_and_alert(latch, alert_sink, DAY_CONVENTION_REASON, DayConventionDetail.MISMATCH)
+    failure = _force_and_alert(
+        latch, alert_sink, DAY_CONVENTION_REASON, DayConventionDetail.MISMATCH
+    )
+    if failure is not None:
+        raise failure
     return True

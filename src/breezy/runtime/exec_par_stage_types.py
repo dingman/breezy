@@ -215,7 +215,10 @@ class StageSnapshot:
     required). ``floor_stubs`` holds, for each station's floor-day label
     (``open_days_at(floor.ts)``), the counters of ONLY the entries armed at or after ``floor.ts``
     (A4); a floor label with no stub is read as an empty stub only when its whole-day counters are
-    empty, else the stage FAILs
+    empty, else the stage FAILs. ``floor_stub_pnl`` holds the settled-P&L row of each floor stub
+    (post-floor entries only); a stub with fills or AMBIGUOUS marks and no such row FAILs
+    (``settled_pnl_missing``). WP-D owns writing the stub P&L rows (plan r2.2); until it does, a
+    K>1 stage with post-floor fills on a floor day fails closed, which is intended
     (``pre_floor_unknown``). ``pnl_days`` lists every day with a settled-P&L row (and
     ``None`` readings for expected-but-unreadable rows) since the first K>1 boot, for
     s15-cumulative. ``gappy_days`` and ``pending_rebuild_days`` are the still-unreconciled
@@ -242,6 +245,7 @@ class StageSnapshot:
     governed: DayConvention
     predicates: PnlPredicatePort
     floor_stubs: tuple[DayCounters, ...] = ()
+    floor_stub_pnl: tuple[DayPnl, ...] = ()
 
 
 # -- public output types ---------------------------------------------------------
@@ -440,5 +444,6 @@ class StageContext:
     by_day: Mapping[str, DayCounters]
     whole_day: Mapping[str, DayCounters]
     pnl: Mapping[str, SettledPnlReading | None]
+    stub_pnl: Mapping[str, SettledPnlReading | None]
     first_k_day: str
     stage_k: int
