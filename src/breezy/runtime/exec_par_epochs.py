@@ -22,7 +22,6 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
-from urllib.parse import quote
 
 from breezy.persistence.epoch_strata import STRATUM_PARALLEL, STRATUM_SINGLE
 from breezy.runtime.exec_par_records import (
@@ -164,7 +163,7 @@ def read_epoch_ledger(db_path: Path) -> EpochLedger:
     A row that does not decode raises :class:`EpochLedgerCorrupt` naming its key. It is never
     skipped: a skipped parallel epoch would let parallel fills into M1-v3.
     """
-    uri = f"file:{quote(db_path.resolve().as_posix())}?mode=ro"
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_S)
     try:
         conn.execute("PRAGMA query_only=ON")

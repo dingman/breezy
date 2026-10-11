@@ -279,7 +279,7 @@ def test_a_corrupt_epoch_row_fails_hard_naming_the_key(tmp_path: Path) -> None:
 
 
 def test_read_epoch_ledger_quotes_the_uri(tmp_path: Path) -> None:
-    folder = tmp_path / "a?b#c d"
+    folder = tmp_path / "a?b#c d%41"
     folder.mkdir()
     db = folder / "s.db"
     with _latch(db, k=2, boot_ns=100) as latch:
