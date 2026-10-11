@@ -101,6 +101,7 @@ from breezy.runtime.exec_par_stage_types import (
 )
 
 __all__ = [
+    "MARKER_ATTEMPTS",
     "STAGE_EVAL_SLOW_NS",
     "STAGE_EVAL_STUCK_NS",
     "StageEvalPorts",
@@ -144,6 +145,8 @@ _EVENT_OF_REASON: Final[dict[str, str]] = {
     REASON_TASK_DIED: EVENT_TASK_DIED,
     REASON_RECONCILE_STUCK: EVENT_RECONCILE_STUCK,
 }
+#: BG-6: tries (ts, ts+1, ts+2) for a stop-verdict marker whose ``ts_ns`` key is taken.
+MARKER_ATTEMPTS: Final[int] = 3
 _OUTBOX_MAX: Final[int] = 64
 _PHASE_RECONCILE: Final[str] = "reconcile"
 _PHASE_EVALUATE: Final[str] = "evaluate"
@@ -242,8 +245,13 @@ class StageEvaluator:
         self._outbox: list[tuple[str, str, str]] = []
         self._ingest_pending: Callable[[], int] | None = None
         self._liveness_seeded = False
+        self._counts_changed: Callable[[tuple[str, ...]], None] | None = None
         self._last_settled_seq: int | None = None
         self._settled_dirty = False
+
+    def bind_counts_changed(self, callback: Callable[[tuple[str, ...]], None]) -> None:
+        """BG-6: told the days a reconcile rebuilt or excluded (the scan cache drops them)."""
+        self._counts_changed = callback
 
     def bind_ingest_pending(self, pending: Callable[[], int]) -> None:
         """Late-bind the ingest guard's retry-queue length (a reconcile waits for zero)."""
@@ -502,6 +510,15 @@ class StageEvaluator:
             raise _PassFailure(f"{_FAIL_PREFIX}reconcile_ordering") from None
         except Exception as exc:  # noqa: BLE001 - mapped to a halt reason
             raise _PassFailure(f"{_FAIL_PREFIX}reconcile:{type(exc).__name__}") from None
+        changed = (
+            *(x.day for x in result.rebuild_events),
+            *(x.day for x in result.excluded_events),
+        )
+        if changed and self._counts_changed is not None:
+            try:
+                self._counts_changed(changed)
+            except Exception as exc:  # noqa: BLE001 - a cache hint never fails a pass
+                logger.error("exec_par counts-changed hook failed: %s", type(exc).__name__)
         for rebuilt in result.rebuild_events:
             self._emit(
                 "WARN",
@@ -641,12 +658,21 @@ class StageEvaluator:
         self._integrity(reason)
 
     def _write_marker(self, reason: str, now: int) -> bool:
-        try:
-            self._ports.store.write_stop_verdict(StopVerdict(reason=reason, ts_ns=now))
-        except Exception as exc:  # noqa: BLE001 - becomes stop_marker_write_fail
-            logger.error("exec_par stop marker write failed: %s", type(exc).__name__)
-            return False
-        return True
+        """The ``stop_verdict`` marker. The row is keyed by ``ts_ns`` and exclusive, so a marker
+        already stored at that instant (another reason, or the daily and intraday paths in the
+        same nanosecond) refuses the write: the timestamp is bumped by 1 ns, up to
+        ``MARKER_ATTEMPTS`` tries in all. Any other failure, or running out of tries, is False."""
+        for bump in range(MARKER_ATTEMPTS):
+            try:
+                self._ports.store.write_stop_verdict(StopVerdict(reason=reason, ts_ns=now + bump))
+            except ValueError:  # an exclusive-put collision (a different row at that key)
+                continue
+            except Exception as exc:  # noqa: BLE001 - becomes stop_marker_write_fail
+                logger.error("exec_par stop marker write failed: %s", type(exc).__name__)
+                return False
+            return True
+        logger.error("exec_par stop marker write failed: %d timestamp collisions", MARKER_ATTEMPTS)
+        return False
 
     def _set_flag(self, reason: str, now: int) -> None:
         store = self._ports.store

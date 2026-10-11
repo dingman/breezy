@@ -525,16 +525,29 @@ class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
         except Exception as exc:  # noqa: BLE001 - the guard is total; this is belt and braces
             logger.error("%s: ingest guard failed: %s", _SITE, type(exc).__name__)
 
+    @staticmethod
+    def _marks_pending(marks: AmbiguousMarkSource | None) -> bool:
+        """Whether durable AMBIGUOUS marks await ingest; an unreadable source counts as yes."""
+        if marks is None:
+            return False
+        try:
+            return bool(marks.ambiguous_marks_pending())
+        except Exception:  # noqa: BLE001 - the ingest below counts the same fault itself
+            return True
+
     def _run_ingest(self, now_ns: int) -> None:
         """Retry failed events, then ingest AMBIGUOUS marks; faults are counted, never raised."""
         guard = self._guard
         if guard is None:
             return
         try:
-            guard.retry(self.cache.order, now_ns)
             marks = self._ambiguous_marks
+            late = guard.pending > 0 or self._marks_pending(marks)
+            guard.retry(self.cache.order, now_ns)
             if marks is not None:
                 guard.ingest_marks(marks, now_ns)
+            if late:
+                self._intraday_invalidate()  # BG-6: rows may have landed on a closed day
         except Exception as exc:  # noqa: BLE001 - belt and braces: ingest cannot stop the tick
             logger.error("%s: ingest pass failed: %s", _SITE, type(exc).__name__)
 

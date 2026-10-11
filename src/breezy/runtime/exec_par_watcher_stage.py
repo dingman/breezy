@@ -101,12 +101,22 @@ class StageEvalWatcherMixin:
                     stop=evaluator.stop_class,
                     integrity=evaluator.integrity_halt,
                 )
+                evaluator.bind_counts_changed(self._intraday.invalidate)
             except Exception as exc:  # noqa: BLE001 - fail closed, once
                 self._intraday_wiring_failed = True
                 logger.error("exec_par intraday monitor wiring failed: %s", type(exc).__name__)
                 evaluator.integrity_halt(f"stage_eval_fail:intraday_wiring:{type(exc).__name__}")
         if self._intraday is not None:
-            self._intraday.check(now_ns)  # never raises
+            try:
+                self._intraday.check(now_ns)  # total by contract; belt and braces
+            except Exception as exc:  # noqa: BLE001 - an escaped fault is an integrity halt
+                logger.error("exec_par intraday check raised: %s", type(exc).__name__)
+                evaluator.integrity_halt("intraday_check_raised")
+
+    def _intraday_invalidate(self) -> None:
+        """A late ingest may have written rows to a closed day: drop every cached scan."""
+        if self._intraday is not None:
+            self._intraday.invalidate()
 
     def _stage_eval_gate(self) -> None:
         if self._stage_eval is not None and not self._stage_eval.heartbeat_ok:

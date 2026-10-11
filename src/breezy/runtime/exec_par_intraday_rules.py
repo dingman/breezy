@@ -175,6 +175,11 @@ class IntradayInputs:
     ambiguous: int
     ambiguous_arm_ns: tuple[int, ...]
     open_cost_by_station_day: Mapping[str, Decimal]
+    #: Integrity findings from the gathering (corrupt or unusable counts). They never stop the
+    #: rules from being evaluated: the conservative reading still trips.
+    findings: tuple[str, ...] = ()
+    #: The ``stage_reset`` instant the window was cut at (``None``: no reset yet).
+    floor_ts: int | None = None
 
 
 def intraday_stop_reasons(inputs: IntradayInputs, port: OpenCostPort) -> tuple[str, ...]:
