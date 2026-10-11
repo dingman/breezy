@@ -83,12 +83,12 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
 Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
 
-### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 2 wins, −4.63; plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
+### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 4 wins, −2.63 (corrected); plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
 | ID | Open work (exact) | Status |
 |---|---|---|
 | TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | PLAN |
-| TE-2 | Diagnose FQ 0/25 (LAX heat bust, 1 °F boundary losses) before any re-arm (delta vs F0/F13) | PLAN |
-| TE-3 | NO-side longshot hypothesis (2/3 wins); prereg-only, distinct from M1-v3 | PLAN |
+| TE-2 | Diagnose FQ 2/25, −2.17 (LAX heat bust) before any re-arm (delta vs F0/F13) | PLAN |
+| TE-3 | NO-side longshot hypothesis (1/3 wins); prereg-only, distinct from M1-v3 | PLAN |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
