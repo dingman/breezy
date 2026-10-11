@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
@@ -165,6 +166,21 @@ class AltSourceDiscovery:
     venue_outcomes_present: bool
 
 
+_ISO_DAY: Final = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _last_valid_day(station_dir: Path) -> str | None:
+    """The newest ``valid_utc`` calendar day over a station's yearly CSV files (read-only)."""
+    newest: str | None = None
+    for csv_file in sorted(station_dir.glob("*.csv")):
+        for line in csv_file.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+            fields = line.split(",")
+            found = _ISO_DAY.match(fields[1]) if len(fields) > 1 else None
+            if found and (newest is None or found.group(0) > newest):
+                newest = found.group(0)
+    return newest
+
+
 def discover_alt_sources(
     archive_root: Path,
     icaos: Sequence[str],
@@ -172,4 +188,19 @@ def discover_alt_sources(
     *,
     venue_outcomes: Path | None = None,
 ) -> AltSourceDiscovery:
-    raise NotImplementedError
+    """S0-G: does a METAR series cover the window for every station, is a venue outcome store given?
+
+    Discovery only: no tmax, no flip count. An absent source is UNTESTABLE for K3 / K4.
+    """
+    last_valid: dict[str, str | None] = {}
+    for icao in icaos:
+        station_dir = archive_root / "metar-routine" / icao
+        last_valid[icao] = _last_valid_day(station_dir) if station_dir.is_dir() else None
+    covers = bool(icaos) and all(
+        v is not None and v >= last_day.isoformat() for v in last_valid.values()
+    )
+    return AltSourceDiscovery(
+        metar_last_valid=last_valid,
+        metar_covers=covers,
+        venue_outcomes_present=venue_outcomes is not None and venue_outcomes.is_file(),
+    )

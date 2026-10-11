@@ -123,6 +123,14 @@ def test_a_perturbed_vector_mismatches_and_is_k1a_with_a_materiality_flag(
     assert result.material == (abs(result.delta) > 0.01)
 
 
+def _run(world: World, wd: Path, spec: FillSpec, cycles: dict, published: dict):  # type: ignore[no-untyped-def,type-arg]
+    rec = Reconstructor(
+        SubprocessGit(world.repo_root), manifest_path=MANIFEST_REL, workdir=wd,
+        cycles=cycles, published=published,
+    )  # fmt: skip
+    return rec.reconstruct(spec, world.commit)
+
+
 def test_missing_and_reissued_bulletins_are_untestable_and_a_late_cycle_is_ambiguous(
     world: World, tmp_path: Path
 ) -> None:
@@ -130,11 +138,9 @@ def test_missing_and_reissued_bulletins_are_untestable_and_a_late_cycle_is_ambig
     case = world.cases[0]
     cycle = world.cycle_ns_by_day[case.climate_day]
     base = load_derived_cycles(world.derived_root)
+    live = published_cycles(world.logs)
 
-    gone = {k: v for k, v in base.items() if k != cycle}
-    missing = Reconstructor(SubprocessGit(world.repo_root), manifest_path=MANIFEST_REL,
-                            workdir=tmp_path / "a", cycles=gone,
-                            published=published_cycles(world.logs)).reconstruct(spec, world.commit)  # fmt: skip
+    missing = _run(world, tmp_path / "a", spec, {k: v for k, v in base.items() if k != cycle}, live)
     assert (missing.match, missing.s0d_class) == (False, S0DMiss.UNTESTABLE)
 
     visible = utc_ns(case.climate_day - dt.timedelta(days=1), 17.0)
@@ -142,23 +148,20 @@ def test_missing_and_reissued_bulletins_are_untestable_and_a_late_cycle_is_ambig
         dataclasses.replace(r, available_at_ns=visible + 3600 * _NS)
         for r in _derived_rows(case.climate_day, cycle, visible, {case.station: 1.5})
     )  # a reissued bulletin: different values, Last-Modified after the live publication
-    reissued = Reconstructor(SubprocessGit(world.repo_root), manifest_path=MANIFEST_REL,
-                             workdir=tmp_path / "b", cycles={**base, cycle: reissued_rows},
-                             published=published_cycles(world.logs)).reconstruct(spec, world.commit)  # fmt: skip
+    reissued = _run(world, tmp_path / "b", spec, {**base, cycle: reissued_rows}, live)
     assert (reissued.match, reissued.s0d_class) == (False, S0DMiss.UNTESTABLE)
+    assert reissued.reason == "bulletin_reissued"
 
-    late = cycle + 3600 * _NS
-    late_rows = tuple(_derived_rows(case.climate_day, late, spec.decision_now_ns + 2 * _NS, {case.station: 2.0}))
-    ambiguous = Reconstructor(SubprocessGit(world.repo_root), manifest_path=MANIFEST_REL,
-                              workdir=tmp_path / "c", cycles={**base, late: late_rows},
-                              published={**published_cycles(world.logs), late: spec.decision_now_ns + 2 * _NS}
-                              ).reconstruct(spec, world.commit)  # fmt: skip
+    late, late_at = cycle + 3600 * _NS, spec.decision_now_ns + 2 * _NS
+    late_rows = tuple(_derived_rows(case.climate_day, late, late_at, {case.station: 2.0}))
+    ambiguous = _run(
+        world, tmp_path / "c", spec, {**base, late: late_rows}, {**live, late: late_at}
+    )
     assert ambiguous.match is True  # the earlier cycle is still the one visible at now_ns
     perturbed = dataclasses.replace(spec, p_hat_logged=spec.p_hat_logged + 0.02)
-    flagged = Reconstructor(SubprocessGit(world.repo_root), manifest_path=MANIFEST_REL,
-                            workdir=tmp_path / "d", cycles={**base, late: late_rows},
-                            published={**published_cycles(world.logs), late: spec.decision_now_ns + 2 * _NS}
-                            ).reconstruct(perturbed, world.commit)  # fmt: skip
+    flagged = _run(
+        world, tmp_path / "d", perturbed, {**base, late: late_rows}, {**live, late: late_at}
+    )
     assert flagged.s0d_class == S0DMiss.CYCLE_AMBIGUOUS
 
 
@@ -233,7 +236,9 @@ def test_production_defaults_real_git_real_pinned_commit_and_real_store_reader(
     git = SubprocessGit(REPO)
     model = load_pinned_model(git, "60290e9ddd29", "deploy/families/pm_us_crh_fq_v1.json", tmp_path)
 
-    assert model.commit.startswith("60290e9ddd29") and model.fee_coefficient == pytest.approx(0.0695)
+    assert model.commit.startswith("60290e9ddd29") and model.fee_coefficient == pytest.approx(
+        0.0695
+    )
     assert git.blob_sha256("60290e9ddd29", "deploy/families/pm_us_crh_fq_v1.json") is not None
     pinned = git.show_blob(
         "60290e9ddd29",
@@ -247,8 +252,8 @@ def test_production_defaults_real_git_real_pinned_commit_and_real_store_reader(
         cycles=cycles, published=published,
     )  # fmt: skip
     case = world.cases[3]
-    spec = FillSpec("g", case.instrument_id, expected_p_hat(case.station, case.climate_day,
-                                                           case.instrument_id), case.decision_ns, 0.15)  # fmt: skip
+    logged = expected_p_hat(case.station, case.climate_day, case.instrument_id)
+    spec = FillSpec("g", case.instrument_id, logged, case.decision_ns, 0.15)
 
     result = rec.reconstruct(spec, "60290e9ddd29")
 

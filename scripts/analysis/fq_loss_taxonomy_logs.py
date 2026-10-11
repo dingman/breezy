@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import itertools
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -34,6 +35,12 @@ _DECISION_MARK: Final = b"SHADOW_DECISION"
 _ANSI: Final = re.compile(r"\x1b\[[0-9;]*m")
 _STATION: Final = re.compile(r"'station': '([^']+)'")
 _CLIMATE_DAY: Final = re.compile(r"'climate_day': datetime\.date\((\d+), (\d+), (\d+)\)")
+_PUBLISHED_STAMP: Final = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{1,9})Z"
+)
+_PUBLISHED_CYCLE: Final = re.compile(r"NBM_NBP_PUBLISHED cycle_ns=(\d+)")
+_RUNG_ID: Final = re.compile(r"^(lt|-?\d+)_(gte|-?\d+)$")
+_NS: Final = 10**9
 _RUNG: Final = re.compile(r"'rung_id': '([^']+)'")
 _KIND: Final = re.compile(r"'kind': '(\w+)'")
 #: The verified P6 counts (plan section 1): fills, instruments, no-legs, open-ended bands,
@@ -208,3 +215,47 @@ def partition_union(
     for event in events:
         union.setdefault((event.station, event.climate_day), set()).add(event.rung_id)
     return {key: frozenset(rungs) for key, rungs in union.items()}
+
+
+def iter_published_cycles(path: Path) -> Iterator[tuple[int, int]]:
+    """``(cycle_ns, visible_ns)`` for every NBM_NBP_PUBLISHED line of one node log (streamed)."""
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            if "NBM_NBP_PUBLISHED" not in raw:
+                continue
+            text = _ANSI.sub("", raw).strip()
+            stamp, cycle = _PUBLISHED_STAMP.match(text), _PUBLISHED_CYCLE.search(text)
+            if stamp is None or cycle is None:
+                continue
+            y, mo, d, hh, mm, ss, frac = stamp.groups()
+            moment = dt.datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss), tzinfo=dt.UTC)
+            yield int(cycle.group(1)), int(moment.timestamp()) * _NS + int(frac.ljust(9, "0"))
+
+
+def published_cycles(paths: Sequence[Path]) -> dict[int, int]:
+    """``cycle_ns -> earliest visible_ns`` over the node logs (the log stamp is the visibility)."""
+    visible: dict[int, int] = {}
+    for path in paths:
+        for cycle_ns, when in iter_published_cycles(path):
+            visible[cycle_ns] = min(when, visible.get(cycle_ns, when))
+    return visible
+
+
+def partition_complete(rung_ids: Sequence[str]) -> bool:
+    """Contiguous inclusive coverage from an open lower tail to an open upper tail."""
+    bounds: list[tuple[int | None, int | None]] = []
+    for rung_id in rung_ids:
+        found = _RUNG_ID.match(rung_id)
+        if found is None:
+            return False
+        lo, hi = found.groups()
+        bounds.append((None if lo == "lt" else int(lo), None if hi == "gte" else int(hi)))
+    if not bounds:
+        return False
+    bounds.sort(key=lambda b: (b[0] is not None, b[0] or 0))
+    if bounds[0][0] is not None or bounds[-1][1] is not None:
+        return False
+    return all(
+        prev[1] is not None and nxt[0] is not None and nxt[0] == prev[1] + 1
+        for prev, nxt in itertools.pairwise(bounds)
+    )

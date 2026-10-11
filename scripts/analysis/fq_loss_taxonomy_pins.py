@@ -21,7 +21,13 @@ _ZERO_SHA: Final = "0" * 12
 _ROW: Final = re.compile(r"^(\S+)\s+old=(\w+)\s+new=(\w+)\b")
 _ABSENT: Final = "<absent>"
 #: A closed environment: no inherited GIT_* variable (GIT_DIR, ...) can redirect git.
-_GIT_ENV: Final = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C"}
+_GIT_ENV: Final = {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "LC_ALL": "C",
+    "GIT_OPTIONAL_LOCKS": "0",  # `git status` must not refresh (write) the index
+}
+#: Placed before every revision/object argument so an option-shaped value cannot become a flag.
+_EOO: Final = "--end-of-options"
 
 
 class SnapshotShaMismatch(Exception):
@@ -49,6 +55,7 @@ class GitPort(Protocol):
     def show_blob(self, commit: str, path: str) -> bytes:
         """The bytes of ``path`` at ``commit`` (``git show``); raises when absent."""
         ...
+
     def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]: ...
     def log_commits(
         self, paths: Sequence[str], until: str, *, since: str | None = None
@@ -74,29 +81,31 @@ class SubprocessGit:
         return done
 
     def head_blob_sha256(self, path: str) -> str:
-        return hashlib.sha256(self._run("cat-file", "blob", f"HEAD:{path}").stdout).hexdigest()
+        return hashlib.sha256(
+            self._run("cat-file", "blob", _EOO, f"HEAD:{path}").stdout
+        ).hexdigest()
 
     def porcelain_clean(self, paths: Sequence[str]) -> bool:
         out = self._run("status", "--porcelain", "--untracked-files=all", "--", *paths).stdout
         return not out.strip()
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        done = self._run("merge-base", "--is-ancestor", ancestor, descendant, check=False)
+        done = self._run("merge-base", "--is-ancestor", _EOO, ancestor, descendant, check=False)
         if done.returncode not in (0, 1):
             raise RuntimeError(f"git merge-base failed: {done.stderr.decode(errors='replace')}")
         return done.returncode == 0
 
     def blob_sha256(self, commit: str, path: str) -> str | None:
-        done = self._run("cat-file", "blob", f"{commit}:{path}", check=False)
+        done = self._run("cat-file", "blob", _EOO, f"{commit}:{path}", check=False)
         return hashlib.sha256(done.stdout).hexdigest() if done.returncode == 0 else None
 
     def show_blob(self, commit: str, path: str) -> bytes:
-        raise NotImplementedError
+        return self._run("cat-file", "blob", _EOO, f"{commit}:{path}").stdout
 
     def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]:
         shas = []
         for path in paths:
-            done = self._run("rev-parse", f"{commit}:{path}", check=False)
+            done = self._run("rev-parse", "--verify", _EOO, f"{commit}:{path}", check=False)
             shas.append(done.stdout.decode().strip() if done.returncode == 0 else _ABSENT)
         return tuple(shas)
 
@@ -104,7 +113,7 @@ class SubprocessGit:
         self, paths: Sequence[str], until: str, *, since: str | None = None
     ) -> tuple[str, ...]:
         span = f"{since}..{until}" if since else until
-        out = self._run("log", "--format=%H", span, "--", *paths).stdout.decode()
+        out = self._run("log", "--format=%H", _EOO, span, "--", *paths).stdout.decode()
         return tuple(out.split())
 
 
@@ -239,7 +248,12 @@ def pin_label(
 def phase_b_refusals(
     pinned_blob_sha256: dict[str, str], predeclaration_commit: str, git: GitPort
 ) -> tuple[RefusalReason, ...]:
-    """Every reason Phase B must refuse (all three checks always run)."""
+    """Every reason Phase B must refuse (all three checks always run).
+
+    An empty pin set is a ``ValueError``: it would otherwise pass every check vacuously.
+    """
+    if not pinned_blob_sha256:
+        raise ValueError("phase_b_refusals needs at least one pinned blob (empty pin set)")
     refusals: list[RefusalReason] = []
     if any(git.head_blob_sha256(path) != sha for path, sha in pinned_blob_sha256.items()):
         refusals.append(RefusalReason.HEAD_BLOB_MISMATCH)

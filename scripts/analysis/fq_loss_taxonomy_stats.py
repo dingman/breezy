@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from breezy.analysis.nbp_calibration import holm_correction
+
 Status = Literal["TESTABLE", "TESTABLE-CONDITIONAL", "NOT-TESTABLE"]
 Alternative = Literal["greater", "less", "two-sided"]
 
@@ -29,6 +31,8 @@ H1_SPREAD_FACTOR: Final = 2.0
 #: mass rule is rejected: under pi = 0.5 every sign vector is equally likely and it returns 1.0
 #: for the all-same-sign outcome, which would make T-LOC untestable by construction.
 T_LOC_TWO_SIDED_FORMULA: Final = "doubled_smaller_tail"
+T_LOC_MEDIAN_RULE: Final = "smallest_integer_with_cdf_at_least_half"
+LOC_MEDIAN_CDF: Final = 0.5
 
 
 @dataclass(frozen=True)
@@ -212,6 +216,26 @@ def spread_fill(pmf: Mapping[int, float], tmax_f: int) -> SpreadFill:
     return SpreadFill(pit=pit, is_tail_miss=is_tail, q_f=q_f)
 
 
+def loc_pi(pmf: Mapping[int, float]) -> float | None:
+    """T-LOC null pi = P(X > m | X != m) for the pmf's median m (smallest t with CDF >= 1/2).
+
+    ``None`` when the pmf is a point mass at m (no tie-free outcome exists). The median rule is
+    named here so the predeclaration can carry it (``T_LOC_MEDIAN_RULE``).
+    """
+    total = 0.0
+    median = None
+    for degree in sorted(pmf):
+        total += pmf[degree]
+        if total >= LOC_MEDIAN_CDF:
+            median = degree
+            break
+    if median is None:
+        return None
+    above = math.fsum(m for v, m in pmf.items() if v > median)
+    not_tied = 1.0 - pmf[median]
+    return above / not_tied if not_tied > 0.0 else None
+
+
 def spread_cluster_null(fill_qs: Sequence[float]) -> float:
     """q_c = min(1, sum q_f): the union (Boole) upper bound, conservative for an upper tail."""
     return min(1.0, math.fsum(fill_qs))
@@ -309,7 +333,11 @@ def t_win_power(
 
 
 def t_spread_power(cluster_qs: Sequence[float], *, alpha: float = ALPHA_PRIMARY) -> float:
-    """Power of the T-SPREAD reject region against H1-S (each q_c doubled, capped at 1)."""
+    """Power of the T-SPREAD reject region against H1-S (each q_c doubled, capped at 1).
+
+    When no x in 0..n reaches the upper-tail alpha the reject region is empty (``x_star`` is
+    ``None``) and the power is 0.0.
+    """
     x_star = min(
         (x for x in range(len(cluster_qs) + 1) if upper_tail(cluster_qs, x) <= alpha), default=None
     )
@@ -343,5 +371,16 @@ def holm_plan(min_ps: Mapping[str, float], *, alpha: float = ALPHA_PRIMARY) -> H
 def holm_decisions(
     p_values: Mapping[str, float], plan: HolmPlan, *, alpha: float = ALPHA_PRIMARY
 ) -> dict[str, bool]:
-    """Holm-adjusted rejections for the Holm members; NOT-TESTABLE members never reject."""
-    raise NotImplementedError
+    """Holm-adjusted rejections for the Holm members; NOT-TESTABLE members never reject.
+
+    The step-down runs over the plan's remaining members (its ``k``) through
+    ``nbp_calibration.holm_correction``; a raw p <= alpha is not a rejection by itself.
+    """
+    extra = set(p_values) - HOLM_MEMBERS
+    if extra:
+        raise ValueError(f"not Holm family members: {sorted(extra)}")
+    alive = {
+        n: p for n, p in p_values.items() if plan.statuses.get(n, "NOT-TESTABLE") != "NOT-TESTABLE"
+    }
+    adjusted = holm_correction(alive, alpha=alpha) if alive else {}
+    return {name: bool(adjusted[name]["rejected"]) if name in alive else False for name in p_values}

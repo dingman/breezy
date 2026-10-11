@@ -17,8 +17,8 @@ from scripts.analysis.fq_loss_taxonomy_core import (
     holm_plan,
     t_spread_power,
 )
-from scripts.analysis.fq_loss_taxonomy_stats import T_LOC_TWO_SIDED_FORMULA
 from scripts.analysis.fq_loss_taxonomy_inputs import SubprocessGit, phase_b_refusals
+from scripts.analysis.fq_loss_taxonomy_stats import T_LOC_TWO_SIDED_FORMULA
 from tests.support.te2_fixtures import tmp_git_repo
 
 _ALLOWED = ("math",)
@@ -96,3 +96,13 @@ def test_t_spread_power_docstring_states_the_no_reject_region_case() -> None:
     doc = inspect.getdoc(t_spread_power) or ""
 
     assert "0" in doc and "no x" in doc.lower()
+
+
+def test_loc_pi_is_p_above_the_cdf_median_given_not_tied() -> None:
+    from scripts.analysis.fq_loss_taxonomy_stats import T_LOC_MEDIAN_RULE, loc_pi
+
+    pmf = {69: 0.2, 70: 0.4, 71: 0.3, 72: 0.1}  # CDF reaches 1/2 at 70
+    assert loc_pi(pmf) == pytest.approx(0.4 / 0.6)
+    assert loc_pi({70: 1.0}) is None  # a point mass has no tie-free outcome
+    assert loc_pi({}) is None
+    assert T_LOC_MEDIAN_RULE == "smallest_integer_with_cdf_at_least_half"

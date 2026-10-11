@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from scripts.analysis import fq_v1_loss_taxonomy as cli
+from scripts.analysis.fq_loss_taxonomy_table import fill_rows
 from tests.support.aut2_fixtures import seed_fills
 from tests.support.te2_cli_fixtures import World, build_world
 from tests.support.te2_fixtures import (
@@ -32,7 +33,15 @@ _FILL_FIELDS = {
     "cycle_age_s", "newest_visible", "cycle_ns", "raw_sha256", "lower_f", "upper_f", "boot",
     "pinned_commit", "pin_state", "pin_label", "k1b", "q_f",
 }  # fmt: skip
-_DAY_FIELDS = {"station", "climate_day", "P_d", "pi_d", "q_d", "partition_rungs", "partition_complete"}
+_DAY_FIELDS = {
+    "station",
+    "climate_day",
+    "P_d",
+    "pi_d",
+    "q_d",
+    "partition_rungs",
+    "partition_complete",
+}
 _CLUSTER_FIELDS = {"station", "climate_days", "P_d", "P_c", "q_c", "pi_min", "pi_max"}
 
 
@@ -93,7 +102,9 @@ def test_phase_a_filters_the_34_fill_store_to_the_25_fq_fills(
     assert total == 34 and len(world.cases) == 25
     assert table["s0c"]["n"] == 25 and table["s0c"]["matched"] == 25
     assert len(table["station_days"]) == 14 and len(table["clusters"]) == 7
-    assert {r["instrument_id"][:20] for r in table["per_fill"]}.isdisjoint({"tc-temp-laxhigh-2026-09"})
+    assert {r["instrument_id"][:20] for r in table["per_fill"]}.isdisjoint(
+        {"tc-temp-laxhigh-2026-09"}
+    )
     assert all("2026-09" not in r["instrument_id"] for r in table["per_fill"])
 
 
@@ -104,9 +115,17 @@ def test_phase_a_pin_table_and_partition_and_s0g_are_written(
 
     assert [p["commit"][:12] for p in table["pin_table"]] == [world.commit[:12]] * 9
     assert len(table["pin_table"]) == 9
-    lax = next(d for d in table["station_days"] if d["station"] == "LAX" and d["climate_day"] == "2026-10-02")
+    lax = next(
+        d
+        for d in table["station_days"]
+        if d["station"] == "LAX" and d["climate_day"] == "2026-10-02"
+    )
     assert lax["partition_complete"] is True  # lt_69 + 70_99 (a Refuse line) + 100_gte
-    mdw = next(d for d in table["station_days"] if d["station"] == "MDW" and d["climate_day"] == "2026-10-05")
+    mdw = next(
+        d
+        for d in table["station_days"]
+        if d["station"] == "MDW" and d["climate_day"] == "2026-10-05"
+    )
     assert mdw["partition_complete"] is False
     assert table["s0g"]["k3_status"] == "UNTESTABLE" and table["s0g"]["k4_status"] == "UNTESTABLE"
     assert table["s0g"]["metar_last_valid"]["KLAX"] == "2026-06-30"
@@ -194,9 +213,11 @@ def _phase_b_inputs(tmp: Path) -> tuple[Path, Path, Path]:
     pins = tmp / "pins.json"
     pins.write_text(
         json.dumps(
-            {"head_blob_sha256": {"manifest.json": sha256_text("{}\n")},
-             "predeclaration_commit": commits[0]}
-        )  # fmt: skip
+            {
+                "head_blob_sha256": {"manifest.json": sha256_text("{}\n")},
+                "predeclaration_commit": commits[0],
+            }
+        )
     )
     store = tmp / "exec.db"
     seed_fills(store, [*fq_durable_fills(), *fq_september_fills()])
@@ -247,10 +268,14 @@ def test_phase_b_reproduces_only_the_25_fq_fills_and_never_reads_pre_october_tru
 
 
 def test_unparseable_instrument_is_a_stop_not_a_bare_assert() -> None:
+    from scripts.analysis.fq_loss_taxonomy_reconstruct import FillSpec, _untestable
     from tests.support.te2_fixtures import fill_read
 
     bad = fq_durable_fills()[0]
     object.__setattr__(bad, "instrument_id", "garbage.POLYMARKET_US")
+    spec = FillSpec("f", bad.instrument_id, 0.3, 1, 0.15)
     with pytest.raises(cli.UnparseableInstrumentStop):
-        cli._station_day_table(fill_read([bad]), [0.3])
-
+        fill_rows(
+            fill_read([bad]), [_untestable(spec, None, None, "x")], [spec], {}, "INFERRED",
+            dt.date(2026, 10, 5),
+        )  # fmt: skip

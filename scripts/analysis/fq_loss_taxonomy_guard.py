@@ -16,7 +16,7 @@ from typing import Final
 
 _HOLDOUT_OPENER: Final = "tuodloh_nepo"[::-1]
 _EXEC_PACKAGE: Final = "breezy.adapters.polymarket_us.exec"
-_FROZEN_PATH: Final = re.compile(r"(^|[/\\])m1[-_ ]?v3([/\\]|$)", re.IGNORECASE)
+_FROZEN_PATH: Final = re.compile(r"(^|[/\\])m1[-_ ]?v3([/\\]|$|[._*-])", re.IGNORECASE)
 _DYNAMIC_CALLS: Final = frozenset({"__import__", "eval", "exec", "compile"})
 _IO_MODULES: Final = frozenset(
     {
@@ -35,6 +35,8 @@ def _under(module: str, allowed: Sequence[str]) -> bool:
 def _static_text(node: ast.AST) -> str | None:
     """The statically known text of a string expression (constants, f-strings, ``+``)."""
     if isinstance(node, ast.Constant):
+        if isinstance(node.value, bytes):
+            return node.value.decode("utf-8", errors="replace")
         return node.value if isinstance(node.value, str) else None
     if isinstance(node, ast.JoinedStr):
         parts = [_static_text(v) for v in node.values]
