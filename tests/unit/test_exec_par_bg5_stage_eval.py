@@ -1473,3 +1473,47 @@ def test_l16_no_currency_value_appears_in_repr_for_any_of_several_amounts() -> N
     v = evaluate_stage(build(8, pnl_over=pnl))
     text = repr(v)
     assert all(s.lstrip("-") not in text for s in secrets)
+
+
+# -- pnl-row criterion: a fill or an AMBIGUOUS mark, not posted>0 (coordinator ruling) -----------
+
+
+def _without_row(snap: StageSnapshot, day: str) -> StageSnapshot:
+    return dataclasses.replace(snap, pnl_days=tuple(p for p in snap.pnl_days if p.day != day))
+
+
+@pytest.mark.parametrize("index", [4, 9])  # a closed day and today
+def test_all_unfilled_ioc_day_needs_no_pnl_row(index: int) -> None:
+    snap = build(8, day_over={index: {"fills": (), "amb": 0}})
+    v = evaluate_stage(_without_row(snap, d(index)))
+    assert v.kind is not VerdictKind.FAIL
+
+
+def test_all_unfilled_ioc_day_before_the_floor_needs_no_pnl_row() -> None:
+    snap = _with_pre_floor()
+    days = tuple(counters(x.day, posted=4, fills=()) if x.day == d(-2) else x for x in snap.days)
+    snap = dataclasses.replace(snap, days=days)
+    assert evaluate_stage(_without_row(snap, d(-2))).kind is VerdictKind.PROMOTION_ELIGIBLE
+
+
+def test_one_fill_without_a_row_still_fails() -> None:
+    one = (fill(d(4), "only"),)
+    snap = build(8, day_over={4: {"posted": 1, "fills": one}})
+    v = evaluate_stage(_without_row(snap, d(4)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:settled_pnl_missing"
+
+
+def test_one_fill_before_the_floor_without_a_row_fails_missing_pnl_day() -> None:
+    snap = _with_pre_floor()
+    days = tuple(
+        counters(x.day, posted=1, fills=(fill(x.day, "only"),)) if x.day == d(-2) else x
+        for x in snap.days
+    )
+    v = evaluate_stage(_without_row(dataclasses.replace(snap, days=days), d(-2)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_pnl_day"
+
+
+def test_an_ambiguous_mark_without_fills_needs_a_row() -> None:
+    snap = build(8, day_over={4: {"fills": (), "amb": 1}})
+    v = evaluate_stage(_without_row(snap, d(4)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:settled_pnl_missing"
