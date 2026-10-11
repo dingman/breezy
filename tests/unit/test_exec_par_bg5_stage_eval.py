@@ -1329,8 +1329,9 @@ def test_h4_missing_counters_before_the_floor_cannot_be_verified() -> None:
 
 
 def test_h4_unreconciled_excluded_day_before_the_floor_is_skipped() -> None:
-    v = evaluate_stage(_with_pre_floor(pnl_missing=True, excluded=True))
-    assert v.kind is VerdictKind.PROMOTION_ELIGIBLE
+    snap = _with_pre_floor(pnl_missing=True, excluded=True)
+    snap = dataclasses.replace(snap, gappy_days=frozenset({d(-2)}))  # still unreconciled
+    assert evaluate_stage(snap).kind is VerdictKind.PROMOTION_ELIGIBLE
 
 
 def test_h4_pre_floor_day_with_no_entries_needs_no_row() -> None:
@@ -1359,7 +1360,7 @@ def test_h5_reconcile_stuck_keeps_its_exact_name() -> None:
 
 
 def test_m6_excluded_day_with_unreadable_reading_is_skipped() -> None:
-    snap = build(8, excluded_days=excl(3))
+    snap = build(8, excluded_days=excl(3), gappy_days=frozenset({d(3)}))  # unreconciled
     pnl = tuple(DayPnl(p.day, None) if p.day == d(3) else p for p in snap.pnl_days)
     assert evaluate_stage(dataclasses.replace(snap, pnl_days=pnl)).kind is not VerdictKind.FAIL
     gone = tuple(p for p in snap.pnl_days if p.day != d(3))
@@ -1517,3 +1518,92 @@ def test_an_ambiguous_mark_without_fills_needs_a_row() -> None:
     snap = build(8, day_over={4: {"fills": (), "amb": 1}})
     v = evaluate_stage(_without_row(snap, d(4)))
     assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:settled_pnl_missing"
+
+
+# -- final fix round (confirm review READY 88) -----------------------------------------------------
+
+
+def test_f1_m5_target_is_clamped_to_a_forced_effective_k() -> None:
+    v = evaluate_stage(build(30, posted=0, k=4, eff=1))
+    assert v.reason == HOLD_CLEANUP_DEMOTION and v.target_k == 1
+    assert (
+        v.report is not None and not v.report.programme_paused
+    )  # S2 -> S1 demotion, not S1 -> K=1
+    unforced = evaluate_stage(build(30, posted=0, k=4))
+    assert unforced.target_k == 2
+
+
+@pytest.mark.parametrize("unreconciled", [True, False])
+def test_f2_pre_floor_excluded_day_is_exempt_only_while_unreconciled(unreconciled: bool) -> None:
+    snap = _with_pre_floor(pnl_missing=True, excluded=True)
+    if unreconciled:
+        snap = dataclasses.replace(snap, gappy_days=frozenset({d(-2)}))
+        assert evaluate_stage(snap).kind is VerdictKind.PROMOTION_ELIGIBLE
+    else:
+        v = evaluate_stage(snap)
+        assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_pnl_day"
+
+
+@pytest.mark.parametrize("which", ["gappy_days", "pending_rebuild_days"])
+def test_f2_stage_excluded_day_is_exempt_while_gappy_or_pending_rebuild(which: str) -> None:
+    snap = build(8, excluded_days=excl(3), **{which: frozenset({d(3)})})
+    assert evaluate_stage(_without_row(snap, d(3))).kind is not VerdictKind.FAIL
+
+
+def test_f2_reconciled_stage_excluded_day_with_fills_and_no_row_fails() -> None:
+    snap = build(8, excluded_days=excl(3))
+    v = evaluate_stage(_without_row(snap, d(3)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_pnl_day"
+
+
+def test_f2_reconciled_excluded_day_with_no_fills_or_ambiguous_needs_no_row() -> None:
+    snap = build(8, excluded_days=excl(3), day_over={3: {"fills": ()}})
+    assert evaluate_stage(_without_row(snap, d(3))).kind is not VerdictKind.FAIL
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        SerialBaseline(25, D("NaN")),
+        SerialBaseline(25, D("Infinity")),
+        SerialBaseline(25, 0.1),  # type: ignore[arg-type]
+        SerialBaseline(-1, D("0")),
+        SerialBaseline(-1, None),
+        SerialBaseline(2.5, D("0")),  # type: ignore[arg-type]
+        SerialBaseline(True, D("0")),
+    ],
+)
+def test_f3_invalid_serial_baseline_is_fail(baseline: SerialBaseline) -> None:
+    v = evaluate_stage(build(8, serial_baseline=baseline))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:parity_baseline"
+
+
+def test_f3_valid_serial_baselines_pass_validation() -> None:
+    for ok in (SerialBaseline(0, None), SerialBaseline(19, None), SerialBaseline(25, D("0.001"))):
+        assert evaluate_stage(build(8, serial_baseline=ok)).kind is not VerdictKind.FAIL
+
+
+@pytest.mark.parametrize("k", [float("nan"), float("inf")])
+def test_f4_wilson_rejects_non_finite_k(k: float) -> None:
+    with pytest.raises(ValueError):
+        wilson_deff_upper_bound(k, 39, icc=0.1, m_bar=3.0, z=1.28)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n", [float("nan"), float("inf")])
+def test_f4_wilson_rejects_non_finite_n(n: float) -> None:
+    with pytest.raises(ValueError):
+        wilson_deff_upper_bound(7, n, icc=0.1, m_bar=3.0, z=1.28)  # type: ignore[arg-type]
+
+
+def test_f5_negative_window_notional_is_fail() -> None:
+    windows = _burst(d(8), ["-10", "60", "60", "10", "10", "10"])  # sums positive, 6 orders
+    v = evaluate_stage(build(8, day_over={8: {"windows": windows}}))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:window_notional"
+
+
+def test_f6_first_k_day_after_today_is_fail() -> None:
+    epochs = (EpochRow("sha", 2, None, ns_of(d(12), 10)),)
+    v = evaluate_stage(build(8, epochs=epochs))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:epoch_after_today"
+    same_day = (EpochRow("sha", 2, None, ns_of(d(9), 10)),)
+    assert evaluate_stage(build(8, epochs=same_day)).kind is not VerdictKind.FAIL

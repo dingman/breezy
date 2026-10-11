@@ -68,7 +68,7 @@ def _window_flagged(row: DayCounters) -> bool:
         return False
     notionals = [parse_dec(w.notional) for w in windows]
     total = sum(notionals, Decimal(0))
-    if total <= S9_ZERO:
+    if total <= S9_ZERO or any(n < S9_ZERO for n in notionals):
         raise fail("window_notional")
     return max(notionals) / total > S9_SHARE_LIMIT
 
