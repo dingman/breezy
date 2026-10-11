@@ -22,7 +22,7 @@ ENGINE_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
 # shared module re-pins BOTH.
 PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
     {
-        "aut2.label": "11359b0ae1c20603a7ae0dafbc501e65421359f9128724f16ca2334fbf2d9921",
+        "aut2.label": "9a86c6d66eb14f52072a2c40cb1f929ac707e00b50b30b767ea63e3b9121684a",
         "aut6.health": "b6df288bed4bb34fcd77e2b39629b50431fc790fa0c0ae7b4ff599a8fe4ab17a",
     }
 )
