@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import re
 import threading
 from collections.abc import Callable, Coroutine
 from datetime import timedelta
@@ -49,17 +48,29 @@ from nautilus_trader.model.events import OrderDenied, OrderSubmitted
 from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.symbology import base_slug_of
+from breezy.runtime.exec_par_counter_ingest import (
+    ExecParCounterError,
+    ExecParCounterIngest,
+    reason_label,
+)
 from breezy.runtime.exec_par_records import (
+    AmbiguousRow,
     Amendment,
     CleanupDemotion,
+    DenialRow,
     EpochRow,
     ExcludedDay,
+    FillRow,
     ForceK1Cleared,
     ForceK1Flag,
     SettledPnlDay,
+    GappyMark,
+    OpenCostFlag,
+    OrderAnchor,
     StageEvalDry,
     StageReset,
     StopVerdict,
+    WindowPeak,
 )
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, AlertSink
@@ -109,8 +120,6 @@ NO_CLIENT_ERROR_TICKS: Final[int] = 5
 
 _SITE: Final[str] = "exec_par_watcher"
 _ORDER_EVENT_TOPIC: Final[str] = "events.order.*"
-_REASON_LABEL_MAX: Final[int] = 48
-_NUMBER_RE: Final[re.Pattern[str]] = re.compile(r"[0-9$.]+")
 
 EVENT_BREAKER_TRIPPED: Final[str] = "EXEC_PAR_BREAKER_TRIPPED"
 EVENT_UNREADABLE_SLOT: Final[str] = "EXEC_PAR_UNREADABLE_SLOT"
@@ -177,6 +186,16 @@ class ExecParStorePort(Protocol):
     def mark_flag_write_failed(self) -> None: ...
     def clear_flag_write_failed(self) -> None: ...
 
+    # BG-1b per-climate-day counter rows (event-sourced, exclusive, idempotent).
+    def write_order_anchor(self, record: OrderAnchor) -> bool: ...
+    def read_order_anchor(self, client_order_id: str) -> OrderAnchor | None: ...
+    def write_denial(self, record: DenialRow) -> bool: ...
+    def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
+    def write_fill(self, record: FillRow) -> bool: ...
+    def write_open_cost_flag(self, record: OpenCostFlag) -> OpenCostFlag: ...
+    def add_window_order(self, day: str, window_start_ns: int, notional: Decimal) -> WindowPeak: ...
+    def write_gappy_mark(self, record: GappyMark) -> bool: ...
+
 
 class LedgerPredicatePort(Protocol):
     """Value-free ledger predicates (K6): aggregates in, ``bool`` only out.
@@ -196,11 +215,6 @@ class LedgerPredicatePort(Protocol):
     def open_cost_exceeds_budget_fraction(
         self, *, aggregate_open_cost: Decimal, fraction: Decimal
     ) -> bool: ...
-
-
-def _reason_label(reason: str) -> str:
-    """A bounded, number-free denial label (never a dollar value)."""
-    return _NUMBER_RE.sub("#", reason.strip().lower())[:_REASON_LABEL_MAX] or "unspecified"
 
 
 class ExecRefusalAlertActor(Actor):
@@ -276,7 +290,7 @@ class ExecRefusalAlertActor(Actor):
         self._arm_timer()
 
     def on_stop(self) -> None:
-        if self._digest is not None:
+        if self._wants_order_events():
             try:
                 self.msgbus.unsubscribe(topic=_ORDER_EVENT_TOPIC, handler=self._on_order_event)
             except (KeyError, ValueError):  # pragma: no cover - defensive
@@ -336,8 +350,11 @@ class ExecRefusalAlertActor(Actor):
 
     # -- order events (digest only) -------------------------------------------
 
+    def _wants_order_events(self) -> bool:
+        return self._digest is not None
+
     def _subscribe_order_events(self) -> None:
-        if self._digest is None:
+        if not self._wants_order_events():
             return
         try:
             self.msgbus.subscribe(topic=_ORDER_EVENT_TOPIC, handler=self._on_order_event)
@@ -352,7 +369,7 @@ class ExecRefusalAlertActor(Actor):
             return
         try:
             if isinstance(event, OrderDenied):
-                digest.record_denial(_reason_label(str(event.reason)))
+                digest.record_denial(reason_label(str(event.reason)))
             elif isinstance(event, OrderSubmitted):
                 self._record_submitted(digest, event)
         except Exception as exc:  # noqa: BLE001 - a telemetry fault is never a trading fault
@@ -497,9 +514,13 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         alert_sink: AlertSink,
         digest: ExecParDigest | None = None,
         interval_seconds: int = WATCHER_INTERVAL_SECONDS,
+        counters: ExecParCounterIngest | None = None,
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
+        self._counters = counters
+        self._ingest_fault_count = 0
+        self._last_ingest_fault: ExecParCounterError | None = None
         self._halt_written = False
         self._trip_reason: str | None = None
         self._seen_contradictions = 0
@@ -507,6 +528,32 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._stuck: tuple[tuple[str, str], ...] = ()
         self._last_hb_ns: int | None = None
         self._denied_at_last_hb = 0
+
+    # -- BG-1b counter ingestion (loop thread; K > 1 only) -----------------------
+
+    @property
+    def ingest_fault_count(self) -> int:
+        """Typed counter-ingestion failures seen so far (BG-6 turns these into a halt)."""
+        return self._ingest_fault_count
+
+    @property
+    def last_ingest_fault(self) -> ExecParCounterError | None:
+        return self._last_ingest_fault
+
+    def _wants_order_events(self) -> bool:
+        return self._digest is not None or self._counters is not None
+
+    def _on_order_event(self, event: object) -> None:
+        super()._on_order_event(event)
+        counters = self._counters
+        if counters is None:
+            return
+        try:
+            counters.on_event(event, self.cache.order)
+        except ExecParCounterError as exc:
+            self._ingest_fault_count += 1
+            self._last_ingest_fault = exc
+            logger.error("%s: counter ingestion failed: %s", _SITE, type(exc).__name__)
 
     def _persist(self, client: ExecClientView, now_ns: int) -> None:
         """Compute the trip reasons and latch the halt BEFORE anything can fail."""

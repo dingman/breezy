@@ -23,6 +23,16 @@ D-PREREG 1, 1b, 10, 10a, r4.1 K9, r4.3 M3, r4.4 N4):
 * ``force_k1``                 flag ``{reason, ts_ns, set_by}`` or, once
   cleared, the tombstone ``{cleared_ts_ns}``
 
+BG-1b counter rows (event-sourced; the id in each key must equal the row's own
+field; ``day`` is the climate-day label of the ARM time, I2):
+
+* ``order/<client_order_id>``  posted entry + the durable DECISION ASK
+* ``denial/<client_order_id>`` and ``ambiguous/<client_order_id>``
+* ``fill/<trade_id>``          per-fill slippage, realized and unrounded fees
+* ``openflag/<station_day>``   value-free "open cost over fraction" flag
+* ``window/<day>/<start_ns>``  per 5 s window order count and notional
+* ``gappy/<day>``              gappy-day mark
+
 The store has only ``get``/``set``, so each ``<ts_ns>`` family keeps a
 ``latest`` pointer ``{"v":1,"ts_ns":N}`` written AFTER the row.
 """
@@ -41,19 +51,26 @@ from breezy.runtime.submit_intent_slots import SlotTableError, canonical_text
 
 __all__ = [
     "EXEC_PAR_PREFIX",
+    "AmbiguousRow",
     "Amendment",
     "CleanupDemotion",
+    "DenialRow",
     "EpochRow",
     "ExcludedDay",
     "ExecParRecordError",
+    "FillRow",
     "ForceK1Cleared",
     "ForceK1Flag",
     "ForceK1Kind",
     "ForceK1State",
     "SettledPnlDay",
+    "GappyMark",
+    "OpenCostFlag",
+    "OrderAnchor",
     "StageEvalDry",
     "StageReset",
     "StopVerdict",
+    "WindowPeak",
     "decode_excluded_days",
     "decode_force_k1_flag",
     "decode_pointer",
@@ -170,6 +187,77 @@ class SettledPnlDay:
         return Decimal(self.pnl)
 
 
+@dataclass(frozen=True, slots=True)
+class OrderAnchor:
+    """A posted entry. ``arm_ns`` is the slot ``created_ns``; ``decision_ask`` a Decimal string."""
+
+    client_order_id: str
+    slug: str
+    day: str
+    arm_ns: int
+    decision_ask: str
+    qty: str
+    notional: str
+    window_start_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class DenialRow:
+    client_order_id: str
+    reason: str
+    day: str
+    arm_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class AmbiguousRow:
+    client_order_id: str
+    day: str
+    arm_ns: int
+    ts_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class FillRow:
+    """One fill, Decimal strings: slippage = px - decision_ask; fee_exact is unrounded."""
+
+    trade_id: str
+    client_order_id: str
+    day: str
+    arm_ns: int
+    qty: str
+    px: str
+    decision_ask: str
+    slippage: str
+    fee_realized: str
+    fee_exact: str
+    fee_theta: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpenCostFlag:
+    station_day: str
+    day: str
+    exceeded: bool
+    ts_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class WindowPeak:
+    day: str
+    window_start_ns: int
+    orders: int
+    notional: str
+
+
+@dataclass(frozen=True, slots=True)
+class GappyMark:
+    day: str
+    cause: str
+    ts_ns: int
+    cleared_ts: int | None
+
+
 class ForceK1Kind(Enum):
     """Reading of the durable force-K1 flag. UNREADABLE must be treated as SET."""
 
@@ -216,6 +304,34 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "fee_unreconciled_entries": "count",
         "fee_floor_total": "dec",
     },
+    OrderAnchor: {
+        "client_order_id": "str",
+        "slug": "str",
+        "day": "str",
+        "arm_ns": "int",
+        "decision_ask": "str",
+        "qty": "str",
+        "notional": "str",
+        "window_start_ns": "int",
+    },
+    DenialRow: {"client_order_id": "str", "reason": "str", "day": "str", "arm_ns": "int"},
+    AmbiguousRow: {"client_order_id": "str", "day": "str", "arm_ns": "int", "ts_ns": "int"},
+    FillRow: {
+        "trade_id": "str",
+        "client_order_id": "str",
+        "day": "str",
+        "arm_ns": "int",
+        "qty": "str",
+        "px": "str",
+        "decision_ask": "str",
+        "slippage": "str",
+        "fee_realized": "str",
+        "fee_exact": "str",
+        "fee_theta": "str",
+    },
+    OpenCostFlag: {"station_day": "str", "day": "str", "exceeded": "bool", "ts_ns": "int"},
+    WindowPeak: {"day": "str", "window_start_ns": "int", "orders": "int", "notional": "str"},
+    GappyMark: {"day": "str", "cause": "str", "ts_ns": "int", "cleared_ts": "int?"},
 }
 
 _DAY_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")

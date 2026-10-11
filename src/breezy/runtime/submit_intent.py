@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Final, Protocol, Self
 
 from breezy.domain.exec_slots import SlotRecord, SlotTableView, Wait, admit
-from breezy.runtime.exec_par_latch_records import ExecParRecordsMixin
+from breezy.runtime.exec_par_latch_counters import ExecParCounterRowsMixin
 from breezy.runtime.submit_intent_slots import (
     BREAKER_ABSENT_GRACE_NS,
     BREAKER_FUTURE_SKEW_NS,
@@ -524,7 +524,7 @@ def decode_slot_table(raw: bytes | None) -> SlotTable:
     )
 
 
-class SubmitIntentLatch(ExecParRecordsMixin):
+class SubmitIntentLatch(ExecParCounterRowsMixin):
     """One-at-a-time submit latch persisted through ``StateStore.get``/``set``.
 
     Constructed only by :func:`open_submit_intent_latch`, which binds this

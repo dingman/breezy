@@ -125,15 +125,16 @@ class ExecParRecordsMixin:
     def _er_put(self, key: str, record: object) -> None:
         self._store.set(key, self._er_encode(record))
 
-    def _er_put_exclusive(self, key: str, record: object) -> None:
-        """Write once; an identical rewrite is a no-op, a different row raises."""
+    def _er_put_exclusive(self, key: str, record: object) -> bool:
+        """Write once. ``True`` if written; identical rewrite is a ``False`` no-op; else raises."""
         raw = self._er_encode(record)
         existing = self._store.get(key)
         if existing is not None:
             if existing == raw:
-                return
+                return False
             raise ValueError(f"conflicting EXEC-PAR row already stored at {key}")
         self._store.set(key, raw)
+        return True
 
     def _er_scan(self, prefix: str, cls: type[T], ts_of: Callable[[T], int]) -> list[T]:
         """All rows under ``prefix``, ascending by ts; any stray/garbled row is corrupt."""
