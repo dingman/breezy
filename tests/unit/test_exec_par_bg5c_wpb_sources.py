@@ -34,7 +34,7 @@ from breezy.runtime.exec_par_reconcile import (
     UnattributableFill,
     reconcile_day,
 )
-from breezy.runtime.exec_par_records import AmbiguousRow, EpochRow
+from breezy.runtime.exec_par_records import AmbiguousRow, EpochRow, OrderAnchor
 from breezy.runtime.exec_par_settled_pnl import SETTLEMENT_DEADLINE_DAYS
 from breezy.runtime.submit_intent import history_key
 
@@ -116,11 +116,23 @@ class Marks:
         return tuple(self.rows.get(day, ()))
 
 
+class Anchors:
+    def __init__(self) -> None:
+        self.rows: dict[str, list[OrderAnchor]] = {}
+        self.error: Exception | None = None
+
+    def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]:
+        if self.error is not None:
+            raise self.error
+        return tuple(self.rows.get(day, ()))
+
+
 @dataclass
 class World:
     intents: Intents = field(default_factory=Intents)
     store: Store = field(default_factory=Store)
     marks: Marks = field(default_factory=Marks)
+    anchors: Anchors = field(default_factory=Anchors)
     n: int = 0
 
     def entry(
@@ -131,10 +143,28 @@ class World:
         fill: tuple[str, str] | None = None,
         is_exit: bool = False,
         side: str = "BUY",
+        notional: str = "10",
     ) -> Intent:
         self.n += 1
         intent = Intent(f"i{self.n}", f"fp{self.n}", created_ns, slug, is_exit)
         self.intents.items.append(intent)
+        station = station_of(slug)
+        if not is_exit and station is not None:
+            day = GOV.entry_day(station, created_ns)
+            self.anchors.rows.setdefault(day, []).append(
+                OrderAnchor(
+                    f"c-{intent.intent_id}",
+                    slug,
+                    day,
+                    created_ns,
+                    "0.5",
+                    "20",
+                    notional,
+                    created_ns,
+                    "event_time",
+                    station,
+                )
+            )
         if fill is not None:
             self.fill_for(intent, fill, side)
         return intent
@@ -171,6 +201,7 @@ class World:
             governed=GOV,
             station_of=station_of,
             ambiguous=self.marks,
+            anchors=self.anchors,
             auditor=auditor,
         )
 
@@ -204,10 +235,10 @@ def test_a_posted_entry_with_no_fill_is_not_a_filled_entry_and_zero_is_a_real_ze
 
 def test_no_intents_at_all_is_an_ok_empty_result_not_a_failure() -> None:
     src = World().sources()
-    for reading in (src.fills_reading(DAY1), src.spend_reading(DAY1)):
+    for reading in (src.fills_reading(DAY1), src.filled_spend_reading(DAY1)):
         assert reading.ok is True
     assert src.fills_reading(DAY1).value == 0
-    assert src.spend_reading(DAY1).value == D(0)
+    assert src.filled_spend_reading(DAY1).value == D(0)
     assert src.slot_counts(DAY1) == SlotDayCounts(0, 0)
 
 
@@ -217,7 +248,7 @@ def test_partial_fills_count_once_and_spend_is_the_terminal_record_only() -> Non
     w.fill_for(intent, ("7", "2.8"))  # the client's monotone rewrite of the SAME venue order
     src = w.sources()
     assert src.entry_fill_count(DAY1) == 1
-    assert src.spend_reading(DAY1).value == D("2.8")  # never 1.2 + 2.8
+    assert src.filled_spend_reading(DAY1).value == D("2.8")  # never 1.2 + 2.8
 
 
 def test_terminal_fill_is_the_max_cumulative_qty_never_a_sum() -> None:
@@ -238,7 +269,7 @@ def test_an_exit_order_is_excluded_from_counts_and_spend() -> None:
     w.entry("m-nyc", ns_at(DAY1), fill=("10", "9"), is_exit=True, side="SELL")
     src = w.sources()
     assert src.entry_fill_count(DAY1) == 1
-    assert src.spend_reading(DAY1).value == D("4")
+    assert src.filled_spend_reading(DAY1).value == D("4")
     assert src.slot_counts(DAY1) == SlotDayCounts(1, 0)
 
 
@@ -251,8 +282,7 @@ def test_a_missing_station_on_a_filled_entry_is_unattributable_and_fails() -> No
     reading = src.fills_reading(DAY1)
     assert reading.ok is False and reading.value is None
     assert reading.failure is not None and reading.failure.reason == "unattributable"
-    assert src.spend_reading(DAY1).ok is False
-    assert src.ledger_spend(DAY1) is None
+    assert src.filled_spend_reading(DAY1).ok is False
 
 
 def test_a_slugless_entry_poisons_slot_counts_but_not_the_fill_count() -> None:
@@ -280,7 +310,7 @@ def test_a_store_or_slot_read_failure_is_a_typed_failure_never_zero() -> None:
     src = w.sources()
     assert src.entry_fill_count(DAY1) is None
     assert src.slot_counts(DAY1) is None
-    assert src.ledger_spend(DAY1) is None
+    assert src.filled_spend_reading(DAY1).ok is False
     failure = src.fills_reading(DAY1).failure
     assert failure is not None and failure.reason == "read_error"
     assert {f.source for f in src.failures} >= {"fills"}
@@ -290,7 +320,7 @@ def test_a_store_or_slot_read_failure_is_a_typed_failure_never_zero() -> None:
     src2 = w2.sources()
     assert src2.entry_fill_count(DAY1) is None
     assert src2.slot_counts(DAY1) is None
-    assert src2.spend_reading(DAY1).ok is False
+    assert src2.filled_spend_reading(DAY1).ok is False
 
 
 def test_a_fingerprint_index_without_a_fill_record_is_corrupt_not_a_missing_fill() -> None:
@@ -316,7 +346,7 @@ def test_a_negative_or_nonfinite_cost_is_corrupt() -> None:
     for cost in ("-1", "NaN"):
         w = World()
         w.entry("m-nyc", ns_at(DAY1), fill=("10", cost))
-        failure = w.sources().spend_reading(DAY1).failure
+        failure = w.sources().filled_spend_reading(DAY1).failure
         assert failure is not None and failure.reason == "corrupt"
 
 
@@ -325,7 +355,7 @@ def test_a_zero_quantity_record_is_not_a_filled_entry() -> None:
     w.entry("m-nyc", ns_at(DAY1), fill=("0", "0"))
     src = w.sources()
     assert src.entry_fill_count(DAY1) == 0
-    assert src.spend_reading(DAY1).value == D(0)
+    assert src.filled_spend_reading(DAY1).value == D(0)
 
 
 def test_a_buy_side_mismatch_on_an_entry_is_unattributable() -> None:
@@ -342,7 +372,7 @@ def test_a_repeated_intent_id_is_counted_once() -> None:
     src = w.sources()
     assert src.entry_fill_count(DAY1) == 1
     assert src.slot_counts(DAY1) == SlotDayCounts(1, 0)
-    assert src.spend_reading(DAY1).value == D(4)
+    assert src.filled_spend_reading(DAY1).value == D(4)
 
 
 def test_the_join_is_exact_on_the_fingerprint_and_the_utc_day_of_the_intent() -> None:
@@ -364,8 +394,8 @@ def test_spend_sums_terminal_costs_per_entry_day() -> None:
     w.entry("m-sfo", ns_at(DAY1), fill=("5", "2.5"))
     w.entry("m-nyc", ns_at(DAY2), fill=("1", "0.5"))
     src = w.sources()
-    assert src.ledger_spend(DAY1) == D("6.75")
-    assert src.ledger_spend(DAY2) == D("0.5")
+    assert src.filled_spend_reading(DAY1).value == D("6.75")
+    assert src.filled_spend_reading(DAY2).value == D("0.5")
 
 
 # -- AMBIGUOUS counts (item 2, R2) -------------------------------------------------
@@ -495,7 +525,9 @@ def test_audit_mismatch_is_reported_and_never_green() -> None:
     cache = Cache([cfill("m-nyc", ns_at(DAY1), "4.25")])
     result = auditor(cache, boot=boot).audit(DAY1, D("6.75"))
     assert result.status is AuditStatus.MISMATCH
-    assert result.defers_look is False
+    assert result.defers_look is True
+    assert result.alerts is True
+    assert result.excludes_day("2099-01-01") is False
 
 
 def test_a_fill_missing_from_durable_but_present_in_the_cache_is_a_mismatch() -> None:
@@ -559,20 +591,76 @@ def test_the_audit_result_repr_carries_no_amounts() -> None:
     assert "123.456" not in repr(result) and "654.321" not in repr(result)
 
 
-def test_durable_sources_audit_spend_and_ledger_spend_on_mismatch() -> None:
+def test_filled_spend_audit_mismatch_defers_and_alerts_without_excluding() -> None:
     w = World()
     w.entry("m-nyc", ns_at(DAY1), fill=("10", "4"))
     boot = day_start(DAY1) + LOOKBACK
     good = w.sources(auditor(Cache([cfill("m-nyc", ns_at(DAY1), "4")]), boot=boot))
     assert good.audit_spend(DAY1).status is AuditStatus.FULL_MATCH
-    assert good.ledger_spend(DAY1) == D(4)
+    assert good.audit_spend(DAY1).alerts is False
     bad = w.sources(auditor(Cache([cfill("m-nyc", ns_at(DAY1), "5")]), boot=boot))
-    assert bad.audit_spend(DAY1).status is AuditStatus.MISMATCH
-    assert bad.ledger_spend(DAY1) is None  # BG-1d exclusion path, never a silent pass
-    assert any(f.reason == "spend_audit_mismatch" for f in bad.failures)
+    audit = bad.audit_spend(DAY1)
+    assert audit.status is AuditStatus.MISMATCH
+    assert audit.defers_look is True and audit.alerts is True
+    assert audit.reason == "spend_audit_mismatch"
+    assert bad.ledger_spend(DAY1) == D(10)  # reconcile's metric is untouched: no exclusion
+    assert bad.failures == ()
     unaudited = w.sources(auditor(None))
-    assert unaudited.ledger_spend(DAY1) == D(4)  # unaudited defers the look; it is not a failure
     assert unaudited.audit_spend(DAY1).status is AuditStatus.UNAUDITED
+    assert unaudited.audit_spend(DAY1).alerts is False
+
+
+def test_ledger_spend_is_armed_notional_of_the_durable_entry_anchors() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("3", "1"), notional="10")
+    w.entry("m-sfo", ns_at(DAY1), notional="7.5")  # posted, never filled
+    w.entry("m-nyc", ns_at(DAY1), fill=("5", "2"), is_exit=True, side="SELL", notional="99")
+    w.entry("m-nyc", ns_at(DAY2), notional="4")
+    src = w.sources()
+    assert src.ledger_spend(DAY1) == D("17.5")
+    assert src.ledger_spend(DAY2) == D(4)
+    assert src.ledger_spend("2026-10-20") == D(0)  # a real empty day
+
+
+def test_a_partially_filled_day_reconciles_clean_on_spend_usd() -> None:
+    from decimal import Decimal as Dec
+
+    from breezy.runtime.exec_par_reconcile import DayCounts
+
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), fill=("3", "1.2"), notional="10")
+    src = w.sources()
+    stored = DayCounts(posted_entries=1, ambiguous=0, fills=1, spend_usd=Dec(10))
+    verdict = reconcile_day(
+        DAY1,
+        stored=stored,
+        fills=src.entry_fill_count(DAY1),
+        slots=src.slot_counts(DAY1),
+        spend=src.ledger_spend(DAY1),
+        gappy=False,
+        expected_counters=True,
+        pending=None,
+    )
+    assert verdict.kind.value == "unchanged"
+    assert src.filled_spend_reading(DAY1).value == Dec("1.2")  # the separate metric
+
+
+def test_ledger_spend_failures_are_none_never_zero() -> None:
+    w = World()
+    w.entry("m-nyc", ns_at(DAY1), notional="10")
+    w.anchors.error = OSError("db")
+    src = w.sources()
+    assert src.ledger_spend(DAY1) is None
+    assert any(f.source == "armed_spend" for f in src.failures)
+    w2 = World()
+    w2.entry("m-nyc", ns_at(DAY1), notional="-1")
+    assert w2.sources().ledger_spend(DAY1) is None
+    w3 = World()
+    w3.entry("m-nyc", ns_at(DAY1), notional="10")
+    w3.anchors.rows[DAY1][0] = OrderAnchor(
+        "c", "m-nyc", DAY2, 1, "0.5", "20", "10", 1, "event_time", "KNYC"
+    )
+    assert w3.sources().ledger_spend(DAY1) is None  # an anchor stored under another day
 
 
 def test_audit_spend_is_durable_unreadable_when_the_durable_side_fails() -> None:
