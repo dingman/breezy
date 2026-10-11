@@ -17,10 +17,14 @@ import pytest
 
 from scripts.analysis.fq_loss_taxonomy_core import (
     ClusterOutcome,
+    FillClass,
     FillFacts,
     HypothesisOutcome,
+    Qualifier,
     Status,
+    Sublabel,
     VerdictInputs,
+    VerdictLabel,
     apply_downgrade,
     art_testability,
     classify_fills,
@@ -40,7 +44,6 @@ from scripts.analysis.fq_loss_taxonomy_core import (
     min_attainable_p_sign,
     pit_midpoint,
     poisson_binomial_pmf,
-    primary_class_names,
     reevaluate_after_ties,
     render_footer,
     report_phrase,
@@ -59,7 +62,7 @@ from scripts.analysis.fq_loss_taxonomy_core import (
     t_win,
     t_win_leave_one_out,
     t_win_power,
-    verdict_labels,
+    t_win_testability,
 )
 from tests.support.te2_fixtures import fq_station_days_per_fill
 
@@ -157,9 +160,10 @@ def test_cluster_collapse_station_event_gap_splits_and_fixture_gives_14_days_7_c
     }
     assert per_station == {"LAX": 1, "MDW": 2, "MIA": 2, "SFO": 2}
     assert len(without_10_06) == 6
-    a, b, c = (dt.date(2026, 10, n) for n in (1, 2, 4))
-    assert len(cluster_station_days([("X", a), ("X", b)])) == 1
-    assert len(cluster_station_days([("X", c), ("X", a)])) == 2  # unsorted input, 2-day gap
+    d1, d2, d3, d4 = (dt.date(2026, 10, n) for n in (1, 2, 3, 4))
+    assert len(cluster_station_days([("X", d1), ("X", d2)])) == 1  # consecutive days
+    assert len(cluster_station_days([("X", d1), ("X", d3)])) == 2  # day 2 missing: a gap splits
+    assert len(cluster_station_days([("X", d4), ("X", d1)])) == 2  # unsorted input, 3-day gap
 
 
 def test_cluster_P_c_is_max_of_P_d_clamped_and_zero_p_prints_below_bound() -> None:
@@ -256,14 +260,9 @@ def test_boundary_and_tail_are_mutually_exclusive() -> None:
 def test_win_class_then_sibling_won_precede_all_other_classes_and_taxonomy_applies_to_losers_only() -> (  # noqa: E501
     None
 ):
-    assert primary_class_names() == (
-        "WIN",
-        "SIBLING_WON",
-        "BOUNDARY",
-        "TAIL",
-        "BAND_SELECTION",
-        "BODY_MISS",
-    )
+    order = [c.value for c in FillClass]
+    assert order[:6] == ["WIN", "SIBLING_WON", "BOUNDARY", "TAIL", "BAND_SELECTION", "BODY_MISS"]
+    assert order[6:] == ["UNTESTABLE"]  # a flag appended after the primary classes, not one of them
     fills = [
         _fact("win", edge_dist=0, pit=0.99, won=True),
         _fact("sib_boundary", edge_dist=1),
@@ -272,10 +271,10 @@ def test_win_class_then_sibling_won_precede_all_other_classes_and_taxonomy_appli
     ]
 
     assert classify_fills(fills) == {
-        "win": "WIN",
-        "sib_boundary": "SIBLING_WON",
-        "sib_tail": "SIBLING_WON",
-        "solo": "BODY_MISS",
+        "win": FillClass.WIN,
+        "sib_boundary": FillClass.SIBLING_WON,
+        "sib_tail": FillClass.SIBLING_WON,
+        "solo": FillClass.BODY_MISS,
     }
 
 
@@ -284,16 +283,19 @@ def test_k7_per_fill_rule_when_edge_dist_differs_within_a_station_day() -> None:
         _fact("near", edge_dist=1),
         _fact("far", edge_dist=3),
         _fact("edge_of_central", edge_dist=3, pit=0.95),
+        _fact("central_low", edge_dist=3, pit=0.10),  # [0.10, 0.90] is inclusive at both ends
+        _fact("central_high", edge_dist=3, pit=0.90),
         _fact("solo", day=dt.date(2026, 10, 3), edge_dist=3),
     ]
 
     classes = classify_fills(fills)
+    assert classes["central_low"] == classes["central_high"] == FillClass.BAND_SELECTION
 
     assert classes["near"] == "BOUNDARY"
     assert classes["far"] == "BAND_SELECTION"
     assert classes["edge_of_central"] == "BODY_MISS"  # PIT outside the central 80%
     assert classes["solo"] == "BODY_MISS"  # a single rung is never band selection
-    assert station_day_k7_count(fills) == 1
+    assert station_day_k7_count(fills) == 1  # one station-day, however many K7 fills
 
 
 def test_partition_incomplete_marks_k7_untestable() -> None:
@@ -301,7 +303,7 @@ def test_partition_incomplete_marks_k7_untestable() -> None:
 
     classes = classify_fills(fills)
 
-    assert classes == {"near": "BOUNDARY", "far": "UNTESTABLE"}
+    assert classes == {"near": FillClass.BOUNDARY, "far": FillClass.UNTESTABLE}
     assert station_day_k7_count(fills) == 0
 
 
@@ -357,6 +359,9 @@ def test_min_attainable_p_marks_not_testable_never_did_not_reject() -> None:
     assert art_testability(7) == "TESTABLE"
     assert art_testability(6) == "NOT-TESTABLE"
     assert status_for_min_p(1 / 64, 0.01) == "NOT-TESTABLE"
+    # T-WIN: the minimum attainable p is P(W = 0) = prod(1 - P_c) under H0-M
+    assert t_win_testability([0.5] * 7) == "TESTABLE"  # 1/128 <= 0.02
+    assert t_win_testability([0.3] * 7) == "NOT-TESTABLE"  # 0.082 > 0.02
     text = report_phrase(_ho("T-ART", status="NOT-TESTABLE"))
     assert "NOT-TESTABLE" in text and "did not reject" not in text
     assert "did not reject" in report_phrase(_ho("T-WIN"))
@@ -406,9 +411,12 @@ def test_verdict_variance_requires_power_0_8_unconditionally_testable_secondary_
     strong = decide_verdict(_vi())
     weak = decide_verdict(_vi(t_spread=_ho("T-SPREAD", power=0.5)))
 
-    assert strong.label == "VARIANCE" and "weak" not in strong.qualifiers
-    assert weak.label == "VARIANCE" and "weak" in weak.qualifiers
+    assert strong.label == VerdictLabel.VARIANCE and Qualifier.WEAK not in strong.qualifiers
+    assert weak.label == VerdictLabel.VARIANCE and Qualifier.WEAK in weak.qualifiers
     assert decide_verdict(_vi(t_win=_ho("T-WIN", power=0.5))).label == "INCONCLUSIVE"
+    art_no_power = _vi(t_art=_ho("T-ART", power=None))  # T-ART power is never computed
+    art = decide_verdict(art_no_power)
+    assert art.label == VerdictLabel.VARIANCE and Qualifier.WEAK in art.qualifiers
     conditional = _ho("T-SPREAD", status="TESTABLE-CONDITIONAL", power=0.9)
     assert decide_verdict(_vi(t_spread=conditional)).label == "INCONCLUSIVE"
     loc_only = _vi(t_spread=_ho("T-SPREAD", status="NOT-TESTABLE"))
@@ -427,7 +435,11 @@ def test_verdict_miscalibrated_unattributed_branch_and_qualifiers() -> None:
     loc_note = decide_verdict(_vi(t_win=reject, t_loc=_ho("T-LOC", rejects=True)))
 
     assert single.label == "MODEL_MISCALIBRATED_UNATTRIBUTED"
-    assert {"single-cluster-driven", "secondaries NOT-TESTABLE"} <= set(single.qualifiers)
+    # Qualifier semantics: SINGLE_CLUSTER_DRIVEN when the leave-one-out does NOT reject;
+    # SECONDARIES_NOT_TESTABLE when neither T-SPREAD nor T-ART is testable.
+    assert {Qualifier.SINGLE_CLUSTER_DRIVEN, Qualifier.SECONDARIES_NOT_TESTABLE} <= set(
+        single.qualifiers
+    )
     assert broad.label == "MODEL_MISCALIBRATED_UNATTRIBUTED" and broad.qualifiers == ()
     assert loc_note.label == "MODEL_MISCALIBRATED_UNATTRIBUTED"
     assert "T-LOC" in " ".join(loc_note.notes)
@@ -486,11 +498,18 @@ def test_model_limitation_sublabels_artefact_source_both_and_t_loc_alone_never_q
     loc_only = decide_verdict(_vi(t_loc=loc))
     spread_loc = decide_verdict(_vi(t_spread=spread, t_loc=loc))
 
-    assert (only_art.label, only_art.sublabel) == ("MODEL_LIMITATION", "ARTEFACT")
-    assert (only_spread.label, only_spread.sublabel) == ("MODEL_LIMITATION", "SOURCE")
-    assert (both.label, both.sublabel) == ("MODEL_LIMITATION", "ARTEFACT+SOURCE")
-    assert loc_only.label != "MODEL_LIMITATION" and loc_only.sublabel != "SOURCE"
-    assert spread_loc.sublabel == "SOURCE" and "T-LOC" in " ".join(spread_loc.notes)
+    ml = VerdictLabel.MODEL_LIMITATION
+    assert (only_art.label, only_art.sublabel) == (ml, Sublabel.ARTEFACT)
+    assert (only_spread.label, only_spread.sublabel) == (ml, Sublabel.SOURCE)
+    assert (both.label, both.sublabel) == (ml, Sublabel.ARTEFACT_AND_SOURCE)
+    assert loc_only.label != ml and loc_only.sublabel != Sublabel.SOURCE
+    assert spread_loc.sublabel == Sublabel.SOURCE and "T-LOC" in " ".join(spread_loc.notes)
+    # rule 2 precedes rule 3: a qualifying secondary rejection beats a T-WIN-only miscalibration
+    win = _ho("T-WIN", rejects=True, power=0.9)
+    assert decide_verdict(_vi(t_win=win, t_spread=spread)).label == ml
+    # a CONDITIONAL member may reject only after a prior Holm rejection: none here, so no qualify
+    cond = _ho("T-SPREAD", status="TESTABLE-CONDITIONAL", rejects=True, power=0.9)
+    assert decide_verdict(_vi(t_spread=cond)).label != ml
 
 
 def test_downgrade_rule_cluster_level_wins_and_scope_sensitive_label() -> None:
@@ -522,14 +541,15 @@ def test_footer_is_present_and_names_t1_t2_t3_not_permission_to_rearm() -> None:
 def test_holm_drops_not_testable_members_first_k_shrinks_step1_alpha_over_k_and_testable_conditional_status_incl_6_cluster_sensitivity() -> (  # noqa: E501
     None
 ):
-    seven = holm_plan({"T-LOC": 1 / 64, "T-SPREAD": 1 / 128, "T-EDGE": 0.001})
+    seven = holm_plan({"T-LOC": 1 / 64, "T-SPREAD": 1 / 128})
     one_dead = holm_plan({"T-LOC": 1 / 64, "T-SPREAD": 0.03})
     six = holm_plan({"T-LOC": 1 / 32, "T-SPREAD": 1 / 64})
     all_dead = holm_plan({"T-LOC": 0.05, "T-SPREAD": 0.03})
 
     assert seven.k == 2
     assert seven.alpha_step1 == pytest.approx(0.01)
-    assert "T-EDGE" not in seven.statuses
+    with pytest.raises(ValueError):  # T-EDGE is outside every family: the caller excludes it
+        holm_plan({"T-LOC": 1 / 64, "T-SPREAD": 1 / 128, "T-EDGE": 0.001})
     assert seven.statuses == {"T-SPREAD": "TESTABLE", "T-LOC": "TESTABLE-CONDITIONAL"}
     assert one_dead.k == 1
     assert one_dead.alpha_step1 == pytest.approx(0.02)
@@ -574,20 +594,24 @@ def test_testability_reevaluated_after_ties_and_downgraded_test_cannot_feed_vari
 
     assert result.downgraded == ("T-ART",)
     assert dict(result.variance_eligible) == {"T-ART": False, "T-SPREAD": True}
-    assert verdict.label == "INCONCLUSIVE"
+    assert verdict.label == VerdictLabel.INCONCLUSIVE
+    cond_after: dict[str, Status] = {"T-ART": "TESTABLE", "T-SPREAD": "TESTABLE-CONDITIONAL"}
+    weaker = reevaluate_after_ties(before, cond_after)
+    assert weaker.downgraded == ("T-SPREAD",)
+    assert dict(weaker.variance_eligible) == {"T-ART": True, "T-SPREAD": False}
 
 
 def test_body_miss_class_name_replaces_k9_variance_and_never_collides_with_verdict_label() -> None:
-    classes = primary_class_names()
-    labels = verdict_labels()
+    assert classify_fills([_fact("solo", edge_dist=4)]) == {"solo": FillClass.BODY_MISS}
+    classes = {c.value for c in FillClass}
+    labels = [v.value for v in VerdictLabel]
 
     assert "BODY_MISS" in classes and "VARIANCE" not in classes
-    assert labels == (
+    assert labels == [
         "FIXABLE_DEFECT",
         "MODEL_LIMITATION",
         "MODEL_MISCALIBRATED_UNATTRIBUTED",
         "VARIANCE",
         "INCONCLUSIVE",
-    )
-    assert not set(classes) & set(labels)
-    assert classify_fills([_fact("solo", edge_dist=4)]) == {"solo": "BODY_MISS"}
+    ]
+    assert not classes & set(labels)

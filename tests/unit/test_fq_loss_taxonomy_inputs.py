@@ -1,20 +1,16 @@
-"""TE-2 WP0 (RED): the I/O wrappers and gates of the FQ v1 loss taxonomy.
+"""TE-2 WP0 (RED): truth, log and count wrappers of the FQ v1 loss taxonomy.
 
-Plan: TE-2_plan_r3_2.md section 5 (WP0 tests 33-46, 48, 49). Offline and synthetic.
-Per L-55 each injected fake is paired with a production default path: the real
-``NwsCliFinal`` over a tmp Parquet catalog, the real ``SubprocessGit`` over a tmp git repo,
-the real ``C1Epoch`` over an empty data root, and the real ``read_durable_fills`` over a store
-written by the real writer.
+Plan tests 33-35, 40-43, 45, 46, 48, 49 (the pin/git tests live in ..._pins.py, the AST pin in
+..._guard.py). Offline and synthetic. Per L-55 each injected fake is paired with a production
+default path: the real ``NwsCliFinal`` over a tmp Parquet catalog, the real ``C1Epoch`` over an
+empty data root, and the real ``read_durable_fills`` over a store written by the real writer.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import hashlib
 import inspect
-import os
-import subprocess
 import tracemalloc
 from collections.abc import Sequence
 from decimal import Decimal
@@ -23,44 +19,43 @@ from typing import Any, cast
 
 import pytest
 
+from breezy.analysis.labeling.attribution import BackfillRefused
 from breezy.analysis.labeling.decision_link import parse_log_line, read_log_events
 from breezy.analysis.labeling.fill_source import FillStoreCorruption, read_durable_fills
 from breezy.analysis.labeling.settlement_source import NwsCliFinal
 from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.persistence.autonomy.capture_reader import OrderLinkView
 from breezy.persistence.catalog import open_station_catalog, write_records
 from breezy.runtime.sqlite_store import SqliteStateStore
 from scripts.analysis.fq_loss_taxonomy_core import (
+    S0DMiss,
     classify_s0d_miss,
-    holdout_violations,
-    reproduction_gate,
     s0d_compare,
 )
 from scripts.analysis.fq_loss_taxonomy_inputs import (
-    Boot,
     ClippingSettlementSource,
     PhaseAProjection,
     S0ACounts,
-    SnapshotShaMismatch,
-    SubprocessGit,
+    S0AStop,
     UnclassifiedFillsStop,
+    UnparseableInstrumentStop,
     alt_truth_summary,
     attribute_fills,
     iter_partition_events,
     partition_union,
-    phase_b_refusals,
-    pin_label,
-    post_hoc_violations,
+    phase_a_truth,
     project_phase_a,
-    refreeze_status,
     reproduce_audit,
-    resolve_pins,
     s0a_counts,
+    s0a_gate,
     stream_take_events,
     truth_status,
 )
-from tests.support.aut2_fixtures import FILL_KEY_PREFIX, seed_fills
+from tests.support.aut2_fixtures import FILL_KEY_PREFIX, durable_fill, seed_fills
 from tests.support.te2_fixtures import (
+    fill_read,
     fq_durable_fills,
+    fq_out_of_scope_fill,
     fq_september_fills,
     fq_settlement_records,
     log_filled,
@@ -70,64 +65,26 @@ from tests.support.te2_fixtures import (
     nws_record,
 )
 
-_REPO = Path(__file__).resolve().parents[2]
 _LAX_YES = "tc-temp-laxhigh-2026-10-02-gte89lt90f.POLYMARKET_US"
-_D6, _D7 = dt.date(2026, 10, 6), dt.date(2026, 10, 7)
-_SCRIPTS = [
-    _REPO / "scripts/analysis/fq_v1_loss_taxonomy.py",
-    _REPO / "scripts/analysis/fq_loss_taxonomy_core.py",
-    _REPO / "scripts/analysis/fq_loss_taxonomy_inputs.py",
-]
-#: Reviewed import allowlist (module equals an entry or sits under it). Never ``exec.*``.
-_ALLOWED = (
-    "__future__", "argparse", "collections", "dataclasses", "datetime", "decimal", "hashlib",
-    "itertools", "json", "math", "pathlib", "re", "subprocess", "sys", "typing",
-    "breezy.analysis.labeling", "breezy.analysis.nbp_calibration", "breezy.domain.nws_climate_day",
-    "breezy.persistence.catalog", "breezy.settlement", "breezy.registry", "breezy.normalize",
-    "breezy.strategy.forecast_quantile_ladder", "breezy.strategy.ladder_ev",
-    "scripts.analysis",
-)  # fmt: skip
-
-
-def _git(root: Path, *args: str) -> str:
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-    ident = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
-    done = subprocess.run(
-        ["git", *ident, *args], cwd=root, env=env, check=True, capture_output=True, text=True
-    )
-    return done.stdout.strip()
-
-
-def _tmp_repo(root: Path, versions: Sequence[str]) -> list[str]:
-    """A hermetic repo whose ``manifest.json`` takes each content in turn; the commit shas."""
-    _git(root, "init", "-q", "-b", "main")
-    commits = []
-    for index, content in enumerate(versions):
-        (root / "manifest.json").write_text(content)
-        _git(root, "add", "manifest.json")
-        _git(root, "commit", "-q", "-m", f"v{index}")
-        commits.append(_git(root, "rev-parse", "HEAD"))
-    return commits
-
-
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+_D5, _D6, _D7 = dt.date(2026, 10, 5), dt.date(2026, 10, 6), dt.date(2026, 10, 7)
+_MIB = 1 << 20
 
 
 class _Src:
-    def __init__(self, records: dict[tuple[str, dt.date], NwsClimateDay]) -> None:
+    def __init__(self, records: dict[tuple[str, dt.date], Any]) -> None:
         self.records = records
         self.asked: list[dt.date] = []
 
     def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
         self.asked.append(climate_day)
-        return self.records.get((station, climate_day))
+        return cast("NwsClimateDay | None", self.records.get((station, climate_day)))
 
 
 class _CatalogRouter:
     """The production ``NwsCliFinal`` over one real tmp catalog per station."""
 
     def __init__(self, base: Path, records: Sequence[NwsClimateDay]) -> None:
+        base.mkdir(parents=True, exist_ok=True)
         self._sources = {}
         for station in sorted({r.station for r in records}):
             catalog = open_station_catalog(base, "polymarket_us", station)
@@ -158,19 +115,27 @@ def test_clipping_wrapper_implements_settlement_source_and_clips_after_2026_10_0
     assert real.record("LAX", _D7) is None
 
 
-def test_phase_a_projection_without_tmax_f_passes_when_tmax_f_raises() -> None:
-    class Explosive:
-        station, climate_day = "LAX", _D6
-        is_final, is_superseded, correction_flag, revision_seq = True, False, False, 1
+class _Explosive:
+    station, climate_day = "LAX", _D6
+    is_final, is_superseded, correction_flag, revision_seq = True, False, False, 1
 
-        @property
-        def tmax_f(self) -> int:
-            raise AssertionError("Phase A read tmax_f")
+    @property
+    def tmax_f(self) -> int:
+        raise AssertionError("Phase A read tmax_f")
 
-    projection = project_phase_a(cast(NwsClimateDay, Explosive()))
 
-    assert projection == PhaseAProjection("LAX", _D6, True, False, False, 1)
+def test_phase_a_projection_without_tmax_f_passes_when_tmax_f_raises(tmp_path: Path) -> None:
+    expected = PhaseAProjection("LAX", _D6, True, False, False, 1)
+    src = _Src({("LAX", _D6): _Explosive(), ("LAX", _D7): _Explosive()})
+
+    assert project_phase_a(cast(NwsClimateDay, _Explosive())) == expected
+    assert phase_a_truth(src, "LAX", _D6) == expected  # the single entry point: clip, then project
+    assert phase_a_truth(src, "LAX", _D7) is None  # clipped before the record is even requested
+    assert _D7 not in src.asked
+    assert phase_a_truth(src, "MIA", _D6) is None
     assert "tmax_f" not in {f.name for f in dataclasses.fields(PhaseAProjection)}
+    router = _CatalogRouter(tmp_path, [nws_record("LAX", _D6, 90)])  # production default path
+    assert phase_a_truth(router, "LAX", _D6) == expected
 
 
 def test_truth_unsettled_for_flagged_or_superseded_day() -> None:
@@ -181,128 +146,82 @@ def test_truth_unsettled_for_flagged_or_superseded_day() -> None:
     assert status(correction_flag=True) == "TRUTH_UNSETTLED"
     assert status(is_superseded=True) == "TRUTH_UNSETTLED"
     assert status(is_final=False) == "TRUTH_UNSETTLED"
+    clean = project_phase_a(nws_record("LAX", _D6, 90))
+    assert truth_status(clean, catalog_disagreement=True) == "TRUTH_UNSETTLED"  # S0-F catalog check
+    assert truth_status(clean, catalog_disagreement=False) == "SETTLED"
 
 
-def test_ast_pin_allowlist_forbids_open_holdout_attribute_and_string_access() -> None:
-    clean = "import datetime as dt\nfrom breezy.settlement.trial_scorer import score_trial\n"
-    bad_sources = {
-        "name": "from breezy.analysis.nbp_calibration import open_holdout\n",
-        "attribute": "import breezy.analysis.nbp_calibration as nc\nnc.open_holdout()\n",
-        "string": "import breezy.analysis.nbp_calibration as nc\ngetattr(nc, 'open_holdout')\n",
-        "m1v3 path": "p = '/home/jon/breezy/data/m1v3/holdout.parquet'\n",
-        "off-list": "import requests\n",
-        "direct exec": "from breezy.adapters.polymarket_us.exec.client import DurableFillRecord\n",
-    }
-
-    assert holdout_violations(clean, _ALLOWED) == ()
-    for label, source in bad_sources.items():
-        assert holdout_violations(source, _ALLOWED), label
-    for script in _SCRIPTS:
-        assert holdout_violations(script.read_text(encoding="utf-8"), _ALLOWED) == (), script.name
+def _boundary_fill(day: str) -> Any:
+    return durable_fill(
+        venue_order_id=f"b-{day}",
+        instrument_id=f"tc-temp-laxhigh-{day}-gte80lt81f.POLYMARKET_US",
+        ts_event=1_790_000_000_000_000_000,
+    )
 
 
-class _FakeGit:
-    def __init__(self, blobs: dict[str, str], *, clean: bool = True, ancestors: Any = ()) -> None:
-        self.blobs, self.clean, self.ancestors = blobs, clean, set(ancestors)
-
-    def head_blob_sha256(self, path: str) -> str:
-        return self.blobs[path]
-
-    def porcelain_clean(self, paths: Sequence[str]) -> bool:
-        return self.clean
-
-    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        return (ancestor, descendant) in self.ancestors
-
-    def blob_sha256(self, commit: str, path: str) -> str | None:
-        raise AssertionError("not used by the Phase B gate")
-
-    def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]:
-        raise AssertionError("not used by the Phase B gate")
-
-
-def test_phase_b_refuses_without_head_blob_pins_clean_path_and_ancestor_commit(
-    tmp_path: Path,
+def test_s0a_count_only_runs_without_any_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pins = {"scripts/a.py": "aa", "scripts/b.py": "bb"}
-    good = _FakeGit(pins, ancestors={("PRE", "HEAD")})
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("S0-A touched settlement data")
 
-    assert phase_b_refusals(pins, "PRE", good) == ()
-    drift = phase_b_refusals(
-        pins, "PRE", _FakeGit({**pins, "scripts/b.py": "zz"}, ancestors=good.ancestors)
-    )
-    assert (
-        len(drift) == 1 and drift[0].startswith("head_blob_mismatch") and "scripts/b.py" in drift[0]
-    )
-    assert phase_b_refusals(pins, "PRE", _FakeGit(pins, clean=False, ancestors=good.ancestors)) == (
-        "dirty_pinned_path",
-    )
-    assert phase_b_refusals(pins, "PRE", _FakeGit(pins)) == ("predeclaration_not_ancestor",)
-    # production default path: the real SubprocessGit over a hermetic repo
-    first, second = _tmp_repo(tmp_path, ["one", "two"])
-    real = SubprocessGit(tmp_path)
-    assert phase_b_refusals({"manifest.json": _sha("two")}, first, real) == ()
-    assert phase_b_refusals({"manifest.json": _sha("one")}, second, real)  # HEAD blob is "two"
-    assert phase_b_refusals(
-        {"manifest.json": _sha("two")}, second, real
-    )  # not strictly... see below
-
-
-def test_refreeze_rule_requires_new_predeclaration_commit() -> None:
-    frozen = {"core.py": "aa", "cli.py": "bb"}
-    changed = {"core.py": "cc", "cli.py": "bb"}
-
-    assert refreeze_status(frozen, frozen, None) == "OK"
-    assert refreeze_status(frozen, changed, None) == "REFREEZE_REQUIRED"
-    assert refreeze_status(frozen, changed, frozen) == "REFREEZE_REQUIRED"  # stale re-pin
-    assert refreeze_status(frozen, changed, changed) == "REFROZEN"
-
-
-def test_post_hoc_verifier_checks_artefact_commit_is_after_predeclaration(tmp_path: Path) -> None:
-    fake = _FakeGit({}, ancestors={("PRE", "ART")})
-
-    assert post_hoc_violations("PRE", "ART", fake) == ()
-    assert post_hoc_violations("PRE", "PRE", _FakeGit({}, ancestors={("PRE", "PRE")}))
-    assert post_hoc_violations("ART", "PRE", fake)
-    # production default path
-    pre, art = _tmp_repo(tmp_path, ["pre", "art"])
-    real = SubprocessGit(tmp_path)
-    assert post_hoc_violations(pre, art, real) == ()
-    assert post_hoc_violations(art, pre, real)
-    assert post_hoc_violations(pre, pre, real)
-
-
-def test_s0a_count_only_runs_without_any_outcome(tmp_path: Path) -> None:
+    monkeypatch.setattr(NwsCliFinal, "record", boom)
     store = tmp_path / "exec.db"
     seed_fills(store, [*fq_durable_fills(), *fq_september_fills()])
 
-    counts = s0a_counts(store, dt.date(2026, 10, 5))
+    counts = s0a_counts(store, _D5)
 
     assert counts == S0ACounts(
         n_fills=25, n_instruments=25, n_no_leg=0, n_open_ended=6, n_station_days=14,
         n_clusters=7, n_clusters_excluding_k1b=6, n_k1b_fills=5, n_k1b_station_days=3,
     )  # fmt: skip
+    s0a_gate(counts)  # the verified P6 counts pass
     params = set(inspect.signature(s0a_counts).parameters)
     assert not params & {"catalog", "settlement", "source", "tmax"}
     assert not {f.name for f in dataclasses.fields(S0ACounts)} & {"n_wins", "pnl", "tmax"}
+    # the 10-01 window boundary: 09-30 is out, 10-01 is in
+    edge = tmp_path / "edge.db"
+    seed_fills(edge, [_boundary_fill("2026-09-30"), _boundary_fill("2026-10-01")])
+    assert s0a_counts(edge, _D5).n_fills == 1
+    # a ^no-leg fill is counted, and the gate STOPs on it
+    no_leg = durable_fill(
+        venue_order_id="no-1", instrument_id=_LAX_YES.replace(".POLY", "^no.POLY")
+    )
+    with_no = tmp_path / "no.db"
+    seed_fills(with_no, [*fq_durable_fills(), no_leg])
+    counted = s0a_counts(with_no, _D5)
+    assert (counted.n_no_leg, counted.n_fills) == (1, 26)
+    with pytest.raises(S0AStop):
+        s0a_gate(counted)
+    # an unparseable instrument id is a STOP, never a skip
+    junk = tmp_path / "junk.db"
+    seed_fills(junk, [durable_fill(venue_order_id="j-1", instrument_id="garbage.POLYMARKET_US")])
+    with pytest.raises(UnparseableInstrumentStop):
+        s0a_counts(junk, _D5)
     writer = SqliteStateStore(store)
     try:
         writer.set(f"{FILL_KEY_PREFIX}vo-bad", b"{not json")
     finally:
         writer.close()
     with pytest.raises(FillStoreCorruption):  # require_clean: corruption is a STOP, never a skip
-        s0a_counts(store, dt.date(2026, 10, 5))
+        s0a_counts(store, _D5)
 
 
 class _EpochReader:
-    def __init__(self, start: int | None) -> None:
-        self._start = start
+    def __init__(self, start: int | None, *, links: bool = False) -> None:
+        self._start, self._links = start, links
 
     def epoch_start_ns(self) -> int | None:
         return self._start
 
-    def order_link(self, client_order_id: str) -> None:
-        return None
+    def order_link(self, client_order_id: str) -> OrderLinkView | None:
+        if not self._links:
+            return None
+        return OrderLinkView(
+            decision_id=f"dec-{client_order_id}", client_order_id=client_order_id,
+            venue_order_id_sha256="", instrument_id=_LAX_YES, side="1", qty="1.00", px="0.15",
+            time_in_force="2", intent_fingerprint="f" * 64, ts_ns=2, source="live",
+        )  # fmt: skip
 
     def earliest_order_link_ns(self) -> None:
         return None
@@ -315,37 +234,34 @@ def _fq_log(path: Path, *, skip_take_for: int | None = None) -> Path:
         if index != skip_take_for:
             lines.append(log_take(t, fill.instrument_id))
         lines.append(log_init(t + 1, fill.client_order_id, fill.instrument_id))
-        lines.append(
-            log_filled(t + 2, fill.client_order_id, cast(str, fill.trade_id), fill.instrument_id)
-        )
-    lines += [
-        log_take(300.0 + n, f"tc-temp-laxhigh-2026-10-02-lt{60 + n}f.POLYMARKET_US")
-        for n in range(7)
-    ]
+        trade = cast(str, fill.trade_id)
+        lines.append(log_filled(t + 2, fill.client_order_id, trade, fill.instrument_id))
+    for n in range(7):  # the IOC-missed Takes: no OrderInitialized follows
+        lines.append(log_take(300.0 + n, f"tc-temp-laxhigh-2026-10-02-lt{60 + n}f.POLYMARKET_US"))
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
 def test_all_25_fills_attribute_or_stop_unclassified(tmp_path: Path) -> None:
-    fills = fq_durable_fills()
+    fills = fill_read(fq_durable_fills())
     log = _fq_log(tmp_path / "boot.log")
-    (tmp_path / "root").mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
 
-    fake = attribute_fills(
-        fills, [log], data_root=tmp_path / "root", epoch_reader=_EpochReader(None)
-    )
-    default = attribute_fills(fills, [log], data_root=tmp_path / "root")  # production C1Epoch
+    fake = attribute_fills(fills, [log], data_root=root, epoch_reader=_EpochReader(None))
+    default = attribute_fills(fills, [log], data_root=root)  # production C1Epoch, empty root
 
     for result in (fake, default):
         assert (result.report.n, result.report.matched, result.report.p_null_count) == (25, 25, 0)
-        assert result.matches[0].p_at_decision == pytest.approx(0.38)
+        assert len(result.matches) == 25
+        assert all(m.p_at_decision == pytest.approx(0.38) for m in result.matches)
     missing = _fq_log(tmp_path / "missing.log", skip_take_for=7)
     with pytest.raises(UnclassifiedFillsStop):
-        attribute_fills(
-            fills, [missing], data_root=tmp_path / "root", epoch_reader=_EpochReader(None)
-        )
-    with pytest.raises(UnclassifiedFillsStop):  # an epoch that is not PRE_EPOCH never bridges
-        attribute_fills(fills, [log], data_root=tmp_path / "root", epoch_reader=_EpochReader(1))
+        attribute_fills(fills, [missing], data_root=root, epoch_reader=_EpochReader(None))
+    with pytest.raises(UnclassifiedFillsStop):  # UNRESOLVED epoch (no order link): never bridged
+        attribute_fills(fills, [log], data_root=root, epoch_reader=_EpochReader(1))
+    with pytest.raises(BackfillRefused):  # POST_EPOCH: bridge_decision refuses, the plan STOPs
+        attribute_fills(fills, [log], data_root=root, epoch_reader=_EpochReader(1, links=True))
 
 
 def test_s0d_perturbed_vector_mismatches_and_is_classed_k1a() -> None:
@@ -363,149 +279,22 @@ def test_s0d_perturbed_vector_mismatches_and_is_classed_k1a() -> None:
     assert classify_s0d_miss(
         bulletin_available=True, bulletin_reissued=False,
         cycle_selection_matches=True, delta_survives_root_cause=True,
-    ) == "K1a"  # fmt: skip
+    ) == S0DMiss.K1A  # fmt: skip
 
 
 def test_unavailable_bulletin_is_untestable_and_cycle_mismatch_is_cycle_ambiguous() -> None:
-    def miss(**over: bool) -> str:
+    def miss(**over: bool) -> S0DMiss:
         base = {
             "bulletin_available": True, "bulletin_reissued": False,
             "cycle_selection_matches": True, "delta_survives_root_cause": True,
         }  # fmt: skip
         return classify_s0d_miss(**{**base, **over})
 
-    assert miss(bulletin_available=False) == "UNTESTABLE"
-    assert miss(bulletin_reissued=True) == "UNTESTABLE"
-    assert miss(cycle_selection_matches=False) == "CYCLE_AMBIGUOUS"
-    assert miss(bulletin_available=False, cycle_selection_matches=False) == "UNTESTABLE"
-
-
-_SNAP_ROWS = [
-    ("2026-10-01T13:39:52", "000000000000", "60290e9ddd29"),
-    ("2026-10-01T16:01:36", "60290e9ddd29", "99067d4a9e7a"),
-    ("2026-10-02T16:00:52", "99067d4a9e7a", "7dfd1af114c1"),
-    ("2026-10-02T20:05:01", "7dfd1af114c1", "6e99a7ae2dbe"),
-    ("2026-10-02T20:54:53", "6e99a7ae2dbe", "3eb4a1085dbf"),
-    ("2026-10-03T15:01:45", "3eb4a1085dbf", "f45f5a6558cd"),
-    ("2026-10-04T16:28:31", "f45f5a6558cd", "c893e13e603e"),
-    ("2026-10-04T17:11:31", "c893e13e603e", "2be63d85aaaa"),  # carries a rebased 4ac87414
-    ("2026-10-04T22:35:21", "2be63d85aaaa", "4ba7f10cd1f6"),
-]  # fmt: skip
-_BOOT_TIMES = [
-    "2026-10-01T15:12:02", "2026-10-01T16:01:58", "2026-10-01T16:50:11", "2026-10-02T16:50:39",
-    "2026-10-02T20:05:26", "2026-10-02T20:55:21", "2026-10-03T16:50:45", "2026-10-04T16:50:12",
-    "2026-10-05T16:50:40",
-]  # fmt: skip
-_EXPECTED = [
-    "60290e9ddd29", "99067d4a9e7a", "99067d4a9e7a", "7dfd1af114c1", "6e99a7ae2dbe", "3eb4a1085dbf",
-    "f45f5a6558cd", "c893e13e603e", "4ba7f10cd1f6",
-]  # fmt: skip
-_TREES = {"60290e9ddd29": "T1", "c893e13e603e": "T3", "4ba7f10cd1f6": "T4"}
-
-
-class _PinGit:
-    """Dict-backed git: blobs equal the logged shas except for one corrupted commit."""
-
-    def __init__(self, bad_blob_commit: str | None = None) -> None:
-        self.bad = bad_blob_commit
-
-    def head_blob_sha256(self, path: str) -> str:
-        raise AssertionError("pin corroboration must read the blob AT the commit, never HEAD")
-
-    def porcelain_clean(self, paths: Sequence[str]) -> bool:
-        raise AssertionError("not used")
-
-    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        raise AssertionError("not used")
-
-    def blob_sha256(self, commit: str, path: str) -> str | None:
-        return "bad" if commit == self.bad else {"m": "logged-m", "a": "logged-a"}[path]
-
-    def tree_shas(self, commit: str, paths: Sequence[str]) -> tuple[str, ...]:
-        return (_TREES.get(commit, "T2"),)
-
-
-def _snapshot(path: Path) -> tuple[Path, str]:
-    body = "".join(f"{ts}+00:00 old={old} new={new} commit: x\n" for ts, old, new in _SNAP_ROWS)
-    text = f"# Captured\n# source: .git/logs/HEAD\n{body}# source: .git/logs/refs/heads/b\n{body}"
-    path.write_text(text)
-    return path, _sha(text)
-
-
-def _boot(number: int, stamp: str, manifest: str = "logged-m", artefact: str = "logged-a") -> Boot:
-    when = dt.datetime.fromisoformat(stamp).replace(tzinfo=dt.UTC)
-    return Boot(number, when, manifest, artefact)
-
-
-_PIN_KW: dict[str, Any] = {"manifest_path": "m", "artefact_path": "a", "widened_paths": ["src/x"]}
-
-
-def test_pin_resolver_reads_reflog_snapshot_file_not_live_reflog_and_never_committer_time(
-    tmp_path: Path,
-) -> None:
-    path, digest = _snapshot(tmp_path / "REFLOG.txt")
-    git = _PinGit()
-    boots = [_boot(i + 1, t) for i, t in enumerate(_BOOT_TIMES)]
-
-    pins = resolve_pins(path, digest, boots, git, **_PIN_KW)
-
-    assert [p.commit for p in pins] == _EXPECTED  # boot 8 is c893e13e603e, never the rebased commit
-    assert [p.near_boundary for p in pins] == [
-        False,
-        True,
-        False,
-        False,
-        True,
-        True,
-        False,
-        False,
-        False,
-    ]
-    assert pins[1].state == "UNTESTABLE" and "tree" in (pins[1].reason or "")
-    assert {p.state for i, p in enumerate(pins) if i != 1} == {"PINNED"}
-    both = resolve_pins(path, digest, boots, git, reproduces_under=lambda n, c: True, **_PIN_KW)
-    assert both[1].commit == "99067d4a9e7a" and both[1].state == "PINNED"
-    one_sided = resolve_pins(
-        path, digest, boots, git, reproduces_under=lambda n, c: c != "60290e9ddd29", **_PIN_KW
-    )
-    assert one_sided[1].state == "UNTESTABLE"
-    with pytest.raises(SnapshotShaMismatch):
-        resolve_pins(path, "0" * 64, boots, git, **_PIN_KW)
-    early = resolve_pins(path, digest, [_boot(1, "2026-09-30T00:00:00")], git, **_PIN_KW)
-    assert early[0].commit is None and early[0].state == "UNTESTABLE"
-    corrupted = resolve_pins(path, digest, boots, _PinGit("4ba7f10cd1f6"), **_PIN_KW)
-    assert corrupted[8].state == "UNTESTABLE" and corrupted[7].state == "PINNED"
-    assert pin_label([]) == "STABLE" and pin_label(["20aa5ea5"]) == "INFERRED"
-    assert reproduction_gate([None] * 3 + [True] * 22).passed is False  # UNTESTABLE = non-match
-    assert reproduction_gate([None] * 2 + [True] * 23).passed is True
-    # production default path: the real SubprocessGit over a hermetic repo
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    old, new = _tmp_repo(repo, ["old-content", "new-content"])
-    rows = [
-        ("2026-10-01T00:00:00", "0" * 12, old[:12]),
-        ("2026-10-02T00:00:00", old[:12], new[:12]),
-    ]
-    body = "".join(f"{ts}+00:00 old={o} new={n} commit: x\n" for ts, o, n in rows)
-    snap = tmp_path / "REFLOG2.txt"
-    snap.write_text(f"# source: .git/logs/HEAD\n{body}")
-    kw: dict[str, Any] = {"manifest_path": "manifest.json", "artefact_path": "manifest.json"}
-    kw["widened_paths"] = ["manifest.json"]
-    o_sha, n_sha = _sha("old-content"), _sha("new-content")
-    real_boots = [
-        _boot(1, "2026-10-01T12:00:00", o_sha, o_sha),
-        _boot(2, "2026-10-02T12:00:00", o_sha, o_sha),  # logged the stale blob: corroboration fails
-        _boot(3, "2026-10-02T13:00:00", n_sha, n_sha),
-    ]
-    real = SubprocessGit(repo)
-    real_pins = resolve_pins(snap, _sha(snap.read_text()), real_boots, real, **kw)
-    assert real.blob_sha256(old, "manifest.json") == o_sha  # at the commit, not HEAD
-    assert real.tree_shas(old, ["manifest.json"]) != real.tree_shas(new, ["manifest.json"])
-    assert [(p.commit, p.state) for p in real_pins] == [
-        (old[:12], "PINNED"),
-        (new[:12], "UNTESTABLE"),
-        (new[:12], "PINNED"),
-    ]
+    assert miss(bulletin_available=False) == S0DMiss.UNTESTABLE
+    assert miss(bulletin_reissued=True) == S0DMiss.UNTESTABLE
+    assert miss(cycle_selection_matches=False) == S0DMiss.CYCLE_AMBIGUOUS
+    assert miss(bulletin_available=False, cycle_selection_matches=False) == S0DMiss.UNTESTABLE
+    assert miss(delta_survives_root_cause=False) == S0DMiss.NO_DEFECT  # not a defect, not K1a
 
 
 def _write_log(path: Path, lines: Sequence[str]) -> Path:
@@ -516,15 +305,28 @@ def _write_log(path: Path, lines: Sequence[str]) -> Path:
 def test_streaming_reader_is_a_lazy_generator_or_tracemalloc_bounded_and_keeps_a_take_split_across_a_prefilter_boundary(  # noqa: E501
     tmp_path: Path,
 ) -> None:
-    takes = [log_take(t, f"tc-temp-laxhigh-2026-10-02-lt{60 + t}f.POLYMARKET_US") for t in range(3)]
+    takes = [log_take(t, f"tc-temp-laxhigh-2026-10-02-lt{60 + t}f.POLYMARKET_US") for t in range(4)]
+    parsed = [e for e in (parse_log_line(t) for t in takes) if e is not None]
     small = _write_log(tmp_path / "small.log", ["x" * 100, takes[0], "y" * 70, takes[1], takes[2]])
-    expected = [e for e in (parse_log_line(t) for t in takes) if e is not None]
 
     stream = stream_take_events(small, chunk_size=64)  # every Take straddles several chunks
 
     assert iter(stream) is stream  # lazy: a generator, never a list
-    assert list(stream) == expected == [e for e in read_log_events([small]) if e.kind == "take"]
-    assert list(stream_take_events(small)) == expected  # production default chunk size
+    assert list(stream) == parsed[:3] == [e for e in read_log_events([small]) if e.kind == "take"]
+    assert list(stream_take_events(small)) == parsed[:3]  # production default chunk size
+    # a Take that straddles exactly the 1 MiB offset, and one that starts exactly on it
+    line = takes[0] + "\n"
+    straddle = tmp_path / "straddle.log"
+    head = "z" * (_MIB - len(line) // 2 - 1) + "\n"
+    straddle.write_text(head + line + "y" * 50 + "\n")
+    assert [e.instrument_id for e in stream_take_events(straddle)] == [parsed[0].instrument_id]
+    on_edge = tmp_path / "on_edge.log"
+    on_edge.write_text("z" * (_MIB - 1) + "\n" + takes[1] + "\n")
+    assert [e.instrument_id for e in stream_take_events(on_edge)] == [parsed[1].instrument_id]
+    # a single Take line far larger than the chunk, after a non-Take line larger than the chunk
+    huge = takes[3] + " " + "q" * 5000
+    giant = _write_log(tmp_path / "giant.log", ["w" * 5000, huge])
+    assert list(stream_take_events(giant, chunk_size=64)) == [parsed[3]]
     filler = "z" * 2000
     big = tmp_path / "big.log"
     with big.open("w") as handle:
@@ -575,22 +377,24 @@ def test_alt_truth_unavailable_marks_untestable_not_zero() -> None:
 
 def test_reproduces_audit_25_fills_2_wins_minus_2_17(tmp_path: Path) -> None:
     store = tmp_path / "exec.db"
-    seed_fills(store, [*fq_durable_fills(), *fq_september_fills()])  # the real writer path
-    fills = read_durable_fills(store).require_clean().fills  # L-42: through the real reader
-    (tmp_path / "catalog").mkdir()
-    source = _CatalogRouter(tmp_path / "catalog", fq_settlement_records())  # real NwsCliFinal
+    seed_fills(store, [*fq_durable_fills(), *fq_september_fills(), fq_out_of_scope_fill()])
+    read = read_durable_fills(store).require_clean()  # L-42: the real writer, the real reader
+    records = [
+        *fq_settlement_records(),
+        nws_record("LAX", _D7, 90),
+    ]  # a 10-07 record that would win
+    source = ClippingSettlementSource(_CatalogRouter(tmp_path / "catalog", records), _D6)
     now_ns = 1_800_000_000_000_000_000
 
-    def audit(subset: Sequence[Any]) -> Any:
-        return reproduce_audit(subset, source, now_ns=now_ns)
+    def audit(marker: str | None) -> Any:
+        keep = [f for f in read.fills if marker is None or marker in f.instrument_id]
+        return reproduce_audit(fill_read(keep), source, now_ns=now_ns)
 
-    full = audit(fills)
-    october = audit([f for f in fills if "-2026-10-" in f.instrument_id])
-    september = audit([f for f in fills if "-2026-09-" in f.instrument_id])
+    full, october, september = audit(None), audit("-2026-10-0"), audit("-2026-09-")
 
-    assert (full.n_fills, full.n_wins, full.n_refused) == (34, 4, 0)
+    assert (full.n_fills, full.n_wins, full.n_refused) == (34, 4, 1)  # the 10-07 fill is refused
     assert abs(full.net_pnl - Decimal("-2.63")) <= Decimal("0.005")
-    assert (october.n_fills, october.n_wins) == (25, 2)
+    assert (october.n_fills, october.n_wins, october.n_refused) == (25, 2, 1)
     assert abs(october.net_pnl - Decimal("-2.17")) <= Decimal("0.005")
     assert (september.n_fills, september.n_wins) == (9, 2)
     assert abs(september.net_pnl - Decimal("-0.46")) <= Decimal("0.005")
@@ -598,3 +402,4 @@ def test_reproduces_audit_25_fills_2_wins_minus_2_17(tmp_path: Path) -> None:
         ("tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US", 87),
         ("tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US", 90),
     }
+    assert "clip_after" not in inspect.signature(reproduce_audit).parameters

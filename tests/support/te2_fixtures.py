@@ -9,26 +9,36 @@ Per-fill cost plus fee sums to 4.17, so the net is exactly 2 - 4.17 = -2.17.
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping
+import hashlib
+import os
+import subprocess
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
+from breezy.analysis.labeling.fill_source import FillRead
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from tests.support.aut2_fixtures import DurableFillRecord, durable_fill
 
 __all__ = [
     "FQ_TMAX",
     "SEP_TMAX",
+    "fill_read",
     "fq_durable_fills",
     "fq_instrument_ids",
+    "fq_out_of_scope_fill",
     "fq_september_fills",
     "fq_settlement_records",
     "fq_station_days_per_fill",
+    "git_cmd",
     "log_filled",
     "log_init",
     "log_refuse",
     "log_take",
     "nws_record",
+    "sha256_text",
+    "tmp_git_repo",
 ]
 
 _VENUE = "POLYMARKET_US"
@@ -217,3 +227,54 @@ def log_filled(offset_s: float, client_order_id: str, trade_id: str, instrument_
         f"instrument_id={instrument_id}, client_order_id={client_order_id}, venue_order_id=V1, "
         f"account_id=A, trade_id={trade_id}, order_side=BUY, last_qty=1.00, last_px=0.40 USD)"
     )
+
+
+def fill_read(fills: Sequence[DurableFillRecord]) -> FillRead:
+    """A clean ``FillRead``, shaped like ``read_durable_fills(...).require_clean()``."""
+    return FillRead(fills=tuple(fills), n_keys=len(fills), n_undecodable=0)
+
+
+def fq_out_of_scope_fill() -> DurableFillRecord:
+    """A LAX fill on climate day 10-07, past the 10-06 clip: it would win if it were scored."""
+    return durable_fill(
+        venue_order_id="oos-1",
+        client_order_id="O-oos-1",
+        trade_id="T-oos-1",
+        instrument_id=f"tc-temp-laxhigh-2026-10-07-gte90lt91f.{_VENUE}",
+        ts_event=_OCT_TS + 900_000_000_000,
+    )
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def git_cmd(root: Path, *args: str, date: str | None = None) -> str:
+    """Run git hermetically in ``root`` (no global config, fixed identity, optional commit date)."""
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    if date is not None:
+        env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = date
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    done = subprocess.run(
+        ["git", *ident, *args], cwd=root, env=env, check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+def tmp_git_repo(
+    root: Path, versions: Sequence[str], dates: Sequence[str | None] | None = None
+) -> list[str]:
+    """A hermetic repo: ``manifest.json`` takes each content in turn; ``extra.py`` and
+    ``other.txt`` are tracked from the first commit. Returns the commit shas."""
+    root.mkdir(parents=True, exist_ok=True)
+    git_cmd(root, "init", "-q", "-b", "main")
+    (root / "extra.py").write_text("x = 1\n")
+    (root / "other.txt").write_text("o\n")
+    commits = []
+    for index, content in enumerate(versions):
+        (root / "manifest.json").write_text(content)
+        git_cmd(root, "add", "manifest.json", "extra.py", "other.txt")
+        date = dates[index] if dates else None
+        git_cmd(root, "commit", "-q", "-m", f"v{index}", date=date)
+        commits.append(git_cmd(root, "rev-parse", "HEAD"))
+    return commits
