@@ -97,6 +97,7 @@ from breezy.analysis.stats.sequential_looks import (  # noqa: F401
     _BoundaryFn,
     run_sequential_looks,
 )
+from breezy.persistence.epoch_strata import parallel_trial_ids as _read_parallel_trial_ids
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.gs_boundary_artefact import BoundaryArtefact, load_boundary_artefact
 from breezy.persistence.realized_draws import (
@@ -288,6 +289,11 @@ class FamilyTallyV2:
     #: (`Var_H0 <= 1/4`) does NOT cover (`Var_H0` up to 1.0 on a mixed day).
     #: Reporting only: never read by `run_sequential_looks` or any verdict.
     mixed_day_count: int = 0
+    #: EXEC-PAR BG-2 (J1): single-vs-parallel K-epoch strata of the admitted fills,
+    #: ``()`` unless at least one admitted fill is in a parallel epoch -- so the
+    #: rendered report is byte-identical for a store that only ever ran at K=1.
+    #: Reporting only: never read by `run_sequential_looks` or any verdict.
+    epoch_strata: tuple[StratumV2, ...] = ()
     #: AUD-07 amendment Stage M1b DoD (iv): `True` exactly when the FINAL
     #: look terminated because the information ceiling was reached
     #: (`state.information >= artefact.i_max`) while `n_max` draws had NOT
@@ -540,6 +546,21 @@ def _ask_band_strata(rows: Sequence[ScoredTrial]) -> tuple[StratumV2, ...]:
     return tuple(strata)
 
 
+def _epoch_strata(
+    rows: Sequence[ScoredTrial], parallel_trial_ids: frozenset[str]
+) -> tuple[StratumV2, ...]:
+    """``epoch:single`` and ``epoch:parallel`` strata; ``()`` when no admitted fill is parallel."""
+    parallel = tuple(_stratum_row(t) for t in rows if t.trial_id in parallel_trial_ids)
+    if not parallel:
+        return ()
+    single = tuple(_stratum_row(t) for t in rows if t.trial_id not in parallel_trial_ids)
+    strata = (
+        build_stratum_v2("epoch:single", single) if single else None,
+        build_stratum_v2("epoch:parallel", parallel),
+    )
+    return tuple(s for s in strata if s is not None)
+
+
 def _roi_bound_line_v2(rows: Sequence[ScoredTrial]) -> str:
     """Obligation (d): `format_roi_bound`'s pinned string, PLUS the BCa
     point estimate `theta_hat` (already on `ROIBound`, never printed by
@@ -600,6 +621,7 @@ def build_family_tally_v2(
     filled_takes: int | None = None,
     truncation: TruncationReason | None = None,
     residual: Decimal = Decimal(0),
+    parallel_trial_ids: frozenset[str] = frozenset(),
 ) -> FamilyTallyV2:
     """Build the pooled sequential trail, strata, and terminal-only BCa line.
 
@@ -618,6 +640,10 @@ def build_family_tally_v2(
     byte-identical. The `LOSS_STOP` gate fires on `total_pnl + residual`,
     never `total_pnl` alone, so a family with real, unscored dollar losses
     cannot look SURVIVE just because the losing fills never entered `rows`.
+
+    `parallel_trial_ids` (EXEC-PAR BG-2, J1): the `trial_id`s whose fill `ts_event`
+    fell in a parallel K-epoch (`epoch_strata.jsonl`). Reporting only; empty (the
+    default, and every K=1 store) leaves the tally and its rendering unchanged.
     """
     # Prefix-filter FIRST, before any integrity/collision/empty-store guard:
     # a foreign (e.g. v3) row must be counted, logged, and refused (or
@@ -763,6 +789,7 @@ def build_family_tally_v2(
         structural_dead=structural,
         store_empty_no_sidecar=store_empty_no_sidecar,
         mixed_day_count=mixed_day_count,
+        epoch_strata=_epoch_strata(non_excluded, parallel_trial_ids),
         i_max_terminal_below_n_max=i_max_terminal_below_n_max,
     )
 
@@ -1164,6 +1191,8 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     for index, stratum in enumerate(rendered_strata):
         side_mix = tally.strata_side_mix[index] if index < len(tally.strata_side_mix) else ""
         add(_fmt_stratum_row(stratum, side_mix=side_mix))
+    for epoch_stratum in tally.epoch_strata:
+        add(_fmt_stratum_row(epoch_stratum))
     if tally.pooled_side_mix or any(tally.strata_side_mix):
         add(_SIDE_MIX_FOOTNOTE)
     add("")
@@ -1412,6 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             filled_takes=filled_takes,
             truncation=truncation,
             residual=residual,
+            parallel_trial_ids=_read_parallel_trial_ids(args.store_dir),
         )
     except ProvenanceRefusal as exc:
         print(f"family_tally_v2: {exc}", file=sys.stderr)

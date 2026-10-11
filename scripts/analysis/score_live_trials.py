@@ -127,6 +127,7 @@ from breezy.domain.weather_bucket_facts import (
     WeatherBucketFacts,
 )
 from breezy.persistence.catalog import open_station_catalog, read_climate_day_including_corrections
+from breezy.persistence.epoch_strata import append_epoch_strata
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 
 # Re-exported unchanged (WP-31): `from score_live_trials import RESIDUAL_EXCLUSION_REASONS`.
@@ -136,6 +137,7 @@ from breezy.persistence.residual_fills import (  # noqa: F401
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import default_registry
+from breezy.runtime.exec_par_epochs import STRATUM_PARALLEL, read_epoch_ledger
 from breezy.runtime.exec_state_db_path import (
     ExecStateDbNotConfiguredError,
     node_store_path_check,
@@ -875,6 +877,12 @@ def score_live_trials(
                 for row in stamped_scored
             ],
         )
+        if fills_path is None and fill_source_path is not None:
+            _append_parallel_epoch_strata(
+                derived_dir,
+                fill_source_path,
+                {row.trial_id: filled_at_ns_by_trial_id[row.trial_id] for row in stamped_scored},
+            )
         write_scored_trials(derived_dir, stamped_scored, now_ns=now_ns)
     # I4 defect fix: written unconditionally (idempotent, empty-safe, mirrors
     # `_write_or_assert_live_provenance_sidecar` above) so an unresolved take
@@ -884,6 +892,25 @@ def score_live_trials(
     # fill), so it is never folded into that artefact or its reason enum.
     _append_unresolved_takes(derived_dir, unresolved_takes, scored_run_utc=_scored_run_utc(now_ns))
     return stamped_scored, refused, tuple(excluded_fills)
+
+
+def _append_parallel_epoch_strata(
+    derived_dir: Path, fill_source_path: Path, filled_at_ns_by_trial_id: Mapping[str, int]
+) -> None:
+    """EXEC-PAR BG-2 (J1): record the fills whose `ts_event` is in a parallel K-epoch.
+
+    Single-slot fills are not recorded, so a store that only ever ran at K=1
+    gains no file. The epoch ledger is read through a `mode=ro` open.
+    """
+    ledger = read_epoch_ledger(fill_source_path)
+    append_epoch_strata(
+        derived_dir,
+        {
+            trial_id: filled_at_ns
+            for trial_id, filled_at_ns in filled_at_ns_by_trial_id.items()
+            if ledger.stratum_of(filled_at_ns) == STRATUM_PARALLEL
+        },
+    )
 
 
 def _append_excluded_fills(
