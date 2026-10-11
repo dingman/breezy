@@ -953,6 +953,37 @@ class DailySpendLedger:
         except Exception:  # noqa: BLE001 -- every failure to evaluate is "tripped"
             return True
 
+    def pnl_breaches_budget_fraction(self, *, aggregate_pnl: Decimal, fraction: Decimal) -> bool:
+        """True iff ``aggregate_pnl <= -(fraction x daily budget)`` (K6, value-free).
+
+        ``aggregate_pnl`` is a caller-summed net P&L and may be negative, zero or
+        positive. Returns ``bool`` only; the limit is computed and discarded.
+
+        Raises:
+            LiveTradingPermissionError: for a non-Decimal / non-finite aggregate,
+                a fraction outside ``(0, 1]``, or an unset daily budget. Never a
+                default: the caller treats any raise as tripped. Messages name
+                the control or the argument, never an amount.
+        """
+        if type(aggregate_pnl) is not Decimal or not aggregate_pnl.is_finite():
+            raise LiveTradingPermissionError("aggregate_pnl must be a finite Decimal")
+        limit = self._checked_fraction(fraction, "fraction") * operator_max_daily_budget_usd()
+        return aggregate_pnl <= -limit
+
+    def open_cost_exceeds_budget_fraction(
+        self, *, aggregate_open_cost: Decimal, fraction: Decimal
+    ) -> bool:
+        """True iff ``aggregate_open_cost > fraction x daily budget`` (K6, value-free).
+
+        Raises:
+            LiveTradingPermissionError: for a negative / non-Decimal / non-finite
+                aggregate, a fraction outside ``(0, 1]``, or an unset daily
+                budget. Never a default; messages never carry an amount.
+        """
+        cost = _require_exact_decimal(aggregate_open_cost, "aggregate_open_cost")
+        limit = self._checked_fraction(fraction, "fraction") * operator_max_daily_budget_usd()
+        return cost > limit
+
     def cost_budget_bucket(self) -> str:
         """The ``cap / budget`` bucket LABEL only; never a dollar value.
 
