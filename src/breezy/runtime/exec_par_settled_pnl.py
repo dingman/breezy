@@ -36,16 +36,16 @@ from breezy.runtime.exec_par_records import SettledPnlDay
 __all__ = [
     "FILL_PREFIX",
     "SETTLEMENT_DEADLINE_DAYS",
-    "PreBootLedger",
-    "SettledPnlReading",
-    "check_monotonic",
-    "SettledPnlRegression",
     "EntryInput",
     "FillLedgerCorrupt",
     "FillLike",
+    "PreBootLedger",
     "SettledPnlInputError",
     "SettledPnlMissing",
+    "SettledPnlReading",
+    "SettledPnlRegression",
     "Timed",
+    "check_monotonic",
     "persist_settled_pnl",
     "pre_boot_fill_ledger",
     "settled_pnl_by_day",
@@ -148,6 +148,7 @@ def _entry_cost(entry: EntryInput, day: _Day) -> Decimal:
     if fill.fee_reconciled is not True:
         fee = max(fee, _unreconciled_fee(fill))
         day.fee_unreconciled += 1
+        day.fee_floor += fee
     return _money(fill.cumulative_cost) + fee
 
 
@@ -171,6 +172,7 @@ class _Day:
         self.unsettled = 0
         self.overdue = 0
         self.fee_unreconciled = 0
+        self.fee_floor = Decimal(0)
 
 
 def _contribution(
@@ -212,6 +214,9 @@ def settled_pnl_by_day(
 ) -> dict[str, SettledPnlDay]:
     """Per arm-time day: sum of (payout - cost - fee) over settled entries.
 
+    ``today`` (ISO date) must be sourced by the caller (BG-5) from the injected clock, never
+    from a stale or cached value: it decides which unsettled entries are overdue losses.
+
     A win pays 1 per contract; AMBIGUOUS-unresolved entries are full-cost losses; an
     entry whose instrument has no outcome yet is PENDING (counted, not summed) until its
     arm-day is ``SETTLEMENT_DEADLINE_DAYS`` old relative to ``today`` (ISO date), then
@@ -247,6 +252,7 @@ def settled_pnl_by_day(
                 unsettled_entries=tally.unsettled,
                 overdue_entries=tally.overdue,
                 fee_unreconciled_entries=tally.fee_unreconciled,
+                fee_floor_total=_canonical(tally.fee_floor),
             )
             for day, tally in sorted(days.items())
         }
@@ -279,12 +285,23 @@ def settled_pnl_or_fail(row: SettledPnlDay | None) -> SettledPnlReading:
 
 
 def check_monotonic(prior: SettledPnlDay | None, new: SettledPnlDay) -> None:
-    """Refuse a write that shrinks the entry count or raises pnl with no new settlement."""
+    """Refuse a write that shrinks the entry count or raises pnl with no new settlement.
+
+    Exception: fees that went from unreconciled to reconciled may lower the charged fee, so
+    pnl may rise by at most the drop in ``fee_floor_total`` while ``fee_unreconciled_entries``
+    decreases.
+    """
     if prior is None:
         return
     if new.total_entries < prior.total_entries:
         raise SettledPnlRegression("entry count would shrink")
-    if new.pnl_decimal > prior.pnl_decimal and new.settled_entries <= prior.settled_entries:
+    rise = new.pnl_decimal - prior.pnl_decimal
+    if rise <= 0 or new.settled_entries > prior.settled_entries:
+        return
+    # No new settlement: a rise is only legitimate when unreconciled fees reconciled to lower
+    # recorded fees, and then by no more than the drop in the charged unreconciled-fee total.
+    allowance = prior.fee_floor_decimal - new.fee_floor_decimal
+    if new.fee_unreconciled_entries >= prior.fee_unreconciled_entries or rise > allowance:
         raise SettledPnlRegression("pnl would rise without a new settlement")
 
 
@@ -325,8 +342,8 @@ def pre_boot_fill_ledger[F: Timed](
 ) -> PreBootLedger[F]:
     """Read-only: durable fills of one family strictly before the first K>1 epoch (spec 7).
 
-    ``first_k_gt1_boot_ts`` ``None`` means no K>1 epoch yet: every fill qualifies; ``has_epoch_rows`` False
-    sets ``no_epoch_rows`` so the caller can tell that apart. A
+    ``first_k_gt1_boot_ts`` ``None`` means no K>1 epoch yet: every fill qualifies;
+    ``has_epoch_rows`` False sets ``no_epoch_rows`` so the caller can tell that apart. A
     garbled row raises :class:`FillLedgerCorrupt`; it is never skipped. Rows come back in
     store-key order (deterministic).
     """
@@ -337,7 +354,7 @@ def pre_boot_fill_ledger[F: Timed](
             raise FillLedgerCorrupt("fill row vanished during the read")
         try:
             record = decode(raw)
-        except Exception as exc:  # noqa: BLE001 - any decoder defect is a corrupt ledger row
+        except Exception as exc:
             raise FillLedgerCorrupt("fill row is not decodable") from exc
         if first_k_gt1_boot_ts is not None and record.ts_event >= first_k_gt1_boot_ts:
             continue

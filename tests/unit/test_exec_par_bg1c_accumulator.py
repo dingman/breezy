@@ -246,10 +246,12 @@ def test_unreconciled_fee_uses_the_theta_floor_rounded_up_and_is_counted() -> No
     row = settled_pnl_by_day([entry(f=low)], {"A": False}, utc_day)["2026-10-12"]
     assert row.pnl_decimal == D("-9.07")
     assert row.fee_unreconciled_entries == 1
+    assert row.fee_floor_total == "0.07"
     high = fill(fee="0.2", reconciled=False, theta="0.0695")
     row = settled_pnl_by_day([entry(f=high)], {"A": False}, utc_day)["2026-10-12"]
     assert row.pnl_decimal == D("-9.2")
     assert row.fee_unreconciled_entries == 1
+    assert row.fee_floor_total == "0.2"
 
 
 def test_unreconciled_fee_without_theta_fails() -> None:
@@ -261,6 +263,7 @@ def test_reconciled_fee_is_taken_as_recorded() -> None:
     row = settled_pnl_by_day([entry(f=fill(fee="0.01"))], {"A": False}, utc_day)["2026-10-12"]
     assert row.pnl_decimal == D("-9.01")
     assert row.fee_unreconciled_entries == 0
+    assert row.fee_floor_total == "0"
 
 
 def test_no_instrument_whose_yes_sibling_lost_is_a_held_side_win() -> None:

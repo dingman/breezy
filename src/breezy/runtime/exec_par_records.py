@@ -148,6 +148,13 @@ class SettledPnlDay:
     unsettled_entries: int
     overdue_entries: int = 0
     fee_unreconciled_entries: int = 0
+    #: Sum of the fees CHARGED to the unreconciled entries (floor-or-recorded); bounds the
+    #: pnl rise a later reconciliation to a lower recorded fee may cause.
+    fee_floor_total: str = "0"
+
+    @property
+    def fee_floor_decimal(self) -> Decimal:
+        return Decimal(self.fee_floor_total)
 
     @property
     def total_entries(self) -> int:
@@ -207,6 +214,7 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "unsettled_entries": "count",
         "overdue_entries": "count",
         "fee_unreconciled_entries": "count",
+        "fee_floor_total": "dec",
     },
 }
 
