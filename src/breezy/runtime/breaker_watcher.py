@@ -30,6 +30,12 @@ duplicate-suspect trip. The halt is entries-only and sticky: no family-halt key
 and no veto are used, exits stay allowed, and only the operator reset CLI (node
 down) clears it. Alerts carry the held-position list. Alert details are
 value-free: slugs, labels and counts only.
+
+BG-5b: when given ``stage_eval_ports`` the K>1 watcher also owns a
+:class:`~breezy.runtime.exec_par_stage_runner.StageEvaluator`. The tick only calls its cheap
+``service()`` (integrity checks, pending-halt retry, scheduling); each pass runs in its own
+detached task, never inside ``tick()``, and ``on_stop`` cancels it. While the evaluator
+reports a halt write pending or a marker / flag-mark failure, the heartbeat is withheld (D3).
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ from breezy.runtime.exec_par_records import (
     StopVerdict,
     WindowPeak,
 )
+from breezy.runtime.exec_par_stage_runner import StageEvalPorts, StageEvaluator
 from breezy.runtime.exec_par_telemetry import ExecParDigest
 from breezy.runtime.health import AlertPayload, AlertSink
 from breezy.runtime.submit_intent_slots import BREAKER_HEARTBEAT_MAX_AGE_NS
@@ -134,6 +141,10 @@ EVENT_NO_FILL_REFUSAL: Final[str] = "EXEC_PAR_NO_FILL_RETIRE_REFUSAL"
 EVENT_AMENDMENT_WRITE_FAILING: Final[str] = "EXEC_PAR_AMENDMENT_WRITE_FAILING"
 #: Consecutive K-forced amendment write failures that raise one CRITICAL alert.
 AMENDMENT_FAILURE_ALERT_STREAK: Final[int] = 5
+
+
+class _HeartbeatWithheldError(RuntimeError):
+    """The stage evaluator has an unresolved integrity write: do not heartbeat (D3)."""
 
 
 class ExecClientView(Protocol):
@@ -535,9 +546,15 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         ambiguous_marks: AmbiguousMarkSource | None = None,
         amendments: AmendmentPort | None = None,
         commit_sha: str | None = None,
+        stage_eval_ports: StageEvalPorts | None = None,
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
+        self._stage_eval = (
+            None
+            if stage_eval_ports is None
+            else StageEvaluator(stage_eval_ports, halt=self._halt_entries, alert=self._send)
+        )
         self._amendments = amendments if commit_sha is not None else None
         self._commit_sha = commit_sha
         self._k_forced_recorded = False
@@ -551,6 +568,20 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._stuck: tuple[tuple[str, str], ...] = ()
         self._last_hb_ns: int | None = None
         self._denied_at_last_hb = 0
+
+    # -- BG-5b stage evaluator (loop thread; K > 1 only) ---------------------------
+
+    @property
+    def stage_evaluator(self) -> StageEvaluator | None:
+        return self._stage_eval
+
+    def _halt_entries(self, reason: str, ts_ns: int) -> None:
+        self._latch.write_breaker_halt(reason, ts_ns=ts_ns)
+
+    def on_stop(self) -> None:
+        if self._stage_eval is not None:
+            self._stage_eval.cancel()
+        super().on_stop()
 
     # -- BG-1b counter ingestion (loop thread; K > 1 only) -----------------------
 
@@ -629,6 +660,8 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
         self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
         self._record_k_forced(client, now_ns)
+        if self._stage_eval is not None:
+            self._stage_eval.service(now_ns)  # never raises; schedules, never awaits a pass
 
     def _record_k_forced(self, client: ExecClientView, now_ns: int) -> None:
         """BG-2: write the amendment once, on the first tick that sees the K=1 force.
@@ -705,6 +738,8 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
 
     def _complete(self, client: ExecClientView, now_ns: int) -> None:
         """The heartbeat: written only after the whole evaluation succeeded."""
+        if self._stage_eval is not None and not self._stage_eval.heartbeat_ok:
+            raise _HeartbeatWithheldError("stage evaluator integrity write unresolved")
         self._note_heartbeat_gap(now_ns)
         self._latch.write_breaker_heartbeat(
             hb_ns=now_ns, resolver_pass_ns=client.resolver_last_pass_ns
@@ -729,11 +764,14 @@ def build_exec_watcher(
     alert_sink: AlertSink,
     digest: ExecParDigest | None = None,
     commit_sha: str | None = None,
+    stage_eval_ports: StageEvalPorts | None = None,
 ) -> ExecRefusalAlertActor:
     """The watcher for an effective K: the breaker only when K>1, else alerts only.
 
     ``commit_sha`` (BG-2) arms the K-forced amendment writer on the K>1 watcher; the
-    K=1 alert-only watcher never writes.
+    K=1 alert-only watcher never writes. ``stage_eval_ports`` (BG-5b) arms the in-node
+    stage evaluator on the K>1 watcher only: at K=1 it is ignored, so production at K=1
+    is unchanged.
     """
     if max_slots > 1:
         if not isinstance(latch, AmendmentPort):
@@ -744,6 +782,7 @@ def build_exec_watcher(
             digest=digest,
             amendments=latch,
             commit_sha=commit_sha,
+            stage_eval_ports=stage_eval_ports,
         )
     return ExecRefusalAlertActor(alert_sink=alert_sink, digest=digest)
 
