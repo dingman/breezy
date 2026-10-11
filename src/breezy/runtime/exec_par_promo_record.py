@@ -44,6 +44,7 @@ UNRAMPED: Final[str] = "UNRAMPED"
 #: Ramp 1 -> 2 -> 4 -> 6: the stage a configured K promotes FROM.
 _STAGE_FOR_K_CEILING: Final[tuple[tuple[int, str], ...]] = ((4, "S1"), (6, "S2"))
 _PIN_KEY: Final[str] = "bg10_promo_record_sha256"
+_LOOSE_PREFIX: Final[str] = "exec_par_bg10_promo_"
 _NAME: Final[re.Pattern[str]] = re.compile(
     r"exec_par_bg10_promo_([A-Za-z0-9]+)_(\d{4}-\d{2}-\d{2})\.json"
 )
@@ -86,6 +87,13 @@ def _is_int(value: object) -> bool:
 
 
 def _shape_problems(rec: object, stage: str, day: str) -> list[str]:
+    try:
+        return _shape_problems_unchecked(rec, stage, day)
+    except (OverflowError, RecursionError):
+        return ["record fields overflowed numeric validation"]
+
+
+def _shape_problems_unchecked(rec: object, stage: str, day: str) -> list[str]:
     if not isinstance(rec, dict):
         return ["record is not a JSON object"]
     problems = [f"field {f} missing" for f in _FIELDS if f not in rec]
@@ -128,44 +136,76 @@ def _is_pinned(repo_root: Path, digest: str) -> bool:
     return False
 
 
-def _latest_record(repo_root: Path, stage: str) -> tuple[Path, str] | None:
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate JSON key")
+    return dict(pairs)
+
+
+def _scan_records(repo_root: Path, stage: str) -> tuple[tuple[str, Path] | None, list[str]]:
+    """The latest well-named record for ``stage`` plus every malformed record name.
+
+    Any file carrying the loose prefix that is not strictly named is a problem (a
+    mis-named later FAIL must never be skipped).
+    """
     try:
         names = list((repo_root / PROMO_RECORD_DIR).iterdir())
     except OSError:
-        return None
+        return None, []
     found: list[tuple[str, Path]] = []
+    malformed: list[str] = []
     for path in names:
-        match = _NAME.fullmatch(path.name)
-        if match is None or match.group(1) != stage:
+        if not path.name.casefold().startswith(_LOOSE_PREFIX):
             continue
+        match = _NAME.fullmatch(path.name)
         try:
+            if match is None:
+                raise ValueError(path.name)
             date.fromisoformat(match.group(2))
         except ValueError:
+            malformed.append(f"malformed record name {path.name!r}")
             continue
-        found.append((match.group(2), path))
-    if not found:
-        return None
-    day, path = max(found)
-    return path, day
+        if match.group(1) == stage:
+            found.append((match.group(2), path))
+    return (max(found) if found else None), sorted(malformed)
 
 
-def promo_record_problems(repo_root: Path, k: int) -> list[str]:
-    """Every reason the O3 record for configured ``k`` is not valid; ``[]`` at K<=2 (no reads)."""
+def _load(path: Path) -> tuple[bytes, object] | str:
+    try:
+        raw = path.read_bytes()
+        return raw, json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except RecursionError:
+        return f"record {path.name} is nested too deeply"
+    except ValueError as exc:
+        if "duplicate" in str(exc):
+            return f"record {path.name} has a duplicate JSON key"
+        return f"record {path.name} is unreadable or not JSON"
+    except OSError:
+        return f"record {path.name} is unreadable or not JSON"
+
+
+def promo_record_problems(repo_root: Path, k: int, *, today: date) -> list[str]:
+    """Every reason the O3 record for configured ``k`` is not valid; ``[]`` at K<=2 (no reads).
+
+    ``today`` (UTC) is injected so the check stays pure; a record dated after it is invalid.
+    """
     stage = required_stage(k)
     if stage is None:
         return []
     if stage == UNRAMPED:
         return [f"configured K={k} is above the 1->2->4->6 ramp"]
-    latest = _latest_record(repo_root, stage)
+    latest, problems = _scan_records(repo_root, stage)
     if latest is None:
-        return [f"no record for stage {stage} under {PROMO_RECORD_DIR}"]
-    path, day = latest
-    try:
-        raw = path.read_bytes()
-        rec = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError):
-        return [f"latest {stage} record {path.name} is unreadable or not JSON"]
-    problems = _shape_problems(rec, stage, day)
+        return [*problems, f"no record for stage {stage} under {PROMO_RECORD_DIR}"]
+    day, path = latest
+    loaded = _load(path)
+    if isinstance(loaded, str):
+        return [*problems, loaded]
+    raw, rec = loaded
+    problems.extend(_shape_problems(rec, stage, day))
+    if date.fromisoformat(day) > today:
+        problems.append(f"record {path.name} is dated in the future (today {today})")
     if not _is_pinned(repo_root, hashlib.sha256(raw).hexdigest()):
         problems.append(f"record {path.name} is not sha-pinned by a frozen amendment")
     return problems
@@ -185,7 +225,9 @@ def _alert(sink: AlertSink, detail: PromoGuardDetail) -> None:
     )
 
 
-def apply_promo_guard(latch: _Latch, *, repo_root: Path, alert_sink: AlertSink) -> bool:
+def apply_promo_guard(
+    latch: _Latch, *, repo_root: Path, alert_sink: AlertSink, today: date
+) -> bool:
     """BG-3 O3: configured K>2 without a valid record forces K=1 and alerts CRITICAL.
 
     A raising check forces first, alerts, then re-raises. ``True`` iff K was forced.
@@ -194,7 +236,7 @@ def apply_promo_guard(latch: _Latch, *, repo_root: Path, alert_sink: AlertSink) 
     if k <= UNGUARDED_K_CEILING:
         return False
     try:
-        problems = promo_record_problems(repo_root, k)
+        problems = promo_record_problems(repo_root, k, today=today)
     except Exception:
         latch.force_k1("O3 promotion-record check failed")
         _alert(alert_sink, PromoGuardDetail.PROMO_CHECK_FAILED)
