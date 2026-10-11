@@ -80,3 +80,20 @@ def test_same_order_with_two_arm_days_is_unattributable() -> None:
 def test_unknown_side_is_unattributable() -> None:
     with pytest.raises(UnattributableFill):
         entry_fills_by_day([FillRecord(order_id="o1", side="HOLD", arm_ns=D0)], day_of=_utc_day)
+
+
+def test_no_instrument_buy_fill_counts_as_an_entry() -> None:
+    # A NO-side entry is Nautilus BUY on the NO instrument (the wire shows
+    # SELL/BUY_SHORT, which must never be consulted).
+    record = FillRecord(order_id="no1", side="BUY", arm_ns=D0 + H)
+    assert entry_fills_by_day([record], day_of=_utc_day) == {"2024-10-04": 1}
+
+
+def test_slot_is_exit_flag_is_preferred_over_side() -> None:
+    exit_fill = FillRecord(order_id="e1", side="BUY", arm_ns=D0, is_exit=True)
+    entry_fill = FillRecord(order_id="n1", side="BUY", arm_ns=D0, is_exit=False)
+    assert entry_fills_by_day([exit_fill, entry_fill], day_of=_utc_day) == {"2024-10-04": 1}
+
+
+def test_fill_record_has_no_wire_or_leg_fields() -> None:
+    assert set(FillRecord.__dataclass_fields__) == {"order_id", "side", "arm_ns", "is_exit"}

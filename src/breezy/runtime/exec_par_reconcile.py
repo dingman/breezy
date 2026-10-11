@@ -170,9 +170,8 @@ class CounterStorePort(Protocol):
     def replace_day_counts(self, day: str, counts: DayCounts) -> None: ...
     def read_gappy_days(self) -> frozenset[str]: ...
     def mark_gappy_day(self, day: str, kind: str) -> None: ...
-    def clear_gappy_mark(self, day: str) -> None:
-        """Clear the mark. MUST also retire the day's pending rebuild record."""
-
+    def clear_gappy_mark(self, day: str) -> None: ...
+    def retire_pending_rebuild(self, day: str) -> None: ...
     def read_pending_rebuild(self, day: str) -> RebuildRecord | None: ...
     def write_rebuild_record(self, record: RebuildRecord) -> None: ...
     def write_reconcile_phase(self, *, start_ns: int, ok_ns: int | None) -> None: ...
@@ -209,11 +208,16 @@ class UnattributableFill(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class FillRecord:
-    """One fill-index record: venue order id, side, and the entry's arm time."""
+    """One fill-index record: venue order id, side, the entry's arm time.
+
+    ``side`` is the Nautilus ``order_side``. ``is_exit`` is the joined slot's
+    flag when known and is preferred over ``side``.
+    """
 
     order_id: str
     side: str
     arm_ns: int | None
+    is_exit: bool | None = None
 
 
 def entry_fills_by_day(
@@ -221,14 +225,19 @@ def entry_fills_by_day(
 ) -> dict[str, int]:
     """Distinct filled entry orders per arm-time climate day.
 
-    SELL (exit) records are skipped: they have no posted entry and no ledger
-    spend. Repeated partial fills of one order id count once. An entry with no
+    Exit records are skipped (slot ``is_exit`` when known, else Nautilus
+    ``order_side == "SELL"``): they have no posted entry and no ledger spend.
+    A NO-side entry is a Nautilus BUY on the NO instrument and counts as an
+    entry; never consult a ``wire*`` field (the venue shows SELL/BUY_SHORT) or
+    the instrument's leg to tell entry from exit.
+
+    Repeated partial fills of one order id count once. An entry with no
     arm time, an unknown side, or one order id mapping to two days raises
     :class:`UnattributableFill` (fail closed).
     """
     day_by_order: dict[str, str] = {}
     for record in records:
-        if record.side == "SELL":
+        if record.is_exit is True or (record.is_exit is None and record.side == "SELL"):
             continue
         if record.side != "BUY" or record.arm_ns is None or not record.order_id:
             raise UnattributableFill("fill record is not attributable")
@@ -305,25 +314,27 @@ def reconcile_day(
     gappy: bool,
     expected_counters: bool,
     pending: RebuildRecord | None,
+    fills_unattributable: bool = False,
 ) -> DayVerdict:
     """Decide one day. Unreadable or self-contradictory sources exclude it.
 
     ``expected_counters`` is whether the day's epoch was up; counters missing
     for such a day are a ``counter_missing`` rebuild, never a silent one. A
     ``pending`` rebuild record whose counts equal the durable counts supplies
-    the mismatch kinds (crash recovery). A rebuild's kinds are never empty.
+    the mismatch kinds (crash recovery); they are unioned with the freshly
+    computed kinds, never masked by them. A gappy day always reconciles. A
+    rebuild's kinds are never empty.
     """
-    reason = _inconsistency(fills, slots, spend)
+    reason = "unattributable_fill" if fills_unattributable else _inconsistency(fills, slots, spend)
     if reason is not None:
         return DayVerdict(day, DayOutcomeKind.DAY_EXCLUDED, reason=reason)
     if fills is None or slots is None or spend is None:  # unreachable; narrows types
         return DayVerdict(day, DayOutcomeKind.DAY_EXCLUDED, reason="sources_unreadable")
     durable = DayCounts(slots.posted_entries, slots.ambiguous, fills, spend)
-    if stored is None and not expected_counters and pending is None:
+    if stored is None and not expected_counters and pending is None and not gappy:
         return DayVerdict(day, DayOutcomeKind.UNCHANGED)
-    kinds = _mismatch_kinds(stored, durable)
-    if pending is not None and pending.counts == durable:
-        kinds = pending.mismatch_kinds
+    fresh = () if stored is None and not expected_counters else _mismatch_kinds(stored, durable)
+    kinds = tuple(sorted({*fresh, *(pending.mismatch_kinds if pending else ())}))
     if not kinds and not gappy:
         return DayVerdict(day, DayOutcomeKind.UNCHANGED)
     kinds = kinds or ("gappy_verified",)
@@ -444,10 +455,16 @@ def run_reconcile_pass(
         if stored is None and expected and day not in gappy:
             counters.mark_gappy_day(day, "counter_missing")
             gappy = gappy | {day}
+        try:
+            fills = sources.entry_fill_count(day)
+            unattributable = False
+        except UnattributableFill:
+            fills, unattributable = None, True
         verdict = reconcile_day(
             day,
             stored=stored,
-            fills=sources.entry_fill_count(day),
+            fills=fills,
+            fills_unattributable=unattributable,
             slots=sources.slot_counts(day),
             spend=sources.ledger_spend(day),
             gappy=day in gappy,
@@ -459,11 +476,16 @@ def run_reconcile_pass(
             # Record first (it carries the mismatch kinds), then the counters,
             # then the mark: a crash at any point re-runs to the same result.
             pending = counters.read_pending_rebuild(day)
-            if pending is None or pending.counts != verdict.rebuilt:
+            if (
+                pending is None
+                or pending.counts != verdict.rebuilt
+                or pending.mismatch_kinds != verdict.mismatch_kinds
+            ):
                 record = RebuildRecord(day, wall_ns(), verdict.mismatch_kinds, verdict.rebuilt)
                 counters.write_rebuild_record(record)
             counters.replace_day_counts(day, verdict.rebuilt)
             counters.clear_gappy_mark(day)
+            counters.retire_pending_rebuild(day)  # after the mark: a crash between keeps kinds
             rebuilds.append(RebuildEvent(day, verdict.mismatch_kinds))
         elif verdict.kind is DayOutcomeKind.DAY_EXCLUDED:
             cause = f"unreconcilable:{verdict.reason}"
