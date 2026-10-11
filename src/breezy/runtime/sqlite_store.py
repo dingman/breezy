@@ -175,6 +175,16 @@ class SqliteStateStore:
         self._conn.execute(_UPSERT_SQL, (key, value))
         self._conn.commit()
 
+    def delete(self, key: str) -> bool:
+        """Remove ``key``; ``True`` if a row was removed (EXEC-PAR clears a gappy mark this way)."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, was {type(key).__name__}")
+        self._check_thread()
+        self._check_open()
+        removed = self._conn.execute("DELETE FROM state WHERE key = ?", (key,)).rowcount
+        self._conn.commit()
+        return removed > 0
+
     def keys_with_prefix(self, prefix: str) -> list[str]:
         """Sorted keys that start with ``prefix`` (literal match, read-only)."""
         if not isinstance(prefix, str):
