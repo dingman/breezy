@@ -93,6 +93,7 @@ __all__ = [
     "StageReset",
     "StopVerdict",
     "WindowPeak",
+    "canonical_decimal",
     "decode_excluded_days",
     "decode_force_k1_flag",
     "decode_pointer",
@@ -484,6 +485,13 @@ _DAY_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
 _DEC_RE: Final = re.compile(r"-?(0|[1-9]\d*)(\.\d*[1-9])?")
 
 T = TypeVar("T")
+
+
+def canonical_decimal(value: Decimal) -> str:
+    """Plain, exponent-free decimal text with no trailing zeros (the ``dec`` field form)."""
+    if not value.is_finite():
+        raise ValueError("non-finite decimal")
+    return "0" if value == 0 else format(value.normalize(), "f")
 
 
 def _is_canonical_decimal(value: str) -> bool:

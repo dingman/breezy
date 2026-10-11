@@ -31,20 +31,12 @@ from breezy.runtime.exec_par_records import (
     GappyMark,
     OrderAnchor,
     RebuildRow,
+    canonical_decimal,
 )
 
-__all__ = ["CounterStoreLatch", "LatchCounterStore", "canonical_decimal", "scan_counts"]
+__all__ = ["CounterStoreLatch", "LatchCounterStore", "scan_counts"]
 
 _KIND_SEP = ","
-
-
-def canonical_decimal(value: Decimal) -> str:
-    """Plain, exponent-free decimal text with no trailing zeros (the record codec's form)."""
-    if not value.is_finite():
-        raise ValueError("non-finite decimal")
-    if value == 0:
-        return "0"
-    return format(value.normalize(), "f")
 
 
 class CounterStoreLatch(Protocol):

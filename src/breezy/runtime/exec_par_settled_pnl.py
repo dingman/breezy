@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, localcontext
 from typing import Final, Protocol
 
-from breezy.runtime.exec_par_records import SettledPnlDay
+from breezy.runtime.exec_par_records import SettledPnlDay, canonical_decimal
 
 __all__ = [
     "FILL_PREFIX",
@@ -198,13 +198,6 @@ def _contribution(
     day.settled += 1
 
 
-def _canonical(value: Decimal) -> str:
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return "0" if text in ("", "-0") else text
-
-
 def settled_pnl_by_day(
     entries: Iterable[EntryInput],
     outcomes: Mapping[str, bool | None],
@@ -246,13 +239,13 @@ def settled_pnl_by_day(
         return {
             day: SettledPnlDay(
                 day=day,
-                pnl=_canonical(sum(tally.contributions, Decimal(0))),
+                pnl=canonical_decimal(sum(tally.contributions, Decimal(0))),
                 settled_entries=tally.settled,
                 ambiguous_entries=tally.ambiguous,
                 unsettled_entries=tally.unsettled,
                 overdue_entries=tally.overdue,
                 fee_unreconciled_entries=tally.fee_unreconciled,
-                fee_floor_total=_canonical(tally.fee_floor),
+                fee_floor_total=canonical_decimal(tally.fee_floor),
             )
             for day, tally in sorted(days.items())
         }

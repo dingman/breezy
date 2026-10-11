@@ -31,11 +31,8 @@ and no veto are used, exits stay allowed, and only the operator reset CLI (node
 down) clears it. Alerts carry the held-position list. Alert details are
 value-free: slugs, labels and counts only.
 
-BG-5b: when given ``stage_eval_ports`` the K>1 watcher also owns a
-:class:`~breezy.runtime.exec_par_stage_runner.StageEvaluator`. The tick only calls its cheap
-``service()`` (integrity checks, pending-halt retry, scheduling); each pass runs in its own
-detached task, never inside ``tick()``, and ``on_stop`` cancels it. While the evaluator
-reports a halt write pending or a marker / flag-mark failure, the heartbeat is withheld (D3).
+BG-5b: given ``stage_eval_ports`` the K>1 watcher also owns the in-node stage evaluator (see
+:mod:`breezy.runtime.exec_par_watcher_stage`).
 """
 
 from __future__ import annotations
@@ -47,7 +44,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from datetime import timedelta
 from decimal import Decimal
-from typing import Final, Protocol, runtime_checkable
+from typing import Final, Protocol
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.model.events import OrderDenied, OrderSubmitted
@@ -58,32 +55,19 @@ from breezy.runtime.exec_par_counter_ingest import (
     AmbiguousMarkSource,
     ExecParCounterError,
     ExecParCounterIngest,
-    IntentView,
     reason_label,
 )
 from breezy.runtime.exec_par_epochs import k_forced_amendment
 from breezy.runtime.exec_par_ingest_guard import IngestGuard
-from breezy.runtime.exec_par_records import (
-    AmbiguousRow,
-    Amendment,
-    CleanupDemotion,
-    DenialRow,
-    EpochRow,
-    ExcludedDay,
-    FillRow,
-    ForceK1Cleared,
-    ForceK1Flag,
-    GappyMark,
-    OpenCostFlag,
-    OrderAnchor,
-    SettledPnlDay,
-    StageEvalDry,
-    StageReset,
-    StopVerdict,
-    WindowPeak,
-)
-from breezy.runtime.exec_par_stage_runner import StageEvalPorts, StageEvaluator
+from breezy.runtime.exec_par_stage_runner import StageEvalPorts
 from breezy.runtime.exec_par_telemetry import ExecParDigest
+from breezy.runtime.exec_par_watcher_ports import (
+    AmendmentPort,
+    BreakerLatchPort,
+    ExecParStorePort,
+    LedgerPredicatePort,
+)
+from breezy.runtime.exec_par_watcher_stage import StageEvalWatcherMixin
 from breezy.runtime.health import AlertPayload, AlertSink
 from breezy.runtime.submit_intent_slots import BREAKER_HEARTBEAT_MAX_AGE_NS
 
@@ -95,10 +79,13 @@ __all__ = [
     "STUCK_AGE_NS",
     "STUCK_TRIP_COUNT",
     "WATCHER_INTERVAL_SECONDS",
+    "AmendmentPort",
     "BreakerLatchPort",
     "BreakerWatcherActor",
     "ExecClientView",
+    "ExecParStorePort",
     "ExecRefusalAlertActor",
+    "LedgerPredicatePort",
     "build_exec_watcher",
     "cross_day_settles_of",
     "exec_client_getter",
@@ -143,10 +130,6 @@ EVENT_AMENDMENT_WRITE_FAILING: Final[str] = "EXEC_PAR_AMENDMENT_WRITE_FAILING"
 AMENDMENT_FAILURE_ALERT_STREAK: Final[int] = 5
 
 
-class _HeartbeatWithheldError(RuntimeError):
-    """The stage evaluator has an unresolved integrity write: do not heartbeat (D3)."""
-
-
 class ExecClientView(Protocol):
     """The exec client's watcher-facing, read-only surface (all properties)."""
 
@@ -170,79 +153,6 @@ class ExecClientView(Protocol):
     def stuck_refusals_after_settle_failure_total(self) -> int: ...
     @property
     def no_fill_retire_refusals_total(self) -> int: ...
-
-
-class BreakerLatchPort(Protocol):
-    """The two single-writer breaker-record methods of ``SubmitIntentLatch``."""
-
-    def write_breaker_heartbeat(self, *, hb_ns: int, resolver_pass_ns: int) -> None: ...
-    def write_breaker_halt(self, reason: str, *, ts_ns: int) -> None: ...
-
-
-@runtime_checkable
-class AmendmentPort(Protocol):
-    """BG-2: the one latch method the K>1 watcher uses to record a K-forced amendment."""
-
-    def write_amendment(self, record: Amendment) -> None: ...
-
-
-class ExecParStorePort(Protocol):
-    """BG-1a store writer: the durable D-PREREG records (spec 10a, K9, M3, N4).
-
-    Implemented by single-writer ``SubmitIntentLatch`` methods that each run
-    under ``_require_held()`` and never nest the latch ``_mutex``. Readers on
-    the latch (``read_*``) are not part of this write port. A write failure
-    propagates (the caller maps it to ``telemetry_write_fail`` or, for the
-    marker, ``stop_marker_write_fail``).
-    """
-
-    def write_stage_reset(self, record: StageReset) -> None: ...
-    def add_excluded_day(self, record: ExcludedDay) -> bool: ...
-    def write_epoch_row(self, record: EpochRow) -> None: ...
-    def write_epoch_stop_ts(self, boot_ts: int, stop_ts: int) -> bool: ...
-    def write_amendment(self, record: Amendment) -> None: ...
-    def write_stage_eval_dry(self, record: StageEvalDry) -> None: ...
-    def write_force_k1_cleared(self, record: ForceK1Cleared) -> None: ...
-    def write_stop_verdict(self, record: StopVerdict) -> None: ...
-    def write_cleanup_demotion(self, record: CleanupDemotion) -> None: ...
-    def write_force_k1_flag(self, record: ForceK1Flag) -> None: ...
-    def clear_force_k1_flag(self, cleared_ts_ns: int) -> None: ...
-    def write_settled_pnl_day(self, record: SettledPnlDay) -> None: ...
-    def mark_flag_write_failed(self) -> None: ...
-    def clear_flag_write_failed(self) -> None: ...
-
-    # BG-1b per-climate-day counter rows (event-sourced, exclusive, idempotent).
-    def write_order_anchor(self, record: OrderAnchor) -> bool: ...
-    def read_order_anchor(self, client_order_id: str) -> OrderAnchor | None: ...
-    def read_intent(self, intent_id: str) -> IntentView | None: ...
-    def write_denial(self, record: DenialRow) -> bool: ...
-    def write_ambiguous(self, record: AmbiguousRow) -> bool: ...
-    def write_fill(self, record: FillRow) -> bool: ...
-    def write_open_cost_flag(self, record: OpenCostFlag) -> OpenCostFlag: ...
-    def add_window_order(
-        self, day: str, window_start_ns: int, notional: Decimal, client_order_id: str
-    ) -> WindowPeak: ...
-    def write_gappy_mark(self, record: GappyMark) -> bool: ...
-
-
-class LedgerPredicatePort(Protocol):
-    """Value-free ledger predicates (K6): aggregates in, ``bool`` only out.
-
-    The caller (loop thread) passes already-aggregated Decimals; the port
-    compares them against budget fractions and returns a bool. Currency
-    values never leave the port's caller and are never logged. A raise or a
-    non-bool return counts as tripped. ``DailySpendLedger`` implements this
-    structurally (BG-1e). The 5 s window share and the 2-of-5 day counts are
-    pure ratios / counts that need no budget, so the caller compares them
-    itself and they are deliberately not on this port.
-    """
-
-    def pnl_breaches_budget_fraction(
-        self, *, aggregate_pnl: Decimal, fraction: Decimal
-    ) -> bool: ...
-    def open_cost_exceeds_budget_fraction(
-        self, *, aggregate_open_cost: Decimal, fraction: Decimal
-    ) -> bool: ...
 
 
 class ExecRefusalAlertActor(Actor):
@@ -532,7 +442,7 @@ class ExecRefusalAlertActor(Actor):
             logger.debug("%s: digest skipped: %s", _SITE, type(exc).__name__)
 
 
-class BreakerWatcherActor(ExecRefusalAlertActor):
+class BreakerWatcherActor(StageEvalWatcherMixin, ExecRefusalAlertActor):
     """The K>1 breaker: evaluate every trigger, latch the halt, then heartbeat."""
 
     def __init__(
@@ -550,10 +460,10 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
     ) -> None:
         super().__init__(alert_sink=alert_sink, digest=digest, interval_seconds=interval_seconds)
         self._latch = latch
-        self._stage_eval = (
-            None
-            if stage_eval_ports is None
-            else StageEvaluator(stage_eval_ports, halt=self._halt_entries, alert=self._send)
+        self._init_stage_eval(
+            stage_eval_ports,
+            halt=lambda reason, ts: latch.write_breaker_halt(reason, ts_ns=ts),
+            alert=self._send,
         )
         self._amendments = amendments if commit_sha is not None else None
         self._commit_sha = commit_sha
@@ -569,18 +479,8 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._last_hb_ns: int | None = None
         self._denied_at_last_hb = 0
 
-    # -- BG-5b stage evaluator (loop thread; K > 1 only) ---------------------------
-
-    @property
-    def stage_evaluator(self) -> StageEvaluator | None:
-        return self._stage_eval
-
-    def _halt_entries(self, reason: str, ts_ns: int) -> None:
-        self._latch.write_breaker_halt(reason, ts_ns=ts_ns)
-
     def on_stop(self) -> None:
-        if self._stage_eval is not None:
-            self._stage_eval.cancel()
+        self._stage_eval_cancel()
         super().on_stop()
 
     # -- BG-1b counter ingestion (loop thread; K > 1 only) -----------------------
@@ -660,8 +560,7 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
         self._seen_duplicates = max(self._seen_duplicates, duplicates)
         self._run_ingest(now_ns)  # AFTER the halt latch: ingest can never delay or block it
         self._record_k_forced(client, now_ns)
-        if self._stage_eval is not None:
-            self._stage_eval.service(now_ns)  # never raises; schedules, never awaits a pass
+        self._stage_eval_service(now_ns)
 
     def _record_k_forced(self, client: ExecClientView, now_ns: int) -> None:
         """BG-2: write the amendment once, on the first tick that sees the K=1 force.
@@ -738,8 +637,7 @@ class BreakerWatcherActor(ExecRefusalAlertActor):
 
     def _complete(self, client: ExecClientView, now_ns: int) -> None:
         """The heartbeat: written only after the whole evaluation succeeded."""
-        if self._stage_eval is not None and not self._stage_eval.heartbeat_ok:
-            raise _HeartbeatWithheldError("stage evaluator integrity write unresolved")
+        self._stage_eval_gate()
         self._note_heartbeat_gap(now_ns)
         self._latch.write_breaker_heartbeat(
             hb_ns=now_ns, resolver_pass_ns=client.resolver_last_pass_ns
