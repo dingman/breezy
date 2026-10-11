@@ -33,12 +33,13 @@ Stop reasons for the intraday rules (s5 Clopper-Pearson, burst, s9 station-day
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import Enum
 from itertools import pairwise
-from math import sqrt
+from math import isfinite, sqrt
 from types import MappingProxyType
 from typing import Final, Protocol
 
@@ -266,8 +267,10 @@ class DayPnl:
 class StageSnapshot:
     """Everything one pass reads. The caller (loop thread) builds it from the BG-1 ports.
 
-    ``days`` carries the counters of every non-excluded stage day plus ``today``; days at or
-    before the floor are ignored. ``pnl_days`` lists every day with a settled-P&L row (and
+    ``days`` carries the counters of every non-excluded stage day plus ``today`` (when it is
+    strictly after the floor day), and, for s15-cumulative, of every day from the first K>1
+    boot through the floor day (their ``posted`` decides whether a settled-P&L row is
+    required). Other days are ignored. ``pnl_days`` lists every day with a settled-P&L row (and
     ``None`` readings for expected-but-unreadable rows) since the first K>1 boot, for
     s15-cumulative. ``gappy_days`` and ``pending_rebuild_days`` are the still-unreconciled
     days after the BG-1d pass whose ``pass_status`` is given. ``looks`` are the recorded
@@ -347,6 +350,13 @@ class StageReport:
     section5_halt_in_stage: bool
     held_days: int
     promotion_blocked_reason: str | None
+    #: A PASSED look is on record but the K change (stage_reset) has not landed yet.
+    promotion_pending_commit: bool
+    #: Entries inside the settlement deadline (not charged), past it (charged as a full-cost
+    #: loss) and AMBIGUOUS-unresolved (charged), summed over the stage's settled-P&L rows.
+    pnl_pending: int
+    pnl_overdue: int
+    pnl_ambiguous_unresolved: int
     programme_paused: bool
     notes: tuple[str, ...]
 
@@ -383,9 +393,11 @@ def wilson_deff_upper_bound(k: int, n: int, *, icc: float, m_bar: float, z: floa
     evaluator never estimates it (r4.5 O2/O5); BG-10(f) supplies ICC_v. ``z`` is
     :data:`Z_ONE_SIDED_90` or :data:`Z_ONE_SIDED_95`.
     """
+    if not all(isfinite(v) for v in (icc, m_bar, z)):
+        raise ValueError("Wilson-DEFF arguments must be finite")
     if n <= 0 or k < 0 or k > n or icc < 0 or m_bar <= 0 or z <= 0:
         raise ValueError("invalid Wilson-DEFF arguments")
-    n_eff = n / (1.0 + (m_bar - 1.0) * icc)
+    n_eff = n / max(1.0, 1.0 + (m_bar - 1.0) * icc)  # DEFF is never below 1
     p = k / n
     z2 = z * z
     centre = p + z2 / (2.0 * n_eff)
@@ -408,8 +420,12 @@ def _fail(kind: str) -> _Fail:
     return _Fail(f"stage_eval_fail:{kind}")
 
 
+_ISO_DAY: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def _day(text: object) -> dt.date:
-    if not isinstance(text, str):
+    """Strict ``YYYY-MM-DD`` (ISO basic and week forms are rejected)."""
+    if not isinstance(text, str) or _ISO_DAY.fullmatch(text) is None:
         raise _fail("bad_day")
     try:
         return dt.date.fromisoformat(text)
@@ -417,14 +433,17 @@ def _day(text: object) -> dt.date:
         raise _fail("bad_day") from None
 
 
-def _dec(text: object) -> Decimal:
-    try:
-        value = Decimal(text)  # type: ignore[arg-type]
-    except (InvalidOperation, TypeError, ValueError):
-        raise _fail("fill_decimal") from None
-    if not value.is_finite():
+def _dec(value: object, *, nonfinite: str = "fill_decimal") -> Decimal:
+    """``str`` or ``Decimal`` only (never a float); non-finite raises ``nonfinite``."""
+    if isinstance(value, bool) or not isinstance(value, str | Decimal):
         raise _fail("fill_decimal")
-    return value
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise _fail("fill_decimal") from None
+    if not parsed.is_finite():
+        raise _fail(nonfinite)
+    return parsed
 
 
 def _count(value: object) -> int:
@@ -435,6 +454,7 @@ def _count(value: object) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _Fill:
+    trade: str
     order: str
     qty: Decimal
     px: Decimal
@@ -477,7 +497,7 @@ def _first_k_gt1_day(snap: StageSnapshot) -> str:
     for epoch in snap.epochs:
         if epoch.effective_k > 1:
             return _day_label(snap, epoch.boot_ts)
-    raise _fail("no_k_gt_1_epoch")
+    return snap.today  # forced to K=1 from its first boot: legitimately serial, cumulative empty
 
 
 def _span(after: dt.date, before: dt.date) -> tuple[str, ...]:
@@ -495,20 +515,27 @@ def _build_ctx(snap: StageSnapshot) -> _Ctx:
     if today < floor_date:
         raise _fail("non_monotonic")
     first_k_day = _first_k_gt1_day(snap)
+    _day(first_k_day)
     excluded = {x.day for x in snap.excluded_days}
-    for label in excluded:
+    for label in (*excluded, *snap.gappy_days, *snap.pending_rebuild_days):
         _day(label)
+    for look in snap.looks:
+        _day(look.day)
     closed = _span(floor_date, today)
     eligible = tuple(x for x in closed if x not in excluded)
-    live = (*eligible, snap.today) if snap.today not in excluded else eligible
+    # The open today joins only when it is strictly after the floor day (item H1).
+    open_today = snap.today not in excluded and today > floor_date
+    live = (*eligible, snap.today) if open_today else eligible
     in_stage = tuple(sorted(x for x in excluded if floor_day < x <= snap.today))
     by_day: dict[str, DayCounters] = {}
     for row in snap.days:
+        _day(row.day)
         if row.day in by_day:
             raise _fail("duplicate_day")
         by_day[row.day] = row
     pnl: dict[str, SettledPnlReading | None] = {}
     for entry in snap.pnl_days:
+        _day(entry.day)
         if entry.day in pnl:
             raise _fail("duplicate_day")
         pnl[entry.day] = entry.reading
@@ -555,35 +582,81 @@ def _validate_counters(ctx: _Ctx) -> None:
             raise _fail("pending_rebuild")
 
 
+def _validate_reading(reading: SettledPnlReading) -> None:
+    if not isinstance(reading.pnl, Decimal) or not reading.pnl.is_finite():
+        raise _fail("pnl_nonfinite")
+    counts = (
+        reading.settled,
+        reading.ambiguous,
+        reading.pending,
+        reading.overdue,
+        reading.fee_unreconciled,
+    )
+    for value in counts:
+        _count(value)
+
+
+def _needs_pnl_row(row: DayCounters) -> bool:
+    """A settled-P&L row must exist for a day with posted entries (ruling item 4)."""
+    return bool(row.posted)
+
+
+def _validate_pre_floor(ctx: _Ctx, excluded: set[str]) -> None:
+    """s15-cumulative is never floored: every day since the first K>1 boot needs its row."""
+    first = _day(ctx.first_k_day)
+    for offset in range((_day(ctx.floor_day) - first).days + 1):
+        label = (first + dt.timedelta(days=offset)).isoformat()
+        if label in excluded:
+            continue  # an unreconciled excluded day counts only once reconciled (10a)
+        row = ctx.by_day.get(label)
+        if row is None:
+            raise _fail("missing_day")
+        if row.posted is None:
+            raise _fail("missing_counter")
+        if _needs_pnl_row(row) and ctx.pnl.get(label) is None:
+            raise _fail("missing_pnl_day")
+
+
 def _validate_pnl(ctx: _Ctx) -> None:
+    excluded = {x.day for x in ctx.snap.excluded_days}
+    for reading in ctx.pnl.values():
+        if reading is not None:
+            _validate_reading(reading)
+    # BG-1c writes a row per arm day with entries (exec_par_settled_pnl.py:234-244), settled
+    # or not, so today needs its row like every closed day.
     for label in ctx.live:
-        if ctx.by_day[label].posted and ctx.pnl.get(label) is None:
+        if _needs_pnl_row(ctx.by_day[label]) and ctx.pnl.get(label) is None:
             raise _fail("settled_pnl_missing")
+    _validate_pre_floor(ctx, excluded)
     for label, reading in ctx.pnl.items():
-        if reading is None and label >= ctx.first_k_day:
+        if reading is None and label >= ctx.first_k_day and label not in excluded:
             raise _fail("settled_pnl_missing")
 
 
 def _parse_fills(ctx: _Ctx, labels: Iterable[str]) -> list[_Fill]:
     parsed: list[_Fill] = []
+    seen: set[str] = set()
     for label in labels:
         for row in ctx.by_day[label].fills or ():
-            _dec(row.decision_ask)  # a missing decision ask is FAIL (s7)
+            ask = _dec(row.decision_ask)  # a missing decision ask is FAIL (s7)
             try:
                 theta = Decimal(row.fee_theta)
                 theta_ok = theta.is_finite() and theta == _FEE_THETA
             except (InvalidOperation, TypeError, ValueError):
                 theta_ok = False
+            qty, px, stored = _dec(row.qty), _dec(row.px), _dec(row.slippage)
+            realized = _dec(row.fee_realized, nonfinite="pnl_nonfinite")
+            exact = _dec(row.fee_exact, nonfinite="pnl_nonfinite")
+            if not 0 <= px <= 1 or qty <= 0:
+                raise _fail("fill_sanity")
+            if row.trade_id in seen:
+                raise _fail("duplicate_fill")
+            seen.add(row.trade_id)
+            slip = px - ask  # s7: slippage per fill is fill_px - decision ask
+            if slip != stored:
+                raise _fail("slippage_inconsistent")
             parsed.append(
-                _Fill(
-                    row.client_order_id,
-                    _dec(row.qty),
-                    _dec(row.px),
-                    _dec(row.slippage),
-                    _dec(row.fee_realized),
-                    _dec(row.fee_exact),
-                    theta_ok,
-                )
+                _Fill(row.trade_id, row.client_order_id, qty, px, slip, realized, exact, theta_ok)
             )
     return parsed
 
@@ -704,17 +777,29 @@ def _s15(ctx: _Ctx) -> list[str]:
     return found
 
 
-def _target_k(outcome: StopOutcome, k: int) -> int:
+#: Tie-break between stops with the same target K: most severe first (item M11).
+_SEVERITY: Final[Mapping[StopOutcome, int]] = MappingProxyType(
+    {
+        StopOutcome.SUSPEND: 0,
+        StopOutcome.K1_AMENDMENT: 1,
+        StopOutcome.RESTART_S1: 2,
+        StopOutcome.DOWN_ONE_STAGE: 3,
+    }
+)
+
+
+def _target_k(outcome: StopOutcome, k: int, effective_k: int) -> int:
+    """The K the ramp goes to; never above a K the node was already forced down to (H2)."""
     if outcome is StopOutcome.RESTART_S1:
-        return _RESTART_S1_K
-    if outcome is StopOutcome.DOWN_ONE_STAGE:
-        return _DEMOTE_K[k]
-    return 1
+        target = _RESTART_S1_K
+    elif outcome is StopOutcome.DOWN_ONE_STAGE:
+        target = _DEMOTE_K[k]
+    else:
+        target = 1
+    return min(target, effective_k) if effective_k < k else target
 
 
 def _stage_looks(ctx: _Ctx) -> list[LookRecord]:
-    for look in ctx.snap.looks:
-        _day(look.day)
     return sorted((x for x in ctx.snap.looks if x.day > ctx.floor_day), key=lambda x: x.day)
 
 
@@ -802,6 +887,9 @@ class _Checks:
     parity: Decimal | None
     blockers: tuple[str, ...]
     minima_met: bool
+    #: (pending, overdue, AMBIGUOUS-unresolved) entry counts over the stage's settled-P&L rows.
+    pnl_counts: tuple[int, int, int]
+    pending_commit: bool
 
 
 def _report(ctx: _Ctx, c: _Checks, **extra: object) -> StageReport:
@@ -843,6 +931,10 @@ def _report(ctx: _Ctx, c: _Checks, **extra: object) -> StageReport:
         "section5_halt_in_stage": "s5_halt_in_stage" in c.blockers,
         "held_days": 0,
         "promotion_blocked_reason": None,
+        "promotion_pending_commit": c.pending_commit,
+        "pnl_pending": c.pnl_counts[0],
+        "pnl_overdue": c.pnl_counts[1],
+        "pnl_ambiguous_unresolved": c.pnl_counts[2],
         "programme_paused": False,
         "notes": (_BUDGET_NOTE,),
     }
@@ -886,6 +978,8 @@ def _evaluate(snap: StageSnapshot) -> Verdict:
     pnl_stops = _s15(ctx)
     stats = _stage_stats(ctx, _parse_fills(ctx, ctx.eligible))
     parity = _parity(snap.serial_baseline, stats.slip_mean)
+    looks = _stage_looks(ctx)
+    readings = [r for x in ctx.eligible if (r := ctx.pnl.get(x)) is not None]
     capped = [x for x in ctx.closed[:STAGE_CAP_DAYS] if x in set(ctx.eligible)]
     checks = _Checks(
         stats,
@@ -897,18 +991,29 @@ def _evaluate(snap: StageSnapshot) -> Verdict:
         _blockers(ctx, stats, parity),
         sum(ctx.by_day[x].posted or 0 for x in capped) >= _MIN_POSTED_ORDERS
         and len(capped) >= _MIN_NONEXCLUDED_DAYS,
+        (
+            sum(r.pending for r in readings),
+            sum(r.overdue for r in readings),
+            sum(r.ambiguous for r in readings),
+        ),
+        any(x.outcome is LookOutcome.PASSED for x in looks),
     )
-    looks = _stage_looks(ctx)
     findings = _stop_findings(ctx, looks, s6_tripped, checks, fee_stops, pnl_stops)
     if findings:
-        # Most restrictive resulting K first; ties keep evaluation order (sort is stable).
-        primary = min(findings, key=lambda r: _target_k(STOP_OUTCOMES[r], ctx.stage_k))
+        eff = snap.effective_k
+
+        def rank(reason: str) -> tuple[int, int]:
+            kind = STOP_OUTCOMES[reason]
+            return _target_k(kind, ctx.stage_k, eff), _SEVERITY[kind]
+
+        # Lowest resulting K first, then severity; ties keep evaluation order (min is stable).
+        primary = min(findings, key=rank)
         outcome = STOP_OUTCOMES[primary]
         return Verdict(
             VerdictKind.STOP,
             primary,
             outcome,
-            _target_k(outcome, ctx.stage_k),
+            _target_k(outcome, ctx.stage_k, eff),
             tuple(findings),
             True,
             report=_report(ctx, checks),
@@ -920,6 +1025,8 @@ def _look_state(
     ctx: _Ctx, looks: list[LookRecord], minima_met: bool
 ) -> tuple[str | None, int | None]:
     """(hold reason, look number due) once no stop fired. At most one is set."""
+    if ctx.stage_k == _S3_K:
+        return None, None  # S3 is terminal: no look, so neither L3 nor M5 applies
     n_closed = len(ctx.closed)
     if any(x.outcome is LookOutcome.NOT_TAKEN for x in looks):
         return HOLD_LOOK_NOT_TAKEN, None
@@ -927,8 +1034,6 @@ def _look_state(
         return None, None  # the lower/higher-K commit is the caller's; nothing more to look at
     if not minima_met:
         return (HOLD_CAP_MINIMA_UNMET if n_closed >= STAGE_CAP_DAYS else None), None
-    if ctx.stage_k == _S3_K:
-        return None, None  # S3 is terminal: no promotion look
     failed = [x for x in looks if x.outcome is LookOutcome.FAILED]
     if failed:
         since = sum(1 for x in ctx.eligible if x > failed[-1].day)
@@ -974,3 +1079,5 @@ def evaluate_stage(snapshot: StageSnapshot) -> Verdict:
         return _evaluate(snapshot)
     except _Fail as failure:
         return Verdict(VerdictKind.FAIL, reason=failure.reason)
+    except Exception as exc:  # noqa: BLE001 - last resort; never echo the message (could carry money)
+        return Verdict(VerdictKind.FAIL, reason=f"stage_eval_fail:internal:{type(exc).__name__}")

@@ -109,12 +109,14 @@ def fill(
     trade: str | None = None,
     qty: str = "10",
     px: str = "0.9",
-    ask: str = "0.9",
+    ask: str | None = None,
     slip: str = "0",
     realized: str = "0.06",
     exact: str = "0.06255",
     theta: str = "0.0695",
 ) -> FillRow:
+    if ask is None:  # slippage is re-derived as px - decision_ask (fix round item 12)
+        ask = str(D(px) - D(slip))
     return FillRow(
         trade_id=trade or f"t-{coid}",
         client_order_id=coid,
@@ -182,7 +184,7 @@ def build(
     """Stage with ``n`` closed days (d(1)..d(n)) plus today = d(n+1); floor on d(0)."""
     day_over = day_over or {}
     pnl_over = pnl_over or {}
-    days: list[DayCounters] = []
+    days: list[DayCounters] = [counters(d(0), posted=0)]  # floor day: needed for cumulative
     pnl: list[DayPnl] = []
     for i in range(1, n + 2):
         kw: dict[str, object] = {"posted": posted}
@@ -318,7 +320,7 @@ def test_floor_day_and_earlier_data_never_enter_the_stage_windows() -> None:
     older = counters(d(-1), posted=9)
     snap = build(
         8,
-        days=build(8).days + (pre, older),
+        days=tuple(x for x in build(8).days if x.day != d(0)) + (pre, older),
         pnl_days=build(8).pnl_days + (DayPnl(d(0), reading("-0.5")), DayPnl(d(-1), reading("-9"))),
     )
     v = evaluate_stage(snap)
@@ -1056,9 +1058,10 @@ def test_non_monotonic_epochs_are_fail() -> None:
     assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:non_monotonic"
 
 
-def test_no_k_gt_1_epoch_is_fail() -> None:
+def test_no_k_gt_1_epoch_is_not_a_fail_cumulative_starts_today() -> None:
+    # fix round item 9: a node forced to K=1 from its first boot is legitimately serial
     v = evaluate_stage(build(8, epochs=(EpochRow("a", 1, None, ns_of(d(0), 10)),)))
-    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:no_k_gt_1_epoch"
+    assert v.kind is VerdictKind.PROMOTION_ELIGIBLE
 
 
 def test_bad_today_label_is_fail() -> None:
@@ -1158,3 +1161,315 @@ def test_importing_the_module_does_not_load_nautilus_or_the_adapters() -> None:
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+# -- fix round (spec-fidelity 78 / failure-mode 62 reviews) --------------------------------------
+
+
+def _floor_day_today(pnl: str, *, posted: int = 4) -> StageSnapshot:
+    """``today`` is the floor day itself (a stop_clear on day D)."""
+    return build(
+        0,
+        today=d(0),
+        days=(counters(d(0), posted=posted),),
+        pnl_days=(DayPnl(d(0), reading(pnl)),),
+    )
+
+
+def test_h1_today_equal_to_floor_day_is_excluded_from_every_floored_window() -> None:
+    v = evaluate_stage(_floor_day_today("-0.5"))
+    assert v.kind is VerdictKind.PASS and v.stops == ()
+    assert v.report is not None and v.report.closed_days == 0 and v.report.posted == 0
+
+
+def test_h1_cumulative_still_trips_on_a_floor_day_loss() -> None:
+    v = evaluate_stage(_floor_day_today("-1.2"))
+    assert v.kind is VerdictKind.STOP and v.stops == (STOP_S15_CUMULATIVE,)
+    assert STOP_S15_DAY not in v.stops and STOP_S15_STAGE not in v.stops
+
+
+def test_h1_floor_day_counters_are_not_validated_as_stage_data() -> None:
+    snap = build(0, today=d(0), days=(counters(d(0), posted=4, denied=None),),
+                 pnl_days=(DayPnl(d(0), reading("0.01")),))  # fmt: skip
+    assert evaluate_stage(snap).kind is VerdictKind.PASS
+
+
+@pytest.mark.parametrize(
+    ("k", "eff", "pnl", "target"),
+    [
+        (4, 1, {3: "-0.2"}, 1),
+        (6, 2, {3: "-0.2"}, 2),
+        (4, 2, {3: "-0.2"}, 2),
+        (4, 4, {3: "-0.2"}, 2),
+    ],
+)
+def test_h2_target_k_is_clamped_to_a_forced_effective_k(
+    k: int, eff: int, pnl: dict[int, str], target: int
+) -> None:
+    v = evaluate_stage(build(8, k=k, eff=eff, pnl_over=pnl))
+    assert v.reason == STOP_S15_DAY and v.target_k == target
+
+
+def test_h2_down_one_stage_is_clamped_too() -> None:
+    each = {i: "-0.05" for i in range(1, 9)} | {9: "0"}
+    v = evaluate_stage(build(8, k=4, eff=1, pnl_over=each))
+    assert v.reason == STOP_S15_STAGE and v.target_k == 1
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_h3_non_finite_pnl_is_fail(bad: str) -> None:
+    snap = build(8)
+    pnl = tuple(DayPnl(p.day, reading(bad)) if p.day == d(3) else p for p in snap.pnl_days)
+    v = evaluate_stage(dataclasses.replace(snap, pnl_days=pnl))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:pnl_nonfinite"
+
+
+@pytest.mark.parametrize("field_name", ["fee_realized", "fee_exact"])
+@pytest.mark.parametrize("bad", ["NaN", "Infinity"])
+def test_h3_non_finite_fee_is_fail(field_name: str, bad: str) -> None:
+    row = dataclasses.replace(fill(d(2), "c1"), **{field_name: bad})
+    v = evaluate_stage(build(8, day_over=_one_day_fills(d(2), row)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:pnl_nonfinite"
+
+
+@pytest.mark.parametrize(
+    "field_name", ["settled", "ambiguous", "pending", "overdue", "fee_unreconciled"]
+)
+def test_h3_negative_reading_counts_are_fail(field_name: str) -> None:
+    snap = build(8)
+    broken = dataclasses.replace(snap.pnl_days[2].reading, **{field_name: -1})
+    pnl = tuple(DayPnl(p.day, broken) if p is snap.pnl_days[2] else p for p in snap.pnl_days)
+    v = evaluate_stage(dataclasses.replace(snap, pnl_days=pnl))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:bad_counter"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"px": "1.5"}, "fill_sanity"),
+        ({"px": "-0.1"}, "fill_sanity"),
+        ({"qty": "0"}, "fill_sanity"),
+        ({"qty": "-3"}, "fill_sanity"),
+        ({"px": 0.9}, "fill_decimal"),
+        ({"qty": 10}, "fill_decimal"),
+    ],
+)
+def test_h3_fill_sanity_and_no_float_input(changes: dict[str, object], reason: str) -> None:
+    row = dataclasses.replace(fill(d(2), "c1", ask="0.9"), **changes)
+    v = evaluate_stage(build(8, day_over=_one_day_fills(d(2), row)))
+    assert v.kind is VerdictKind.FAIL and v.reason == f"stage_eval_fail:{reason}"
+
+
+def test_h3_decimal_objects_are_accepted_as_fill_input() -> None:
+    row = dataclasses.replace(fill(d(2), "c1"), qty=D("10"))
+    assert evaluate_stage(build(8, day_over=_one_day_fills(d(2), row))).kind is not VerdictKind.FAIL
+
+
+def test_h3_duplicate_fill_ids_are_fail() -> None:
+    a = fill(d(2), "c1", trade="dup")
+    b = fill(d(3), "c2", trade="dup")
+    snap = build(8, day_over=_one_day_fills(d(2), a) | _one_day_fills(d(3), b))
+    v = evaluate_stage(snap)
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:duplicate_fill"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"icc": float("nan")},
+        {"icc": float("inf")},
+        {"m_bar": float("nan")},
+        {"m_bar": float("inf")},
+        {"z": float("nan")},
+        {"z": float("inf")},
+    ],
+)
+def test_h3_wilson_rejects_non_finite_floats(args: dict[str, float]) -> None:
+    kw = {"icc": 0.1, "m_bar": 3.0, "z": 1.28} | args
+    with pytest.raises(ValueError):
+        wilson_deff_upper_bound(7, 39, **kw)
+
+
+def test_h3_wilson_clamps_deff_to_at_least_one() -> None:
+    base = wilson_deff_upper_bound(7, 39, icc=0.4, m_bar=1.0, z=mod.Z_ONE_SIDED_90)
+    assert wilson_deff_upper_bound(7, 39, icc=0.4, m_bar=0.5, z=mod.Z_ONE_SIDED_90) == base
+
+
+def _with_pre_floor(
+    *, pnl_missing: bool = False, counters_missing: bool = False, excluded: bool = False
+) -> StageSnapshot:
+    pre_days = [counters(d(i), posted=4) for i in (-3, -2, -1)]
+    pre_pnl = [DayPnl(d(i), reading("0.01")) for i in (-3, -2, -1)]
+    if counters_missing:
+        pre_days = [x for x in pre_days if x.day != d(-2)]
+    if pnl_missing:
+        pre_pnl = [x for x in pre_pnl if x.day != d(-2)]
+    base = build(
+        8,
+        epochs=(EpochRow("sha", 2, None, ns_of(d(-3), 10)),),
+        excluded_days=excl(-2) if excluded else (),
+    )
+    return dataclasses.replace(
+        base, days=base.days + tuple(pre_days), pnl_days=base.pnl_days + tuple(pre_pnl)
+    )
+
+
+def test_h4_pre_floor_days_with_entries_and_rows_pass() -> None:
+    assert evaluate_stage(_with_pre_floor()).kind is VerdictKind.PROMOTION_ELIGIBLE
+
+
+def test_h4_missing_pnl_row_before_the_floor_is_fail() -> None:
+    v = evaluate_stage(_with_pre_floor(pnl_missing=True))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_pnl_day"
+
+
+def test_h4_missing_counters_before_the_floor_cannot_be_verified() -> None:
+    v = evaluate_stage(_with_pre_floor(counters_missing=True))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:missing_day"
+
+
+def test_h4_unreconciled_excluded_day_before_the_floor_is_skipped() -> None:
+    v = evaluate_stage(_with_pre_floor(pnl_missing=True, excluded=True))
+    assert v.kind is VerdictKind.PROMOTION_ELIGIBLE
+
+
+def test_h4_pre_floor_day_with_no_entries_needs_no_row() -> None:
+    snap = _with_pre_floor()
+    days = tuple(counters(x.day, posted=0) if x.day == d(-2) else x for x in snap.days)
+    pnl = tuple(p for p in snap.pnl_days if p.day != d(-2))
+    assert (
+        evaluate_stage(dataclasses.replace(snap, days=days, pnl_days=pnl)).kind
+        is not VerdictKind.FAIL
+    )
+
+
+def test_h5_unexpected_exception_is_a_named_fail_without_its_message() -> None:
+    def boom(_: int) -> str:
+        raise ValueError("secret pnl 1234.56")
+
+    v = evaluate_stage(build(8, day_of_ns=boom))
+    assert v.kind is VerdictKind.FAIL and not v.sets_flag
+    assert v.reason == "stage_eval_fail:internal:ValueError"
+    assert "1234" not in repr(v)
+
+
+def test_h5_reconcile_stuck_keeps_its_exact_name() -> None:
+    v = evaluate_stage(build(8, pass_status=PassStatus.RECONCILE_STUCK))
+    assert v.reason == "reconcile_stuck"
+
+
+def test_m6_excluded_day_with_unreadable_reading_is_skipped() -> None:
+    snap = build(8, excluded_days=excl(3))
+    pnl = tuple(DayPnl(p.day, None) if p.day == d(3) else p for p in snap.pnl_days)
+    assert evaluate_stage(dataclasses.replace(snap, pnl_days=pnl)).kind is not VerdictKind.FAIL
+    gone = tuple(p for p in snap.pnl_days if p.day != d(3))
+    assert evaluate_stage(dataclasses.replace(snap, pnl_days=gone)).kind is not VerdictKind.FAIL
+
+
+def test_m7_today_row_is_required_like_closed_days() -> None:
+    # BG-1c writes a row per arm day with any entry (exec_par_settled_pnl.py:234-244), not
+    # only once something settles, so an absent row for a day with entries is not zero.
+    snap = build(8)
+    gone = tuple(p for p in snap.pnl_days if p.day != d(9))
+    v = evaluate_stage(dataclasses.replace(snap, pnl_days=gone))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:settled_pnl_missing"
+
+
+def test_m8_pending_overdue_ambiguous_are_reported_and_never_halt() -> None:
+    snap = build(8)
+    busy = SettledPnlReading(
+        D("0.01"), settled=1, ambiguous=1, pending=2, overdue=3, fee_unreconciled=0
+    )
+    pnl = tuple(DayPnl(p.day, busy) if p.day in (d(2), d(3)) else p for p in snap.pnl_days)
+    v = evaluate_stage(dataclasses.replace(snap, pnl_days=pnl))
+    assert v.kind is VerdictKind.PROMOTION_ELIGIBLE and v.report is not None
+    assert (v.report.pnl_pending, v.report.pnl_overdue, v.report.pnl_ambiguous_unresolved) == (
+        4,
+        6,
+        2,
+    )
+
+
+def test_m9_no_k_gt_1_epoch_makes_cumulative_start_today() -> None:
+    old_loss = evaluate_stage(
+        build(8, epochs=(EpochRow("a", 1, None, ns_of(d(0), 10)),), pnl_over={4: "-1.5"})
+    )
+    assert STOP_S15_CUMULATIVE not in old_loss.stops  # day 4 predates "first K>1" (= today)
+
+
+def test_m10_s3_is_terminal_no_hold_and_no_cleanup_demotion() -> None:
+    assert evaluate_stage(build(15, k=6, posted=0)).kind is VerdictKind.PASS
+    assert evaluate_stage(build(30, k=6, posted=0)).kind is VerdictKind.PASS
+    looks = (LookRecord(d(5), LookOutcome.NOT_TAKEN),)
+    assert evaluate_stage(build(30, k=6, looks=looks)).kind is VerdictKind.PASS
+
+
+def test_m10_stops_still_apply_at_s3() -> None:
+    assert evaluate_stage(build(8, k=6, pnl_over={3: "-0.2"})).kind is VerdictKind.STOP
+
+
+def test_m11_equal_target_k_is_broken_by_severity_suspend_first() -> None:
+    snap = build(8, k=6, day_over=_share(4, 7), pnl_over={5: "-1.2"})
+    v = evaluate_stage(snap)
+    assert {STOP_S6_DROPPED_SHARE, STOP_S15_CUMULATIVE} <= set(v.stops)
+    assert v.target_k == 1 and v.reason == STOP_S6_DROPPED_SHARE
+
+
+def test_m11_restart_s1_beats_down_one_stage_on_equal_target() -> None:
+    pnl = {3: "-0.2"} | {i: "-0.05" for i in (1, 2, 4, 5, 6, 7, 8)}
+    v = evaluate_stage(build(8, k=4, pnl_over=pnl))
+    assert {STOP_S15_DAY, STOP_S15_STAGE} <= set(v.stops)
+    assert v.reason == STOP_S15_DAY and v.target_k == 2
+
+
+def test_m12_slippage_is_rederived_from_px_and_decision_ask() -> None:
+    bad = dataclasses.replace(fill(d(2), "c1", ask="0.9"), slippage="0.01")
+    v = evaluate_stage(build(8, day_over=_one_day_fills(d(2), bad)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:slippage_inconsistent"
+    ok = dataclasses.replace(fill(d(2), "c1", ask="0.89"), slippage="0.01")
+    assert evaluate_stage(build(8, day_over=_one_day_fills(d(2), ok))).kind is not VerdictKind.FAIL
+
+
+def test_m12_derived_slippage_feeds_the_blockers() -> None:
+    snap = _slip_snapshot(40, slip="0.0051")
+    assert "slippage_mean" in evaluate_stage(snap).look_blockers
+
+
+@pytest.mark.parametrize(
+    "bad", ["2027-1-1", "20270105", "2027/01/05", "2027-W01-1", "", " 2027-01-05"]
+)
+def test_l13_day_labels_must_be_iso_yyyy_mm_dd(bad: str) -> None:
+    for over in (
+        {"today": bad},
+        {"gappy_days": frozenset({bad})},
+        {"pending_rebuild_days": frozenset({bad})},
+        {"excluded_days": (ExcludedDay(bad, "x", 1),)},
+        {"looks": (LookRecord(bad, LookOutcome.FAILED),)},
+    ):
+        v = evaluate_stage(build(8, **over))
+        assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:bad_day", over
+
+
+def test_l13_day_keys_of_counters_and_pnl_rows_are_validated() -> None:
+    snap = build(8)
+    v = evaluate_stage(dataclasses.replace(snap, days=snap.days + (counters("20270105"),)))
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:bad_day"
+    v = evaluate_stage(
+        dataclasses.replace(snap, pnl_days=snap.pnl_days + (DayPnl("x", reading()),))
+    )
+    assert v.kind is VerdictKind.FAIL and v.reason == "stage_eval_fail:bad_day"
+
+
+def test_l14_passed_look_without_a_commit_is_flagged_in_the_report() -> None:
+    v = evaluate_stage(build(9, looks=(LookRecord(d(8), LookOutcome.PASSED),)))
+    assert v.kind is VerdictKind.PASS and v.report is not None
+    assert v.report.promotion_pending_commit is True
+    assert evaluate_stage(build(9)).report.promotion_pending_commit is False  # type: ignore[union-attr]
+
+
+def test_l16_no_currency_value_appears_in_repr_for_any_of_several_amounts() -> None:
+    secrets = ["-0.123456", "-0.7654321", "0.0000417"]
+    pnl = {2 + i: s for i, s in enumerate(secrets)}
+    v = evaluate_stage(build(8, pnl_over=pnl))
+    text = repr(v)
+    assert all(s.lstrip("-") not in text for s in secrets)
