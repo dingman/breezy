@@ -38,7 +38,6 @@ from breezy.runtime.exec_par_governed_days import governed_days_for
 from breezy.runtime.exec_par_records import AmbiguousRow, OrderAnchor, SettledPnlDay, StageReset
 from breezy.runtime.exec_par_settled_pnl import (
     CENT,
-    SettledPnlRegression,
     check_monotonic,
 )
 from breezy.runtime.exec_par_settled_pnl_driver import (
@@ -96,6 +95,7 @@ def tr(station: str, tmax: int | None, *, token: str = "p1", flag: str = "") -> 
         tmax_flag=flag,
         correction=False,
         token=f"{token}:{tmax}",
+        product_sha256=token,
     )
 
 
@@ -152,21 +152,34 @@ class Reader:
 
 
 class PnlStore:
-    """The latch's writer surface with the REAL monotonic guard."""
+    """The latch's surface with the REAL monotonic guard and the revision-audit rule."""
 
     def __init__(self, floor: StageReset | None = None) -> None:
         self.floor = floor
         self.days: dict[str, SettledPnlDay] = {}
         self.stubs: dict[str, SettledPnlDay] = {}
+        self.revisions: list[Any] = []
         self.error: Exception | None = None
+        self.fail_days: set[str] = set()
         self.writes = 0
 
     def read_stage_reset(self) -> StageReset | None:
         return self.floor
 
-    def write_settled_pnl_day(self, record: SettledPnlDay) -> None:
+    def read_settled_pnl_day(self, day: str) -> SettledPnlDay | None:
+        return self.days.get(day)
+
+    def read_floor_stub_pnl_day(self, day: str) -> SettledPnlDay | None:
+        return self.stubs.get(day)
+
+    def _check(self, record: SettledPnlDay) -> None:
         if self.error is not None:
             raise self.error
+        if record.day in self.fail_days:
+            raise OSError("disk")
+
+    def write_settled_pnl_day(self, record: SettledPnlDay) -> None:
+        self._check(record)
         check_monotonic(self.days.get(record.day), record)
         self.days[record.day] = record
         self.writes += 1
@@ -175,6 +188,25 @@ class PnlStore:
         if self.error is not None:
             raise self.error
         check_monotonic(self.stubs.get(record.day), record)
+        self.stubs[record.day] = record
+        self.writes += 1
+
+    def write_settled_pnl_revision(self, audit: Any) -> None:
+        self.revisions.append(audit)
+
+    def _audited(self, record: SettledPnlDay, ts_ns: int, scope: str) -> None:
+        if not any(
+            r.day == record.day and r.ts_ns == ts_ns and r.scope == scope for r in self.revisions
+        ):
+            raise RuntimeError("no revision audit row")
+
+    def replace_settled_pnl_day_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None:
+        self._audited(record, ts_ns, "day")
+        self.days[record.day] = record
+        self.writes += 1
+
+    def replace_floor_stub_pnl_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None:
+        self._audited(record, ts_ns, "stub")
         self.stubs[record.day] = record
         self.writes += 1
 
@@ -189,6 +221,8 @@ class World:
     sources_error: Exception | None = None
     today: str = TODAY_PENDING
     days: list[str] = field(default_factory=lambda: [DAY_S])
+    alerts: list[str] = field(default_factory=list)
+    mono: float = 0.0
     n: int = 0
 
     def entry(
@@ -199,11 +233,12 @@ class World:
         cost: str = "4",
         fee: str = "0.1",
         hour: int = 15,
+        day: str = DAY_S,
         ambiguous_mark: bool = False,
     ) -> Intent:
         self.n += 1
         slug = instrument_id.split(".")[0].removesuffix("^no")
-        created = ns_at(DAY_S, hour)
+        created = ns_at(day, hour)
         intent = Intent(f"i{self.n}", f"fp{self.n}", created, slug)
         self.intents.append(intent)
         station = station_of(slug)
@@ -282,6 +317,9 @@ class World:
             "store": store,
             "today": lambda: self.today,
             "read_timeout_s": 2.0,
+            "alert": self.alerts.append,
+            "clock_ns": lambda: 1_700_000_000 * S,
+            "monotonic": lambda: self.mono,
         }
         kwargs.update(over)
         return SettledPnlDriver(**kwargs)
@@ -448,44 +486,7 @@ async def test_a_revised_cli_value_invalidates_the_cached_outcome() -> None:
     assert len(world.reader.calls) == 2  # the cached final was re-validated, not trusted
 
 
-@pytest.mark.asyncio
-async def test_a_revision_that_would_raise_pnl_without_a_new_settlement_fails_closed() -> None:
-    world = World()
-    world.entry(YES_NY)
-    world.reader.truth[("NYC", DAY)] = tr("NYC", 80, token="p1")  # YES loses
-    store = PnlStore()
-    driver = world.driver(store)
-    try:
-        await driver.run_pass()
-        seq = driver.settled_pnl_seq()
-        world.reader.truth[("NYC", DAY)] = tr("NYC", 72, token="p2")  # now YES wins
-        with pytest.raises(SettledPnlPersistError) as caught:
-            await driver.run_pass()
-    finally:
-        driver.dispose()
-    assert isinstance(caught.value.__cause__, SettledPnlRegression)
-    assert driver.settled_pnl_seq() == seq
-    assert row_of(store).pnl_decimal == D("-4.1")  # the stored row is untouched
-
-
-@pytest.mark.asyncio
-async def test_a_cached_final_the_store_stops_showing_is_pending_again_and_fails_closed() -> None:
-    world = World()
-    world.entry(YES_NY)
-    world.reader.truth[("NYC", DAY)] = tr("NYC", 80)
-    store = PnlStore()
-    driver = world.driver(store)
-    try:
-        await driver.run_pass()
-        seq = driver.settled_pnl_seq()
-        world.reader.truth[("NYC", DAY)] = None  # successfully read, no longer a final
-        with pytest.raises(SettledPnlPersistError) as caught:  # a loss would silently vanish
-            await driver.run_pass()
-    finally:
-        driver.dispose()
-    assert isinstance(caught.value.__cause__, SettledPnlRegression)
-    assert driver.settled_pnl_seq() == seq
-    assert row_of(store).settled_entries == 1 and row_of(store).pnl_decimal == D("-4.1")
+# (the revision-raises-pnl and truth-shrank cases live in test_exec_par_bg5c_wpd_review.py)
 
 
 # -- A7: executor mechanics ------------------------------------------------------------------

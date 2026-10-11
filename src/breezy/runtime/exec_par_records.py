@@ -20,6 +20,9 @@ D-PREREG 1, 1b, 10, 10a, r4.1 K9, r4.3 M3, r4.4 N4):
   ``cleanup_demotion/latest`` pointer
 * ``settled_pnl/<YYYY-MM-DD>`` BG-1c per-arm-day settled-P&L row (overwritten on
   each recompute; pnl is a canonical decimal STRING, never a float)
+* ``settled_pnl_floor_stub/<label>`` BG-5c N-A: a floor label's POST-floor settled-P&L row
+* ``settled_pnl_revision/<label>/<ts_ns>`` (``.../stub`` for a stub row) BG-5c WP-D audit row that
+  must exist before a promoted CLI revision may replace a row non-monotonically
 * ``force_k1``                 flag ``{reason, ts_ns, set_by}`` or, once
   cleared, the tombstone ``{cleared_ts_ns}``
 * ``day_convention``           ``{"v": 2}`` (BG-5c R1): per-station standard-time ``entry_day``;
@@ -97,6 +100,7 @@ __all__ = [
     "RebuildRow",
     "ReconcilePhase",
     "SettledPnlDay",
+    "SettledPnlRevision",
     "StageEvalDry",
     "StageEvalLiveness",
     "StageEvalStamp",
@@ -197,6 +201,25 @@ class ForceK1Flag:
     reason: str
     ts_ns: int
     set_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class SettledPnlRevision:
+    """BG-5c WP-D audit: a promoted CLI revision replaced a settled-P&L row (scope day/stub)."""
+
+    day: str
+    ts_ns: int
+    scope: str
+    old_pnl: str
+    new_pnl: str
+    old_entries: int
+    new_entries: int
+    cause: str
+    product_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("day", "stub"):
+            raise ExecParRecordError("revision scope")
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +472,17 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "overdue_entries": "count",
         "fee_unreconciled_entries": "count",
         "fee_floor_total": "dec",
+    },
+    SettledPnlRevision: {
+        "day": "day",
+        "ts_ns": "int",
+        "scope": "str",
+        "old_pnl": "dec",
+        "new_pnl": "dec",
+        "old_entries": "count",
+        "new_entries": "count",
+        "cause": "str",
+        "product_sha256": "str",
     },
     OrderAnchor: {
         "client_order_id": "str",

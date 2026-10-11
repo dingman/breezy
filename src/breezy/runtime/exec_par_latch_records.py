@@ -44,6 +44,7 @@ from breezy.runtime.exec_par_records import (
     ForceK1State,
     HeartbeatLapse,
     SettledPnlDay,
+    SettledPnlRevision,
     StageEvalDry,
     StageReset,
     StopVerdict,
@@ -56,6 +57,7 @@ from breezy.runtime.exec_par_records import (
 )
 from breezy.runtime.exec_par_settled_pnl import (
     PreBootLedger,
+    SettledPnlRevisionUnaudited,
     Timed,
     check_monotonic,
     pre_boot_fill_ledger,
@@ -76,6 +78,7 @@ _STOP_VERDICT = EXEC_PAR_PREFIX + "stop_verdict/"
 _CLEANUP_DEMOTION = EXEC_PAR_PREFIX + "cleanup_demotion/"
 _SETTLED_PNL = EXEC_PAR_PREFIX + "settled_pnl/"
 _FLOOR_STUB_PNL = EXEC_PAR_PREFIX + "settled_pnl_floor_stub/"
+_REVISION = EXEC_PAR_PREFIX + "settled_pnl_revision/"
 
 
 class _Store(Protocol):
@@ -439,6 +442,47 @@ class ExecParRecordsMixin:
             if row is not None and row.day != day:
                 raise self.CorruptError()
             return row
+
+    # -- BG-5c WP-D: audited non-monotonic replacement on a promoted CLI revision -----------
+
+    @staticmethod
+    def _revision_key(day: str, ts_ns: int, scope: str) -> str:
+        base = f"{_REVISION}{day}/{ts_ns}"
+        return base if scope == "day" else f"{base}/stub"
+
+    def write_settled_pnl_revision(self, record: SettledPnlRevision) -> None:
+        """Write the audit row (idempotent overwrite); it must precede the replacement."""
+        self._require_held()
+        with self._mutex:
+            self._er_put(self._revision_key(record.day, record.ts_ns, record.scope), record)
+
+    def read_settled_pnl_revision(
+        self, day: str, ts_ns: int, scope: str
+    ) -> SettledPnlRevision | None:
+        self._require_held()
+        with self._mutex:
+            return self._er_get(self._revision_key(day, ts_ns, scope), SettledPnlRevision)
+
+    def replace_settled_pnl_day_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None:
+        """Replace the day's row WITHOUT the monotonic guard, only under a matching audit row."""
+        self._replace_audited(f"{_SETTLED_PNL}{record.day}", record, ts_ns, "day")
+
+    def replace_floor_stub_pnl_for_revision(self, record: SettledPnlDay, ts_ns: int) -> None:
+        """The stub-row twin of :meth:`replace_settled_pnl_day_for_revision`."""
+        self._replace_audited(f"{_FLOOR_STUB_PNL}{record.day}", record, ts_ns, "stub")
+
+    def _replace_audited(self, key: str, record: SettledPnlDay, ts_ns: int, scope: str) -> None:
+        self._require_held()
+        with self._mutex:
+            self._er_encode(record)  # validate first
+            audit = self._er_get(self._revision_key(record.day, ts_ns, scope), SettledPnlRevision)
+            if (
+                audit is None
+                or audit.new_pnl != record.pnl
+                or audit.new_entries != record.total_entries
+            ):
+                raise SettledPnlRevisionUnaudited("no matching revision audit row")
+            self._er_put(key, record)
 
     def read_settled_pnl_days(self) -> tuple[SettledPnlDay, ...]:
         """Every stored day ascending; a row under the wrong key is corrupt."""

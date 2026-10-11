@@ -64,6 +64,8 @@ class TruthRecord:
     tmax_flag: str
     correction: bool
     token: str
+    #: The CLI product's own digest: names WHICH revision a record came from (audit rows).
+    product_sha256: str = ""
 
     @property
     def is_final_grade(self) -> bool:
@@ -100,6 +102,7 @@ def _parse_row(row: dict[str, str]) -> TruthRecord:
         tmax_flag=flag,
         correction=correction,
         token=f"{sha}:{tmax}:{flag}:{int(correction)}",
+        product_sha256=sha,
     )
 
 
@@ -166,6 +169,10 @@ class FinalTruthCache:
 
     def get(self, key: Hashable) -> TruthRecord | None:
         return self._finals.get(key)
+
+    def drop(self, key: Hashable) -> bool:
+        """Forget a cached final (staleness); ``True`` when there was one."""
+        return self._finals.pop(key, None) is not None
 
     def land(self, key: Hashable, record: TruthRecord | None) -> CacheEvent:
         """Fold one SUCCESSFUL read in. A non-final answer invalidates a cached final."""
