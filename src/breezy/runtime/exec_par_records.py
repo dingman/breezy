@@ -146,6 +146,17 @@ class SettledPnlDay:
     settled_entries: int
     ambiguous_entries: int
     unsettled_entries: int
+    overdue_entries: int = 0
+    fee_unreconciled_entries: int = 0
+
+    @property
+    def total_entries(self) -> int:
+        return (
+            self.settled_entries
+            + self.ambiguous_entries
+            + self.unsettled_entries
+            + self.overdue_entries
+        )
 
     @property
     def pnl_decimal(self) -> Decimal:
@@ -194,6 +205,8 @@ _SPECS: Final[dict[type, dict[str, str]]] = {
         "settled_entries": "count",
         "ambiguous_entries": "count",
         "unsettled_entries": "count",
+        "overdue_entries": "count",
+        "fee_unreconciled_entries": "count",
     },
 }
 
