@@ -1692,3 +1692,17 @@ Before planning a test of a hypothesis chosen from live fills: (1) re-score ever
 - Audit and plan briefs that score outcomes name `bucket_facts_from_instrument_id`; a hand-rolled band is a review finding.
 - The SEARCH fills that motivated a hypothesis are premises only; they never count toward its n.
 - Related: L-44 (NO-leg buy semantics), L-55.
+
+## L-57 — A production-default path that a test can reach will write live state the moment its precondition flips (2026-10-11)
+
+### What happened
+- TE-1 WP-A pinned the `aut2.label` producer. An existing guard test (`test_aut2_canary_isolation::test_cli_requires_exactly_one_mode`) called `label_run.main([])` with no factory; while the producer was unpinned it refused early, so the test was harmless.
+- Once pinned, the same call reached the production factory on the live host: it wrote `evidence/aut2/holds/…_label-outcomes.json` and a CRITICAL `aut2.label_timer_held` alert that was delivered (20:20Z / 20:23Z). The first fix still trusted any `run-r*.service` cgroup leaf — the name `systemd-run` gives the very gate units we launch.
+
+### The rule
+A production-default seam that touches host paths must refuse unless it is positively inside its own unit (exact unit name, not a pattern a transient unit can match) AND not under pytest (`"pytest" in sys.modules` or `PYTEST_CURRENT_TEST`). Before flipping any pin, flag or gate that unlocks such a path, grep `tests/` for every call that reaches it without injection.
+
+### How to apply
+- Briefs that flip a pin/enable a producer include: "grep tests/ for un-injected calls to the newly reachable default; list each".
+- Spurious live artefacts are quarantined (moved, never deleted) with a README, so no consumer counts them.
+- Related: L-55 (run the production default once — against a tmp root, never the host), L-51.
