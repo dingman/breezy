@@ -33,6 +33,7 @@ from breezy.runtime.submit_intent_slots import (
 __all__ = [
     "ABSENT_RECORD_GRACE_NS",
     "BOOT_GRACE_NS",
+    "OK_LOG_INTERVAL_NS",
     "PROBE_INTERVAL_NS",
     "REALERT_INTERVAL_NS",
     "RETRY_INTERVAL_NS",
@@ -59,6 +60,9 @@ REALERT_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
 
 #: BG-8: the supervisor probes the store no more often than this (read-only).
 PROBE_INTERVAL_NS: Final[int] = 600 * 1_000_000_000
+
+#: BG-8: a healthy probe logs ``breaker_probe_ok`` on the first probe, then at most this often.
+OK_LOG_INTERVAL_NS: Final[int] = 3600 * 1_000_000_000
 
 #: BG-8: a lost send (raised or non-durable) is retried on this throttle, from the
 #: cached probe; it never reopens the 10-minute store-probe throttle.
@@ -161,6 +165,8 @@ class BreakerWatchState:
     unreadable_streak: int = 0
     last_probe: BreakerProbe | None = None
     last_send_fail_ns: int | None = None
+    #: When ``breaker_probe_ok`` was last logged (first probe, then hourly).
+    last_ok_log_ns: int | None = None
 
     def delivered(self, spec: BreakerAlertSpec, now_ns: int) -> None:
         self.active[spec.key] = now_ns

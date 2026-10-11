@@ -48,6 +48,7 @@ from breezy.runtime.alert_outbox import AlertOutbox, DeliveryRecordWriter, defau
 from breezy.runtime.alert_proof import COUNTERS as _ALERT_COUNTERS
 from breezy.runtime.alert_proof import deliver_with_proof
 from breezy.runtime.breaker_supervisor_watch import (
+    OK_LOG_INTERVAL_NS,
     PROBE_INTERVAL_NS,
     RETRY_INTERVAL_NS,
     BreakerProbe,
@@ -3209,6 +3210,28 @@ def _dispatch_permit_watch(
         return tracked_pid, node_log, state
 
 
+def _log_probe_ok(watch: BreakerWatchState, probe: BreakerProbe, k: int, now_ns: int) -> None:
+    """Positive evidence that a healthy probe ran: first probe, then at most hourly.
+
+    Booleans and states only -- never a store value, never anything from env files.
+    """
+    last = watch.last_ok_log_ns
+    if last is not None and 0 <= now_ns - last < OK_LOG_INTERVAL_NS:
+        return
+    watch.last_ok_log_ns = now_ns
+    if not probe.anchor_readable:
+        anchor = "unreadable"
+    else:
+        anchor = "none" if probe.k_anchor_ns is None else "k_gt_1"
+    log_decision(
+        "breaker_probe_ok",
+        k_configured=k,
+        halted=str(probe.halted),
+        slots_readable=str(probe.unreadable_slots == 0),
+        anchor=anchor,
+    )
+
+
 def _do_breaker_watch(
     *,
     ports: SupervisorPorts,
@@ -3247,6 +3270,8 @@ def _do_breaker_watch(
         watch.last_probe = probe
         if not probe.readable:
             log_decision("breaker_probe_unreadable", k_configured=k)
+        else:
+            _log_probe_ok(watch, probe, k, now_ns)
     else:
         assert watch.last_probe is not None  # probe_due is True when it is None
         probe = watch.last_probe  # a retry re-decides the cached reading: no store read
