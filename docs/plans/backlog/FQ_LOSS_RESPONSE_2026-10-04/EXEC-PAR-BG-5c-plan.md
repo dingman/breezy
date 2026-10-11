@@ -1,6 +1,6 @@
 # EXEC-PAR BG-5c: wiring the stage-evaluator ports into the node (plan r2)
 
-**Status:** PROPOSED r2. Awaiting confirmation review.
+**Status:** READY r2.1 (r2 confirm reviews: architecture 88, failure-mode 86, market/stats 84; all findings adopted as A1–A7).
 
 **Inputs**
 - r1 (3930f19e) peer reviews, all NOT-READY:
@@ -155,3 +155,73 @@ Every row also obeys BG-5b's last-resort FAIL.
 | Architecture | F1 R6 → R6.1–4; F2 R1 → R1.1–3; F3 R5 → R5 (smaller property route chosen); F4 R8 → R8.3; F5 dependencies → WP table; F6 → R4.4 | All adopted |
 | Failure-mode | F1 R7 → R7; F2 → port contract table; F3 → R1.6; F4 → E obligations; F5 → R3.2–3; F6 → E obligations; F7 → R4.2 | All adopted |
 | Market/stats | R3 → R3.1–2; R2 → R2.2–3; R1 → R1.1, 4, 5; R4 → R4.2; R8 → R8.1–2 | All adopted |
+
+## r2.1 amendments (binding)
+
+These come from the r2 confirm reviews: architecture 88 READY-with-amendments, failure-mode 86, market/stats 84. Where an amendment conflicts with the r2 text above, the amendment wins.
+
+### A1. R5 is replaced: inject the ledger through the factory
+
+The exec client (`client.py`) is byte-pinned, so a new property on it is rejected. Instead:
+- `app/trade.py` constructs the ledger at K>1 only, through a now-public `spend_ledger_for(...)`. This is the factory's existing constructor, with the same arguments, so it cannot diverge from the admitting ledger.
+- The ledger is injected through an optional factory config field, following the `submit_intent_latch` precedent.
+- At K=1 the field is `None` and the factory builds exactly as it does today. A test asserts the K=1 factory output is unchanged.
+- The watcher receives a read-only `SpendLedgerView` protocol (`spent_today_usd`, `cost_budget_bucket`, the predicate methods), never the mutable ledger.
+- Mark recording writes through the latch, never through the ledger.
+- A stale or non-identical ledger instance gives FAIL `ledger_unavailable`. The check is an identity comparison against the injected instance.
+
+### A2. `spend_unaudited` defers a look; it never fails it
+
+This amends R3.2.
+- **Coverage rule.** The Nautilus cache audit is full when `day_start ≥ boot_ts − reconciliation_lookback`. Otherwise it covers only the post-boot span.
+- **Restart days.** A restart day is `spend_unaudited` by design.
+- **Effect on looks.** `spend_unaudited` **defers** the look: no look is taken, it is not a failed look, and it never counts toward demotion. It clears when the audit covers the day.
+- **Unresolved days.** A day still unaudited past `SETTLEMENT_DEADLINE_DAYS` becomes `day_excluded` (§10a), never PASS.
+
+### A3. AMBIGUOUS full-cost term, precisely
+
+This amends R2.3.
+- An AMBIGUOUS intent leaves the full-cost term **only when its fill's settled row is persisted**.
+- Between fill confirmation and settlement it counts at that fill's `cumulative_cost + fee`.
+- An unresolved or zero-fill intent counts at armed notional.
+- "Resolved" comes from a venue-evidenced resolution record, not from the mark.
+- WP-B verifies BG-1c `_contribution` against these rules and fixes it if they do not hold.
+
+### A4. The floor stub is per station
+
+This amends R1.4.
+- For each station, the stub applies to `entry_day(station, floor.ts)`, filtered by `arm_ns ≥ floor.ts`.
+- Whole-day counters apply only to station-days that start at or after `floor.ts`.
+- **Missing `arm_ns`.** A floor-day row with no `arm_ns` counts as pre-floor-unknown. That makes the station's floor day non-PASS; such a row is never silently included or excluded.
+- **BG-5a change.** BG-5a's "strictly after the floor day" becomes "per station: the stub on that station's floor day, then the days after it".
+
+### A5. Open days are evaluated immediately by the halt rules
+
+This amends R1.5.
+- These halts evaluate open days immediately: §15 single-day, §15 cumulative, §9, and the §5 intraday halts.
+- Only the look minima, the trailing windows and the cap wait for a day to close.
+- Open data is re-attributed on every pass.
+- An entry whose day is more than 2 days after `today()` gives `counter_missing`.
+
+### A6. The R8 sign rule, unambiguous
+
+This amends R8.2.
+- The **held side comes from the instrument or intent** (the NO sibling), never from `order_side` and never from a stored leg sign.
+- `payoff = |qty| · outcome(held) − cost_held − fee`.
+- For a NO buy recorded by the venue as SELL YES at price y: `cost_held = |qty| · (1 − y)`. Apply exactly one flip.
+- Tests pin the sign:
+  - against `fq_scorer.py:424`;
+  - against one recorded live NO fill;
+  - for YES and NO, each settling both ways.
+
+### A7. Mechanics of the R8 executor
+
+- Single-flight per (station, day).
+- A read timeout. On timeout the day is `pending`.
+- Results are posted back to the loop with `call_soon_threadsafe`.
+- The executor shuts down on dispose.
+- WP-D confirms that the F2 truth-store format is SQLite before using `mode=ro`. If it is not SQLite, WP-D states the read-only mode it uses instead.
+
+### Status
+
+**READY** for build once the A1–A7 amendments are folded in. A further review round is not required unless a build contradicts this text, in which case the builder STOPs and reports.
