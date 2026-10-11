@@ -94,18 +94,16 @@ def s15_findings(ctx: StageContext) -> list[str]:
     """Day, stage and cumulative stops, all through the predicate port.
 
     ``ctx.live`` includes the OPEN labels (A5), so a loss on an open day trips a stop on the
-    first pass that sees it. A floor label's settled-P&L row is a WHOLE-day row that carries
-    pre-floor entries, so the day and stage stops skip it (a pre-floor loss can never re-trip a
-    stop, A4); the never-floored cumulative stop reads it.
+    first pass that sees it. A floor label's whole-day settled-P&L row carries pre-floor
+    entries, so the day and stage stops read its post-floor STUB row instead (a pre-floor loss can
+    never re-trip a stop, A4); the never-floored cumulative stop reads the whole-day row.
     """
     port = ctx.snap.predicates
     found: list[str] = []
     stage_total = Decimal(0)
     day_hit = False
     for label in ctx.live:
-        if label in ctx.floor_days:
-            continue
-        reading = ctx.pnl.get(label)
+        reading = ctx.stub_pnl.get(label) if label in ctx.floor_days else ctx.pnl.get(label)
         if reading is None:
             continue
         stage_total += reading.pnl

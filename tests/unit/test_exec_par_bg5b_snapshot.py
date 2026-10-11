@@ -139,6 +139,10 @@ class _Reads:
         self._maybe(f"anchors:{day}")
         return self.anchors.get(day, ())
 
+    def read_latest_entry_day(self) -> str | None:
+        self._maybe("latest_entry_day")
+        return max((day for day, rows in self.anchors.items() if rows), default=None)
+
 
 @dataclass
 class _Counters:

@@ -15,6 +15,7 @@ climate-day label of the ARM time (I2); this layer stores it, the ingest layer
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
@@ -41,6 +42,7 @@ _FILL = EXEC_PAR_PREFIX + "fill/"
 _OPEN_FLAG = EXEC_PAR_PREFIX + "openflag/"
 _WINDOW = EXEC_PAR_PREFIX + "window/"
 _GAPPY = EXEC_PAR_PREFIX + "gappy/"
+_DAY_KEY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _part(value: object) -> str:
@@ -120,6 +122,29 @@ class ExecParCounterRowsMixin(ExecParRecordsMixin):
         _part(day)
         with self._mutex:
             return self._ec_scan(_ORDER, OrderAnchor, lambda r: r.client_order_id, day)
+
+    def read_latest_entry_day(self) -> str | None:
+        """The latest ``day`` of any posted entry, denial, AMBIGUOUS mark or fill, or ``None``.
+
+        A key-prefix scan (no day loop): the day-scoped families carry the day in the key, so
+        only the anchors (keyed by order id) are decoded. BG-5c A5 uses it to fail closed on
+        activity dated beyond any bounded day probe."""
+        self._require_held()
+        lister = getattr(self._store, "keys_with_prefix", None)
+        if lister is None:
+            raise RuntimeError("store has no keys_with_prefix; cannot scan EXEC-PAR rows")
+        with self._mutex:
+            days: list[str] = []
+            for family in (_DENIAL, _AMBIGUOUS, _FILL):
+                for key in lister(family):
+                    day = key[len(family) :].split("/", 1)[0]
+                    if _DAY_KEY.fullmatch(day) is None:
+                        raise self.CorruptError()
+                    days.append(day)
+            days.extend(
+                a.day for a in self._ec_scan(_ORDER, OrderAnchor, lambda r: r.client_order_id, None)
+            )
+        return max(days, default=None)
 
     # -- denials, AMBIGUOUS, fills ----------------------------------------
 

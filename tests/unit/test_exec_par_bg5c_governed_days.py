@@ -224,11 +224,21 @@ def test_mixed_offset_night_gap_span_marks_every_open_day_it_overlaps() -> None:
 # -- the grep test --------------------------------------------------------------------------------
 
 
-def test_no_day_of_ns_remains_in_the_exec_par_runtime_modules() -> None:
+FORBIDDEN = (r"\bday_of_ns\b", r"\btoday_of\b", r"Callable\[\[int\], str\]")
+
+
+def test_the_forbidden_station_less_day_patterns_actually_match_offenders() -> None:
+    samples = ("day_of_ns: int", "ports.today_of(now)", "f: Callable[[int], str]")
+    for pattern, sample in zip(FORBIDDEN, samples, strict=True):
+        assert re.search(pattern, sample)
+
+
+def test_no_station_less_day_function_remains_in_the_exec_par_runtime_modules() -> None:
     root = Path(__file__).resolve().parents[2] / "src" / "breezy" / "runtime"
     offenders = [
-        path.name
+        (path.name, pattern)
         for path in sorted(root.glob("exec_par_*.py"))
-        if re.search(r"\bday_of_ns\b", path.read_text(encoding="utf-8"))
+        for pattern in FORBIDDEN
+        if re.search(pattern, path.read_text(encoding="utf-8"))
     ]
     assert offenders == []
