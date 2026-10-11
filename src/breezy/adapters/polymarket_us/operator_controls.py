@@ -396,6 +396,7 @@ class DailySpendLedger:
         "_last_ns",
         "_lock",
         "_open",
+        "_record_marks",
         "_registry_last_ns",
         "_released_ids",
         "_seeded",
@@ -422,6 +423,9 @@ class DailySpendLedger:
         #: until acknowledged. ``abandon``/``settle``/the day roll never touch it, so a
         #: with-id entry that resolves between two watcher ticks is still countable.
         self._ambiguous_marks: set[tuple[str, str]] = set()
+        #: Recording is off until a consumer (the K>1 watcher) opts in, so K=1 never
+        #: accumulates marks that nothing will ever acknowledge.
+        self._record_marks = False
         #: High-water clock of registry-driven (settle) activity, so a stale
         #: authorize can never roll the ledger back across a settle's roll.
         self._registry_last_ns = 0
@@ -776,14 +780,22 @@ class DailySpendLedger:
                 self._unknown_keys.add(key)
 
     def mark_ambiguous(self, key: str) -> None:
-        """Mark a registered key AMBIGUOUS. An unregistered (exit) key is a no-op."""
+        """Mark a key AMBIGUOUS (exposure semantics unchanged for an unregistered key)."""
         with self._lock:
             entry = self._open.get(key)
             if entry is not None:
                 entry.ambiguous = True
-                # The call sites (boot, create, resolver) are not distinguishable here
-                # without editing the pinned client, so the source is always "unknown".
+            if self._record_marks and type(key) is str and key:
+                # Recorded even when the key is no longer registered (abandoned before it
+                # was marked): the entry WAS ambiguous. The call sites (boot, create,
+                # resolver) are not distinguishable here without editing the pinned
+                # client, so the source is always "unknown".
                 self._ambiguous_marks.add((key, _UNKNOWN_MARK_SOURCE))
+
+    def enable_ambiguous_mark_recording(self) -> None:
+        """Opt in to the ever-ambiguous mark set (idempotent; a consumer must acknowledge)."""
+        with self._lock:
+            self._record_marks = True
 
     def ambiguous_marks_pending(self) -> frozenset[tuple[str, str]]:
         """Value-free snapshot of unacknowledged ``(intent_id, source)`` AMBIGUOUS marks."""

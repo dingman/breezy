@@ -48,11 +48,16 @@ ROWS = (
     ANCHOR,
     DenialRow(client_order_id="O-2", reason="k-full", day="2026-10-11", arm_ns=7),
     AmbiguousRow(
-        intent_id="a1", source="unknown", day="2026-10-11", arm_ns=5, attribution="slot", ts_ns=9
+        intent_id="a1",
+        source="armed_pre_boot",
+        day="2026-10-11",
+        arm_ns=5,
+        attribution="slot",
+        ts_ns=9,
     ),
     FILL,
     OpenCostFlag(station_day="NYC@2026-10-11", day="2026-10-11", exceeded=True, ts_ns=3),
-    WindowPeak(day="2026-10-11", window_start_ns=5, orders=2, notional="8.00"),
+    WindowPeak(day="2026-10-11", window_start_ns=5, orders=2, notional="8.00", coids="O-1,O-2"),
     GappyMark(day="2026-10-11", cause="heartbeat_lapse", ts_ns=4, cleared_ts=None),
     GappyMark(day="2026-10-12", cause="heartbeat_lapse", ts_ns=4, cleared_ts=8),
 )

@@ -90,7 +90,7 @@ def test_readers_filter_by_day_and_are_scan_based(tmp_path: Path) -> None:
 def test_denial_ambiguous_fill_rows_round_trip_by_day(tmp_path: Path) -> None:
     with _open(_Store(), tmp_path) as latch:
         d = DenialRow("O-2", "k-full", DAY, 5)
-        a = AmbiguousRow("a1", "unknown", DAY, 5, "slot", 6)
+        a = AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6)
         f = _fill()
         assert latch.write_denial(d) and latch.write_ambiguous(a) and latch.write_fill(f)
         assert not latch.write_denial(d)
@@ -124,18 +124,67 @@ def test_open_cost_flag_never_downgrades_within_a_station_day(tmp_path: Path) ->
         }
 
 
+def test_open_cost_flag_skips_the_write_when_the_value_is_unchanged(tmp_path: Path) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        first = latch.write_open_cost_flag(OpenCostFlag("NYC@" + DAY, DAY, False, 1))
+        raw = dict(store.data)
+        store.fail_set = True  # any write would raise
+        again = latch.write_open_cost_flag(OpenCostFlag("NYC@" + DAY, DAY, False, 99))
+        assert again == first and store.data == raw
+
+
+def test_per_day_rows_are_keyed_by_day_so_reads_are_prefix_scoped(tmp_path: Path) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        latch.write_fill(_fill())
+        latch.write_denial(DenialRow("O-2", "k-full", DAY, 5))
+        latch.write_ambiguous(AmbiguousRow("a1", "armed_pre_boot", DAY, 5, "slot", 6))
+        latch.write_open_cost_flag(OpenCostFlag("NYC@" + DAY, DAY, True, 1))
+        latch.write_order_anchor(_anchor())
+    assert f"{P}fill/{DAY}/TR-1" in store.data
+    assert f"{P}denial/{DAY}/O-2" in store.data
+    assert f"{P}ambiguous/{DAY}/a1" in store.data
+    assert f"{P}openflag/{DAY}/NYC@{DAY}" in store.data
+    assert f"{P}order/O-1" in store.data  # globally unique id: not day-scoped
+
+
+def test_day_scoped_reader_ignores_other_days_without_decoding_them(tmp_path: Path) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        latch.write_fill(_fill(trade="TR-1", day="2026-10-12"))
+        store.data[f"{P}fill/2026-10-12/TR-1"] = b"garbage"  # other day: never touched
+        latch.write_fill(_fill(trade="TR-2", day=DAY))
+        assert [f.trade_id for f in latch.read_fills(DAY)] == ["TR-2"]
+        with pytest.raises(SubmitIntentCorrupt):
+            latch.read_fills("2026-10-12")
+
+
 def test_window_accumulates_per_five_second_window_and_exposes_the_peak(tmp_path: Path) -> None:
     with _open(_Store(), tmp_path) as latch:
-        w1 = latch.add_window_order(DAY, 5_000, Decimal("4.00"))
-        assert (w1.orders, w1.notional) == (1, "4.00")
-        w1 = latch.add_window_order(DAY, 5_000, Decimal("1.50"))
+        w1 = latch.add_window_order(DAY, 5_000, Decimal("4.00"), "O-1")
+        assert (w1.orders, w1.notional, w1.coids) == (1, "4.00", "O-1")
+        w1 = latch.add_window_order(DAY, 5_000, Decimal("1.50"), "O-2")
         assert (w1.orders, w1.notional) == (2, "5.50")
-        latch.add_window_order(DAY, 10_000, Decimal("9.00"))
-        latch.add_window_order("2026-10-12", 5_000, Decimal(99))
+        latch.add_window_order(DAY, 10_000, Decimal("9.00"), "O-3")
+        latch.add_window_order("2026-10-12", 5_000, Decimal(99), "O-4")
         windows = latch.read_window_peaks(DAY)
         assert [(w.window_start_ns, w.orders) for w in windows] == [(5_000, 2), (10_000, 1)]
         with pytest.raises(ValueError):
-            latch.add_window_order(DAY, 5_000, Decimal("NaN"))
+            latch.add_window_order(DAY, 5_000, Decimal("NaN"), "O-5")
+        with pytest.raises(ValueError):
+            latch.add_window_order(DAY, 5_000, Decimal(1), "a,b")
+
+
+def test_window_add_is_idempotent_per_client_order_id(tmp_path: Path) -> None:
+    store = _Store()
+    with _open(store, tmp_path) as latch:
+        first = latch.add_window_order(DAY, 5_000, Decimal("4.00"), "O-1")
+        sets_before = len(store.data)
+        again = latch.add_window_order(DAY, 5_000, Decimal("4.00"), "O-1")
+        assert again == first  # a replay never double-counts
+        assert (again.orders, again.notional) == (1, "4.00")
+        assert len(store.data) == sets_before
 
 
 def test_gappy_mark_is_first_wins_and_listed(tmp_path: Path) -> None:
@@ -182,7 +231,7 @@ def test_not_held_latch_raises_before_touching_the_store(tmp_path: Path) -> None
     for op in (
         lambda: latch.write_order_anchor(_anchor()),
         lambda: latch.read_fills(DAY),
-        lambda: latch.add_window_order(DAY, 5, Decimal(1)),
+        lambda: latch.add_window_order(DAY, 5, Decimal(1), "O-1"),
         lambda: latch.read_gappy_marks(),
     ):
         with pytest.raises(SubmitIntentLockNotHeld):
@@ -193,8 +242,8 @@ def test_not_held_latch_raises_before_touching_the_store(tmp_path: Path) -> None
 def test_concurrent_window_adds_from_threads_do_not_lose_counts(tmp_path: Path) -> None:
     with _open(_Store(), tmp_path) as latch:
         threads = [
-            threading.Thread(target=lambda: [latch.add_window_order(DAY, 5, Decimal(1))] * 1)
-            for _ in range(8)
+            threading.Thread(target=latch.add_window_order, args=(DAY, 5, Decimal(1), f"O-{i}"))
+            for i in range(8)
         ]
         for t in threads:
             t.start()

@@ -69,6 +69,12 @@ def _ingest(latch: SubmitIntentLatch) -> ExecParCounterIngest:
     )
 
 
+def _ledger() -> DailySpendLedger:
+    ledger = DailySpendLedger()
+    ledger.enable_ambiguous_mark_recording()
+    return ledger
+
+
 def _ambiguous(ledger: DailySpendLedger, intent_id: str) -> None:
     ledger.register_open_exposure(
         intent_id,
@@ -119,7 +125,7 @@ def test_with_id_ambiguous_attributed_from_the_open_slot(tmp_path: Path) -> None
     store = _Store()
     with _latch(tmp_path, store) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        ledger = DailySpendLedger()
+        ledger = _ledger()
         _ambiguous(ledger, slot.intent_id)
         assert _ingest(latch).ingest_ambiguous_marks(ledger, now_ns=ARM + 5 * SEC) == 1
         (row,) = latch.read_ambiguous(DAY)
@@ -131,7 +137,7 @@ def test_resolved_inside_one_tick_is_still_counted_from_history(tmp_path: Path) 
     """The finding-4 case: abandoned and retired before the watcher ever looked."""
     with _latch(tmp_path, _Store()) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        ledger = DailySpendLedger()
+        ledger = _ledger()
         _ambiguous(ledger, slot.intent_id)
         ledger.abandon_open_exposure(slot.intent_id)
         latch.retire(
@@ -171,7 +177,7 @@ def test_source_is_boot_for_an_intent_armed_before_this_process_started(tmp_path
             _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + SEC
         )
         (row,) = latch.read_ambiguous(DAY)
-        assert row.source == "boot"
+        assert row.source == "armed_pre_boot"
 
 
 def test_source_is_live_for_an_intent_armed_at_or_after_boot(tmp_path: Path) -> None:
@@ -181,7 +187,7 @@ def test_source_is_live_for_an_intent_armed_at_or_after_boot(tmp_path: Path) -> 
             _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + SEC
         )
         (row,) = latch.read_ambiguous(DAY)
-        assert row.source == "live"
+        assert row.source == "armed_post_boot"
 
 
 def test_source_is_live_for_a_history_only_post_boot_intent(tmp_path: Path) -> None:
@@ -192,7 +198,7 @@ def test_source_is_live_for_a_history_only_post_boot_intent(tmp_path: Path) -> N
             _FixedMarks({(slot.intent_id, "unknown")}), now_ns=ARM + 3 * SEC
         )
         (row,) = latch.read_ambiguous(DAY)
-        assert (row.source, row.attribution) == ("live", "history")
+        assert (row.source, row.attribution) == ("armed_post_boot", "history")
 
 
 # -- idempotence, restart, acknowledge ------------------------------------
@@ -201,7 +207,7 @@ def test_source_is_live_for_a_history_only_post_boot_intent(tmp_path: Path) -> N
 def test_idempotent_across_ticks_and_the_set_shrinks_after_acknowledge(tmp_path: Path) -> None:
     with _latch(tmp_path, _Store()) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        ledger = DailySpendLedger()
+        ledger = _ledger()
         ingest = _ingest(latch)
         _ambiguous(ledger, slot.intent_id)
         assert ingest.ingest_ambiguous_marks(ledger, now_ns=ARM + SEC) == 1
@@ -218,11 +224,11 @@ def test_restart_re_mark_of_an_already_counted_intent_is_not_counted_twice(
     store = _Store()
     with _latch(tmp_path, store) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        first = DailySpendLedger()
+        first = _ledger()
         _ambiguous(first, slot.intent_id)
         _ingest(latch).ingest_ambiguous_marks(first, now_ns=ARM + SEC)
     with _latch(tmp_path, store) as latch:  # new process: the slot persists, H6 re-marks it
-        reboot = DailySpendLedger()
+        reboot = _ledger()
         _ambiguous(reboot, slot.intent_id)
         assert _ingest(latch).ingest_ambiguous_marks(reboot, now_ns=ARM + 600 * SEC) == 0
         (row,) = latch.read_ambiguous(DAY)
@@ -240,14 +246,17 @@ def test_restart_attributes_a_never_counted_boot_mark_from_the_persisted_slot(
         marks = _FixedMarks({(slot.intent_id, "unknown")})
         assert _ingest(latch).ingest_ambiguous_marks(marks, now_ns=ARM + 900 * SEC) == 1
         (row,) = latch.read_ambiguous(DAY)
-        assert (row.arm_ns, row.source) == (ARM, "boot")  # armed before this process booted
+        assert (row.arm_ns, row.source) == (
+            ARM,
+            "armed_pre_boot",
+        )  # armed before this process booted
 
 
 def test_write_failure_does_not_acknowledge_and_the_next_tick_retries(tmp_path: Path) -> None:
     store = _Store()
     with _latch(tmp_path, store) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        ledger = DailySpendLedger()
+        ledger = _ledger()
         _ambiguous(ledger, slot.intent_id)
         ingest = _ingest(latch)
         store.fail_set = True
@@ -325,7 +334,7 @@ async def test_watcher_tick_ingests_marks_and_surfaces_failures_as_faults(tmp_pa
     store = _Store()
     with _latch(tmp_path, store) as latch:
         slot = latch.arm_slot(FP, slug=SLUG, is_exit=False, now_ns=ARM)
-        ledger = DailySpendLedger()
+        ledger = _ledger()
         _ambiguous(ledger, slot.intent_id)
         ledger.abandon_open_exposure(slot.intent_id)  # resolved before the first tick
         actor = _watcher(_ingest(latch), ledger)
