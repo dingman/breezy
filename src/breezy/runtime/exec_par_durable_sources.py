@@ -12,9 +12,12 @@ slot's own ``is_exit`` flag, never a ``wire*`` field, tells entry from exit; the
 ``entry_day(station_of(slug), created_ns)``. A fill that cannot be placed (no station) is
 unattributable and FAILS the days it could belong to; it is never dropped.
 
-**Spend (R3).** Σ over entry orders of the ``cumulative_cost`` of the order's TERMINAL record (max
-``cumulative_qty``): the client rewrites one cumulative record per venue order, so partial fills
-are never summed.
+**Two spend metrics (R3 as amended).** ``ledger_spend`` (the BG-1d reconcile check) is Σ armed
+notional over the day's durable entry anchors, the same definition as the counter store's
+``spend_usd``, so a partially filled day reconciles clean. ``filled_spend`` is Σ over entry orders
+of the ``cumulative_cost`` of the order's TERMINAL record (max ``cumulative_qty``; the client
+rewrites one cumulative record per venue order, so partial fills are never summed); only it is
+audited against the Nautilus cache.
 
 **AMBIGUOUS (R2).** Counted only from the BG-1b ever-ambiguous mark rows, attributed by each
 mark's stored ``arm_ns`` and station.
@@ -29,8 +32,9 @@ also kept on :attr:`DurableSources.failures` (reasons only, never amounts).
 ``day_start >= boot_ts - reconciliation_lookback``. Otherwise, or when the cache is
 unavailable, the day is ``UNAUDITED``: that DEFERS the look (it is
 not a failed look and never counts toward demotion), and past ``SETTLEMENT_DEADLINE_DAYS`` it
-excludes the day. A full-coverage mismatch is routed to the BG-1d exclusion path
-(``ledger_spend`` returns ``None``).
+excludes the day. A full-coverage mismatch of filled spend is ``spend_audit_mismatch``: it also
+DEFERS the look and raises an alert (``SpendAudit.alerts``), and never excludes the day; exclusion
+stays the BG-1d path for counter-vs-durable mismatches only.
 
 Use a FRESH :class:`DurableSources` per reconcile pass: the slot/fill join is read once and cached.
 """
@@ -56,13 +60,14 @@ from breezy.runtime.exec_par_reconcile import (
     UnattributableFill,
     entry_fills_by_day,
 )
-from breezy.runtime.exec_par_records import AmbiguousRow, EpochRow
+from breezy.runtime.exec_par_records import AmbiguousRow, EpochRow, OrderAnchor
 from breezy.runtime.exec_par_settled_pnl import SETTLEMENT_DEADLINE_DAYS
 
 __all__ = [
     "HISTORY_KEY_PREFIX",
     "UNATTRIBUTED",
     "AmbiguousRowsPort",
+    "AnchorRowsPort",
     "AuditStatus",
     "CacheFill",
     "CacheFillPort",
@@ -143,6 +148,12 @@ class AmbiguousRowsPort(Protocol):
     """The latch's day-scoped ever-ambiguous mark rows (BG-1b ``read_ambiguous``)."""
 
     def read_ambiguous(self, day: str) -> tuple[AmbiguousRow, ...]: ...
+
+
+class AnchorRowsPort(Protocol):
+    """The latch's day-scoped posted-entry anchors (BG-1b ``read_order_anchors``)."""
+
+    def read_order_anchors(self, day: str) -> tuple[OrderAnchor, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,8 +359,13 @@ class SpendAudit:
 
     @property
     def defers_look(self) -> bool:
-        """``spend_unaudited``: no look is taken; it is NOT a failed look (A2)."""
-        return self.status is AuditStatus.UNAUDITED
+        """``spend_unaudited`` or ``spend_audit_mismatch``: no look is taken; NOT a failed look."""
+        return self.status in (AuditStatus.UNAUDITED, AuditStatus.MISMATCH)
+
+    @property
+    def alerts(self) -> bool:
+        """A full-coverage mismatch raises an alert; it never excludes the day."""
+        return self.status is AuditStatus.MISMATCH
 
     def excludes_day(self, today: str) -> bool:
         """An unaudited day at least ``SETTLEMENT_DEADLINE_DAYS`` old becomes ``day_excluded``."""
@@ -396,8 +412,9 @@ class SpendAuditor:
             return SpendAudit(day, AuditStatus.UNAUDITED, "cache_error")
         if unattributable:
             return SpendAudit(day, AuditStatus.UNAUDITED, "cache_unattributable")
-        status = AuditStatus.FULL_MATCH if cache_total == durable else AuditStatus.MISMATCH
-        return SpendAudit(day, status, None, durable, cache_total)
+        if cache_total == durable:
+            return SpendAudit(day, AuditStatus.FULL_MATCH, None, durable, cache_total)
+        return SpendAudit(day, AuditStatus.MISMATCH, REASON_AUDIT_MISMATCH, durable, cache_total)
 
     def _cache_total(self, day: str, fills: Iterable[CacheFill]) -> tuple[Decimal, bool]:
         total = Decimal(0)
@@ -432,11 +449,13 @@ class DurableSources:
         governed: DayConvention,
         station_of: Callable[[str], str | None],
         ambiguous: AmbiguousRowsPort,
+        anchors: AnchorRowsPort,
         auditor: SpendAuditor | None = None,
     ) -> None:
         self._join = _Join(intents, store, decode_fill, governed, station_of)
         self._governed = governed
         self._ambiguous = ambiguous
+        self._anchors = anchors
         self._auditor = auditor
         self._built: _Joined | None = None
         self._build_failure: str | None = None
@@ -456,7 +475,7 @@ class DurableSources:
             return self._fail("fills", REASON_UNATTRIBUTABLE)
         return SourceReading.success(joined.fills.get(day, 0))
 
-    def spend_reading(self, day: str) -> SourceReading[Decimal]:
+    def filled_spend_reading(self, day: str) -> SourceReading[Decimal]:
         joined = self._joined()
         if isinstance(joined, str):
             return self._fail("spend", joined)
@@ -486,7 +505,7 @@ class DurableSources:
             return self._fail("unattributed_ambiguous", REASON_READ_ERROR)
 
     def audit_spend(self, day: str) -> SpendAudit:
-        reading = self.spend_reading(day)
+        reading = self.filled_spend_reading(day)
         if not reading.ok or reading.value is None:
             return SpendAudit(day, AuditStatus.DURABLE_UNREADABLE)
         if self._auditor is None:
@@ -505,16 +524,20 @@ class DurableSources:
         return self.slots_reading(day).value
 
     def ledger_spend(self, day: str) -> Decimal | None:
-        reading = self.spend_reading(day)
-        if not reading.ok or reading.value is None:
+        """Σ armed notional of the day's durable entry anchors: the SAME definition as the counter
+        store's ``spend_usd`` (BG-1d compares like with like, so a partial fill never mismatches).
+        The separate filled-spend metric (:meth:`filled_spend_reading`) is what the cache audits."""
+        try:
+            total = Decimal(0)
+            for anchor in self._anchors.read_order_anchors(day):
+                notional = Decimal(anchor.notional)
+                if anchor.day != day or not notional.is_finite() or notional < 0:
+                    raise _Corrupt
+                total += notional
+        except Exception:  # noqa: BLE001 - mapped to a typed failure, never a zero
+            self._failures.append(SourceFailure("armed_spend", REASON_READ_ERROR))
             return None
-        if (
-            self._auditor is not None
-            and self._auditor.audit(day, reading.value).status is AuditStatus.MISMATCH
-        ):
-            self._failures.append(SourceFailure("spend", REASON_AUDIT_MISMATCH))
-            return None
-        return reading.value
+        return total
 
     # internals -------------------------------------------------------------------------------
 
