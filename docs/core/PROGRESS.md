@@ -71,7 +71,7 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | # | ID | Work | Needs | Status |
 |---|---|---|---|---|
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
-| 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
+| 4 | ARCH-0 | BUILD Wave 0 core (E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04 (reviews/ARCH-0-r1-merged.md) |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
 | 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1/WP3b/WP5 merged+live; WP2 canary LIVE 10-08 (absence rule BLOCKED-EXTERNAL: needs operator dead-man endpoint, ruling r3); WP3 S1-S6 merged+LIVE (health timer */10, X-12..X-16; 10-09 fixes: oneshot self-grace 2e7f35d5, rotate show-read 4d02d594, timer Unit= lookup + ingest/replay named 1462514d); open: X-15 doc says two-pass, code is single-pass (erratum owed); WP9 live-proof report next |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
@@ -86,7 +86,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`; plans `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
 | ID | Open work (exact) | Status |
 |---|---|---|
-| TE-1 | WP-A+WP-B merged (f41b3e93): report books all 34 fills; NO_INPUT ended; WP-C/D/E label-unit promotion SHELVED (no family trades) | PARTIAL |
+| TE-1 | WP-A+B merged (f41b3e93); WP-C/D/E SHELVED until a family trades | PARTIAL |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
@@ -100,6 +100,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 | AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
 | AUD-10b | ING-3 block cleared 10-10; parked P2 by ROI (no family trades, nothing to promote) |
 | F13 freeze prep | backfills DONE; draft build clean 10-09 (observed ⊆ proposed after nbp gap fix c34f1417; ArchiveCache fix bb1ea022, 182 s); left: peer review of list → freeze ≥10-21 |
+| T2-MAKER | `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` v0.2 (T2 candidate, reviewed ×2). Next: Stage 0 replay §6.0; exec is IOC-only/no cancel (§9.1-3) |
 
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
