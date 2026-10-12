@@ -96,6 +96,7 @@ from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFi
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
 from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
 from breezy.adapters.polymarket_us.operator_controls import _round_cost_up_to_cent
+from breezy.analysis.labeling import accounting
 from breezy.analysis.labeling.completeness import is_final_row
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.labeling.legacy_crh_scorer import LEGACY_SCORER_ID
@@ -2567,6 +2568,14 @@ class PortfolioRoiReportData:
     #: The per-day net verdict, keyed by `day` -- a SIBLING of
     #: `daily_reconciliation` (see `NetReconciliationRow`'s docstring).
     net_reconciliation: tuple[NetReconciliationRow, ...] = ()
+    #: TE-1 WP-B (schema_version=5): the accounting view, a SIBLING of the statistics fields.
+    realised_pnl_accounting_total: Decimal = Decimal(0)
+    roi_accounting: Decimal | None = None
+    roi_accounting_status: str = "OK"
+    fill_pnl: tuple[accounting.FillPnlRow, ...] = ()
+    family_pnl: tuple[accounting.FamilyPnlRow, ...] = ()
+    #: ``None`` only for data assembled without an accounting view (a hand-built test fixture).
+    disclosures: accounting.Disclosures | None = None
 
 
 def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
@@ -2612,6 +2621,8 @@ def build_portfolio_roi_report_data(
     n_external_flow_records: int = 0,
     realised_pnl_c2_total: Decimal = Decimal(0),
     roi_status_override: str | None = None,
+    pnl_outside_admissible: bool = False,
+    disclosures: accounting.Disclosures | None = None,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -2720,6 +2731,7 @@ def build_portfolio_roi_report_data(
         settled_cumulative_passes_net=cumulative.settled_cumulative_passes_net,
         realised_pnl_c2_total=realised_pnl_c2_total,
         pass_flag=cumulative.settled_cumulative_passes_net,
+        disclosures=disclosures,
     )
 
 
@@ -2814,6 +2826,12 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
             data.provisional_cumulative_unexplained_net
         ),
         "settled_cumulative_passes_net": data.settled_cumulative_passes_net,
+        "realised_pnl_accounting_total": str(data.realised_pnl_accounting_total),
+        "roi_accounting": None,
+        "roi_accounting_status": data.roi_accounting_status,
+        "fill_pnl": [row.to_json() for row in data.fill_pnl],
+        "family_pnl": [row.to_json() for row in data.family_pnl],
+        "disclosures": None if data.disclosures is None else data.disclosures.to_json(),
     }
 
 
@@ -2903,6 +2921,13 @@ class PortfolioRoiReportView:
     _roi: Decimal
     _roi_minus_b0: Decimal
     _roi_minus_b1: Decimal
+    #: TE-1 WP-B, schema_version >= 5; ``None`` means "this report predates the accounting view".
+    realised_pnl_accounting_total: Decimal | None = None
+    roi_accounting: Decimal | None = None
+    roi_accounting_status: str | None = None
+    fill_pnl: tuple[accounting.FillPnlRow, ...] | None = None
+    family_pnl: tuple[accounting.FamilyPnlRow, ...] | None = None
+    disclosures: accounting.Disclosures | None = None
 
     def _raise_if_gated(self) -> None:
         if self.roi_status in _LABEL_GATED_STATUSES - {ROI_STATUS_GATED_UNSETTLED_CAPITAL}:
@@ -3543,6 +3568,11 @@ def _default_families_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "deploy" / "families"
 
 
+def _default_cli_final_reader(catalog_base: Path) -> accounting.CliFinalReader:
+    """Stub: no CLI FINAL is readable."""
+    return lambda station, climate_day: None
+
+
 def _default_catalog_base() -> Path:
     """FU-3b: the NWS catalog root residual settlement resolution reads
     settlement truth from -- same env-var-or-literal-default convention as
@@ -3978,6 +4008,10 @@ class _LabelView:
             if row.admissible and row.role.value == "entry" and row.scorer_id != LEGACY_SCORER_ID
         )
 
+    def accounting_rows(self) -> tuple[LabelRow, ...]:
+        """The ENTRY rows the per-fill P&L table may book (TE-1 R1)."""
+        return ()
+
 
 def _gate_status_of(root: Path, now_ns: int) -> str | None:
     """``None`` when the newest marker lets the labels be consumed, else the gated status."""
@@ -4068,6 +4102,7 @@ def _run(
     catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
     capital_flows_dir: Path | None = None,
     labels_data_root: Path | None = None,
+    cli_final_reader: accounting.CliFinalReader | None = None,
 ) -> int:
     """The I/O shell's actual work, factored out of `main()` as an explicit
     test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
@@ -4332,6 +4367,7 @@ def _run(
         n_external_flow_records=len(external_flow_evidence.flows),
         realised_pnl_c2_total=c2_pnl,
         roi_status_override=label_status,
+        disclosures=accounting.Disclosures(),
     )
 
     # F7/F9: atomic writes -- the directory is created by

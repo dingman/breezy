@@ -280,7 +280,7 @@ class TestJsonSchemaVersion:
 
         raw = json.loads(path.read_text())
         # Stage C3 bumps this to 2 (the per-trial `trial_rows` breakdown).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
         # D6: the JSON is PRIVATE, mode 0600.
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -420,7 +420,7 @@ class TestPerTrialPnlBreakdown:
         write_portfolio_roi_json(path, data)
         raw = json.loads(path.read_text())
 
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
         assert raw["trial_rows"] == [
             {
                 "trial_id": "fam_a/trial/1",
@@ -2231,7 +2231,7 @@ class TestAdditiveSchemaFieldBackwardCompat:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
         assert view.n_family_station_refusals == 0
 
     def test_the_journal_line_carries_the_new_dimensionless_count(self) -> None:
@@ -2292,7 +2292,7 @@ class TestF1CumulativeReconciliationReachesTheArtefact:
         ]
         # These fields are additive-within-version (D7); the schema_version
         # bump to 2 is unrelated (Stage C3's `trial_rows` field).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
 
         view = read_portfolio_roi_report(path)
         assert view.settled_cumulative_passes is False
@@ -4421,7 +4421,7 @@ class TestResidualPnlAndD9:
         write_portfolio_roi_json(path, data)
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
         assert view.realised_pnl_residual_total == Decimal("0.30")
         assert view.realised_pnl_portfolio_total == Decimal("0.87")
 
@@ -5162,7 +5162,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
     def test_fu13b_schema_version_stays_3_and_reader_accepts_old_v3(
         self, tmp_path: Path
     ) -> None:
-        assert PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 5
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, _report_data())
         raw = json.loads(path.read_text())
@@ -5184,7 +5184,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
         assert view.external_flow_evidence_status == STATUS_NOT_CONFIGURED
         assert view.n_windows_not_covered == 0
         assert view.settled_cumulative_passes_net is True
@@ -5905,9 +5905,9 @@ class TestSchemaV4AndKeptUnsettledSignal:
             roi_status=_prr.ROI_STATUS_GATED_IDENTITY,
         )
 
-    def test_schema_version_is_four_and_every_prior_version_stays_readable(self) -> None:
-        assert PORTFOLIO_ROI_SCHEMA_VERSION == 4
-        assert _prr._KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS == frozenset({1, 2, 3, 4})
+    def test_schema_version_is_five_and_every_prior_version_stays_readable(self) -> None:
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert _prr._KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS == frozenset({1, 2, 3, 4, 5})
 
     def test_a_label_gated_v4_report_round_trips_with_null_roi_and_raises_on_access(
         self, tmp_path: Path
@@ -5918,8 +5918,8 @@ class TestSchemaV4AndKeptUnsettledSignal:
         raw = json.loads(path.read_text())
         view = read_portfolio_roi_report(path)
 
-        assert raw["schema_version"] == 4 and raw["roi"] is None
-        assert view.schema_version == 4
+        assert raw["schema_version"] == 5 and raw["roi"] is None
+        assert view.schema_version == 5
         for name in ("roi", "roi_minus_b0", "roi_minus_b1"):
             with pytest.raises(_prr.UnsettledCapitalRoiError):
                 getattr(view, name)
