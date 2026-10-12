@@ -20,110 +20,63 @@ Two reserved controls: **maximum daily budget** and **maximum per POSITION**.
 They live ONLY in the operator's gitignored `operator.env`, present by NAME in
 the supervisor/node env, enforced per grant by `DailySpendLedger.authorize_order_cost`
 (`operator_controls.py:348`; process-local, re-seeded at boot from durable fills via
-`exec/client.py:2214`, with AMBIGUOUS/no-fill spend still process-local). The three
-session ceilings derive from the two caps at permit mint (`safety.py:552-608`).
-Everything else is build-side.
+`exec/client.py:2214`). The three session ceilings derive from the two caps at
+permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ## Standing verdicts that gate future work
 
-- **G-02 ROI feasibility NO-GO** on the downstream programme (not the first fill). `docs/evidence/roi_feasibility_2026-08-26.md`.
-- **G-01 prelim→final revision POWERED FAIL** on MDW/NYC/SFO; interior-bucket strategies dead. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
-- **Lock strategies DEAD (L-9); K1 DEAD at ask ≥2c.** Rev5 `pm_us_crh_fc_v1` (NBS point forecast) CLOSED 09-20 (`RULING_forecast_edge_programme_closes_2026-09-20.md`); `pm_us_crh_cont` NOT displaced. Probabilistic NBM-NBP family: plan CONVERGED 09-29 (`docs/plans/FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md`), built S1–S4-infra + SL-9/SL-15. **PM.us confirmatory leg INFEASIBLE 09-30 → §6 node 4** (validate n_min 592, range [552, 645] > 520; `RULING_nbp_pmus_leg_infeasible_node4_2026-09-30.md`). Holdout sealed; the weather-only S2 still runs at n_min; L + S4-infra carried as K-2 assets.
-- **Price history is forward-only; a forecast archive is a CALIBRATION set.** Venue surface = 5 cities × daily HIGH. BL-6 (no NO-side instrument) is SUPERSEDED by the 09-14 operator ruling: NO-side hunting is a requirement (NO-1).
-- **NO FAMILY HAS A PROVEN EDGE; CURRENT SENDING FAMILY IS UNDER LIVE MEASUREMENT** (`pm_us_crh_fq_v1`, S9 activation merged 60290e9d, d0 2026-10-02; `pm_us_crh_cont`/`pm_us_crh_v2` are prior registered families, not the current sender). Demonstrated edge NONE; admissible n = 0 after 10 live days; 10 orders, 9 fills as of 09-24 (9 durable exec-fill-store records, exact match against real-event log lines net of inferred/relaunch noise; order 1, 09-05, had no fill — AMBIGUOUS no-response, operator-cleared; `ORDER1_NO_ORDERSUBMITTED_2026-09-26.md`). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
-- **Readiness audit 2026-09-12** (`docs/evidence/READINESS_AUDIT_2026-09-12.md`): the KILL-clock counter read 0/15 for 09-05..09-11 BY MECHANISM (any-overlap rule + feed-wide gap fan-out; L-38), not by outage; the create-path accept-fill branch has never fired live; v3 has never been fill-replayed; alerts reach nobody.
+- **NO FAMILY HAS A PROVEN EDGE; NO FAMILY TRADES.** Node runs `pm_us_crh_fq_v1`
+  with orders OFF (drop-in `fq-v1-halt-orders-off.conf`). Re-open only via
+  `RULING_FQ-v2-NO-TRADE_2026-10-08.md` T1/T2/T3; review 2027-01-25.
+- **Forecast-taker hunt CLOSED** (`RULING_forecast_edge_programme_closes_2026-09-20.md`:
+  market resolution 1.98× forecast). Lock strategies DEAD (L-9). Cheap YES is a
+  measured loser (M1 scan; TE-2 TAIL 44%). NBP PM.us leg INFEASIBLE (node 4).
+  Live record: 34 fills / 4 wins / −2.63 (`TRADE_EFFECTIVENESS_2026-10-11.md`).
+- **Price history is forward-only (from 2026-08-30)**; a forecast archive is a
+  CALIBRATION set, never a backtest. Venue surface = 5 cities × daily HIGH.
+- Pre-backlog state as of 2026-10-12 (every prior row, dispositioned):
+  `docs/core/archive/PROGRESS_2026-10-12_pre-maker.md`. Items there are PARKED,
+  not closed; nothing from it is scheduled while the MAKER programme runs.
 
 ---
 
-## BACKLOG — verified open set (re-synced 2026-09-28 18:00Z; every item dispositioned by `docs/evidence/RULING_backlog_resolution_2026-09-28.md`)
+## BACKLOG — MAKER programme (operator 2026-10-12: "replace the backlog with this work")
 
-**Binding on EVERY item.** Never set `allow_short=True`; never weaken `BacktestOrderGuard` or any
-safety, settlement, contract or NO-SEND firewall test (widen exact sets by one reviewed row, L-12);
-never touch live-trading enablement; never invent an operator-reserved value; PREREG semantics change
-only via a ruling under `docs/evidence/`. L-1 null-hypothesis verdict per increment. Durable processes
-via `systemd-run --user` (L-26); worktree commands need `PYTHONPATH=<wt>/src`; never `uv`/`pip` from a
-worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/`.
+Spec: `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` (v0.2, T2
+candidate). Plans: `docs/plans/backlog/MAKER_2026-10-12/` (`S<n>_*_plan_r<N>.md`,
+peer reviews in `reviews/`). Execution order is strict; each step's STOP
+condition ends the programme and the family stays at its last version.
 
-**Revival path (RA-13):** R3 NOT VIABLE 10-08 (`RULING_R3-VIABILITY_NOT_VIABLE_2026-10-08.md`; Wilson .26–.56 < f_req .625); KILL backstop 2027-01-25 kept; routes R4 + FQ-v2 T1–T3. Kalshi K-2a desk plan CONVERGED (`docs/plans/backlog/K-2a_2026-10-08/`, WA-0..WA-4); WB build gated on KILL.
+**Binding on EVERY item.** Nautilus immutable; never `allow_short=True`; never
+weaken `BacktestOrderGuard` or any safety, settlement, contract or NO-SEND
+firewall test (widen exact sets by one reviewed row, L-12); never touch live
+enablement or `BREEZY_ORDERS_ENABLED`; never invent an operator-reserved value;
+never edit a frozen PREREG; Stage 0 is exploratory, never promotion evidence.
+Durable processes via `systemd-run --user` (L-26) with RuntimeMaxSec + stall
+watch; worktree commands need `PYTHONPATH=<wt>/src`; never `uv`/`pip` from a
+worktree; never `git stash`; full gate after EVERY merge (basetemp under
+~/.cache, rm after reading EXIT); `lint-imports` from the tree root.
 
-### LIVE-PROOF owed
-| ID | Proof owed (exact) |
+| # | ID | Work | Needs | STOP condition | Status |
+|---|---|---|---|---|---|
+| 1 | S1 | Maker-window print census (recorder liveness + `trade_tick`, dedupe on trade_id) incl. a dated SEARCH declaration for post-09-25 tape; resolve/bracket `TRADE_QUANTITY_UNIT` from own fills | WP0: ≥10 GB disk | E below the n_eff ≥ 30 floor → UNDERPOWERED, route to Q1 | PLAN r3 READY |
+| 2 | S2 | Stage 0 exploratory maker replay (spec §6.0/§6.1, process-schedule episodes, pooled §6.9) → `docs/evidence/maker/STAGE0_REPLAY_*.md` | 1 | NO-GO (stressed fill rate < 0.10 or §6.9 FAIL) → programme ends | PLAN r3 READY |
+| 3 | S3 | A1 loss-floor reachability for the maker mix (FloorSpec on the FQ engine; FQ result byte-reproduced) → `docs/evidence/maker/A1_REACHABILITY_*.md` | 2 NOT-KILLED | `unreachable_veto` at the stressed fill rate → not registrable, programme ends | PLAN r3 READY |
+| 4 | S4 | Exec resting path: GTD BUY NO, per-order + slug cancel-all, K=1 released on ACCEPTED_RESTING, boot sweep; ~24 WIDENED pin rows | 2, 3 PASS | venue refuses non-post-only GTD or slug-scoped cancel-all → programme ends | PLAN r3 READY |
+| 5 | S5 | `no_ladder_maker` family (SHADOW, never submits), PREREG frozen before start (A1 stop, calendar split, read target 300/200), scorer + 9-gate advisory report | 2, 3 (S4 only at gate 8) | any §7 gate FAIL on the read-once holdout; UNSCREENED-TERMINAL power stop | PLAN r3 READY |
+
+Review record: 11 r1 reviews, 6 r2 verifications (`reviews/`), r3 = conformance to spec v0.3. Known residuals: S4 no-id maker fill during node downtime stays AMBIGUOUS (fail-closed, alert); bid-live window ≈ 10 h/day under the 16:50Z launch + 10 h permit (spec §3). Disk 4.2 GB free: every WP0 clears ≥10 GB first.
+
+Activation after S5 PASS remains manual (`BREEZY_SENDING_FAMILY_ID` + supervisor
+restart + `live_orders_ruling`); no auto-arm path is built by this programme.
+
+### Calendar obligations (pre-registered; never moved after seeing data)
+| When | What |
 |---|---|
-| FAILURE-KIND-DURABLE | Next restart with an OPEN AMBIGUOUS intent names the durable kind |
-| R3V-a | Daily replay stalled since 10-01 → AUT-6 WP3 disposition |
-| Failed units | portfolio-roi 17:40Z NO_INPUT exit-0 check owed 10-09 |
+| ≥ 2026-10-21 | F13 `source_lags_ns` freeze (T3 input) |
+| ≥ 2026-12-07 | M1-v3 single read-once (`no_longshot_pooled_test.py`, default `--out`); T1 route |
+| 2027-01-25 | NO-TRADE ruling review; RA-13 KILL backstop |
 
-### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
-Resume: docs/plans/backlog/HALT_POINT_2026-10-07.md
-| Row | Status |
-|---|---|
-| F2 truth fetch | LIVE (timers 11:40Z/12:40Z) |
-| F4 labels | build-now DONE (WP0-3,5,6,8 + plugins); promote waits AUT-6; see F4-open-items_2026-10-06.md |
-| F5 prereg | design 072ab026; A0 KILL frozen; A1 floor frozen 8756dcc4 = unreachable_veto |
-| F6 bridge | permanent veto: RULING_FQ-v2-NO-TRADE_2026-10-08 (FQ-R8-2 G-B); F6b CANCELLED |
-| F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
-| F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
-| F7b / M1-v3 | M1-v3 frozen, read >= 12-07; serial latch unviable (d̂_p90 0.49). EXEC-PAR plan r5+r5.1 READY; WP-DR..WP7 merged (d5e5568d, K=1 inert); sup live on d4e2f474 (v2 admitted 01:30Z 10-11); D-PREREG r4+r4.1-r4.4 design converged; BG-1a merged; BG-1b..e building; freeze <=12-06 |
-Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 live stages); owes HALT_INERT test (R8-2f).
-
-### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
-`/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
-| # | ID | Work | Needs | Status |
-|---|---|---|---|---|
-| 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
-| 4 | ARCH-0 | BUILD Wave 0 core (E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04 (reviews/ARCH-0-r1-merged.md) |
-| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
-| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | IN PROGRESS: WP1/WP3b/WP5 merged+live; WP2 canary LIVE 10-08 (absence rule BLOCKED-EXTERNAL: needs operator dead-man endpoint, ruling r3); WP3 S1-S6 merged+LIVE (health timer */10, X-12..X-16; 10-09 fixes: oneshot self-grace 2e7f35d5, rotate show-read 4d02d594, timer Unit= lookup + ingest/replay named 1462514d); open: X-15 doc says two-pass, code is single-pass (erratum owed); WP9 live-proof report next |
-| 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | 7a OPEN, 7b GATED |
-| 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
-| 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
-| 10 | AUT-4 | BUILD eval (4a move, live sequential, offline) | 9 | OPEN |
-| 11 | AUT-5b | BUILD policy ruling + drill clauses; PROMOTE stays off | 10 | OPEN |
-| 12 | AUT-7 | BUILD 7a gate drill, 7b live drill | 11 | OPEN |
-| 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
-Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
-
-### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`; plans `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
-| ID | Open work (exact) | Status |
-|---|---|---|
-| TE-1 | WP-A+B merged (f41b3e93); WP-C/D/E SHELVED until a family trades | PARTIAL |
-
-### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
-| ID | Sev | Open work (exact) | Source |
-|---|---|---|---|
-| CF-12-W3 | LOW | r5.1 READY; Stage 0 10-09 STOP (tests/unit FIN 1308>1288) → blocked on W3e | CF-12 |
-| CF-12-W3e | LOW | PLAN r1 drafted (`BP/CF-12-W3e_plan_r1.md`; measured FIN tests/unit 1176/1285); peer review PAUSED — ROI priority 10-09 (no trading lever) | W3 Stage 0 |
-
-### RUN / ANALYSE
-| ID | Open work (exact) |
-|---|---|
-| AUD-07 | 20k drain timer `breezy-aud07-m1c-drain20k` (02:10Z nightly, ~3 nights, 24 cells); remove timer when DEFERRED empty; then 80k → `--final` → AC7 ruling |
-| AUD-10b | ING-3 block cleared 10-10; parked P2 by ROI (no family trades, nothing to promote) |
-| F13 freeze prep | backfills DONE; draft build clean 10-09 (observed ⊆ proposed after nbp gap fix c34f1417; ArchiveCache fix bb1ea022, 182 s); left: peer review of list → freeze ≥10-21 |
-| T2-MAKER | `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` v0.2 (T2 candidate, reviewed ×2). Next: Stage 0 replay §6.0; exec is IOC-only/no cancel (§9.1-3) |
-
-### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
-| ID | Open work (exact) |
-|---|---|
-| AMBIG-LATCH-RESUME | A+B LIVE; §5.4 boot proof DONE 10-10 16:50Z (`no_id_retire_admitted=True`). Owed: in-service proof at next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (LOW) |
-| SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
-| CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test. FD-FLAKE: bind_integrity + run_mounts fd-set tests each failed once in full gates 10-11/12, green isolated; 3rd → per-test fd snapshot |
-
-### Comment backlog (R0.1)
-- Queue live-file comment/docstring fixes for the next real edit of each file: `websocket.py:61-63` wrong `retry.py` lines; `operator_controls.py:267` non-existent `RiskLimits` and `:271-275` stale ledger persistence wording; `signing.py` / `write_transport.py:6` stale cage docstrings; `exec/client.py:660` cites `risk.py:139` but the flag is at `:224`.
-
-### WATCH / GATED (no build owed; re-open only on the named trigger)
-- **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
-- **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
-- **Trigger watches:** AMBIG-SIGN-TABLE (extend the no-id manual sign table if `SELL_SHORT` or any unobserved manual shape appears); EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration). TE-3 RULED (`RULING_TE-3_NO_CHEAP_LONGSHOT_2026-10-11.md` §6). TE-2 verdict (89531726) = T2 min-ask/rung-stacking + F13 input.
-- **Rules:** HALT-FSM = accepted cosmetic (Nautilus swallows it; fail-safe; whitelist `InvalidStateTrigger STOPPED->START_COMPLETED` in greps); T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
-
-
----
-
-## Pointers
-
-Audit backlog 09-21: `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
-(binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
-· programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
-`docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
+### Live-state watches (no build owed)
+- `breezy-aud07-m1c-drain20k` timer: remove when DEFERRED empty (AUD-07, parked).
+- FD-FLAKE / CT13-FLAKE: on a 3rd occurrence add the per-test fd snapshot / `locks_path` fault-injection test.
