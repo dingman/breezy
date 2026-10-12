@@ -71,7 +71,10 @@
     "value_ns": 50400000000000,
     "value_s": 50400
   },
-  "disclosed_contamination": "The audit and triage showed the headline direction (low win rate, LAX heat bust, MIA wins). The freeze constrains classification and thresholds, not the prior.",
+  "disclosed_contamination": [
+    "The audit and triage showed the headline direction (low win rate, LAX heat bust, MIA wins). The freeze constrains classification and thresholds, not the prior.",
+    "2026-10-11 freeze review: T-WIN rejection is derivable before Phase B from the public audit W=2 and Phase A P_c; the verdict label is therefore largely pre-determined; the informative Phase B outputs are the per-fill classification, T-SPREAD/T-LOC, K1a/K3 flags and the descriptive table."
+  ],
   "footer": {
     "lines": [
       "diagnostic, post-hoc, n = N station-days in C clusters, non-confirmatory",
@@ -98,11 +101,11 @@
     "sensitivity": "H1-K_ask_only (labelled sensitivity, not binding)"
   },
   "honest_expectation": {
-    "expected_verdict": "INCONCLUSIVE unless a positive finding exists (material K1a, K4, a T-WIN rejection, or a T-SPREAD/T-ART rejection)",
+    "expected_verdict": "MODEL_MISCALIBRATED_UNATTRIBUTED, or MODEL_LIMITATION if T-SPREAD rejects. T-WIN and its leave-one-out are expected to REJECT on already-public counts (W=2 is in the corrected audit and plan s0; Phase A gives sum P_c ~ 5.10; P_H0(W<=2) ~ 0.0035, 6-cluster ~ 0.0071, leave-one-out W=1 p ~ 4.8e-5), so the single-cluster-driven qualifier is not expected. T-ART is expected NOT-TESTABLE after ties (MDW 10-02 single-day cluster has d=0; n'<=6; min p 0.0156 > 0.01), so the ARTEFACT sublabel is unreachable. K4 is UNTESTABLE (no venue outcome source at Phase A) and cannot yield FIXABLE.",
     "floors_immutable": "the 0.8 power floor and alpha values may not be changed after freeze",
     "inconclusive_means": "uninformative: it neither supports 'no defect' nor 'bad luck'",
     "not_permission_to_rearm": "INCONCLUSIVE, like every verdict, is NOT permission to re-arm; routes are T1 (12-07), T2, T3 only",
-    "reason": "T-WIN cluster power 0.248 (7 clusters) / 0.341 (6 clusters) under binding H1-K fee_net, below the 0.8 floor; T-SPREAD power 0.091 / 0.140",
+    "reason": "T-WIN cluster power 0.248 (7 clusters) / 0.341 (6 clusters) under binding H1-K fee_net, below the 0.8 floor; T-SPREAD power 0.091 / 0.140; T-WIN is NOT a blind test: its rejection is derivable from public W and Phase A P_c (disclosed contamination)",
     "variance_reachable": false
   },
   "leave_one_out_rule": "Outside the alpha budget. Drop the cluster with the largest P_c (ties to the alphabetically first station). If the dropped cluster is a WIN cluster recompute w_obs on the remaining clusters (w_obs - 1); if a loss cluster w_obs is unchanged. Retest at alpha 0.02. Can only block VARIANCE or add the single-cluster-driven label; a leave-one-out rejection with a full-sample non-rejection routes to INCONCLUSIVE.",
@@ -683,7 +686,7 @@
       "alpha": 0.01,
       "level": "cluster",
       "sidedness": "one-sided (H1: corrected worse)",
-      "statistic": "exact paired sign test on d = |corrected error| - |raw error|, null 0.5",
+      "statistic": "per cluster: |cluster-mean corrected error| - |cluster-mean raw error| (signed errors averaged within a cluster before abs; cluster median from the earliest fill's pmf); one-sided sign test across clusters, zeros dropped",
       "ties": "dropped, n after drops reported"
     },
     "T-EDGE": {
@@ -709,7 +712,8 @@
       "status": "INDICATIVE",
       "ties": "zero-error clusters dropped, n after drops reported",
       "two_sided_formula": "doubled_smaller_tail",
-      "two_sided_formula_definition": "p = min(1, 2*min(upper_tail(pis, n_pos), lower_tail(pis, n_pos))) over the Poisson-binomial count of positive cluster signs"
+      "two_sided_formula_definition": "p = min(1, 2*min(upper_tail(pis, n_pos), lower_tail(pis, n_pos))) over the Poisson-binomial count of positive cluster signs",
+      "companions_status": "raw-NBM-median companion NOT RUN: no raw pmf stored; raw error reported descriptively only"
     },
     "T-SPREAD": {
       "attribution": "spread vs location NOT identified; never attributed to spread alone",
@@ -797,5 +801,6 @@
     "src/breezy/normalize/climate_day.py",
     "src/breezy/ingest/nbm_quantile_actor.py",
     "deploy/families/"
-  ]
+  ],
+  "refreeze_record": "first freeze b0fe067c/1c007b82 superseded BEFORE any Phase B run (no outcome consumed): code fixes from freeze review (provenance binding, src dependency pins, pins-file verification, lower clip, K4 gate) + CR-1/CR-2 text"
 }
