@@ -3634,7 +3634,11 @@ class TestResidualSettlementCash:
 
         trial_id = "fam_res/trial/LAX/2026-09-13"
         raw_trial = _residual_trial(trial_id=trial_id)
-        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        # TE-1: the fill is joined to its residual trial (as the real reader does), so the
+        # accounting table books it from the residual settlement instead of leaving it unpriced
+        reader = _stub_reader(
+            {("fam_res/trial/", "LAX"): ((raw_trial,), {trial_id: (False, "vo-res", False)})}
+        )
         monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
 
         release_ns = _ns_of_day("2026-09-14")
@@ -4328,7 +4332,11 @@ class TestResidualPnlAndD9:
 
         trial_id = "fam_res/trial/LAX/2026-09-13"
         raw_trial = _residual_trial(trial_id=trial_id, scheduled_release_day="2026-09-14")
-        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        # TE-1: the fill is joined to its residual trial (as the real reader does), so the
+        # accounting table books it from the residual settlement instead of leaving it unpriced
+        reader = _stub_reader(
+            {("fam_res/trial/", "LAX"): ((raw_trial,), {trial_id: (False, "vo-res", False)})}
+        )
         monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
 
         release_ns = _ns_of_day("2026-09-14")
@@ -4468,7 +4476,11 @@ class TestResidualPnlAndD9:
 
         trial_id = "fam_res/trial/LAX/2026-09-13"
         raw_trial = _residual_trial(trial_id=trial_id)
-        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        # TE-1: the fill is joined to its residual trial (as the real reader does), so the
+        # accounting table books it from the residual settlement instead of leaving it unpriced
+        reader = _stub_reader(
+            {("fam_res/trial/", "LAX"): ((raw_trial,), {trial_id: (False, "vo-res", False)})}
+        )
         monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
 
         release_ns = _ns_of_day("2026-09-14")
@@ -4553,7 +4565,9 @@ class TestResidualPnlAndD9:
         `_run`'s own narrowing line, so dropping `- scored_ids` there still
         passed all 131 tests before this one existed."""
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        # TE-1: a REGISTERED manifest (a draft is skipped by the family/station scan), so the
+        # fill is joined to its trial and the residual-narrowing line below is really exercised
+        _write_registered_family_manifest(
             families_dir, family_id="fam_both", trial_id_prefix="fam_both/trial/"
         )
 
@@ -4577,7 +4591,10 @@ class TestResidualPnlAndD9:
         # and station mapping to resolve against, exactly like the
         # narrowed-away case above.
         raw_trial = _residual_trial(trial_id=trial_id)
-        reader = _stub_reader({("fam_both/trial/", "LAX"): ((raw_trial,), {})})
+        # TE-1: the fill is joined to its (scored) trial, as the real reader does
+        reader = _stub_reader(
+            {("fam_both/trial/", "LAX"): ((raw_trial,), {trial_id: (True, "vo-both", False)})}
+        )
         monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
 
         release_ns = _ns_of_day("2026-09-14")
@@ -5672,7 +5689,9 @@ class TestLabelGate:
 
         exit_code = _full_run(tmp_path, _fq_store(tmp_path), root, _NOW_NS)
 
-        assert exit_code == 0
+        # TE-1 R5: the lone FQ fill has no final row and is past its settlement deadline, so it is
+        # UNPRICED: the report is still written (asserted below) but the run exits 1
+        assert exit_code == 1
         report = _report(tmp_path, "2026-10-04")
         assert report["roi_status"] == _prr.ROI_STATUS_GATED_UNLABELLED_FQ
         for key in ("roi", "roi_minus_b0", "roi_minus_b1"):
