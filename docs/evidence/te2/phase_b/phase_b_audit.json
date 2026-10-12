@@ -1,0 +1,196 @@
+{
+  "audit_fq": {
+    "n_fills": 25,
+    "n_refused": 0,
+    "n_wins": 2,
+    "net_pnl": "-2.1700",
+    "per_fill": [
+      {
+        "fill_id": "CV3SB0HXPYG6",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte61lt62f.POLYMARKET_US",
+        "pnl": "-0.0700",
+        "tmax_f": 65,
+        "won": false
+      },
+      {
+        "fill_id": "CV3SBJ492YH4",
+        "instrument_id": "tc-temp-laxhigh-2026-10-02-gte91lt92f.POLYMARKET_US",
+        "pnl": "-0.0900",
+        "tmax_f": 87,
+        "won": false
+      },
+      {
+        "fill_id": "CV3SNMHQ6YHC",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-02-lt61f.POLYMARKET_US",
+        "pnl": "-0.0300",
+        "tmax_f": 65,
+        "won": false
+      },
+      {
+        "fill_id": "CV3SSVR9WYGE",
+        "instrument_id": "tc-temp-laxhigh-2026-10-02-gte89lt90f.POLYMARKET_US",
+        "pnl": "-0.2400",
+        "tmax_f": 87,
+        "won": false
+      },
+      {
+        "fill_id": "CV4WCWVC4YHH",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte63lt64f.POLYMARKET_US",
+        "pnl": "-0.2400",
+        "tmax_f": 65,
+        "won": false
+      },
+      {
+        "fill_id": "CVS422HYWYH0",
+        "instrument_id": "tc-temp-laxhigh-2026-10-03-gte91lt92f.POLYMARKET_US",
+        "pnl": "-0.0500",
+        "tmax_f": 102,
+        "won": false
+      },
+      {
+        "fill_id": "CVS44D1MJYGW",
+        "instrument_id": "tc-temp-miahigh-2026-10-03-gte88lt89f.POLYMARKET_US",
+        "pnl": "-0.4300",
+        "tmax_f": 87,
+        "won": false
+      },
+      {
+        "fill_id": "CVW455HKJYGE",
+        "instrument_id": "tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US",
+        "pnl": "-0.1600",
+        "tmax_f": 102,
+        "won": false
+      },
+      {
+        "fill_id": "CVWK0YQYAYH4",
+        "instrument_id": "tc-temp-sfohigh-2026-10-03-gte83lt84f.POLYMARKET_US",
+        "pnl": "-0.0500",
+        "tmax_f": 90,
+        "won": false
+      },
+      {
+        "fill_id": "CW0A0BQWMYHK",
+        "instrument_id": "tc-temp-sfohigh-2026-10-03-gte85lt86f.POLYMARKET_US",
+        "pnl": "-0.1600",
+        "tmax_f": 90,
+        "won": false
+      },
+      {
+        "fill_id": "CW1747MQAYH8",
+        "instrument_id": "tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US",
+        "pnl": "0.8800",
+        "tmax_f": 87,
+        "won": true
+      },
+      {
+        "fill_id": "CWDY5H7CGYH0",
+        "instrument_id": "tc-temp-laxhigh-2026-10-04-gte93lt94f.POLYMARKET_US",
+        "pnl": "-0.1600",
+        "tmax_f": 102,
+        "won": false
+      },
+      {
+        "fill_id": "CWDYMBNT2YGP",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-04-gte70lt71f.POLYMARKET_US",
+        "pnl": "-0.2100",
+        "tmax_f": 74,
+        "won": false
+      },
+      {
+        "fill_id": "CWE078KPEYHK",
+        "instrument_id": "tc-temp-sfohigh-2026-10-04-lt83f.POLYMARKET_US",
+        "pnl": "-0.1000",
+        "tmax_f": 83,
+        "won": false
+      },
+      {
+        "fill_id": "CWF5VBTK2YG6",
+        "instrument_id": "tc-temp-laxhigh-2026-10-04-gte95lt96f.POLYMARKET_US",
+        "pnl": "-0.1600",
+        "tmax_f": 102,
+        "won": false
+      },
+      {
+        "fill_id": "CX2CSDPR2YH4",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-05-gte64lt65f.POLYMARKET_US",
+        "pnl": "-0.0700",
+        "tmax_f": 68,
+        "won": false
+      },
+      {
+        "fill_id": "CX2D0CFYWYHK",
+        "instrument_id": "tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US",
+        "pnl": "0.5000",
+        "tmax_f": 90,
+        "won": true
+      },
+      {
+        "fill_id": "CX2D0CNW8YHK",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-05-lt64f.POLYMARKET_US",
+        "pnl": "-0.0300",
+        "tmax_f": 68,
+        "won": false
+      },
+      {
+        "fill_id": "CX2D8Y2T6YHH",
+        "instrument_id": "tc-temp-laxhigh-2026-10-05-lt97f.POLYMARKET_US",
+        "pnl": "-0.6600",
+        "tmax_f": 101,
+        "won": false
+      },
+      {
+        "fill_id": "CX5F40JYMYH4",
+        "instrument_id": "tc-temp-miahigh-2026-10-05-gte87lt88f.POLYMARKET_US",
+        "pnl": "-0.1200",
+        "tmax_f": 90,
+        "won": false
+      },
+      {
+        "fill_id": "CXPTKNASJYGE",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-06-lt70f.POLYMARKET_US",
+        "pnl": "-0.0300",
+        "tmax_f": 74,
+        "won": false
+      },
+      {
+        "fill_id": "CXPTQ7HGEYHH",
+        "instrument_id": "tc-temp-laxhigh-2026-10-06-lt92f.POLYMARKET_US",
+        "pnl": "-0.1500",
+        "tmax_f": 94,
+        "won": false
+      },
+      {
+        "fill_id": "CXPTQWPK0YGW",
+        "instrument_id": "tc-temp-sfohigh-2026-10-06-gte81lt82f.POLYMARKET_US",
+        "pnl": "-0.1100",
+        "tmax_f": 80,
+        "won": false
+      },
+      {
+        "fill_id": "CXPV5XMJ2YGE",
+        "instrument_id": "tc-temp-mdwhigh-2026-10-06-gte70lt71f.POLYMARKET_US",
+        "pnl": "-0.0700",
+        "tmax_f": 74,
+        "won": false
+      },
+      {
+        "fill_id": "CXS74BRHJYH0",
+        "instrument_id": "tc-temp-sfohigh-2026-10-06-gte83lt84f.POLYMARKET_US",
+        "pnl": "-0.1600",
+        "tmax_f": 80,
+        "won": false
+      }
+    ],
+    "wins": [
+      [
+        "tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US",
+        87
+      ],
+      [
+        "tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US",
+        90
+      ]
+    ]
+  },
+  "phase": "B"
+}
