@@ -1504,3 +1504,55 @@ def test_every_importer_shares_one_report_module() -> None:
     other = importlib.import_module("tests.unit.test_portfolio_roi_report")
 
     assert other._prr is before
+
+
+@pytest.mark.parametrize(
+    "first_loader",
+    ["fixture_first", "capital_flow_loader_first", "plain_import_first", "report_test_first"],
+)
+def test_report_module_is_one_object_in_every_import_order(first_loader: str) -> None:
+    """Every loader returns the same ``sys.modules`` object whichever runs first (one subprocess
+    per order): nothing may ever overwrite an existing entry."""
+    import subprocess
+    import sys as _sys
+
+    steps = {
+        "fixture_first": "from tests.support.aut2_fixtures import portfolio_roi_module as f; f()",
+        "capital_flow_loader_first": (
+            "import tests.unit.test_polymarket_us_capital_flow_pull as c; c._load_report_module()"
+        ),
+        "plain_import_first": "import portfolio_roi_report",
+        "report_test_first": "import tests.unit.test_portfolio_roi_report",
+    }
+    code = (
+        f"{steps[first_loader]}\n"
+        "import sys\n"
+        "from tests.support.aut2_fixtures import portfolio_roi_module\n"
+        "import tests.unit.test_polymarket_us_capital_flow_pull as c\n"
+        "import tests.unit.test_portfolio_roi_report as r\n"
+        "import portfolio_roi_report as plain\n"
+        "m = sys.modules['portfolio_roi_report']\n"
+        "assert portfolio_roi_module() is m\n"
+        "assert c._load_report_module() is m\n"
+        "assert r._prr is m\n"
+        "assert plain is m\n"
+    )
+    root = _REPO_ROOT
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(Path.home()),
+        "PYTHONPATH": f"{root}:{root / 'src'}:{root / 'scripts' / 'analysis'}",
+        "PYTEST_CURRENT_TEST": "subprocess-order-check",
+    }
+
+    proc = subprocess.run(
+        [_sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-800:]

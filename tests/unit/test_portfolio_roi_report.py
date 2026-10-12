@@ -55,17 +55,10 @@ def _all_json_keys(node: Any) -> set[str]:
 
 
 def _load_module() -> ModuleType:
-    existing = sys.modules.get("portfolio_roi_report")
-    if existing is not None:  # one object for every importer, whatever the import order (TE-1 M5)
-        return existing
-    path = _SCRIPTS_ANALYSIS_DIR / "portfolio_roi_report.py"
-    spec = importlib.util.spec_from_file_location("portfolio_roi_report", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    # one idempotent loader for every importer, whatever the import order (TE-1)
+    from tests.support.portfolio_roi_loader import load_portfolio_roi_report
+
+    return load_portfolio_roi_report()
 
 
 _prr = _load_module()

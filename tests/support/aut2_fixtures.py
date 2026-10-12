@@ -238,16 +238,6 @@ def make_recon_facts(**over: Any) -> ReconFacts:
 
 def portfolio_roi_module() -> Any:
     """The ``scripts/analysis/portfolio_roi_report.py`` module, loaded once and shared."""
-    import importlib.util
-    import sys
+    from tests.support.portfolio_roi_loader import load_portfolio_roi_report
 
-    existing = sys.modules.get("portfolio_roi_report")
-    if existing is not None:
-        return existing
-    path = Path(__file__).resolve().parents[2] / "scripts" / "analysis" / "portfolio_roi_report.py"
-    spec = importlib.util.spec_from_file_location("portfolio_roi_report", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_portfolio_roi_report()

@@ -656,6 +656,14 @@ def _write_minimal_aud04_report(
         "roi": "0.10",
         "roi_minus_b0": "0.10",
         "roi_minus_b1": "0.10",
+        # schema_version=5 REQUIRES the accounting view (null allowed); this minimal producer
+        # fixture stamps the CURRENT version, so it carries the v5 keys with neutral values
+        "realised_pnl_accounting_total": str(realised_pnl_after_fees_total),
+        "roi_accounting": None,
+        "roi_accounting_status": prr.ROI_STATUS_OK,
+        "fill_pnl": [],
+        "family_pnl": [],
+        "disclosures": None,
         # AUD-04 schema_version=2 requires this key (Stage C3's per-trial
         # P&L breakdown); one row, summing exactly to
         # `realised_pnl_after_fees_total` (the sum invariant), matching this

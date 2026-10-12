@@ -386,14 +386,9 @@ def test_not_an_execution_egress_module() -> None:
 
 
 def _load_report_module() -> ModuleType:
-    path = _REPO_ROOT / "scripts" / "analysis" / "portfolio_roi_report.py"
-    spec = importlib.util.spec_from_file_location("portfolio_roi_report", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    from tests.support.portfolio_roi_loader import load_portfolio_roi_report
+
+    return load_portfolio_roi_report()
 
 
 def test_puller_dir_matches_report_dir_rule(
