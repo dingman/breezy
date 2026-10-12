@@ -12,7 +12,9 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -157,7 +159,6 @@ def test_pre_trade_capture_rows_are_emitted_without_reading_tape() -> None:
         firewall_class="PRE_FREEZE",
         window=window,
         clean_instances=7,
-        corrupt_instances=0,
         trade_parse_failed=True,
         spans=(),
         prints=(),
@@ -194,7 +195,6 @@ def test_coverage_is_alive_span_minus_gaps_not_book_density() -> None:
         firewall_class="PRE_FREEZE",
         window=_LAX_WINDOW,
         clean_instances=1,
-        corrupt_instances=0,
         trade_parse_failed=False,
         spans=(span,),
         prints=(),  # zero prints at all: a quiet book is still a covered day
@@ -217,7 +217,6 @@ def test_tail_span_only_failure_is_flagged() -> None:
             firewall_class="PRE_FREEZE",
             window=_LAX_WINDOW,
             clean_instances=1,
-            corrupt_instances=0,
             trade_parse_failed=False,
             spans=(AliveSpan(start, start + alive_minutes * 60 * _NS, ()),),
             prints=(),
@@ -232,7 +231,6 @@ def test_tail_span_only_failure_is_flagged() -> None:
         firewall_class="PRE_FREEZE",
         window=_LAX_WINDOW,
         clean_instances=1,
-        corrupt_instances=0,
         trade_parse_failed=False,
         spans=(
             AliveSpan(
@@ -317,7 +315,6 @@ def _covered_row(
         firewall_class="PRE_FREEZE",
         window=_LAX_WINDOW,
         clean_instances=1,
-        corrupt_instances=0,
         trade_parse_failed=False,
         spans=(AliveSpan(start, end, ()),),
         prints=prints,
@@ -377,6 +374,7 @@ def test_zero_covered_days_is_underpowered_with_no_fillability_ratio() -> None:
     assert summary.n_cov == 0
     assert summary.c is None
     assert summary.stops == ("S-1",)
+    assert summary.s5_unscreened
 
 
 def test_censused_days_round_trip_refuses_extra_keys_and_duplicates(tmp_path: Path) -> None:
@@ -596,8 +594,11 @@ def test_main_writes_output_prints_provenance_and_the_stop_lines(
     )  # fmt: skip
 
     captured = capsys.readouterr()
-    assert code == 0
+    assert code == 4  # S-5 UNSCREENED: 1 covered station-day < 10
     assert [r.reason for r in read_censused_days(output)] == ["COVERED"]
+    assert "STOP S-5 UNSCREENED (covered_days=1 < 10)" in captured.out
+    assert "NO-GO" not in captured.out and "KILL-LIKELY" not in captured.out
+    assert "INFO bidlive:" in captured.out
     assert "census_provenance:" in captured.out
     assert "STOP S-1 UNDERPOWERED" in captured.out
     assert "inst-a" in captured.err  # one progress line per instance (the stall watch keys on it)
@@ -612,7 +613,7 @@ def test_nyc_prints_never_reach_a_count_in_the_script(tmp_path: Path) -> None:
     assert sorted(r.station for r in result.rows) == ["LAX", "MIA"]
     lax = next(r for r in result.rows if r.station == "LAX")
     assert sum(lax.buyer_by_bucket) == 2  # NYC 0.50 buyer and the D+1 0.50 buyer are absent
-    assert next(r for r in result.rows if r.station == "MIA").reason == "NO_CLEAN_INSTANCE"
+    assert next(r for r in result.rows if r.station == "MIA").reason == "NEVER_LISTED"
     with pytest.raises(FirewallRefused):
         _run(capture, tmp_path, stations=("NYC",))
 
@@ -645,7 +646,8 @@ def test_live_instance_is_counted_never_read(
 
     assert converted == []
     assert result.instance_counts["LIVE"] == 1
-    assert [r.reason for r in result.rows] == ["NO_CLEAN_INSTANCE"]
+    assert [r.reason for r in result.rows] == ["AMBIGUOUS_NO_CLEAN_INSTANCE"]
+    assert result.rows[0].instances_live_unread == 1
     assert result.rows[0].buyer_by_bucket == (0, 0, 0, 0)
 
 
@@ -705,5 +707,185 @@ def test_script_refuses_post_freeze_days_with_a_mismatched_declaration(
 
     assert (refused, missing) == (2, 2)
     assert "FirewallRefused" in capsys.readouterr().err
-    assert cleared == 0
-    assert [r.reason for r in read_censused_days(tmp_path / "out.jsonl")] == ["NO_CLEAN_INSTANCE"]
+    assert cleared == 4  # cleared and read; nothing covered, so S-5 is UNSCREENED
+    assert [r.reason for r in read_censused_days(tmp_path / "out.jsonl")] == ["NEVER_LISTED"]
+
+
+# --------------------------------------------------------------------------------------
+# Review round: bid-live columns, scope filtering, reasons, S-5 guard, exit codes
+# --------------------------------------------------------------------------------------
+
+
+def test_bidlive_window_constants_are_the_spec_permit_window() -> None:
+    assert mtc.BIDLIVE_START_HHMM_UTC == (16, 50)
+    assert mtc.BIDLIVE_END_HHMM_UTC == (2, 50)
+
+    start, end = mtc.bidlive_window_ns(climate_day=_DAY, window=_LAX_WINDOW)
+
+    assert start == _ns("2026-09-21T16:50:00")
+    assert end == _ns("2026-09-22T02:50:00")
+    assert _LAX_WINDOW.start_ns < start and end < _LAX_WINDOW.end_ns  # a strict sub-window
+
+
+def test_print_in_plan_window_outside_bidlive_counts_in_n_but_not_n_bidlive() -> None:
+    inside = PrintRecord("in", _ns("2026-09-21T20:00:00"), Decimal("0.25"), "BUYER", "r1")
+    plan_only = PrintRecord("out", _ns("2026-09-22T06:00:00"), Decimal("0.35"), "BUYER", "r1")
+
+    row = _covered_row((inside, plan_only))
+
+    assert (row.n_prints, row.n_prints_bidlive) == (2, 1)
+    assert row.buyer_by_bucket == (0, 0, 1, 1)
+    assert row.buyer_by_bucket_bidlive == (0, 0, 1, 0)
+    assert row.covered_bidlive is True
+
+
+def test_bidlive_covered_flag_survives_a_plan_window_failure() -> None:
+    start = _ns("2026-09-21T16:00:00")
+    spans = (AliveSpan(start, _ns("2026-09-22T03:00:00"), ()),)  # bid-live fully alive, plan 43%
+
+    row = classify(
+        station="LAX",
+        climate_day=_DAY,
+        firewall_class="PRE_FREEZE",
+        window=_LAX_WINDOW,
+        clean_instances=1,
+        trade_parse_failed=False,
+        spans=spans,
+        prints=(PrintRecord("a", _ns("2026-09-21T20:00:00"), Decimal("0.25"), "BUYER", "r"),),
+        first_seen_ns=None,
+    )
+
+    assert row.reason == "LOW_COVERAGE"
+    assert row.n_prints == 0  # the plan-window basis is unchanged
+    assert row.covered_bidlive is True and row.n_prints_bidlive == 1
+    summary = summarise([row])
+    assert (summary.n_cov, summary.n_cov_bidlive, summary.c_bidlive) == (0, 1, 1.0)
+
+
+def test_summary_carries_bidlive_fields_alongside_the_plan_figures() -> None:
+    def day_row(station: str, day: dt.date, ts: str) -> CensusedDay:
+        prints = (PrintRecord(f"{station}{day}", _ns(ts), Decimal("0.25"), "BUYER", "r"),)
+        return _covered_row(prints, station=station, day=day)
+
+    # Same window anchor for both days is not needed: only the print's own clock matters.
+    rows = [
+        day_row("LAX", _DAY, "2026-09-21T20:00:00"),  # inside bid-live
+        day_row("MIA", _DAY, "2026-09-22T06:00:00"),  # plan window only
+    ]
+
+    summary = summarise(rows)
+
+    assert (summary.n_cov, summary.d_cov, summary.c) == (2, 1, 1.0)
+    assert (summary.n_cov_bidlive, summary.d_cov_bidlive) == (2, 1)
+    assert summary.c_bidlive == pytest.approx(0.5)
+    assert summary.n_eff_ub_bidlive == pytest.approx(2 / 1.5)
+    assert summary.stops == ("S-1",)  # bid-live figures never add or remove a STOP
+
+
+def test_s5_is_unscreened_below_ten_covered_station_days_and_evaluated_at_ten() -> None:
+    def quiet(count: int) -> Any:
+        stations = ("LAX", "MDW", "MIA", "SFO")
+        rows = [
+            _covered_row((), station=stations[i % 4], day=_DAY + dt.timedelta(days=i // 4))
+            for i in range(count)
+        ]
+        return summarise(rows)
+
+    nine = quiet(9)
+    ten = quiet(10)
+
+    assert nine.c == 0.0 and nine.s5_unscreened is True
+    assert "S-5" not in nine.stops and nine.flag is None
+    assert ten.s5_unscreened is False and "S-5" in ten.stops
+
+
+def test_nyc_only_capture_contributes_nothing_and_is_only_counted(tmp_path: Path) -> None:
+    capture = tmp_path / "capture"
+    nyc = _instrument(_slug("nyc", "2026-09-22"), _ns("2026-09-21T12:00:00"))
+    gap = QuoteTapeGap(
+        instrument_id=nyc.id,
+        gap_seq=1,
+        started_ns=_ns("2026-09-22T01:00:00"),
+        ended_ns=_ns("2026-09-22T02:00:00"),
+        resolved=True,
+        recorder_instance_id="11111111-1111-1111-1111-111111111111",
+        ts_event=_ns("2026-09-22T01:00:00"),
+        ts_init=_ns("2026-09-22T02:00:00"),
+    )
+    _write_instance(
+        capture,
+        "inst-nyc",
+        instruments=[nyc],
+        trades=[_trade(nyc, "n", "0.500", AggressorSide.BUYER, _ns("2026-09-22T05:00:00"))],
+        alive=(_ns("2026-09-21T12:00:00"), _ns("2026-09-22T09:00:00")),
+        gaps=(gap,),
+    )
+
+    result = _run(capture, tmp_path)
+
+    (row,) = result.rows
+    assert (row.reason, row.first_seen_ns, row.instances_clean) == ("NEVER_LISTED", None, 0)
+    assert result.rows_discarded_out_of_scope >= 3  # instrument + gap + print, values dropped
+
+    work = ParquetDataCatalog(str(tmp_path / "direct"))
+    census_script.convert_instance(ParquetDataCatalog(str(capture)), "inst-nyc", work)
+    scope = census_script._Scope(frozenset({_DAY}), frozenset({"LAX"}))
+    assert census_script._gaps_by_station_day(work, scope) == {}
+    assert census_script._first_seen_by_station_day(work, scope) == {}
+    assert scope.discarded >= 2
+
+
+def test_corrupt_instance_is_ambiguous_not_never_listed_and_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    lax = _instrument(_slug("lax", "2026-09-22"), _ns("2026-09-21T12:30:00"))
+    directory = _write_instance(
+        capture,
+        "inst-corrupt",
+        instruments=[lax],
+        trades=[_trade(lax, "t", "0.250", AggressorSide.BUYER, _ns("2026-09-22T05:00:00"))],
+        alive=(_ns("2026-09-21T12:00:00"), _ns("2026-09-22T09:00:00")),
+    )
+    victim = next(directory.rglob("trade_tick/**/*.feather"))
+    with victim.open("r+b") as handle:
+        handle.truncate(victim.stat().st_size - 16)
+    stale = time.time() - 30 * 86400
+    os.utime(victim, (stale, stale))
+    converted: list[str] = []
+
+    def refuse_to_convert(catalog: Any, instance_id: str, *args: Any, **kwargs: Any) -> str:
+        converted.append(instance_id)
+        return "converted"
+
+    monkeypatch.setattr(census_script, "default_convert", refuse_to_convert)
+
+    result = _run(capture, tmp_path, stations=("LAX", "MIA"))
+
+    assert converted == []
+    assert result.instance_counts["CORRUPT"] == 1
+    by_station = {r.station: r for r in result.rows}
+    assert by_station["LAX"].reason == "AMBIGUOUS_NO_CLEAN_INSTANCE"
+    assert by_station["LAX"].instances_corrupt_unread == 1
+    assert by_station["MIA"].reason == "NEVER_LISTED"
+    assert summarise(result.rows).n_cov == 0  # neither reason is in any denominator
+
+
+def test_io_failure_exits_3_with_its_own_prefix_not_the_refusal_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = census_script.main(
+        [
+            "--from", "2026-09-22",
+            "--to", "2026-09-22",
+            "--stations", "LAX",
+            "--catalog-root", str(tmp_path / "capture"),
+            "--work-root", str(tmp_path / "work"),
+            "--output", str(tmp_path / "out.jsonl"),
+            "--search-declaration", str(tmp_path / "missing.md"),
+        ]
+    )  # fmt: skip
+
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "IO_FAILED" in err and "REFUSED" not in err

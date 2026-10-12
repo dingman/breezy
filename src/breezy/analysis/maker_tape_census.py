@@ -42,6 +42,7 @@ __all__ = [
     "PrintRecord",
     "PrintTally",
     "admit_print",
+    "bidlive_window_ns",
     "classify",
     "covered_intervals",
     "maker_window_ns",
@@ -111,10 +112,21 @@ BUYER: Final[str] = "BUYER"
 SELLER: Final[str] = "SELLER"
 NO_AGGRESSOR: Final[str] = "NO_AGGRESSOR"
 
+#: S-5 is a NO-GO pre-screen on a point estimate; below this many covered
+#: bid-bearing station-days it is reported UNSCREENED, never NO-GO/KILL-LIKELY.
+S5_MIN_COVERED: Final[int] = 10
+
+#: Bid-live sub-window (spec section 3: the permit binds first; 16:50Z launch +
+#: 10 h). A resting bid for climate day D can only exist from D-1 16:50Z to
+#: D 02:50Z. The plan window (23 h) stays the pre-registered STOP basis; the
+#: bid-live columns are a parallel report, intersected with it.
+BIDLIVE_START_HHMM_UTC: Final[tuple[int, int]] = (16, 50)  # on D-1
+BIDLIVE_END_HHMM_UTC: Final[tuple[int, int]] = (2, 50)  # on D
+
 REASONS: Final[tuple[str, ...]] = (
     "PRE_TRADE_CAPTURE",
-    "NO_CLEAN_INSTANCE",
-    "CORRUPT_ONLY",
+    "NEVER_LISTED",
+    "AMBIGUOUS_NO_CLEAN_INSTANCE",
     "TRADE_PARSE_FAILURE",
     "LOW_COVERAGE",
     "LONG_HOLE",
@@ -153,6 +165,14 @@ def maker_window_ns(*, climate_day: dt.date, std_utc_offset_hours: float) -> Mak
     if lst_end < stale_end:
         return MakerWindow(start, lst_end, "CANCEL_LST")
     return MakerWindow(start, stale_end, "STALE_DERIVED")
+
+
+def bidlive_window_ns(*, climate_day: dt.date, window: MakerWindow) -> tuple[int, int]:
+    """``[D-1 16:50Z, D 02:50Z)`` intersected with the plan window (spec section 3)."""
+    prior = climate_day - dt.timedelta(days=1)
+    start = _utc_ns(prior, BIDLIVE_START_HHMM_UTC[0]) + BIDLIVE_START_HHMM_UTC[1] * _MINUTE_NS
+    end = _utc_ns(climate_day, BIDLIVE_END_HHMM_UTC[0]) + BIDLIVE_END_HHMM_UTC[1] * _MINUTE_NS
+    return max(start, window.start_ns), min(end, window.end_ns)
 
 
 def require_firewall_clearance(
@@ -331,6 +351,7 @@ class PrintTally:
     prints_seller: int
     prints_no_aggressor: int
     rungs_with_qualifying_buyer: int
+    n_prints: int = 0
 
 
 def _bucket_index(price: Decimal) -> int | None:
@@ -367,20 +388,29 @@ def tally_prints(prints: Iterable[PrintRecord], start_ns: int, end_ns: int) -> P
         else:
             no_aggressor += 1
     return PrintTally(
-        (buyers[0], buyers[1], buyers[2], buyers[3]), sellers, no_aggressor, len(qualifying_rungs)
+        (buyers[0], buyers[1], buyers[2], buyers[3]),
+        sellers,
+        no_aggressor,
+        len(qualifying_rungs),
+        len(seen),
     )
 
 
 # --- Rows -----------------------------------------------------------------------------
 _ROW_KEYS: Final[tuple[str, ...]] = (
     "buyer_by_bucket",
+    "buyer_by_bucket_bidlive",
     "climate_day",
+    "covered_bidlive",
     "coverage_fraction",
     "firewall_class",
     "first_seen_ns",
     "instances_clean",
-    "instances_corrupt",
+    "instances_corrupt_unread",
+    "instances_live_unread",
     "longest_hole_min",
+    "n_prints",
+    "n_prints_bidlive",
     "prints_no_aggressor",
     "prints_seller",
     "reason",
@@ -388,10 +418,21 @@ _ROW_KEYS: Final[tuple[str, ...]] = (
     "station",
     "tail_span_only",
 )
+_ZERO4: Final[tuple[int, int, int, int]] = (0, 0, 0, 0)
+
+
+def _four(raw: object) -> tuple[int, int, int, int]:
+    if not isinstance(raw, list) or len(raw) != len(PRICE_BUCKETS):
+        raise ValueError("bucket columns must be a list of four counts")
+    return (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
 
 
 @dataclass(frozen=True, slots=True)
 class CensusedDay:
+    """One station-day. ``instances_corrupt_unread`` / ``instances_live_unread`` count
+    CORRUPT / LIVE instances whose directory names list this station-day; their
+    bytes are never read (only the classifier's verdict is used)."""
+
     station: str
     climate_day: dt.date
     firewall_class: str
@@ -405,22 +446,37 @@ class CensusedDay:
     rungs_with_qualifying_buyer: int
     first_seen_ns: int | None
     instances_clean: int
-    instances_corrupt: int
+    instances_corrupt_unread: int
+    instances_live_unread: int = 0
+    n_prints: int = 0
+    # Parallel bid-live columns (sub-window; the plan window above stays the STOP basis).
+    covered_bidlive: bool = False
+    buyer_by_bucket_bidlive: tuple[int, int, int, int] = _ZERO4
+    n_prints_bidlive: int = 0
 
     @property
     def has_qualifying_buyer(self) -> bool:
         return self.buyer_by_bucket[2] + self.buyer_by_bucket[3] > 0
 
+    @property
+    def has_qualifying_buyer_bidlive(self) -> bool:
+        return self.buyer_by_bucket_bidlive[2] + self.buyer_by_bucket_bidlive[3] > 0
+
     def to_dict(self) -> dict[str, object]:
         return {
             "buyer_by_bucket": list(self.buyer_by_bucket),
+            "buyer_by_bucket_bidlive": list(self.buyer_by_bucket_bidlive),
             "climate_day": self.climate_day.isoformat(),
+            "covered_bidlive": self.covered_bidlive,
             "coverage_fraction": self.coverage_fraction,
             "firewall_class": self.firewall_class,
             "first_seen_ns": self.first_seen_ns,
             "instances_clean": self.instances_clean,
-            "instances_corrupt": self.instances_corrupt,
+            "instances_corrupt_unread": self.instances_corrupt_unread,
+            "instances_live_unread": self.instances_live_unread,
             "longest_hole_min": self.longest_hole_min,
+            "n_prints": self.n_prints,
+            "n_prints_bidlive": self.n_prints_bidlive,
             "prints_no_aggressor": self.prints_no_aggressor,
             "prints_seller": self.prints_seller,
             "reason": self.reason,
@@ -432,12 +488,8 @@ class CensusedDay:
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> CensusedDay:
         if set(raw) != set(_ROW_KEYS):
-            raise ValueError(
-                f"censused day keys differ from the schema: {sorted(set(raw) ^ set(_ROW_KEYS))}"
-            )
-        buckets = raw["buyer_by_bucket"]
-        if not isinstance(buckets, list) or len(buckets) != len(PRICE_BUCKETS):
-            raise ValueError("buyer_by_bucket must be a list of four counts")
+            diff = sorted(set(raw) ^ set(_ROW_KEYS))
+            raise ValueError(f"censused day keys differ from the schema: {diff}")
         reason = str(raw["reason"])
         if reason not in REASONS:
             raise ValueError(f"unknown reason {reason!r}")
@@ -453,29 +505,64 @@ class CensusedDay:
             coverage_fraction=float(str(raw["coverage_fraction"])),
             longest_hole_min=int(str(raw["longest_hole_min"])),
             tail_span_only=bool(raw["tail_span_only"]),
-            buyer_by_bucket=(int(buckets[0]), int(buckets[1]), int(buckets[2]), int(buckets[3])),
+            buyer_by_bucket=_four(raw["buyer_by_bucket"]),
             prints_seller=int(str(raw["prints_seller"])),
             prints_no_aggressor=int(str(raw["prints_no_aggressor"])),
             rungs_with_qualifying_buyer=int(str(raw["rungs_with_qualifying_buyer"])),
             first_seen_ns=None if first_seen is None else int(str(first_seen)),
             instances_clean=int(str(raw["instances_clean"])),
-            instances_corrupt=int(str(raw["instances_corrupt"])),
+            instances_corrupt_unread=int(str(raw["instances_corrupt_unread"])),
+            instances_live_unread=int(str(raw["instances_live_unread"])),
+            n_prints=int(str(raw["n_prints"])),
+            covered_bidlive=bool(raw["covered_bidlive"]),
+            buyer_by_bucket_bidlive=_four(raw["buyer_by_bucket_bidlive"]),
+            n_prints_bidlive=int(str(raw["n_prints_bidlive"])),
         )
 
 
-def _empty_row(
+class _Bidlive(NamedTuple):
+    covered: bool
+    buckets: tuple[int, int, int, int]
+    n_prints: int
+
+
+_NO_BIDLIVE: Final[_Bidlive] = _Bidlive(False, _ZERO4, 0)
+
+
+def _bidlive(
+    climate_day: dt.date,
+    window: MakerWindow,
+    spans: Sequence[AliveSpan],
+    prints: Sequence[PrintRecord],
+) -> _Bidlive:
+    """Same coverage gates and print tally, on the bid-live sub-window."""
+    bounds = bidlive_window_ns(climate_day=climate_day, window=window)
+    if bounds[1] <= bounds[0]:
+        return _NO_BIDLIVE
+    cover = _coverage(bounds, covered_intervals(bounds, spans))
+    if not _passes(cover.fraction, cover.longest_hole_ns):
+        return _NO_BIDLIVE
+    tally = tally_prints(prints, *bounds)
+    return _Bidlive(True, tally.buyer_by_bucket, tally.n_prints)
+
+
+def _row(
     station: str,
     climate_day: dt.date,
     firewall_class: str,
     reason: str,
     *,
     clean: int,
-    corrupt: int,
+    corrupt_unread: int,
+    live_unread: int,
     first_seen_ns: int | None,
     coverage_fraction: float = 0.0,
     longest_hole_min: int = 0,
     tail_span_only: bool = False,
+    tally: PrintTally | None = None,
+    bidlive: _Bidlive = _NO_BIDLIVE,
 ) -> CensusedDay:
+    counted = tally if tally is not None else PrintTally(_ZERO4, 0, 0, 0, 0)
     return CensusedDay(
         station=station,
         climate_day=climate_day,
@@ -484,13 +571,18 @@ def _empty_row(
         coverage_fraction=coverage_fraction,
         longest_hole_min=longest_hole_min,
         tail_span_only=tail_span_only,
-        buyer_by_bucket=(0, 0, 0, 0),
-        prints_seller=0,
-        prints_no_aggressor=0,
-        rungs_with_qualifying_buyer=0,
+        buyer_by_bucket=counted.buyer_by_bucket,
+        prints_seller=counted.prints_seller,
+        prints_no_aggressor=counted.prints_no_aggressor,
+        rungs_with_qualifying_buyer=counted.rungs_with_qualifying_buyer,
         first_seen_ns=first_seen_ns,
         instances_clean=clean,
-        instances_corrupt=corrupt,
+        instances_corrupt_unread=corrupt_unread,
+        instances_live_unread=live_unread,
+        n_prints=counted.n_prints,
+        covered_bidlive=bidlive.covered,
+        buyer_by_bucket_bidlive=bidlive.buckets,
+        n_prints_bidlive=bidlive.n_prints,
     )
 
 
@@ -501,40 +593,49 @@ def classify(
     firewall_class: str,
     window: MakerWindow,
     clean_instances: int,
-    corrupt_instances: int,
     trade_parse_failed: bool,
     spans: Sequence[AliveSpan],
     prints: Iterable[PrintRecord],
     first_seen_ns: int | None,
+    corrupt_unread: int = 0,
+    live_unread: int = 0,
 ) -> CensusedDay:
     """One row per station-day, ``reason`` from the closed alphabet.
 
-    Precedence: PRE_TRADE_CAPTURE (decided from the window alone, no tape is
-    consulted), NO_CLEAN_INSTANCE, CORRUPT_ONLY, TRADE_PARSE_FAILURE (never a
-    silent lower count), LOW_COVERAGE, LONG_HOLE, COVERED. Counts are only
-    populated for COVERED days; every other row carries zeros.
+    Precedence: PRE_TRADE_CAPTURE (from the window alone, no tape consulted);
+    with no CLEAN instance, AMBIGUOUS_NO_CLEAN_INSTANCE (a LIVE/CORRUPT instance
+    lists the day, so the absence is not evidence) or NEVER_LISTED;
+    TRADE_PARSE_FAILURE (never a silent lower count); LOW_COVERAGE; LONG_HOLE;
+    COVERED. Plan-window counts are populated only for COVERED days. The
+    bid-live columns are computed whenever the tape was read cleanly, even if
+    the 23 h plan window failed its gates.
     """
     if window.start_ns < TRADE_CAPTURE_START_NS:
-        return _empty_row(
+        return _row(
             station, climate_day, firewall_class, "PRE_TRADE_CAPTURE",
-            clean=0, corrupt=0, first_seen_ns=None,
+            clean=0, corrupt_unread=0, live_unread=0, first_seen_ns=None,
         )  # fmt: skip
     if clean_instances == 0:
-        reason = "CORRUPT_ONLY" if corrupt_instances > 0 else "NO_CLEAN_INSTANCE"
-        return _empty_row(
+        ambiguous = corrupt_unread + live_unread > 0
+        reason = "AMBIGUOUS_NO_CLEAN_INSTANCE" if ambiguous else "NEVER_LISTED"
+        return _row(
             station, climate_day, firewall_class, reason,
-            clean=0, corrupt=corrupt_instances, first_seen_ns=first_seen_ns,
+            clean=0, first_seen_ns=first_seen_ns,
+            corrupt_unread=corrupt_unread, live_unread=live_unread,
         )  # fmt: skip
     if trade_parse_failed:
-        return _empty_row(
+        return _row(
             station, climate_day, firewall_class, "TRADE_PARSE_FAILURE",
-            clean=clean_instances, corrupt=corrupt_instances, first_seen_ns=first_seen_ns,
+            clean=clean_instances, first_seen_ns=first_seen_ns,
+            corrupt_unread=corrupt_unread, live_unread=live_unread,
         )  # fmt: skip
 
+    materialised = tuple(prints)
     bounds = (window.start_ns, window.end_ns)
     covered = covered_intervals(bounds, spans)
     cover = _coverage(bounds, covered)
     hole_min = cover.longest_hole_ns // _MINUTE_NS
+    bidlive = _bidlive(climate_day, window, spans, materialised)
     failure = (
         "LOW_COVERAGE"
         if cover.fraction < COVERAGE_MIN
@@ -543,29 +644,20 @@ def classify(
         else None
     )
     if failure is not None:
-        return _empty_row(
+        return _row(
             station, climate_day, firewall_class, failure,
-            clean=clean_instances, corrupt=corrupt_instances, first_seen_ns=first_seen_ns,
+            clean=clean_instances, first_seen_ns=first_seen_ns,
+            corrupt_unread=corrupt_unread, live_unread=live_unread,
             coverage_fraction=cover.fraction, longest_hole_min=hole_min,
-            tail_span_only=_tail_span_only(bounds, covered),
+            tail_span_only=_tail_span_only(bounds, covered), bidlive=bidlive,
         )  # fmt: skip
-    tally = tally_prints(prints, window.start_ns, window.end_ns)
-    return CensusedDay(
-        station=station,
-        climate_day=climate_day,
-        firewall_class=firewall_class,
-        reason="COVERED",
-        coverage_fraction=cover.fraction,
-        longest_hole_min=hole_min,
-        tail_span_only=False,
-        buyer_by_bucket=tally.buyer_by_bucket,
-        prints_seller=tally.prints_seller,
-        prints_no_aggressor=tally.prints_no_aggressor,
-        rungs_with_qualifying_buyer=tally.rungs_with_qualifying_buyer,
-        first_seen_ns=first_seen_ns,
-        instances_clean=clean_instances,
-        instances_corrupt=corrupt_instances,
-    )
+    return _row(
+        station, climate_day, firewall_class, "COVERED",
+        clean=clean_instances, first_seen_ns=first_seen_ns,
+            corrupt_unread=corrupt_unread, live_unread=live_unread,
+        coverage_fraction=cover.fraction, longest_hole_min=hole_min,
+        tally=tally_prints(materialised, *bounds), bidlive=bidlive,
+    )  # fmt: skip
 
 
 # --- Summary --------------------------------------------------------------------------
@@ -579,6 +671,22 @@ class CensusSummary:
     tail_span_only: int
     stops: tuple[str, ...]
     flag: str | None
+    s5_unscreened: bool = False
+    n_cov_bidlive: int = 0
+    d_cov_bidlive: int = 0
+    c_bidlive: float | None = None
+    n_eff_ub_bidlive: float = 0.0
+
+
+def _per_date(rows: Iterable[CensusedDay]) -> dict[dt.date, int]:
+    counts: dict[dt.date, int] = defaultdict(int)
+    for row in rows:
+        counts[row.climate_day] += 1
+    return counts
+
+
+def _n_eff(per_date: dict[dt.date, int]) -> float:
+    return sum(m / (1 + (m - 1) * RHO_ASSUMED) for m in per_date.values())
 
 
 def summarise(rows: Iterable[CensusedDay]) -> CensusSummary:
@@ -587,24 +695,30 @@ def summarise(rows: Iterable[CensusedDay]) -> CensusSummary:
     ``n_eff_ub = sum_d m_d / (1 + (m_d - 1) * RHO_ASSUMED)`` over covered
     station-day units ``m_d`` per climate date. ``C`` = covered station-days
     with >= 1 YES BUYER print at p_yes >= 0.20 in the window / ``N_cov``
-    (any rung, queue-blind: loose upward). PRE_TRADE_CAPTURE rows and every
-    non-COVERED row are excluded from every denominator.
+    (any rung, queue-blind: loose upward). Rows that are not COVERED
+    (PRE_TRADE_CAPTURE, NEVER_LISTED, AMBIGUOUS_NO_CLEAN_INSTANCE, ...) are
+    excluded from every denominator. S-1 and S-5 are evaluated on the PLAN
+    window; S-5 only once ``S5_MIN_COVERED`` station-days are covered, else it
+    is UNSCREENED. The ``*_bidlive`` figures are a parallel report on the
+    bid-live sub-window and never gate a STOP.
     """
     materialised = list(rows)
     covered = [r for r in materialised if r.reason == "COVERED"]
-    per_date: dict[dt.date, int] = defaultdict(int)
-    for row in covered:
-        per_date[row.climate_day] += 1
-    n_eff = sum(m / (1 + (m - 1) * RHO_ASSUMED) for m in per_date.values())
+    per_date = _per_date(covered)
+    n_eff = _n_eff(per_date)
     n_cov = len(covered)
     c = sum(1 for r in covered if r.has_qualifying_buyer) / n_cov if n_cov else None
     c_030 = sum(1 for r in covered if r.buyer_by_bucket[3] > 0) / n_cov if n_cov else None
+    screened = n_cov >= S5_MIN_COVERED
     stops: list[str] = []
     if n_eff < N_EFF_FLOOR:
         stops.append("S-1")
-    if c is not None and c < C_STOP:
+    if screened and c is not None and c < C_STOP:
         stops.append("S-5")
-    flag = "KILL-LIKELY" if c is not None and C_STOP <= c < C_FLAG else None
+    flag = "KILL-LIKELY" if screened and c is not None and C_STOP <= c < C_FLAG else None
+    live = [r for r in materialised if r.covered_bidlive]
+    live_dates = _per_date(live)
+    c_live = sum(1 for r in live if r.has_qualifying_buyer_bidlive) / len(live) if live else None
     return CensusSummary(
         n_cov=n_cov,
         d_cov=len(per_date),
@@ -614,6 +728,11 @@ def summarise(rows: Iterable[CensusedDay]) -> CensusSummary:
         tail_span_only=sum(1 for r in materialised if r.tail_span_only),
         stops=tuple(stops),
         flag=flag,
+        s5_unscreened=not screened,
+        n_cov_bidlive=len(live),
+        d_cov_bidlive=len(live_dates),
+        c_bidlive=c_live,
+        n_eff_ub_bidlive=_n_eff(live_dates),
     )
 
 

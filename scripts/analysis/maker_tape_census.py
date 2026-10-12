@@ -62,6 +62,7 @@ DEFAULT_WORK_ROOT: Final[Path] = Path.home() / ".cache/breezy/maker-s1-work"
 _DEFAULT_STATIONS: Final[str] = ",".join(sorted(core.MAKER_STATIONS))
 _EXIT_REFUSED: Final[int] = 2
 _EXIT_FAILED: Final[int] = 3
+_EXIT_UNSCREENED: Final[int] = 4
 
 _StationDay = tuple[str, dt.date]
 
@@ -72,6 +73,7 @@ class CensusRun:
     summary: core.CensusSummary
     instance_counts: Counter[str]
     instances_read: tuple[str, ...]
+    rows_discarded_out_of_scope: int = 0
 
 
 @dataclass
@@ -81,6 +83,8 @@ class _Accumulator:
     clean: int = 0
     parse_failed: bool = False
     first_seen_ns: int | None = None
+    corrupt_unread: int = 0
+    live_unread: int = 0
     spans: list[core.AliveSpan] = field(default_factory=list)
     prints: list[core.PrintRecord] = field(default_factory=list)
 
@@ -117,11 +121,28 @@ def _unwrap(item: Any) -> Any:
     return getattr(item, "data", item)
 
 
-def _first_seen_by_station_day(work: ParquetDataCatalog) -> dict[_StationDay, int]:
+@dataclass
+class _Scope:
+    """In-scope stations and days. Every stream is filtered through ``admits`` BEFORE any
+    gap / first-seen / coverage / count computation, so an out-of-scope row never enters a
+    computation (SEARCH declaration section 2). ``discarded`` counts them; no value is kept."""
+
+    days: frozenset[dt.date]
+    stations: frozenset[str]
+    discarded: int = 0
+
+    def admits(self, key: _StationDay | None) -> bool:
+        ok = key is not None and core.admit_print(key[0], key[1], self.days, self.stations)
+        if not ok:
+            self.discarded += 1
+        return ok
+
+
+def _first_seen_by_station_day(work: ParquetDataCatalog, scope: _Scope) -> dict[_StationDay, int]:
     first: dict[_StationDay, int] = {}
     for instrument in work.query(data_cls=BinaryOption):
         key = _station_day(instrument.id)
-        if key is not None:
+        if key is not None and scope.admits(key):
             first[key] = min(first.get(key, instrument.ts_init), instrument.ts_init)
     return first
 
@@ -131,11 +152,13 @@ def _alive_span(work: ParquetDataCatalog) -> tuple[int, int] | None:
     return (min(stamps), max(stamps)) if stamps else None
 
 
-def _gaps_by_station_day(work: ParquetDataCatalog) -> dict[_StationDay, list[core.GapInterval]]:
+def _gaps_by_station_day(
+    work: ParquetDataCatalog, scope: _Scope
+) -> dict[_StationDay, list[core.GapInterval]]:
     gaps: dict[_StationDay, list[core.GapInterval]] = defaultdict(list)
     for partition, records in load_partitioned_quote_tape_gaps(work).items():
         key = _station_day(partition.instrument_id)
-        if key is None:
+        if not scope.admits(key) or key is None:
             continue
         gaps[key].extend(
             core.GapInterval(g.started_ns, g.ended_ns if g.resolved else None) for g in records
@@ -144,13 +167,13 @@ def _gaps_by_station_day(work: ParquetDataCatalog) -> dict[_StationDay, list[cor
 
 
 def _admitted_prints(
-    work: ParquetDataCatalog, days: frozenset[dt.date], stations: frozenset[str]
+    work: ParquetDataCatalog, scope: _Scope
 ) -> dict[_StationDay, list[core.PrintRecord]]:
     out: dict[_StationDay, list[core.PrintRecord]] = defaultdict(list)
     for tick in work.query(data_cls=TradeTick):
         key = _station_day(tick.instrument_id)
         # Before any bucketing, count or log: NYC, D+1 and out-of-range slugs vanish here.
-        if key is None or not core.admit_print(key[0], key[1], days, stations):
+        if not scope.admits(key) or key is None:
             continue
         out[key].append(
             core.PrintRecord(
@@ -167,17 +190,14 @@ def _admitted_prints(
 def _read_instance(
     work: ParquetDataCatalog,
     parse_failed: bool,
-    days: frozenset[dt.date],
-    stations: frozenset[str],
+    scope: _Scope,
     ledger: dict[_StationDay, _Accumulator],
 ) -> None:
-    first_seen = _first_seen_by_station_day(work)
+    first_seen = _first_seen_by_station_day(work, scope)
     alive = _alive_span(work)
-    gaps = _gaps_by_station_day(work)
-    prints = _admitted_prints(work, days, stations)
+    gaps = _gaps_by_station_day(work, scope)
+    prints = _admitted_prints(work, scope)
     for key, seen_ns in first_seen.items():
-        if not core.admit_print(key[0], key[1], days, stations):
-            continue
         entry = ledger[key]
         entry.clean += 1
         entry.parse_failed = entry.parse_failed or parse_failed
@@ -187,6 +207,22 @@ def _read_instance(
         if alive is not None:
             entry.spans.append(core.AliveSpan(alive[0], alive[1], tuple(gaps.get(key, ()))))
         entry.prints.extend(prints.get(key, ()))
+
+
+def _listed_station_days(instance_dir: Path, scope: _Scope) -> set[_StationDay]:
+    """Station-days an UNREAD (LIVE/CORRUPT) instance lists, from directory NAMES only.
+
+    Per-instrument streams live at ``<class>/<instrument_id>/``; the instrument id is in
+    the directory name, so no feather byte is opened. A lower bound: an instance that
+    wrote only the flat ``binary_option`` file lists nothing here.
+    """
+    listed: set[_StationDay] = set()
+    for class_dir in (d for d in instance_dir.iterdir() if d.is_dir()):
+        for instrument_dir in (d for d in class_dir.iterdir() if d.is_dir()):
+            key = _station_day(instrument_dir.name)
+            if key is not None and scope.admits(key):
+                listed.add(key)
+    return listed
 
 
 def _check_work_root(work_root: Path, catalog_root: Path) -> None:
@@ -235,7 +271,7 @@ def run_census(
         for (_, day), (_, window) in plan.items()
         if window.start_ns >= core.TRADE_CAPTURE_START_NS
     )
-    station_set = frozenset(stations)
+    scope = _Scope(read_days, frozenset(stations))
     ledger: dict[_StationDay, _Accumulator] = defaultdict(_Accumulator)
     counts: Counter[str] = Counter()
     read: list[str] = []
@@ -256,6 +292,14 @@ def run_census(
             f"maker-s1-census: {position}/{len(instance_ids)} {instance_id} {verdict}",
             file=sys.stderr,
         )
+        if verdict in ("LIVE", "CORRUPT"):  # classifier verdict only; no byte is read
+            for key in _listed_station_days(
+                catalog_root / DEFAULT_SUBDIRECTORY / instance_id, scope
+            ):
+                if verdict == "LIVE":
+                    ledger[key].live_unread += 1
+                else:
+                    ledger[key].corrupt_unread += 1
         if verdict != "CLEAN":
             continue
         work_dir = work_root / instance_id
@@ -265,7 +309,7 @@ def run_census(
             work_dir.mkdir(parents=True, exist_ok=True)
             work = ParquetDataCatalog(str(work_dir))
             parse_failed = convert_instance(source, instance_id, work)
-            _read_instance(work, parse_failed, read_days, station_set, ledger)
+            _read_instance(work, parse_failed, scope, ledger)
             read.append(instance_id)
         finally:
             _cleanup_work_catalog(work_dir)
@@ -276,7 +320,7 @@ def run_census(
     rows = tuple(
         _row(key, plan[key], ledger.get(key)) for key in sorted(plan, key=lambda k: (k[0], k[1]))
     )
-    return CensusRun(rows, core.summarise(rows), counts, tuple(read))
+    return CensusRun(rows, core.summarise(rows), counts, tuple(read), scope.discarded)
 
 
 def _row(
@@ -290,7 +334,8 @@ def _row(
         firewall_class=firewall,
         window=window,
         clean_instances=entry.clean,
-        corrupt_instances=0,  # CORRUPT/LIVE instances are counted globally, never read (plan)
+        corrupt_unread=entry.corrupt_unread,
+        live_unread=entry.live_unread,
         trade_parse_failed=entry.parse_failed,
         spans=tuple(entry.spans),
         prints=tuple(entry.prints),
@@ -331,7 +376,7 @@ def _provenance(
     }
 
 
-def _report(summary: core.CensusSummary) -> list[str]:
+def _report(summary: core.CensusSummary, run: CensusRun) -> list[str]:
     lines = [
         "census_summary: "
         + json.dumps(
@@ -343,16 +388,34 @@ def _report(summary: core.CensusSummary) -> list[str]:
                 "C": summary.c,
                 "C_030": summary.c_030,
                 "tail_span_only_days": summary.tail_span_only,
+                "rows_discarded_out_of_scope": run.rows_discarded_out_of_scope,
+                "reasons": dict(Counter(r.reason for r in run.rows)),
             },
             sort_keys=True,
         )
     ]
     if "S-1" in summary.stops:
         lines.append(f"STOP S-1 UNDERPOWERED n_eff_ub={summary.n_eff_ub:.2f} < {core.N_EFF_FLOOR}")
+    if summary.s5_unscreened:
+        lines.append(f"STOP S-5 UNSCREENED (covered_days={summary.n_cov} < {core.S5_MIN_COVERED})")
     if "S-5" in summary.stops:
         lines.append(f"STOP S-5 NO-GO pre-screen C={summary.c} < {core.C_STOP}")
     if summary.flag is not None:
         lines.append(f"FLAG {summary.flag} C={summary.c} in [{core.C_STOP}, {core.C_FLAG})")
+    lines.append(
+        "INFO bidlive: "
+        + json.dumps(
+            {
+                "window": "[D-1 16:50Z, D 02:50Z) within the plan window (spec section 3)",
+                "N_cov_bidlive": summary.n_cov_bidlive,
+                "D_cov_bidlive": summary.d_cov_bidlive,
+                "C_bidlive": summary.c_bidlive,
+                "n_eff_ub_bidlive": round(summary.n_eff_ub_bidlive, 4),
+                "gates_no_stop": True,
+            },
+            sort_keys=True,
+        )
+    )
     return lines
 
 
@@ -384,16 +447,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             day_to=dt.date.fromisoformat(args.day_to),
             declaration_sha256=declaration,
         )
-    except (core.FirewallRefused, ValueError, OSError) as exc:
+    except (core.FirewallRefused, ValueError) as exc:
         print(f"maker-s1-census: REFUSED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_REFUSED
+    except OSError as exc:
+        print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
     except Exception as exc:  # noqa: BLE001 -- loud, never a partial output file
         print(f"maker-s1-census: FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_FAILED
-    core.write_censused_days(args.output.expanduser(), run.rows)
+    try:
+        core.write_censused_days(args.output.expanduser(), run.rows)
+    except OSError as exc:
+        print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
     print("census_provenance: " + json.dumps(_provenance(args, declaration, run), sort_keys=True))
-    print("\n".join(_report(run.summary)))
-    return 0
+    print("\n".join(_report(run.summary, run)))
+    return _EXIT_UNSCREENED if run.summary.s5_unscreened else 0
 
 
 if __name__ == "__main__":
