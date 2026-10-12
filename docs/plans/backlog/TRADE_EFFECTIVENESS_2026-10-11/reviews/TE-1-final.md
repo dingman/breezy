@@ -55,3 +55,8 @@ Build in this order: WP-A → WP-B → WP-D → WP-C → WP-E.
 - Stage 0 STOP at S0-2 (5 FQ fills on 10-06 vs retroactive terminal 10-05; `te1/TE1_STAGE0_RECORD_2026-10-11.md`). S0-2b PASS.
 - r3.4 (planner, Ruling R11 post-terminal straddle) → round 4: domain 80 RWC, python 84 RWC, architecture 88 RC → r3.5 merge → confirmations domain 90 RWC, python 86 RWC (same control-flow defect) → r3.6 coordinator text pass. Both confirmers: READY once r3.6 text applied. **READY r3.6.** Fallback: Claude reviewers (Grok 402; Codex not used for confirmation).
 - Binding stack: r3.3 + r3.4 + r3.5 + r3.6.
+
+## Build record (2026-10-11/12)
+- WP-A: 533fb7b3/b67fe609 + fixes c2838e17/86bc8418/ee803b18; reviews security RC→APPROVE, domain 78→91 APPROVE, python APPROVE (AUT-6 co-sign YES). Incident: a guard test reached the live host once aut2.label was pinned (spurious hold + CRITICAL page 20:20Z); fix = exact-unit + pytest refusal (L-57).
+- WP-B: 9bcd3e32/42802b47/658cd914/6880b0ea + fixes 74f545a7/f41b3e93; reviews domain 88 RC, python RC → all applied. Real-ledger acceptance: 34/4/−2.63; FQ 25/2/−2.17 (post-terminal 5, −0.52); crh −0.46; n_settlement_disagree 0; roi_accounting −0.3967.
+- Coordinator ruling (operator feedback 10-12, complexity): TE-1 closes at the REPORT level. WP-C/D/E (label-unit promotion, sizing, activation) SHELVED until a family trades; the write-once lag anchor follow-up goes with them.

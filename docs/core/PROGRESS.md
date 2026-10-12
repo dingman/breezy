@@ -83,10 +83,10 @@ Row 7: 7a WP1-9 inert OPEN; 7b WP10 GATED by NO-TRADE ruling (also rows 8-12 liv
 | 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
 Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
 
-### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`: 34 fills, 4 wins, −2.63 (corrected); plans `TE` = `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
+### TRADE EFFECTIVENESS (audit `docs/evidence/TRADE_EFFECTIVENESS_2026-10-11.md`; plans `docs/plans/backlog/TRADE_EFFECTIVENESS_2026-10-11/`)
 | ID | Open work (exact) | Status |
 |---|---|---|
-| TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.6 (S0 STOP→R11); WP-A building |
+| TE-1 | WP-A+WP-B merged (f41b3e93): report books all 34 fills; NO_INPUT ended; WP-C/D/E label-unit promotion SHELVED (no family trades) | PARTIAL |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
@@ -106,7 +106,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 |---|---|
 | AMBIG-LATCH-RESUME | A+B LIVE; §5.4 boot proof DONE 10-10 16:50Z (`no_id_retire_admitted=True`). Owed: in-service proof at next AMBIGUOUS. Follow-ups: RESOLVER-PAGE-LOOP-DRY; prune inert pre-POST context rows (LOW) |
 | SUP-RESTART-ANYTIME | merged d47ead9a, supervisor restarted 10-09 01:05Z (RESULT=OK, node pid kept). Owed: D2.4 proof ≥17:10Z 10-09 (`ready_adoption_terminal verdict=not_required`), no hourly false permit_absent CRITICAL |
-| CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
+| CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test. FD-FLAKE: bind_integrity + run_mounts fd-set tests each failed once in full gates 10-11/12, green isolated; 3rd → per-test fd snapshot |
 
 ### Comment backlog (R0.1)
 - Queue live-file comment/docstring fixes for the next real edit of each file: `websocket.py:61-63` wrong `retry.py` lines; `operator_controls.py:267` non-existent `RiskLimits` and `:271-275` stale ledger persistence wording; `signing.py` / `write_transport.py:6` stale cage docstrings; `exec/client.py:660` cites `risk.py:139` but the flag is at `:224`.
@@ -122,7 +122,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 
 ## Pointers
 
-Audit backlog 09-21 (AUD-01..19; open/partial items listed in BACKLOG above): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
+Audit backlog 09-21: `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
 (binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
