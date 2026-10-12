@@ -20,6 +20,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, cast
 
+import scripts.analysis.fq_loss_taxonomy_provenance as provenance
 from breezy.analysis.labeling.fill_source import FillRead
 from breezy.analysis.labeling.settlement_source import SettlementSource
 from scripts.analysis.fq_loss_taxonomy_battery import BatteryResult, run_battery
@@ -31,12 +32,7 @@ from scripts.analysis.fq_loss_taxonomy_fills import (
     k4_mismatches,
     t_edge,
 )
-from scripts.analysis.fq_loss_taxonomy_pins import (
-    GitPort,
-    RefusalReason,
-    phase_b_refusals,
-    post_hoc_violations,
-)
+from scripts.analysis.fq_loss_taxonomy_pins import GitPort, RefusalReason, phase_b_refusals
 from scripts.analysis.fq_loss_taxonomy_predecl import (
     Predeclaration,
     PredeclarationError,
@@ -75,7 +71,7 @@ from scripts.analysis.fq_loss_taxonomy_verdict import (
 
 EXIT_STOP: Final = 2
 RESULT_STEM: Final = "fq_v1_loss_taxonomy"
-CLI_PATH: Final = "scripts/analysis/fq_v1_loss_taxonomy.py"
+CLI_PATH: Final = provenance.CLI_PATH
 _TESTS: Final = ("T-WIN", "T-LOC", "T-SPREAD", "T-ART")
 _CAVEATS: Final = (
     "diagnostic, post-hoc: the audit and triage showed the headline direction before the freeze",
@@ -122,23 +118,40 @@ class Gates:
     pins: Mapping[str, Any]
     predeclaration: Predeclaration
     table: Mapping[str, Any]
+    script_sha256: str = ""  # sha256 of the RUNNING CLI file (equal to its pin once gates pass)
 
 
-def check_gates(inp: PhaseBInputs, git: GitPort) -> Gates:
-    """Every refusal reason at once (all checks run); raises ``PhaseBRefused`` when any fails."""
+_PINS_ERRORS = (OSError, ValueError, KeyError, RuntimeError, AttributeError, TypeError)
+
+
+def _pin_refusals(inp: PhaseBInputs, git: GitPort, locate: provenance.ModuleLocator) -> list[str]:
+    pinned = provenance.read_pins(inp.pins_json)
+    blobs, deps, pre_commit = pinned
+    reasons = provenance.provenance_refusals(inp.repo_root, inp.pins_json, pinned, git, locate)
+    missing = unpinned_family_modules(inp.repo_root, blobs)
+    if missing:
+        reasons.append(f"{RefusalReason.UNPINNED_FAMILY_MODULE.value}: {list(missing)}")
+    if provenance.commit_refusals(pre_commit):
+        return reasons  # git must never be asked about a non-sha "commit" (HEAD, empty, ...)
+    reasons += [r.value for r in phase_b_refusals({**blobs, **deps}, pre_commit, git)]
+    return reasons + _predeclaration_modified(inp, pre_commit, git)
+
+
+def check_gates(
+    inp: PhaseBInputs, git: GitPort, locate: provenance.ModuleLocator | None = None
+) -> Gates:
+    """Every refusal reason at once (all checks run); raises ``PhaseBRefused`` when any fails.
+
+    ``locate`` names the file each pinned module actually runs from (default: the interpreter's).
+    """
     reasons: list[str] = []
     pins: Mapping[str, Any] = {}
+    locate = locate or provenance.locate_running
     try:
+        reasons += _pin_refusals(inp, git, locate)
         pins = json.loads(inp.pins_json.read_text())
-        blobs = pins["head_blob_sha256"]
-        pre_commit = pins["predeclaration_commit"]
-        reasons += [r.value for r in phase_b_refusals(blobs, pre_commit, git)]
-        missing = unpinned_family_modules(inp.repo_root, blobs)
-        if missing:
-            reasons.append(f"{RefusalReason.UNPINNED_FAMILY_MODULE.value}: {list(missing)}")
-        reasons += _predeclaration_modified(inp, pre_commit, git)
-    except (OSError, ValueError, KeyError, RuntimeError) as exc:
-        reasons.append(f"pins unusable: {type(exc).__name__}: {exc}")
+    except _PINS_ERRORS as exc:
+        reasons.append(f"{RefusalReason.PINS_UNUSABLE.value}: {type(exc).__name__}: {exc}")
     predeclaration = None
     try:
         predeclaration = load_predeclaration(inp.predeclaration, inp.phase_a_table)
@@ -147,16 +160,19 @@ def check_gates(inp: PhaseBInputs, git: GitPort) -> Gates:
             reasons.append(f"consumer_map missing findings: {absent}")
     except PredeclarationError as exc:
         reasons.append(str(exc))
+    except (AttributeError, TypeError, KeyError) as exc:
+        reasons.append(f"predeclaration malformed: {exc!r}")
     table: Mapping[str, Any] = {}
     try:
         table = json.loads(inp.phase_a_table.read_text())
         if table.get("phase") != "A" or table.get("outcome_blind") is not True:
             reasons.append("the Phase A table is not an outcome-blind Phase A table")
-    except (OSError, ValueError) as exc:
-        reasons.append(f"Phase A table unreadable: {exc}")
-    if reasons or predeclaration is None:
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        reasons.append(f"Phase A table unreadable: {exc!r}")
+    script = locate(CLI_PATH)
+    if reasons or predeclaration is None or script is None:
         raise PhaseBRefused(reasons)
-    return Gates(pins, predeclaration, table)
+    return Gates(pins, predeclaration, table, sha256_file(script))
 
 
 def _predeclaration_modified(inp: PhaseBInputs, commit: str, git: GitPort) -> list[str]:
@@ -204,15 +220,16 @@ def _analyse(inp: PhaseBInputs, gates: Gates, audit: AuditReproduction) -> dict[
         (d["station"], dt.date.fromisoformat(str(d["climate_day"]))): d
         for d in table["station_days"]
     }
-    present = bool(table["s0g"]["k3_status"] == "SOURCE_PRESENT")
+    k3_present = bool(table["s0g"]["k3_status"] == "SOURCE_PRESENT")
+    k4_present = bool(table["s0g"].get("k4_status") == "SOURCE_PRESENT")
     scored = {s.fill_id: s for s in audit.per_fill}
     bare = build_fill_records(
         table["per_fill"], days, scored, thresholds=th, terminal_climate_day=terminal,
         k3=None, k4=None,
     )  # fmt: skip
     k3, k4 = (
-        k3_flips(bare, inp.archive_root, present=present),
-        k4_mismatches(bare, inp.venue_outcomes),
+        k3_flips(bare, inp.archive_root, present=k3_present),
+        k4_mismatches(bare, inp.venue_outcomes, present=k4_present),
     )
     records = build_fill_records(
         table["per_fill"], days, scored, thresholds=th, terminal_climate_day=terminal, k3=k3, k4=k4
@@ -232,11 +249,15 @@ def _analyse(inp: PhaseBInputs, gates: Gates, audit: AuditReproduction) -> dict[
     label = str(verdict.label)
     run_date = dt.datetime.fromtimestamp(inp.now_ns / 1e9, tz=dt.UTC).date()
     pins = gates.pins
+    venue = inp.venue_outcomes
+    venue_sha = sha256_file(venue) if k4 is not None and venue is not None else None
     return {
         "phase": "B",
         "provenance": {
-            "script_sha256": pins["head_blob_sha256"].get(CLI_PATH),
+            "script_sha256": gates.script_sha256,
             "head_blob_sha256": pins["head_blob_sha256"],
+            "src_dependency_sha256": pins["src_dependency_sha256"],
+            "venue_outcomes_sha256": venue_sha,
             "pins_json_sha256": sha256_file(inp.pins_json),
             "reflog_snapshot_sha256": pins.get("reflog_snapshot_sha256"),
             "phase_a_table_sha256": pre.phase_a_table_sha256,
@@ -293,13 +314,17 @@ def execute(inp: PhaseBInputs, gates: Gates, fills: FillRead, source: Settlement
         sys.stderr.write("STOP: the fill store and the Phase A table hold different fills\n")
         return EXIT_STOP
     audit = reproduce_audit(fills, source, now_ns=inp.now_ns)
-    write_json(
-        inp.output_dir / "phase_b_audit.json", {"phase": "B", "audit_fq": fields_dict(audit)}
-    )
+    audit_payload = {"phase": "B", "audit_fq": fields_dict(audit)}
     if not _audit_ok(audit, gates.predeclaration.thresholds["audit"]):
+        write_json(inp.output_dir / "phase_b_audit_STOP.json", audit_payload)
         sys.stderr.write("STOP: the corrected audit (25 fills, 2 wins, -2.17) did not reproduce\n")
         return EXIT_STOP
-    payload = _analyse(inp, gates, audit)
+    write_json(inp.output_dir / "phase_b_audit.json", audit_payload)
+    try:
+        payload = _analyse(inp, gates, audit)
+    except ValueError as exc:  # e.g. a malformed venue outcomes file: nothing is written
+        sys.stderr.write(f"STOP: invalid alternative-truth input: {exc}\n")
+        return EXIT_STOP
     run_date = dt.datetime.fromtimestamp(inp.now_ns / 1e9, tz=dt.UTC).date().isoformat()
     stem = inp.output_dir / f"{RESULT_STEM}_{run_date}"
     write_json(stem.with_suffix(".json"), payload)
@@ -308,19 +333,3 @@ def execute(inp: PhaseBInputs, gates: Gates, fills: FillRead, source: Settlement
         f"phase B result written to {stem}.json and .md ({payload['verdict']['label']})\n"
     )
     return 0
-
-
-def verify_artefact(
-    repo_root: Path, pins_json: Path, artefact: Path, git: GitPort
-) -> tuple[str, ...]:
-    """Post-hoc check: the result artefact is committed, clean, and in a STRICT descendant of the
-    predeclaration commit. Returns the violation reasons (empty = OK)."""
-    pre_commit = json.loads(pins_json.read_text())["predeclaration_commit"]
-    try:
-        rel = artefact.resolve().relative_to(repo_root.resolve()).as_posix()
-    except ValueError:
-        return ("artefact_outside_repo",)
-    commits = git.log_commits([rel], "HEAD")
-    if not commits or not git.porcelain_clean([rel]):
-        return (RefusalReason.ARTEFACT_UNCOMMITTED.value,)
-    return tuple(r.value for r in post_hoc_violations(pre_commit, commits[-1], git))

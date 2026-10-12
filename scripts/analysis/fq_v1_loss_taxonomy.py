@@ -70,8 +70,8 @@ from scripts.analysis.fq_loss_taxonomy_phase_b import (
     PhaseBRefused,
     check_gates,
     execute,
-    verify_artefact,
 )
+from scripts.analysis.fq_loss_taxonomy_provenance import verify_artefact
 from scripts.analysis.fq_loss_taxonomy_reconstruct import SEMANTICS_NOTE
 from scripts.analysis.fq_loss_taxonomy_report import fields_dict as _fields_dict
 from scripts.analysis.fq_loss_taxonomy_report import write_json as _write_json
@@ -184,7 +184,9 @@ def _truth_projection(
     """Phase A truth: status counts through the clipping wrapper and the tmax-free projection."""
     if catalog_root is None:
         return {"NOT_CHECKED": len(days)}
-    source = ClippingSettlementSource(_CatalogRouter(catalog_root), LAST_CLIMATE_DAY)
+    source = ClippingSettlementSource(
+        _CatalogRouter(catalog_root), LAST_CLIMATE_DAY, first_day=FQ_WINDOW_START
+    )
     counts: dict[str, int] = {}
     for station, day in days:
         status = truth_status(phase_a_truth(source, station, day, last_day=LAST_CLIMATE_DAY))
@@ -217,9 +219,10 @@ def _phase_a(args: argparse.Namespace, policy: PinPolicy) -> int:
     ]  # fmt: skip
     git = SubprocessGit(args.repo_root)
     boots = _boots_from_logs(args.logs, len(policy.expected_commits))
+    published = published_cycles(args.logs)
     reconstructor = Reconstructor(
         git, manifest_path=MANIFEST_PATH, workdir=args.output_dir / "pinned",
-        cycles=load_derived_cycles(args.derived_store), published=published_cycles(args.logs),
+        cycles=load_derived_cycles(args.derived_store, published), published=published,
     )  # fmt: skip
     specs_by_boot: dict[int, list[FillSpec]] = {}
     for spec in specs:
@@ -277,7 +280,9 @@ def _phase_b(args: argparse.Namespace) -> int:
         sys.stderr.write(f"PHASE B REFUSED: {refused.reasons}\n")
         return EXIT_STOP
     fq_only = _fq_only(read_durable_fills(args.fills_db).require_clean())
-    source = ClippingSettlementSource(_CatalogRouter(args.catalog_root), LAST_CLIMATE_DAY)
+    source = ClippingSettlementSource(
+        _CatalogRouter(args.catalog_root), LAST_CLIMATE_DAY, first_day=FQ_WINDOW_START
+    )
     return execute(inputs, gates, fq_only, source)
 
 

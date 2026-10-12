@@ -406,6 +406,7 @@ def _git_repo_with_artefact(tmp: Path, *, same_commit: bool) -> tuple[Path, Path
         git_cmd(repo, "commit", "-q", "-m", "artefact")
     pins = tmp / "pins.json"
     pins.write_text(json.dumps({"head_blob_sha256": {PRE_REL: sha256_path(pre)},
+                                "src_dependency_sha256": {},
                                 "predeclaration_commit": first}))  # fmt: skip
     return repo, pins
 
@@ -538,7 +539,7 @@ def test_k3_flips_streams_and_reads_each_station_csv_once(
 def test_k4_is_untestable_unless_phase_a_found_the_source_present(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
-    rec = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
+    rec: Any = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
     venue = tmp_path / "venue.json"
     venue.write_text(json.dumps({"i1": False}))
 
@@ -551,7 +552,7 @@ def test_k4_is_untestable_unless_phase_a_found_the_source_present(tmp_path: Path
 def test_k4_rejects_non_boolean_or_non_object_venue_outcomes(tmp_path: Path, bad: str) -> None:
     from types import SimpleNamespace
 
-    rec = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
+    rec: Any = SimpleNamespace(fill_id="f1", instrument_id="i1", won=True)
     venue = tmp_path / "venue.json"
     venue.write_text(bad)
 

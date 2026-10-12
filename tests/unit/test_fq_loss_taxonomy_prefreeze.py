@@ -31,12 +31,11 @@ from tests.support.te2_phase_b_fixtures import (
     rewrite_pins,
     sha256_path,
 )
-from tests.unit.test_fq_loss_taxonomy_phase_b import (  # noqa: F401  (fixture re-use)
-    _policy,
+from tests.unit.test_fq_loss_taxonomy_phase_b import (
     _records,
     _router,
-    phase_a,
 )
+from tests.unit.test_fq_loss_taxonomy_phase_b import phase_a as shared_phase_a  # noqa: F401
 
 REAL_LOCATE = prov.locate_running
 REPO = Path(__file__).resolve().parents[2]
@@ -49,6 +48,12 @@ _REQUIRED_DEPS = (
     "src/breezy/persistence/catalog.py",
     "src/breezy/registry/sites.py",
 )
+
+
+@pytest.fixture
+def phase_a(shared_phase_a: Any) -> Any:  # noqa: F811
+    """The module-scoped synthetic Phase A world, re-exported under the usual name."""
+    return shared_phase_a
 
 
 @pytest.fixture(autouse=True)
@@ -123,13 +128,16 @@ def test_phase_b_refuses_a_working_file_that_differs_from_its_pin_even_if_git_sa
 
 
 def test_the_real_locator_returns_the_file_that_runs() -> None:
-    import scripts.analysis.fq_loss_taxonomy_core as core
     import breezy.settlement.trial_scorer as scorer
+    import scripts.analysis.fq_loss_taxonomy_core as core
 
     assert REAL_LOCATE(FAMILY[0]) == Path(core.__file__).resolve()
     assert REAL_LOCATE("src/breezy/settlement/trial_scorer.py") == Path(scorer.__file__).resolve()
     assert REAL_LOCATE("scripts/analysis/fq_v1_loss_taxonomy.py") == Path(cli.__file__).resolve()
     assert REAL_LOCATE("src/breezy/registry/sites.toml") is None  # data, not a module
+    for rel in (*SRC_DEPENDENCIES, *FAMILY):  # the CLI import loads every pinned module
+        if rel.endswith(".py"):
+            assert REAL_LOCATE(rel) == (REPO / rel).resolve(), rel
 
 
 # ---- H2: the src semantics dependencies --------------------------------------------------
@@ -169,7 +177,7 @@ def test_phase_b_refuses_pins_without_the_dependency_map(phase_a: Any, tmp_path:
 
     reasons = _refusals(b)
 
-    assert "pins unusable" in _text(reasons) or "unpinned_src_dependency" in _text(reasons)
+    assert "pins_unusable" in _text(reasons) or "unpinned_src_dependency" in _text(reasons)
 
 
 def test_phase_b_refuses_a_src_dependency_changed_after_the_freeze(
@@ -351,7 +359,7 @@ def test_verify_fails_when_a_src_dependency_changed_by_the_artefact_commit(
         ("provenance", "pins_json_sha256"),
         ("predeclaration", "sha256"),
         ("provenance", "script_sha256"),
-    ],  # fmt: skip
+    ],
 )
 def test_verify_fails_when_the_artefact_provenance_differs_from_the_committed_blobs(
     phase_a: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, section: str, key: str

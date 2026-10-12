@@ -17,6 +17,7 @@ from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.persistence.catalog import open_station_catalog
 from breezy.settlement.trial_scorer import FilledTrial, ScoreRefusal, score_trial
 
+FIRST_FQ_CLIMATE_DAY: Final = dt.date(2026, 10, 1)
 LAST_FQ_CLIMATE_DAY: Final = dt.date(2026, 10, 6)
 
 
@@ -35,14 +36,20 @@ class CatalogRouter:
 
 
 class ClippingSettlementSource:
-    """A ``SettlementSource`` that returns ``None`` for any climate day after ``last_day``."""
+    """A ``SettlementSource`` that returns ``None`` outside ``[first_day, last_day]`` (the lower
+    clip keeps the frozen pre-October holdout unread; ``first_day=None`` leaves it open)."""
 
-    def __init__(self, inner: SettlementSource, last_day: dt.date) -> None:
+    def __init__(
+        self, inner: SettlementSource, last_day: dt.date, first_day: dt.date | None = None
+    ) -> None:
         self._inner = inner
         self._last_day = last_day
+        self._first_day = first_day
 
     def record(self, station: str, climate_day: dt.date) -> NwsClimateDay | None:
         if climate_day > self._last_day:
+            return None
+        if self._first_day is not None and climate_day < self._first_day:
             return None
         return self._inner.record(station, climate_day)
 
@@ -207,11 +214,13 @@ def _last_valid_day(station_dir: Path) -> str | None:
     """The newest ``valid_utc`` calendar day over a station's yearly CSV files (read-only)."""
     newest: str | None = None
     for csv_file in sorted(station_dir.glob("*.csv")):
-        for line in csv_file.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
-            fields = line.split(",")
-            found = _ISO_DAY.match(fields[1]) if len(fields) > 1 else None
-            if found and (newest is None or found.group(0) > newest):
-                newest = found.group(0)
+        with csv_file.open(encoding="utf-8", errors="replace") as handle:
+            next(handle, None)  # header
+            for line in handle:
+                fields = line.split(",", 2)
+                found = _ISO_DAY.match(fields[1]) if len(fields) > 1 else None
+                if found and (newest is None or found.group(0) > newest):
+                    newest = found.group(0)
     return newest
 
 

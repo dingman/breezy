@@ -35,6 +35,24 @@ from scripts.analysis.fq_loss_taxonomy_verdict import MATERIAL_DELTA_P, POWER_FL
 ANALYSIS_DIR: Final = "scripts/analysis"
 FAMILY_GLOB: Final = "fq_loss_taxonomy_*.py"
 CLI_MODULE: Final = "fq_v1_loss_taxonomy.py"
+#: The src/ files whose behaviour Phase B's truth join, scoring, instrument parsing and statistics
+#: depend on (traced from the imports of the Phase B path). Pinned by ``src_dependency_sha256``.
+SRC_DEPENDENCIES: Final[tuple[str, ...]] = (
+    "src/breezy/adapters/polymarket_us/symbology.py",
+    "src/breezy/analysis/labeling/fill_source.py",
+    "src/breezy/analysis/labeling/instrument_facts.py",
+    "src/breezy/analysis/labeling/settlement_source.py",
+    "src/breezy/analysis/nbp_calibration.py",
+    "src/breezy/domain/instrument_leg.py",
+    "src/breezy/domain/nws_climate_day.py",
+    "src/breezy/domain/selection.py",
+    "src/breezy/domain/weather_bucket_facts.py",
+    "src/breezy/persistence/catalog.py",
+    "src/breezy/registry/sites.py",
+    "src/breezy/registry/sites.toml",
+    "src/breezy/settlement/settlement_truth.py",
+    "src/breezy/settlement/trial_scorer.py",
+)
 _TOP_KEYS: Final = (
     "phase_a_table_sha256", "thresholds", "consumer_map", "s0i_statuses", "terminal_climate_day",
 )  # fmt: skip
@@ -148,3 +166,8 @@ def unpinned_family_modules(repo_root: Path, pinned_paths: Iterable[str]) -> tup
     if (folder / CLI_MODULE).is_file():
         on_disk.add(f"{ANALYSIS_DIR}/{CLI_MODULE}")
     return tuple(sorted(on_disk - set(pinned_paths)))
+
+
+def unpinned_src_dependencies(pinned_paths: Iterable[str]) -> tuple[str, ...]:
+    """Every ``SRC_DEPENDENCIES`` entry the pins file does not list (pins must cover all)."""
+    return tuple(sorted(set(SRC_DEPENDENCIES) - set(pinned_paths)))

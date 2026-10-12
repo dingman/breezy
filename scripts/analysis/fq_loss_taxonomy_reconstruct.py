@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Container, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
@@ -101,14 +101,21 @@ class PinnedModel:
     fee_coefficient: float
 
 
-def load_derived_cycles(root: Path) -> dict[int, tuple[DerivedNbpRow, ...]]:
-    """Every ``nbp_*.parquet`` the ``nbp_backfill.py`` derived store holds, by cycle (read-only)."""
+def load_derived_cycles(
+    root: Path, published: Container[int] | None = None
+) -> dict[int, tuple[DerivedNbpRow, ...]]:
+    """The ``nbp_*.parquet`` rows the ``nbp_backfill.py`` derived store holds, by cycle (read-only).
+
+    With ``published`` only those cycles are kept (the reconstruction never looks at another one),
+    so the rest of the store is not held in memory.
+    """
     from breezy.persistence.nbp_derived_store import read_partition
 
     grouped: dict[int, list[DerivedNbpRow]] = {}
     for path in sorted(root.rglob("nbp_*.parquet")):
         for row in read_partition(path):
-            grouped.setdefault(row.cycle_runtime_ns, []).append(row)
+            if published is None or row.cycle_runtime_ns in published:
+                grouped.setdefault(row.cycle_runtime_ns, []).append(row)
     return {cycle: tuple(rows) for cycle, rows in grouped.items()}
 
 

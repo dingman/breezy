@@ -15,7 +15,7 @@ _ANALYSIS = Path(__file__).resolve().parents[2] / "scripts/analysis"
 _CORE_FAMILY = ("core", "stats", "classify", "verdict", "guard", "battery")
 _IO_FAMILY = (
     "inputs", "pins", "logs", "truth", "reconstruct", "table", "predecl", "fills", "report",
-    "phase_b",
+    "phase_b", "provenance",
 )  # fmt: skip
 _CORE_FILES = [_ANALYSIS / f"fq_loss_taxonomy_{n}.py" for n in _CORE_FAMILY]
 _IO_FILES = [_ANALYSIS / f"fq_loss_taxonomy_{n}.py" for n in _IO_FAMILY]

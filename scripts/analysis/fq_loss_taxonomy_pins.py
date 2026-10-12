@@ -42,6 +42,16 @@ class RefusalReason(StrEnum):
     UNPINNED_FAMILY_MODULE = "unpinned_family_module"
     PREDECLARATION_MODIFIED = "predeclaration_modified"
     ARTEFACT_UNCOMMITTED = "artefact_uncommitted"
+    RUNNING_MODULE_MISMATCH = "running_module_mismatch"
+    WORKING_FILE_MISMATCH = "working_file_mismatch"
+    UNPINNED_SRC_DEPENDENCY = "unpinned_src_dependency"
+    PINS_JSON_UNCOMMITTED = "pins_json_uncommitted"
+    PINS_JSON_OUTSIDE_REPO = "pins_json_outside_repo"
+    PREDECLARATION_COMMIT_INVALID = "predeclaration_commit_invalid"
+    PINS_UNUSABLE = "pins_unusable"
+    PINNED_BLOB_CHANGED_AT_ARTEFACT = "pinned_blob_changed_at_artefact_commit"
+    ARTEFACT_PROVENANCE_MISMATCH = "artefact_provenance_mismatch"
+    ARTEFACT_SIBLING_UNCOMMITTED = "artefact_sibling_uncommitted"
 
 
 class PinReason(StrEnum):

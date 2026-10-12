@@ -118,7 +118,8 @@ def test_clipping_wrapper_implements_settlement_source_and_clips_after_2026_10_0
 def test_clipping_wrapper_clips_below_first_day_without_asking_the_inner_source() -> None:
     first, before = dt.date(2026, 10, 1), dt.date(2026, 9, 30)
     inner = _Src(
-        {("LAX", before): nws_record("LAX", before, 80), ("LAX", first): nws_record("LAX", first, 81),
+        {("LAX", before): nws_record("LAX", before, 80),
+         ("LAX", first): nws_record("LAX", first, 81),
          ("LAX", _D6): nws_record("LAX", _D6, 90)}
     )  # fmt: skip
     clip = ClippingSettlementSource(inner, _D6, first_day=first)

@@ -124,7 +124,7 @@ def build_phase_b(
 
 
 def rewrite_pins(b: BPaths, mutate: Any) -> None:
-    """Edit the pins file and COMMIT it, so only the edited content (not dirtiness) is under test."""
+    """Edit the pins file and COMMIT it: only the edited content (not dirtiness) is under test."""
     payload = json.loads(b.pins.read_text())
     mutate(payload)
     b.pins.write_text(json.dumps(payload))

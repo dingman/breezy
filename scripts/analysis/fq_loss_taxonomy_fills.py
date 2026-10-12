@@ -32,7 +32,11 @@ from scripts.analysis.fq_loss_taxonomy_stats import (
     station_day_probability,
     upper_tail,
 )
-from scripts.analysis.fq_loss_taxonomy_truth import ScoredFill
+from scripts.analysis.fq_loss_taxonomy_truth import (
+    FIRST_FQ_CLIMATE_DAY,
+    LAST_FQ_CLIMATE_DAY,
+    ScoredFill,
+)
 
 VENUE: Final = "polymarket_us"
 _PIT_PLACEHOLDER: Final = (
@@ -42,6 +46,7 @@ _PMF_CLASSES: Final = frozenset(
     {FillClass.BOUNDARY, FillClass.TAIL, FillClass.BAND_SELECTION, FillClass.BODY_MISS}
 )
 _METAR_COLUMNS: Final = ("valid_utc", "tmpf")
+_METAR_MARGIN: Final = dt.timedelta(days=1)  # a local-standard day spans at most UTC +-14 h
 
 
 @dataclass(frozen=True)
@@ -250,36 +255,58 @@ def _utc(value: str) -> dt.datetime | None:
         return None
 
 
+def _metar_series(archive_root: Path, icao: str) -> tuple[tuple[dt.datetime, float], ...]:
+    """The station's METAR ``(valid_utc, tmpf)`` rows that can fall in the FQ window, streamed.
+
+    Only rows within a day of ``[FIRST_FQ_CLIMATE_DAY, LAST_FQ_CLIMATE_DAY]`` are kept, so memory
+    stays small however large the yearly archive files are.
+    """
+    lo = dt.datetime.combine(FIRST_FQ_CLIMATE_DAY, dt.time(), tzinfo=dt.UTC) - _METAR_MARGIN
+    hi = dt.datetime.combine(LAST_FQ_CLIMATE_DAY, dt.time(), tzinfo=dt.UTC) + 2 * _METAR_MARGIN
+    series: list[tuple[dt.datetime, float]] = []
+    for csv_file in sorted((archive_root / "metar-routine" / icao).glob("*.csv")):
+        with csv_file.open(encoding="utf-8", errors="replace") as handle:
+            header = next(handle, "").rstrip("\r\n").split(",")
+            if not all(name in header for name in _METAR_COLUMNS):
+                continue
+            when_at, temp_at = (header.index(name) for name in _METAR_COLUMNS)
+            width = max(when_at, temp_at)
+            for line in handle:
+                fields = line.split(",", width + 1)
+                if len(fields) <= width:
+                    continue
+                when = _utc(fields[when_at])
+                if when is None or not lo <= when < hi:
+                    continue
+                try:
+                    series.append((when, float(fields[temp_at])))
+                except ValueError:
+                    continue
+    return tuple(series)
+
+
 def metar_daily_max(
-    archive_root: Path, icao: str, climate_day: dt.date, std_utc_offset_hours: float
+    archive_root: Path,
+    icao: str,
+    climate_day: dt.date,
+    std_utc_offset_hours: float,
+    *,
+    series: Sequence[tuple[dt.datetime, float]] | None = None,
 ) -> int | None:
-    """The METAR/ASOS max (``tmpf`` rounded) over the local-standard climate day, or ``None``."""
+    """The METAR/ASOS max (``tmpf`` rounded) over the local-standard climate day, or ``None``.
+
+    Mirrors the FQ window: a climate day outside ``[2026-10-01, 2026-10-06]`` is never read.
+    ``series`` is the pre-loaded station series (``k3_flips`` loads it once per station).
+    """
+    if not FIRST_FQ_CLIMATE_DAY <= climate_day <= LAST_FQ_CLIMATE_DAY:
+        return None
     start = dt.datetime.combine(climate_day, dt.time(), tzinfo=dt.UTC) - dt.timedelta(
         hours=std_utc_offset_hours
     )
     end = start + dt.timedelta(days=1)
-    best: float | None = None
-    for csv_file in sorted((archive_root / "metar-routine" / icao).glob("*.csv")):
-        lines = csv_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        if not lines:
-            continue
-        header = lines[0].split(",")
-        if not all(name in header for name in _METAR_COLUMNS):
-            continue
-        when_at, temp_at = (header.index(name) for name in _METAR_COLUMNS)
-        for line in lines[1:]:
-            fields = line.split(",", max(when_at, temp_at) + 1)
-            if len(fields) <= max(when_at, temp_at):
-                continue
-            when = _utc(fields[when_at])
-            if when is None or not start <= when < end:
-                continue
-            try:
-                value = float(fields[temp_at])
-            except ValueError:
-                continue
-            best = value if best is None else max(best, value)
-    return None if best is None else round(best)
+    rows = _metar_series(archive_root, icao) if series is None else series
+    values = [value for when, value in rows if start <= when < end]
+    return round(max(values)) if values else None
 
 
 def k3_flips(
@@ -291,25 +318,37 @@ def k3_flips(
         return None
     registry = default_registry()
     flips: dict[str, bool] = {}
+    loaded: dict[str, tuple[tuple[dt.datetime, float], ...]] = {}
     for rec in records:
         icao = registry.settlement_site(VENUE, rec.station).icao
         offset = registry.climate_day_window(VENUE, rec.station).std_utc_offset_hours
-        metar = metar_daily_max(archive_root, icao, rec.climate_day, offset)
+        if icao not in loaded:
+            loaded[icao] = _metar_series(archive_root, icao)
+        metar = metar_daily_max(archive_root, icao, rec.climate_day, offset, series=loaded[icao])
         if metar is not None:
             flips[rec.fill_id] = (edge_distance(rec.instrument_id, metar) == 0) != rec.won
     return flips or None
 
 
 def k4_mismatches(
-    records: Sequence[FillRecord], venue_outcomes: Path | None
+    records: Sequence[FillRecord], venue_outcomes: Path | None, *, present: bool
 ) -> dict[str, bool] | None:
     """fill_id -> venue-resolved YES outcome differs from the slug-parsed one. The file is a JSON
-    object ``{instrument_id: bool}``; an absent file or no overlap is UNTESTABLE."""
-    if venue_outcomes is None or not venue_outcomes.is_file():
+    object ``{instrument_id: bool}``. UNTESTABLE (``None``) unless Phase A found the source
+    (``present``), a file is given and it overlaps the fills; malformed content is a ``ValueError``.
+    """
+    if not present or venue_outcomes is None or not venue_outcomes.is_file():
         return None
     resolved = json.loads(venue_outcomes.read_text())
+    if not isinstance(resolved, dict):
+        raise ValueError(  # noqa: TRY004  (malformed content, not a caller type error)
+            "venue outcomes file is not a JSON object {instrument_id: bool}"
+        )
+    bad = sorted(k for k, v in resolved.items() if not isinstance(v, bool))
+    if bad:
+        raise ValueError(f"venue outcomes must be booleans; not boolean for: {bad[:5]}")
     mismatches = {
-        r.fill_id: bool(resolved[r.instrument_id]) != r.won
+        r.fill_id: resolved[r.instrument_id] != r.won
         for r in records
         if r.instrument_id in resolved
     }
