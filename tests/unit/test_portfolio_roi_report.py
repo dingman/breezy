@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.analysis.labeling import accounting as acct
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.persistence.catalog import open_station_catalog, write_records
@@ -45,7 +46,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 
 
+def _all_json_keys(node: Any) -> set[str]:
+    if isinstance(node, dict):
+        return set(node) | {k for v in node.values() for k in _all_json_keys(v)}
+    if isinstance(node, list):
+        return {k for v in node for k in _all_json_keys(v)}
+    return set()
+
+
 def _load_module() -> ModuleType:
+    existing = sys.modules.get("portfolio_roi_report")
+    if existing is not None:  # one object for every importer, whatever the import order (TE-1 M5)
+        return existing
     path = _SCRIPTS_ANALYSIS_DIR / "portfolio_roi_report.py"
     spec = importlib.util.spec_from_file_location("portfolio_roi_report", path)
     assert spec is not None
@@ -75,6 +87,8 @@ def _consumable_label_marker(tmp_path_factory: pytest.TempPathFactory, monkeypat
         now_ns=4_102_444_800_000_000_000,
     )
     monkeypatch.setenv("BREEZY_LABELS_DATA_ROOT", str(root))
+    # L-57: no `_run` that omits `catalog_base` may reach the live NWS catalog (TE-1 M4)
+    monkeypatch.setenv("BREEZY_NWS_CATALOG_BASE", str(tmp_path_factory.mktemp("nws_catalog")))
 
 FEE_RECONCILED_LABEL = _prr.FEE_RECONCILED_LABEL
 FEE_UNRECONCILED_LABEL = _prr.FEE_UNRECONCILED_LABEL
@@ -3933,13 +3947,59 @@ class TestFeeUnverifiedResidualDisclosure:
         assert deduped["vo-dup"].scored_run_utc == "2026-09-20T12:00:00Z"
 
     def test_disclosure_never_reaches_the_json_dict(self) -> None:
-        """AC4/AC6: `_portfolio_roi_json_dict` is an explicit literal --
-        adding the disclosure feature must never introduce a new key."""
-        data = _report_data()
-        assert "fee_unverified" not in json.dumps(_portfolio_roi_json_dict(data))
+        """AC4/AC6: the FU-3d MODELLED delta is Markdown-only. Against real accounting data (not a
+        bare ``_report_data()``): none of the FU-3d keys or phrases reaches the JSON, and the
+        substring ``fee_unverified`` appears only as TE-1's own count key."""
+        data = dataclasses.replace(
+            _report_data(), disclosures=acct.Disclosures(n_fee_unverified=2)
+        )
+
+        document = _portfolio_roi_json_dict(data)
+
+        keys = _all_json_keys(document)
+        assert not keys & {
+            "n_fee_unverified_settled",
+            "model_minus_recorded_fee",
+            "n_fee_unverified_unmodelled",
+        }
+        assert {k for k in keys if "fee_unverified" in k} == {"n_fee_unverified"}
+        text = json.dumps(document).replace(acct.FEE_DELTA_DISCLOSURE_REF, "")
+        assert "fee_unverified residuals" not in text
+        assert "model minus recorded fee" not in text
+
+    def test_a_fee_unverified_fill_row_adds_only_its_own_flag_key(self) -> None:
+        row = acct.FillPnlRow(
+            fill_key="k",
+            client_order_id="c",
+            instrument_id="tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US",
+            climate_day="2026-10-03",
+            family_id="fam",
+            source=acct.PnlSource.RESIDUAL,
+            status=acct.FillStatus.SETTLED_NWS_IMPLIED,
+            attribution_basis=acct.Basis.RESIDUAL,
+            win=True,
+            payout=Decimal(1),
+            cost=Decimal("0.70"),
+            fee=Decimal(0),
+            net=Decimal("0.30"),
+            fee_unverified=True,
+            booked_tmax_f=92,
+            cli_final_check=acct.CliCheck.UNAVAILABLE,
+            cli_final_net=None,
+            entry_ask_known=False,
+        )
+        data = dataclasses.replace(
+            _report_data(), fill_pnl=(row,), disclosures=acct.Disclosures(n_fee_unverified=1)
+        )
+
+        keys = _all_json_keys(_portfolio_roi_json_dict(data))
+
+        assert {k for k in keys if "fee_unverified" in k} == {"fee_unverified", "n_fee_unverified"}
 
     def test_the_markdown_line_appears_only_when_a_disclosure_is_passed(self) -> None:
-        data = _report_data()
+        data = dataclasses.replace(
+            _report_data(), disclosures=acct.Disclosures(n_fee_unverified=2)
+        )
         disclosure = FeeUnverifiedResidualDisclosure(
             n_fee_unverified_settled=2,
             model_minus_recorded_fee=Decimal("0.03"),
@@ -3949,6 +4009,7 @@ class TestFeeUnverifiedResidualDisclosure:
         without = render_markdown_report(data)
         with_disclosure = render_markdown_report(data, fee_unverified=disclosure)
 
+        assert "Accounting P&L" in without  # real accounting data is rendered either way
         assert "fee_unverified residuals" not in without
         assert (
             "fee_unverified residuals (FU-3d, modelled, never booked): n=2, "

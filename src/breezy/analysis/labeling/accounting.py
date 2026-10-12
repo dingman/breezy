@@ -35,6 +35,7 @@ __all__ = [
     "AMBIGUOUS_UNKNOWN",
     "FEE_DELTA_DISCLOSURE_REF",
     "LEGACY_CHECK_WHOLE_STORE",
+    "NO_FILL_AS_OF",
     "NO_FILL_INTENTS_RECORDED",
     "NO_FILL_SOURCE",
     "POST_TERMINAL_NOTE",
@@ -63,19 +64,19 @@ __all__ = [
 
 #: The family label of a fill no source can attribute (the report's ``UNKNOWN`` label).
 UNKNOWN_FAMILY: Final = "UNKNOWN"
-#: Stage 0 S0-5 (2026-10-11): the whole-store total equals the SCORED-bucket sum, so the LEGACY
-#: runtime check compares against the whole-store figure (``realised_pnl_after_fees_total``).
-LEGACY_CHECK_WHOLE_STORE: Final = True
+#: The LEGACY runtime check compares the booked sum with the SCORED-bucket subset of the store.
+#: Stage 0 S0-5 found the whole-store total equal to it; a store trial with no ledger fill is
+#: disclosed (``n_scored_without_fill``) and warned, never fatal (review M1).
+LEGACY_CHECK_WHOLE_STORE: Final = False
 #: Stage 0 S0-11 (2026-10-11): five intents that never filled, read from the exec store's intent
 #: history and resolver rows. A recorded fact, not a runtime measurement.
 NO_FILL_INTENTS_RECORDED: Final = 5
 NO_FILL_SOURCE: Final = "exec/polymarket_us/intent/history+resolver"
+NO_FILL_AS_OF: Final = "2026-10-11"
 #: The strict ambiguity count is not knowable from the store (every IOC miss is AMBIGUOUS): never 0.
 AMBIGUOUS_UNKNOWN: Final = "UNKNOWN"
 #: Where the FU-3d fee delta lives (the sibling Markdown line), never in this JSON.
-FEE_DELTA_DISCLOSURE_REF: Final = (
-    "markdown: fee_unverified residuals (FU-3d, modelled, never booked)"
-)
+FEE_DELTA_DISCLOSURE_REF: Final = "markdown: FU-3d fee-delta line"
 POST_TERMINAL_REF: Final = "TE-2 P16 / cebaab49"
 POST_TERMINAL_NOTE: Final = (
     "sent by the live v1 node after the failed 10-05 halt; included in family P&L; excluded from "
@@ -367,6 +368,8 @@ class Disclosures:
     n_labels_gated: int = 0
     n_no_fill_intents: int = NO_FILL_INTENTS_RECORDED
     no_fill_source: str = NO_FILL_SOURCE
+    no_fill_as_of: str = NO_FILL_AS_OF
+    n_scored_without_fill: int = 0
     n_ambiguous_no_fill: str = AMBIGUOUS_UNKNOWN
     venue_positions_reconciled: bool = False
     fee_delta_disclosure_ref: str = FEE_DELTA_DISCLOSURE_REF
@@ -390,6 +393,8 @@ class Disclosures:
             "n_labels_gated": self.n_labels_gated,
             "n_no_fill_intents": self.n_no_fill_intents,
             "no_fill_source": self.no_fill_source,
+            "no_fill_as_of": self.no_fill_as_of,
+            "n_scored_without_fill": self.n_scored_without_fill,
             "n_ambiguous_no_fill": self.n_ambiguous_no_fill,
             "venue_positions_reconciled": self.venue_positions_reconciled,
             "fee_delta_disclosure_ref": self.fee_delta_disclosure_ref,
@@ -426,6 +431,8 @@ class Disclosures:
             n_labels_gated=_read_int(raw, "n_labels_gated"),
             n_no_fill_intents=_read_int(raw, "n_no_fill_intents"),
             no_fill_source=_read_str(raw, "no_fill_source"),
+            no_fill_as_of=_read_str(raw, "no_fill_as_of"),
+            n_scored_without_fill=_read_int(raw, "n_scored_without_fill"),
             n_ambiguous_no_fill=ambiguous,
             venue_positions_reconciled=_read_bool(raw, "venue_positions_reconciled"),
             fee_delta_disclosure_ref=_read_str(raw, "fee_delta_disclosure_ref"),
@@ -547,10 +554,14 @@ def _basis_of(
 
 
 def _c2_booking(
-    row: LabelRow, fill: DurableFillRecord, manifests: Mapping[str, FamilyManifest]
+    row: LabelRow, fill: DurableFillRecord, manifests: Mapping[str, FamilyManifest], overdue: bool
 ) -> _Booking:
     basis = _basis_of(row, fill, manifests)
     if row.realized_pnl is None:
+        if row.excluded_reason is ExcludedReason.UNATTRIBUTED and row.settled_outcome is None:
+            # no outcome yet: OPEN (then UNPRICED once overdue), not a false null-net CRITICAL
+            status = FillStatus.UNPRICED if overdue else FillStatus.OPEN
+            return _Booking(PnlSource.NONE, status, basis, row.family_id)
         return _Booking(PnlSource.C2, FillStatus.UNSETTLED, basis, row.family_id)
     win = row.settled_outcome
     payout = None if win is None else (fill.cumulative_qty if win else Decimal(0))
@@ -586,7 +597,7 @@ def _unreconciled_booking(
     if len(rows) > 1:
         raise AmbiguousAccountingRow("two accounting rows cover one fill")
     if rows:
-        return _c2_booking(rows[0], item.fill, manifests)
+        return _c2_booking(rows[0], item.fill, manifests, overdue)
     return _unbooked(FillStatus.UNPRICED if overdue else FillStatus.OPEN)
 
 

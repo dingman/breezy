@@ -37,6 +37,7 @@ from breezy.persistence.autonomy.label_store import (
     write_marker,
 )
 from breezy.persistence.catalog import station_catalog_path
+from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.settlement.trial_scorer import ScoredTrial
 from tests.support.aut2_fixtures import (
     durable_fill,
@@ -403,20 +404,20 @@ def test_legacy_sum_mismatch_raises() -> None:
 
 
 def test_legacy_check_uses_scored_bucket_subset_when_store_has_extra_trials() -> None:
-    """Merge 8, a branch test only: S0-5 recorded store total == SCORED sum, so the whole-store
-    form is the runtime default; a store with a trial that has no ledger fill needs the subset."""
+    """Review M1: the subset form is the runtime default (a store trial with no ledger fill is
+    disclosed, not fatal); the whole-store form stays reachable as a branch."""
     store_total, bucket_total = Decimal("-0.24"), Decimal("-0.54")
 
-    assert acct.LEGACY_CHECK_WHOLE_STORE is True
+    assert acct.LEGACY_CHECK_WHOLE_STORE is False
     assert (
         acct.legacy_expected_total(store_total=store_total, scored_bucket_total=bucket_total)
-        == store_total
+        == bucket_total
     )
     assert (
         acct.legacy_expected_total(
-            store_total=store_total, scored_bucket_total=bucket_total, whole_store=False
+            store_total=store_total, scored_bucket_total=bucket_total, whole_store=True
         )
-        == bucket_total
+        == store_total
     )
 
 
@@ -857,7 +858,13 @@ def test_disclosures_no_fill_intents_five_ambiguous_unknown_and_venue_positions_
     assert disclosures["n_null_pnl_final"] == 0
     assert disclosures["n_fee_unverified"] == 2  # counted from the table, not a constant
     assert "FU-3d" in disclosures["fee_delta_disclosure_ref"]
-    assert "fee_unverified residuals (FU-3d" in (run.json_path.with_suffix(".md")).read_text()
+    assert "fee_unverified residuals" not in disclosures["fee_delta_disclosure_ref"]
+    assert disclosures["no_fill_as_of"] == "2026-10-11"
+    markdown = (run.json_path.with_suffix(".md")).read_text()
+    assert "fee_unverified residuals (FU-3d" in markdown
+    assert "no_fill_as_of: 2026-10-11" in markdown
+    assert "recorded fee (unreconciled, may understate)" in markdown
+    assert "accounting view; not a statistic; never a verdict input" in markdown
 
 
 def test_world_roi_fields(world: World, run: Any) -> None:
@@ -1202,6 +1209,8 @@ def test_legacy_total_mismatch_raises_exit_1_and_writes_nothing(
     assert run.exit_code == 1
     assert "SourceTotalMismatch" in capsys.readouterr().err
     assert not run.json_path.exists()
+    # never a silent blind run: the refusal reaches the alert sink
+    assert run.sink.severities("PORTFOLIO_ROI_ACCOUNTING_ERROR") == ["CRITICAL"]
 
 
 def test_settlement_disagree_flagged_and_warned(
@@ -1381,3 +1390,117 @@ def test_accounting_module_never_uses_dataclasses_asdict() -> None:
         n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
     }
     assert "asdict" not in names
+
+
+# ---------------------------------------------------------------------------------------------
+# WP-B review fixes
+# ---------------------------------------------------------------------------------------------
+
+
+def test_extra_scored_trial_is_a_warning_not_a_blind_run(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1: a scored trial with no ledger fill is disclosed and warned; the run still reports."""
+    extra_fill = _fill("O-EXTRA")
+    extra = _scored("current_rung_hold/trial/MIA/2026-09-30/x", extra_fill)
+    write_scored_trials(world.scored_dir / "pm_us_crh_cont", [extra], now_ns=world.now_ns)
+
+    run = run_report(monkeypatch, world, tmp_path)
+    report = run.report()
+
+    assert run.exit_code == 0
+    assert report["disclosures"]["n_scored_without_fill"] == 1
+    assert run.sink.severities("PORTFOLIO_ROI_LEGACY_STORE_EXTRA") == ["WARN"]
+    assert Decimal(report["realised_pnl_accounting_total"]) == Decimal("-2.63")
+    assert Decimal(report["realised_pnl_after_fees_total"]) == Decimal("-0.54") + extra.pnl
+
+
+def test_a_clean_world_has_no_store_extra_warning(world: World, run: Any) -> None:
+    """Positive control for the test above."""
+    assert run.report()["disclosures"]["n_scored_without_fill"] == 0
+    assert "PORTFOLIO_ROI_LEGACY_STORE_EXTRA" not in run.sink.events()
+
+
+def test_an_unsettled_unattributed_row_is_open_not_a_false_critical() -> None:
+    """L2: a pre-epoch row with no outcome yet is OPEN (then UNPRICED), never UNSETTLED."""
+    row = _row("x", realized_pnl=None, settled_outcome=None)
+    buckets = _buckets(unreconciled=[_af(_fill("x"))])
+
+    inside = _build(buckets, accounting=[row], now=_DEADLINE + _HOUR_NS)
+    overdue = _build(buckets, accounting=[row], now=_DEADLINE + 24 * _HOUR_NS)
+
+    assert [r.status for r in inside] == [acct.FillStatus.OPEN]
+    assert [r.status for r in overdue] == [acct.FillStatus.UNPRICED]
+    assert acct.build_disclosures(inside).n_null_pnl_final == 0
+
+
+def test_a_settled_row_with_a_null_net_is_still_unsettled() -> None:
+    """Positive control for L2: an outcome with no P&L stays a CRITICAL."""
+    rows = _build(
+        _buckets(unreconciled=[_af(_fill("x"))]),
+        accounting=[_row("x", realized_pnl=None, settled_outcome=True)],
+    )
+
+    assert [r.status for r in rows] == [acct.FillStatus.UNSETTLED]
+
+
+def test_a_non_unattributed_exclusion_with_a_null_net_is_still_unsettled() -> None:
+    rows = _build(
+        _buckets(unreconciled=[_af(_fill("x"))]),
+        accounting=[
+            _row(
+                "x", excluded_reason=None, admissible=True, realized_pnl=None, settled_outcome=None
+            )
+        ],
+    )
+
+    assert [r.status for r in rows] == [acct.FillStatus.UNSETTLED]
+
+
+def test_under_pytest_keys_on_the_current_test_marker_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M3: importing pytest anywhere (a library, a plugin) must not count as running a test."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    assert _prr._under_pytest() is False
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "x::y (call)")
+    assert _prr._under_pytest() is True
+
+
+def test_run_defaults_the_catalog_base_through_the_env_resolver() -> None:
+    """M4: ``catalog_base`` is resolved like ``labels_data_root`` (None -> the env/default root)."""
+    import inspect
+
+    assert inspect.signature(portfolio_roi_module()._run).parameters["catalog_base"].default is None
+
+
+def test_an_omitted_catalog_base_resolves_the_env_root(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "env_catalog"
+    monkeypatch.setenv("BREEZY_NWS_CATALOG_BASE", str(root))
+    seen: list[Path] = []
+    module = portfolio_roi_module()
+    real = module._default_cli_final_reader
+
+    def spy(base: Path) -> Any:
+        seen.append(base)
+        return real(base)
+
+    monkeypatch.setattr(module, "_default_cli_final_reader", spy)
+
+    run = run_report(monkeypatch, world, tmp_path, omit_catalog_base=True, injected_reader=False)
+
+    assert seen == [root]
+    assert run.exit_code == 0
+
+
+def test_every_importer_shares_one_report_module() -> None:
+    """M5: loading ``test_portfolio_roi_report`` must reuse the registered module, so a patch made
+    through ``portfolio_roi_module()`` reaches the object that file's tests run."""
+    import importlib
+
+    before = portfolio_roi_module()
+
+    other = importlib.import_module("tests.unit.test_portfolio_roi_report")
+
+    assert other._prr is before

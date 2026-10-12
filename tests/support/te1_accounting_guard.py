@@ -10,6 +10,9 @@ file's imports to fully qualified names and flags:
 * a string literal naming the module (``importlib.import_module``).
 
 The bare name ``accounting`` is never matched: ``nautilus_trader.accounting`` exists.
+
+Known gap: ``importlib.import_module`` / ``__import__`` with a COMPUTED name (anything but a string
+literal naming the module) is not caught.
 """
 
 from __future__ import annotations

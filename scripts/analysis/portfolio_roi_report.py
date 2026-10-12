@@ -3421,6 +3421,7 @@ def _accounting_markdown(
     lines = [
         "",
         "## Accounting P&L (TE-1: every ledger fill once, at the recorded fee)",
+        "- accounting view; not a statistic; never a verdict input",
         f"- roi_accounting_status: {data.roi_accounting_status}",
         f"- roi_accounting: {roi_text}",
         f"- realised_pnl_accounting_total: {data.realised_pnl_accounting_total}",
@@ -3430,7 +3431,8 @@ def _accounting_markdown(
         ),
         f"- cost_total / fee_total: {disclosures.cost_total} / {disclosures.fee_total}",
         (
-            f"- n_fee_unverified: {disclosures.n_fee_unverified} "
+            f"- n_fee_unverified: {disclosures.n_fee_unverified} fills shown at the "
+            "recorded fee (unreconciled, may understate) "
             f"(delta: {disclosures.fee_delta_disclosure_ref})"
         ),
         (
@@ -3440,11 +3442,13 @@ def _accounting_markdown(
         (
             f"- n_null_pnl_final: {disclosures.n_null_pnl_final}; "
             f"n_labels_gated: {disclosures.n_labels_gated}; "
+            f"n_scored_without_fill: {disclosures.n_scored_without_fill}; "
             f"n_entry_ask_unknown: {disclosures.n_entry_ask_unknown}"
         ),
         (
             f"- n_no_fill_intents: {disclosures.n_no_fill_intents} "
             f"(source {disclosures.no_fill_source}); "
+            f"no_fill_as_of: {disclosures.no_fill_as_of}; "
             f"n_ambiguous_no_fill: {disclosures.n_ambiguous_no_fill}; "
             f"venue_positions_reconciled: {disclosures.venue_positions_reconciled}"
         ),
@@ -3724,7 +3728,9 @@ _ACCOUNTING_VENUE: Final[str] = "polymarket_us"
 
 
 def _under_pytest() -> bool:
-    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    # the marker pytest sets while a test runs; merely importing pytest (a plugin, a library)
+    # must not turn the production reader off
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
 def _unavailable_cli_final(station: str, climate_day: date) -> int | None:
@@ -4311,7 +4317,7 @@ def _run(
     families_dir: Path,
     now_ns: int,
     sink: AlertSink,
-    catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
+    catalog_base: Path | None = None,
     capital_flows_dir: Path | None = None,
     labels_data_root: Path | None = None,
     cli_final_reader: accounting.CliFinalReader | None = None,
@@ -4331,6 +4337,7 @@ def _run(
     no residual fills touches no catalog path, so the default is safe for
     every pre-existing caller/test that never writes one.
     """
+    catalog_base = catalog_base if catalog_base is not None else _default_catalog_base()
     bucketed = _read_bucketed_ledger(
         exec_state_db_path=exec_state_db_path,
         scored_trials_dir=scored_trials_dir,
@@ -4587,8 +4594,20 @@ def _run(
         )
     except accounting.AccountingError as exc:
         print(f"portfolio_roi_report: {type(exc).__name__}: {exc}", file=sys.stderr)
+        emit_alert(
+            sink,
+            AlertPayload(
+                severity="CRITICAL",
+                event=ACCOUNTING_ERROR_EVENT,
+                site=_ACCOUNTING_ALERT_SITE,
+                detail=f"type={type(exc).__name__}",
+            ),
+        )
         return 1
-    disclosures = accounting.build_disclosures(fill_rows)
+    n_scored_without_fill = sum(1 for t in scored_trials if t.trial_id not in scored_bucket_ids)
+    disclosures = replace(
+        accounting.build_disclosures(fill_rows), n_scored_without_fill=n_scored_without_fill
+    )
     admissible_coids = frozenset(row.client_order_id for row in c2_rows)
     pnl_outside_admissible = any(
         row.source is accounting.PnlSource.C2
@@ -4684,6 +4703,8 @@ def _run(
     )
 
 
+ACCOUNTING_ERROR_EVENT: Final[str] = "PORTFOLIO_ROI_ACCOUNTING_ERROR"
+LEGACY_STORE_EXTRA_EVENT: Final[str] = "PORTFOLIO_ROI_LEGACY_STORE_EXTRA"
 NO_INPUT_EVENT: Final[str] = "PORTFOLIO_ROI_NO_INPUT"
 LABEL_IDENTITY_EVENT: Final[str] = "PORTFOLIO_ROI_LABEL_IDENTITY"
 NULL_PNL_FINAL_EVENT: Final[str] = "PORTFOLIO_ROI_NULL_PNL_FINAL"
@@ -4730,6 +4751,12 @@ def _emit_accounting_alerts(
             f"n_fill_pnl={len(fill_rows)} n_ledger_rows={n_ledger_rows}",
         )
         exit_code = 1
+    if disclosures.n_scored_without_fill:
+        emit(
+            "WARN",
+            LEGACY_STORE_EXTRA_EVENT,
+            f"n_scored_without_fill={disclosures.n_scored_without_fill}",
+        )
     if disclosures.n_settlement_disagree:
         emit(
             "WARN",

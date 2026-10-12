@@ -219,11 +219,18 @@ def run_report(
     reader: Callable[[str, dt.date], int | None] | None = None,
     now_ns: int | None = None,
     labels_root: Path | None = None,
+    omit_catalog_base: bool = False,
+    injected_reader: bool = True,
 ) -> ReportRun:
     """``portfolio_roi_report._run`` over the world, every seam injected."""
     prr = portfolio_roi_module()
     capture = sink if sink is not None else CaptureSink()
     out = tmp_path / "report_out"
+    extra: dict[str, Any] = {}
+    if not omit_catalog_base:
+        extra["catalog_base"] = tmp_path / "catalog"
+    if injected_reader:
+        extra["cli_final_reader"] = reader if reader is not None else settlements_reader(world)
     with _patched_catalog(monkeypatch, prr, world):
         code = prr._run(
             exec_state_db_path=world.exec_db,
@@ -233,9 +240,8 @@ def run_report(
             families_dir=FAMILIES_DIR,
             now_ns=world.now_ns if now_ns is None else now_ns,
             sink=capture,
-            catalog_base=tmp_path / "catalog",
             labels_data_root=world.data_root if labels_root is None else labels_root,
-            cli_final_reader=reader if reader is not None else settlements_reader(world),
+            **extra,
         )
     day = dt.datetime.fromtimestamp((world.now_ns if now_ns is None else now_ns) / 1e9, dt.UTC)
     return ReportRun(
