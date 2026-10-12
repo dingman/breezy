@@ -33,6 +33,7 @@ from typing import Any
 from breezy.analysis.labeling.fill_source import FillStoreCorruption, read_durable_fills
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.trade_quantity_unit import (
+    MATCH_BASIS,
     Clearance,
     ClearanceRefused,
     Fill,
@@ -146,6 +147,7 @@ def _fill_row(fill: Fill, prints: Sequence[Print]) -> dict[str, Any]:
         "anti_candidate_count": match.anti_candidate_count,
         "summed": match.summed,
         "counted": is_counted(match),
+        "match_basis": MATCH_BASIS if is_counted(match) else None,
         "consistent": sorted(consistent_hypotheses(match)),
         "inversion": inversion_verdict(match),
         "candidates": [
@@ -176,7 +178,7 @@ def main(argv: Sequence[str] | None = None, *, clearance: Clearance | None = Non
     if clearance is None:
         try:
             clearance = firewall_clearance(hashlib.sha256(declaration_bytes).hexdigest())
-        except ImportError as exc:
+        except (ImportError, AttributeError) as exc:
             print(f"firewall module unavailable: {exc}", file=sys.stderr)
             return EXIT_NO_FIREWALL
 

@@ -22,6 +22,12 @@ Matching (size-blind, else the test is circular): a NO fill (bought as a SELL of
 both within ``MATCH_WINDOW_NS`` of the fill's ``tsEvent`` on the fill's YES instrument. A match
 counts only with exactly one candidate and not summed (``DurableFillRecord`` is cumulative per
 venue order, ``exec/client.py:933-957``).
+
+Known limitation (the plan's rule, deliberately unchanged): "unique candidate in a +-5 s window"
+is not "our own print". If our print is missing (recorder gap), a stranger's same-side,
+same-price print in the window can be the unique candidate and be counted; the script tags every
+counted match ``match_basis: unique_candidate_in_window`` so the evidence doc can say so. For a
+multi-contract fill the per-contract price is the cumulative average quantized to the venue tick.
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Final, Literal
 
 from breezy.domain.instrument_leg import (
@@ -39,7 +45,9 @@ from breezy.domain.instrument_leg import (
 )
 
 __all__ = [
+    "MATCH_BASIS",
     "MATCH_WINDOW_NS",
+    "PRICE_TICK",
     "TRADE_CAPTURE_START_NS",
     "UNIT_HYPOTHESES",
     "USD_BRACKET",
@@ -67,6 +75,11 @@ TRADE_CAPTURE_START_NS: Final[int] = 1_789_635_600_000_000_000
 
 #: Clock tolerance: create-path ``tsEvent`` is the venue ``Execution.transactTime`` (print clock).
 MATCH_WINDOW_NS: Final[int] = 5_000_000_000
+
+#: Venue price tick (every pinned fill price is a whole cent).
+PRICE_TICK: Final[Decimal] = Decimal("0.01")
+
+MATCH_BASIS: Final[str] = "unique_candidate_in_window"
 
 UNIT_HYPOTHESES: Final[tuple[str, ...]] = ("CONTRACTS", "USD_NOTIONAL_YES", "USD_NOTIONAL_TAKER")
 USD_BRACKET: Final[frozenset[str]] = frozenset({"USD_NOTIONAL_YES", "USD_NOTIONAL_TAKER"})
@@ -122,7 +135,7 @@ class Fill:
 
     @property
     def unit_cost(self) -> Decimal:
-        return self.cost / self.qty
+        return (self.cost / self.qty).quantize(PRICE_TICK, rounding=ROUND_HALF_EVEN)
 
     @property
     def yes_instrument(self) -> str:
@@ -186,6 +199,8 @@ def keep_decision(fill: Fill, clearance: Clearance) -> KeepDecision:
     """Whether ``fill`` may be matched; the firewall is consulted last, for a kept fill only."""
     if fill.order_side != "BUY":
         return KeepDecision(False, "NOT_A_BUY")
+    if fill.qty <= 0:
+        return KeepDecision(False, "ZERO_QTY")
     if fill.ts_event_ns < TRADE_CAPTURE_START_NS:
         return KeepDecision(False, "PRE_CAPTURE")
     if fill.trade_id is None:

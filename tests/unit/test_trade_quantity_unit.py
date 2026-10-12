@@ -10,6 +10,8 @@ real ``FILL_KEY_PREFIX`` via ``SqliteStateStore`` (``tests.support.aut2_fixtures
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import importlib
 import importlib.util
 import json
 import sqlite3
@@ -499,3 +501,112 @@ def test_crosscheck_opens_exec_db_read_only(
             ro.execute("INSERT INTO state (key, value) VALUES ('k', X'00')")
     finally:
         ro.close()
+
+
+_CENSUS = "breezy.analysis.maker_tape_census"
+
+
+def _stub_census(
+    monkeypatch: pytest.MonkeyPatch, *, accept_sha: str | None, seen: list[str]
+) -> None:
+    """A stand-in for WP1's module with the two names the script binds."""
+    stub = ModuleType(_CENSUS)
+
+    class FirewallRefused(Exception):
+        pass
+
+    def require_firewall_clearance(station: str, day: dt.date, sha: str | None) -> str:
+        seen.append(str(sha))
+        if day > dt.date(2026, 9, 25) and sha != accept_sha:
+            raise FirewallRefused("declaration sha256 mismatch")
+        return "SEARCH_DECLARED"
+
+    stub.FirewallRefused = FirewallRefused  # type: ignore[attr-defined]
+    stub.require_firewall_clearance = require_firewall_clearance  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, _CENSUS, stub)
+
+
+def test_missing_firewall_module_exits_5_with_a_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = _load_script()
+    real_import = importlib.import_module
+
+    def fail_for_census(name: str, package: str | None = None) -> ModuleType:
+        if name == _CENSUS:
+            raise ModuleNotFoundError(f"No module named '{_CENSUS}'")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", fail_for_census)
+    db = _seed(tmp_path)
+    prints = _prints_file(tmp_path, [])
+    decl = _declaration(tmp_path, ["TRADEA", "TRADEB"])
+    code = _run(
+        script,
+        ["--db", str(db), "--prints", str(prints), "--declaration", str(decl)],
+        clearance=None,
+    )
+    captured = capsys.readouterr()
+    assert code == script.EXIT_NO_FIREWALL == 5
+    assert captured.out == ""
+    assert _CENSUS in captured.err
+
+
+def test_declaration_sha256_is_forwarded_and_a_mismatch_is_refused_before_matching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = _load_script()
+    db = _seed(tmp_path)
+    prints = _prints_file(tmp_path, [_print_row("SELLER", "0.88", "0.12", _T0, "P-A")])
+    decl = _declaration(tmp_path, ["TRADEA", "TRADEB"])
+    argv = ["--db", str(db), "--prints", str(prints), "--declaration", str(decl)]
+    sha = hashlib.sha256(decl.read_bytes()).hexdigest()
+
+    seen: list[str] = []
+    _stub_census(
+        monkeypatch, accept_sha="0" * 64, seen=seen
+    )  # the pinned hash is some other file's
+    code = _run(script, argv, clearance=None)
+    captured = capsys.readouterr()
+    assert set(seen) == {sha}  # the hash of the declaration bytes reached the firewall
+    assert code == script.EXIT_PIN_MISMATCH  # post-freeze fills refused, so nothing is matched
+    assert captured.out == ""  # no result JSON
+    assert "TRADEA" in captured.err
+
+    seen.clear()
+    _stub_census(monkeypatch, accept_sha=sha, seen=seen)
+    code = _run(script, argv, clearance=None)
+    out = json.loads(capsys.readouterr().out)
+    assert set(seen) == {sha}
+    assert code in (script.EXIT_OK, script.EXIT_STOP)
+    assert {f["trade_id"] for f in out["fills"]} == {"TRADEA", "TRADEB"}
+
+
+def test_multi_contract_fill_matches_at_the_venue_tick() -> None:
+    # cumulative cost 0.35 over 3 contracts: average 0.11666..., the tick price is 0.12
+    fill = _fill(leg="YES", cost="0.35", qty="3")
+    match = match_fill(fill, [_print("BUYER", "0.12", "3")])
+    assert match.candidate_count == 1
+    assert match.print_price_yes == _D("0.12")
+    assert inversion_verdict(match) == "HOLDS"
+    assert tqu.is_counted(match)  # size 3 == fill_qty: CONTRACTS, explained by one print
+
+
+def test_zero_quantity_fill_is_refused_not_a_crash() -> None:
+    decision = keep_decision(_fill(qty="0"), _clear)
+    assert (decision.kept, decision.reason) == (False, "ZERO_QTY")
+
+
+def test_counted_matches_carry_their_match_basis(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = _load_script()
+    db = _seed(tmp_path)
+    prints = _prints_file(tmp_path, [_print_row("SELLER", "0.88", "0.12", _T0 + _S, "P-A")])
+    decl = _declaration(tmp_path, ["TRADEA", "TRADEB"])
+    _run(script, ["--db", str(db), "--prints", str(prints), "--declaration", str(decl)])
+    rows = {r["trade_id"]: r for r in json.loads(capsys.readouterr().out)["fills"]}
+    assert rows["TRADEA"]["counted"] is True
+    assert rows["TRADEA"]["match_basis"] == "unique_candidate_in_window"
+    assert rows["TRADEB"]["counted"] is False
+    assert rows["TRADEB"]["match_basis"] is None
