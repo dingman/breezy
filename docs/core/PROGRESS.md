@@ -87,7 +87,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 | ID | Open work (exact) | Status |
 |---|---|---|
 | TE-1 | Live P&L self-report: 25 FQ fills unscored, portfolio_roi NO_INPUT (delta vs F4/AUT-2) | READY r3.6 (S0 STOP→R11); WP-A building |
-| TE-2 | Diagnose FQ 2/25, −2.17 (LAX heat bust) before any re-arm (delta vs F0/F13) | READY r3.2 |
+| TE-2 | Diagnose FQ 2/25, −2.17 | DONE 89531726: MODEL_MISCALIBRATED_UNATTRIBUTED (T-WIN p .0035; spread n.s.); TAIL 44%/BAND_SEL 28% of loss → T2 min-ask + rung-stacking inputs, F13/T3; not a re-arm |
 
 ### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
