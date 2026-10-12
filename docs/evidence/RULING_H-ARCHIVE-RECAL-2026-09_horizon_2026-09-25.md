@@ -161,3 +161,6 @@ An independent pass by `mle-reviewer` returned **CONFIRMED-WITH-NOTES**.
   - That the comparator corpora do not overlap the SEARCH window was established by script and commit forensics. The ruling body does not state it.
 
 **The :137 condition is closed.** Registration of H-ARCHIVE-RECAL-2026-09 is unblocked, as a follow-up slice.
+
+## SEARCH declaration MAKER-S1 (2026-10-12)
+- 2026-10-12 SEARCH declaration (MAKER S1): LAX/MDW/MIA/SFO climate days 2026-09-26..2026-10-13, 72 station-days declared SEARCH and forfeited for CONFIRM (the 14 exit-window days show no Depth10 read, so none is credited as already spent); EDGE-4 revival ~2026-11-24 -> ~2026-12-08; see `docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md`.

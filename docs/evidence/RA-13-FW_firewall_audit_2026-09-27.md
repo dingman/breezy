@@ -26,4 +26,5 @@ No SEARCH cost is incurred by AUD-05 or AUD-07.
    - While the A1 halt is SET, no new fills occur. The study then touches only exit windows of fills made on or before 2026-09-24 [INFERRED: those windows close by settlement, roughly 2026-09-25].
    - **RA-13-FW2 VERIFIED (coordinator, 2026-09-27):** the latest run that wrote output was `derived/exit_window_study/2026-09-25_nightly/`, covering 8 positions. The newest date anywhere in its output is **2026-09-22**, which is before the freeze. The 09-26 15:20Z run was SKIPPED (the studies lock was held).
    - **Forfeiture to date: 0 post-freeze station-days.** The SEARCH declaration applies from the first run that reads a climate day of 2026-09-26 or later. That happens only after new fills, which require the A1 halt to be cleared.
+   - 2026-10-12: superseded by `docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md` §3; post-freeze forfeiture now 72 (LAX/MDW/MIA/SFO 09-26..10-13).
 4. **The study keeps running.** It is the evidence base for the UNARMED exit seam.

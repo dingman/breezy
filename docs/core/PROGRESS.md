@@ -59,7 +59,7 @@ worktree; never `git stash`; full gate after EVERY merge (basetemp under
 
 | # | ID | Work | Needs | STOP condition | Status |
 |---|---|---|---|---|---|
-| 1 | S1 | Maker-window print census (recorder liveness + `trade_tick`, dedupe on trade_id) incl. a dated SEARCH declaration for post-09-25 tape; resolve/bracket `TRADE_QUANTITY_UNIT` from own fills | WP0: ≥10 GB disk | E below the n_eff ≥ 30 floor → UNDERPOWERED, route to Q1 | PLAN r3 READY |
+| 1 | S1 | Maker-window print census (recorder liveness + `trade_tick`, dedupe on trade_id) incl. a dated SEARCH declaration for post-09-25 tape; resolve/bracket `TRADE_QUANTITY_UNIT` from own fills | WP0: ≥10 GB disk | E below the n_eff ≥ 30 floor → UNDERPOWERED, route to Q1 | IN PROGRESS 2026-10-12 (WP0 →) |
 | 2 | S2 | Stage 0 exploratory maker replay (spec §6.0/§6.1, process-schedule episodes, pooled §6.9) → `docs/evidence/maker/STAGE0_REPLAY_*.md` | 1 | NO-GO (stressed fill rate < 0.10 or §6.9 FAIL) → programme ends | PLAN r3 READY |
 | 3 | S3 | A1 loss-floor reachability for the maker mix (FloorSpec on the FQ engine; FQ result byte-reproduced) → `docs/evidence/maker/A1_REACHABILITY_*.md` | 2 NOT-KILLED | `unreachable_veto` at the stressed fill rate → not registrable, programme ends | PLAN r3 READY |
 | 4 | S4 | Exec resting path: GTD BUY NO, per-order + slug cancel-all, K=1 released on ACCEPTED_RESTING, boot sweep; ~24 WIDENED pin rows | 2, 3 PASS | venue refuses non-post-only GTD or slug-scoped cancel-all → programme ends | PLAN r3 READY |
