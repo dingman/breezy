@@ -1,25 +1,42 @@
 {
-  "computed_at_head": "669106ecd4c0a12fdde0e1829fd314143d37b243",
   "head_blob_sha256": {
     "scripts/analysis/fq_loss_taxonomy_battery.py": "e0b81590b429594cf1065dbf7408dde5ee736c220fd781e775bc252960b8d317",
     "scripts/analysis/fq_loss_taxonomy_classify.py": "388d3bcf0172515b5c6e81813069c23d0186be069eb9a48c058dd2a52f68c9ca",
     "scripts/analysis/fq_loss_taxonomy_core.py": "e67352852c938672b68580bc201e80a84820160e3d5e563bec02a858a0b5b783",
-    "scripts/analysis/fq_loss_taxonomy_fills.py": "5b4edd430c14e0f492fbfad8d97d4b67952ad10eff4b7eed551d9305a841985e",
+    "scripts/analysis/fq_loss_taxonomy_fills.py": "4e3068d573764ee0b0be1b05ab637eaf9b6d850790ad2a9288ec1583a613e359",
     "scripts/analysis/fq_loss_taxonomy_guard.py": "f7e90fa1018deba8f16738b181963e6fa0ae4612d16f7ca6b8108f5185f50fe9",
     "scripts/analysis/fq_loss_taxonomy_inputs.py": "f6932aab7e8a5e7cb5d8be9a4942afb98ec4c27bf884cf7c087fb9f6025eee62",
     "scripts/analysis/fq_loss_taxonomy_logs.py": "37748ea1ebe06ce409479a860019a40fc6936d7d1425eced2ffc62ebc328982a",
-    "scripts/analysis/fq_loss_taxonomy_phase_b.py": "08fc7e90a0771e4b23345c3742480ac660a0cfabe8c1ecdf7a3bac5a5932217a",
-    "scripts/analysis/fq_loss_taxonomy_pins.py": "a75a965c3b1dbeef5c93e939e785ada38c2219e8b9db46193c49792f7ee8aad3",
-    "scripts/analysis/fq_loss_taxonomy_predecl.py": "42cc3c4be1cf815935324e54880696cb8502c7ffddc98fb4d8381f605096bd05",
-    "scripts/analysis/fq_loss_taxonomy_reconstruct.py": "6b571f25aa06d0044858a6b31dbe45bfac0b507455221624d9f13580c6996693",
+    "scripts/analysis/fq_loss_taxonomy_phase_b.py": "9eb6fa445d143675ca5a54de69498c36bfa83f7c472622b1c1022c0aa2b6652f",
+    "scripts/analysis/fq_loss_taxonomy_pins.py": "25409c8aa644d342dd4e3a5c24ac3437ff6b19105a73b367ca0ea87338aead85",
+    "scripts/analysis/fq_loss_taxonomy_predecl.py": "7bb69c601508eb988df700b5fed49092c7ae58f68dc8bf16af6138eaf29d0232",
+    "scripts/analysis/fq_loss_taxonomy_provenance.py": "d2ed20da397137bfc347d0e231534d703c54816437ccb2176e19b54f4b154a9e",
+    "scripts/analysis/fq_loss_taxonomy_reconstruct.py": "019884d1b84ddbfa40667ff469839c358ea9e83e031abaf98e95c3f16ec75a4b",
     "scripts/analysis/fq_loss_taxonomy_report.py": "d9c32256275819a024de63dcda46498662de50cd7d77aac257356712a12f5651",
     "scripts/analysis/fq_loss_taxonomy_stats.py": "5d8fcb3ecf98b1fd4b6a19c02cd428d8adbce96068cf3600fffcf9c567faedbe",
     "scripts/analysis/fq_loss_taxonomy_table.py": "18674c1bc4931c963fa28cc1676b4c63b4d7afd8207d6b8f9a8dedd9c7572aeb",
-    "scripts/analysis/fq_loss_taxonomy_truth.py": "bc1a3999ec2705ae0e3b18d697f20bd2eb14c54cf6edc838d5e83c7d86170e37",
+    "scripts/analysis/fq_loss_taxonomy_truth.py": "1b0d4bd14bfe9dad9507890d0318d8955ea927aef5c8cf46968240fae197fb21",
     "scripts/analysis/fq_loss_taxonomy_verdict.py": "df81ab091a17d17ba61501af4dfd11c02dba51b1f10d565c05cfeddfefdfc43d",
-    "scripts/analysis/fq_v1_loss_taxonomy.py": "ba70ad9ffa76564857ee9da435879c70c0499b3e938402fd2a2c63bc20f51d0d"
+    "scripts/analysis/fq_v1_loss_taxonomy.py": "1ee00a6ff305b2ca4853a3d67f8e02d9cc9aecf9f27caff921a0fdf342dc439d"
   },
-  "predeclaration_commit": "b0fe067cb6e0902d39cf8ff8e41ad3f2c22bbc8f",
+  "src_dependency_sha256": {
+    "src/breezy/adapters/polymarket_us/symbology.py": "40e46379c60d54eac67901000b074409a7092c36dd08c0e39bebf4d1baa5f85d",
+    "src/breezy/analysis/labeling/fill_source.py": "099e281679cc07b550386741f78a82b29336ed09e7d7868c03659e6327f59a57",
+    "src/breezy/analysis/labeling/instrument_facts.py": "2fffa04b4871d9de3d53f8d06316e0bf4b858f184a5d9e275d05a20368c821cc",
+    "src/breezy/analysis/labeling/settlement_source.py": "33205fa51354cb6fe74947d9a16ad56fa600ed556ec4fc004800bf3d4d9d060e",
+    "src/breezy/analysis/nbp_calibration.py": "5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6",
+    "src/breezy/domain/instrument_leg.py": "c21958e2893e209bdfa2004a97575566e2bf12467cc51079a40815f8514abeab",
+    "src/breezy/domain/nws_climate_day.py": "6ffd789603b5f748f2818c4d44ea633d053ef75666ddfa0ac6e918feae2ba1bf",
+    "src/breezy/domain/selection.py": "5a818d7207d77baab1194c9bd0f062cbb64ffd63f13555bb59143c21453c2ba0",
+    "src/breezy/domain/weather_bucket_facts.py": "c3bc8db62066c811a3f3159729e8e55cdab54b641b17e073aa41f6064662906f",
+    "src/breezy/persistence/catalog.py": "237fac3f5f9e169ae0096166189af0352b8b18cdc653c0619d3c061e79b3100b",
+    "src/breezy/registry/sites.py": "e45a12e39ada01f39acba68c37bdb9d0c72da1119b010a7115a08c2e4a9c7f65",
+    "src/breezy/registry/sites.toml": "fdf400951f9cde11614d44df013716d3ed59b1006416dbb39abd60be9f0b216f",
+    "src/breezy/settlement/settlement_truth.py": "89f64a31552da69015cc243caed003cd1ccf61ec4bd24aaedab7cb279a43c01b",
+    "src/breezy/settlement/trial_scorer.py": "5472bf81c569a00adf36afcde8b82df81b0a5663e5fbc3bb951264da7f5362d4"
+  },
+  "predeclaration_commit": "526bdd112b97600073d5f0b6d5a4fa7160eb40bc",
   "reflog_snapshot_path": "docs/evidence/te2/REFLOG_SNAPSHOT_2026-10-01_to_10-06.txt",
-  "reflog_snapshot_sha256": "f359e070c2334a31252782fbf949643dfac84bba1c0992fda73b7ef9094e427d"
+  "reflog_snapshot_sha256": "f359e070c2334a31252782fbf949643dfac84bba1c0992fda73b7ef9094e427d",
+  "computed_at_head": "526bdd112b97600073d5f0b6d5a4fa7160eb40bc"
 }
