@@ -343,6 +343,7 @@ class PrintRecord:
     price_yes: Decimal
     aggressor: str
     rung: str
+    size: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)

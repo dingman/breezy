@@ -507,6 +507,7 @@ def _two_instance_capture(capture: Path) -> None:
             _trade(lax, "sell", "0.400", AggressorSide.SELLER, _ns("2026-09-22T05:01:00")),
             _trade(nyc, "nyc-buy", "0.500", AggressorSide.BUYER, _ns("2026-09-22T05:02:00")),
             _trade(lax_next, "next-day", "0.500", AggressorSide.BUYER, _ns("2026-09-22T05:03:00")),
+            _trade(lax, "noagg", "0.450", AggressorSide.NO_AGGRESSOR, _ns("2026-09-22T05:04:00")),
             shared,
         ],
         alive=(_ns("2026-09-21T12:00:00"), _ns("2026-09-22T09:00:10")),
@@ -889,3 +890,108 @@ def test_io_failure_exits_3_with_its_own_prefix_not_the_refusal_code(
     err = capsys.readouterr().err
     assert code == 3
     assert "IO_FAILED" in err and "REFUSED" not in err
+
+
+# --------------------------------------------------------------------------------------
+# --prints-out: the print file the WP2 crosscheck consumes
+# --------------------------------------------------------------------------------------
+
+_PRINT_KEYS = {"ts_ns", "side", "price", "size", "instrument_id", "trade_id"}
+
+
+def _census_argv(capture: Path, tmp_path: Path, *extra: str, day: str = "2026-09-22") -> list[str]:
+    return [
+        "--from", day,
+        "--to", day,
+        "--stations", "LAX",
+        "--catalog-root", str(capture),
+        "--work-root", str(tmp_path / "work"),
+        "--output", str(tmp_path / "out.jsonl"),
+        *extra,
+    ]  # fmt: skip
+
+
+def _read_print_lines(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_prints_out_round_trips_into_the_wp2_print_contract(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    capture = tmp_path / "capture"
+    _two_instance_capture(capture)
+    prints_out = tmp_path / "prints.jsonl"
+
+    code = census_script.main(_census_argv(capture, tmp_path, "--prints-out", str(prints_out)))
+
+    out = capsys.readouterr().out
+    rows = _read_print_lines(prints_out)
+    assert code == 4  # S-5 UNSCREENED (one covered day); the census itself succeeded
+    assert {r["trade_id"] for r in rows} == {"early", "sell", "shared"}  # 'shared' once, deduped
+    assert all(set(r) == _PRINT_KEYS for r in rows)  # exactly these keys, no others
+    by_id = {r["trade_id"]: r for r in rows}
+    assert by_id["early"] == {
+        "ts_ns": _ns("2026-09-22T05:00:00"),
+        "side": "BUYER",
+        "price": "0.250",
+        "size": "3",
+        "instrument_id": f"{_slug('lax', '2026-09-22')}.POLYMARKET_US",
+        "trade_id": "early",
+    }
+    assert by_id["sell"]["side"] == "SELLER"
+    assert '"prints_written": 3' in out and '"prints_skipped_no_aggressor": 1' in out
+    try:
+        from breezy.analysis.trade_quantity_unit import parse_print
+    except ImportError:  # the WP2 module lives on its own branch until merge
+        return
+    assert [parse_print(r).trade_id for r in rows] == [r["trade_id"] for r in rows]
+
+
+def test_prints_out_is_off_by_default_and_never_written_on_refusal_or_io_failure(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture"
+    _two_instance_capture(capture)
+    forged = tmp_path / "forged.md"
+    forged.write_text("not the declaration\n")
+    off = tmp_path / "off.jsonl"
+    refused_out = tmp_path / "refused.jsonl"
+    failed_out = tmp_path / "failed.jsonl"
+
+    census_script.main(_census_argv(capture, tmp_path))
+    refused = census_script.main(
+        _census_argv(
+            capture, tmp_path, "--prints-out", str(refused_out),
+            "--search-declaration", str(forged), day="2026-10-02",
+        )
+    )  # fmt: skip
+    failed = census_script.main(
+        _census_argv(
+            capture, tmp_path, "--prints-out", str(failed_out),
+            "--search-declaration", str(tmp_path / "missing.md"),
+        )
+    )  # fmt: skip
+
+    assert (refused, failed) == (2, 3)
+    assert not off.exists() and not refused_out.exists() and not failed_out.exists()
+    assert list(tmp_path.glob("*.jsonl")) == [tmp_path / "out.jsonl"]
+
+
+def test_prints_out_stays_inside_the_search_scope(tmp_path: Path) -> None:
+    capture = tmp_path / "capture"
+    _two_instance_capture(capture)
+    in_scope = tmp_path / "in.jsonl"
+    post_freeze = tmp_path / "post.jsonl"
+
+    census_script.main(_census_argv(capture, tmp_path, "--prints-out", str(in_scope)))
+    cleared = census_script.main(
+        _census_argv(
+            capture, tmp_path, "--prints-out", str(post_freeze),
+            "--search-declaration", str(_DECLARATION), day="2026-10-02",
+        )
+    )  # fmt: skip
+
+    ids = {r["instrument_id"] for r in _read_print_lines(in_scope)}
+    assert ids == {f"{_slug('lax', '2026-09-22')}.POLYMARKET_US"}  # no NYC, no D+1 slug
+    assert cleared == 4  # nothing covered -> S-5 UNSCREENED, but the census ran
+    assert _read_print_lines(post_freeze) == []  # an in-scope day with no tape yields no rows

@@ -74,6 +74,7 @@ class CensusRun:
     instance_counts: Counter[str]
     instances_read: tuple[str, ...]
     rows_discarded_out_of_scope: int = 0
+    prints: tuple[core.PrintRecord, ...] = ()
 
 
 @dataclass
@@ -182,6 +183,7 @@ def _admitted_prints(
                 price_yes=Decimal(str(tick.price)),
                 aggressor=tick.aggressor_side.name,
                 rung=str(tick.instrument_id),
+                size=Decimal(str(tick.size)),
             )
         )
     return out
@@ -320,7 +322,47 @@ def run_census(
     rows = tuple(
         _row(key, plan[key], ledger.get(key)) for key in sorted(plan, key=lambda k: (k[0], k[1]))
     )
-    return CensusRun(rows, core.summarise(rows), counts, tuple(read), scope.discarded)
+    return CensusRun(
+        rows, core.summarise(rows), counts, tuple(read), scope.discarded, _dedupe_prints(ledger)
+    )
+
+
+def _dedupe_prints(ledger: dict[_StationDay, _Accumulator]) -> tuple[core.PrintRecord, ...]:
+    """Every admitted print once (first wins on ``trade_id``), in a stable order."""
+    first: dict[str, core.PrintRecord] = {}
+    for key in sorted(ledger):
+        for record in ledger[key].prints:
+            first.setdefault(record.trade_id, record)
+    return tuple(sorted(first.values(), key=lambda r: (r.ts_event_ns, r.trade_id)))
+
+
+def write_prints(path: Path, prints: Sequence[core.PrintRecord]) -> tuple[int, int]:
+    """The WP2 crosscheck's print file: exactly six keys per line, aggressor prints only.
+
+    Returns ``(written, skipped_no_aggressor)``.
+    """
+    usable = [r for r in prints if r.aggressor in (core.BUYER, core.SELLER)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "ts_ns": r.ts_event_ns,
+                    "side": r.aggressor,
+                    "price": str(r.price_yes),
+                    "size": str(r.size),
+                    "instrument_id": r.rung,
+                    "trade_id": r.trade_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            for r in usable
+        ),
+        encoding="utf-8",
+    )
+    return len(usable), len(prints) - len(usable)
 
 
 def _row(
@@ -376,7 +418,7 @@ def _provenance(
     }
 
 
-def _report(summary: core.CensusSummary, run: CensusRun) -> list[str]:
+def _report(summary: core.CensusSummary, run: CensusRun, prints_written: int = 0) -> list[str]:
     lines = [
         "census_summary: "
         + json.dumps(
@@ -389,6 +431,10 @@ def _report(summary: core.CensusSummary, run: CensusRun) -> list[str]:
                 "C_030": summary.c_030,
                 "tail_span_only_days": summary.tail_span_only,
                 "rows_discarded_out_of_scope": run.rows_discarded_out_of_scope,
+                "prints_written": prints_written,
+                "prints_skipped_no_aggressor": sum(
+                    1 for r in run.prints if r.aggressor == core.NO_AGGRESSOR
+                ),
                 "reasons": dict(Counter(r.reason for r in run.rows)),
             },
             sort_keys=True,
@@ -426,6 +472,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--stations", default=_DEFAULT_STATIONS)
     parser.add_argument("--search-declaration", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prints-out", type=Path, default=None)
     parser.add_argument("--catalog-root", type=Path, default=DEFAULT_CATALOG_ROOT)
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
     return parser.parse_args(argv)
@@ -461,8 +508,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_FAILED
+    written = 0
+    if args.prints_out is not None:
+        try:
+            written, _ = write_prints(args.prints_out.expanduser(), run.prints)
+        except OSError as exc:
+            print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _EXIT_FAILED
     print("census_provenance: " + json.dumps(_provenance(args, declaration, run), sort_keys=True))
-    print("\n".join(_report(run.summary, run)))
+    print("\n".join(_report(run.summary, run, written)))
     return _EXIT_UNSCREENED if run.summary.s5_unscreened else 0
 
 
