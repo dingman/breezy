@@ -6,3 +6,8 @@
 
 ## Plan §5 layout erratum (E-TE2-a)
 To hold the 400-line cap after implementation, core splits into `scripts/analysis/fq_loss_taxonomy_stats.py`, `_classify.py`, `_verdict.py`; inputs into `_pins.py`, `_logs.py`, `_truth.py`. `fq_loss_taxonomy_core.py` and `fq_loss_taxonomy_inputs.py` remain the plan-named facades (re-exports). The S0-H HEAD-blob pins (`TE2_PINS.json`) cover the CLI script plus every core-side module (facade + stats/classify/verdict).
+
+## WP2 freeze record (2026-10-12)
+- First freeze b0fe067c/1c007b82 superseded BEFORE any Phase B run (no outcome consumed): freeze reviews (stats CHANGES-REQUIRED: honest expectation wrong — T-WIN rejection derivable from public W=2 + Phase A P_c; K4 gate; code CHANGES-REQUIRED: 6 HIGH provenance/clip gaps). Fixes 122ad04f/48f9bcd1.
+- RE-FREEZE: predeclaration 526bdd11, pins 34e15832 (18 family modules + 14 src deps). Confirmation (python-reviewer): FREEZE-CONFIRMED; check_gates against the real repo returns no refusal.
+- ACCEPTED GAP (MED, coordinator ruling): breezy.domain.{validation,strict_arrow,nws_raw_product} are in Phase B's import closure but unpinned; they validate NWS climate-day values. Accepted rather than a third re-freeze; any edit to them before the Phase B run is checked by hand (`git log 34e15832..<run commit> -- <paths>` must be empty) and recorded in the Phase B report.
