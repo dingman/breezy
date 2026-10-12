@@ -407,10 +407,13 @@ def _keep_latest(latest: dict[str, LabelRow], row: LabelRow) -> None:
 
 
 def admissible_rows(rows: Iterable[LabelRow]) -> tuple[LabelRow, ...]:
-    """The one selection rule for any P&L or ROI aggregate: ``admissible`` rows and nothing else.
+    """The one selection rule for any STATISTIC, P&L or ROI aggregate built to decide something:
+    ``admissible`` rows and nothing else (AUT-2 D3, narrowed to statistics by E-TE1-a).
 
     A null ``excluded_reason`` does not make a row eligible (an exit row or a venue-fallback row has
-    none and is still inadmissible).
+    none and is still inadmissible). The per-fill ACCOUNTING P&L of ``portfolio_roi_report``
+    deliberately reads a wider set (``analysis.labeling.accounting.accounting_rows``: final entry
+    rows including the pre-epoch ``unattributed`` ones) and builds no verdict from it.
     """
     return tuple(row for row in rows if row.admissible)
 

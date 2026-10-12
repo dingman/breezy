@@ -89,7 +89,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
@@ -118,6 +118,7 @@ from breezy.persistence.catalog import (
     CatalogPathError,
     open_station_catalog,
     read_climate_day_including_corrections,
+    station_catalog_path,
 )
 from breezy.persistence.external_capital_flows import (
     STATUS_NOT_CONFIGURED,
@@ -143,6 +144,7 @@ from breezy.persistence.scored_trial_dedupe import (  # noqa: F401 - re-exported
     dedupe_scored_trials,
 )
 from breezy.persistence.scored_trial_store import read_scored_trials, read_scored_trials_pooled
+from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime import alert_ladder
 from breezy.runtime.health import (
@@ -191,6 +193,7 @@ __all__ = [
     "PERMANENTLY_UNSETTLED_EVENT",
     "PORTFOLIO_ROI_SCHEMA_VERSION",
     "PROCEEDS_DATE_PROXY_LABEL",
+    "ROI_STATUS_GATED_ACCOUNTING_ONLY",
     "ROI_STATUS_GATED_IDENTITY",
     "ROI_STATUS_GATED_UNLABELLED_FQ",
     "ROI_STATUS_GATED_UNSETTLED_CAPITAL",
@@ -813,7 +816,15 @@ def _family_id_of_trial(
     collapse to :data:`UNKNOWN_TRIAL_FAMILY_LABEL` here: this report's own
     label for "never a guess", distinct from AUD-07's own string constant.
     """
-    resolved = resolve_trial_family(trial.trial_id, trial.climate_day, registered_manifests)
+    return _family_label(trial.trial_id, trial.climate_day, registered_manifests)
+
+
+def _family_label(
+    trial_id: str, climate_day: str, registered_manifests: Sequence[FamilyManifest]
+) -> str:
+    """:func:`_family_id_of_trial` over a bare ``(trial_id, climate_day)`` -- the form the
+    accounting table needs for a fill that has no ``ScoredTrial`` (a residual)."""
+    resolved = resolve_trial_family(trial_id, climate_day, registered_manifests)
     if resolved is None or resolved == _AMBIGUOUS_FAMILY_LABEL:
         return UNKNOWN_TRIAL_FAMILY_LABEL
     return resolved
@@ -1196,6 +1207,9 @@ class ResidualSettlement:
     #: `admissible_scored_trials`, `n_scored`, `trial_rows`, the lags sample,
     #: or the scored-trial store (AC5).
     realised_pnl: Decimal
+    #: TE-1 R10: the high this settlement was graded on, so the report can compare it with a fresh
+    #: CLI FINAL read. Never an input to ``realised_pnl``.
+    settlement_tmax_f: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1246,6 +1260,7 @@ def residual_settlement(
         dated_at_ns=trial.scheduled_release_at_ns,
         settlement_basis=scored.settlement_basis,
         realised_pnl=realised_pnl,
+        settlement_tmax_f=scored.settlement_tmax_f,
     )
 
 
@@ -2106,9 +2121,12 @@ def roi_against_baselines(
 #: into their numerator (Decision 2/R1) -- a semantic change to an existing
 #: field, not an additive-only one, so D7 requires the bump. AUT-2 WP6 bumps it to 4: `roi`,
 #: `roi_minus_b0` and `roi_minus_b1` are now `null` in a report gated on the label marker (a type
-#: change for an existing field), and `pass_flag` / `realised_pnl_c2_total` are added. The in-module
-#: reader and the exit-window study's reader (`read_portfolio_roi_report`) accept 1..4.
-PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 4
+#: change for an existing field), and `pass_flag` / `realised_pnl_c2_total` are added. TE-1 WP-B
+#: bumps it to 5: the accounting view (`fill_pnl`, `family_pnl`, `disclosures`,
+#: `roi_accounting*`) is REQUIRED from v5 on, and `roi*` is `null` under the new
+#: `GATED_ACCOUNTING_ONLY` status. The in-module reader and the exit-window study's reader
+#: (`read_portfolio_roi_report`) accept 1..5.
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 5
 
 #: The version `trial_rows` was introduced at -- every `schema_version` at
 #: or above this REQUIRES the key (see `_require_trial_rows`); below it,
@@ -2118,7 +2136,7 @@ _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
 #: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
 #: (the current, writer-stamped version) plus every prior version this
 #: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
-_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3, 4})
+_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3, 4, 5})
 
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
@@ -2127,8 +2145,16 @@ ROI_STATUS_GATED_UNSETTLED_CAPITAL: Final[str] = "GATED_UNSETTLED_CAPITAL"
 #: stale, unreadable or FAILED_IDENTITY marker, or any unresolved / missing-label fill, is
 #: `GATED_IDENTITY`; pending labels reuse `GATED_UNSETTLED_CAPITAL`. A gated report publishes no ROI.
 ROI_STATUS_GATED_IDENTITY: Final[str] = "GATED_IDENTITY"
+#: TE-1 R6: `GATED_ACCOUNTING_ONLY` -- some booked P&L sits outside the admissible (statistics) set,
+#: so the statistics `roi*` fields are withheld; `roi_accounting*` carries the accounting view.
+ROI_STATUS_GATED_ACCOUNTING_ONLY: Final[str] = "GATED_ACCOUNTING_ONLY"
 _LABEL_GATED_STATUSES: Final[frozenset[str]] = frozenset(
-    {"GATED_IDENTITY", "GATED_UNLABELLED_FQ", "GATED_UNSETTLED_CAPITAL"}
+    {
+        "GATED_IDENTITY",
+        "GATED_UNLABELLED_FQ",
+        "GATED_UNSETTLED_CAPITAL",
+        ROI_STATUS_GATED_ACCOUNTING_ONLY,
+    }
 )
 #: AUT-2 r7 WP1: the status of the `--status-only` scorer entry while any durable fill sits in
 #: the legacy UNRECONCILED bucket (every FQ fill, until a C2 label store feeds this report in
@@ -2622,7 +2648,10 @@ def build_portfolio_roi_report_data(
     realised_pnl_c2_total: Decimal = Decimal(0),
     roi_status_override: str | None = None,
     pnl_outside_admissible: bool = False,
+    fill_pnl: Sequence[accounting.FillPnlRow] = (),
+    family_pnl: Sequence[accounting.FamilyPnlRow] = (),
     disclosures: accounting.Disclosures | None = None,
+    roi_accounting_status: str = ROI_STATUS_OK,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -2635,6 +2664,7 @@ def build_portfolio_roi_report_data(
     max_days_past_horizon = (
         max((row.days_past_horizon for row in permanently_unsettled), default=0)
     )
+    accounting_total = sum((row.net or Decimal(0) for row in fill_pnl), Decimal(0))
     non_provisional_rows = tuple(row for row in cumulative.all_rows if not row.provisional)
     unexplained_flow_days = sum(1 for row in non_provisional_rows if row.breaches_tolerance)
     n_unexplained_capital_flow_days = sum(
@@ -2690,6 +2720,8 @@ def build_portfolio_roi_report_data(
             if roi_status_override is not None
             else ROI_STATUS_GATED_UNSETTLED_CAPITAL
             if unsettled_count > 0
+            else ROI_STATUS_GATED_ACCOUNTING_ONLY
+            if pnl_outside_admissible
             else ROI_STATUS_OK
         ),
         unsettled_capital_positions=unsettled_count,
@@ -2731,6 +2763,15 @@ def build_portfolio_roi_report_data(
         settled_cumulative_passes_net=cumulative.settled_cumulative_passes_net,
         realised_pnl_c2_total=realised_pnl_c2_total,
         pass_flag=cumulative.settled_cumulative_passes_net,
+        realised_pnl_accounting_total=accounting_total,
+        roi_accounting=(
+            roi(total_realised_pnl=accounting_total, total_capital_deployed=total_capital_deployed)
+            if roi_accounting_status == ROI_STATUS_OK
+            else None
+        ),
+        roi_accounting_status=roi_accounting_status,
+        fill_pnl=tuple(fill_pnl),
+        family_pnl=tuple(family_pnl),
         disclosures=disclosures,
     )
 
@@ -2827,7 +2868,7 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         ),
         "settled_cumulative_passes_net": data.settled_cumulative_passes_net,
         "realised_pnl_accounting_total": str(data.realised_pnl_accounting_total),
-        "roi_accounting": None,
+        "roi_accounting": None if data.roi_accounting is None else str(data.roi_accounting),
         "roi_accounting_status": data.roi_accounting_status,
         "fill_pnl": [row.to_json() for row in data.fill_pnl],
         "family_pnl": [row.to_json() for row in data.family_pnl],
@@ -2930,6 +2971,12 @@ class PortfolioRoiReportView:
     disclosures: accounting.Disclosures | None = None
 
     def _raise_if_gated(self) -> None:
+        if self.roi_status == ROI_STATUS_GATED_ACCOUNTING_ONLY:
+            raise UnsettledCapitalRoiError(
+                "the statistics ROI is withheld: some booked P&L sits outside the admissible "
+                "set (GATED_ACCOUNTING_ONLY); read roi_accounting / realised_pnl_accounting_total "
+                "for the accounting view"
+            )
         if self.roi_status in _LABEL_GATED_STATUSES - {ROI_STATUS_GATED_UNSETTLED_CAPITAL}:
             raise UnsettledCapitalRoiError(
                 f"portfolio ROI is gated on the label run ({self.roi_status}); "
@@ -2958,6 +3005,56 @@ class PortfolioRoiReportView:
     def roi_minus_b1(self) -> Decimal:
         self._raise_if_gated()
         return self._roi_minus_b1
+
+
+_MIN_SCHEMA_VERSION_WITH_ACCOUNTING: Final[int] = 5
+
+
+def _require_object_list(raw: Mapping[str, object], key: str) -> list[Mapping[str, object]]:
+    value = raw.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {key!r} must be a list of objects"
+        )
+    return value
+
+
+def _require_accounting_view(raw: Mapping[str, object]) -> dict[str, Any]:
+    """TE-1 WP-B: from schema_version=5 the accounting view is REQUIRED -- an absent or
+    wrong-typed key raises, never reads as a default."""
+    if "roi_accounting" not in raw or "disclosures" not in raw:
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report v5 requires 'roi_accounting' and 'disclosures' (null allowed)"
+        )
+    roi_accounting = raw["roi_accounting"]
+    disclosures = raw["disclosures"]
+    if disclosures is not None and not isinstance(disclosures, dict):
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report field 'disclosures' must be an object or null"
+        )
+    try:
+        return {
+            "realised_pnl_accounting_total": _require_decimal_str(
+                raw, "realised_pnl_accounting_total"
+            ),
+            "roi_accounting": (
+                None if roi_accounting is None else _require_decimal_str(raw, "roi_accounting")
+            ),
+            "roi_accounting_status": _require_str(raw, "roi_accounting_status"),
+            "fill_pnl": tuple(
+                accounting.FillPnlRow.from_json(item)
+                for item in _require_object_list(raw, "fill_pnl")
+            ),
+            "family_pnl": tuple(
+                accounting.FamilyPnlRow.from_json(item)
+                for item in _require_object_list(raw, "family_pnl")
+            ),
+            "disclosures": (
+                None if disclosures is None else accounting.Disclosures.from_json(disclosures)
+            ),
+        }
+    except accounting.AccountingError as exc:
+        raise PortfolioRoiReportMalformedFieldError(str(exc)) from exc
 
 
 def _gated_decimal(raw: Mapping[str, object], key: str) -> Decimal:
@@ -3155,6 +3252,7 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
         _roi=_gated_decimal(raw, "roi"),
         _roi_minus_b0=_gated_decimal(raw, "roi_minus_b0"),
         _roi_minus_b1=_gated_decimal(raw, "roi_minus_b1"),
+        **(_require_accounting_view(raw) if version >= _MIN_SCHEMA_VERSION_WITH_ACCOUNTING else {}),
     )
 
 
@@ -3310,7 +3408,61 @@ def render_markdown_report(
             ),
         ]
     )
+    if data.disclosures is not None:
+        lines.extend(_accounting_markdown(data, data.disclosures))
     return "\n".join(lines) + "\n"
+
+
+def _accounting_markdown(
+    data: PortfolioRoiReportData, disclosures: accounting.Disclosures
+) -> list[str]:
+    """TE-1 WP-B: the accounting view, appended after every pre-existing section."""
+    roi_text = "GATED" if data.roi_accounting is None else str(data.roi_accounting)
+    lines = [
+        "",
+        "## Accounting P&L (TE-1: every ledger fill once, at the recorded fee)",
+        f"- roi_accounting_status: {data.roi_accounting_status}",
+        f"- roi_accounting: {roi_text}",
+        f"- realised_pnl_accounting_total: {data.realised_pnl_accounting_total}",
+        (
+            f"- booked_total / cli_final_net_total: {disclosures.booked_total} / "
+            f"{disclosures.cli_final_net_total}"
+        ),
+        f"- cost_total / fee_total: {disclosures.cost_total} / {disclosures.fee_total}",
+        (
+            f"- n_fee_unverified: {disclosures.n_fee_unverified} "
+            f"(delta: {disclosures.fee_delta_disclosure_ref})"
+        ),
+        (
+            f"- n_settlement_disagree: {disclosures.n_settlement_disagree} "
+            f"(cli final unavailable on {disclosures.n_cli_final_unavailable} settled fills)"
+        ),
+        (
+            f"- n_null_pnl_final: {disclosures.n_null_pnl_final}; "
+            f"n_labels_gated: {disclosures.n_labels_gated}; "
+            f"n_entry_ask_unknown: {disclosures.n_entry_ask_unknown}"
+        ),
+        (
+            f"- n_no_fill_intents: {disclosures.n_no_fill_intents} "
+            f"(source {disclosures.no_fill_source}); "
+            f"n_ambiguous_no_fill: {disclosures.n_ambiguous_no_fill}; "
+            f"venue_positions_reconciled: {disclosures.venue_positions_reconciled}"
+        ),
+        (
+            "- post-terminal straddle fills (included here, excluded from the v1 tally): "
+            f"n={disclosures.n_post_terminal_bridge} pnl={disclosures.post_terminal_pnl} "
+            f"wins={disclosures.post_terminal_wins} ({disclosures.post_terminal_ref}); "
+            f"{disclosures.post_terminal_note}"
+        ),
+        "",
+        "### Per-family P&L",
+    ]
+    lines.extend(
+        f"{row.family_id} n_fills={row.n_fills} n_booked={row.n_booked} n_wins={row.n_wins} "
+        f"cost={row.cost} fee={row.fee} net={row.net}"
+        for row in data.family_pnl
+    )
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -3568,9 +3720,66 @@ def _default_families_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "deploy" / "families"
 
 
+_ACCOUNTING_VENUE: Final[str] = "polymarket_us"
+
+
+def _under_pytest() -> bool:
+    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _unavailable_cli_final(station: str, climate_day: date) -> int | None:
+    return None
+
+
 def _default_cli_final_reader(catalog_base: Path) -> accounting.CliFinalReader:
-    """Stub: no CLI FINAL is readable."""
-    return lambda station, climate_day: None
+    """The fresh NWS CLI FINAL of a station-day, read from ``catalog_base`` (R10).
+
+    ``None`` (UNAVAILABLE) when the station has no catalog directory (none is created), the read
+    fails, or the stored record is not a FINAL with a high. Read-only. Under pytest the production
+    catalog root is refused outright (L-57): a test must inject its own root or reader.
+    """
+    if catalog_base == DEFAULT_NWS_CATALOG_BASE and _under_pytest():
+        return _unavailable_cli_final
+
+    def read(station: str, climate_day: date) -> int | None:
+        if not station_catalog_path(catalog_base, _ACCOUNTING_VENUE, station).is_dir():
+            return None
+        try:
+            catalog = open_station_catalog(catalog_base, _ACCOUNTING_VENUE, station)
+            record = read_climate_day_including_corrections(
+                catalog, station=station, climate_day=climate_day
+            )
+        except _RESIDUAL_SETTLEMENT_READ_ERRORS as exc:
+            logger.warning(
+                "portfolio_roi_report: cli final lookup failed station=%s type=%s",
+                station,
+                type(exc).__name__,
+            )
+            return None
+        if record is None or not record.is_final or record.tmax_f is None:
+            return None
+        return int(record.tmax_f)
+
+    return read
+
+
+def _fill_deadline_ns(fill: DurableFillRecord) -> int:
+    """The venue's settlement instant for a fill's climate day.
+
+    A fill whose rung or station the registry cannot resolve has no derivable instant: it counts
+    from the D9 horizon of its own fill time (:func:`max_settlement_horizon_ns`), so it surfaces as
+    overdue after that, never as open forever.
+    """
+    facts = bucket_facts_from_instrument_id(fill.instrument_id)
+    if facts is None:
+        return max_settlement_horizon_ns(fill.ts_event)
+    try:
+        deadline = default_registry().settlement_deadline(
+            _ACCOUNTING_VENUE, facts.settlement_station
+        )
+    except SiteNotFoundError:
+        return max_settlement_horizon_ns(fill.ts_event)
+    return settlement_deadline_ns(deadline, facts.climate_day)
 
 
 def _default_catalog_base() -> Path:
@@ -4009,8 +4218,11 @@ class _LabelView:
         )
 
     def accounting_rows(self) -> tuple[LabelRow, ...]:
-        """The ENTRY rows the per-fill P&L table may book (TE-1 R1)."""
-        return ()
+        """The ENTRY rows the per-fill P&L table may book (TE-1 R1): final, non-legacy, and either
+        admissible or ``unattributed``. Never a statistic's input (``c2_rows`` stays that)."""
+        return accounting.accounting_rows(
+            self.rows, legacy_scorer_ids=frozenset({LEGACY_SCORER_ID})
+        )
 
 
 def _gate_status_of(root: Path, now_ns: int) -> str | None:
@@ -4143,8 +4355,10 @@ def _run(
         labels_data_root if labels_data_root is not None else _default_labels_data_root(), now_ns
     )
     c2_rows = labels.c2_rows()
+    accounting_label_rows = labels.accounting_rows()
     overlap = sorted(
-        {row.trial_id for row in c2_rows} & (frozenset(scored_ids) | frozenset(residual_ids))
+        {row.trial_id for row in (*accounting_label_rows, *c2_rows)}
+        & (frozenset(scored_ids) | frozenset(residual_ids))
     )
     if overlap:
         print(
@@ -4339,6 +4553,50 @@ def _run(
         print(f"portfolio_roi_report: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    try:
+        fill_rows = accounting.build_fill_pnl(
+            buckets,
+            scored={trial.trial_id: trial for trial in scored_trials},
+            residual={s.trial_id: s for s in residual_settlements},
+            accounting=accounting_label_rows,
+            gate_status=labels.gate_status,
+            cli_check=(
+                cli_final_reader
+                if cli_final_reader is not None
+                else _default_cli_final_reader(catalog_base)
+            ),
+            now_ns=now_ns,
+            deadline_ns=_fill_deadline_ns,
+            family_of_trial=lambda trial_id, day: _family_label(
+                trial_id, day, registered_manifests
+            ),
+            manifests=registered_manifests,
+        )
+        scored_bucket_ids = frozenset(
+            item.trial_id for item in buckets.get(FillBucket.SCORED, ()) if item.trial_id
+        )
+        accounting.assert_source_totals(
+            fill_rows,
+            legacy_expected=accounting.legacy_expected_total(
+                store_total=total_pnl,
+                scored_bucket_total=total_realised_pnl_all_settled(
+                    trial for trial in scored_trials if trial.trial_id in scored_bucket_ids
+                ),
+            ),
+            residual_expected=residual_pnl,
+        )
+    except accounting.AccountingError as exc:
+        print(f"portfolio_roi_report: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    disclosures = accounting.build_disclosures(fill_rows)
+    admissible_coids = frozenset(row.client_order_id for row in c2_rows)
+    pnl_outside_admissible = any(
+        row.source is accounting.PnlSource.C2
+        and row.net is not None
+        and row.client_order_id not in admissible_coids
+        for row in fill_rows
+    )
+
     report_data = build_portfolio_roi_report_data(
         period_start=period_start,
         period_end=period_end,
@@ -4367,7 +4625,15 @@ def _run(
         n_external_flow_records=len(external_flow_evidence.flows),
         realised_pnl_c2_total=c2_pnl,
         roi_status_override=label_status,
-        disclosures=accounting.Disclosures(),
+        pnl_outside_admissible=pnl_outside_admissible,
+        fill_pnl=fill_rows,
+        family_pnl=accounting.family_pnl(fill_rows),
+        disclosures=disclosures,
+        roi_accounting_status=accounting.roi_accounting_status(
+            gate_status=labels.gate_status,
+            n_unlabelled_fq=unlabelled_fq,
+            statuses=[row.status for row in fill_rows],
+        ).value,
     )
 
     # F7/F9: atomic writes -- the directory is created by
@@ -4413,7 +4679,64 @@ def _run(
     alert_ladder.write_latch_state(unsettled_latch_path, new_unsettled_latch)
     _emit_ladder_decision(sink, "portfolio_roi_report", unsettled_decision)
 
-    return 0
+    return _emit_accounting_alerts(
+        sink, fill_rows, disclosures, n_ledger_rows=ledger_result.n_ledger_rows
+    )
+
+
+NO_INPUT_EVENT: Final[str] = "PORTFOLIO_ROI_NO_INPUT"
+LABEL_IDENTITY_EVENT: Final[str] = "PORTFOLIO_ROI_LABEL_IDENTITY"
+NULL_PNL_FINAL_EVENT: Final[str] = "PORTFOLIO_ROI_NULL_PNL_FINAL"
+FILL_COUNT_MISMATCH_EVENT: Final[str] = "PORTFOLIO_ROI_FILL_COUNT_MISMATCH"
+SETTLEMENT_DISAGREE_EVENT: Final[str] = "PORTFOLIO_ROI_SETTLEMENT_DISAGREE"
+_ACCOUNTING_ALERT_SITE: Final[str] = "portfolio_roi_report"
+
+
+def _emit_accounting_alerts(
+    sink: AlertSink,
+    fill_rows: Sequence[accounting.FillPnlRow],
+    disclosures: accounting.Disclosures,
+    *,
+    n_ledger_rows: int,
+) -> int:
+    """TE-1 R5/R7: the accounting alerts, counts only (never an amount). Returns the exit code.
+
+    ``PORTFOLIO_ROI_NO_INPUT`` (exit 1) only when a fill is UNPRICED -- ``LABELS_GATED`` fills are
+    excluded; a label gate raises ``PORTFOLIO_ROI_LABEL_IDENTITY`` (exit 1) instead, never both for
+    one cause. A final row with a null net is CRITICAL (exit 0); a settlement disagreement is a
+    WARN (exit 0); a fill table whose length differs from the ledger's raw row count exits 1.
+    """
+    exit_code = 0
+
+    def emit(severity: str, event: str, detail: str) -> None:
+        payload = AlertPayload(
+            severity=severity, event=event, site=_ACCOUNTING_ALERT_SITE, detail=detail
+        )
+        emit_alert(sink, payload)
+
+    n_unpriced = sum(1 for row in fill_rows if row.status is accounting.FillStatus.UNPRICED)
+    if n_unpriced:
+        emit("CRITICAL", NO_INPUT_EVENT, f"n_unpriced={n_unpriced}")
+        exit_code = 1
+    if disclosures.n_labels_gated:
+        emit("CRITICAL", LABEL_IDENTITY_EVENT, f"n_labels_gated={disclosures.n_labels_gated}")
+        exit_code = 1
+    if disclosures.n_null_pnl_final:
+        emit("CRITICAL", NULL_PNL_FINAL_EVENT, f"n_null_pnl_final={disclosures.n_null_pnl_final}")
+    if len(fill_rows) != n_ledger_rows:
+        emit(
+            "CRITICAL",
+            FILL_COUNT_MISMATCH_EVENT,
+            f"n_fill_pnl={len(fill_rows)} n_ledger_rows={n_ledger_rows}",
+        )
+        exit_code = 1
+    if disclosures.n_settlement_disagree:
+        emit(
+            "WARN",
+            SETTLEMENT_DISAGREE_EVENT,
+            f"n_settlement_disagree={disclosures.n_settlement_disagree}",
+        )
+    return exit_code
 
 
 def _parse_main_args(argv: Sequence[str]) -> argparse.Namespace:

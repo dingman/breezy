@@ -36,6 +36,7 @@ from breezy.persistence.autonomy.label_store import (
     write_labels,
     write_marker,
 )
+from breezy.persistence.catalog import station_catalog_path
 from breezy.settlement.trial_scorer import ScoredTrial
 from tests.support.aut2_fixtures import (
     durable_fill,
@@ -45,6 +46,7 @@ from tests.support.aut2_fixtures import (
 )
 from tests.support.te1_accounting_guard import offending_lines, scan_file
 from tests.support.te1_fixtures import LEGACY_COIDS, World, day_start_ns, slug
+from tests.support.te1_real_ledger import REAL_TMAX
 from tests.support.te1_report_fixtures import (
     label_world,
     post_terminal_label_keys,
@@ -52,7 +54,17 @@ from tests.support.te1_report_fixtures import (
     settlements_reader,
 )
 
-_prr = portfolio_roi_module()
+
+class _ReportModule:
+    """The report module, resolved at USE time: ``test_portfolio_roi_report`` loads (and registers)
+    its own copy of the script, so a copy bound at import time may not be the one ``run_report``
+    runs. Patches therefore go through ``portfolio_roi_module()`` directly."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(portfolio_roi_module(), name)
+
+
+_prr = _ReportModule()
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOUR_NS = 3_600_000_000_000
 _DEADLINE = 1_790_000_000_000_000_000
@@ -581,13 +593,20 @@ def test_cli_final_check_reads_the_station_day_of_the_instrument() -> None:
     seen: list[tuple[str, dt.date]] = []
     fill = _fill("x")
 
-    _build(
-        _buckets(scored=[_af(fill, "t")]),
-        scored={"t": _scored("t", fill)},
-        reader=lambda s, d: seen.append((s, d)) or 87,
-    )
+    def reader(station: str, day: dt.date) -> int | None:
+        seen.append((station, day))
+        return 87
+
+    _build(_buckets(scored=[_af(fill, "t")]), scored={"t": _scored("t", fill)}, reader=reader)
 
     assert seen == [("MIA", dt.date(2026, 10, 3))]
+
+
+def _fixed_reader(fresh: int) -> Callable[[str, dt.date], int | None]:
+    def read(station: str, day: dt.date) -> int | None:
+        return fresh
+
+    return read
 
 
 _BAND_CASES = [
@@ -618,7 +637,7 @@ def test_band_fixture_reproduces_through_bucket_facts() -> None:
         rows += _build(
             _buckets(scored=[_af(fill, f"t{n}")]),
             scored={f"t{n}": booked},
-            reader=lambda station, day, fresh=tmax: fresh,
+            reader=_fixed_reader(tmax),
         )
         expected.append((Decimal(1) if held else Decimal(0)) - Decimal("0.20"))
 
@@ -989,11 +1008,26 @@ def test_gated_unsettled_capital_books_final_rows_and_marks_only_pending_fill(
     assert statuses.pop("O-PENDING") == "OPEN"
     assert set(statuses.values()) == {"SETTLED_NWS_IMPLIED"}
     assert len(statuses) == 34
-    assert report["roi_accounting_status"] == "GATED_UNSETTLED_CAPITAL"
+    # R6 rule 2 (an FQ fill no final row covers) is matched before rule 3 (the gate itself)
+    assert report["roi_accounting_status"] == "GATED_UNLABELLED_FQ"
     assert report["roi_accounting"] is None
     assert Decimal(report["realised_pnl_accounting_total"]) == Decimal("-2.63")
     assert run.exit_code == 0
     assert "PORTFOLIO_ROI_LABEL_IDENTITY" not in run.sink.events()
+
+
+def test_pending_marker_with_every_fill_final_is_gated_unsettled_capital(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6 rule 3 by the gate alone: every fill is booked, yet no accounting ROI is published."""
+    _marker(world, pending=1)
+
+    report = run_report(monkeypatch, world, tmp_path).report()
+
+    assert {r["status"] for r in report["fill_pnl"]} == {"SETTLED_NWS_IMPLIED"}
+    assert report["roi_accounting_status"] == "GATED_UNSETTLED_CAPITAL"
+    assert report["roi_accounting"] is None
+    assert report["roi_status"] == "GATED_UNSETTLED_CAPITAL"
 
 
 def test_gated_identity_books_no_label_row_alerts_identity_not_no_input(
@@ -1135,7 +1169,13 @@ def test_fill_count_mismatch_alerts_exit_1(
     world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real = _prr.accounting.build_fill_pnl
-    monkeypatch.setattr(_prr.accounting, "build_fill_pnl", lambda *a, **k: real(*a, **k)[1:])
+
+    def drop_one_c2_row(*args: Any, **kwargs: Any) -> Any:
+        rows = list(real(*args, **kwargs))
+        rows.remove(next(r for r in rows if r.source is acct.PnlSource.C2))
+        return tuple(rows)  # sums per source still agree, only the row count is short
+
+    monkeypatch.setattr(_prr.accounting, "build_fill_pnl", drop_one_c2_row)
 
     run = run_report(monkeypatch, world, tmp_path)
 
@@ -1152,7 +1192,9 @@ def test_legacy_total_mismatch_raises_exit_1_and_writes_nothing(
 ) -> None:
     real = _prr.total_realised_pnl_all_settled
     monkeypatch.setattr(
-        _prr, "total_realised_pnl_all_settled", lambda trials: real(trials) + Decimal("0.01")
+        portfolio_roi_module(),
+        "total_realised_pnl_all_settled",
+        lambda trials: real(trials) + Decimal("0.01"),
     )
 
     run = run_report(monkeypatch, world, tmp_path)
@@ -1165,20 +1207,42 @@ def test_legacy_total_mismatch_raises_exit_1_and_writes_nothing(
 def test_settlement_disagree_flagged_and_warned(
     world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A synthetic correction: the fresh FINAL for MIA 10-03 is one degree higher than booked."""
-    reader = settlements_reader(world, shift={("MIA", "2026-10-03"): 1})
+    """A synthetic correction: the fresh FINAL for MIA 10-05 is one degree higher than booked.
+
+    Two ledger fills sit on that station-day (``gte87lt88``, a booked loss, and ``gte89lt90``, a
+    booked win); both are flagged, only the win flips, and the disclosure net is decided by the
+    bucket facts. The booked net is never edited.
+    """
+    booked_tmax = REAL_TMAX[("MIA", "2026-10-05")]
+    reader = settlements_reader(world, shift={("MIA", "2026-10-05"): 1})
 
     run = run_report(monkeypatch, world, tmp_path, reader=reader)
     report = run.report()
-    row = _row_of(report, "O-20261003-021031-L001-MIA-1")
+    disagree = [r for r in report["fill_pnl"] if r["cli_final_check"] == "DISAGREE"]
+    by_instrument = {f.instrument_id: f for f in world.fills}
 
-    assert row["cli_final_check"] == "DISAGREE"
-    assert Decimal(row["net"]) == Decimal("0.88")  # booked, never edited
-    assert Decimal(row["cli_final_net"]) == Decimal("-0.12")  # gte86lt87 no longer contains 88
-    assert report["disclosures"]["n_settlement_disagree"] == 1
+    assert sorted(r["instrument_id"] for r in disagree) == [
+        "tc-temp-miahigh-2026-10-05-gte87lt88f.POLYMARKET_US",
+        "tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US",
+    ]
+    delta = Decimal(0)
+    for row in disagree:
+        fill = by_instrument[row["instrument_id"]]
+        facts = bucket_facts_from_instrument_id(row["instrument_id"])
+        assert facts is not None
+        fresh_net = (
+            (Decimal(1) if facts.contains(booked_tmax + 1) else Decimal(0))
+            - fill.cumulative_cost
+            - fill.cumulative_fee
+        )
+        assert Decimal(row["cli_final_net"]) == fresh_net
+        delta += fresh_net - Decimal(row["net"])
+    assert delta == Decimal(-1)  # exactly the booked win flips
     disclosures = report["disclosures"]
+    assert disclosures["n_settlement_disagree"] == 2
     assert Decimal(disclosures["booked_total"]) == Decimal("-2.63")
     assert Decimal(disclosures["cli_final_net_total"]) == Decimal("-3.63")
+    assert Decimal(report["realised_pnl_accounting_total"]) == Decimal("-2.63")
     assert run.sink.severities("PORTFOLIO_ROI_SETTLEMENT_DISAGREE") == ["WARN"]
     assert run.exit_code == 0
 
@@ -1204,8 +1268,8 @@ def test_default_cli_reader_never_touches_the_host_catalog_under_pytest(
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the host catalog must not be opened under pytest")
 
-    monkeypatch.setattr(_prr, "open_station_catalog", boom)
-    monkeypatch.setattr(_prr, "read_climate_day_including_corrections", boom)
+    monkeypatch.setattr(portfolio_roi_module(), "open_station_catalog", boom)
+    monkeypatch.setattr(portfolio_roi_module(), "read_climate_day_including_corrections", boom)
 
     reader = _prr._default_cli_final_reader(_prr.DEFAULT_NWS_CATALOG_BASE)
 
@@ -1218,18 +1282,24 @@ def test_injected_cli_reader_reads_only_an_existing_station_catalog(
     """Positive control: an injected base is read, and a station with no catalog directory is
     never created (UNAVAILABLE)."""
     opened: list[str] = []
-    monkeypatch.setattr(
-        _prr, "open_station_catalog", lambda base, venue, city: opened.append(city) or city
-    )
+
+    def open_catalog(base: Path, venue: str, city: str) -> str:
+        opened.append(city)
+        return city
+
+    monkeypatch.setattr(portfolio_roi_module(), "open_station_catalog", open_catalog)
     record = type("R", (), {"is_final": True, "tmax_f": 87})()
-    monkeypatch.setattr(_prr, "read_climate_day_including_corrections", lambda cat, **k: record)
-    reader = _prr._default_cli_final_reader(tmp_path / "catalog")
-    (tmp_path / "catalog" / "polymarket_us" / "MIA").mkdir(parents=True)
+    monkeypatch.setattr(
+        portfolio_roi_module(), "read_climate_day_including_corrections", lambda cat, **k: record
+    )
+    base = tmp_path / "catalog"
+    reader = _prr._default_cli_final_reader(base)
+    station_catalog_path(base, "polymarket_us", "MIA").mkdir(parents=True)
 
     assert reader("MIA", dt.date(2026, 10, 3)) == 87
     assert reader("LAX", dt.date(2026, 10, 3)) is None
     assert opened == ["MIA"]
-    assert not (tmp_path / "catalog" / "polymarket_us" / "LAX").exists()
+    assert not station_catalog_path(base, "polymarket_us", "LAX").exists()
 
 
 # -- schema v5 and the journal -----------------------------------------------------------------

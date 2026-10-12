@@ -10,6 +10,7 @@ FINAL reader, the labels root, the output root and the alert sink are all under 
 from __future__ import annotations
 
 import datetime as dt
+import importlib
 import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -108,9 +109,8 @@ def _deps(world: World) -> LabelRunDeps:
 
 def _write_residual_sidecar(world: World) -> None:
     """The real ``excluded_fills.jsonl`` writer marks the two fee-unverified fills RESIDUAL."""
-    import score_live_trials  # on sys.path once the report script is loaded
-
-    prr = portfolio_roi_module()
+    prr = portfolio_roi_module()  # loading the report puts scripts/analysis on sys.path
+    score_live_trials = importlib.import_module("score_live_trials")
     exclusions = []
     for coid in LEGACY_COIDS[:2]:
         fill = next(f for f in world.fills if f.client_order_id == coid)
@@ -167,7 +167,7 @@ def post_terminal_label_keys(world: World) -> frozenset[str]:
         fill_key_sha(item.fill)
         for items in plan.inputs_by_kind.values()
         for item in items
-        if isinstance(item.attribution, PreEpochAttribution)
+        if isinstance(getattr(item, "attribution", None), PreEpochAttribution)
         and item.attribution.basis is BridgeBasis.BRIDGE_POST_TERMINAL
     )
 

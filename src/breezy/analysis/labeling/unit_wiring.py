@@ -142,7 +142,8 @@ def activation_ns(data_root: Path, now_ns: int) -> int:
     A ``--measure-peak`` run writes its markers under its own output root, never here, so it can
     neither start nor move this anchor. Once a marker exists the anchor only ever moves BACK (an
     older marker), never forward. Before the first marker every run anchors at its own clock: a run
-    that writes no marker leaves the next one its own ``now`` (a later start, lenient toward pass).
+    that writes no marker leaves the next one its own ``now`` (a later start: lenient toward pass,
+    can only hide lag).
     """
     oldest = oldest_marker_ns(data_root)
     return now_ns if oldest is None else oldest
@@ -158,7 +159,7 @@ class LagRule:
 
     ``first_record_ns`` is ``None`` by design: the unit reads no per-fill settlement-record time, so
     the plain rule is the settlement deadline alone (``min(None, deadline)``): a deadline-only
-    start, never earlier than the true first record, conservative toward pass.
+    start, never earlier than the true first record: lenient toward pass (can only hide lag).
     """
 
     activation_ns: int

@@ -83,6 +83,11 @@ POST_TERMINAL_NOTE: Final = (
     "n_post_terminal_bridge are unrelated counts."
 )
 
+_SCORED: Final = "scored"
+_RESIDUAL: Final = "residual"
+_UNRECONCILED: Final = "unreconciled"
+_BUY: Final = "BUY"
+_SELL: Final = "SELL"
 _GATED_IDENTITY: Final = "GATED_IDENTITY"
 _GATED_UNSETTLED_CAPITAL: Final = "GATED_UNSETTLED_CAPITAL"
 _NS_PER_H: Final = 3_600_000_000_000
@@ -435,8 +440,175 @@ class Disclosures:
 def accounting_rows(
     rows: Iterable[LabelRow], *, legacy_scorer_ids: Collection[str]
 ) -> tuple[LabelRow, ...]:
-    """The ENTRY rows the P&L table may book (R1)."""
-    return ()
+    """The ENTRY rows the P&L table may book (R1).
+
+    A row is selected when it is an entry row written by a non-legacy scorer (a legacy row IS a
+    trial the scored store already pays), carries no exclusion other than ``unattributed``, and is
+    final: admissible, or ``unattributed``, or settled. The predicate is static (no clock, no
+    deadline) and equals ``is_final_row`` on the set it selects. It is the P&L-side twin of
+    ``admissible_rows``, which stays the only selector for statistics.
+    """
+    return tuple(
+        row
+        for row in rows
+        if row.role == LabelRole.ENTRY
+        and row.scorer_id not in legacy_scorer_ids
+        and row.excluded_reason in (ExcludedReason.UNATTRIBUTED, None)
+        and (
+            row.admissible
+            or row.excluded_reason is ExcludedReason.UNATTRIBUTED
+            or row.settled_outcome is not None
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _Booking:
+    """What one source booked for one fill (everything but the fill's own columns)."""
+
+    source: PnlSource
+    status: FillStatus
+    basis: Basis
+    family_id: str
+    win: bool | None = None
+    payout: Decimal | None = None
+    net: Decimal | None = None
+    booked_tmax_f: int | None = None
+    entry_ask_known: bool = False
+
+
+def _bucket_name(key: Any) -> str:
+    return str(getattr(key, "value", key))
+
+
+def _label_index(accounting: Sequence[LabelRow]) -> dict[str, list[LabelRow]]:
+    index: dict[str, list[LabelRow]] = defaultdict(list)
+    for row in accounting:
+        if row.role == LabelRole.ENTRY:
+            index[row.client_order_id].append(row)
+    return index
+
+
+def _legacy_booking(
+    item: AttributedFillLike,
+    scored: Mapping[str, ScoredTrial],
+    family_of_trial: Callable[[str, str], str],
+) -> _Booking:
+    trial = scored.get(item.trial_id or "")
+    if trial is None:
+        raise AccountingError("a SCORED-bucket fill has no scored trial")
+    qty = item.fill.cumulative_qty
+    return _Booking(
+        source=PnlSource.LEGACY,
+        status=FillStatus.SETTLED_NWS_IMPLIED,
+        basis=Basis.LEGACY_LATCH,
+        family_id=family_of_trial(trial.trial_id, trial.climate_day),
+        win=trial.held,
+        payout=qty if trial.held else Decimal(0),
+        net=trial.pnl,
+        booked_tmax_f=trial.settlement_tmax_f,
+        entry_ask_known=trial.entry_ask is not None,
+    )
+
+
+def _residual_booking(
+    item: AttributedFillLike,
+    residual: Mapping[str, ResidualLike],
+    family_of_trial: Callable[[str, str], str],
+    day: str,
+) -> _Booking:
+    trial_id = item.trial_id or ""
+    family = family_of_trial(trial_id, day)
+    settled = residual.get(trial_id)
+    if settled is None:
+        return _Booking(PnlSource.NONE, FillStatus.RESIDUAL_PENDING, Basis.RESIDUAL, family)
+    return _Booking(
+        source=PnlSource.RESIDUAL,
+        status=FillStatus.SETTLED_NWS_IMPLIED,
+        basis=Basis.RESIDUAL,
+        family_id=family,
+        win=settled.payout > 0,
+        payout=settled.payout,
+        net=settled.realised_pnl,
+        booked_tmax_f=settled.settlement_tmax_f,
+        entry_ask_known=False,
+    )
+
+
+def _basis_of(
+    row: LabelRow, fill: DurableFillRecord, manifests: Mapping[str, FamilyManifest]
+) -> Basis:
+    if row.excluded_reason is not ExcludedReason.UNATTRIBUTED:
+        return Basis.C1_DECISION
+    manifest = manifests.get(row.family_id)
+    if manifest is not None and post_terminal_straddle(manifest, row.climate_day, fill.ts_event):
+        return Basis.PRE_EPOCH_BRIDGE_POST_TERMINAL
+    return Basis.PRE_EPOCH_BRIDGE
+
+
+def _c2_booking(
+    row: LabelRow, fill: DurableFillRecord, manifests: Mapping[str, FamilyManifest]
+) -> _Booking:
+    basis = _basis_of(row, fill, manifests)
+    if row.realized_pnl is None:
+        return _Booking(PnlSource.C2, FillStatus.UNSETTLED, basis, row.family_id)
+    win = row.settled_outcome
+    payout = None if win is None else (fill.cumulative_qty if win else Decimal(0))
+    tmax = None if row.settlement_tmax_f is None else int(row.settlement_tmax_f)
+    return _Booking(
+        source=PnlSource.C2,
+        status=FillStatus.SETTLED_NWS_IMPLIED,
+        basis=basis,
+        family_id=row.family_id,
+        win=win,
+        payout=payout,
+        net=row.realized_pnl,
+        booked_tmax_f=tmax,
+        entry_ask_known=row.entry_ask is not None,
+    )
+
+
+def _unbooked(status: FillStatus) -> _Booking:
+    return _Booking(PnlSource.NONE, status, Basis.NONE, UNKNOWN_FAMILY)
+
+
+def _unreconciled_booking(
+    item: AttributedFillLike,
+    labels: Mapping[str, list[LabelRow]],
+    manifests: Mapping[str, FamilyManifest],
+    *,
+    gate_status: str | None,
+    overdue: bool,
+) -> _Booking:
+    if gate_status == _GATED_IDENTITY:
+        return _unbooked(FillStatus.LABELS_GATED)
+    rows = labels.get(item.fill.client_order_id, [])
+    if len(rows) > 1:
+        raise AmbiguousAccountingRow("two accounting rows cover one fill")
+    if rows:
+        return _c2_booking(rows[0], item.fill, manifests)
+    return _unbooked(FillStatus.UNPRICED if overdue else FillStatus.OPEN)
+
+
+def _cli_check(
+    fill: DurableFillRecord,
+    facts: Any,
+    booked_tmax_f: int | None,
+    cli_check: CliFinalReader,
+) -> tuple[CliCheck, Decimal | None]:
+    """R10: the booked tmax against a fresh read; a disagreement carries a disclosure-only net."""
+    if facts is None or booked_tmax_f is None:
+        return CliCheck.UNAVAILABLE, None
+    fresh = cli_check(facts.settlement_station, facts.climate_day)
+    if fresh is None:
+        return CliCheck.UNAVAILABLE, None
+    if fresh == booked_tmax_f:
+        return CliCheck.AGREE, None
+    inside = facts.contains(fresh)
+    is_no = leg_of_symbol(symbol_of_instrument_id(fill.instrument_id)) == "no"
+    held = (not inside) if is_no else inside
+    payout = fill.cumulative_qty if held else Decimal(0)
+    return CliCheck.DISAGREE, payout - fill.cumulative_cost - fill.cumulative_fee
 
 
 def build_fill_pnl(
@@ -452,13 +624,88 @@ def build_fill_pnl(
     family_of_trial: Callable[[str, str], str],
     manifests: Sequence[FamilyManifest] = (),
 ) -> tuple[FillPnlRow, ...]:
-    """One :class:`FillPnlRow` per fill in ``buckets`` (R9, R10)."""
-    return ()
+    """One :class:`FillPnlRow` per fill in ``buckets``, booked from exactly one source.
+
+    The source order is fixed: the scored store (LEGACY) for the SCORED bucket, the residual
+    settlement for the RESIDUAL bucket, the C2 accounting row for the UNRECONCILED bucket. Under a
+    ``GATED_IDENTITY`` label gate no label-sourced row is booked. R9 gives the status; R10 the
+    settlement check, which applies to SETTLED rows only.
+    """
+    labels = _label_index(accounting)
+    by_family = {m.family_id: m for m in manifests}
+    items = sorted(
+        ((_bucket_name(key), item) for key, members in buckets.items() for item in members),
+        key=lambda pair: (pair[1].fill.ts_event, pair[1].fill.venue_order_id),
+    )
+    rows = []
+    for bucket, item in items:
+        fill = item.fill
+        facts = bucket_facts_from_instrument_id(fill.instrument_id)
+        day = "" if facts is None else facts.climate_day.isoformat()
+        overdue = now_ns >= deadline_ns(fill) + LABEL_LAG_MAX_H * _NS_PER_H
+        if fill.order_side == _SELL:
+            booking = _Booking(PnlSource.NONE, FillStatus.EXIT, Basis.NONE, UNKNOWN_FAMILY)
+        elif fill.order_side != _BUY:
+            raise AccountingError("a fill's order side is neither BUY nor SELL")
+        elif bucket == _SCORED:
+            booking = _legacy_booking(item, scored, family_of_trial)
+        elif bucket == _RESIDUAL:
+            booking = _residual_booking(item, residual, family_of_trial, day)
+        elif bucket == _UNRECONCILED:
+            booking = _unreconciled_booking(
+                item, labels, by_family, gate_status=gate_status, overdue=overdue
+            )
+        else:
+            raise AccountingError("an unknown ledger bucket")
+        settled = booking.status is FillStatus.SETTLED_NWS_IMPLIED
+        check, cli_net = (
+            _cli_check(fill, facts, booking.booked_tmax_f, cli_check)
+            if settled
+            else (CliCheck.UNAVAILABLE, None)
+        )
+        exit_row = booking.status is FillStatus.EXIT
+        rows.append(
+            FillPnlRow(
+                fill_key=fill_key_sha(fill),
+                client_order_id=fill.client_order_id,
+                instrument_id=fill.instrument_id,
+                climate_day=day or None,
+                family_id=booking.family_id,
+                source=booking.source,
+                status=booking.status,
+                attribution_basis=booking.basis,
+                win=booking.win if settled else None,
+                payout=booking.payout if settled else None,
+                cost=None if exit_row else fill.cumulative_cost,
+                fee=None if exit_row else fill.cumulative_fee,
+                net=booking.net if settled else None,
+                fee_unverified=not fill.fee_reconciled,
+                booked_tmax_f=booking.booked_tmax_f if settled else None,
+                cli_final_check=check,
+                cli_final_net=cli_net,
+                entry_ask_known=booking.entry_ask_known,
+            )
+        )
+    return tuple(rows)
 
 
 def family_pnl(rows: Sequence[FillPnlRow]) -> tuple[FamilyPnlRow, ...]:
-    """The per-family table, derived from the fill table alone."""
-    return ()
+    """The per-family table, derived from the fill table alone (so it sums to the same total)."""
+    grouped: dict[str, list[FillPnlRow]] = defaultdict(list)
+    for row in rows:
+        grouped[row.family_id].append(row)
+    return tuple(
+        FamilyPnlRow(
+            family_id=family,
+            n_fills=len(members),
+            n_booked=sum(1 for r in members if r.net is not None),
+            n_wins=sum(1 for r in members if r.win is True),
+            cost=sum((r.cost or Decimal(0) for r in members), Decimal(0)),
+            fee=sum((r.fee or Decimal(0) for r in members), Decimal(0)),
+            net=sum((r.net or Decimal(0) for r in members), Decimal(0)),
+        )
+        for family, members in sorted(grouped.items())
+    )
 
 
 def roi_accounting_status(
@@ -467,13 +714,49 @@ def roi_accounting_status(
     n_unlabelled_fq: int,
     statuses: Iterable[FillStatus],
 ) -> RoiAccountingStatus:
-    """R6: the first match wins."""
+    """R6: the first match wins.
+
+    1. the label gate is ``GATED_IDENTITY``;
+    2. an FQ fill no final C2 row covers (a fill that arrived after the run);
+    3. the gate is ``GATED_UNSETTLED_CAPITAL`` or any fill is not SETTLED_NWS_IMPLIED / EXIT;
+    4. otherwise OK.
+    """
+    if gate_status == _GATED_IDENTITY:
+        return RoiAccountingStatus.GATED_IDENTITY
+    if n_unlabelled_fq > 0:
+        return RoiAccountingStatus.GATED_UNLABELLED_FQ
+    settled = (FillStatus.SETTLED_NWS_IMPLIED, FillStatus.EXIT)
+    if gate_status == _GATED_UNSETTLED_CAPITAL or any(s not in settled for s in statuses):
+        return RoiAccountingStatus.GATED_UNSETTLED_CAPITAL
     return RoiAccountingStatus.OK
 
 
 def build_disclosures(rows: Sequence[FillPnlRow]) -> Disclosures:
-    """The disclosure counts and totals of a fill table."""
-    return Disclosures()
+    """The disclosure counts and totals of a fill table (counts and totals only)."""
+    settled = [r for r in rows if r.status is FillStatus.SETTLED_NWS_IMPLIED]
+    booked = [r for r in rows if r.net is not None]
+    straddle = [r for r in rows if r.attribution_basis is Basis.PRE_EPOCH_BRIDGE_POST_TERMINAL]
+    zero = Decimal(0)
+    return Disclosures(
+        n_fee_unverified=sum(1 for r in rows if r.fee_unverified),
+        n_null_pnl_final=sum(1 for r in rows if r.status is FillStatus.UNSETTLED),
+        n_settlement_disagree=sum(1 for r in rows if r.cli_final_check is CliCheck.DISAGREE),
+        n_cli_final_unavailable=sum(
+            1 for r in settled if r.cli_final_check is CliCheck.UNAVAILABLE
+        ),
+        cli_final_net_total=sum(
+            ((r.cli_final_net if r.cli_final_net is not None else r.net) or zero for r in settled),
+            zero,
+        ),
+        booked_total=sum((r.net or zero for r in booked), zero),
+        cost_total=sum((r.cost or zero for r in rows), zero),
+        fee_total=sum((r.fee or zero for r in rows), zero),
+        n_entry_ask_unknown=sum(1 for r in booked if not r.entry_ask_known),
+        n_labels_gated=sum(1 for r in rows if r.status is FillStatus.LABELS_GATED),
+        n_post_terminal_bridge=len(straddle),
+        post_terminal_pnl=sum((r.net or zero for r in straddle), zero),
+        post_terminal_wins=sum(1 for r in straddle if r.win is True),
+    )
 
 
 def legacy_expected_total(
@@ -482,17 +765,25 @@ def legacy_expected_total(
     scored_bucket_total: Decimal,
     whole_store: bool = LEGACY_CHECK_WHOLE_STORE,
 ) -> Decimal:
-    """The figure the LEGACY-source sum must equal."""
-    return store_total
+    """The figure the LEGACY-source sum must equal.
+
+    Stage 0 S0-5 recorded that the whole-store total equals the SCORED-bucket sum, so the runtime
+    check compares against the whole-store ``realised_pnl_after_fees_total``; a store holding a
+    trial with no ledger fill would then fail loudly. ``whole_store=False`` is the subset form.
+    """
+    return store_total if whole_store else scored_bucket_total
 
 
 def assert_source_totals(
     rows: Sequence[FillPnlRow], *, legacy_expected: Decimal, residual_expected: Decimal
 ) -> None:
     """Raise :class:`SourceTotalMismatch` when a source's sum differs from its report total."""
-    return
-
-
-_ = (defaultdict, ExcludedReason, LabelRole, fill_key_sha, post_terminal_straddle)
-_ = (LABEL_LAG_MAX_H, bucket_facts_from_instrument_id, leg_of_symbol, symbol_of_instrument_id)
-_ = (_GATED_IDENTITY, _GATED_UNSETTLED_CAPITAL, _NS_PER_H)
+    for source, expected in (
+        (PnlSource.LEGACY, legacy_expected),
+        (PnlSource.RESIDUAL, residual_expected),
+    ):
+        booked = sum((r.net or Decimal(0) for r in rows if r.source is source), Decimal(0))
+        if booked != expected:
+            raise SourceTotalMismatch(
+                f"the {source.value} booked sum differs from the report's own total for that source"
+            )
