@@ -119,6 +119,17 @@ STUDY_THETA_BY_VENUE: frozenset[tuple[str, str, str, Decimal]] = frozenset(
             Decimal("0.0695"),
         ),
         ("kalshi", "k1_kalshi_prior", "KALSHI_TAKER_THETA", Decimal("0.07")),
+        # MAKER S3. Report-only STRESS theta (0.08) for the maker loss-floor
+        # templates: a deliberately pessimistic sensitivity cell, NOT a venue
+        # coefficient. The taker basis there is THETA_TAKER = 0.0695 (the
+        # post-drift coefficient registered above); this does not touch
+        # `DOCUMENTED_TAKER_FEE_COEFFICIENT`, which stays pinned at 0.06.
+        (
+            "polymarket_us",
+            "fq_loss_floor_mc_maker_templates",
+            "STRESS_THETA",
+            Decimal("0.08"),
+        ),
     }
 )
 
@@ -156,8 +167,10 @@ def wire_thetas_from_raw(
 def _literal_decimal(node: ast.AST) -> Decimal | None:
     if isinstance(node, ast.Call):
         func = node.func
-        name = func.id if isinstance(func, ast.Name) else (
-            func.attr if isinstance(func, ast.Attribute) else None
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else (func.attr if isinstance(func, ast.Attribute) else None)
         )
         if name == "Decimal" and node.args:
             arg = node.args[0]
@@ -242,8 +255,7 @@ def test_every_in_scope_theta_site_agrees_with_its_venue_constant() -> None:
     added = extracted - STUDY_THETA_BY_VENUE
     missing = STUDY_THETA_BY_VENUE - extracted
     assert extracted == STUDY_THETA_BY_VENUE, (
-        f"study theta census drifted; added={sorted(added)!r} "
-        f"missing={sorted(missing)!r}"
+        f"study theta census drifted; added={sorted(added)!r} missing={sorted(missing)!r}"
     )
 
     crh = Decimal(str(CurrentRungHoldConfig().required_fee_coefficient))

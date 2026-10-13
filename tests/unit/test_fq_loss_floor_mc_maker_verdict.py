@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ import pytest
 
 from scripts.analysis import fq_loss_floor_mc_maker as maker
 from scripts.analysis import fq_loss_floor_mc_maker_verdict as vmod
+from scripts.analysis.fq_loss_floor_mc_engine import _run as engine_run
 from scripts.analysis.fq_loss_floor_mc_gate import HORIZON, inclusive_days, t_low_count
 
 ICC = 0.5 / 7
@@ -106,7 +107,7 @@ def _ok(**kw: Any) -> dict[str, Any]:
     return out
 
 
-def _grid_cells(f: float, c_by: dict[tuple[int, float], float | None]) -> list[dict[str, Any]]:
+def _grid_cells(f: float, c_by: Mapping[tuple[int, float], float | None]) -> list[dict[str, Any]]:
     return [_cell(k, b, f, c_by[(k, b)]) for k in (2, 1) for b in GRID]
 
 
@@ -302,7 +303,7 @@ def test_verdict_reachable_underdetermined_unreachable() -> None:
 def _evaluate(
     kill: list[dict[str, Any]],
     pas: list[dict[str, Any]],
-    recheck: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+    recheck: Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]],
     *,
     b_median: float = 0.75,
     k: int | None = 2,
@@ -313,8 +314,8 @@ def _evaluate(
 def test_verdict_kill_reads_stressed_point_and_pass_reads_stressed_lower_bound() -> None:
     kill, pas = _grid_cells(0.30, C_BY), _grid_cells(0.22, C_BY)
 
-    def fails_at(f: float) -> Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]:
-        def recheck(cell: dict[str, Any], frozen: dict[str, Any]) -> dict[str, Any]:
+    def fails_at(f: float) -> Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]:
+        def recheck(cell: Mapping[str, Any], frozen: Mapping[str, Any]) -> dict[str, Any]:
             if (cell["k"], cell["b"], cell["f"]) == (1, 0.80, f):
                 return _ok(frozen_c_g3_holds=False)
             return _ok()
@@ -336,7 +337,7 @@ def test_frozen_c_reevaluates_g1_g3_on_every_binding_cell() -> None:
     pas = _grid_cells(0.22, C_BY)
     seen: list[tuple[int, float, float, float, int, float]] = []
 
-    def recheck(cell: dict[str, Any], frozen: dict[str, Any]) -> dict[str, Any]:
+    def recheck(cell: Mapping[str, Any], frozen: Mapping[str, Any]) -> dict[str, Any]:
         seen.append(
             (cell["k"], cell["b"], cell["f"], frozen["c"], frozen["t_min"], frozen["alpha_star"])
         )
@@ -368,7 +369,7 @@ def test_frozen_c_reevaluates_g1_g3_on_every_binding_cell() -> None:
         for c in kill
     ]
 
-    def h0_fail(cell: dict[str, Any], frozen: dict[str, Any]) -> dict[str, Any]:
+    def h0_fail(cell: Mapping[str, Any], frozen: Mapping[str, Any]) -> dict[str, Any]:
         if (cell["k"], cell["b"]) == (1, 0.70):
             return _ok(frozen_c_h0_ok=False, frozen_c_h0_rate_by_row={"H0": 0.2, "S4": 0.1})
         return _ok()
@@ -575,7 +576,7 @@ def _real_cell() -> dict[str, Any]:
 def test_horizon_sensitivity_resimulates_to_l_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     cell = _real_cell()
     frozen = {"c": 1.2, "t_min": cell["t_min"], "alpha_star": cell["alpha_star"]}
-    base = vmod._run
+    base = engine_run
     days_seen: list[int] = []
 
     def spy(*args: Any, **kwargs: Any) -> Any:

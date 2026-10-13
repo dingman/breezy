@@ -353,7 +353,8 @@ def test_deff_variance_inflation_cancels_in_certified_stop() -> None:
     rng = np.random.default_rng(14)
     unit, inflated = [], []
     for _ in range(2000):
-        zs1, zs15 = [], []
+        zs1: list[float] = []
+        zs15: list[float] = []
         for _t in range(60):
             prep = prepared[int(rng.integers(0, len(prepared)))]
             x = prep.xs[invert_cdf(prep.masses, float(rng.random()))]

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
 from typing import Any, Final
 
 from scripts.analysis.fq_loss_floor_mc_gate import (
@@ -154,7 +153,15 @@ def cell_summary(
         "b": mix.bid,
         "f": mix.fill_rate,
         "theta": mix.theta,
-        "mix": asdict(mix),
+        "mix": {
+            "fill_rate": mix.fill_rate,
+            "bid": mix.bid,
+            "rungs": mix.rungs,
+            "bid_bearing": mix.bid_bearing,
+            "two_fill_share": mix.two_fill_share,
+            "fill_icc": mix.fill_icc,
+            "theta": mix.theta,
+        },
         "replicates": replicates,
         "seed": seed,
         "n_dates": n_dates,
