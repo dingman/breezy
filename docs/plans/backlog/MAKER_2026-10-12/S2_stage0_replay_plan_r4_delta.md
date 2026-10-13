@@ -1,6 +1,6 @@
 # S2 plan r4: DELTA against `S2_stage0_replay_plan_r3.md` (2026-10-12)
 
-**MAKER-S2 plan r4 = r3 + this delta (rev 2), 2026-10-13; status READY-PENDING-VERIFICATION.**
+**MAKER-S2 plan r4 = r3 + this delta (rev 2 + final-round edits, §(p)), 2026-10-13; status READY.**
 
 r3 stays in force except at the anchors named here. "r3 Lnn" means a line of `docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md`. "MAKER-S2" is this study; "NBP S2" is the calibration study named in holdout clause 3. They are different studies.
 
@@ -29,7 +29,7 @@ Sources:
 - **Governing estimator (frozen; S1's outcome-independent form).**
   - `n_sd` = covered bid-bearing station-days per (e); `m_d` = their count on climate date d; `n0` = number of dates.
   - `n_eff_gov = Σ_d m_d/(1+(m_d−1)·RHO_ASSUMED)`. `RHO_ASSUMED` and `N_EFF_FLOOR` are **imported** from `breezy.analysis.maker_tape_census`, never copied.
-  - `test_n_eff_gov_equals_s1_n_eff_on_same_per_date` asserts equality with `maker_tape_census._n_eff` on the same dict.
+  - `test_n_eff_gov_equals_s1_n_eff_on_same_per_date` asserts equality against the public `summarise(rows).n_eff_ub` on all-COVERED generated `CensusedDay` rows; `_n_eff` is neither imported nor aliased (final round, MLE E-1).
   - n_sd is fixed before any fill, so V0 never depends on a fill outcome.
 - **Fitted ICC: REPORT-ONLY, never decides V0.**
   - Data: y_dj ∈ {0,1}, the **base-rule** station-day fill indicator; clusters = climate dates; N = n_sd, k = n0.
@@ -89,8 +89,8 @@ Sources:
   - The driver refuses unless `git status --porcelain -- scripts/analysis src tests pyproject.toml uv.lock` is empty. `tests` includes `tests/fixtures`.
   - Any code, threshold or constant change after the run starts voids it.
 - **Verdict ledger** (amendment §3). The driver keeps `~/.local/share/breezy/derived/maker_stage0/verdict_ledger.jsonl`, keyed by the amendment sha; its path is in `pins.json`.
-  - The entry is appended **at run start, before any scoring**.
-  - A verdict run refuses when an entry exists, unless the sha of a dated addendum naming the voided `run_id` is supplied.
+  - The entry is appended **after every preflight refusal** (clean tree, frozen block, amendment sha, E4, subset flags) **and before the S-7 pre-pass**, so a launch refused for a trivial reason never burns the ledger (final round, MLE E-2).
+  - A verdict run refuses when an entry exists, unless the sha of a dated addendum naming the voided `run_id` is supplied. The driver refuses an addendum unless the named `run_id` directory is `.void`-renamed and contains none of `scored_episodes.csv`, `s3_inputs.json`, `verdict.*` (test `test_ledger_refuses_addendum_for_run_with_result_files`). The same addendum form may name a substitute verify-first day (on or before 2026-06-30, by date, before run-time step 5) (final round, PMR E-D).
   - Re-runs are allowed only for runs void for non-result reasons: S-5, S-6, S-7, E4, OOM, crash, host kill. Result-driven re-runs are forbidden (PMR M-4).
 - **Abort handling.**
   - There is no resume. A run that dies is void: its directory is renamed `<run_id>.void`, sha-pinned, and its `episodes.jsonl` is never opened.
@@ -108,7 +108,7 @@ Sources:
 
 ## (d) One schedule source (r3 L124, L217, L254)
 - **PRIMARY schedule on every day:** nominal `permit_window_for_day` [16:50Z, 02:50Z); `STOP_PRIOR_UTC`; the UTC-midnight GTD cut.
-- **The logged-relaunch overlay is a report-only second pass** (`process_schedule_overlay.json`, `overlay_station_days.csv`).
+- **The logged-relaunch overlay is a report-only second pass** (`process_schedule_overlay.json`, `overlay_station_days.csv`), computed inside the same verdict invocation (one ledger entry; amendment §1) (final round, PMR E-A).
   - It never sets the label. Its V-row outcome is printed beside the primary, with the count of days it changed.
 - **Full-day outage** = no boot line and no permit line inside [16:50Z, 02:50Z) in node-log files (Popen stdout, never journald) whose span **fully** covers that window.
   - Outage days leave numerator and denominator alike, and are listed and counted.
@@ -140,8 +140,8 @@ Sources:
 ## (f) S3 interface: `s3_inputs.json` (goal r3 L21, L28)
 - **Goal item 2 (r3 L21).** Beside each rate: the climate-date cluster-bootstrap 95% two-sided percentile interval as **primary** (`bootstrap_cluster_draws` / `percentile_interval`, `scoring_core.py:216,246`; seed 20260919 × 2000), with Wilson as sidecar.
   - With fewer than 5 clusters the interval prints "not estimable" and its key is `null`.
-- **Cross-hypothesis rule.**
-  - Every key prefixed `r_lo` is the **minimum over unit hypotheses**, computed per key. The "governing" (more severe) hypothesis never carries a higher value.
+- **Cross-hypothesis rule** (final round, PMR E-B).
+  - `r_lo`, `r_lo_station_day`, `r_lo_position`, `r_lo_k1`, `r_lo_lcb_cluster_boot` and `r_lo_k1_lcb_cluster_boot` are each the **minimum over unit hypotheses**. `r_lo_by_hypothesis` and `r_lo_lcb_by_hypothesis` are maps (tested). `r_lo_se_cluster_boot` is the SD of the draws of the hypothesis that attains the minimum `r_lo_lcb_cluster_boot` (never the smallest SD). The "governing" (more severe) hypothesis never carries a higher value.
   - All other keys come from the governing hypothesis (a).
   - The rule is stressed (2 × (size ahead + 1)) unless the key says `base`. The unit is the station-day unless the key says `position`/`rung_trial`.
 
@@ -154,6 +154,8 @@ Sources:
 | `r_lo_lcb_cluster_boot` | 2.5th percentile of the two-sided 95% stressed station-day bootstrap (S3 `f_pass`); not a one-sided bound |
 | `r_lo_se_cluster_boot` | SD of those draws |
 | `r_lo_k1`, `base_k1` | K1 station-day rates (e); `r_lo_k1` min over hypotheses |
+| `r_lo_k1_lcb_cluster_boot` | 2.5th percentile of the stressed K1 station-day bootstrap, min over hypotheses (S3 `f_pass` at k = 1) (PMR E-C) |
+| `fill_icc_rung_trial_k1` | the (a) ANOVA on stressed-rule K1 positions only (≤ 4 per date); `null` when undefined (PMR E-C) |
 | `base_station_day_rate`, `base_station_day_rate_ci_cluster_boot` | base point; [2.5, 97.5] percentiles |
 | `two_fill_share` | filled station-days with 2 filled positions ÷ filled station-days |
 | `bid_bearing_share_of_covered_listed` | n_sd ÷ covered station-days |
@@ -180,14 +182,16 @@ Sources:
   - hours: `process_live_h`, `forecast_valid_h`, `gap_h`, `covered_live_h`, `gap_share` (= gap_h / forecast_valid_h; null if 0);
   - fills: `filled_pairs_base`, `filled_pairs_stress`, `k1_rung_id`, `k1_filled_base`, `k1_filled_stress`, `bid_median_fills_stress`;
   - `nogo_driving` = included in the denominator and unfilled under the stressed rule;
-  - days-to-200 inputs: `positions_filled_k2_base`, `positions_filled_k2_stress`, `positions_filled_k1_base`, `positions_filled_k1_stress` (÷ distinct dates gives the per-day rate);
+  - days-to-200 inputs: `positions_filled_k2_base`, `positions_filled_k2_stress`, `positions_filled_k1_base`, `positions_filled_k1_stress`; days-to-200 divides by distinct `climate_day` among rows with `covered` true, per hypothesis (MLE E-3);
   - clock and scoring: `delta_ns`, `truth_final`, `truth_tmax_f`, `void`, `unresolved_d14`, `theta`.
 - **`test_stats_rerun_on_scored_csv_reproduces_tables`** reads `scored_episodes.csv` + `station_days.csv` + `tail_reliability.csv`.
   - It byte-compares: V0 and fitted-ICC blocks, V1–V5, intervals, the S3 block, Tests A/B, tail, Δ distribution, coverage sensitivity, non-COVERED-by-reason, ≥ 1-frame rate, gap-share-of-NO-GO-driving table and days-to-200.
   - It asserts every other block is labelled "run-time only, sha-pinned" and that its sidecar sha matches `pins.json`. Those sidecars are:
     - `overlay_station_days.csv` (d);
     - `wp0_agreement.json`;
-    - `stress_plus60_station_days.csv` and `stress_poll_lag_station_days.csv` (i)1.
+    - `stress_plus60_station_days.csv` and `stress_poll_lag_station_days.csv` (i)1;
+    - `progress.jsonl` and the bench output.
+  - `scored_episodes.csv` columns (MLE E-3): `position_id`, `rung_trial_id`, `station`, `climate_day`, `unit_hypothesis`, `bid`, `filled_base`, `filled_stress`, `p_yes_point_live`, `truth_final`.
 - **`pin_inputs` (r3 L125) gains:**
   - the clean-tree assertion and its scope (c);
   - the installed-package-set sha (sorted `importlib.metadata` `name==version`);
@@ -212,7 +216,7 @@ Sources:
 - Printed beside it, descriptive: the stratum-mix-adjusted rate ratio, and the climate-date cluster count next to each Test A/B p-value. r3 Q2 is closed.
 
 ## (i) WP-time items (frozen now; each lands in its named WP before that WP merges)
-1. **WP2, poll lag.** A report-only stress delays every `available_at_ns` by `DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS` (900 s), **imported** from `breezy.ingest.nbm_quantile_actor` (`:126`). It sits beside the P2 +60 min stress, and both write the (g) stress sidecars. Test: `test_poll_lag_stress_delays_available_at_by_actor_poll_interval`.
+1. **WP2, poll lag.** A report-only stress delays every `available_at_ns` by `DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS` (900 s), **imported** from `breezy.ingest.nbm_quantile_actor` (`:126`). It sits beside the P2 +60 min stress; both are computed inside the verdict invocation (one ledger entry) and write only the (g) stress sidecars (PMR E-A). Test: `test_poll_lag_stress_delays_available_at_by_actor_poll_interval`.
 2. **WP2, 07Z note "moot"** (r3 L221). A 07Z D−1 cycle (≈ 08:10Z) is 8 h-stale by ≈ 16:10Z, before launch. A 07Z D cycle arrives after the 02:50Z permit end. A late 13Z (max 137 min, valid by 15:17Z) is also pre-launch. The live-side bias runs the other way (replay `available_at` = Last-Modified/floor), and item 1 measures it.
 3. **WP0/WP4, clock offset.**
    - Δ is computed per recorder instance-day as max |offset_ns| in the station-day's process-live window. A station-day spanning two instances takes the max over both.
@@ -256,7 +260,7 @@ Sources:
   - WP5: fixture CSVs;
   - WP6: fake catalog + store, incl. `--bench`.
 - **Order:** WP3 ∥ WP4 ∥ WP1 ∥ WP2 ∥ WP0 → WP5 → WP6. Each WP passes the r3 L102 focused gate.
-- **Shared fixture.** It is **generated** from `CensusedDay.to_dict` and its field set (never hand-typed) plus the unit-verdict set {CONTRACTS, USD_NOTIONAL_YES, USD_NOTIONAL_TAKER}, so an S1 schema change fails MAKER-S2 loudly.
+- **Shared fixture.** It is **generated** from `CensusedDay.to_dict` and its field set (never hand-typed) plus the unit-verdict set {CONTRACTS, USD_NOTIONAL_YES, USD_NOTIONAL_TAKER}, so an S1 schema change fails MAKER-S2 loudly. The fixture test also round-trips `write_censused_days` → `read_censused_days` (MLE E-4).
 - **Run-time steps, in order:**
   1. S1 run (10-14), then E1.
   2. WP0 step 2: first print instant.
@@ -316,7 +320,10 @@ All are resolved: 1 → (a); 2 → (f) and (n)2; 3 → (n)1; 4 → amendment §2
 1. **Allowlist.** S3 WP4 binding mode admits MAKER-S2 `verdict` only by exact-string allowlist {"NOT-KILLED", "NOT-KILLED-UNSCREENED"}. Every other value is refused: `UNDERPOWERED-WAIT`, any `NO-GO (…)`, missing, or unknown. Test `test_binding_mode_refuses_any_label_outside_allowlist` supersedes `test_binding_mode_refuses_s2_no_go`. MAKER-S2 does not claim this refusal is in force until that S3 WP4 test is merged.
 2. **k.** S3 takes k from the MAX_RUNGS admission ruling, else brackets {2, 1}. MAKER-S2 emits only `max_rungs_hypothesis`.
 3. **ICC.** S3 reads only `fill_icc_rung_trial`. Null handling, flooring at `FILL_ICC` (0.5/7) and the `MakerRefusal` on a mapped value ≥ 1 (`fq_loss_floor_mc_maker_templates.py:144`) are S3's. MAKER-S2 never pre-clips or substitutes. The S3 WP4 brief must apply the floor rather than pass the raw value to `MakerMix`.
-4. **f.** S3 `f_kill` = `r_lo` and `f_pass` = `r_lo_lcb_cluster_boot`, both minimum over unit hypotheses (f).
+4. **f.** S3 `f_kill` = `r_lo` and `f_pass` = `r_lo_lcb_cluster_boot`, both minimum over unit hypotheses (f). For k = 1: `f_kill` = `r_lo_k1`, `f_pass` = `r_lo_k1_lcb_cluster_boot`, ICC = `fill_icc_rung_trial_k1` (PMR E-C). A rung-trial ICC above 3/7 maps to ≥ 1 and trips `MakerRefusal` (templates :144); the S3 WP4 brief must define that outcome, never clip it.
+
+## (p) Final-round disposition (2026-10-13; `reviews/S2-r4-pmr-final.md`, `reviews/S2-r4-mle-final.md`)
+Both READY-WITH-EDITS, text only. Applied by the coordinator: MLE E-1 → (a); E-2 → (c); E-3 → (g); E-4 → (k). PMR E-A → (d), (i)1, amendment §1; E-B → (f); E-C → (f), (n)4; E-D → (c), amendment §3; E-E → amendment §2; E-F → amendment §1. (o)2 resolved by E-1 (public `summarise` API). **Status: READY.** Build on the (k) list may start; the amendment goes FINAL only after the frozen block is filled.
 
 ## (o) Rev 2 residual notes (for the verification round)
 1. Verify-first day fixed at 2026-06-30 (last fit-slice day); whether the NBP store and truth CSV hold rows for it is checked at run-time step 5 and fails closed (dated addendum before step 5 if missing).
