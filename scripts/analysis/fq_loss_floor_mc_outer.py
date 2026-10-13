@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from scripts.analysis.fq_loss_floor_mc_gate import AlphaEval, FloorConfig
+from scripts.analysis.fq_loss_floor_mc_gate import FQ_SPEC, AlphaEval, FloorConfig, FloorSpec
 from scripts.analysis.fq_loss_floor_mc_rows import StationDay
 
 __all__ = [
@@ -42,7 +42,8 @@ class TemplateComponent:
         }
 
 
-_BINDING: tuple[tuple[str, str], ...] = (("H0", "none"), ("S4", "none"), ("S5", "bind"))
+# FQ default (pinned by WP0). binding_c reads ``spec.binding``.
+_BINDING: tuple[tuple[str, str], ...] = FQ_SPEC.binding
 
 
 def c_mc_se_total(replicate_se: float, template_sd: float) -> float:
@@ -94,10 +95,10 @@ def binding_c(
     p_keep: float,
     seed: int,
     config: FloorConfig,
+    spec: FloorSpec = FQ_SPEC,
 ) -> float:
     """Binding-max grid ``c`` at a fixed ``t_min``. Imports the engine lazily."""
     from scripts.analysis.fq_loss_floor_mc_engine import (
-        MIXES,
         _criticals,
         _rho,
         _run,
@@ -106,10 +107,10 @@ def binding_c(
     )
     from scripts.analysis.fq_loss_floor_mc_solve import binding_max, smallest_grid_c
 
-    pooled = {mix: prepare_mix_groups(groups, mix, s6=False) for mix in MIXES}
+    pooled = {mix: prepare_mix_groups(groups, mix, s6=False) for mix in spec.mixes}
     cells: dict[tuple[str, str], float] = {}
-    for row, mode in _BINDING:
-        for mix in MIXES:
+    for row, mode in spec.binding:
+        for mix in spec.mixes:
             simulation = _run(
                 pooled[mix],
                 replicates=replicates,
@@ -120,6 +121,7 @@ def binding_c(
                 config=config,
                 rho=_rho(mode, config),
                 netting=True,
+                persist=spec.persist_for(mode),
             )
             drawn = _criticals(simulation, n_days, t_min)
             cells[(row, mix)] = smallest_grid_c(drawn, alpha)
@@ -138,6 +140,7 @@ def solve_resampled(
     p_keep: float,
     seed: int,
     config: FloorConfig,
+    spec: FloorSpec = FQ_SPEC,
 ) -> tuple[float, dict[str, float]]:
     """``c`` sample sd and quantiles across ``resamples`` of the template set."""
 
@@ -151,6 +154,7 @@ def solve_resampled(
             p_keep=p_keep,
             seed=seed + draw * 1_000_003,
             config=config,
+            spec=spec,
         )
 
     samples = resample_template_c(groups, resamples=resamples, seed=seed, solve=solve)
@@ -167,6 +171,7 @@ def apply_outer_se(
     p_keep: float,
     seed_for: Callable[[str], int],
     config: FloorConfig,
+    spec: FloorSpec = FQ_SPEC,
 ) -> tuple[tuple[AlphaEval, ...], dict[str, TemplateComponent]]:
     """Replace each ``c_se`` with ``c_mc_se_total`` before the ladder reads it."""
     adjusted: list[AlphaEval] = []
@@ -186,6 +191,7 @@ def apply_outer_se(
                 p_keep=p_keep,
                 seed=seed_for(f"outer|{evaluation.alpha:.2f}"),
                 config=config,
+                spec=spec,
             )
         total = c_mc_se_total(replicate_se, template_sd)
         components[f"{evaluation.alpha:.2f}"] = TemplateComponent(

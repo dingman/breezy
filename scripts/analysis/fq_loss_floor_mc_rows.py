@@ -46,6 +46,7 @@ __all__ = [
     "sum_cell_q",
     "template_overround",
     "walk_fixed",
+    "worst_feasible_z",
 ]
 
 Side = Literal["yes", "no"]
@@ -331,6 +332,22 @@ def all_lose_z(day: StationDay) -> float | None:
         return None
     x_rand = sum(x_piece(0.0, Decimal(str(leg.be))) for leg in day.legs)
     step = step_clock(_normalised(day.station, x_rand, day.netting, variance), 0.0)
+    return step.z
+
+
+def worst_feasible_z(day: StationDay, xs: Sequence[float]) -> float | None:
+    """Lowest ``z`` over the categorical outcomes a day can realise.
+
+    ``xs`` is ``PreparedDay.xs`` (one entry per outcome: leg ``i`` is the winning rung,
+    or none). Exclusive legs cannot all lose, which is why ``all_lose_z`` can score a
+    path the day never takes.
+    """
+    if not day.legs or not xs:
+        return None
+    variance = production_variance(day)
+    if sigma_from_variance(variance) == 0.0:
+        return None
+    step = step_clock(_normalised(day.station, min(xs), day.netting, variance), 0.0)
     return step.z
 
 

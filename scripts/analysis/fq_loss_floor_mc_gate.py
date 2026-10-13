@@ -10,7 +10,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import Final
+from typing import Final, Literal
 
 from breezy.analysis.fq_loss_stop_core import (
     ALPHA_FLOOR_GRID,
@@ -24,12 +24,15 @@ from scripts.analysis.fq_mc_eprocess import POWER_TARGET
 __all__ = [
     "DEFAULT_FREEZE",
     "DELTAS",
+    "FQ_CAL",
+    "FQ_SPEC",
     "HORIZON",
     "POOL_EXIT_FRACTION_SOURCE",
     "RATE_CAL_RULE",
     "AlphaEval",
     "FloorConfig",
     "FloorOutcome",
+    "FloorSpec",
     "choose_t_min",
     "epoch_grid",
     "epoch_holds",
@@ -39,6 +42,7 @@ __all__ = [
     "inclusive_days",
     "keep_probability",
     "margin_limit",
+    "path_families",
     "rate_cal",
     "rate_cal_max",
     "rate_gate",
@@ -351,3 +355,79 @@ class FloorConfig:
     pool_exit_fraction_source: str = POOL_EXIT_FRACTION_SOURCE
     r_sd_cal: float | None = None
     lambda_sd_cal: float | None = None
+
+
+FQ_CAL: Final[tuple[tuple[str, str], ...]] = (
+    ("H0", "none"),
+    ("S1", "none"),
+    ("S2", "none"),
+    ("S4", "none"),
+    ("S5", "bind"),
+    ("S5", "half"),
+    ("S6", "none"),
+    ("S7", "none"),
+)
+_MIX_CANON: Final[tuple[str, ...]] = ("M-pool", "M-yes", "M-no")
+_EPOCH_LENGTHS: Final = 4  # the freeze date plus the three fixed epoch starts
+
+
+@dataclass(frozen=True, slots=True)
+class FloorSpec:
+    """Mixset, calibration rows, binding rows, persistence and G1 path of one floor run.
+
+    Every field defaults to FQ's value, so ``FloorSpec() == FQ_SPEC`` reproduces the
+    FQ A1 documents byte for byte. ``persist`` holds ``(mode, block_days, rho_p)``.
+    """
+
+    mixes: tuple[str, ...] = _MIX_CANON
+    cal: tuple[tuple[str, str], ...] = FQ_CAL
+    binding: tuple[tuple[str, str], ...] = (("H0", "none"), ("S4", "none"), ("S5", "bind"))
+    persist: tuple[tuple[str, int, float], ...] = ()
+    g1_path: Literal["all_lose", "worst_feasible"] = "all_lose"
+
+    def __post_init__(self) -> None:
+        canonical = tuple(mix for mix in _MIX_CANON if mix in self.mixes)
+        if not self.mixes or self.mixes != canonical or "M-pool" not in self.mixes:
+            raise ValueError(
+                f"mixes must be a non-empty canonical-order subset of {_MIX_CANON} "
+                f"containing 'M-pool', got {self.mixes!r}"
+            )
+        outside = [row for row in self.binding if row not in self.cal]
+        if outside:
+            raise ValueError(f"binding rows {outside} are not calibration rows")
+        labels = [row for row, _mode in self.binding]
+        if len(set(labels)) != len(labels):
+            raise ValueError(f"binding rows must have distinct labels, got {labels}")
+        modes = {mode for _row, mode in self.cal}
+        for mode, block_days, rho_p in self.persist:
+            if mode not in modes:
+                raise ValueError(f"persist mode {mode!r} is not a calibration mode")
+            if block_days < 1 or not 0.0 <= rho_p <= 1.0:
+                raise ValueError(f"persist {mode!r}: need L >= 1 and 0 <= rho_p <= 1")
+        if self.g1_path not in ("all_lose", "worst_feasible"):
+            raise ValueError(f"unknown g1_path {self.g1_path!r}")
+
+    def persist_for(self, mode: str) -> tuple[int, float] | None:
+        """``(block_days, rho_p)`` for a calibration mode, or None when it has no persistence."""
+        for name, block_days, rho_p in self.persist:
+            if name == mode:
+                return (block_days, rho_p)
+        return None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "mixes": list(self.mixes),
+            "cal": [list(item) for item in self.cal],
+            "binding": [list(item) for item in self.binding],
+            "persist": [list(item) for item in self.persist],
+            "g1_path": self.g1_path,
+            "path_families": path_families(self),
+        }
+
+
+FQ_SPEC: Final = FloorSpec()
+
+
+def path_families(spec: FloorSpec) -> int:
+    """Calibration rows x mixes, plus G3 deltas x mixes x the four epoch lengths."""
+    return len(spec.cal) * len(spec.mixes) + len(DELTAS) * len(spec.mixes) * _EPOCH_LENGTHS

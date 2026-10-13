@@ -1,6 +1,8 @@
 """One floor-MC family: resampled calendar days, keep probability, core clock.
 
-S5 draws a Gaussian copula uniform. Every other row draws an independent uniform.
+S5 draws a Gaussian copula uniform. Every other row draws an independent uniform,
+unless ``persist=(L, rho_p)``: then each station carries one factor, held for ``L``
+simulated days and redrawn at the next block, and ``u = Φ(√ρp·F + √(1−ρp)·ε)``.
 The carry is whatever ``step_clock`` returns. This module does not solve ``c``.
 """
 
@@ -15,6 +17,8 @@ import numpy as np
 from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, TickDraw, advance_prepared
 
 __all__ = ["Simulation", "simulate_family"]
+
+_PERSIST_STREAM = 0x9E15  # child stream for station factors; the main stream is untouched
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +66,13 @@ def simulate_family(
     half_spread: float | None = None,
     theta: float = 0.0,
     record_draws: bool = False,
+    persist: tuple[int, float] | None = None,
 ) -> Simulation:
-    """``n_days`` resampled calendar days. A station-day is kept with ``p_keep``."""
+    """``n_days`` resampled calendar days. A station-day is kept with ``p_keep``.
+
+    ``persist=(L, rho_p)`` shares a per-station factor within L-day blocks. It cannot
+    be combined with ``rho``. ``persist=None`` leaves the RNG stream unchanged.
+    """
     if replicates < 1:
         raise ValueError(f"replicates must be positive, got {replicates}")
     if n_days < 0:
@@ -72,7 +81,13 @@ def simulate_family(
         raise ValueError("simulate_family needs at least one calendar-day group")
     if not 0.0 <= p_keep <= 1.0:
         raise ValueError(f"p_keep must be in [0, 1], got {p_keep}")
+    if persist is not None:
+        if rho is not None:
+            raise ValueError("persist and rho are mutually exclusive")
+        if persist[0] < 1 or not 0.0 <= persist[1] <= 1.0:
+            raise ValueError(f"persist needs L >= 1 and 0 <= rho_p <= 1, got {persist!r}")
     rng = np.random.default_rng(seed)
+    factor_rng = np.random.default_rng([seed, _PERSIST_STREAM]) if persist else None
     paths: list[tuple[float, ...]] = []
     cuts: list[tuple[int, ...]] = []
     draw_paths: list[tuple[TickDraw, ...]] = []
@@ -87,14 +102,24 @@ def simulate_family(
         draw_increments: list[TickDraw] = []
         day_cuts: list[int] = []
         carry = 0.0
-        for _day in range(n_days):
+        station_factors: dict[str, float] = {}
+        for day_index in range(n_days):
+            if persist is not None and day_index % persist[0] == 0:
+                station_factors.clear()
             group = groups[int(rng.integers(0, len(groups)))]
             factor = float(rng.standard_normal()) if rho is not None else 0.0
             ticks_today = 0
             for prep in group:
                 if p_keep < 1.0 and float(rng.random()) >= p_keep:
                     continue
-                u = float(rng.random()) if rho is None else _copula_u(rng, rho, factor)
+                if persist is not None and factor_rng is not None:
+                    shared = station_factors.get(prep.day.station)
+                    if shared is None:
+                        shared = float(factor_rng.standard_normal())
+                        station_factors[prep.day.station] = shared
+                    u = _copula_u(rng, persist[1], shared)
+                else:
+                    u = float(rng.random()) if rho is None else _copula_u(rng, rho, factor)
                 step, incoming, h1_fallback = advance_prepared(
                     prep,
                     u=u,
