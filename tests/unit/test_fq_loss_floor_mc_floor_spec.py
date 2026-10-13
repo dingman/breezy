@@ -21,8 +21,9 @@ from breezy.analysis.fq_loss_stop_core import step_clock
 from scripts.analysis import fq_loss_floor_mc_engine as engine
 from scripts.analysis import fq_loss_floor_mc_gate as gate
 from scripts.analysis import fq_loss_floor_mc_outer as outer
+from scripts.analysis import fq_loss_floor_mc_report as report
 from scripts.analysis import fq_loss_floor_mc_rows as rows
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, prepare_day
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, prepare_day
 from scripts.analysis.fq_loss_floor_mc_gate import repeated_crossing
 from scripts.analysis.fq_loss_floor_mc_rows import StationDay, make_leg, make_station_day
 from scripts.analysis.fq_loss_floor_mc_sim import simulate_family
@@ -119,6 +120,40 @@ def test_floor_spec_rejects_duplicate_binding_row_labels_and_binding_outside_cal
     )
     assert spec.persist_for("persist3") == (3, 0.5)
     assert spec.persist_for("none") is None
+
+
+def test_floor_spec_rejects_duplicate_persist_modes() -> None:
+    cells = (*_fq_cal(), ("S8", "persist3"))
+    with pytest.raises(ValueError, match="persist"):
+        gate.FloorSpec(
+            mixes=("M-pool",),
+            cal=cells,
+            persist=(("persist3", 3, 0.5), ("persist3", 5, 0.9)),
+        )
+    one = gate.FloorSpec(mixes=("M-pool",), cal=cells, persist=(("persist3", 3, 0.5),))
+    assert one.persist_for("persist3") == (3, 0.5)
+
+
+def test_report_day_z_skips_exactly_the_days_the_sim_drops() -> None:
+    days = {
+        "ok": StationDay("LAX", (make_leg("T70", "no", 0.75),)),
+        "two_leg_ok": StationDay("LAX", (make_leg("T70", "no", 0.75), make_leg("T72", "no", 0.75))),
+        "refusal": StationDay("LAX", (make_leg("T70", "no", 0.2), make_leg("T72", "no", 0.2))),
+        "zero_sigma": StationDay("LAX", (make_leg("T70", "no", 1 - 1e-13),)),
+        "zero_variance_nonzero_outcome": StationDay("LAX", (make_leg("T70", "no", 1e-13),)),
+        "legless": StationDay("LAX", ()),
+    }
+    no_z = {name for name, day in days.items() if report._day_z(day, "worst_feasible") is None}
+    dropped = {
+        name
+        for name, day in days.items()
+        if not engine.prepare_mix_groups([[day]], "M-pool", s6=False)[0]
+    }
+    assert no_z == dropped == {"refusal", "zero_sigma", "zero_variance_nonzero_outcome", "legless"}
+    # the sim names the clock reason for each non-legless drop
+    assert clock_block(days["refusal"]) == "sigma_no_exceeds_one"
+    assert clock_block(days["zero_sigma"]) == "zero_variance_realised"
+    assert clock_block(days["zero_variance_nonzero_outcome"]) == "zero_variance_realised"
 
 
 def test_floor_spec_defaults_are_fq_and_path_families_counts_cells() -> None:
@@ -433,7 +468,7 @@ def test_maker_binding_c_takes_max_over_s8(monkeypatch: pytest.MonkeyPatch) -> N
         return real_seed(master, label)
 
     monkeypatch.setattr(engine, "_seed", spy)
-    document = engine.run_floor(
+    document: dict[str, Any] = engine.run_floor(
         groups,
         gate_groups=groups,
         replicates=200,
@@ -456,4 +491,21 @@ def test_maker_binding_c_takes_max_over_s8(monkeypatch: pytest.MonkeyPatch) -> N
     assert any(label.startswith("sens|S8|persist3|M-pool|") for label in labels)
     assert any(label.startswith("sens|H0|none|M-pool|") for label in labels)
     assert not any(label.startswith("sens|S4|") for label in labels)
-    assert sensitivity[0]["c"] == pytest.approx(max(by_row.values()), abs=1.0)
+    # The sensitivity keeps every station-day (p_keep 1.0 vs the calibration's 0.625), so its c
+    # sits above the calibration c: +0.32 at this seed. The band [-0.1, +0.5] is about 1 MC SE
+    # of c below (200 replicates) and 1.5x the observed gap above.
+    cal_c = max(by_row.values())
+    assert cal_c - 0.1 <= sensitivity[0]["c"] <= cal_c + 0.5
+    # S8 enters the sensitivity max: with S8 dropped from the binding set the c is smaller.
+    h0_doc: dict[str, Any] = engine.run_floor(
+        groups,
+        gate_groups=groups,
+        replicates=200,
+        seed=5,
+        config=config,
+        spec=h0,
+        alphas=(0.10,),
+        outer_resamples=0,
+    )
+    h0_sens = [r for r in h0_doc["rows"] if r.get("row") == "cal_at_max_rate"]
+    assert sensitivity[0]["c"] > h0_sens[0]["c"] + 0.2

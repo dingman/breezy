@@ -399,6 +399,9 @@ class FloorSpec:
         if len(set(labels)) != len(labels):
             raise ValueError(f"binding rows must have distinct labels, got {labels}")
         modes = {mode for _row, mode in self.cal}
+        persist_modes = [mode for mode, _block_days, _rho_p in self.persist]
+        if len(set(persist_modes)) != len(persist_modes):
+            raise ValueError(f"persist modes must be distinct, got {persist_modes}")
         for mode, block_days, rho_p in self.persist:
             if mode not in modes:
                 raise ValueError(f"persist mode {mode!r} is not a calibration mode")
