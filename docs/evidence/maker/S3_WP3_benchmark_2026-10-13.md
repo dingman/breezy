@@ -97,3 +97,40 @@ note's per-replicate slope was extrapolated from 100/200-replicate points; the e
 Superseded run (before the sweep was moved off the outer SE): sweep cell 486 s, 30 cells 14,569 s.
 That is why the sweep runs WITHOUT the outer SE (context only, plan r3 WP4 step 2); the confirm
 step and the binding run use the pinned 20x2000.
+
+## WP4 step 0 calibration result (2026-10-13, this host)
+
+Unit `s3-calib-1791928822` (oneshot, exit 0, Result=success): `systemd-run --user -p MemoryMax=9G
+-p RuntimeMaxSec=5400 -p LimitNOFILE=524288`, address-space cap 12 GiB, cell f 0.5, b 0.80, k 2,
+N_TEMPLATE_DATES 1000, seed 20261012. Driver `s3_calibration.py` (session scratchpad; no CLI flag
+runs exactly these two calls). `recheck_cell` used the cell's own solved stop (c 2.99, t_min 1, alpha* 0.10).
+
+| Stage | Replicates | Outer SE | Seconds | Peak RSS MiB | MemoryPeak |
+|---|---|---|---|---|---|
+| `run_cell` | 1,000 | 20x2000 | 379.00 | 533 | not reported (cgroup accounting off) |
+| `recheck_cell` | 1,000 | n/a | 5.22 | 533 (process max) | not reported |
+
+Decomposition: the outer SE is fixed (20x2000) and does not scale with replicates. Using the note's
+12.7 s for 1,000 plain replicates, outer SE = 379 - 12.7 = about 366 s (0.0092 s per unit). Recheck
+scales linearly: 52 s per cell at 10,000 replicates (the note's 79 s was an upper bound).
+
+| Stage | Arithmetic | Central s |
+|---|---|---|
+| sweep | 30 x 25 s (2,000 reps, no outer) | 750 |
+| confirm | 6 x (115 + 366 = 481 s) | 2,886 |
+| binding | 12 x 481 s | 5,772 |
+| report | 6 x 481 s | 2,886 |
+| re-check | 12 x 52 s | 626 |
+| horizon | 52 x 4/7 x 2 | 60 |
+
+Caps. Memory: 533 MiB + 0.11 MiB/replicate gives about 5.8 GiB for a 50,000-replicate re-run; x1.5 = 9G.
+(Peak RSS at 1,000 replicates x1.5 alone would give the 5G floor, which a re-run would exceed.)
+
+| Unit | Central | `RuntimeMaxSec` (2x) | `MemoryMax` | `--max-memory-gib` |
+|---|---|---|---|---|
+| `--sweep` (sweep + confirm) | 3,636 s | 7,300 | 9G | 12 |
+| `--binding` (binding + report + re-check + horizon) | 9,344 s | 18,700 | 9G | 12 |
+
+Each 50,000-replicate re-run costs about 940 s (575 + 366); the 2x margin absorbs about 3.9 (sweep)
+and 9.9 (binding) of them; the 18-re-run worst case does not fit and needs a manual extension.
+Caps below supersede the provisional table above.
