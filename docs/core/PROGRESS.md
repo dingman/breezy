@@ -42,7 +42,7 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ## BACKLOG — MAKER programme (operator 2026-10-12: "replace the backlog with this work")
 
-Spec: `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` (v0.2, T2
+Spec: `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` (v0.3, T2
 candidate). Plans: `docs/plans/backlog/MAKER_2026-10-12/` (`S<n>_*_plan_r<N>.md`,
 peer reviews in `reviews/`). Execution order is strict; each step's STOP
 condition ends the programme and the family stays at its last version.
@@ -59,13 +59,13 @@ worktree; never `git stash`; full gate after EVERY merge (basetemp under
 
 | # | ID | Work | Needs | STOP condition | Status |
 |---|---|---|---|---|---|
-| 1 | S1 | Maker-window print census (recorder liveness + `trade_tick`, dedupe on trade_id) incl. a dated SEARCH declaration for post-09-25 tape; resolve/bracket `TRADE_QUANTITY_UNIT` from own fills | WP0: ≥10 GB disk | E below the n_eff ≥ 30 floor → UNDERPOWERED, route to Q1 | IN PROGRESS 2026-10-12 (WP0 →) |
+| 1 | S1 | Maker-window print census (recorder liveness + `trade_tick`, dedupe on trade_id) incl. a dated SEARCH declaration for post-09-25 tape; resolve/bracket `TRADE_QUANTITY_UNIT` from own fills | WP0: ≥10 GB disk | E below the n_eff ≥ 30 floor → UNDERPOWERED, route to Q1 | IN PROGRESS: WP0 FINAL 6068a00e (72 station-days); WP1+WP2 built, 4 blind reviews, gate-green; RUN ≥ 10-14 10:00Z per `S1_RUN_PROCEDURE_2026-10-14.md`; then WP3 (if single-hypothesis) + WP4 |
 | 2 | S2 | Stage 0 exploratory maker replay (spec §6.0/§6.1, process-schedule episodes, pooled §6.9) → `docs/evidence/maker/STAGE0_REPLAY_*.md` | 1 | NO-GO (stressed fill rate < 0.10 or §6.9 FAIL) → programme ends | PLAN r3 READY |
 | 3 | S3 | A1 loss-floor reachability for the maker mix (FloorSpec on the FQ engine; FQ result byte-reproduced) → `docs/evidence/maker/A1_REACHABILITY_*.md` | 2 NOT-KILLED | `unreachable_veto` at the stressed fill rate → not registrable, programme ends | PLAN r3 READY |
 | 4 | S4 | Exec resting path: GTD BUY NO, per-order + slug cancel-all, K=1 released on ACCEPTED_RESTING, boot sweep; ~24 WIDENED pin rows | 2, 3 PASS | venue refuses non-post-only GTD or slug-scoped cancel-all → programme ends | PLAN r3 READY |
 | 5 | S5 | `no_ladder_maker` family (SHADOW, never submits), PREREG frozen before start (A1 stop, calendar split, read target 300/200), scorer + 9-gate advisory report | 2, 3 (S4 only at gate 8) | any §7 gate FAIL on the read-once holdout; UNSCREENED-TERMINAL power stop | PLAN r3 READY |
 
-Review record: 11 r1 reviews, 6 r2 verifications (`reviews/`), r3 = conformance to spec v0.3. Known residuals: S4 no-id maker fill during node downtime stays AMBIGUOUS (fail-closed, alert); bid-live window ≈ 10 h/day under the 16:50Z launch + 10 h permit (spec §3). Disk 4.2 GB free: every WP0 clears ≥10 GB first.
+Review record: 11 r1 reviews, 6 r2 verifications (`reviews/`), r3 = conformance to spec v0.3. Known residuals: S4 no-id maker fill during node downtime stays AMBIGUOUS (fail-closed, alert); bid-live window ≈ 10 h/day under the 16:50Z launch + 10 h permit (spec §3). Disk: 121 GB free after 2026-10-13 00Z (789 gate basetemps removed); collectors reset after `disk_guard_refused`; LESSONS.md volume gate (133 KB) DEFERRED as a separate docs task.
 
 Activation after S5 PASS remains manual (`BREEZY_SENDING_FAMILY_ID` + supervisor
 restart + `live_orders_ruling`); no auto-arm path is built by this programme.
