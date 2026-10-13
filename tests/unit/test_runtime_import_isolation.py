@@ -137,6 +137,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # (c) picks it up; tracked, not excluded (WIDENED by this one reviewed row,
     # never relaxed).
     "scripts.ops.ambig_latch_phase_a_check",
+    "scripts.analysis.maker_tape_census",  # MAKER S1 WP1 census
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
