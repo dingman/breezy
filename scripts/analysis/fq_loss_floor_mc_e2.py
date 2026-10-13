@@ -10,13 +10,13 @@ from datetime import date
 import numpy as np
 
 from breezy.analysis.fq_loss_stop_core import ALPHA_FLOOR_GRID
-from scripts.analysis.fq_loss_floor_mc_gate import AlphaEval, FloorOutcome, epoch_grid
+from scripts.analysis.fq_loss_floor_mc_gate import FQ_SPEC, AlphaEval, FloorOutcome, epoch_grid
 from scripts.analysis.fq_loss_floor_mc_rows import RefusedTemplate
 from scripts.analysis.fq_loss_floor_mc_solve import binding_max, smallest_grid_c
 
 __all__ = ["blank_document", "complete_veto", "finish_e2", "refused_names", "sensitivity_c"]
 
-_MIX_ORDER: tuple[str, ...] = ("M-pool", "M-yes", "M-no")
+_MIX_ORDER: tuple[str, ...] = FQ_SPEC.mixes  # FQ default; callers pass the spec's mixes
 _G3_KEYS: tuple[str, ...] = ("-0.16", "-0.08", "-0.04")
 
 
@@ -97,7 +97,11 @@ def _g3(row: Mapping[str, object]) -> dict[str, float]:
 
 
 def _rows_at(
-    gates: Sequence[Mapping[str, object]], *, alpha: float, epoch: str
+    gates: Sequence[Mapping[str, object]],
+    *,
+    alpha: float,
+    epoch: str,
+    mixes: Sequence[str] = _MIX_ORDER,
 ) -> dict[str, Mapping[str, object]]:
     found: dict[str, Mapping[str, object]] = {}
     for row in gates:
@@ -109,7 +113,7 @@ def _rows_at(
         if not isinstance(mix, str):
             raise TypeError(f"gate mix must be a string, got {mix!r}")
         found[mix] = row
-    missing = [mix for mix in _MIX_ORDER if mix not in found]
+    missing = [mix for mix in mixes if mix not in found]
     if missing:
         raise ValueError(f"gate rows missing {missing} at alpha {alpha} epoch {epoch}")
     return found
@@ -123,28 +127,33 @@ def _flag(rows: Mapping[str, Mapping[str, object]], mix: str, flag: str) -> bool
 
 
 def _measured(
-    gates: Sequence[Mapping[str, object]], *, alpha: float, epoch: str
+    gates: Sequence[Mapping[str, object]],
+    *,
+    alpha: float,
+    epoch: str,
+    mixes: Sequence[str] = _MIX_ORDER,
 ) -> dict[str, float]:
-    rows = _rows_at(gates, alpha=alpha, epoch=epoch)
-    return {key: min(_g3(rows[mix])[key] for mix in _MIX_ORDER) for key in _G3_KEYS}
+    rows = _rows_at(gates, alpha=alpha, epoch=epoch, mixes=mixes)
+    return {key: min(_g3(rows[mix])[key] for mix in mixes) for key in _G3_KEYS}
 
 
 def _failing_mix(
     outcome: FloorOutcome,
     gates: Sequence[Mapping[str, object]],
     epoch: str,
+    mixes: Sequence[str] = _MIX_ORDER,
 ) -> str:
     if outcome.veto_cause == "g3_floor":
         alpha = outcome.alpha_star
         if alpha is None:
             raise ValueError("g3_floor veto is missing alpha_star")
-        rows = _rows_at(gates, alpha=alpha, epoch=epoch)
-        scores = {mix: _g3(rows[mix])["-0.16"] for mix in _MIX_ORDER}
-        return min(_MIX_ORDER, key=lambda mix: (scores[mix], _MIX_ORDER.index(mix)))
+        rows = _rows_at(gates, alpha=alpha, epoch=epoch, mixes=mixes)
+        scores = {mix: _g3(rows[mix])["-0.16"] for mix in mixes}
+        return min(mixes, key=lambda mix: (scores[mix], mixes.index(mix)))
     for alpha in ALPHA_FLOOR_GRID:
-        rows = _rows_at(gates, alpha=alpha, epoch=epoch)
+        rows = _rows_at(gates, alpha=alpha, epoch=epoch, mixes=mixes)
         flag = "g1" if math.isclose(alpha, ALPHA_FLOOR_GRID[0], abs_tol=1e-9) else "g1_margin"
-        failed = [mix for mix in _MIX_ORDER if not _flag(rows, mix, flag)]
+        failed = [mix for mix in mixes if not _flag(rows, mix, flag)]
         if failed:
             return failed[0]
     raise ValueError("g1_unreachable veto has no failing mix on the ladder")
@@ -172,6 +181,7 @@ def finish_e2(
     refused_detail: str,
     mixes: Sequence[str],
     run_at: Callable[[str, str, str, int], np.ndarray],
+    binding: Sequence[tuple[str, str]] = FQ_SPEC.binding,
 ) -> FloorOutcome:
     """Append the max-rate sensitivity c, fill a veto, then apply a refusal block."""
     final_alpha = outcome.alpha_star if outcome.alpha_star is not None else grid_last
@@ -192,14 +202,14 @@ def finish_e2(
                 same_rate=math.isclose(max_rate, cal_rate),
                 bound_c=final_eval.c,
                 alpha=final_alpha,
-                binding=(("H0", "none"), ("S4", "none"), ("S5", "bind")),
+                binding=binding,
                 mixes=mixes,
                 run_cell=_cell,
             ),
         }
     )
     if outcome.floor_mode == "unreachable_veto":
-        outcome = complete_veto(outcome, gates=gates, evals=adjusted, freeze=freeze)
+        outcome = complete_veto(outcome, gates=gates, evals=adjusted, freeze=freeze, mixes=mixes)
     if not refused:
         return outcome
     return replace(
@@ -223,6 +233,7 @@ def complete_veto(
     gates: Sequence[Mapping[str, object]],
     evals: Sequence[AlphaEval],
     freeze: date,
+    mixes: Sequence[str] = _MIX_ORDER,
 ) -> FloorOutcome:
     """Fill power, the failing mix, and α=0.10 diagnostics. Those are not pins."""
     if outcome.floor_mode != "unreachable_veto":
@@ -242,7 +253,7 @@ def complete_veto(
         c=None,
         c_mc_se=None,
         t_min=None,
-        measured_power=_measured(gates, alpha=alpha0, epoch=epoch),
-        failing_mix=_failing_mix(outcome, gates, epoch),
+        measured_power=_measured(gates, alpha=alpha0, epoch=epoch, mixes=mixes),
+        failing_mix=_failing_mix(outcome, gates, epoch, mixes),
         diagnostics=diagnostics,
     )

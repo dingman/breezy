@@ -8,13 +8,16 @@ from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 
-from breezy.analysis.fq_loss_stop_core import T_MIN_GRID, VARIANCE_EPS
-from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, with_s7_skips
+from breezy.analysis.fq_loss_stop_core import T_MIN_GRID, VARIANCE_EPS, FqLossStopRefusal
+from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, prepare_day, with_s7_skips
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
+    FQ_CAL,
+    FQ_SPEC,
     AlphaEval,
     FloorConfig,
     FloorOutcome,
+    FloorSpec,
     choose_t_min,
     delta_key,
     epoch_holds,
@@ -34,6 +37,7 @@ from scripts.analysis.fq_loss_floor_mc_rows import (
     production_variance,
     rho_bind,
     template_overround,
+    worst_feasible_z,
 )
 from scripts.analysis.fq_loss_floor_mc_sim import Simulation
 from scripts.analysis.fq_loss_floor_mc_solve import (
@@ -46,6 +50,7 @@ from scripts.analysis.fq_loss_floor_mc_solve import (
 )
 
 __all__ = [
+    "all_lose_by_mix",
     "append_rows",
     "evaluate_alpha",
     "finish_document",
@@ -66,18 +71,10 @@ C_TEMPLATE_RESAMPLE = (
 )
 
 Power = Callable[[float, str, int, int, float], float]
-MIXES: tuple[str, ...] = ("M-pool", "M-yes", "M-no")
-_CAL: tuple[tuple[str, str], ...] = (
-    ("H0", "none"),
-    ("S1", "none"),
-    ("S2", "none"),
-    ("S4", "none"),
-    ("S5", "bind"),
-    ("S5", "half"),
-    ("S6", "none"),
-    ("S7", "none"),
-)
-_BINDING: frozenset[tuple[str, str]] = frozenset({("H0", "none"), ("S4", "none"), ("S5", "bind")})
+# FQ defaults, pinned by WP0. A run reads its own FloorSpec; these stay the FQ values.
+MIXES: tuple[str, ...] = FQ_SPEC.mixes
+_CAL: tuple[tuple[str, str], ...] = FQ_CAL
+_BINDING: frozenset[tuple[str, str]] = frozenset(FQ_SPEC.binding)
 
 
 def _seed(master: int, label: str) -> int:
@@ -85,14 +82,35 @@ def _seed(master: int, label: str) -> int:
     return int.from_bytes(digest[:4], "little")
 
 
-def _median_z(groups: Sequence[Sequence[StationDay]], mix: str) -> float | None:
+def _day_z(day: StationDay, path: str) -> float | None:
+    if path == "all_lose":
+        return all_lose_z(day)
+    try:
+        return worst_feasible_z(day, prepare_day(day).xs)
+    except FqLossStopRefusal:
+        return None  # the sim drops the same day (clock_block)
+
+
+def _median_z(
+    groups: Sequence[Sequence[StationDay]], mix: str, path: str = "all_lose"
+) -> float | None:
     scores = [
-        z for group in groups for day in group if (z := all_lose_z(apply_mix(day, mix))) is not None
+        z
+        for group in groups
+        for day in group
+        if (z := _day_z(apply_mix(day, mix), path)) is not None
     ]
     if not scores:
         return None
     scores.sort()
     return scores[len(scores) // 2]
+
+
+def all_lose_by_mix(
+    groups: Sequence[Sequence[StationDay]], mixes: Sequence[str]
+) -> dict[str, float | None]:
+    """Median all-lose ``z`` per mix: the FQ G1 path, printed as context on other specs."""
+    return {mix: _median_z(groups, mix, "all_lose") for mix in mixes}
 
 
 def _rho(mode: str, config: FloorConfig) -> float | None:
@@ -113,11 +131,13 @@ def append_rows(
     n_cal: int,
     replicates: int,
     config: FloorConfig,
+    spec: FloorSpec = FQ_SPEC,
 ) -> None:
     """Per-cell crossing rate at the solved ``c``, plus the S3 single-day share."""
-    for row, mode in _CAL:
+    binding = frozenset(spec.binding)
+    for row, mode in spec.cal:
         rho = _rho(mode, config)
-        for mix in MIXES:
+        for mix in spec.mixes:
             sim = cal_sims[(row, mode, mix)]
             drawn = crit(sim, n_cal, t_min)
             rate = crossing_rate(drawn, solved)
@@ -125,7 +145,7 @@ def append_rows(
                 {
                     "row": row,
                     "mix": mix,
-                    "role": "binding" if (row, mode) in _BINDING else "report",
+                    "role": "binding" if (row, mode) in binding else "report",
                     "alpha": alpha,
                     "t_min": t_min,
                     "rho": rho,
@@ -165,33 +185,36 @@ def evaluate_alpha(
     rows: list[dict[str, object]],
     gates: list[dict[str, object]],
     tick_share: float = 1.0,
+    spec: FloorSpec = FQ_SPEC,
 ) -> tuple[AlphaEval, tuple[str, str]]:
     """Solve ``c`` and the epoch gates for one α. Appends to ``rows`` and ``gates``."""
+    binding = frozenset(spec.binding)
+    mixes = spec.mixes
     by_t: dict[int, tuple[float, tuple[str, str]]] = {}
     scores: dict[int, float] = {}
     for t_min in T_MIN_GRID:
         cells: dict[tuple[str, str], float] = {}
-        for row, mode in _CAL:
-            if (row, mode) not in _BINDING:
+        for row, mode in spec.cal:
+            if (row, mode) not in binding:
                 continue
-            for mix in MIXES:
+            for mix in mixes:
                 drawn = crit(cal_sims[(row, mode, mix)], n_cal, t_min)
                 cells[(row, mix)] = smallest_grid_c(drawn, alpha)
         solved, cell = binding_max(cells)
         by_t[t_min] = (solved, cell)
-        scores[t_min] = min(power(-0.16, mix, n_cal, t_min, solved) for mix in MIXES)
+        scores[t_min] = min(power(-0.16, mix, n_cal, t_min, solved) for mix in mixes)
     t_star = choose_t_min(scores, set(by_t))
     solved, cell = by_t[t_star]
     binding_draws = {
         (row, mix): crit(cal_sims[(row, mode, mix)], n_cal, t_star)
-        for row, mode in _CAL
-        if (row, mode) in _BINDING
-        for mix in MIXES
+        for row, mode in spec.cal
+        if (row, mode) in binding
+        for mix in mixes
     }
     c_se = bootstrap_c_se(binding_draws, alpha=alpha, seed=_seed(seed, f"boot|{alpha}"))
     s6_rates = [
         crossing_rate(crit(cal_sims[("S6", "none", mix)], n_cal, t_star), solved)
-        for mix in MIXES
+        for mix in mixes
         if any(prep.day.legs for group in feasible[mix] for prep in group)
     ]
     s6_rate = max(s6_rates) if s6_rates else 1.0
@@ -199,7 +222,7 @@ def evaluate_alpha(
     freeze_key = config.freeze.isoformat()
     measured = {
         delta_key(delta): min(
-            power(delta, mix, lengths[freeze_key], t_star, solved) for mix in MIXES
+            power(delta, mix, lengths[freeze_key], t_star, solved) for mix in mixes
         )
         for delta in DELTAS
     }
@@ -211,8 +234,8 @@ def evaluate_alpha(
         passes: list[bool] = []
         margins: list[bool] = []
         g3_epoch: list[float] = []
-        for mix in MIXES:
-            z = _median_z(cleaned, mix)
+        for mix in mixes:
+            z = _median_z(cleaned, mix, spec.g1_path)
             t_cross = (
                 None if z is None else repeated_crossing(z, c=solved, t_min=t_star, t_low=t_low)
             )
@@ -225,21 +248,23 @@ def evaluate_alpha(
             }
             g3_epoch.append(g3_values["-0.16"])
             f_star = None if z is None else fully_lost_fraction(z, c=solved, t_low=t_low)
-            gates.append(
-                {
-                    "alpha": alpha,
-                    "epoch": epoch,
-                    "mix": mix,
-                    "t_min": t_star,
-                    "c": solved,
-                    "t_low": t_low,
-                    "t_cross": t_cross,
-                    "g1": passed,
-                    "g1_margin": margin,
-                    "f_star": f_star,
-                    "g3": g3_values,
-                }
-            )
+            gate_row: dict[str, object] = {
+                "alpha": alpha,
+                "epoch": epoch,
+                "mix": mix,
+                "t_min": t_star,
+                "c": solved,
+                "t_low": t_low,
+                "t_cross": t_cross,
+                "g1": passed,
+                "g1_margin": margin,
+                "f_star": f_star,
+                "g3": g3_values,
+            }
+            if spec.g1_path != "all_lose":
+                gate_row["z_g1"] = z
+                gate_row["z_all_lose"] = _median_z(cleaned, mix, "all_lose")
+            gates.append(gate_row)
         epoch_ok[epoch] = epoch_holds(
             g1_pass=all(passes),
             g1_margin=all(margins),
@@ -262,7 +287,7 @@ def evaluate_alpha(
         measured_power=measured,
         epoch_ok=epoch_ok,
     )
-    append_rows(rows, cal_sims, crit, alpha, t_star, solved, n_cal, replicates, config)
+    append_rows(rows, cal_sims, crit, alpha, t_star, solved, n_cal, replicates, config, spec)
     return evaluation, cell
 
 
@@ -335,11 +360,12 @@ def kappa_fallback_share(days: Sequence[StationDay]) -> float:
 
 def h1_fallback_table(
     sims: Mapping[tuple[float, str], Simulation],
+    spec: FloorSpec = FQ_SPEC,
 ) -> dict[str, dict[str, float]]:
     table: dict[str, dict[str, float]] = {}
     for delta in DELTAS:
-        uses = sum(sims[(delta, mix)].h1_fallback_uses for mix in MIXES)
-        draws = sum(sims[(delta, mix)].h1_draws for mix in MIXES)
+        uses = sum(sims[(delta, mix)].h1_fallback_uses for mix in spec.mixes)
+        draws = sum(sims[(delta, mix)].h1_draws for mix in spec.mixes)
         table[delta_key(delta)] = {
             "uses": float(uses),
             "draws": float(draws),
@@ -374,6 +400,8 @@ def stamp_run(
     outer_resamples: int,
     outer_replicates: int,
     c_components: Mapping[str, Mapping[str, object]],
+    spec: FloorSpec = FQ_SPEC,
+    g1_all_lose_z: Mapping[str, float | None] | None = None,
 ) -> dict[str, object]:
     document["lambda_pool"] = config.lambda_pool
     document["lambda_pool_definition"] = LAMBDA_POOL_DEFINITION
@@ -396,4 +424,8 @@ def stamp_run(
     document["outer_replicates"] = outer_replicates
     document["c_template_resample"] = C_TEMPLATE_RESAMPLE
     document["c_components"] = {key: dict(value) for key, value in c_components.items()}
+    if spec != FQ_SPEC:
+        document["floor_spec"] = spec.as_dict()
+        if g1_all_lose_z is not None:
+            document["g1_all_lose_z"] = dict(g1_all_lose_z)
     return document

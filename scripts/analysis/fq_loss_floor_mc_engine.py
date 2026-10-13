@@ -18,11 +18,14 @@ from scripts.analysis.fq_loss_floor_mc_draw import PreparedDay, clock_block, day
 from scripts.analysis.fq_loss_floor_mc_e2 import blank_document, finish_e2, refused_names
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DELTAS,
+    FQ_SPEC,
     RATE_CAL_RULE,
     FloorConfig,
+    FloorSpec,
     epoch_grid,
     inclusive_days,
     keep_probability,
+    path_families,
     rate_cal,
     rate_cal_max,
     rate_gate,
@@ -31,6 +34,7 @@ from scripts.analysis.fq_loss_floor_mc_gate import (
 from scripts.analysis.fq_loss_floor_mc_outer import apply_outer_se
 from scripts.analysis.fq_loss_floor_mc_rates import split_p_keep_cap
 from scripts.analysis.fq_loss_floor_mc_report import (
+    all_lose_by_mix,
     evaluate_alpha,
     finish_document,
     h1_fallback_table,
@@ -53,19 +57,10 @@ from scripts.analysis.fq_loss_floor_mc_solve import critical_value, crossing_rat
 
 __all__ = ["PATH_FAMILIES", "prepare_mix_groups", "run_floor"]
 
-MIXES: tuple[str, ...] = ("M-pool", "M-yes", "M-no")
-_CAL: tuple[tuple[str, str], ...] = (
-    ("H0", "none"),
-    ("S1", "none"),
-    ("S2", "none"),
-    ("S4", "none"),
-    ("S5", "bind"),
-    ("S5", "half"),
-    ("S6", "none"),
-    ("S7", "none"),
-)
-# Calibration rows × mixes, plus G3 deltas × mixes × the four epoch lengths.
-PATH_FAMILIES: int = len(_CAL) * len(MIXES) + len(DELTAS) * len(MIXES) * 4
+# FQ defaults, kept as module names: np_bound and the CLI import them and enforce drift.
+MIXES: tuple[str, ...] = FQ_SPEC.mixes
+_CAL: tuple[tuple[str, str], ...] = FQ_SPEC.cal
+PATH_FAMILIES: int = path_families(FQ_SPEC)
 
 
 def _seed(master: int, label: str) -> int:
@@ -139,6 +134,7 @@ def _run(
     delta: float | None = None,
     rho: float | None = None,
     netting: bool = True,
+    persist: tuple[int, float] | None = None,
 ) -> Simulation:
     return simulate_family(
         groups,
@@ -150,6 +146,7 @@ def _run(
         delta=delta,
         rho=rho,
         netting=netting,
+        persist=persist,
         p_exit=exit_probability(config.pool_exit_fraction),
         half_spread=config.half_spread,
         theta=config.theta,
@@ -170,6 +167,7 @@ def run_floor(
     gate_groups: Sequence[Sequence[StationDay]] | None = None,
     outer_resamples: int = 0,
     outer_replicates: int = 2000,
+    spec: FloorSpec = FQ_SPEC,
 ) -> dict[str, object]:
     if replicates < 1:
         raise ValueError(f"replicates must be positive, got {replicates}")
@@ -195,6 +193,9 @@ def run_floor(
     raw_gate = (gate_rate / config.r_sd) / config.lambda_sd
     tick_share = ticking_share(gate_cleaned)
     kappa_share = kappa_fallback_share(admitted)
+    all_lose_context: dict[str, float | None] | None = None
+    if spec.g1_path != "all_lose":
+        all_lose_context = all_lose_by_mix(gate_cleaned, spec.mixes)
 
     def _emit(
         document: dict[str, object],
@@ -221,6 +222,8 @@ def run_floor(
             outer_resamples=outer_resamples,
             outer_replicates=outer_replicates,
             c_components=components,
+            spec=spec,
+            g1_all_lose_z=all_lose_context,
         )
         stamped["rate_cal_rule"] = RATE_CAL_RULE
         stamped["p_keep_notes"] = cap_notes
@@ -233,12 +236,12 @@ def run_floor(
         day.isoformat(): inclusive_days(day, config.horizon) for day in epoch_grid(config.freeze)
     }
     n_gate = max(lengths.values(), default=0)
-    pooled = {mix: prepare_mix_groups(cleaned, mix, s6=False) for mix in MIXES}
-    feasible = {mix: prepare_mix_groups(cleaned, mix, s6=True) for mix in MIXES}
-    gate_pooled = {mix: prepare_mix_groups(gate_cleaned, mix, s6=False) for mix in MIXES}
+    pooled = {mix: prepare_mix_groups(cleaned, mix, s6=False) for mix in spec.mixes}
+    feasible = {mix: prepare_mix_groups(cleaned, mix, s6=True) for mix in spec.mixes}
+    gate_pooled = {mix: prepare_mix_groups(gate_cleaned, mix, s6=False) for mix in spec.mixes}
     cal_sims: dict[tuple[str, str, str], Simulation] = {}
-    for row, mode in _CAL:
-        for mix in MIXES:
+    for row, mode in spec.cal:
+        for mix in spec.mixes:
             source = day_pool(row, mix, pooled=pooled, feasible=feasible)
             cal_sims[(row, mode, mix)] = _run(
                 source,
@@ -250,6 +253,7 @@ def run_floor(
                 config=config,
                 rho=_rho(mode, config),
                 netting=row != "S6",
+                persist=spec.persist_for(mode),
             )
     gate_sims = {
         (delta, mix): _run(
@@ -263,7 +267,7 @@ def run_floor(
             delta=delta,
         )
         for delta in DELTAS
-        for mix in MIXES
+        for mix in spec.mixes
     }
     cache: dict[tuple[int, int, int], np.ndarray] = {}
 
@@ -299,6 +303,7 @@ def run_floor(
             rows=rows,
             gates=gates,
             tick_share=tick_share,
+            spec=spec,
         )
         evals.append(evaluation)
         solved_cell[alpha] = cell
@@ -311,6 +316,7 @@ def run_floor(
         p_keep=p_cal,
         seed_for=lambda label: _seed(seed, label),
         config=config,
+        spec=spec,
     )
     outcome = select_alpha(adjusted)
     chosen_alpha = outcome.alpha_star if outcome.alpha_star is not None else adjusted[0].alpha
@@ -335,6 +341,7 @@ def run_floor(
             config=config,
             rho=_rho(mode, config),
             netting=True,
+            persist=spec.persist_for(mode),
         )
         return crit(sim, n_cal, t_min)
 
@@ -349,14 +356,15 @@ def run_floor(
         cal_rate=cal_rate,
         refused=bool(refused),
         refused_detail=f"{len(refused)} station-day template(s) refused",
-        mixes=MIXES,
+        mixes=spec.mixes,
         run_at=_drawn,
+        binding=spec.binding,
     )
     carry = cal_sims[("H0", "none", "M-pool")]
     binding_cell: list[str] | None = None
     if outcome.c is not None and outcome.alpha_star is not None:
         binding_cell = list(solved_cell[outcome.alpha_star])
-    h1 = h1_fallback_table(gate_sims)
+    h1 = h1_fallback_table(gate_sims, spec)
     return _emit(
         finish_document(
             seed=seed,
