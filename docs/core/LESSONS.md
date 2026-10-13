@@ -316,3 +316,4 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Prevention:** A host-path production default must refuse unless inside its exact unit name and not under pytest (`"pytest" in sys.modules`); before unlocking any such path, grep `tests/` for un-injected calls and quarantine spurious artefacts by move.
 **Applied:** 2026-10-11
 **Last updated:** 2026-10-11
+Full pre-consolidation text (how-to-apply checks, amendments): docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md
