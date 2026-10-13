@@ -181,7 +181,8 @@ def test_binding_mode_refuses_realised_bid_outside_floor_cap(tmp_path: Path) -> 
 
 def test_binding_cells_round_iqr_outward_and_follow_admitted_k(tmp_path: Path) -> None:
     def cells(iqr: Any, k: int | None = None) -> list[tuple[int, float]]:
-        doc = {**S2_DOC, "realised_bid_iqr": iqr}
+        median = 0.75 if iqr is None else min(max(0.75, iqr[0]), iqr[1])  # the IQR holds the median
+        doc = {**S2_DOC, "realised_bid_iqr": iqr, "realised_bid_median": median}
         s2 = maker.load_s2(_write(tmp_path, "s2.json", doc))
         return sorted((c.k, c.b) for c in maker.binding_cells(s2, admitted_k=k))
 

@@ -15,7 +15,13 @@ from scripts.analysis.fq_loss_floor_mc_gate import (
 )
 from scripts.analysis.fq_loss_floor_mc_maker_templates import DEFF_CEILING, MakerMix
 
-__all__ = ["assemble_artifact", "cell_summary", "window_label"]
+__all__ = [
+    "assemble_artifact",
+    "cell_summary",
+    "early_stop_evaluation",
+    "freeze_blocked_cells",
+    "window_label",
+]
 
 _RULING: Final = "RULING_MAKER-S3_loss_stop_window_2026-10-13"
 _STATEMENTS: Final = (
@@ -48,12 +54,44 @@ def window_label(frozen_cell: Mapping[str, Any], ticks: object, c_deff: object) 
     )
 
 
+def freeze_blocked_cells(**groups: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Every cell the builder blocked (``freeze_blocked``), tagged with the group it came from."""
+    return [
+        {
+            "group": group,
+            "k": cell.get("k"),
+            "b": cell.get("b"),
+            "f": cell.get("f"),
+            "theta": cell.get("theta"),
+            "freeze_blocked": cell["freeze_blocked"],
+        }
+        for group, cells in groups.items()
+        for cell in cells
+        if cell.get("freeze_blocked") is not None
+    ]
+
+
+def early_stop_evaluation(confirm_cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The evaluation shape ``assemble_artifact`` reads for an early-stopped sweep (no freeze)."""
+    return {
+        "verdict": "UNREACHABLE",
+        "frozen_cell": None,
+        "frozen_c": None,
+        "frozen_c_deff": None,
+        "frozen_t_min": None,
+        "frozen_alpha_star": None,
+        "frozen_certified_ticks": None,
+        "cells": list(confirm_cells),
+    }
+
+
 def assemble_artifact(
     evaluation: Mapping[str, Any],
     *,
     report_cells: Sequence[Mapping[str, Any]] = (),
     horizon: Mapping[str, Any] | None = None,
     early_stop: Mapping[str, Any] | None = None,
+    sweep_cells: Sequence[Mapping[str, Any]] = (),
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Verdict, certified object and cells. Report cells and the horizon never enter the verdict."""
@@ -75,8 +113,13 @@ def assemble_artifact(
         "cells": list(evaluation["cells"]),
         "report_cells": list(report_cells),
         "horizon_sensitivity": None if horizon is None else dict(horizon),
+        "freeze_blocked_cells": freeze_blocked_cells(
+            cells=evaluation["cells"], report_cells=report_cells, sweep_cells=sweep_cells
+        ),
         "statements": list(_STATEMENTS),
     }
+    if sweep_cells:
+        art["sweep_cells"] = list(sweep_cells)
     if early_stop:
         art.update(early_stop)
     if provenance:
@@ -101,7 +144,7 @@ def cell_summary(
     out = doc["outcome"]
     alpha = out["alpha_star"]
     gates = [g for g in doc["gates"] if alpha is None or g["alpha"] == alpha]
-    epoch0 = next((g for g in gates if g["epoch"] == config.freeze.isoformat()), {})
+    epoch0: dict[str, Any] = next((g for g in gates if g["epoch"] == config.freeze.isoformat()), {})
     first_alpha = gates[0]["alpha"] if gates else None
     rows = [r for r in doc["rows"] if "rate" in r and (alpha is None or r["alpha"] == alpha)]
     c = out["c"]

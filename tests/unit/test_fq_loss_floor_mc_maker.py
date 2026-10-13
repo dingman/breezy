@@ -17,6 +17,7 @@ from breezy.analysis.fq_loss_stop_clock import first_crossing, step_clock
 from breezy.strategy.weather_common.costs import venue_fee_prob
 from scripts.analysis import fq_loss_floor_mc_engine as engine
 from scripts.analysis import fq_loss_floor_mc_maker as maker
+from scripts.analysis import fq_loss_floor_mc_maker_templates as templates_mod
 from scripts.analysis.fq_loss_floor_mc_draw import advance_prepared, invert_cdf, prepare_day
 from scripts.analysis.fq_loss_floor_mc_gate import (
     DEFAULT_FREEZE,
@@ -165,11 +166,60 @@ def test_template_listing_bid_bearing_and_fill_rates_match_parameters() -> None:
     assert any(len(g) == 0 for g in groups)  # fill-less dates stay as empty groups
 
 
-def test_template_fill_overdispersion_matches_pinned_design_effect() -> None:
+def _realised_deff(
+    monkeypatch: pytest.MonkeyPatch, icc_rung_trial: float, *, n: int, seed: int
+) -> tuple[float, float]:
+    """Variance inflation of the 4 per-date fill trials over independent trials, and its MC SE.
+
+    Listing is forced to 1 so each station-day is exactly one fill trial; the count variance over
+    ``4 f (1 - f)`` is then the design effect of those trials.
+    """
+    monkeypatch.setattr(templates_mod, "LISTING", 1.0)
+    f = 0.5
+    mix = _mix(fill_rate=f, fill_icc=icc_rung_trial, rungs=1, two_fill_share=0.0)
+    groups = maker.build_maker_groups(mix, n_dates=n, seed=seed)
+    counts = np.array([len(g) for g in groups], dtype=float)
+    independent = 4 * f * (1 - f)
+    centred = counts - counts.mean()
+    var = float(centred.var())
+    se_var = math.sqrt(float(np.mean(centred**4)) - var**2) / math.sqrt(n)
+    return var / independent, se_var / independent
+
+
+def test_template_fill_overdispersion_matches_pinned_design_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REALISED variance inflation of the fill trials is the pinned 1.5, not the arithmetic."""
     assert 1 + 7 * ICC == pytest.approx(maker.DEFF_CEILING) == pytest.approx(1.5)
-    f, rho, n = 0.5, 0.2, 8000
+    assert maker.FILL_ICC == pytest.approx(ICC)
+    assert maker.FILL_ICC_SD == pytest.approx(0.5 / 3)
+    deff, se = _realised_deff(monkeypatch, ICC, n=40_000, seed=6)
+    assert abs(deff - 1.5) < 3 * se, (deff, se)
+    # the unit slip would have realised 1 + 3 * (0.5/7) = 1.214: that is many SE away
+    assert abs(deff - (1 + 3 * ICC)) > 6 * se
+    # and a larger (S2-estimated) rung-trial ICC scales the same way
+    big, big_se = _realised_deff(monkeypatch, 0.2, n=40_000, seed=7)
+    assert abs(big - (1 + 7 * 0.2)) < 3 * big_se, (big, big_se)
+
+
+def test_design_effects_record_both_icc_units() -> None:
+    eff = maker.design_effects(maker.FILL_ICC)
+    assert eff["fill_icc_rung_trial"] == pytest.approx(0.5 / 7)
+    assert eff["fill_icc_station_day"] == pytest.approx(0.5 / 3)
+    assert eff["design_effect_pinned"] == pytest.approx(1.5)
+    assert eff["design_effect_realised"] == pytest.approx(1.5)
+    assert maker.design_effects(0.2)["design_effect_realised"] == pytest.approx(2.4)
+    with pytest.raises(ValueError, match="station-day"):
+        _mix(fill_icc=3 / 7)  # maps to a per-station-day ICC of 1
+    with pytest.raises(ValueError, match="0.5/7"):
+        _mix(fill_icc=0.05)  # the floor stays on the rung-trial value
+
+
+def test_template_fill_counts_match_analytic_variance_at_high_icc() -> None:
+    f, rho_rt, n = 0.5, 0.2, 8000
+    rho = maker.station_day_icc(rho_rt)
     groups = maker.build_maker_groups(
-        _mix(fill_rate=f, fill_icc=rho, rungs=1, two_fill_share=0.0), n_dates=n, seed=6
+        _mix(fill_rate=f, fill_icc=rho_rt, rungs=1, two_fill_share=0.0), n_dates=n, seed=6
     )
     counts = np.array([len(g) for g in groups], dtype=float)
     q = 0.91 * f

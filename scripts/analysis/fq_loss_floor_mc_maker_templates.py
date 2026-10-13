@@ -31,14 +31,18 @@ __all__ = [
     "B_FLOOR",
     "DEFF_CEILING",
     "FILL_ICC",
+    "FILL_ICC_SD",
     "GRID_BIDS",
+    "LISTING",
     "MAKER_SPEC",
     "MAX_RUNGS",
     "N_TEMPLATE_DATES",
     "OUTER_REPLICATES",
     "OUTER_RESAMPLES",
+    "RUNG_TRIALS_PER_DATE",
     "SEED",
     "STATIONS",
+    "STATIONS_PER_DATE",
     "STRESS_THETA",
     "SWEEP_REPLICATES",
     "THETA_TAKER",
@@ -46,8 +50,10 @@ __all__ = [
     "MakerRefusal",
     "build_maker_groups",
     "confirm_mixes",
+    "design_effects",
     "maker_be",
     "maker_floor_config",
+    "station_day_icc",
     "sweep_mixes",
 ]
 
@@ -64,10 +70,19 @@ STRESS_THETA: Final = 0.08
 B_FLOOR: Final = 0.70
 B_CAP: Final = 0.80
 MAX_RUNGS: Final = 2
-FILL_ICC: Final = 0.5 / 7  # spec §6.4: design effect 1 + 7·ICC = 1.5 at 8 rung-trials per date
 DEFF_CEILING: Final = 1.5
 LISTING: Final = 0.91
 STATIONS: Final = ("LAX", "MDW", "MIA", "SFO")
+# Spec §6.4 defines deff 1.5 = 1 + (m − 1)·ICC at m = 8 rung-trials per date (4 stations x 2 rungs).
+# The template draws ONE fill trial per station-day, so m = 4 trials per date: the same ICC applied
+# per station-day would realise only 1 + 3·(0.5/7) = 1.21. Hence two units:
+#   FILL_ICC     per rung-trial (S2's unit, the floor of the refusal): (1.5 − 1)/(8 − 1) = 0.5/7
+#   FILL_ICC_SD  per station-day (the Beta draw's unit): (1.5 − 1)/(4 − 1) = 0.5/3
+# so the REALISED design effect of the fill trials equals the pinned 1.5.
+RUNG_TRIALS_PER_DATE: Final = 8
+STATIONS_PER_DATE: Final = len(STATIONS)
+FILL_ICC: Final = (DEFF_CEILING - 1.0) / (RUNG_TRIALS_PER_DATE - 1)
+FILL_ICC_SD: Final = (DEFF_CEILING - 1.0) / (STATIONS_PER_DATE - 1)
 GRID_BIDS: Final = (0.70, 0.75, 0.80)
 _FILLS: Final = (0.1, 0.2, 0.3, 0.4, 0.5)
 _RUNG_IDS: Final = tuple(f"T{t}" for t in range(66, 78, 2))  # numeric, so rung_temperature orders
@@ -84,6 +99,26 @@ MAKER_SPEC: Final = FloorSpec(
 
 class MakerRefusal(ValueError):
     """An input or parameter the run refuses rather than extrapolates."""
+
+
+def station_day_icc(icc_rung_trial: float) -> float:
+    """Map a per-rung-trial fill ICC (S2's unit) to the per-station-day ICC the template draws.
+
+    Both give the same design effect on their own trial count: ``1 + 7·ICC_rt`` at 8 rung-trials
+    per date equals ``1 + 3·ICC_sd`` at 4 station-day trials per date.
+    """
+    return icc_rung_trial * (RUNG_TRIALS_PER_DATE - 1) / (STATIONS_PER_DATE - 1)
+
+
+def design_effects(icc_rung_trial: float) -> dict[str, float]:
+    """Both ICC units, the pinned design effect, and the one the templates realise."""
+    icc_sd = station_day_icc(icc_rung_trial)
+    return {
+        "fill_icc_rung_trial": icc_rung_trial,
+        "fill_icc_station_day": icc_sd,
+        "design_effect_pinned": 1.0 + (RUNG_TRIALS_PER_DATE - 1) * icc_rung_trial,
+        "design_effect_realised": 1.0 + (STATIONS_PER_DATE - 1) * icc_sd,
+    }
 
 
 def maker_be(bid: float, theta: float) -> float:
@@ -106,8 +141,11 @@ class MakerMix:
             raise MakerRefusal(f"bid {self.bid!r} is outside [B_FLOOR {B_FLOOR}, B_CAP {B_CAP}]")
         if self.rungs not in (1, MAX_RUNGS):
             raise MakerRefusal(f"rungs must be 1 or {MAX_RUNGS}, got {self.rungs!r}")
-        if self.fill_icc < FILL_ICC - _TOL or self.fill_icc >= 1.0:
-            raise MakerRefusal(f"fill_icc {self.fill_icc!r} is below the 0.5/7 floor (or >= 1)")
+        if self.fill_icc < FILL_ICC - _TOL or station_day_icc(self.fill_icc) >= 1.0:
+            raise MakerRefusal(
+                f"fill_icc {self.fill_icc!r} (per rung-trial) is below the 0.5/7 floor, or maps "
+                "to a per-station-day ICC >= 1"
+            )
         if self.two_fill_share > 0.0 and self.rungs == 1:
             raise MakerRefusal("two_fill_share > 0 with rungs == 1")
         for name in ("fill_rate", "bid_bearing", "two_fill_share", "theta"):
@@ -116,10 +154,14 @@ class MakerMix:
 
 
 def _fill_probability(rng: np.random.Generator, mix: MakerMix) -> float:
-    """Per-date fill probability ``Beta(mean f, ICC)``: ``a + b = (1 − ICC)/ICC``."""
+    """Per-date fill probability ``Beta(mean f, ICC_sd)``: ``a + b = (1 − ICC_sd)/ICC_sd``.
+
+    ``mix.fill_icc`` is per rung-trial; the draw uses its per-station-day image (see top).
+    """
     if mix.fill_rate in (0.0, 1.0):
         return mix.fill_rate
-    total = (1.0 - mix.fill_icc) / mix.fill_icc
+    icc_sd = station_day_icc(mix.fill_icc)
+    total = (1.0 - icc_sd) / icc_sd
     return float(rng.beta(mix.fill_rate * total, (1.0 - mix.fill_rate) * total))
 
 

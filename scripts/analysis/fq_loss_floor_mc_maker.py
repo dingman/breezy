@@ -10,10 +10,8 @@ belong to WP4: run them under ``systemd-run`` with ``--out`` to scratch.
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +35,8 @@ from scripts.analysis.fq_loss_floor_mc_maker_inputs import (
     load_s1,
     load_s2,
     load_s5_cap_pin,
-    mix_for,
 )
+from scripts.analysis.fq_loss_floor_mc_maker_stages import Runners, run_binding, run_sweep
 from scripts.analysis.fq_loss_floor_mc_maker_templates import (
     B_CAP,
     B_FLOOR,
@@ -47,6 +45,7 @@ from scripts.analysis.fq_loss_floor_mc_maker_templates import (
     BORDERLINE_SEED,
     DEFF_CEILING,
     FILL_ICC,
+    FILL_ICC_SD,
     MAKER_SPEC,
     MAX_RUNGS,
     N_TEMPLATE_DATES,
@@ -55,12 +54,13 @@ from scripts.analysis.fq_loss_floor_mc_maker_templates import (
     SEED,
     STRESS_THETA,
     SWEEP_REPLICATES,
-    THETA_TAKER,
     MakerMix,
     MakerRefusal,
     build_maker_groups,
+    design_effects,
     maker_be,
     maker_floor_config,
+    station_day_icc,
     sweep_mixes,
 )
 from scripts.analysis.fq_loss_floor_mc_maker_verdict import (
@@ -82,6 +82,7 @@ __all__ = [
     "DEFAULT_FREEZE",
     "DEFF_CEILING",
     "FILL_ICC",
+    "FILL_ICC_SD",
     "MAKER_SPEC",
     "MAX_RUNGS",
     "N_TEMPLATE_DATES",
@@ -95,6 +96,7 @@ __all__ = [
     "assemble_artifact",
     "binding_cells",
     "build_maker_groups",
+    "design_effects",
     "evaluate_binding",
     "horizon_sensitivity",
     "listing_rate_4stn",
@@ -109,6 +111,7 @@ __all__ = [
     "run_cell",
     "run_cell_final",
     "select_frozen_cell",
+    "station_day_icc",
     "sweep_early_stop",
     "sweep_mixes",
     "verdict",
@@ -162,106 +165,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=_REPO, text=True).strip()
-
-
-def _write(path: Path, doc: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def _pinned(
-    mix: MakerMix, replicates: int, *, final: bool = True, outer: bool = True
-) -> dict[str, Any]:
-    run = run_cell_final if final else run_cell
-    cell = run(
-        mix,
-        replicates=replicates,
-        outer_resamples=OUTER_RESAMPLES if outer else 0,
-        outer_replicates=OUTER_REPLICATES if outer else 0,
-        seed=SEED,
+def _runners() -> Runners:
+    """Looked up at call time, so the module-level names stay the single patch points."""
+    return Runners(
+        plain=run_cell,
+        final=run_cell_final,
+        recheck=recheck_cell,
+        horizon=horizon_sensitivity,
+        apply_cap=apply_address_space_cap,
     )
-    print(
-        f"cell k={mix.rungs} b={mix.bid} f={mix.fill_rate} theta={mix.theta} "
-        f"floor_mode={cell['floor_mode']} c={cell['c']}",
-        flush=True,
-    )
-    return cell
-
-
-def _sweep(out: Path) -> int:
-    cells = [_pinned(mix, SWEEP_REPLICATES, final=False, outer=False) for mix in sweep_mixes()]
-    stop = sweep_early_stop(cells, lambda mix: _pinned(mix, BINDING_REPLICATES))
-    doc = {"mode": "sweep", "seed": SEED, "replicates": SWEEP_REPLICATES, "cells": cells}
-    _write(out, {**doc, **(stop or {})})
-    print(f"early_stop={stop['early_stop'] if stop else None}", flush=True)
-    return 0
-
-
-def _frozen_horizon(
-    evaluation: Mapping[str, Any], kill: Sequence[Mapping[str, Any]], pin: Any
-) -> Any:
-    frozen_cell = evaluation["frozen_cell"]
-    if frozen_cell is None:
-        return None
-    base = next(c for c in kill if (c["k"], c["b"]) == (frozen_cell["k"], frozen_cell["b"]))
-    frozen = {
-        "c": evaluation["frozen_c"],
-        "t_min": evaluation["frozen_t_min"],
-        "alpha_star": evaluation["frozen_alpha_star"],
-    }
-    return horizon_sensitivity(
-        base,
-        frozen,
-        l_cap=pin.l_cap,
-        holdout_start=pin.holdout_start.isoformat(),
-        cap_date=pin.cap_date.isoformat(),
-    )
-
-
-def _binding(args: argparse.Namespace) -> int:
-    s2 = load_s2(args.s2_artifact)
-    listing, s1_sha = load_s1(args.s1_artifact)
-    pin = load_s5_cap_pin(args.s5_cap_pin)
-    derived = {
-        "s2_verdict": s2.verdict,
-        "s2_sha256": s2.sha256,
-        "r_lo": s2.f_kill,
-        "f_pass": s2.f_pass,
-        "listing_rate_4stn": listing.listing_rate,
-        "unknown_share": listing.unknown_share,
-        "s1_sha256": s1_sha,
-        "realised_bid_median": s2.b_median,
-        "L_cap": pin.l_cap,
-        "s5_cap_pin_sha256": pin.sha256,
-    }
-    print("\n".join(f"{key}={value}" for key, value in derived.items()), flush=True)
-    if args.inputs_only:
-        return 0
-    apply_address_space_cap(args.max_memory_gib)
-    plan = binding_cells(s2, args.admitted_k)
-    reps = BINDING_REPLICATES
-    kill = [_pinned(mix_for(c, s2, f=c.f_kill, theta=THETA_TAKER), reps) for c in plan]
-    low = [_pinned(mix_for(c, s2, f=c.f_pass, theta=THETA_TAKER), reps) for c in plan]
-    evaluation = evaluate_binding(kill, low, b_median=s2.b_median, k_admitted=args.admitted_k)
-    report = [_pinned(mix_for(c, s2, f=c.f_pass, theta=STRESS_THETA), reps) for c in plan]
-    provenance = {
-        **derived,
-        "git_head": _git("rev-parse", "HEAD"),
-        "script_git_sha": _git("hash-object", str(Path(__file__).resolve())),
-    }
-    artifact = assemble_artifact(
-        evaluation,
-        report_cells=report,
-        horizon=_frozen_horizon(evaluation, kill, pin),
-        provenance=provenance,
-    )
-    _write(args.out, artifact)
-    print(f"verdict={artifact['verdict']}", flush=True)
-    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -279,14 +191,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if missing:
                 print(f"binding mode requires {', '.join(missing)}", file=sys.stderr)
                 return 2
-            return _binding(args)
+            return run_binding(args, _runners())
         apply_address_space_cap(args.max_memory_gib)
         if args.subset_benchmark:
             return benchmark(run_cell)
         if args.out is None:
             print("--sweep requires --out", file=sys.stderr)
             return 2
-        return _sweep(args.out)
+        return run_sweep(args.out, _runners())
     except MakerRefusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

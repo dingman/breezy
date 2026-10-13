@@ -264,7 +264,8 @@ def needs_borderline_rerun(cell: Mapping[str, Any]) -> bool:
     alpha, g3 = cell.get("alpha_star"), (cell.get("g3_by_delta") or {}).get("-0.16")
     if alpha is None or g3 is None:
         return False
-    return abs(g3 - g3_floor(alpha)) < 2.0 * binomial_se(min(1.0, max(0.0, g3)), cell["replicates"])
+    se = binomial_se(min(1.0, max(0.0, g3)), cell["replicates"])
+    return bool(abs(g3 - g3_floor(alpha)) < 2.0 * se)
 
 
 def sweep_early_stop(
