@@ -42,11 +42,11 @@ from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
     PreflightError,
     list_instance_ids,
-    scan_instance,
 )
 from breezy.registry import default_registry
 from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.runtime.quote_tape_ingest_core import default_convert
+from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis.cli_basis_offer_gate_scan import classify_instance
 
 from scripts.analysis.maker_stage0_probe_core import (  # isort: skip
@@ -261,11 +261,13 @@ def _for_each_clean_instance(
     streams: Sequence[type],
     visit: Callable[[ParquetDataCatalog, str], None],
     skipped: dict[str, str],
+    keep_rung: Callable[[str], bool] | None = None,
 ) -> None:
     """Convert each CLEAN instance into a fresh scratch dir, visit it, delete it.
 
     ``work_root/<instance_id>`` must not exist (``FileExistsError``, left untouched). Instances
     that are malformed or not CLEAN are recorded in ``skipped`` with the reason, never dropped.
+    ``keep_rung`` (S-5) limits the per-rung streams converted to the ids it accepts (None: all).
     """
     _check_work_root(work_root, catalog_root)
     source = ParquetDataCatalog(str(catalog_root))
@@ -273,7 +275,8 @@ def _for_each_clean_instance(
     for instance_id in list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY):
         try:
             verdict = classify_instance(
-                scan_instance(catalog_root, instance_id, DEFAULT_SUBDIRECTORY), now_ns=now_ns
+                sc.scan_instance_memoized(catalog_root, instance_id, DEFAULT_SUBDIRECTORY),
+                now_ns=now_ns,
             )
         except PreflightError as error:
             skipped[instance_id] = f"PreflightError: {error}"
@@ -287,8 +290,8 @@ def _for_each_clean_instance(
         )  # before the try: a foreign dir is never rmtree'd
         try:
             work = ParquetDataCatalog(str(work_dir))
-            for data_cls in streams:
-                default_convert(source, instance_id, data_cls, DEFAULT_SUBDIRECTORY, target=work)
+            instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
+            sc.convert_scoped(default_convert, source, work, instance_dir, streams, keep_rung)
             visit(work, instance_id)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -319,7 +322,8 @@ def first_print_instant(
             if licensed[rung]:
                 stamps.append(t.ts_event)
 
-    _for_each_clean_instance(catalog_root, work_root, (TradeTick,), visit, {})
+    keep = sc.licensed_rung_filter(day_set, station_set)
+    _for_each_clean_instance(catalog_root, work_root, (TradeTick,), visit, {}, keep)
     return min(stamps) if stamps else None
 
 
@@ -368,7 +372,8 @@ def probe(
     def visit(work: ParquetDataCatalog, instance_id: str) -> None:
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
-    _for_each_clean_instance(catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped)
+    keep = sc.licensed_rung_filter(day_set, station_set)
+    _for_each_clean_instance(catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, keep)
     frames = {rung: sorted(fs, key=lambda f: f.ts_ns) for rung, fs in ledger.frames.items()}
     unique = unique_prints(ledger.prints)
     rows = [_coverage((s, d), ledger) for s in stations for d in sorted(day_set)]
