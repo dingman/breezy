@@ -513,7 +513,12 @@ def test_bench_mode_skips_scoring_and_writes_no_episode_or_rate_output(
     bench = json.loads((cfg.out_dir / "bench.json").read_text())
     session = CatalogSession(world.capture, tmp_path / "plan_work")
     plans = session.plan([rw.DAY, rw.DIRECTION_DAY], ["SFO"])
-    assert len(bench["station_days"]) == 2  # N = 4 over two replayed days: both are timed
+    rows = bench["station_days"]
+    assert len(rows) == 3  # N = 4 over two replayed days: both timed, then the heaviest again
+    assert [bool(r.get("repeat_of_first")) for r in rows] == [False, False, True]
+    assert (rows[2]["station"], rows[2]["climate_day"]) in {
+        (r["station"], r["climate_day"]) for r in rows[:2]
+    }
     by_day = {r["climate_day"]: r for r in bench["station_days"]}
     for (_, day), plan in plans.items():  # weights are capture bytes only
         assert by_day[day.isoformat()]["catalog_bytes"] == plan.catalog_bytes > 0

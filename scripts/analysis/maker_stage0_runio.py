@@ -51,6 +51,7 @@ PROGRESS_FIELDS: Final[frozenset[str]] = frozenset(
         "n_events",
         "rss_peak_delta_bytes",
         "peak_rss_bytes",
+        "repeat_of_first",
     }
 )
 _NS: Final[int] = 10**9
