@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -32,6 +32,12 @@ NOT_YET_AVAILABLE: str = "NOT_YET_AVAILABLE"  # no forecast vector yet for this 
 DROP_REASONS: frozenset[str] = frozenset(
     {CANCEL_PMIN, CANCEL_BFLOOR, CANCEL_STALE, CANCEL_DAYMISMATCH, CANCEL_HARD, NOT_YET_AVAILABLE}
 )
+
+
+def _flat_fields(obj: Any) -> dict[str, Any]:
+    """Shallow field-name -> value dict (all callers' fields are scalars)."""
+    return {f.name: getattr(obj, f.name) for f in fields(obj)}
+
 
 Level = tuple[int, int]  # (price in cents, displayed size in whole contracts)
 
@@ -330,7 +336,7 @@ class Episode:
     available_at_ns_stress: int | None
 
     def to_dict(self) -> dict[str, Any]:
-        out = asdict(self)
+        out = _flat_fields(self)
         out["bid"] = self.bid_cents / CENTS
         return out
 
@@ -372,7 +378,7 @@ class StationDaySummary:
     gap_share: float | None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _flat_fields(self)
 
 
 @dataclass(frozen=True)
