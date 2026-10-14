@@ -139,6 +139,8 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.ops.ambig_latch_phase_a_check",
     "scripts.analysis.maker_tape_census",  # MAKER S1 WP1 census
     "scripts.analysis.maker_stage0_probe",  # MAKER S2 WP0 probe
+    "scripts.analysis.maker_stage0_nodelog",  # MAKER-S2 WP1 node-log scan
+    "scripts.analysis.maker_stage0_schedule",  # MAKER-S2 WP1 process schedule
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
