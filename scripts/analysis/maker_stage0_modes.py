@@ -24,12 +24,12 @@ import nautilus_trader
 
 from breezy.analysis.stats.scoring_core import BOOTSTRAP_ITERATIONS, BOOTSTRAP_SEED
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
+from scripts.analysis.maker_stage0_bench_screen import project_bench
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_inputs import load_trade_unit
 from scripts.analysis.maker_stage0_run_types import (
     BENCH_COUNTS,
     RSS_ABORT_BYTES,
-    S5_MAX_SECONDS,
     MemoryAbort,
     Pre,
     RunConfig,
@@ -236,20 +236,17 @@ def _write_bench(
 ) -> None:
     by_iso = {(s, d.isoformat()): n for (s, d), n in weights.items()}
     rows = [{**t, "catalog_bytes": by_iso[(t["station"], t["climate_day"])]} for t in timings]
-    total = len(weights)
-    mean_s = sum(r["elapsed_s"] for r in rows) / max(1, len(rows))
-    peak = max((r["peak_rss_bytes"] for r in rows), default=0)
-    growth = sum(r["rss_peak_delta_bytes"] for r in rows) / max(1, len(rows))
-    projected = peak + int(growth * max(0, total - len(rows)))
+    proj = project_bench(rows, len(weights))
     write_json(
         cfg.out_dir / "bench.json",
         {
             "station_days": rows,
             "variants": list(variants),
-            "n_replayable_station_days": total,
-            "projected_total_s": mean_s * total,
-            "projected_peak_rss_bytes": projected,
-            "s5_exceeded": mean_s * total > S5_MAX_SECONDS or projected > RSS_ABORT_BYTES,
+            "n_replayable_station_days": len(weights),
+            "projected_total_s": proj.projected_total_s,
+            "projected_peak_rss_bytes": proj.projected_peak_rss_bytes,
+            "rss_slope_bytes_per_row": proj.rss_slope_bytes_per_row,
+            "s5_exceeded": proj.s5_exceeded,
             "code_sha": pre.code_sha,
         },
     )
