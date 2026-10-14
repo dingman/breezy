@@ -17,6 +17,7 @@ from typing import Any
 
 from nautilus_trader.model.enums import AggressorSide
 
+from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from tests.fixtures.maker_stage0 import make_census_fixture as fx
 from tests.unit import test_maker_stage0_pno as pno_fx
 from tests.unit.test_maker_stage0_probe import (
@@ -94,6 +95,8 @@ def build_capture(
         records.append(
             _trade(dir_rung, f"s{i}", seller_px, AggressorSide.SELLER, start + 400 * 10**9 + step)
         )
+    extra, defined = _scope_probes(rungs, listed)
+    records.extend(extra)
     offsets = [
         (_t("2026-09-18T01:00:00"), 1 * 10**9),
         (_t("2026-09-29T01:00:00"), -5 * 10**9),
@@ -104,7 +107,7 @@ def build_capture(
     _write_instance(
         capture,
         "inst-a",
-        instruments=[*rungs.values(), dir_rung],
+        instruments=[*rungs.values(), dir_rung, *defined],
         records=records,
         offsets=offsets,
     )
@@ -116,6 +119,45 @@ def build_capture(
             capture, "inst-b", instruments=list(rungs.values()), records=later, offsets=[]
         )
     return capture
+
+
+def _scope_probes(rungs: dict[str, Any], listed: int) -> tuple[list[Any], list[Any]]:
+    """Extra ``inst-a`` records that exercise the reader's rung scoping (S-5 review fixes).
+
+    * ``sib``: a defined SFO same-day rung (so a PLANNED third sibling: the writer drops records
+      of an undefined instrument, and a same-day YES-leg definition is always planned) with depth,
+      a 22:00Z BUYER print (after the licensed 21:00Z one, so the first print is unchanged), an
+      unresolved gap and a DepthTruncation. Rungs genuinely outside the plan are the 09-18
+      direction rung and the NO leg below.
+    * the NO leg (``^no``) of FILL_RUNG: never a planned rung, prints at 19:00Z.
+    * a licensed-rung DepthTruncation and unresolved gap on a second planned rung.
+    * ``sub``: an id that CONTAINS FILL_RUNG's id as a substring. Native identifier filtering is a
+      substring match on the feather subdirectory name, so it is converted too; that over-inclusion
+      is harmless because every reader re-filters by the exact rung id.
+    """
+    fill = rungs[FILL_RUNG]
+    no_leg = _instrument(
+        _slug("sfo", FILL_RUNG, DAY.isoformat()) + "^no", _t("2026-09-28T08:00:00")
+    )
+    sub = _instrument(_slug("sfo", FILL_RUNG, DAY.isoformat()) + "x", _t("2026-09-28T08:00:00"))
+    mid = rungs["gte82lt83f"]
+    sib = _instrument(_slug("sfo", "gte61lt62f", DAY.isoformat()), listed)
+    records: list[Any] = [
+        _depth(sib, "0.150", "0.250", _t("2026-09-28T20:00:00")),
+        _trade(sib, "sib-1", "0.250", AggressorSide.BUYER, _t("2026-09-28T22:00:00")),
+        _gap(sib, start=_t("2026-09-28T20:10:00"), end=_t("2026-09-28T20:20:00"), resolved=False),
+        DepthTruncation(sib.id, 12, 14, 6, _t("2026-09-28T20:00:00"), _t("2026-09-28T20:00:00")),
+        _depth(no_leg, "0.150", "0.250", _t("2026-09-28T20:00:00")),
+        _trade(no_leg, "no-1", "0.250", AggressorSide.BUYER, _t("2026-09-28T19:00:00")),
+        _depth(sub, "0.150", "0.250", _t("2026-09-28T20:00:00")),
+        _trade(sub, "sub-1", "0.250", AggressorSide.BUYER, _t("2026-09-28T18:30:00")),
+        _gap(sub, start=_t("2026-09-28T19:00:00"), end=_t("2026-09-28T19:05:00"), resolved=False),
+        DepthTruncation(sub.id, 12, 14, 6, _t("2026-09-28T20:00:00"), _t("2026-09-28T20:00:00")),
+        DepthTruncation(mid.id, 12, 14, 6, _t("2026-09-28T20:30:00"), _t("2026-09-28T20:30:00")),
+        _gap(mid, start=_t("2026-09-28T21:30:00"), end=_t("2026-09-28T21:40:00"), resolved=False),
+        _depth(fill, "0.150", "0.250", _t("2026-09-28T23:00:00")),
+    ]
+    return records, [no_leg, sub, sib]
 
 
 def build_nbp(root: Path) -> Path:

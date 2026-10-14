@@ -6,11 +6,11 @@ recorder instance is converted by ``default_convert`` into a scratch ``ParquetDa
 instrument and absolute ns, and deleted. ``plan`` converts only the instrument definitions to find
 which instances hold each station-day; ``read`` keeps at most ``keep`` converted instances alive
 (day-major iteration touches each instance on consecutive station-days) so no instance is
-converted more than once in a normal run. ``_catalog`` converts whole instances, so bytes outside
-the frozen set (NYC, 2026-10-01) reach scratch although they are never queried, hashed or read
-into a record. The CAPTURE's source files (by path relative to the
-capture root, size and sha256; never the scratch conversion, which differs in path and mtime on
-every run and every LRU re-conversion) behind each query are hashed into the caller's
+converted more than once in a normal run. ``_catalog`` converts only the planned rungs' partitions
+(S-5 reader fix), so no byte outside the station-day's ladder reaches scratch. The CAPTURE's
+source files (by path relative to the capture root, size and sha256; never the scratch
+conversion, which differs in path and mtime on every run and every LRU re-conversion) behind each
+query are hashed into the caller's
 ``CatalogSliceManifest``. The reader returns plain records (``maker_stage0_events_build``);
 it never imports the simulator, the truth loader or the report.
 """
@@ -23,6 +23,7 @@ from collections import OrderedDict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -48,6 +49,7 @@ from scripts.analysis.maker_stage0_events_build import (
 from scripts.analysis.maker_stage0_pno_store import site
 from scripts.analysis.maker_stage0_probe import _for_each_clean_instance
 from scripts.analysis.maker_stage0_probe_core import StationDay, station_day_key
+from scripts.analysis.maker_stage0_scoped_convert import scope_kwargs
 
 if TYPE_CHECKING:  # annotation only: the pins module imports the frozen-set module
     from scripts.analysis.maker_stage0_pins import CatalogSliceManifest
@@ -97,7 +99,9 @@ class CatalogSession:
     manifest: CatalogSliceManifest | None = None
     keep: int = 3
     skipped: dict[str, str] = field(default_factory=dict)
-    _open: OrderedDict[str, tuple[ParquetDataCatalog, Path]] = field(default_factory=OrderedDict)
+    _open: OrderedDict[str, tuple[ParquetDataCatalog, Path, frozenset[str]]] = field(
+        default_factory=OrderedDict
+    )
 
     # --- planning ---------------------------------------------------------------------------
     def plan(
@@ -134,23 +138,51 @@ class CatalogSession:
     def read(self, plan: StationDayPlan, window: tuple[int, int]) -> list[InstanceSlice]:
         return [self._read_instance(i, plan.instruments, window) for i in plan.instances]
 
-    def _catalog(self, instance: str) -> tuple[ParquetDataCatalog, Path]:
+    def _catalog(self, instance: str, rungs: frozenset[str]) -> ParquetDataCatalog:
+        """The scratch conversion of ``instance`` holding at least ``rungs`` (reused when it does).
+
+        Only the planned rungs' depth/print/gap/truncation partitions are converted (S-5 reader
+        fix: a whole live instance is ~15 GB and OOMs at 4 GiB); instrument definitions are few
+        and converted whole. A cached conversion of a narrower rung set is rebuilt.
+        """
         if instance in self._open:
-            self._open.move_to_end(instance)
-            return self._open[instance]
+            work, _dir, held = self._open[instance]
+            if rungs <= held:
+                self._open.move_to_end(instance)
+                return work
+            self._evict(instance)
+        # Cost accepted: a station-day reconverts its instances (memory-bounded, ~86 s each on the
+        # 15 GB one; 96 station-days ~ 2.3 h fits the 21600 s cap), so `keep` is not a hot path.
         source = ParquetDataCatalog(str(self.capture_root))
         work_dir = self.work_root / "replay" / instance
         work_dir.mkdir(parents=True, exist_ok=False)
         work = ParquetDataCatalog(str(work_dir))
-        for data_cls in REPLAY_STREAMS:
-            default_convert(source, instance, data_cls, DEFAULT_SUBDIRECTORY, target=work)
-        self._open[instance] = (work, work_dir)
+        try:
+            self._convert(source, work, instance, rungs)
+        except BaseException:
+            shutil.rmtree(work_dir, ignore_errors=True)  # never registered, so close() cannot
+            raise
+        self._open[instance] = (work, work_dir, rungs)
         while len(self._open) > self.keep:
             self._evict(next(iter(self._open)))
-        return work, work_dir
+        return work
+
+    @staticmethod
+    def _convert(
+        source: ParquetDataCatalog, work: ParquetDataCatalog, instance: str, rungs: frozenset[str]
+    ) -> None:
+        for data_cls in REPLAY_STREAMS:
+            default_convert(
+                source,
+                instance,
+                data_cls,
+                DEFAULT_SUBDIRECTORY,
+                target=work,
+                **scope_kwargs(data_cls, sorted(rungs)),
+            )
 
     def _evict(self, instance: str) -> None:
-        _work, work_dir = self._open.pop(instance)
+        _work, work_dir, _rungs = self._open.pop(instance)
         shutil.rmtree(work_dir, ignore_errors=True)
 
     def close(self) -> None:
@@ -160,8 +192,8 @@ class CatalogSession:
     def _read_instance(
         self, instance: str, rungs: Sequence[str], window: tuple[int, int]
     ) -> InstanceSlice:
-        work, _work_dir = self._catalog(instance)
         wanted = frozenset(rungs)
+        work = self._catalog(instance, wanted)
         frames: list[RawFrame] = []
         prints: list[RawPrint] = []
         for rung in rungs:
@@ -204,8 +236,14 @@ class CatalogSession:
                         self.manifest.add_capture_file(self.capture_root, path)
 
 
+@lru_cache(maxsize=1 << 16)
+def _level(price: str, size: str) -> tuple[Decimal, Decimal]:
+    """One shared (price, size) pair: a book repeats few distinct levels, many times over."""
+    return Decimal(price), Decimal(size)
+
+
 def _levels(orders: Sequence[Any]) -> tuple[tuple[Decimal, Decimal], ...]:
-    return tuple((Decimal(str(o.price)), Decimal(str(o.size))) for o in orders)
+    return tuple(_level(str(o.price), str(o.size)) for o in orders)
 
 
 def _frame(depth: OrderBookDepth10) -> RawFrame:

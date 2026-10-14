@@ -14,7 +14,7 @@ import resource
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -701,6 +701,29 @@ def convert_instrument_definitions(
     return CONVERTED
 
 
+def _scoped_feather_files(
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    identifiers: list[str] | None,
+) -> Iterator[Any]:
+    """Feather files of one type, optionally restricted to named instruments.
+
+    Native ``_list_feather_data_files`` treats an EMPTY identifier list as "no
+    filter" (``if identifiers:``), which would convert the whole instance for a
+    caller that asked for nothing; an empty list therefore yields nothing here.
+    """
+    if identifiers is not None and not identifiers:
+        return
+    yield from catalog._list_feather_data_files(
+        kind=subdirectory,
+        instance_id=instance_id,
+        data_cls=data_cls,
+        identifiers=identifiers,
+    )
+
+
 def _convert_stream_natively(
     catalog: ParquetDataCatalog,
     instance_id: str,
@@ -708,6 +731,7 @@ def _convert_stream_natively(
     subdirectory: str,
     *,
     target: ParquetDataCatalog | None = None,
+    identifiers: list[str] | None = None,
 ) -> None:
     """Breezy mirror of native ``convert_stream_to_data`` (ING-2 S3a, Arch S2).
 
@@ -719,13 +743,13 @@ def _convert_stream_natively(
     behaviour is unchanged: a ``None`` table means ``continue`` (native
     parity), ``used_catalog`` is computed exactly like native (A1), and the
     conversion call uses native's own defaults
-    (``use_ts_event_for_ts_init=False``, ``identifiers=None``).
+    (``use_ts_event_for_ts_init=False``). ``identifiers`` (default ``None`` =
+    every instrument, native parity) restricts the per-instrument feather
+    subdirectories converted; see :func:`_scoped_feather_files`.
     """
     used_catalog = catalog if target is None else target
-    for feather_file in catalog._list_feather_data_files(
-        kind=subdirectory,
-        instance_id=instance_id,
-        data_cls=data_cls,
+    for feather_file in _scoped_feather_files(
+        catalog, instance_id, data_cls, subdirectory, identifiers
     ):
         feather_table = read_feather_coalesced(catalog.fs, feather_file.path)
         if feather_table is None:
@@ -746,6 +770,7 @@ def default_convert(
     subdirectory: str,
     *,
     target: ParquetDataCatalog | None = None,
+    identifiers: list[str] | None = None,
 ) -> str:
     """The one native call this module exists to schedule and guard.
 
@@ -760,18 +785,25 @@ def default_convert(
     -- the shape ``_convert_live_capture`` needs to convert a read-only
     capture into a disposable work catalog without duplicating this
     function's dispatch logic.
+
+    ``identifiers`` (default ``None``, the unchanged whole-instance path) scopes a
+    non-definition conversion to the named instruments' feather subdirectories;
+    definitions are few, flat and always converted whole.
     """
     if _is_instrument_definition(data_cls):
         return convert_instrument_definitions(
             catalog, instance_id, data_cls, subdirectory, target=target
         )
+    scope: dict[str, Any] = {} if identifiers is None else {"identifiers": identifiers}
     try:
-        _convert_stream_natively(catalog, instance_id, data_cls, subdirectory, target=target)
+        _convert_stream_natively(
+            catalog, instance_id, data_cls, subdirectory, target=target, **scope
+        )
     except ValueError as exc:
         if not _is_non_disjoint_refusal(exc):
             raise
         return _extend_overlapping_stream(
-            catalog, instance_id, data_cls, subdirectory, target=target
+            catalog, instance_id, data_cls, subdirectory, target=target, **scope
         )
     return CONVERTED
 
@@ -877,6 +909,7 @@ def _extend_overlapping_stream(
     subdirectory: str,
     *,
     target: ParquetDataCatalog | None = None,
+    identifiers: list[str] | None = None,
 ) -> str:
     """ING-1 EXTEND: land only rows the partial slice did not already write.
 
@@ -903,10 +936,8 @@ def _extend_overlapping_stream(
     streamed_any = False
     written = 0
     zero_row_failures: list[tuple[Any, int]] = []
-    for feather_file in catalog._list_feather_data_files(
-        kind=subdirectory,
-        instance_id=instance_id,
-        data_cls=data_cls,
+    for feather_file in _scoped_feather_files(
+        catalog, instance_id, data_cls, subdirectory, identifiers
     ):
         table = read_feather_coalesced(catalog.fs, feather_file.path)
         if table is None or len(table) == 0:
