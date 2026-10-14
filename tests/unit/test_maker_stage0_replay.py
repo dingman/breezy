@@ -93,3 +93,14 @@ def test_main_prints_the_summary_and_returns_zero(
     assert cli.main(REQUIRED) == 0
     out = capsys.readouterr().out
     assert "UNDERPOWERED-WAIT" in out and str(tmp_path) in out
+
+
+def test_main_returns_zero_for_a_reported_s4_stop(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stop = drv.RunSummary(
+        run_dir=tmp_path, label="STOP-S4-NO-BID-BEARING-DAYS", code_sha="c0ffee", mode="verdict"
+    )
+    monkeypatch.setattr(drv, "run", lambda _cfg: stop)
+    assert cli.main(REQUIRED) == 0  # a reported stop, not a refusal or a void
+    assert "STOP-S4-NO-BID-BEARING-DAYS" in capsys.readouterr().out

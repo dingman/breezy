@@ -72,7 +72,6 @@ class RunConfig:
     verify_first: bool = False
     parity: tuple[tuple[str, int], ...] | None = None
     tail_csv: Path | None = None
-    as_of: dt.date | None = None
     argv: tuple[str, ...] = ()
     min_free_bytes: int = MIN_FREE_BYTES
 

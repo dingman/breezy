@@ -32,6 +32,7 @@ from scripts.analysis.maker_stage0_verdict import UNDERPOWERED
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.unit import test_maker_stage0_pins as pins_fx
 from tests.unit import test_maker_stage0_pno as pno_fx
+from tests.unit.test_maker_stage0_probe import _slug as pt_slug
 
 TRUTH_TOKENS = {"", "YES", "NO", "VOID", "UNRESOLVED"}
 STATION_DAY_COLUMNS = {
@@ -86,7 +87,6 @@ def make_cfg(
         spec=repo / "docs/strategies/SPEC.md",
         ledger=base / "derived" / "verdict_ledger.jsonl",
         work_root=base / "work" / name,
-        as_of=dt.date(2026, 10, 14),
         argv=("maker_stage0_replay", "--fixture"),
     )
     return dataclasses.replace(cfg, **over)
@@ -262,6 +262,7 @@ def test_stats_rerun_on_scored_csv_reproduces_tables(e2e: Run) -> None:
         e2e.run_dir / "scored_episodes.csv",
         e2e.run_dir / "station_days.csv",
         e2e.run_dir / "tail_reliability.csv",
+        hypotheses=["CONTRACTS"],
         code_sha=e2e.summary.code_sha,
     )
     report = (e2e.run_dir / "report.md").read_text()
@@ -705,3 +706,64 @@ def test_bracketed_unit_runs_both_hypotheses_and_converts_sizes_per_hypothesis(
     assert {r["unit_hypothesis"] for r in scored} == {"USD_NOTIONAL_TAKER", "USD_NOTIONAL_YES"}
     episodes = [json.loads(x) for x in (cfg.out_dir / "episodes.jsonl").read_text().splitlines()]
     assert {e["unit_hypothesis"] for e in episodes} == {"USD_NOTIONAL_TAKER", "USD_NOTIONAL_YES"}
+
+
+# --- WP5 contract (delta (r)) ------------------------------------------------------------------
+
+STOP_S4 = "STOP-S4-NO-BID-BEARING-DAYS"
+
+
+def test_s4_no_bid_bearing_days_is_a_reported_stop_not_a_void(tmp_path: Path) -> None:
+    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
+    cfg = _fresh(world, tmp_path / "r")
+    summary = drv.run(cfg)  # completes: the caller (CLI) exits 0
+    assert summary.label == STOP_S4 and summary.run_dir == cfg.out_dir
+    assert not _void_dir(cfg).exists() and cfg.out_dir.is_dir()
+    s3 = json.loads((cfg.out_dir / "s3_inputs.json").read_text())
+    assert s3["verdict"] == STOP_S4
+    assert {k for k, v in s3.items() if v is not None} == {"verdict"}  # every other key null
+    assert f"Verdict: {STOP_S4}" in (cfg.out_dir / "report.md").read_text()
+    manifest = json.loads((cfg.out_dir / "run_manifest.json").read_text())
+    assert manifest["verdict"] == STOP_S4 and manifest["phases"][-1] == "report"
+    assert [e["kind"] for e in _ledger(cfg)] == ["verdict_run_start"]  # the entry stays
+
+
+def test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict(
+    e2e: Run, tmp_path: Path
+) -> None:
+    real = json.loads((e2e.run_dir / "s3_inputs.json").read_text())
+    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
+    cfg = _fresh(world, tmp_path / "r")
+    drv.run(cfg)
+    assert set(json.loads((cfg.out_dir / "s3_inputs.json").read_text())) == set(real)
+
+
+def test_theta_outside_zero_to_point_two_is_refused_before_the_ledger(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(drv, "theta_for_day", lambda _day: 0.25)
+    cfg = _fresh(world, tmp_path)
+    with pytest.raises(drv.InputRefused, match="theta"):
+        drv.run(cfg)
+    _assert_untouched(cfg)
+
+
+def test_replayed_station_days_carry_both_denominator_columns(e2e: Run) -> None:
+    rows = _rows(e2e.run_dir / "station_days.csv")
+    day = next(r for r in rows if r["climate_day"] == "2026-09-29")
+    assert int(day["rung_trials_attempted"]) >= 1 and int(day["n_no_book_wants"]) >= 0
+    unreplayed = next(r for r in rows if r["climate_day"] == "2026-09-25")
+    assert unreplayed["n_no_book_wants"] in ("", "0")
+
+
+def test_truth_token_is_one_function_and_a_missing_final_is_blank_at_any_age() -> None:
+    high = pt_slug("sfo", rw.FILL_RUNG, "2026-09-29")
+    band = pt_slug("sfo", "gte60lt61f", "2026-09-29")
+    assert rep.truth_token(high, None) == ""  # no FINAL row: never UNRESOLVED, however old
+    assert rep.truth_token(high, rw.TRUTH_TMAX_F) == "NO"
+    assert rep.truth_token(band, 60) == "YES"
+    assert rep.day_truth(None) == {
+        "truth_final": False, "truth_tmax_f": None, "void": False, "unresolved_d14": False,
+    }  # fmt: skip
+    assert rep.day_truth(70)["truth_final"] is True
+    assert not hasattr(rep, "UNRESOLVED_AFTER_DAYS")

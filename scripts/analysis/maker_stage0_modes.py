@@ -25,7 +25,7 @@ from breezy.strategy.ladder_ev.quantile_density import Rung
 from scripts.analysis import maker_stage0_report as report
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_inputs import load_trade_unit
-from scripts.analysis.maker_stage0_pins import git_commit
+from scripts.analysis.maker_stage0_pins import PinSources, git_commit
 from scripts.analysis.maker_stage0_pno_store import PNoStore
 from scripts.analysis.maker_stage0_run_types import (
     RSS_ABORT_BYTES,
@@ -52,8 +52,10 @@ from scripts.analysis.maker_stage0_station_loop import LoopContext, LoopOutput, 
 from scripts.analysis.maker_stage0_tables import tail_rows_to_csv
 
 __all__ = [
+    "THETA_PIN_SITE",
     "build_context",
     "free_bytes",
+    "pin_sources",
     "run_bench",
     "run_tail",
     "run_verify_first",
@@ -61,6 +63,9 @@ __all__ = [
     "write_manifest",
 ]
 
+THETA_PIN_SITE: Final[str] = (
+    "src/breezy/adapters/polymarket_us/fees.py::taker_fee_coefficient_as_of (post-drift schedule)"
+)
 TAIL_BAND_FLOOR_F: Final[int] = 10
 TAIL_BAND_CEIL_F: Final[int] = 125
 Key = tuple[str, dt.date]
@@ -74,11 +79,18 @@ def free_bytes(path: Path) -> int:
 
 
 def write_manifest(
-    cfg: RunConfig, pre: Pre, mode: str, phases: Sequence[str], parity: dict[str, int]
+    cfg: RunConfig,
+    pre: Pre,
+    mode: str,
+    phases: Sequence[str],
+    parity: dict[str, int],
+    verdict: str | None = None,
 ) -> None:
+    extra = {} if verdict is None else {"verdict": verdict}
     write_json(
         cfg.out_dir / "run_manifest.json",
         {
+            **extra,
             "mode": mode,
             "run_id": cfg.out_dir.name,
             "argv": list(cfg.argv),
@@ -95,6 +107,31 @@ def write_manifest(
             "free_disk_end_bytes": free_bytes(cfg.out_dir),
             "ladder_lower_parity": parity,
         },
+    )
+
+
+def pin_sources(
+    cfg: RunConfig, pre: Pre, consumed: list[tuple[str, str]], sidecar_names: tuple[str, ...]
+) -> PinSources:
+    d = cfg.out_dir
+    return PinSources(
+        repo_root=cfg.repo_root,
+        census=cfg.census_days,
+        trade_unit=cfg.trade_unit,
+        truth_copy=d / "truth_cli_finals.csv",
+        truth_cross_check=cfg.truth_cross_check,
+        truth_csv_sha256=pre.frozen.truth_csv_sha256,
+        nbp_manifest=cfg.nbp_root / "_manifest.json",
+        nbp_consumed=consumed,
+        process_schedule=d / "process_schedule.json",
+        catalog_slice_manifest=d / "catalog_slice_manifest.json",
+        amendment_final=cfg.amendment,
+        ledger_path=cfg.ledger,
+        node_logs=pre.scan_paths,
+        sidecar_names=sidecar_names,
+        argv=cfg.argv,
+        theta_pin_site=THETA_PIN_SITE,
+        spec=cfg.spec,
     )
 
 

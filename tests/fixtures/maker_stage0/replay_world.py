@@ -168,20 +168,27 @@ class World:
     node_log_dir: Path
 
 
-def census_rows() -> list[Any]:
+def census_rows(**changes: Any) -> list[Any]:
     days = [FIRST_DAY + dt.timedelta(days=i) for i in range((LAST_DAY - FIRST_DAY).days + 1)]
-    return [fx.census_row(STATION, d) for d in days]
+    return [fx.census_row(STATION, d, **changes) for d in days]
 
 
 def build_world(
-    root: Path, *, capture: Path | None = None, unit: str = "CONTRACTS", status: str = "FINAL"
+    root: Path,
+    *,
+    capture: Path | None = None,
+    unit: str = "CONTRACTS",
+    status: str = "FINAL",
+    census_changes: dict[str, Any] | None = None,
 ) -> World:
     root.mkdir(parents=True, exist_ok=True)
     cap = capture if capture is not None else build_capture(root)
     csv_path, cross, truth_sha = write_truth(root)
     amendment = root / "amendment.md"
     amendment.write_text(amendment_text(truth_sha, status=status))
-    census = fx.write_census_fixture(root / "censused_days.jsonl", census_rows())
+    census = fx.write_census_fixture(
+        root / "censused_days.jsonl", census_rows(**(census_changes or {}))
+    )
     unit_path = fx.write_unit_fixture(root / "unit.json", unit)
     logs = root / "node_logs"
     logs.mkdir(exist_ok=True)

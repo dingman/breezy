@@ -106,7 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify-first", action="store_true")
     p.add_argument("--parity", type=_parity, help="tail-only: STATION:0|1,...")
     p.add_argument("--tail-csv", type=Path, help="verdict run: a prior --tail-only table to embed")
-    p.add_argument("--as-of", type=dt.date.fromisoformat, help="date for the D+14 UNRESOLVED rule")
     return p
 
 
@@ -149,7 +148,6 @@ def parse_args(argv: Sequence[str] | None = None) -> drv.RunConfig:
         verify_first=ns.verify_first,
         parity=ns.parity,
         tail_csv=ns.tail_csv,
-        as_of=ns.as_of,
         argv=shown,
     )
 

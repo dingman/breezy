@@ -6,6 +6,21 @@ mode that accepts ``--stations/--days``), ``--tail-only`` and ``--verify-first``
 one-shot ledger; every refusal happens BEFORE the ledger is claimed, and after the claim ANY
 failure renames the run directory ``<run_id>.void`` (no resume; ``episodes.jsonl`` never reopened).
 
+DEVIATIONS (each is a reported departure from, or a pinned reading of, plan r3/r4; WP6 review aid):
+  D1 r4 (d)/(i)1: decision instants come from depth frames, forecast releases and schedule cuts
+     (``clock_events``), not from a fixed wall-clock grid.
+  D2 r4 (g): p_NO abstains NO_VECTOR / UNKNOWN_ERA / NONFINITE_P_YES map to the rule's
+     ``NOT_YET_AVAILABLE`` reason (the rung is not wanted); the adapter owns the table.
+  D3 r4 (e): a later recorder instance's FIRST event (frame or print) ends the earlier instance.
+  D4 r3 WP4 sizing: per hypothesis, depth sizes round UP and print sizes DOWN to whole contracts.
+  D5 r4 (r)3 / spec 6.5: ``truth_final`` is "" for a day with no FINAL row at ANY age; UNRESOLVED
+     and VOID are never scored (the pinned truth CSV has no resolution state; one function,
+     ``report.day_truth``, feeds both truth fields).
+  D6 r4 (r)1: ``n_no_book_wants`` = wanted RUNGS with no book all day (``replay_station_day``).
+  D7 r4 (a) S-4 + coordinator ruling: n_sd = 0 is a REPORTED stop ``STOP-S4-NO-BID-BEARING-DAYS``
+     (exit 0, ledger entry kept), not a void; ``s3_inputs.json`` holds the verdict, rest null.
+  D8 r4 (r)6: a day whose venue theta falls outside [0, 0.2] is refused before the ledger claim.
+
 Verdict flow: preflight -> ledger claim -> WP0 probe (S-2) -> S-7 pre-pass -> simulate every
 station-day (episodes streamed, one progress line each, RSS watch) -> only then ``report.score``
 (truth) -> CSVs, sidecars, pins, S3 inputs and the report. Nothing here writes under the capture.
@@ -18,7 +33,7 @@ import json
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from breezy.analysis.maker_tape_census import CensusedDay
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
@@ -27,6 +42,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
 )
 from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis import maker_stage0_report as report
+from scripts.analysis import maker_stage0_verdict as vd
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_fill_events import assert_delta_within_bound
 from scripts.analysis.maker_stage0_frozen import (
@@ -51,7 +67,6 @@ from scripts.analysis.maker_stage0_nodelog import NodeLogScan, scan_node_log
 from scripts.analysis.maker_stage0_pins import (
     CANONICAL_SIDECARS,
     CatalogSliceManifest,
-    PinSources,
     assert_clean_tree,
     git_commit,
     pin_inputs,
@@ -109,9 +124,7 @@ __all__ = [
 ]
 
 TAIL_RANGE: tuple[dt.date, dt.date] = (dt.date(2026, 7, 1), dt.date(2026, 9, 17))
-THETA_PIN_SITE: Final[str] = (
-    "src/breezy/adapters/polymarket_us/fees.py::taker_fee_coefficient_as_of (post-drift schedule)"
-)
+THETA_RANGE: Final[tuple[float, float]] = (0.0, 0.2)  # r4 (r)6: a coefficient outside is refused
 VARIANT_FILES: Final[dict[str, str]] = {
     "overlay": "overlay_station_days.csv",
     "plus60": "stress_plus60_station_days.csv",
@@ -187,6 +200,14 @@ def _requested(cfg: RunConfig, fs: FrozenDateSet) -> dict[Key, CensusedDay]:
     return census
 
 
+def _check_theta(days: list[dt.date]) -> None:
+    low, high = THETA_RANGE
+    for day in days:
+        theta = theta_for_day(day)
+        if not low <= theta <= high:
+            raise InputRefused(f"theta {theta} for {day} is outside [{low}, {high}]")
+
+
 def _scan_logs(directory: Path) -> tuple[list[NodeLogScan], list[Path]]:
     paths = sorted(directory.glob("*.log")) if directory.is_dir() else []
     return [scan_node_log(p) for p in paths], paths
@@ -195,6 +216,7 @@ def _scan_logs(directory: Path) -> tuple[list[NodeLogScan], list[Path]]:
 def _preflight(cfg: RunConfig, *, strict: bool) -> Pre:
     fs = load_amendment(cfg.amendment, cfg.amendment_sha)
     census = _requested(cfg, fs)
+    _check_theta(sorted({d for _, d in census}))
     free = modes.free_bytes(cfg.out_dir.parent)
     if free < cfg.min_free_bytes:
         raise DiskLow(f"E4: {free} bytes free < {cfg.min_free_bytes}")
@@ -311,29 +333,6 @@ def _write_tables(cfg: RunConfig, scored: report.Scored, out: LoopOutput) -> Non
         (d / filename).write_text(sd_rows_to_csv(out.rows.get(name, [])), encoding="utf-8")
 
 
-def _pin_sources(cfg: RunConfig, pre: Pre, consumed: list[tuple[str, str]]) -> PinSources:
-    d = cfg.out_dir
-    return PinSources(
-        repo_root=cfg.repo_root,
-        census=cfg.census_days,
-        trade_unit=cfg.trade_unit,
-        truth_copy=d / "truth_cli_finals.csv",
-        truth_cross_check=cfg.truth_cross_check,
-        truth_csv_sha256=pre.frozen.truth_csv_sha256,
-        nbp_manifest=cfg.nbp_root / "_manifest.json",
-        nbp_consumed=consumed,
-        process_schedule=d / "process_schedule.json",
-        catalog_slice_manifest=d / "catalog_slice_manifest.json",
-        amendment_final=cfg.amendment,
-        ledger_path=cfg.ledger,
-        node_logs=pre.scan_paths,
-        sidecar_names=SIDECAR_NAMES,
-        argv=cfg.argv,
-        theta_pin_site=THETA_PIN_SITE,
-        spec=cfg.spec,
-    )
-
-
 def _finish(
     cfg: RunConfig, pre: Pre, out: LoopOutput, manifest: CatalogSliceManifest, phases: list[str]
 ) -> RunSummary:
@@ -346,24 +345,43 @@ def _finish(
         truth_csv=cfg.truth,
         cross_check=cfg.truth_cross_check,
         run_dir=d,
-        as_of=cfg.as_of or _utcnow().date(),
     )
     phases.append("score")
     _write_tables(cfg, scored, out)
     manifest.write(d / "catalog_slice_manifest.json")
     consumed = [(str(cycle), sha) for cycle, sha in sorted(out.consumed)]
-    pins = seal_sidecars(pin_inputs(_pin_sources(cfg, pre, consumed)), d)
+    sources = modes.pin_sources(cfg, pre, consumed, SIDECAR_NAMES)
+    pins = seal_sidecars(pin_inputs(sources), d)
     write_pins(d, pins)
-    tables = tables_from_csvs(
-        d / "scored_episodes.csv",
-        d / "station_days.csv",
-        d / "tail_reliability.csv",
-        code_sha=pre.code_sha,
-    )
+    hypotheses = [u.name for u in load_trade_unit(cfg.trade_unit).hypotheses()]
+    try:
+        tables = tables_from_csvs(
+            d / "scored_episodes.csv",
+            d / "station_days.csv",
+            d / "tail_reliability.csv",
+            hypotheses=hypotheses,
+            code_sha=pre.code_sha,
+        )
+    except vd.NoBidBearingDays as exc:  # S-4: a reported stop, never a void
+        return _stop_s4(cfg, pre, pins, phases, out, str(exc))
     (d / "s3_inputs.json").write_text(tables["s3"], encoding="utf-8")
     variants = {name: out.rows.get(name, []) for name in VARIANT_FILES}
-    text = report.render_report(tables, pins, variants, scored.sd_rows, run_id=d.name)
+    text = report.render_report(
+        tables, pins, variants, scored.sd_rows, run_id=d.name, hypotheses=hypotheses
+    )
     (d / "report.md").write_text(text, encoding="utf-8")
     phases.append("report")
     modes.write_manifest(cfg, pre, "verdict", phases, out.parity)
     return RunSummary(d, json.loads(tables["s3"])["verdict"], pre.code_sha, "verdict")
+
+
+def _stop_s4(
+    cfg: RunConfig, pre: Pre, pins: dict[str, Any], phases: list[str], out: LoopOutput, why: str
+) -> RunSummary:
+    d = cfg.out_dir
+    write_json(d / "s3_inputs.json", report.stop_s3_inputs())
+    text = report.render_stop_report(pins, run_id=d.name, reason=why)
+    (d / "report.md").write_text(text, encoding="utf-8")
+    phases.append("report")
+    modes.write_manifest(cfg, pre, "verdict", phases, out.parity, verdict=report.STOP_S4)
+    return RunSummary(d, report.STOP_S4, pre.code_sha, "verdict")

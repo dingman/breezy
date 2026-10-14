@@ -28,19 +28,32 @@ from scripts.analysis.maker_stage0_tables import BANNER, RUNTIME_ONLY_LABEL
 __all__ = [
     "BANNER",
     "HOLDOUT_LINE",
-    "UNRESOLVED_AFTER_DAYS",
+    "S3_KEYS",
+    "STOP_S4",
     "Scored",
+    "day_truth",
     "load_tail_truth",
     "load_truth",
     "render_report",
+    "render_stop_report",
     "score",
+    "stop_s3_inputs",
     "tail_rows_for",
     "truth_token",
     "variant_section",
 ]
 
-UNRESOLVED_AFTER_DAYS: Final[int] = 14
-OUTCOME_UNRESOLVED: Final[str] = "UNRESOLVED"
+STOP_S4: Final[str] = "STOP-S4-NO-BID-BEARING-DAYS"  # r4 (a) S-4: a REPORTED stop, not a void
+#: the ``s3_inputs.json`` keys (``build_s3_inputs``); a stop writes the verdict, null elsewhere
+S3_KEYS: Final[tuple[str, ...]] = (
+    "b", "base_k1", "base_station_day_rate", "base_station_day_rate_ci_cluster_boot",
+    "bid_bearing_share_of_covered_listed", "code_sha", "fill_icc_rung_trial",
+    "fill_icc_rung_trial_k1", "fill_icc_station_day", "max_rungs_hypothesis", "n0_climate_dates",
+    "n_eff_gov", "n_stressed_fills", "r_lo", "r_lo_by_hypothesis", "r_lo_k1",
+    "r_lo_k1_lcb_cluster_boot", "r_lo_lcb_by_hypothesis", "r_lo_lcb_cluster_boot", "r_lo_position",
+    "r_lo_se_cluster_boot", "r_lo_station_day", "realised_bid_iqr", "realised_bid_median_base",
+    "two_fill_share", "unit_hypothesis", "verdict",
+)  # fmt: skip
 OUTCOME_YES: Final[str] = "YES"
 TAIL_P_YES_MAX: Final[float] = TAIL_EDGES[-1]
 HOLDOUT_LINE: Final[str] = (
@@ -65,29 +78,38 @@ class Scored:
     truth: TruthTable
 
 
-def truth_token(rung_id: str, tmax_f: int | None, *, day: dt.date, as_of: dt.date) -> str:
-    """ "" (no FINAL yet), YES / NO from the rung's inclusive band, or UNRESOLVED past D+14."""
-    if tmax_f is None:
-        late = (as_of - day).days > UNRESOLVED_AFTER_DAYS
-        return OUTCOME_UNRESOLVED if late else vd.NO_FINAL
+def day_truth(tmax_f: int | None) -> dict[str, object]:
+    """The station-day truth fields; the ONE place that decides whether a FINAL row exists.
+
+    A day with no FINAL row is blank (excluded from 6.9 and counted) at ANY age. ``UNRESOLVED``
+    (spec 6.5, past D+14 = loss) and ``VOID`` need venue resolution state that the pinned truth CSV
+    does not carry, so no row is ever scored either here (see ``DEVIATIONS`` in the driver).
+    """
+    return {
+        "truth_final": tmax_f is not None, "truth_tmax_f": tmax_f, "void": False,
+        "unresolved_d14": False,
+    }  # fmt: skip
+
+
+def truth_token(rung_id: str, tmax_f: int | None) -> str:
+    """ "" (no FINAL row), or YES / NO from the rung's inclusive band (from ``day_truth``)."""
+    if not day_truth(tmax_f)["truth_final"]:
+        return vd.NO_FINAL
     facts = bucket_facts_from_instrument_id(rung_id)
     if facts is None:
         raise ValueError(f"{rung_id} has no rung facts; cannot settle it")
+    assert tmax_f is not None
     return OUTCOME_YES if facts.contains(tmax_f) else vd.OUTCOME_NO
 
 
-def _truth_row(row: vd.SdRow, truth: TruthTable, as_of: dt.date) -> vd.SdRow:
+def _truth_row(row: vd.SdRow, truth: TruthTable) -> vd.SdRow:
     day = dt.date.fromisoformat(row.climate_day)
-    tmax = truth.finals.get((row.station, day))
-    late = tmax is None and (as_of - day).days > UNRESOLVED_AFTER_DAYS
-    return replace(
-        row, truth_final=tmax is not None, truth_tmax_f=tmax, void=False, unresolved_d14=late
-    )
+    return replace(row, **day_truth(truth.finals.get((row.station, day))))  # type: ignore[arg-type]
 
 
-def _pos_row(seed: PositionSeed, truth: TruthTable, as_of: dt.date) -> vd.PosRow:
+def _pos_row(seed: PositionSeed, truth: TruthTable) -> vd.PosRow:
     day = dt.date.fromisoformat(seed.climate_day)
-    token = truth_token(seed.rung_id, truth.finals.get((seed.station, day)), day=day, as_of=as_of)
+    token = truth_token(seed.rung_id, truth.finals.get((seed.station, day)))
     return vd.PosRow(
         position_id=f"{seed.station}|{seed.climate_day}|{seed.unit_hypothesis}|{seed.rung_id}",
         rung_trial_id=seed.rung_id,
@@ -111,7 +133,6 @@ def score(
     truth_csv: Path,
     cross_check: Path,
     run_dir: Path,
-    as_of: dt.date,
 ) -> Scored:
     """Load FINAL truth for the replayed station-days; called once, post-simulation."""
     keys = {(r.station, dt.date.fromisoformat(r.climate_day)) for r in sd_rows}
@@ -120,8 +141,8 @@ def score(
     )
     verify_set_matches_rule(frozen, census, truth)
     return Scored(
-        [_truth_row(r, truth, as_of) for r in sd_rows],
-        [_pos_row(s, truth, as_of) for s in seeds],
+        [_truth_row(r, truth) for r in sd_rows],
+        [_pos_row(s, truth) for s in seeds],
         truth,
     )
 
@@ -177,15 +198,20 @@ def _fmt(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.4f}"
 
 
-def _label(rows: Sequence[vd.SdRow]) -> str:
+def _label(rows: Sequence[vd.SdRow], hypotheses: Sequence[str]) -> str:
     try:
-        return vd.decide(vd.analyse_all(rows, [])).label
+        return vd.decide(vd.analyse_all(rows, [], hypotheses), hypotheses).label
     except vd.NoBidBearingDays:
         return "n/a (no bid-bearing days)"
 
 
 def variant_section(
-    title: str, name: str, sidecar: str, rows: Sequence[vd.SdRow], primary: Sequence[vd.SdRow]
+    title: str,
+    name: str,
+    sidecar: str,
+    rows: Sequence[vd.SdRow],
+    primary: Sequence[vd.SdRow],
+    hypotheses: Sequence[str],
 ) -> str:
     """Rates beside the primary for one report-only variant, labelled run-time only."""
     base = {(r.station, r.climate_day, r.unit_hypothesis): r for r in primary}
@@ -205,8 +231,11 @@ def variant_section(
             f"| {hyp} | {n_sd} | {_fmt(_station_day_rate(mine, 'filled_pairs_base'))} | "
             f"{_fmt(_station_day_rate(mine, 'filled_pairs_stress'))} | {changed} |"
         )
-    primary_label = _label(primary)
-    out.append(f"\nrate-rows V-row outcome: {_label(rows)} (primary: {primary_label}); {name}\n")
+    primary_label = _label(primary, hypotheses)
+    out.append(
+        f"\nrate-rows V-row outcome: {_label(rows, hypotheses)} "
+        f"(primary: {primary_label}); {name}\n"
+    )
     return "\n".join(out)
 
 
@@ -248,6 +277,7 @@ def render_report(
     primary: Sequence[vd.SdRow],
     *,
     run_id: str,
+    hypotheses: Sequence[str],
 ) -> str:
     """The evidence Markdown: verdict, tables (verbatim reproducible blocks), pins, holdout line."""
     parts = [
@@ -266,7 +296,7 @@ def render_report(
     parts += ["## S3 inputs\n", "```json\n" + blocks["s3"] + "```\n"]
     parts.append("## Report-only variants\n")
     parts += [
-        variant_section(title, name, sidecar, variants.get(name, ()), primary)
+        variant_section(title, name, sidecar, variants.get(name, ()), primary, hypotheses)
         for name, sidecar, title in _VARIANT_FILES
         if name in variants
     ]
@@ -288,3 +318,28 @@ def render_report(
     ]
     parts += [_pins_block(pins), "## Holdout\n", HOLDOUT_LINE + "\n"]
     return "\n".join(parts)
+
+
+def stop_s3_inputs() -> dict[str, object]:
+    """S-4: the verdict alone; every other key is null so S3 cannot read a number into a stop."""
+    return {k: STOP_S4 if k == "verdict" else None for k in S3_KEYS}
+
+
+def render_stop_report(pins: Mapping[str, Any], *, run_id: str, reason: str) -> str:
+    """The S-4 report: the verdict, why, the pins and the holdout line (no tables to render)."""
+    return "\n".join(
+        [
+            f"# MAKER-S2 Stage 0 replay: {run_id}\n",
+            f"{BANNER}\n",
+            "## Verdict\n",
+            f"Verdict: {STOP_S4}\n",
+            f"{reason}\n",
+            (
+                "This is a REPORTED stop (r4 (a) S-4), not a void: the ledger entry stands and "
+                "there is no re-run without a new dated declaration.\n"
+            ),
+            _pins_block(pins),
+            "## Holdout\n",
+            HOLDOUT_LINE + "\n",
+        ]
+    )
