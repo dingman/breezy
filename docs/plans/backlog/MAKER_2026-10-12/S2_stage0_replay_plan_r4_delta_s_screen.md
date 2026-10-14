@@ -21,6 +21,9 @@ Status: PROPOSED for blind review (2026-10-14). Touches only the `--bench` scree
 - Why two warm-up rows, not one: with the observed rows a one-row warm-up fits rows 2-4 (1.94, 2.13, 2.10 GB), slope +0.08 GB/row, projection 9.6 GB, i.e. the row that carries the heaviest day is still read as growth. Rows 1-2 are where the working set is built; the screen measures what happens after.
 - Caveat (stated, not hidden): a day heavier than every earlier day that lands after row 2 raises end-of-row RSS legitimately and can read as growth (a false alarm in the safe direction). It is a screen, not a proof.
 
+## Time projection by weight
+The bench rows are the heaviest station-days by catalog bytes (outcome-blind), so `mean_s * n` charges every remaining day at a heavy-day cost. The consistent reading of "heaviest by catalog bytes" plus "linear extrapolation to the set size" is linear in bytes: `projected_total_s = (sum elapsed_s / sum bench bytes) * sum bytes of all replayable station-days`. It falls back to the by-count figure when any bench weight is 0 or a sum is degenerate. `bench.json` reports both (`projected_total_s` by weight, `projected_total_s_by_count`); `s5_exceeded` uses the by-weight one. `S5_MAX_SECONDS` and the procedure's `+ 2 x T_FP` term are unchanged.
+
 ## Result on the observed rows
 Rows after warm-up: 2.125, 2.100 GB, slope -0.025 GB/row floored to 0, so `projected_peak` = 2.838 GB < 4 GiB; `s5_exceeded` then depends on time alone.
 

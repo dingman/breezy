@@ -236,7 +236,7 @@ def _write_bench(
 ) -> None:
     by_iso = {(s, d.isoformat()): n for (s, d), n in weights.items()}
     rows = [{**t, "catalog_bytes": by_iso[(t["station"], t["climate_day"])]} for t in timings]
-    proj = project_bench(rows, len(weights))
+    proj = project_bench(rows, len(weights), sum(weights.values()))
     write_json(
         cfg.out_dir / "bench.json",
         {
@@ -244,6 +244,7 @@ def _write_bench(
             "variants": list(variants),
             "n_replayable_station_days": len(weights),
             "projected_total_s": proj.projected_total_s,
+            "projected_total_s_by_count": proj.projected_total_s_by_count,
             "projected_peak_rss_bytes": proj.projected_peak_rss_bytes,
             "rss_slope_bytes_per_row": proj.rss_slope_bytes_per_row,
             "s5_exceeded": proj.s5_exceeded,

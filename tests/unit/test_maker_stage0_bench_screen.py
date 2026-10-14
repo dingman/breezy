@@ -109,7 +109,8 @@ def test_write_bench_records_the_new_projection_and_keeps_the_old_keys(tmp_path:
     modes._write_bench(cfg, pre, timings, weights, ("primary",))  # type: ignore[arg-type]
     bench = json.loads((tmp_path / "bench.json").read_text())
     assert bench["n_replayable_station_days"] == TOTAL
-    assert bench["projected_total_s"] == 100.0 * TOTAL
+    assert bench["projected_total_s_by_count"] == 100.0 * TOTAL
+    assert bench["projected_total_s"] == pytest.approx(400.0 / 40 * (40 + 84))
     assert bench["projected_peak_rss_bytes"] <= RSS_ABORT_BYTES
     assert bench["s5_exceeded"] is False
     assert "rss_slope_bytes_per_row" in bench
@@ -119,3 +120,34 @@ def test_write_bench_records_the_new_projection_and_keeps_the_old_keys(tmp_path:
 def test_degenerate_row_counts_do_not_raise(rows: list[dict[str, Any]]) -> None:
     out = project_bench(rows, TOTAL)
     assert out.rss_slope_bytes_per_row == 0
+
+
+def _weighted(weights: list[int], elapsed: float = 100.0) -> list[dict[str, Any]]:
+    return [{**_row(2.0, 2.0, 0.0, elapsed=elapsed), "catalog_bytes": w} for w in weights]
+
+
+def test_equal_weights_give_the_by_count_projection() -> None:
+    out = project_bench(_weighted([10] * 4), TOTAL, 10 * TOTAL)
+    assert out.projected_total_s == pytest.approx(out.projected_total_s_by_count)
+
+
+def test_heaviest_rows_at_four_times_the_mean_weight_project_a_quarter() -> None:
+    out = project_bench(_weighted([40] * 4), TOTAL, 10 * TOTAL)
+    assert out.projected_total_s == pytest.approx(out.projected_total_s_by_count / 4)
+
+
+@pytest.mark.parametrize(
+    "weights, total_weight", [([10, 0, 10, 10], 880), ([10] * 4, 0), ([], 880)]
+)
+def test_degenerate_weights_fall_back_to_the_by_count_projection(
+    weights: list[int], total_weight: int
+) -> None:
+    rows = _weighted(weights) if weights else []
+    out = project_bench(rows, TOTAL, total_weight)
+    assert out.projected_total_s == out.projected_total_s_by_count
+
+
+def test_s5_uses_the_by_weight_time() -> None:
+    rows = _weighted([40] * 4, elapsed=400.0)  # by count 35,200 s (> 6 h); by weight 8,800 s
+    assert project_bench(rows, TOTAL, 10 * TOTAL).s5_exceeded is False
+    assert project_bench(rows, TOTAL).s5_exceeded is True  # no total weight: by-count fallback

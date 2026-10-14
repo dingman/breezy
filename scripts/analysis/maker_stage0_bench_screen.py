@@ -3,7 +3,11 @@
 Plan r3/r4: "Per-station-day RSS goes in the progress events; linear extrapolation to the set size
 is a screen, not a proof; S-5 fires if the projection exceeds 4 GiB or 6 h."
 
-Time: ``projected_total_s = mean(elapsed_s) * n_replayable_station_days`` (unchanged).
+Time. The bench rows are the HEAVIEST station-days by catalog bytes, so extrapolating by
+count (``mean(elapsed_s) * n``, kept as ``projected_total_s_by_count``) charges every remaining
+day at a heavy-day cost. ``projected_total_s`` is by weight: ``(sum elapsed_s / sum bench bytes)
+* sum bytes of all replayable station-days``. It falls back to the by-count figure when a bench
+weight is 0 or a sum is degenerate. ``s5_exceeded`` uses the by-weight figure.
 
 Memory. ``ru_maxrss`` is a ratchet, so its per-row delta is NOT a growth rate: the first rows
 raise the high-water mark once (allocator warm-up, the heaviest day) and later rows add 0. The
@@ -39,6 +43,7 @@ _MIN_FIT_ROWS: Final[int] = 2
 @dataclass(frozen=True, slots=True)
 class BenchProjection:
     projected_total_s: float
+    projected_total_s_by_count: float
     projected_peak_rss_bytes: int
     rss_slope_bytes_per_row: int
     s5_exceeded: bool
@@ -55,12 +60,24 @@ def _slope(ys: Sequence[float]) -> float:
     return num / den
 
 
-def project_bench(rows: Sequence[Mapping[str, Any]], total: int) -> BenchProjection:
-    """Project the full set (``total`` station-days) from the timed rows, in run order."""
+def _by_weight(rows: Sequence[Mapping[str, Any]], total_weight: int, fallback: float) -> float:
+    weights = [r.get("catalog_bytes", 0) for r in rows]
+    bench_bytes = sum(weights)
+    if not rows or min(weights) <= 0 or bench_bytes <= 0 or total_weight <= 0:
+        return fallback
+    return float(sum(r["elapsed_s"] for r in rows) / bench_bytes * total_weight)
+
+
+def project_bench(
+    rows: Sequence[Mapping[str, Any]], total: int, total_weight: int = 0
+) -> BenchProjection:
+    """Project the full set (``total`` station-days, ``total_weight`` bytes) from the timed rows."""
     mean_s = sum(r["elapsed_s"] for r in rows) / max(1, len(rows))
     peak = max((r["peak_rss_bytes"] for r in rows), default=0)
     resident = [float(r["rss_bytes"]) for r in rows[WARMUP_ROWS:]]
     slope = max(0, int(_slope(resident)))
     projected = peak + slope * max(0, total - len(rows))
-    exceeded = mean_s * total > S5_MAX_SECONDS or projected > RSS_ABORT_BYTES
-    return BenchProjection(mean_s * total, projected, slope, exceeded)
+    by_count = mean_s * total
+    seconds = _by_weight(rows, total_weight, by_count)
+    exceeded = seconds > S5_MAX_SECONDS or projected > RSS_ABORT_BYTES
+    return BenchProjection(seconds, by_count, projected, slope, exceeded)
