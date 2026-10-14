@@ -223,12 +223,13 @@ TRADE_KNOWN_KEYS: frozenset[str] = frozenset(
 )
 
 #: Unit of a print's ``quantity`` -- and so of ``TradeTick.size`` -- on this
-#: venue: ``"UNRESOLVED"`` until the first live print is cross-checked against
-#: the REST fill quantity for the same trade (contracts vs dollars). Any
-#: consumer of ``TradeTick.size`` (the resting-bid study first) MUST check this
-#: constant before treating a size as a contract count. The data client keeps
-#: the raw ``quantity`` object verbatim as bounded evidence for that check.
-TRADE_QUANTITY_UNIT: str = "UNRESOLVED"
+#: venue: ``"CONTRACTS"``. Resolved 2026-10-14 by
+#: ``scripts/analysis/trade_quantity_unit_crosscheck.py`` (evidence:
+#: ``docs/evidence/MAKER-S1_preconditions_2026-10-14.md``): 25 counted of 28
+#: pinned own create-path fills were each matched to a unique recorded print
+#: and only CONTRACTS survived; the dollars-inversion check HOLDS on every
+#: match. The parser performs NO unit conversion -- the tape stays byte-stable.
+TRADE_QUANTITY_UNIT: str = "CONTRACTS"
 
 #: Venue ``state`` values that mean the contract has reached a terminal
 #: settlement, so ``settlementPx`` is the final value rather than a daily mark.
@@ -947,7 +948,8 @@ def parse_trade_tick(
     risk. It cannot be reconciled with the venue and must never be presented
     as if it could.
 
-    **``size`` is unit-unresolved** -- see :data:`TRADE_QUANTITY_UNIT`.
+    **``size`` is in contracts** per :data:`TRADE_QUANTITY_UNIT` (resolved by
+    the own-fill crosscheck); no conversion is applied here.
     """
     trade = _require_mapping(payload, TRADE_CONTAINER_KEY, context="trade payload")
     expected_slug = instrument.id.symbol.value

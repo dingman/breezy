@@ -91,6 +91,7 @@ from breezy.adapters.polymarket_us.parsing import (
     TERMINAL_SETTLEMENT_METHOD,
     TRADE_CONTAINER_KEY,
     TRADE_KNOWN_KEYS,
+    TRADE_QUANTITY_UNIT,
     depth_levels_dropped,
     parse_instrument_close,
     parse_instrument_status,
@@ -1862,7 +1863,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         if not self._trade_quantity_evidence:
             self._log.info(
                 "Polymarket.us first print kept as quantity-unit evidence "
-                f"(TRADE_QUANTITY_UNIT is UNRESOLVED): {evidence!r}"
+                f"(TRADE_QUANTITY_UNIT is {TRADE_QUANTITY_UNIT}): {evidence!r}"
             )
         self._trade_quantity_evidence.append(evidence)
 
