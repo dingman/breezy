@@ -12,9 +12,9 @@ below b.
 from __future__ import annotations
 
 import ast
-import importlib.util
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,18 +23,23 @@ from scripts.analysis import maker_stage0_fill_events as ev
 
 SEC = 1_000_000_000
 T = 1_000 * SEC
-ASKS: tuple[ev.Level, ...] = ((21, 4.0), (22, 6.0), (25, 10.0))
-BIDS: tuple[ev.Level, ...] = ((3, 10.0),)
+ASKS: tuple[ev.Level, ...] = ((21, 4), (22, 6), (25, 10))
+BIDS: tuple[ev.Level, ...] = ((3, 10),)
 BID = 78
 Selector = Callable[[fill.DecisionContext], fill.Decision]
 
 
 class Tape:
     def __init__(self) -> None:
-        self.events: list[ev.Event] = []
+        self._raw: list[ev.Event] = []
+
+    @property
+    def events(self) -> list[ev.Event]:
+        """Canonical order: the simulator rejects unsorted input rather than sorting it."""
+        return sorted(self._raw)
 
     def _add(self, ts: int, kind: ev.Kind, payload: ev.Payload) -> None:
-        self.events.append(ev.Event(ts, kind, len(self.events), payload))
+        self._raw.append(ev.Event(ts, kind, len(self._raw), payload))
 
     def release(
         self, ts: int, p: float = 0.02, sha: str = "sha1", rungs: tuple[str, ...] = ("R1",)
@@ -55,17 +60,27 @@ class Tape:
         rung: str = "R1",
         asks: tuple[ev.Level, ...] = ASKS,
         bids: tuple[ev.Level, ...] = BIDS,
-        truncated: bool = False,
+        asks_truncated: bool = False,
+        bids_truncated: bool = False,
         instance: str = "i1",
+        frame_ts: int | None = None,
     ) -> None:
-        frame = ev.DepthFrame(rung, bids, asks, truncated, instance)
+        frame = ev.DepthFrame(
+            rung_id=rung,
+            ts_ns=ts if frame_ts is None else frame_ts,
+            yes_bids=bids,
+            yes_asks=asks,
+            asks_truncated=asks_truncated,
+            bids_truncated=bids_truncated,
+            instance_id=instance,
+        )
         self._add(ts, ev.Kind.DEPTH, frame)
 
     def buy(
         self,
         ts: int,
         price: int,
-        size: float,
+        size: int,
         rung: str = "R1",
         aggressor: str = ev.BUYER,
         instance: str = "i1",
@@ -86,7 +101,9 @@ def fixed(bids: Mapping[str, int]) -> Selector:
     def select(ctx: fill.DecisionContext) -> fill.Decision:
         if ctx.vector is None:
             return fill.Decision()
-        return fill.Decision(tuple(fill.Desired(r, b) for r, b in bids.items()))
+        return fill.Decision(
+            tuple(fill.Desired(r, b) for r, b in bids.items()), forecast_valid=True
+        )
 
     return select
 
@@ -99,7 +116,11 @@ def base_tape() -> Tape:
 
 
 def run(
-    tape: Tape, selector: Selector | None = None, delta: int = 0, live_from: int = T
+    tape: Tape,
+    selector: Selector | None = None,
+    delta: int = 0,
+    live_from: int = T,
+    max_rungs: int = 2,
 ) -> fill.StationDayResult:
     return fill.simulate_station_day(
         tape.events,
@@ -109,6 +130,7 @@ def run(
         unit_hypothesis="RESOLVED",
         live_from_ns=live_from,
         delta_ns=delta,
+        max_rungs=max_rungs,
     )
 
 
@@ -193,7 +215,7 @@ def test_better_priced_reduction_capped_at_size_strictly_better() -> None:
 def test_fill_when_own_unit_consumed() -> None:
     tape = Tape()
     tape.release(T)
-    tape.depth(T + 10 * SEC, asks=((22, 5.0),))  # A_gt 0, A_eq 5, Q0 = 6
+    tape.depth(T + 10 * SEC, asks=((22, 5),))  # A_gt 0, A_eq 5, Q0 = 6
     tape.buy(T + 20 * SEC, 22, 5)
     tape.buy(T + 21 * SEC, 22, 1)
     tape.cut(T + 100 * SEC)
@@ -232,7 +254,7 @@ def test_replace_resets_queue() -> None:
         if ctx.vector is None:
             return fill.Decision()
         bid = BID if ctx.now_ns < T + 30 * SEC else BID - 1
-        return fill.Decision((fill.Desired("R1", bid),))
+        return fill.Decision((fill.Desired("R1", bid),), forecast_valid=True)
 
     tape = base_tape()
     tape.buy(T + 20 * SEC, 22, 10)  # R 11 -> 1 on the first episode
@@ -328,13 +350,13 @@ def test_gapped_frame_never_fills() -> None:
     tape.cut(T + 200 * SEC)
     result = run(tape)
     assert all(e.filled_ns_base is None for e in result.episodes)
-    assert [e.refused_reason for e in result.episodes] == ["STALE_FRAME"]
+    assert [e.refused_reason for e in result.episodes] == ["STALE_FRAME", "STALE_FRAME"]
 
 
 def test_stale_or_truncated_frame_refuses_episode() -> None:
     tape = Tape()
     tape.release(T)
-    tape.depth(T + 10 * SEC, truncated=True)
+    tape.depth(T + 10 * SEC, asks=((21, 4),), asks_truncated=True)  # level 22 beyond deepest ask
     tape.depth(T + 20 * SEC)  # fresh frame: the retry places
     tape.cut(T + 100 * SEC)
     refused, placed = run(tape).episodes
@@ -345,11 +367,8 @@ def test_stale_or_truncated_frame_refuses_episode() -> None:
 def test_frame_from_an_earlier_recorder_instance_refuses() -> None:
     tape = Tape()
     tape.depth(T + 5 * SEC, instance="i1")
-    tape.release(T + 20 * SEC)
-    tape.buy(
-        T + 25 * SEC, 99, 1, instance="i2"
-    )  # the recorder restarted: the book frame predates it
-    tape.release(T + 40 * SEC, sha="s2")  # decision instant
+    tape.buy(T + 6 * SEC, 99, 1, instance="i2")  # the recorder restarted: the frame predates it
+    tape.release(T + 20 * SEC)  # decision instant
     tape.cut(T + 100 * SEC)
     refused = [e for e in run(tape).episodes if e.end_reason == "REFUSED"]
     assert [e.refused_reason for e in refused] == ["STALE_FRAME"]
@@ -358,7 +377,7 @@ def test_frame_from_an_earlier_recorder_instance_refuses() -> None:
 def test_marketable_bid_is_refused() -> None:
     tape = Tape()
     tape.release(T)
-    tape.depth(T + 10 * SEC, bids=((80, 5.0),))  # NO ask = 20 <= 78
+    tape.depth(T + 10 * SEC, bids=((80, 5),))  # NO ask = 20 <= 78
     tape.cut(T + 100 * SEC)
     ep = only(run(tape))
     assert ep.refused_reason == "MARKETABLE"
@@ -382,7 +401,8 @@ def test_clock_shift_hides_a_vector_until_delta_after_release() -> None:
     tape.depth(T + 25 * SEC)
     tape.cut(T + 100 * SEC)
     ep = only(run(tape, delta=20 * SEC))
-    assert ep.t0_ns == T + 25 * SEC  # the T+10 frame precedes the shifted vintage
+    # the vector is hidden until shifted release + 1 ns, then the decision uses the T+10 frame
+    assert ep.t0_ns == T + 20 * SEC + 1 and ep.depth_ts_used_ns == T + 10 * SEC
 
 
 def test_delta_is_per_instance_day_max_over_instances_and_over_10min_aborts_before_scoring_s7() -> (
@@ -429,7 +449,7 @@ def test_k1_rung_is_first_attempt_rung_held_for_day_with_stressed_pass() -> None
         if ctx.vector is None:
             return fill.Decision()
         order = ("R2", "R1") if ctx.now_ns < T + 90 * SEC else ("R1", "R2")
-        return fill.Decision(tuple(fill.Desired(r, BID) for r in order))
+        return fill.Decision(tuple(fill.Desired(r, BID) for r in order), forecast_valid=True)
 
     tape = Tape()
     tape.release(T, rungs=("R1", "R2"))
@@ -462,12 +482,13 @@ def test_bid_counts_and_median_none_without_fills() -> None:
 def test_bid_bearing_counts_guard_refused_attempts() -> None:
     tape = Tape()
     tape.release(T)
-    tape.depth(T + 10 * SEC, truncated=True)
-    tape.depth(T + 20 * SEC, truncated=True)
+    tape.depth(T + 10 * SEC, asks=((21, 4),), asks_truncated=True)
+    tape.depth(T + 20 * SEC, asks=((21, 4),), asks_truncated=True)
     tape.cut(T + 100 * SEC)
     s = run(tape).summary
     assert s.bid_bearing is True and s.guard_refused_only is True
     assert (s.n_attempts, s.n_refused, s.n_episodes, s.rung_trials_posted) == (2, 2, 0, 0)
+    assert s.rung_trials_attempted == 1
     assert s.k1_rung_id == "R1"
 
 
@@ -557,20 +578,486 @@ def test_unfinished_episode_closes_at_end_of_data() -> None:
     assert only(run(tape)).end_reason == "END_OF_DATA"
 
 
+# ---- review fixes: truncation rule --------------------------------------------------------------
+
+
+def test_truncated_asks_with_level_inside_displayed_range_place() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.depth(T + 10 * SEC, asks_truncated=True)  # level 22 <= deepest displayed ask 25
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape))
+    assert ep.refused_reason is None and (ep.a_gt, ep.a_eq) == (4, 6)
+
+
+def test_truncated_asks_with_level_beyond_deepest_ask_refuse() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.depth(T + 10 * SEC, asks=((21, 4),), asks_truncated=True)  # level 22 > 21
+    tape.cut(T + 100 * SEC)
+    assert only(run(tape)).refused_reason == "TRUNCATED_FRAME"
+
+
+def test_bid_side_only_truncation_places() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.depth(T + 10 * SEC, asks=((21, 4),), bids_truncated=True)
+    tape.cut(T + 100 * SEC)
+    assert only(run(tape)).refused_reason is None
+
+
+def test_truncation_refused_share_and_first_refusal_to_first_placement() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.depth(T + 10 * SEC, asks=((21, 4),), asks_truncated=True)
+    tape.depth(T + 20 * SEC, asks=((21, 4),), asks_truncated=True)
+    tape.depth(T + 30 * SEC)
+    tape.cut(T + 100 * SEC)
+    s = run(tape).summary
+    assert s.n_attempts == 3 and s.truncation_refused_share == pytest.approx(2 / 3)
+    assert s.first_refusal_to_first_placement_s == pytest.approx(20.0)
+
+
+def test_truncation_fields_are_none_without_truncation_refusals() -> None:
+    tape = base_tape()
+    tape.cut(T + 100 * SEC)
+    s = run(tape).summary
+    assert s.truncation_refused_share == 0.0 and s.first_refusal_to_first_placement_s is None
+
+
+# ---- review fixes: forecast release is a decision instant ----------------------------------------
+
+
+def _cancel_when_p_high(ctx: fill.DecisionContext) -> fill.Decision:
+    if ctx.vector is None:
+        return fill.Decision()
+    if ctx.vector.p_yes_point["R1"] > 0.05:
+        return fill.Decision(dropped={"R1": ev.CANCEL_PMIN}, forecast_valid=True)
+    return fill.Decision((fill.Desired("R1", BID),), forecast_valid=True)
+
+
+def test_release_cancels_a_rest_before_a_later_print_can_fill_it() -> None:
+    tape = base_tape()
+    tape.release(T + 50 * SEC, p=0.30, sha="sha2")  # the new vector fails p_min
+    tape.buy(T + 51 * SEC, 22, 500)  # no frame follows; would fill the surviving rest
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape, _cancel_when_p_high))
+    assert ep.end_reason == ev.CANCEL_PMIN and ep.end_ns == T + 50 * SEC + 1
+    assert ep.filled_ns_base is None and ep.filled_ns_stress is None
+
+
+def test_clock_shift_emits_a_decide_event_one_ns_after_the_shifted_release() -> None:
+    tape = Tape()
+    tape.release(T)
+    shifted = ev.apply_clock_shift(tape.events, 20 * SEC)
+    decides = [e.ts_ns for e in shifted if e.kind is ev.Kind.DECIDE]
+    assert decides == [T + 20 * SEC + 1]
+
+
+def test_decision_with_no_vector_in_force_raises() -> None:
+    tape = Tape()
+    tape.depth(T + 10 * SEC)
+    tape.cut(T + 100 * SEC)
+
+    def eager(ctx: fill.DecisionContext) -> fill.Decision:
+        return fill.Decision((fill.Desired("R1", BID),), forecast_valid=True)
+
+    with pytest.raises(ev.LeakageError):
+        run(tape, eager)
+
+
+# ---- review fixes: stress rows carry stress fields -----------------------------------------------
+
+
+def test_stress_row_has_its_own_end_fill_instant_and_vector() -> None:
+    tape = base_tape()
+    tape.buy(T + 20 * SEC, 22, 11)  # base fills
+    tape.release(T + 50 * SEC, p=0.03, sha="sha2")
+    tape.buy(T + 60 * SEC, 22, 11)  # stress fills later, under the newer vector
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape))
+    assert (ep.filled_ns_base, ep.end_ns, ep.end_reason) == (T + 20 * SEC, T + 20 * SEC, "FILLED")
+    assert ep.raw_sha256 == "sha1" and ep.p_yes_point_live == 0.02
+    assert ep.filled_ns_stress == T + 60 * SEC and ep.end_ns_stress == T + 60 * SEC
+    assert ep.end_reason_stress == "FILLED"
+    assert ep.filled_ns_stress <= ep.end_ns_stress
+    assert ep.raw_sha256_stress == "sha2" and ep.p_yes_point_live_stress == 0.03
+    assert ep.available_at_ns_stress == T + 50 * SEC
+
+
+def test_unfilled_stress_ends_at_its_own_cut() -> None:
+    tape = base_tape()
+    tape.buy(T + 20 * SEC, 22, 11)  # base fills only
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape))
+    assert ep.filled_ns_stress is None
+    assert (ep.end_ns_stress, ep.end_reason_stress) == (T + 100 * SEC, "CANCEL_PROCESS")
+
+
+# ---- review fixes: real depth timestamps and leak asserts ----------------------------------------
+
+
+def test_depth_ts_used_is_the_frame_ts_not_t0() -> None:
+    tape = Tape()
+    tape.depth(T + 5 * SEC)
+    tape.release(T + 50 * SEC)  # the release decision uses the 45 s old frame
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape))
+    assert ep.depth_ts_used_ns == T + 5 * SEC and ep.depth_ts_used_ns < ep.t0_ns
+
+
+def test_frame_stamped_after_t0_raises_leakage_error() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.depth(T + 10 * SEC, frame_ts=T + 99 * SEC)
+    tape.cut(T + 100 * SEC)
+    with pytest.raises(ev.LeakageError, match="depth"):
+        run(tape)
+
+
+# ---- review fixes: denominators, delta bound, caps -----------------------------------------------
+
+
+def test_refused_only_rung_stays_in_the_attempted_denominator() -> None:
+    def two(ctx: fill.DecisionContext) -> fill.Decision:
+        if ctx.vector is None:
+            return fill.Decision()
+        return fill.Decision(
+            (fill.Desired("R1", BID), fill.Desired("R2", BID)), forecast_valid=True
+        )
+
+    tape = Tape()
+    tape.release(T, rungs=("R1", "R2"))
+    tape.depth(T + 10 * SEC, rung="R1")
+    tape.depth(T + 11 * SEC, rung="R2", asks=((21, 4),), asks_truncated=True)
+    tape.cut(T + 100 * SEC)
+    s = run(tape, two).summary
+    assert (s.rung_trials_attempted, s.rung_trials_posted) == (2, 1)
+
+
+def test_delta_above_the_s7_bound_raises_inside_the_simulator() -> None:
+    tape = base_tape()
+    with pytest.raises(ev.DeltaBoundExceeded):
+        run(tape, delta=601 * SEC)
+    run(tape, delta=600 * SEC)
+
+
+def _three_rungs() -> Tape:
+    tape = Tape()
+    tape.release(T, rungs=("R1", "R2", "R3"))
+    for i, rung in enumerate(("R1", "R2", "R3")):
+        tape.depth(T + (10 + i) * SEC, rung=rung)
+    tape.buy(T + 20 * SEC, 22, 11, rung="R1")  # R1 fills (base)
+    tape.depth(T + 30 * SEC, rung="R1")
+    tape.depth(T + 31 * SEC, rung="R2")
+    tape.depth(T + 32 * SEC, rung="R3")
+    tape.cut(T + 100 * SEC)
+    return tape
+
+
+def _backfilling(ctx: fill.DecisionContext) -> fill.Decision:
+    if ctx.vector is None:
+        return fill.Decision()
+    ranked = tuple(fill.Desired(r, BID) for r in ("R1", "R2", "R3") if r not in ctx.held)
+    return fill.Decision(ranked, forecast_valid=True)
+
+
+def test_backfilling_selector_cannot_exceed_the_position_cap_in_either_pass() -> None:
+    result = run(_three_rungs(), _backfilling, max_rungs=2)
+    assert {e.rung_id for e in result.episodes} == {"R1", "R2"}
+    assert result.summary.rungs_ever_posted == 2
+
+
+def test_cap_is_a_parameter() -> None:
+    result = run(_three_rungs(), _backfilling, max_rungs=3)
+    assert {e.rung_id for e in result.episodes} == {"R1", "R2", "R3"}
+
+
+def test_rungs_ever_posted_counts_rotation() -> None:
+    def rotate(ctx: fill.DecisionContext) -> fill.Decision:
+        if ctx.vector is None:
+            return fill.Decision()
+        if ctx.now_ns < T + 30 * SEC:
+            return fill.Decision(
+                (fill.Desired("R1", BID),), dropped={"R2": ev.CANCEL_PMIN}, forecast_valid=True
+            )
+        return fill.Decision(
+            (fill.Desired("R2", BID),), dropped={"R1": ev.CANCEL_PMIN}, forecast_valid=True
+        )
+
+    tape = Tape()
+    tape.release(T, rungs=("R1", "R2"))
+    tape.depth(T + 10 * SEC, rung="R1")
+    tape.depth(T + 11 * SEC, rung="R2")
+    tape.depth(T + 40 * SEC, rung="R2")
+    tape.cut(T + 100 * SEC)
+    assert run(tape, rotate).summary.rungs_ever_posted == 2
+
+
+# ---- review fixes: Decision shape ----------------------------------------------------------------
+
+
+def test_decision_defaults_fail_closed() -> None:
+    d = fill.Decision()
+    assert d.forecast_valid is False and d.drop_reason is None and not d.dropped
+
+
+def test_forecast_valid_default_does_not_accrue_valid_hours() -> None:
+    def abstain(ctx: fill.DecisionContext) -> fill.Decision:
+        return fill.Decision()
+
+    tape = base_tape()
+    tape.cut(T + 3600 * SEC)
+    s = run(tape, abstain).summary
+    assert s.forecast_valid_h == 0 and s.gap_share is None
+
+
+def test_per_rung_drop_reasons_distinguish_stale_from_day_mismatch() -> None:
+    def select(ctx: fill.DecisionContext) -> fill.Decision:
+        if ctx.vector is None:
+            return fill.Decision()
+        if ctx.now_ns < T + 30 * SEC:
+            return fill.Decision(
+                (fill.Desired("R1", BID), fill.Desired("R2", BID)), forecast_valid=True
+            )
+        return fill.Decision(
+            dropped={"R1": ev.CANCEL_STALE, "R2": ev.CANCEL_DAYMISMATCH}, forecast_valid=True
+        )
+
+    tape = Tape()
+    tape.release(T, rungs=("R1", "R2"))
+    tape.depth(T + 10 * SEC, rung="R1")
+    tape.depth(T + 11 * SEC, rung="R2")
+    tape.depth(T + 40 * SEC, rung="R1")
+    tape.cut(T + 100 * SEC)
+    reasons = {e.rung_id: e.end_reason for e in run(tape, select).episodes}
+    assert reasons == {"R1": ev.CANCEL_STALE, "R2": ev.CANCEL_DAYMISMATCH}
+
+
+def test_dropping_a_live_rung_without_a_reason_raises() -> None:
+    def forgetful(ctx: fill.DecisionContext) -> fill.Decision:
+        if ctx.vector is None:
+            return fill.Decision()
+        if ctx.now_ns < T + 30 * SEC:
+            return fill.Decision((fill.Desired("R1", BID),), forecast_valid=True)
+        return fill.Decision(forecast_valid=True)
+
+    tape = base_tape()
+    tape.depth(T + 40 * SEC)
+    tape.cut(T + 100 * SEC)
+    with pytest.raises(ValueError, match="reason"):
+        run(tape, forgetful)
+
+
+def test_unknown_drop_reason_and_duplicate_rungs_and_bad_bids_raise() -> None:
+    tape = base_tape()
+    tape.cut(T + 100 * SEC)
+
+    def bad(d: fill.Decision) -> Selector:
+        return lambda ctx: d if ctx.vector is not None else fill.Decision()
+
+    dup = fill.Decision((fill.Desired("R1", BID), fill.Desired("R1", 70)), forecast_valid=True)
+    out = fill.Decision((fill.Desired("R1", 100),), forecast_valid=True)
+    for decision in (dup, out):
+        with pytest.raises(ValueError):
+            run(tape, bad(decision))
+    with pytest.raises(ValueError, match="reason"):
+        fill.Decision(dropped={"R1": "BOGUS"}, forecast_valid=True)
+
+
+# ---- review fixes: integer queues, on-tick median ------------------------------------------------
+
+
+def test_queue_arithmetic_is_exact_integer() -> None:
+    tape = base_tape()
+    tape.buy(T + 20 * SEC, 22, 10)  # R 11 -> 1
+    tape.buy(T + 21 * SEC, 22, 1)  # R 1 -> 0 exactly
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape))
+    assert ep.filled_ns_base == T + 21 * SEC
+    assert isinstance(ep.a_gt, int) and isinstance(ep.a_eq, int)
+
+
+def test_fractional_sizes_are_rejected_at_the_boundary() -> None:
+    tape = base_tape()
+    tape.buy(T + 20 * SEC, 22, 0.5)  # type: ignore[arg-type]
+    with pytest.raises(ev.EventError, match="integer"):
+        run(tape)
+
+
+def test_bid_median_is_the_on_tick_lower_median() -> None:
+    def two_bids(ctx: fill.DecisionContext) -> fill.Decision:
+        if ctx.vector is None:
+            return fill.Decision()
+        return fill.Decision((fill.Desired("R1", 78), fill.Desired("R2", 77)), forecast_valid=True)
+
+    tape = Tape()
+    tape.release(T, rungs=("R1", "R2"))
+    tape.depth(T + 10 * SEC, rung="R1")
+    tape.depth(T + 11 * SEC, rung="R2")
+    tape.buy(T + 20 * SEC, 30, 1000, rung="R1")
+    tape.buy(T + 21 * SEC, 30, 1000, rung="R2")
+    tape.cut(T + 100 * SEC)
+    s = run(tape, two_bids).summary
+    assert s.filled_pairs_stress == 2 and s.bid_median_fills_stress == 0.77
+
+
+# ---- review fixes: validation, determinism, keyword-only records ---------------------------------
+
+
+def test_unsorted_or_duplicate_events_are_rejected_with_a_reason() -> None:
+    tape = base_tape()
+    tape.cut(T + 100 * SEC)
+    events = tape.events
+    with pytest.raises(ev.EventError, match="out of order"):
+        fill.simulate_station_day(
+            events[::-1],
+            fixed({"R1": BID}),
+            station="K",
+            climate_day="d",
+            unit_hypothesis="RESOLVED",
+            live_from_ns=T,
+        )
+    with pytest.raises(ev.EventError, match="duplicate"):
+        fill.simulate_station_day(
+            [events[0], events[0]],
+            fixed({"R1": BID}),
+            station="K",
+            climate_day="d",
+            unit_hypothesis="RESOLVED",
+            live_from_ns=T,
+        )
+
+
+def test_same_events_twice_give_identical_results() -> None:
+    tape = _three_rungs()
+    assert run(tape, _backfilling) == run(tape, _backfilling)
+    gen = fill.simulate_station_day(
+        (e for e in tape.events),
+        _backfilling,
+        station="KSFO",
+        climate_day="2026-10-10",
+        unit_hypothesis="RESOLVED",
+        live_from_ns=T,
+    )
+    assert gen == run(tape, _backfilling)
+
+
+def test_records_are_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        positional: Any = ev.Episode
+        positional("KSFO", "d")
+    with pytest.raises(TypeError):
+        positional2: Any = ev.StationDaySummary
+        positional2("KSFO", "d")
+
+
+def test_filled_rung_stays_held_in_both_passes() -> None:
+    tape = base_tape()
+    tape.buy(T + 20 * SEC, 22, 11)  # base fills
+    tape.buy(T + 21 * SEC, 22, 11)  # stress fills
+    tape.depth(T + 30 * SEC)
+    tape.cut(T + 40 * SEC, "GTD_EXPIRY", resume=True)
+    tape.depth(T + 41 * SEC)
+    tape.cut(T + 100 * SEC)
+    result = run(tape)
+    assert len(result.episodes) == 1  # no new episode after the fill, in either pass
+    assert result.summary.rung_trials_posted == 1
+
+
+def test_marketable_boundary_b_equal_to_no_ask() -> None:
+    def placed(bids: tuple[ev.Level, ...]) -> bool:
+        tape = Tape()
+        tape.release(T)
+        tape.depth(T + 10 * SEC, bids=bids)
+        tape.cut(T + 100 * SEC)
+        return only(run(tape)).refused_reason is None
+
+    assert placed(((21, 5),)) is True  # NO ask 79 > b
+    assert placed(((22, 5),)) is False  # NO ask 78 == b : marketable
+    assert placed(((23, 5),)) is False  # NO ask 77 < b
+
+
+def test_frame_at_gap_end_ts_is_still_stale_and_next_frame_places() -> None:
+    tape = Tape()
+    tape.release(T)
+    tape.gap(T + 5 * SEC, T + 100 * SEC)
+    tape.depth(T + 100 * SEC)  # DEPTH precedes GAP_END at an equal ts: still inside the gap
+    tape.depth(T + 101 * SEC)
+    tape.cut(T + 200 * SEC)
+    first, second = run(tape).episodes
+    assert first.refused_reason == "STALE_FRAME" and first.t0_ns == T + 100 * SEC
+    assert second.refused_reason is None and second.t0_ns == T + 101 * SEC
+
+
+def test_print_at_gap_end_ts_is_not_credited() -> None:
+    tape = base_tape()
+    tape.gap(T + 20 * SEC, T + 100 * SEC)
+    tape.buy(T + 100 * SEC, 22, 500)  # inside the gap by event priority
+    tape.buy(T + 101 * SEC, 22, 11)
+    tape.cut(T + 200 * SEC)
+    assert only(run(tape)).filled_ns_base == T + 101 * SEC
+
+
+def test_overlapping_gaps_on_one_key_end_at_the_last_end() -> None:
+    tape = base_tape()
+    tape.gap(T + 20 * SEC, T + 60 * SEC)
+    tape.gap(T + 30 * SEC, T + 100 * SEC)
+    tape.buy(T + 70 * SEC, 22, 500)  # inside the second gap
+    tape.buy(T + 110 * SEC, 22, 11)
+    tape.cut(T + 200 * SEC)
+    ep = only(run(tape))
+    assert ep.filled_ns_base == T + 110 * SEC and ep.gap_ns_subtracted == 80 * SEC
+
+
+def test_selector_cancel_runs_after_same_ts_print_is_credited() -> None:
+    tape = base_tape()
+    tape.release(T + 50 * SEC, p=0.30, sha="sha2")
+    tape.buy(T + 50 * SEC + 1, 22, 11)  # same instant as the DECIDE: credited first
+    tape.cut(T + 100 * SEC)
+    ep = only(run(tape, _cancel_when_p_high))
+    assert ep.filled_ns_base == T + 50 * SEC + 1
+
+
+def test_empty_event_list_yields_an_empty_day() -> None:
+    result = fill.simulate_station_day(
+        [],
+        fixed({"R1": BID}),
+        station="K",
+        climate_day="d",
+        unit_hypothesis="RESOLVED",
+        live_from_ns=T,
+    )
+    assert result.episodes == () and result.summary.bid_bearing is False
+
+
 # ---- purity: the simulator never sees truth ------------------------------------------------------
 
 REPO = Path(__file__).resolve().parents[2]
-SIM_MODULES = ("scripts.analysis.maker_stage0_fill", "scripts.analysis.maker_stage0_fill_events")
+SIM_MODULES = (
+    "scripts.analysis.maker_stage0_fill",
+    "scripts.analysis.maker_stage0_fill_events",
+    "scripts.analysis.maker_stage0_fill_pass",
+)
 FORBIDDEN = ("truth", "settlement")
 
 
-def _imports(path: Path) -> list[str]:
+def _resolve(node: ast.ImportFrom, package: str) -> str:
+    """Absolute dotted base of an ``ImportFrom``, resolving relative levels against ``package``."""
+    if node.level == 0:
+        return node.module or ""
+    parts = package.split(".")
+    base = parts[: len(parts) - (node.level - 1)]
+    return ".".join([*base, *([node.module] if node.module else [])])
+
+
+def _imports(path: Path, package: str) -> list[str]:
     names: list[str] = []
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
             names += [a.name for a in node.names]
         elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
+            base = _resolve(node, package)
             names.append(base)
             names += [f"{base}.{a.name}" for a in node.names]
     return names
@@ -587,15 +1074,11 @@ def _module_path(name: str) -> Path | None:
     return None
 
 
-def test_simulator_module_does_not_import_truth() -> None:
-    for mod in SIM_MODULES:
-        path = _module_path(mod)
-        assert path is not None
-        offenders = [n for n in _imports(path) if any(f in n.lower() for f in FORBIDDEN)]
-        assert offenders == [], offenders
+def _package_of(name: str, path: Path) -> str:
+    return name if path.name == "__init__.py" else name.rpartition(".")[0]
 
 
-def test_simulator_transitive_import_closure_excludes_truth() -> None:
+def _closure() -> set[str]:
     seen: set[str] = set()
     todo = list(SIM_MODULES)
     while todo:
@@ -603,8 +1086,36 @@ def test_simulator_transitive_import_closure_excludes_truth() -> None:
         if name in seen:
             continue
         seen.add(name)
+        parts = name.split(".")
+        todo += [".".join(parts[:i]) for i in range(1, len(parts))]  # parent __init__ executes
         path = _module_path(name)
         if path is not None:
-            todo += _imports(path)
+            todo += _imports(path, _package_of(name, path))
+    return seen
+
+
+def test_simulator_module_does_not_import_truth() -> None:
+    for mod in SIM_MODULES:
+        path = _module_path(mod)
+        assert path is not None
+        offenders = [
+            n
+            for n in _imports(path, _package_of(mod, path))
+            if any(f in n.lower() for f in FORBIDDEN)
+        ]
+        assert offenders == [], offenders
+
+
+def test_simulator_transitive_import_closure_excludes_truth() -> None:
+    seen = _closure()
+    assert "scripts.analysis.maker_stage0_fill_pass" in seen
     assert [n for n in seen if any(f in n.lower() for f in FORBIDDEN)] == []
-    assert importlib.util.find_spec("scripts.analysis.maker_stage0_fill") is not None
+
+
+def test_import_resolver_follows_relative_imports() -> None:
+    node = ast.parse("from .truth_store import x").body[0]
+    assert isinstance(node, ast.ImportFrom)
+    assert _resolve(node, "scripts.analysis") == "scripts.analysis.truth_store"
+    node = ast.parse("from .. import y").body[0]
+    assert isinstance(node, ast.ImportFrom)
+    assert _resolve(node, "scripts.analysis") == "scripts"

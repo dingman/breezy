@@ -10,6 +10,7 @@ from __future__ import annotations
 import enum
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Protocol
 
 NS_PER_MIN: int = 60_000_000_000
@@ -21,7 +22,18 @@ BUYER: str = "BUYER"  # YES-buyer aggressor (direction fixed by WP0); the only c
 SELLER: str = "SELLER"
 NO_AGGRESSOR: str = "NO_AGGRESSOR"  # never credited
 
-Level = tuple[int, float]  # (price in cents, displayed size)
+# Selector drop-reason vocabulary (per-rung end reasons for a live rung no longer desired).
+CANCEL_PMIN: str = "CANCEL_PMIN"
+CANCEL_BFLOOR: str = "CANCEL_BFLOOR"
+CANCEL_STALE: str = "CANCEL_STALE"  # forecast older than the staleness bound
+CANCEL_DAYMISMATCH: str = "CANCEL_DAYMISMATCH"  # forecast is for a different climate day
+CANCEL_HARD: str = "CANCEL_HARD"
+NOT_YET_AVAILABLE: str = "NOT_YET_AVAILABLE"  # no forecast vector yet for this rung
+DROP_REASONS: frozenset[str] = frozenset(
+    {CANCEL_PMIN, CANCEL_BFLOOR, CANCEL_STALE, CANCEL_DAYMISMATCH, CANCEL_HARD, NOT_YET_AVAILABLE}
+)
+
+Level = tuple[int, int]  # (price in cents, displayed size in whole contracts)
 
 
 class Kind(enum.IntEnum):
@@ -40,18 +52,29 @@ class LeakageError(RuntimeError):
     """A look-ahead or ordering invariant of plan L168-170 was violated."""
 
 
+class EventError(ValueError):
+    """The event stream is malformed (order, duplicates, price or size domain)."""
+
+
 class DeltaBoundExceeded(RuntimeError):
     """S-7: a recorder clock offset above ten minutes voids the whole run before any scoring."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class DepthFrame:
-    """One book frame; YES asks at ``a`` cents are NO bids at ``100 - a`` cents."""
+    """One book frame; YES asks at ``a`` cents are NO bids at ``100 - a`` cents.
+
+    ``ts_ns`` is the frame's own timestamp (leak asserts use it, never the decision time).
+    ``asks_truncated`` / ``bids_truncated``: a same-``ts_event`` ``DepthTruncation`` row says that
+    side holds levels beyond the displayed ones. Only the YES-ask side matters to the guard.
+    """
 
     rung_id: str
+    ts_ns: int
     yes_bids: tuple[Level, ...]
     yes_asks: tuple[Level, ...]
-    truncated: bool = False  # a same-ts_event DepthTruncation row exists
+    asks_truncated: bool = False
+    bids_truncated: bool = False
     instance_id: str = ""
 
 
@@ -59,7 +82,7 @@ class DepthFrame:
 class Print:
     rung_id: str
     yes_price_cents: int
-    size: float
+    size: int
     aggressor: str
     instance_id: str = ""
 
@@ -88,8 +111,17 @@ class ForecastVector:
     raw_sha256: str
     nbm_era: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "p_yes_point", MappingProxyType(dict(self.p_yes_point)))
+        object.__setattr__(self, "p_yes_upper", MappingProxyType(dict(self.p_yes_upper)))
 
-Payload = DepthFrame | Print | GapMark | Cut | ForecastVector
+
+@dataclass(frozen=True)
+class DecideMark:
+    """Synthetic decision instant (shifted release + 1 ns) made by ``apply_clock_shift``."""
+
+
+Payload = DepthFrame | Print | GapMark | Cut | ForecastVector | DecideMark
 
 
 @dataclass(frozen=True, order=True)
@@ -102,13 +134,54 @@ class Event:
     payload: Payload = field(compare=False)
 
 
+def _check_levels(levels: tuple[Level, ...], what: str) -> None:
+    for price, size in levels:
+        if not _is_int(price) or not 1 <= price <= CENTS - 1:
+            raise EventError(f"{what}: price {price!r} is not an integer cent in 1..99")
+        if not _is_int(size) or size < 0:
+            raise EventError(f"{what}: size {size!r} is not a non-negative integer contract count")
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_payload(payload: Payload) -> None:
+    if isinstance(payload, DepthFrame):
+        _check_levels(payload.yes_bids, "yes_bids")
+        _check_levels(payload.yes_asks, "yes_asks")
+    elif isinstance(payload, Print):
+        _check_levels(((payload.yes_price_cents, payload.size),), "print")
+
+
+def validate_events(events: Sequence[Event]) -> None:
+    """Strictly increasing ``(ts_ns, kind, seq)`` and sane payload domains, else ``EventError``."""
+    prev: tuple[int, int, int] | None = None
+    for event in events:
+        key = (event.ts_ns, int(event.kind), event.seq)
+        if prev is not None and key == prev:
+            raise EventError(f"duplicate event key {key}")
+        if prev is not None and key < prev:
+            raise EventError(f"events out of order: {key} follows {prev}")
+        prev = key
+        _check_payload(event.payload)
+
+
 def apply_clock_shift(events: Iterable[Event], delta_ns: int) -> tuple[Event, ...]:
-    """Forecast releases +|delta|, cancels/process cuts -|delta| (plan L152; leak-safe)."""
+    """Validate, then shift forecast releases +|delta| and cancels/process cuts -|delta|.
+
+    Every shifted release also yields a ``DECIDE`` event at shifted release + 1 ns so the new vector
+    is in force for a decision before any later print (plan L152). The input must already be in
+    canonical order (``EventError`` otherwise); only the post-shift reordering is sorted here.
+    """
+    source = tuple(events)
+    validate_events(source)
     d = abs(delta_ns)
     shifted: list[Event] = []
-    for ev in events:
+    for ev in source:
         if ev.kind is Kind.FORECAST_RELEASE:
             ev = replace(ev, ts_ns=ev.ts_ns + d)
+            shifted.append(replace(ev, ts_ns=ev.ts_ns + 1, kind=Kind.DECIDE, payload=DecideMark()))
         elif ev.kind is Kind.CANCEL:
             ev = replace(ev, ts_ns=ev.ts_ns - d)
         shifted.append(ev)
@@ -181,11 +254,29 @@ class Desired:
 
 @dataclass(frozen=True)
 class Decision:
-    """Selector output. ``desired`` is in rank order (first = the K1 rung)."""
+    """Selector output. ``desired`` is in rank order (first = the K1 rung).
+
+    A live rung absent from ``desired`` ends with ``dropped[rung]``, else ``drop_reason``; with
+    neither the simulator raises. Defaults fail closed (``forecast_valid`` False, no reason).
+    """
 
     desired: tuple[Desired, ...] = ()
-    drop_reason: str = "CANCEL_PMIN"  # end reason for live rungs no longer desired
-    forecast_valid: bool = True  # drives ``forecast_valid_h``
+    drop_reason: str | None = None
+    forecast_valid: bool = False  # drives ``forecast_valid_h``
+    dropped: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reasons = [*self.dropped.values(), *([self.drop_reason] if self.drop_reason else [])]
+        for reason in reasons:
+            if reason not in DROP_REASONS:
+                raise ValueError(f"unknown drop reason {reason!r}; expected one of DROP_REASONS")
+        object.__setattr__(self, "dropped", MappingProxyType(dict(self.dropped)))
+
+    def reason_for(self, rung_id: str) -> str:
+        reason = self.dropped.get(rung_id, self.drop_reason)
+        if reason is None:
+            raise ValueError(f"selector dropped live rung {rung_id} without a drop reason")
+        return reason
 
 
 @dataclass(frozen=True)
@@ -203,8 +294,11 @@ class RungSelector(Protocol):
     def __call__(self, ctx: DecisionContext, /) -> Decision: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Episode:
+    """One (rung, t0) row. Un-suffixed end/vector fields are the base pass's (the stress pass's
+    for a stress-only row); the ``*_stress`` fields are the stress pass's own end and vector."""
+
     station: str
     climate_day: str
     rung_id: str
@@ -212,8 +306,8 @@ class Episode:
     end_ns: int
     end_reason: str
     bid_cents: int
-    a_gt: float
-    a_eq: float
+    a_gt: int
+    a_eq: int
     refused_reason: str | None
     filled_ns_base: int | None
     filled_ns_stress: int | None
@@ -226,6 +320,14 @@ class Episode:
     available_at_ns: int | None
     depth_ts_used_ns: int | None
     unit_hypothesis: str
+    end_ns_stress: int | None
+    end_reason_stress: str | None
+    p_yes_point_live_stress: float | None
+    p_yes_upper_live_stress: float | None
+    cycle_runtime_ns_stress: int | None
+    raw_sha256_stress: str | None
+    nbm_era_stress: str | None
+    available_at_ns_stress: int | None
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -233,8 +335,12 @@ class Episode:
         return out
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class StationDaySummary:
+    """``n_attempts``/``n_episodes``/``n_refused`` count the BASE pass; ``episodes`` also holds
+    stress-only rows. ``rung_trials_attempted`` (refused or placed) is the position-unit
+    denominator; ``rung_trials_posted`` counts placed rungs only."""
+
     station: str
     climate_day: str
     unit_hypothesis: str
@@ -245,9 +351,11 @@ class StationDaySummary:
     n_refused: int
     n_process_cuts: int
     n_gtd_cuts: int
+    rung_trials_attempted: int
     rung_trials_posted: int
     rung_trials_filled_base: int
     rung_trials_filled_stress: int
+    rungs_ever_posted: int
     filled_pairs_base: int
     filled_pairs_stress: int
     k1_rung_id: str | None
@@ -255,6 +363,8 @@ class StationDaySummary:
     k1_filled_stress: int
     bid_median_fills_stress: float | None
     delta_ns: int
+    truncation_refused_share: float | None
+    first_refusal_to_first_placement_s: float | None
     process_live_h: float
     forecast_valid_h: float
     gap_h: float
