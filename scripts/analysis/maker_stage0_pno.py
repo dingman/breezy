@@ -26,7 +26,6 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Final
 
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
@@ -89,7 +88,6 @@ FORECAST_DAY_MISMATCH: Final = "forecast_day_mismatch"
 FORECAST_STALE: Final = "forecast_stale"
 FORECAST_NOT_YET_AVAILABLE: Final = "forecast_not_yet_available"
 _STALE_NS: Final = STALE_H * 3600 * _NS
-_END_OF_TIME_NS: Final = 2**62
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +127,7 @@ def release_instants(
     For WP6: schedule a forecast-release decision event at each so a resting bid is cancelled
     the instant a new vector drops p_NO below P_MIN.
     """
-    state = store.state(station, climate_day, stress)
-    instants: set[int] = set()
-    vector = state.value_at(_END_OF_TIME_NS)
-    while vector is not None:
-        if vector.climate_day == climate_day:
-            instants.add(vector.available_at_ns)
-        vector = state.value_at(vector.available_at_ns - 1)
-    return tuple(sorted(instants))
+    return store.vector_chain(station, climate_day, stress).releases
 
 
 def assert_decision_before(decision_ts_ns: int, fill_ts_ns: int) -> None:
@@ -171,12 +162,10 @@ def classify_p_no(
     recorded in ``store.abstentions`` / ``store.abstention_counts``, keyed by stress.
     """
     site(station)  # refuses NYC before any lookup
-    state = store.state(station, climate_day, stress)  # raises for an unloaded station-day
-    vector = state.value_at(decision_ts_ns - 1)
+    chain = store.vector_chain(station, climate_day, stress)  # raises for an unloaded station-day
+    vector = chain.at(decision_ts_ns - 1)
     reason = _abstain_reason(vector, climate_day, decision_ts_ns)
-    if reason == NO_VECTOR and any(
-        t >= decision_ts_ns for t in release_instants(store, station, climate_day, stress=stress)
-    ):
+    if reason == NO_VECTOR and chain.releases and chain.releases[-1] >= decision_ts_ns:
         reason = FORECAST_NOT_YET_AVAILABLE
     p_yes: Mapping[str, PYes] | str = ""
     if reason is None and vector is not None:
@@ -189,7 +178,7 @@ def classify_p_no(
         return AbstainReason(reason, station, climate_day, stress)
     store.served.add((station, climate_day, stress))
     return PNoAtInstant(
-        p_yes_point_live=MappingProxyType({k: p.point for k, p in p_yes.items()}),
+        p_yes_point_live=store.p_yes_points(station, climate_day, vector, p_yes),
         bounds=p_yes,
         cycle=vector.cycle_runtime_ns,
         available_at_ns=vector.available_at_ns,

@@ -152,6 +152,45 @@ def _ladder_order(rungs: Mapping[str, float], lower_edges_f: Mapping[str, float]
     return sorted(rungs, key=lambda rung: lower_edges_f[rung])
 
 
+@dataclass(frozen=True, slots=True)
+class LadderPlan:
+    """The bid-independent half of `select_rungs`, built once per forecast vector.
+
+    Validation, ladder order, the modal rung, and the P_MIN test depend only on the
+    probabilities and the edges; a decision then only filters by its bids.
+    """
+
+    rungs: tuple[str, ...]
+    modal: int
+    p_yes: tuple[float, ...]
+    p_min_ok: tuple[bool, ...]
+
+    def select(self, bids: Mapping[str, float | None]) -> tuple[str, ...]:
+        floor = _cents(B_FLOOR)
+        eligible: list[tuple[float, int]] = []
+        for idx, rung in enumerate(self.rungs):
+            bid = bids.get(rung)
+            if abs(idx - self.modal) <= 1 or bid is None or _cents(bid) < floor:
+                continue
+            if self.p_min_ok[idx]:
+                eligible.append((self.p_yes[idx], idx))
+        eligible.sort()
+        return tuple(self.rungs[idx] for _, idx in eligible[:MAX_RUNGS])
+
+
+def ladder_plan(
+    p_yes_by_rung: Mapping[str, float], lower_edges_f: Mapping[str, float]
+) -> LadderPlan:
+    """Validate and order the ladder (`select_rungs`' bid-independent half)."""
+    for rung, p_yes in p_yes_by_rung.items():
+        _validate_probability(p_yes, f"p_yes[{rung!r}]")
+    rungs = tuple(_ladder_order(p_yes_by_rung, lower_edges_f))
+    ordered = tuple(p_yes_by_rung[rung] for rung in rungs)
+    modal = max(range(len(rungs)), key=lambda i: ordered[i]) if rungs else 0
+    p_min_ok = tuple(not _p_no_below_p_min(1.0 - p) for p in ordered)
+    return LadderPlan(rungs, modal, ordered, p_min_ok)
+
+
 def select_rungs(
     p_yes_by_rung: Mapping[str, float],
     bids: Mapping[str, float | None],
@@ -167,22 +206,7 @@ def select_rungs(
     ineligible). Equal p_yes ties rank by ascending ladder index. Raises ValueError
     for any p_yes outside [0, 1] / NaN or an unorderable ladder.
     """
-    for rung, p_yes in p_yes_by_rung.items():
-        _validate_probability(p_yes, f"p_yes[{rung!r}]")
-    rungs = _ladder_order(p_yes_by_rung, lower_edges_f)
-    if not rungs:
-        return ()
-    modal = max(range(len(rungs)), key=lambda i: p_yes_by_rung[rungs[i]])
-    eligible: list[tuple[float, int]] = []
-    for idx, rung in enumerate(rungs):
-        bid = bids.get(rung)
-        if abs(idx - modal) <= 1 or bid is None or _cents(bid) < _cents(B_FLOOR):
-            continue
-        if _p_no_below_p_min(1.0 - p_yes_by_rung[rung]):
-            continue
-        eligible.append((p_yes_by_rung[rung], idx))
-    eligible.sort()
-    return tuple(rungs[idx] for _, idx in eligible[:MAX_RUNGS])
+    return ladder_plan(p_yes_by_rung, lower_edges_f).select(bids)
 
 
 def k1_rung(selected: tuple[str, ...]) -> str | None:

@@ -142,6 +142,8 @@ class Event:
 
 def _check_levels(levels: tuple[Level, ...], what: str) -> None:
     for price, size in levels:
+        if type(price) is int and type(size) is int and 1 <= price <= CENTS - 1 and size >= 0:
+            continue  # exact ints in domain: the common case, same verdict as the checks below
         if not _is_int(price) or not 1 <= price <= CENTS - 1:
             raise EventError(f"{what}: price {price!r} is not an integer cent in 1..99")
         if not _is_int(size) or size < 0:

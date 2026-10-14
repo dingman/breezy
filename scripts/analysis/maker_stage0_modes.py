@@ -24,12 +24,12 @@ import nautilus_trader
 
 from breezy.analysis.stats.scoring_core import BOOTSTRAP_ITERATIONS, BOOTSTRAP_SEED
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
+from scripts.analysis.maker_stage0_bench_screen import project_bench
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_inputs import load_trade_unit
 from scripts.analysis.maker_stage0_run_types import (
     BENCH_COUNTS,
     RSS_ABORT_BYTES,
-    S5_MAX_SECONDS,
     MemoryAbort,
     Pre,
     RunConfig,
@@ -171,13 +171,15 @@ def simulate(
         started, peak_before = time.monotonic(), peak_fn()
         n_events = run_station_day(ctx, key, out)
         elapsed, rss, peak = time.monotonic() - started, rss_fn(), peak_fn()
-        measured = {
+        measured: dict[str, Any] = {
             "elapsed_s": round(elapsed, 3),
             "rss_bytes": rss,
             "n_events": n_events,
             "rss_peak_delta_bytes": max(0, peak - peak_before),
             "peak_rss_bytes": peak,
         }
+        if key in keys[: index - 1]:
+            measured["repeat_of_first"] = True
         iso = key[1].isoformat()
         where = {"station": key[0], "climate_day": iso}
         progress.write({"index": index, "of": len(keys), **where, "status": "done", **measured})
@@ -217,7 +219,8 @@ def run_bench(
             if k in pre.census and replays(pre.census[k], ctx.statuses.get(k[1]))
         }
         chosen = sorted(heaviest(weights, count or 0), key=lambda k: (k[1], k[0]))
-        timings = simulate(ctx, chosen, progress, LoopOutput(), rss_fn, peak_fn)
+        keys = [*chosen, *heaviest(weights, 1)]  # the heaviest day again: the leak screen's repeat
+        timings = simulate(ctx, keys, progress, LoopOutput(), rss_fn, peak_fn)
     finally:
         progress.close()
         session.close()
@@ -236,20 +239,22 @@ def _write_bench(
 ) -> None:
     by_iso = {(s, d.isoformat()): n for (s, d), n in weights.items()}
     rows = [{**t, "catalog_bytes": by_iso[(t["station"], t["climate_day"])]} for t in timings]
-    total = len(weights)
-    mean_s = sum(r["elapsed_s"] for r in rows) / max(1, len(rows))
-    peak = max((r["peak_rss_bytes"] for r in rows), default=0)
-    growth = sum(r["rss_peak_delta_bytes"] for r in rows) / max(1, len(rows))
-    projected = peak + int(growth * max(0, total - len(rows)))
+    proj = project_bench(rows, len(weights), sum(weights.values()))
     write_json(
         cfg.out_dir / "bench.json",
         {
             "station_days": rows,
             "variants": list(variants),
-            "n_replayable_station_days": total,
-            "projected_total_s": mean_s * total,
-            "projected_peak_rss_bytes": projected,
-            "s5_exceeded": mean_s * total > S5_MAX_SECONDS or projected > RSS_ABORT_BYTES,
+            "n_replayable_station_days": len(weights),
+            "projected_total_s": proj.projected_total_s,
+            "projected_total_s_by_count": proj.projected_total_s_by_count,
+            "projected_peak_rss_bytes": proj.projected_peak_rss_bytes,
+            "by_count_exceeds_cap": proj.by_count_exceeds_cap,
+            "leak_rate_bytes_per_row": proj.leak_rate_bytes_per_row,
+            "rss_slope_bytes_per_row": proj.rss_slope_bytes_per_row,
+            "n_fit_rows": proj.n_fit_rows,
+            "n_time_fit_rows": proj.n_time_fit_rows,
+            "s5_exceeded": proj.s5_exceeded,
             "code_sha": pre.code_sha,
         },
     )

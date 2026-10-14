@@ -8,12 +8,14 @@ computes the spec §3 per-rung ``PYes`` (calibration loaded, never refit). The e
 
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 import functools
 import logging
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, NamedTuple
@@ -55,6 +57,7 @@ UNKNOWN_ERA: Final = "unknown_era"
 NONFINITE_P_YES: Final = "nonfinite_p_yes"
 _NS: Final = 10**9
 _PLUS60_NS: Final = 3600 * _NS
+END_OF_TIME_NS: Final = 2**62
 _POLL_LAG_NS: Final = DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS * _NS
 
 
@@ -235,6 +238,36 @@ def p_yes_is_valid(p_yes: Mapping[str, PYes]) -> bool:
     return all(math.isfinite(x) and 0.0 <= x <= 1.0 for triple in p_yes.values() for x in triple)
 
 
+@dataclass(frozen=True, slots=True)
+class VectorChain:
+    """Every complete vector a station-day can serve, newest first, for O(log n) lookup.
+
+    ``ForecastQuantileState.value_at(now)`` is the newest complete vector with
+    ``available_at_ns <= now``. Walking ``value_at(v.available_at_ns - 1)`` from the newest visits
+    exactly the vectors that can ever be that answer, so ``at`` returns what ``value_at`` returns.
+    ``releases`` is the sorted ``available_at_ns`` of those for the station-day's own climate day.
+    """
+
+    available_at_ns: tuple[int, ...]  # ascending
+    vectors: tuple[ForecastQuantileVector, ...]  # aligned with available_at_ns
+    releases: tuple[int, ...]
+
+    def at(self, now_ns: int) -> ForecastQuantileVector | None:
+        i = bisect.bisect_right(self.available_at_ns, now_ns)
+        return self.vectors[i - 1] if i else None
+
+
+def build_chain(state: ForecastQuantileState, climate_day: dt.date) -> VectorChain:
+    newest_first: list[ForecastQuantileVector] = []
+    vector = state.value_at(END_OF_TIME_NS)
+    while vector is not None:
+        newest_first.append(vector)
+        vector = state.value_at(vector.available_at_ns - 1)
+    vectors = tuple(reversed(newest_first))
+    releases = {v.available_at_ns for v in vectors if v.climate_day == climate_day}
+    return VectorChain(tuple(v.available_at_ns for v in vectors), vectors, tuple(sorted(releases)))
+
+
 class PNoStore:
     """Pinned-cycle rows for the requested station-days, calibration and ladders.
 
@@ -256,6 +289,8 @@ class PNoStore:
         self.missing_cycles = missing_cycles
         self._states: dict[tuple[str, dt.date, Stress], ForecastQuantileState] = {}
         self._p_yes: dict[tuple[str, dt.date, int], Mapping[str, PYes] | str] = {}
+        self._chains: dict[tuple[str, dt.date, Stress], VectorChain] = {}
+        self._points: dict[tuple[str, dt.date, int], Mapping[str, float]] = {}
         self.abstentions: set[tuple[str, dt.date, Stress, str]] = set()
         self.abstention_counts: Counter[tuple[Stress, str]] = Counter()
         self.served: set[tuple[str, dt.date, Stress]] = set()
@@ -300,6 +335,21 @@ class PNoStore:
                 self._rows[(station, day)], site(station).offset_hours, stress
             )
         return self._states[key]
+
+    def vector_chain(self, station: str, day: dt.date, stress: Stress) -> VectorChain:
+        key = (station, day, stress)
+        if key not in self._chains:
+            self._chains[key] = build_chain(self.state(station, day, stress), day)
+        return self._chains[key]
+
+    def p_yes_points(
+        self, station: str, day: dt.date, vector: ForecastQuantileVector, p_yes: Mapping[str, PYes]
+    ) -> Mapping[str, float]:
+        """The shared read-only ``{rung: point}`` view of ``p_yes`` (one per cycle)."""
+        key = (station, day, vector.cycle_runtime_ns)
+        if key not in self._points:
+            self._points[key] = MappingProxyType({k: p.point for k, p in p_yes.items()})
+        return self._points[key]
 
     def p_yes(
         self, station: str, day: dt.date, vector: ForecastQuantileVector
