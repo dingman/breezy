@@ -25,6 +25,7 @@ from nautilus_trader.model.enums import AggressorSide, OrderSide
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.writer import StreamingFeatherWriter
 
 from breezy.adapters.polymarket_us.tape_records import (
@@ -272,10 +273,16 @@ def _trade(
 
 
 def _gap(
-    instrument: BinaryOption, *, start: int, end: int, resolved: bool, instance: str = "inst-a"
+    instrument: BinaryOption,
+    *,
+    start: int,
+    end: int,
+    resolved: bool,
+    instance: str = "inst-a",
+    seq: int = 1,
 ) -> QuoteTapeGap:
     ts = end if resolved else start
-    return QuoteTapeGap(instrument.id, 1, start, end, resolved, instance, ts, ts)
+    return QuoteTapeGap(instrument.id, seq, start, end, resolved, instance, ts, ts)
 
 
 def _write_instance(
@@ -304,7 +311,16 @@ def _write_instance(
     writer.close()
 
 
-def _capture(tmp_path: Path) -> Path:
+_IN_WINDOW_OFFSETS = (
+    (_ns("2026-09-22T01:00:00"), -5 * _NS),  # inside the bid-live window [D-1 16:50Z, D 02:50Z)
+    (_ns("2026-09-22T02:00:00"), 2 * _NS),
+)
+_OUT_OF_WINDOW_OFFSET = (_ns("2026-09-22T06:00:00"), 660 * _NS)  # 11 min, no bid can be live
+
+
+def _capture(
+    tmp_path: Path, *, offsets: list[tuple[int, int]] | None = None, instance: str = "inst-a"
+) -> Path:
     """LAX 2 rungs (listed before D-1 12:00Z), SFO 1 rung (listed late), NYC noise."""
     capture = tmp_path / "capture"
     lax = _instrument(_slug("lax"), _ns("2026-09-21T11:00:00"))
@@ -313,7 +329,11 @@ def _capture(tmp_path: Path) -> Path:
     nyc = _instrument(_slug("nyc"), _ns("2026-09-21T11:00:00"))
     t = _ns
     records: list[Any] = [
+        _depth(lax, "0.490", "0.510", t("2026-09-20T05:00:00")),  # before the day bound
         _depth(lax, "0.390", "0.410", t("2026-09-22T05:00:00")),  # mid .40
+        _gap(
+            lax, start=t("2026-09-22T02:10:00"), end=t("2026-09-22T02:20:00"), resolved=True, seq=2
+        ),
         _gap(lax, start=t("2026-09-22T05:10:00"), end=t("2026-09-22T05:10:00"), resolved=False),
         _gap(lax, start=t("2026-09-22T05:10:00"), end=t("2026-09-22T05:20:00"), resolved=True),
         _depth(lax, "0.890", "0.910", t("2026-09-22T05:15:00")),  # inside the gap
@@ -326,10 +346,10 @@ def _capture(tmp_path: Path) -> Path:
     ]
     _write_instance(
         capture,
-        "inst-a",
+        instance,
         instruments=[lax, lax2, sfo, nyc],
         records=records,
-        offsets=[(t("2026-09-22T05:00:00"), -5 * _NS), (t("2026-09-22T06:00:00"), 2 * _NS)],
+        offsets=offsets if offsets is not None else [*_IN_WINDOW_OFFSETS, _OUT_OF_WINDOW_OFFSET],
     )
     return capture
 
@@ -368,8 +388,12 @@ def test_probe_reports_coverage_census_clocks_and_ladder(tmp_path: Path) -> None
     assert report.to_dict()["truncated_frame_share"] == pytest.approx(1 / 3)
     by_key = {(c.station, c.climate_day): c for c in report.coverage}
     lax, sfo = by_key[("LAX", "2026-09-22")], by_key[("SFO", "2026-09-22")]
-    assert lax.live_hours == pytest.approx(1.0)
-    assert lax.gap_overlap_hours == pytest.approx(10 / 60)
+    # live/gap hours are on the process-live window [D-1 16:50Z, D 02:50Z): alive 01:00..02:50
+    assert lax.live_hours == pytest.approx(110 / 60)
+    assert lax.gap_overlap_hours == pytest.approx(10 / 60)  # the 02:10 gap, not the 05:10 one
+    # the S1 maker-window hours are a separate labelled column (alive 01:00..06:00, two gaps)
+    assert lax.maker_live_hours == pytest.approx(5.0)
+    assert lax.maker_gap_overlap_hours == pytest.approx(20 / 60)
     assert (lax.listing_abstain, sfo.listing_abstain) == (False, True)  # SFO listed after 12:00Z
     assert lax.listing_ns == _ns("2026-09-21T11:00:00")
     assert lax.delta_ns == 5 * _NS
@@ -379,10 +403,17 @@ def test_probe_reports_coverage_census_clocks_and_ladder(tmp_path: Path) -> None
     assert report.delta_distribution["max"] == 5 * _NS
 
 
-def test_first_print_instant_reads_timestamps_only_across_all_stations(tmp_path: Path) -> None:
-    capture = _capture(tmp_path)
+def test_first_print_instant_ignores_nyc_and_undeclared_days(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)  # the earliest print on the tape (04:00) is NYC
+    work = tmp_path / "work"
 
-    assert p.first_print_instant(capture, work_root=tmp_path / "work") == _ns("2026-09-22T04:00:00")
+    maker = p.first_print_instant(capture, {_DAY}, work_root=work)
+    other_day = p.first_print_instant(capture, {dt.date(2026, 9, 23)}, work_root=work)
+    nyc_only = p.first_print_instant(capture, {_DAY}, work_root=work, stations=("NYC",))
+
+    assert maker == _ns("2026-09-22T05:12:00")
+    assert other_day is None  # no print for an undeclared day: None is a STOP for the driver
+    assert nyc_only is None  # the firewall: NYC is never a licensed station
 
 
 def test_positive_control_is_reported_for_the_named_station(tmp_path: Path) -> None:
@@ -415,12 +446,14 @@ def test_probe_report_to_dict_is_json_serialisable_and_pinned(tmp_path: Path) ->
         "first_replayable_day",
         "ladder_parity",
         "positive_control",
+        "skipped_instances",
         "stations",
         "truncated_frame_share",
         "truncated_frames",
     )
     assert tuple(sorted(payload["direction"])) == (
         "buyer",
+        "mid_age_ns",
         "seller",
         "thresholds",
         "verdict",
@@ -439,7 +472,7 @@ def test_probe_never_writes_under_catalog_root(tmp_path: Path) -> None:
     before = _tree(capture)
 
     p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
-    p.first_print_instant(capture, work_root=tmp_path / "work")
+    p.first_print_instant(capture, {_DAY}, work_root=tmp_path / "work")
 
     assert _tree(capture) == before
 
@@ -449,3 +482,249 @@ def test_work_root_inside_the_catalog_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="inside the capture root"):
         p.probe(capture, {_DAY}, ("LAX",), work_root=capture / "scratch")
+
+
+# --------------------------------------------------------------------------------------
+# Review fixes (pmr H1/H2, py M1-M4, ties, mid age)
+# --------------------------------------------------------------------------------------
+
+
+def _delta_of(report: p.ProbeReport, station: str = "LAX") -> int | None:
+    return {c.station: c.delta_ns for c in report.coverage}[station]
+
+
+def test_offset_outside_the_bidlive_window_does_not_raise_delta(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)  # 11 min offset at 06:00Z, after the bid-live window closes
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert _delta_of(report) == 5 * _NS
+    assert max(d.delta_ns for d in report.delta_instance_days) <= 600 * _NS
+
+
+def test_offset_inside_the_bidlive_window_raises_delta(tmp_path: Path) -> None:
+    offsets = [(_ns("2026-09-22T01:00:00"), -5 * _NS), (_ns("2026-09-22T02:30:00"), 660 * _NS)]
+    capture = _capture(tmp_path, offsets=offsets)
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert _delta_of(report) == 660 * _NS
+    assert report.delta_distribution["max"] == 660 * _NS
+
+
+def test_a_station_day_without_offset_samples_has_unknown_delta_never_zero(tmp_path: Path) -> None:
+    offsets = [_OUT_OF_WINDOW_OFFSET]  # alive, but no sample inside the bid-live window
+    capture = _capture(tmp_path, offsets=offsets)
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert _delta_of(report) is None
+    assert report.delta_distribution["n"] == 0 and report.delta_distribution["min"] is None
+    assert report.delta_distribution["n_unknown"] == 1
+
+
+def test_queries_for_depth_and_trades_are_bounded_to_the_day_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = _capture(tmp_path)
+    seen: list[tuple[type, Any, Any]] = []
+    original = ParquetDataCatalog.query
+
+    def spy(self: Any, data_cls: type, *args: Any, **kwargs: Any) -> Any:
+        seen.append((data_cls, kwargs.get("start"), kwargs.get("end")))
+        return original(self, data_cls, *args, **kwargs)
+
+    monkeypatch.setattr(ParquetDataCatalog, "query", spy)
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    start, end = _ns("2026-09-21T12:00:00"), _ns("2026-09-23T11:00:00")  # D-1 12:00Z .. D+1 end
+    bounded = {OrderBookDepth10, TradeTick}
+    calls = [c for c in seen if c[0] in bounded]
+    assert {c[0] for c in calls} == bounded
+    assert all((c[1], c[2]) == (start, end) for c in calls)
+    assert report.depth_frames == 3  # the 09-20 frame is never loaded
+
+
+def test_malformed_and_non_clean_instances_are_recorded_as_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = _capture(tmp_path)
+    (capture / "live" / "bad-inst").mkdir()  # an instance directory with no feather files
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert set(report.skipped) == {"bad-inst"}
+    assert report.skipped["bad-inst"].startswith("PreflightError")
+    assert report.to_dict()["skipped_instances"] == dict(report.skipped)
+
+    monkeypatch.setattr(p, "classify_instance", lambda *a, **k: "LIVE")
+    live = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work2")
+    assert live.skipped["inst-a"] == "verdict LIVE"
+    assert live.depth_frames == 0
+
+
+def test_work_dir_that_already_exists_is_refused_and_left_alone(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+    stale = tmp_path / "work" / "inst-a"
+    stale.mkdir(parents=True)
+    (stale / "leftover").write_text("keep")
+
+    with pytest.raises(FileExistsError):
+        p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert (stale / "leftover").read_text() == "keep"
+
+
+def test_catalog_inside_the_work_root_is_refused(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+
+    with pytest.raises(ValueError, match="inside the work root"):
+        p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path)
+
+
+def test_symlinked_work_root_into_the_catalog_is_refused(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(capture / "live", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="inside the capture root"):
+        p.probe(capture, {_DAY}, ("LAX",), work_root=link)
+
+
+def test_work_root_is_left_empty_after_a_run(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+    work = tmp_path / "work"
+
+    p.probe(capture, {_DAY}, ("LAX",), work_root=work)
+    p.first_print_instant(capture, {_DAY}, work_root=work)
+
+    assert work.is_dir() and not any(work.iterdir())
+
+
+def test_cross_instance_duplicate_keeps_the_first_sorted_instances_print(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)  # inst-a: 'after' BUYER @0.50 vs prior mid .60 -> disagrees
+    lax = _instrument(_slug("lax"), _ns("2026-09-21T11:00:00"))
+    _write_instance(
+        capture,
+        "inst-b",
+        instruments=[lax],
+        records=[_trade(lax, "after", "0.700", AggressorSide.BUYER, _ns("2026-09-22T05:40:00"))],
+        offsets=[(_ns("2026-09-22T01:00:00"), 0)],
+    )
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert report.census.cross_instance_overlap == 1
+    assert (report.direction.buyer.n_agree, report.direction.buyer.n_disagree) == (1, 1)
+
+
+def test_probe_is_deterministic(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+
+    first = p.probe(capture, {_DAY}, ("LAX", "SFO"), work_root=tmp_path / "work")
+    second = p.probe(capture, {_DAY}, ("LAX", "SFO"), work_root=tmp_path / "work")
+
+    assert first.to_dict() == second.to_dict()
+
+
+def test_mid_age_distribution_is_reported_for_the_mids_used(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    # 'in-gap' uses the 05:00 mid (12 min old); 'after' uses 05:30 (10 min old)
+    assert report.direction.mid_age_ns == {
+        "n": 2, "min": 600 * _NS, "p50": 600 * _NS, "p95": 720 * _NS, "max": 720 * _NS,
+    }  # fmt: skip
+    assert report.to_dict()["direction"]["mid_age_ns"] == report.direction.mid_age_ns
+
+
+def test_clocks_document_the_gap_clock_against_the_frame_clock() -> None:
+    assert "recorder" in p.CLOCKS["gap_started_ns_ended_ns"]
+    assert "venue" in p.CLOCKS["depth_ts_event"]
+
+
+# --- ties --------------------------------------------------------------------------------
+
+
+def test_ties_agree_but_are_counted_and_a_tie_excluded_rate_is_reported() -> None:
+    frames = _frames((10, "0.40"))
+    prints = [
+        _print("BUYER", "0.40", 20, "a"),  # tie
+        _print("BUYER", "0.45", 21, "b"),
+        _print("BUYER", "0.30", 22, "c"),
+        _print("SELLER", "0.40", 23, "d"),  # tie
+        _print("SELLER", "0.40", 24, "e"),  # tie
+        _print("SELLER", "0.41", 25, "f"),
+    ]
+
+    result = p.direction_result(prints, frames)
+
+    assert (result.buyer.n_agree, result.buyer.n_tie) == (2, 1)
+    assert (result.seller.n_agree, result.seller.n_tie) == (2, 2)
+    assert result.buyer.to_dict()["agreement_excl_ties"] == pytest.approx(1 / 2)
+    assert result.seller.to_dict()["agreement_excl_ties"] == pytest.approx(0 / 2)
+    assert result.seller.agreement == pytest.approx(2 / 3)  # the frozen statistic keeps ties
+
+
+def test_tie_excluded_rate_is_none_when_every_defined_print_is_a_tie() -> None:
+    tally = p.SideTally(n_agree=3, n_disagree=0, n_undefined=0, n_tie=3)
+
+    assert tally.to_dict()["agreement_excl_ties"] is None
+
+
+# --- pure rules moved to the core --------------------------------------------------------
+
+
+def test_mid_of_is_none_for_a_one_sided_book_else_the_exact_midpoint() -> None:
+    lax = _instrument(_slug("lax"), 0)
+    two_sided = _depth(lax, "0.390", "0.410", 1)
+    one_sided = _depth(lax, "0.390", "0.410", 1)
+    one_sided = OrderBookDepth10(
+        one_sided.instrument_id, one_sided.bids, [
+            BookOrder(OrderSide.SELL, Price.from_str("0.000"), Quantity.from_str("0"), i)
+            for i in range(_LEVELS)
+        ], [1] * _LEVELS, [1] * _LEVELS, 0, 0, 1, 1,
+    )  # fmt: skip
+
+    assert p.mid_of(two_sided) == Decimal("0.400")
+    assert p.mid_of(one_sided) is None
+
+
+def test_listing_abstain_when_unlisted_or_listed_after_the_window_opens() -> None:
+    opens = _ns("2026-09-21T12:00:00")
+
+    assert p.listing_abstain(None, opens) is True
+    assert p.listing_abstain(opens + 1, opens) is True
+    assert p.listing_abstain(opens, opens) is False
+    assert p.listing_abstain(opens - 1, opens) is False
+
+
+def test_distribution_summarises_n_min_p50_p95_max() -> None:
+    assert p.distribution([]) == {"n": 0, "min": None, "p50": None, "p95": None, "max": None}
+    assert p.distribution(list(range(1, 101))) == {
+        "n": 100, "min": 1, "p50": 50, "p95": 95, "max": 100,
+    }  # fmt: skip
+
+
+def test_ladder_parity_flags_a_station_whose_rung_count_varies_by_day() -> None:
+    d1, d2 = dt.date(2026, 9, 22), dt.date(2026, 9, 23)
+    rungs = {("LAX", d1): {"a", "b"}, ("LAX", d2): {"a"}, ("SFO", d1): {"a"}, ("SFO", d2): {"b"}}
+
+    parity = p.ladder_parity(rungs, ("LAX", "SFO", "MIA"))
+
+    assert parity["LAX"] == {"rungs_per_day": {"1": 1, "2": 1}, "uniform": False}
+    assert parity["SFO"] == {"rungs_per_day": {"1": 2}, "uniform": True}
+    assert parity["MIA"] == {"rungs_per_day": {}, "uniform": True}
+
+
+def test_station_day_key_admits_only_yes_leg_maker_station_days_in_scope() -> None:
+    def key(slug: str, days: set[dt.date], stations: set[str]) -> object:
+        return p.station_day_key(_instrument(slug, 0).id, days, stations)
+
+    days = {_DAY}
+    assert key(_slug("lax"), days, {"LAX"}) == ("LAX", _DAY)
+    assert key(_slug("nyc"), days, {"LAX", "NYC"}) is None  # firewall
+    assert key(_slug("lax"), {dt.date(2026, 9, 23)}, {"LAX"}) is None  # undeclared day
+    assert key(_slug("lax"), days, {"SFO"}) is None  # unrequested station
