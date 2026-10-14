@@ -231,3 +231,11 @@ Sources:
 
 ## Verdict
 r4 = r3 + this delta (rev 2); READY. Round-2 items N-1..N-6 and the architect round-2 items are folded in (a), (c), (f), (g), (h), (i), (j).
+
+## (k) S2 interface update (rev 3, 2026-10-14; from S2 r4 delta §(n), §(r); binding on the WP4 brief)
+1. **Verdict allowlist.** WP4 binding mode admits `s3_inputs.json` `verdict` only by exact-string allowlist {"NOT-KILLED", "NOT-KILLED-UNSCREENED"}; `UNDERPOWERED-WAIT`, any `NO-GO (…)`, `STOP-S4-NO-BID-BEARING-DAYS`, missing or unknown → refuse. Test `test_binding_mode_refuses_any_label_outside_allowlist` supersedes `test_binding_mode_refuses_s2_no_go` (widen, never delete).
+2. **k.** S2 emits only `max_rungs_hypothesis` (no `k` key). WP4 takes k from the MAX_RUNGS admission ruling if one exists, else brackets {2, 1} using the `_k1` keys for k = 1.
+3. **f.** `f_kill` = `r_lo` (= `r_lo_station_day`, minimum over unit hypotheses), `f_pass` = `r_lo_lcb_cluster_boot`; for k = 1 `f_kill` = `r_lo_k1`, `f_pass` = `r_lo_k1_lcb_cluster_boot`. Any `r_lo*` key `null` → REFUSE (not 0).
+4. **ICC.** WP4 reads only `fill_icc_rung_trial` (k = 1: `fill_icc_rung_trial_k1`). `null` → refuse. A value below `FILL_ICC` (0.5/7) is floored to `FILL_ICC` with the floor disclosed in the artifact; a value ≥ 3/7 maps to a station-day ICC ≥ 1 and `MakerMix` raises `MakerRefusal` — WP4 records `icc_out_of_range` and refuses the binding run (never clips). `fill_icc_station_day` is report-only.
+5. **b.** `b` is the lower on-tick median of stressed-rule fills; outside [0.70, 0.80] or null → refuse (ruling O-4 unchanged).
+6. **Provenance.** The artifact pins the S2 `s3_inputs.json` sha256, its `code_sha`, and the amendment FINAL sha it was produced under.
