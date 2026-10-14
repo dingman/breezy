@@ -667,6 +667,22 @@ def test_episodes_jsonl_has_one_line_per_primary_episode_and_valid_leakage_field
     assert all(l["depth_ts_used_ns"] <= l["t0_ns"] for l in placed)
 
 
+#: sha256 of the fixture run's result files, taken on d563e702 BEFORE the S-5 time optimisations
+GOLDEN_RESULT_SHA256 = {
+    "episodes.jsonl": "8a3e7f3b8922375eca95e947abcea16cfd5c13027e53f5fb2ea77282ce2835e9",
+    "station_days.csv": "7cf762357f754c3aaae291d9f21a1fa492f4fbdee96514d55dcf208d97a1fc3d",
+    "scored_episodes.csv": "14879a8c2efdfcfaaa1820cf22463bd8d0888a9d4920fef345e596b1965647ec",
+}
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN_RESULT_SHA256))
+def test_fixture_result_files_are_byte_identical_to_the_pre_optimisation_golden(
+    e2e: Run, name: str
+) -> None:
+    digest = hashlib.sha256((e2e.run_dir / name).read_bytes()).hexdigest()
+    assert digest == GOLDEN_RESULT_SHA256[name]
+
+
 SIM_PREFIX = "scripts.analysis.maker_stage0_"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRUTH_NAMES = {"load_truth", "TruthTable", "load_tail_truth"}

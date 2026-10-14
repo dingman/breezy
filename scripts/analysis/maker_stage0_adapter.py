@@ -50,6 +50,7 @@ from scripts.analysis.maker_stage0_pno_store import (
     PNoStore,
     Stress,
 )
+from scripts.analysis.maker_stage0_pricing import RungPricer
 
 __all__ = [
     "DROP_REASON_FOR",
@@ -125,7 +126,7 @@ def _quote(frame: DepthFrame | None) -> tuple[float | None, float | None]:
 
 
 def _price_rungs(
-    p_yes: Mapping[str, float], ctx: DecisionContext, theta: float
+    p_yes: Mapping[str, float], ctx: DecisionContext, pricer: RungPricer
 ) -> tuple[dict[str, float | None], dict[str, str | None]]:
     bids: dict[str, float | None] = {}
     reasons: dict[str, str | None] = {}
@@ -133,8 +134,7 @@ def _price_rungs(
         if rung in ctx.held:
             bids[rung], reasons[rung] = None, None  # filled: ineligible, still on the ladder
             continue
-        nb, na = _quote(ctx.books.get(rung))
-        decided = rule.decide_bid(1.0 - p, nb, na, theta)
+        decided = pricer.price(rung, ctx.books.get(rung), 1.0 - p)
         bids[rung], reasons[rung] = decided.bid, decided.reason
     return bids, reasons
 
@@ -171,7 +171,26 @@ def _abstain(served: AbstainReason, tracker: WantTracker | None) -> Decision:
     return Decision(drop_reason=drop_reason_for(served.reason), forecast_valid=False)
 
 
-def _decide(cfg: SelectorConfig, tracker: WantTracker | None, ctx: DecisionContext) -> Decision:
+@dataclass
+class _Memo:
+    """What one selector may reuse between decisions: rung prices and per-vector ladder plans."""
+
+    pricer: RungPricer
+    plans: dict[int, tuple[Mapping[str, float], rule.LadderPlan]] = field(default_factory=dict)
+
+    def plan_for(self, p_yes: Mapping[str, float], edges: Mapping[str, float]) -> rule.LadderPlan:
+        """One plan per p_yes view (the store keeps one view per cycle; the ref pins its id)."""
+        hit = self.plans.get(id(p_yes))
+        if hit is not None and hit[0] is p_yes:
+            return hit[1]
+        plan = rule.ladder_plan(p_yes, edges)
+        self.plans[id(p_yes)] = (p_yes, plan)
+        return plan
+
+
+def _decide(
+    cfg: SelectorConfig, tracker: WantTracker | None, memo: _Memo, ctx: DecisionContext
+) -> Decision:
     shift = abs(cfg.delta_ns)
     served = classify_p_no(cfg.store, cfg.station, cfg.day, ctx.now_ns - shift, stress=cfg.stress)
     if isinstance(served, AbstainReason):
@@ -180,19 +199,25 @@ def _decide(cfg: SelectorConfig, tracker: WantTracker | None, ctx: DecisionConte
     gate = rule.forecast_gate(served.vector.climate_day, cfg.day, age)
     if gate is not None:
         return Decision(drop_reason=drop_reason_for(gate), forecast_valid=False)
-    return _priced(cfg, tracker, ctx, served)
+    return _priced(cfg, tracker, memo, ctx, served)
 
 
 def _priced(
-    cfg: SelectorConfig, tracker: WantTracker | None, ctx: DecisionContext, served: PNoAtInstant
+    cfg: SelectorConfig,
+    tracker: WantTracker | None,
+    memo: _Memo,
+    ctx: DecisionContext,
+    served: PNoAtInstant,
 ) -> Decision:
     p_yes = served.p_yes_point_live
-    bids, reasons = _price_rungs(p_yes, ctx, cfg.theta)
-    if tracker is not None:  # hindsight, write-only: what the rule would want without a book
-        wanted = rule.select_rungs(p_yes, bids, lower_edges_f=cfg.lower_edges_f)
+    plan = memo.plan_for(p_yes, cfg.lower_edges_f)
+    bids, reasons = _price_rungs(p_yes, ctx, memo.pricer)
+    unbooked = [r for r in bids if r not in ctx.books]
+    bookable = {r: (b if r in ctx.books else None) for r, b in bids.items()} if unbooked else bids
+    chosen = plan.select(bookable)
+    if tracker is not None and unbooked:  # hindsight, write-only: what the rule would want unbooked
+        wanted = plan.select(bids)
         tracker.wanted_without_book.update(r for r in wanted if r not in ctx.books)
-    bookable = {r: (b if r in ctx.books else None) for r, b in bids.items()}
-    chosen = rule.select_rungs(p_yes, bookable, lower_edges_f=cfg.lower_edges_f)
     desired = _desired(chosen, bookable, ctx)
     return Decision(
         desired=desired,
@@ -203,8 +228,9 @@ def _priced(
 
 def build_selector(cfg: SelectorConfig, tracker: WantTracker | None = None) -> RungSelector:
     """The pure-in-effect selector WP4 calls at each decision instant (tracker is write-only)."""
+    memo = _Memo(RungPricer(cfg.theta, _quote))
 
     def selector(ctx: DecisionContext, /) -> Decision:
-        return _decide(cfg, tracker, ctx)
+        return _decide(cfg, tracker, memo, ctx)
 
     return selector
