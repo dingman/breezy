@@ -21,7 +21,7 @@ import shutil
 import time
 from collections import defaultdict
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
@@ -53,7 +53,7 @@ from scripts.analysis.maker_stage0_probe_core import (  # isort: skip
     CensusCounts, CensusViolation, DirectionResult, Frame, Gap, InstanceDayDelta, SideTally,
     StationDay, StationDayCoverage, StopS2, classify_direction, count_census, direction_result,
     distribution, enforce_direction, first_replayable_day, gap_free_frames, instance_day_deltas,
-    ladder_parity, listing_abstain, live_and_gap_hours, mid_of, reassert_census,
+    flat_fields, ladder_parity, listing_abstain, live_and_gap_hours, mid_of, reassert_census,
     station_day_delta, station_day_key, unique_prints,
 )  # fmt: skip
 
@@ -120,12 +120,12 @@ class ProbeReport:
             "first_replayable_day": self.first_replayable_day,
             "direction": self.direction.to_dict(),
             "positive_control": None if self.control is None else self.control.to_dict(),
-            "census": asdict(self.census),
+            "census": flat_fields(self.census),
             "depth_frames": self.depth_frames,
             "truncated_frames": self.truncated_frames,
             "truncated_frame_share": share,
-            "coverage": [asdict(c) for c in self.coverage],
-            "delta_instance_days": [asdict(d) for d in self.delta_instance_days],
+            "coverage": [flat_fields(c) for c in self.coverage],
+            "delta_instance_days": [flat_fields(d) for d in self.delta_instance_days],
             "delta_distribution": dict(self.delta_distribution),
             "ladder_parity": {k: dict(v) for k, v in self.ladder_parity.items()},
             "skipped_instances": dict(self.skipped),

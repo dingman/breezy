@@ -13,7 +13,7 @@ import statistics
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, fields, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -42,6 +42,11 @@ class StopS2(Exception):
     def __init__(self, result: DirectionResult) -> None:
         super().__init__(f"STOP S-2 direction check {result.verdict}: {result.to_dict()}")
         self.result = result
+
+
+def flat_fields(obj: object) -> dict[str, object]:
+    """Shallow field-name -> value dict (all callers' fields are scalars)."""
+    return {f.name: getattr(obj, f.name) for f in fields(obj)}  # type: ignore[arg-type]
 
 
 class CensusViolation(Exception):
@@ -90,7 +95,7 @@ class SideTally:
     def to_dict(self) -> dict[str, object]:
         """JSON-ready tally including both agreement rates."""
         return {
-            **asdict(self),
+            **flat_fields(self),
             "n_defined": self.n_defined,
             "agreement": self.agreement,
             "agreement_excl_ties": self.agreement_excl_ties,
@@ -230,7 +235,7 @@ def count_census(prints_by_instance: Mapping[str, Sequence[core.PrintRecord]]) -
 def reassert_census(counts: CensusCounts) -> CensusCounts:
     """Return ``counts`` unless an S1 invariant failed, then raise ``CensusViolation``."""
     if counts.no_aggressor or counts.duplicate_trade_ids or counts.opposite_side_twins:
-        raise CensusViolation(f"census re-assertion failed: {asdict(counts)}")
+        raise CensusViolation(f"census re-assertion failed: {flat_fields(counts)}")
     return counts
 
 
