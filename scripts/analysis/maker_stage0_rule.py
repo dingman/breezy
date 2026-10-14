@@ -26,7 +26,15 @@ STALE_H: Final[int] = 8
 MAX_RUNGS: Final[int] = 2
 CANCEL_LST: Final[dt.time] = dt.time(9, 0)
 
-_CENT: Final[float] = 0.01
+# Refusal / abstain reasons: the implicit interface WP4/WP6 compare against.
+REASON_P_NO_BELOW_P_MIN: Final[str] = "p_no_below_p_min"
+REASON_B_MAX_BELOW_FLOOR: Final[str] = "b_max_below_floor"
+REASON_BID_BELOW_FLOOR: Final[str] = "bid_below_floor"
+REASON_FORECAST_DAY_MISMATCH: Final[str] = "forecast_day_mismatch"
+REASON_FORECAST_STALE: Final[str] = "forecast_stale"
+REASON_FORECAST_NOT_YET_AVAILABLE: Final[str] = "forecast_not_yet_available"
+
+CENTS_PER_DOLLAR: Final[int] = 100
 _EPS: Final[float] = 1e-9
 _NS_PER_S: Final[int] = 1_000_000_000
 _NS_PER_H: Final[int] = 3_600 * _NS_PER_S
@@ -45,12 +53,26 @@ class BidDecision:
 
 
 def _cents(price: float) -> int:
-    return round(price * 100)
+    return round(price * CENTS_PER_DOLLAR)
+
+
+def _validate_probability(value: float, name: str) -> None:
+    if math.isnan(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
 
 
 def _validate_p_no(p_no: float) -> None:
-    if math.isnan(p_no) or not 0.0 <= p_no <= 1.0:
-        raise ValueError(f"p_no must be in [0, 1], got {p_no!r}")
+    _validate_probability(p_no, "p_no")
+
+
+def _validate_theta(theta: float) -> None:
+    if not math.isfinite(theta) or theta < 0.0:
+        raise ValueError(f"theta must be finite and >= 0, got {theta!r}")
+
+
+def _p_no_below_p_min(p_no: float) -> bool:
+    """The one strict P_MIN comparison shared by `decide_bid` and `select_rungs`."""
+    return p_no < P_MIN
 
 
 def b_max(p_no: float, theta: float) -> float | None:
@@ -59,9 +81,10 @@ def b_max(p_no: float, theta: float) -> float | None:
     Returns None when that value is below B_FLOOR (spec line 84).
     """
     _validate_p_no(p_no)
+    _validate_theta(theta)
     floor_c = _cents(B_FLOOR)
     for cent in range(_cents(B_CAP), floor_c - 1, -1):
-        b = cent / 100
+        b = cent / CENTS_PER_DOLLAR
         if b + theta * b * (1.0 - b) <= p_no - E_MIN + _EPS:
             return b
     return None
@@ -73,17 +96,19 @@ def decide_bid(
     no_ask: float | None,
     theta: float,
 ) -> BidDecision:
-    """Spec lines 82-90. `best_no_bid` excludes our own order (size-0 pad ignored).
+    """Spec lines 82-90; `theta` must be finite and >= 0.
+
+    `best_no_bid` excludes our own order (size-0 pad ignored).
 
     `best_no_bid` None is the empty NO bid side (price = min(b_max, no_ask - 0.01),
     spec line 88); `no_ask` None is the empty YES bid side (no ask clamp).
     """
     _validate_p_no(p_no)
-    if p_no < P_MIN:
-        return BidDecision(None, "p_no_below_p_min")
+    if _p_no_below_p_min(p_no):
+        return BidDecision(None, REASON_P_NO_BELOW_P_MIN)
     cap = b_max(p_no, theta)
     if cap is None:
-        return BidDecision(None, "b_max_below_floor")
+        return BidDecision(None, REASON_B_MAX_BELOW_FLOOR)
     limits = [_cents(cap)]
     if best_no_bid is not None:
         limits.append(_cents(best_no_bid) + 1)
@@ -91,8 +116,8 @@ def decide_bid(
         limits.append(_cents(no_ask) - 1)
     bid_c = min(limits)
     if bid_c < _cents(B_FLOOR):
-        return BidDecision(None, "bid_below_floor")
-    return BidDecision(bid_c / 100, None)
+        return BidDecision(None, REASON_BID_BELOW_FLOOR)
+    return BidDecision(bid_c / CENTS_PER_DOLLAR, None)
 
 
 def bid_price(
@@ -108,22 +133,42 @@ def bid_price(
 def forecast_gate(vector_day: dt.date | None, station_day: dt.date, age_ns: int) -> str | None:
     """Spec lines 77-81: None if the forecast may be used, else the abstain reason."""
     if vector_day != station_day:
-        return "forecast_day_mismatch"
+        return REASON_FORECAST_DAY_MISMATCH
+    if age_ns < 0:  # available_at in the future of `now`: lookahead, never fresh
+        return REASON_FORECAST_NOT_YET_AVAILABLE
     if age_ns > STALE_H * _NS_PER_H:
-        return "forecast_stale"
+        return REASON_FORECAST_STALE
     return None
 
 
+def _ladder_order(rungs: Mapping[str, float], lower_edges_f: Mapping[str, float]) -> list[str]:
+    """Rung keys in ascending lower-edge order; raises if the edges cannot order them."""
+    if set(lower_edges_f) != set(rungs):
+        raise ValueError("lower_edges_f keys must equal the p_yes_by_rung keys")
+    edges = list(lower_edges_f.values())
+    if any(math.isnan(e) for e in edges) or len(set(edges)) != len(edges):
+        raise ValueError("lower_edges_f must be non-NaN and distinct to order the ladder")
+    return sorted(rungs, key=lambda rung: lower_edges_f[rung])
+
+
 def select_rungs(
-    p_yes_by_rung: Mapping[str, float], bids: Mapping[str, float | None]
+    p_yes_by_rung: Mapping[str, float],
+    bids: Mapping[str, float | None],
+    *,
+    lower_edges_f: Mapping[str, float],
 ) -> tuple[str, ...]:
     """Spec lines 125-127: up to MAX_RUNGS rungs, lowest p_YES first.
 
-    `p_yes_by_rung` iterates in ascending ladder order (adjacency is by position).
-    Eligible: 1 - p_yes >= P_MIN, not the modal rung (argmax p_yes, first on a
-    tie) nor adjacent to it, and a bid >= B_FLOOR in `bids` (missing = ineligible).
+    The ladder is ordered by `lower_edges_f` (ascending), never by mapping insertion
+    order, so adjacency is deterministic. Eligible: 1 - p_yes passes the shared
+    strict P_MIN test, not the modal rung (argmax p_yes; the lowest ladder index
+    wins a tie) nor adjacent to it, and a bid >= B_FLOOR in `bids` (missing =
+    ineligible). Equal p_yes ties rank by ascending ladder index. Raises ValueError
+    for any p_yes outside [0, 1] / NaN or an unorderable ladder.
     """
-    rungs = list(p_yes_by_rung)
+    for rung, p_yes in p_yes_by_rung.items():
+        _validate_probability(p_yes, f"p_yes[{rung!r}]")
+    rungs = _ladder_order(p_yes_by_rung, lower_edges_f)
     if not rungs:
         return ()
     modal = max(range(len(rungs)), key=lambda i: p_yes_by_rung[rungs[i]])
@@ -132,7 +177,7 @@ def select_rungs(
         bid = bids.get(rung)
         if abs(idx - modal) <= 1 or bid is None or _cents(bid) < _cents(B_FLOOR):
             continue
-        if 1.0 - p_yes_by_rung[rung] < P_MIN - _EPS:
+        if _p_no_below_p_min(1.0 - p_yes_by_rung[rung]):
             continue
         eligible.append((p_yes_by_rung[rung], idx))
     eligible.sort()
@@ -149,7 +194,11 @@ def _utc_ns(stamp: dt.datetime) -> int:
 
 
 def hard_cancel_ns(day: dt.date, std_offset_hours: int) -> int:
-    """`day` CANCEL_LST (09:00 local standard time) as integer UTC ns (spec line 96)."""
+    """`day` CANCEL_LST (09:00 local standard time) as integer UTC ns (spec line 96).
+
+    `std_offset_hours` is the station's STANDARD-time UTC offset, east-positive
+    (US stations are negative: -8 Pacific, -5 Eastern). Whole hours only.
+    """
     local = dt.datetime.combine(day, CANCEL_LST, tzinfo=dt.UTC)
     return _utc_ns(local) - std_offset_hours * _NS_PER_H
 
