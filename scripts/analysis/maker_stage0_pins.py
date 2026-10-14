@@ -172,6 +172,7 @@ class CatalogSliceManifest:
 
     def __init__(self) -> None:
         self._entries: dict[str, dict[str, object]] = {}
+        self._stamps: dict[str, tuple[int, int]] = {}
 
     def add(self, path: Path) -> None:
         before = path.stat()
@@ -189,6 +190,27 @@ class CatalogSliceManifest:
         if known is not None and known != entry:
             raise ValueError(f"{path} changed between reads")
         self._entries[str(path)] = entry
+
+    def add_capture_file(self, root: Path, path: Path) -> None:
+        """Record a CAPTURE file by its path relative to ``root``: size and sha256 only.
+
+        No mtime and no absolute path enter the manifest, so it is identical across runs, work
+        roots and scratch re-conversions. A re-read of an unchanged file costs one ``stat``.
+        """
+        rel = path.relative_to(root).as_posix()
+        before = path.stat()
+        stamp = (before.st_size, before.st_mtime_ns)
+        if self._stamps.get(rel) == stamp:
+            return
+        digest = sha256_file(path)
+        after = path.stat()
+        if (after.st_size, after.st_mtime_ns) != stamp:
+            raise ValueError(f"{path} changed while it was hashed")
+        entry: dict[str, object] = {"path": rel, "size": after.st_size, "sha256": digest}
+        known = self._entries.get(rel)
+        if known is not None and known != entry:
+            raise ValueError(f"{path} changed between reads")
+        self._entries[rel], self._stamps[rel] = entry, stamp
 
     def to_dict(self) -> dict[str, Any]:
         return {"files": [self._entries[key] for key in sorted(self._entries)]}
