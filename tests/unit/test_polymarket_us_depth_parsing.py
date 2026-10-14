@@ -436,7 +436,7 @@ class TestTradeTick:
         evidence_dir = Path(__file__).resolve().parents[2] / "docs" / "evidence"
         docs = sorted(evidence_dir.glob("MAKER-S1_preconditions_*.md"))
         assert docs, "no MAKER-S1_preconditions_*.md evidence doc"
-        assert any("CONTRACTS" in d.read_text(encoding="utf-8") for d in docs)
+        assert any("TRADE_QUANTITY_UNIT = CONTRACTS" in d.read_text(encoding="utf-8") for d in docs)
 
     def test_a_bare_decimal_quantity_is_accepted_alongside_the_documented_amount_object(
         self, open_instrument: BinaryOption

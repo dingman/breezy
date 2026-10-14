@@ -1004,14 +1004,14 @@ def parse_trade_tick(
 
 
 def _parse_trade_quantity(value: object, *, field: str) -> Decimal:
-    """Read a print's ``quantity`` as a decimal, unit UNRESOLVED.
+    """Read a print's ``quantity`` as a decimal; the unit is CONTRACTS.
 
     The snapshot types ``quantity`` as ``Amount{value, currency}`` -- the
     venue's cash-quantity shape elsewhere -- while the book payload's ``qty``
     is a bare decimal. Both shapes are accepted; the value is carried into
-    ``TradeTick.size`` WITHOUT asserting whether it is contracts or dollars
-    (:data:`TRADE_QUANTITY_UNIT`). The currency label is not consulted here
-    because refusing on it would settle the unit question by assumption.
+    ``TradeTick.size`` unchanged: the unit is CONTRACTS per
+    :data:`TRADE_QUANTITY_UNIT`, and no conversion is performed. The currency
+    label is not consulted here.
     """
     raw: object = value
     if isinstance(value, Mapping):
