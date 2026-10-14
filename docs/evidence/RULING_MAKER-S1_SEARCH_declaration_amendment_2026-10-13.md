@@ -1,6 +1,6 @@
 # RULING_MAKER-S1_SEARCH_declaration_amendment_2026-10-13
 
-Status: **DRAFT rev 2** (coordinator ruling). It becomes FINAL only on the commit that fills the `FROZEN_DATE_SET` block. Immutable once FINAL; any change is a new dated ruling or a §3 addendum.
+Status: **FINAL** (rev 2; FROZEN_DATE_SET filled 2026-10-14). Immutable once FINAL; any change is a new dated ruling or a §3 addendum.
 Date: 2026-10-13. Type: dated amendment to `docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md` (6068a00e), under RA-13 B-3. Decision owner per Pre-Auth; no operator cap involved.
 Naming: "MAKER-S2" = the maker Stage 0 replay (`docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md` + r4 delta). "NBP S2" = the calibration study named in holdout clause 3. They are different studies.
 Hash: `S2_NBP_LICENCE_SHA256` = sha256 of this file's **FINAL** committed bytes, never the DRAFT. MAKER-S2 pins it in `pins.json` (r4 delta (b), E5). The 10-12 file is not edited, and S1's `SEARCH_DECLARATION_SHA256` (`src/breezy/analysis/maker_tape_census.py:76-78`) is unaffected.
@@ -22,11 +22,35 @@ There is one scoring pass. The report-only overlay and the +60 min and poll-lag 
 
 ```FROZEN_DATE_SET
 stations: LAX MDW MIA SFO
-first_replayable_day: <FILL>
-truth_csv_path: <FILL>
-truth_csv_sha256: <FILL>
-last_final_day: <FILL>
-dates: <FILL: ISO dates, ascending, one per line; 2026-10-01 absent>
+first_replayable_day: 2026-09-18
+truth_csv_path: /home/jon/.local/share/breezy/derived/maker_stage0_inputs/truth_cli_finals_2026-10-14.csv
+truth_csv_sha256: 947b244a87b192bce8f6f7b772f3447a85398e3a67abbb06c8b41a97202100f8
+last_final_day: 2026-10-12
+dates:
+2026-09-18
+2026-09-19
+2026-09-20
+2026-09-21
+2026-09-22
+2026-09-23
+2026-09-24
+2026-09-25
+2026-09-26
+2026-09-27
+2026-09-28
+2026-09-29
+2026-09-30
+2026-10-02
+2026-10-03
+2026-10-04
+2026-10-05
+2026-10-06
+2026-10-07
+2026-10-08
+2026-10-09
+2026-10-10
+2026-10-11
+2026-10-12
 ```
 
 ## 2. Why this complies with RA-13 B-3 (`RULING_RA-13_programme_kill_2026-09-27.md:89-92`)

@@ -27,4 +27,5 @@ No SEARCH cost is incurred by AUD-05 or AUD-07.
    - **RA-13-FW2 VERIFIED (coordinator, 2026-09-27):** the latest run that wrote output was `derived/exit_window_study/2026-09-25_nightly/`, covering 8 positions. The newest date anywhere in its output is **2026-09-22**, which is before the freeze. The 09-26 15:20Z run was SKIPPED (the studies lock was held).
    - **Forfeiture to date: 0 post-freeze station-days.** The SEARCH declaration applies from the first run that reads a climate day of 2026-09-26 or later. That happens only after new fills, which require the A1 halt to be cleared.
    - 2026-10-12: superseded by `docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md` §3; post-freeze forfeiture now 72 (LAX/MDW/MIA/SFO 09-26..10-13).
+   - 2026-10-14: MAKER-S1 amendment 2026-10-13: MAKER-S2 NBP read licensed (five named reads); 2026-10-01 excluded; forfeiture unchanged at 72; AUT-4 forward windows: 2026-10-02..10-13 MAKER-S2 NBP-vs-outcome statistics disclosed as descriptive contamination (FINAL; FROZEN_DATE_SET 2026-09-18..2026-10-12, 24 dates).
 4. **The study keeps running.** It is the evidence base for the UNARMED exit seam.
