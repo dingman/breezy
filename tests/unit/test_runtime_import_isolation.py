@@ -141,6 +141,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.maker_stage0_probe",  # MAKER S2 WP0 probe
     "scripts.analysis.maker_stage0_nodelog",  # MAKER-S2 WP1 node-log scan
     "scripts.analysis.maker_stage0_schedule",  # MAKER-S2 WP1 process schedule
+    "scripts.analysis.maker_stage0_catalog_read",  # MAKER-S2 WP6 capture reader
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
