@@ -6,6 +6,7 @@ tests build their own (cheap) configurations. No real catalog, NBP store, truth 
 
 from __future__ import annotations
 
+import ast
 import csv
 import dataclasses
 import datetime as dt
@@ -18,16 +19,27 @@ from typing import Any, cast
 
 import pytest
 
+from breezy.runtime import quote_tape_ingest_core as ingest_core
+from scripts.analysis import maker_stage0_catalog_read as catalog_read
 from scripts.analysis import maker_stage0_driver as drv
 from scripts.analysis import maker_stage0_events_build as eb
+from scripts.analysis import maker_stage0_finish as fin
+from scripts.analysis import maker_stage0_modes as modes_mod
+from scripts.analysis import maker_stage0_preflight as pf
+from scripts.analysis import maker_stage0_render as render
 from scripts.analysis import maker_stage0_report as rep
 from scripts.analysis import maker_stage0_verify_first as vf
-from scripts.analysis.maker_stage0_catalog_read import CatalogSession
-from scripts.analysis.maker_stage0_fill_events import DeltaBoundExceeded
+from scripts.analysis.maker_stage0_catalog_read import CatalogSession, query_window_ns
+from scripts.analysis.maker_stage0_events_build import LocalDayViolation
+from scripts.analysis.maker_stage0_fill_events import DeltaBoundExceeded, EventError, LeakageError
 from scripts.analysis.maker_stage0_frozen import FrozenSetRefused
+from scripts.analysis.maker_stage0_inputs import InputRefused
 from scripts.analysis.maker_stage0_ledger import LedgerRefused
-from scripts.analysis.maker_stage0_pins import DirtyTree
+from scripts.analysis.maker_stage0_pins import CatalogSliceManifest, DirtyTree
+from scripts.analysis.maker_stage0_pno_store import PNoStoreReadError, StationRefusedError
 from scripts.analysis.maker_stage0_probe_core import StopS2
+from scripts.analysis.maker_stage0_rows import CsvCellError, CsvColumnError
+from scripts.analysis.maker_stage0_scored import VerdictRefused
 from scripts.analysis.maker_stage0_verdict import UNDERPOWERED
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.unit import test_maker_stage0_pins as pins_fx
@@ -151,9 +163,10 @@ def test_end_to_end_on_the_fixture_produces_a_verdict_and_every_artifact(e2e: Ru
 
 def test_the_fixture_resting_bid_is_filled_under_base_and_stress(e2e: Run) -> None:
     sd = {
-        (r["climate_day"], r["unit_hypothesis"]): r for r in _rows(e2e.run_dir / "station_days.csv")
+        (r["station"], r["climate_day"], r["unit_hypothesis"]): r
+        for r in _rows(e2e.run_dir / "station_days.csv")
     }
-    day = sd[("2026-09-29", "CONTRACTS")]
+    day = sd[("SFO", "2026-09-29", "CONTRACTS")]
     assert day["covered"] == "true" and day["bid_bearing"] == "true"
     assert int(day["filled_pairs_base"]) >= 1 and int(day["filled_pairs_stress"]) >= 1
     assert day["positions_filled_k2_base"] == day["filled_pairs_base"]
@@ -166,11 +179,11 @@ def test_station_days_csv_has_every_contract_column_plus_wp5_obligations(e2e: Ru
     rows = _rows(e2e.run_dir / "station_days.csv")
     assert set(rows[0]) == STATION_DAY_COLUMNS
     # one row per (station, climate_day, hypothesis) for every census day in the frozen set,
-    # replayed or not: 25 rule days, 2026-10-01 absent.
+    # replayed or not: 4 frozen stations x 25 rule days, 2026-10-01 absent.
     keys = [(r["station"], r["climate_day"], r["unit_hypothesis"]) for r in rows]
-    assert len(keys) == len(set(keys)) == len(rw.rule_days())
+    assert len(keys) == len(set(keys)) == 4 * len(rw.rule_days())
     assert "2026-10-01" not in {k[1] for k in keys}
-    unreplayed = next(r for r in rows if r["climate_day"] == "2026-09-25")
+    unreplayed = next(r for r in rows if r["climate_day"] == "2026-09-25" and r["station"] == "SFO")
     assert unreplayed["n_attempts"] == "" or unreplayed["bid_bearing"] in {"false", ""}
     assert unreplayed["census_reason"] == "COVERED"
 
@@ -189,15 +202,9 @@ def test_progress_events_carry_no_fill_or_rate_fields(e2e: Run) -> None:
     lines = [json.loads(x) for x in (e2e.run_dir / "progress.jsonl").read_text().splitlines()]
     assert lines
     allowed = {
-        "index",
-        "of",
-        "station",
-        "climate_day",
-        "status",
-        "elapsed_s",
-        "rss_bytes",
-        "n_events",
-    }
+        "index", "of", "station", "climate_day", "status", "elapsed_s", "rss_bytes", "n_events",
+        "rss_peak_delta_bytes", "peak_rss_bytes",
+    }  # fmt: skip
     for event in lines:
         assert set(event) <= allowed
         assert not [k for k in event if any(bad in k for bad in FORBIDDEN_PROGRESS)]
@@ -217,7 +224,7 @@ def test_sidecars_are_sealed_and_pinned_incl_delta0_and_stress(e2e: Run) -> None
     delta0 = [
         r
         for r in _rows(e2e.run_dir / "delta0_station_days.csv")
-        if r["climate_day"] == "2026-09-29"
+        if r["climate_day"] == "2026-09-29" and r["station"] == "SFO"
     ]
     assert delta0[0]["delta_ns"] == "0"
 
@@ -246,11 +253,11 @@ def test_pins_include_clean_tree_package_set_argv_node_logs_ledger_and_sidecars(
 def test_report_has_verdict_pins_banner_and_holdout_line(e2e: Run) -> None:
     text = (e2e.run_dir / "report.md").read_text()
     assert f"Verdict: {UNDERPOWERED}" in text
-    assert rep.BANNER in text and "never emits a go verdict" in text
+    assert render.BANNER in text and "never emits a go verdict" in text
     assert "## Pins" in text and e2e.summary.code_sha in text and e2e.world.amendment_sha in text
-    assert rep.HOLDOUT_LINE in text
+    assert render.HOLDOUT_LINE in text
     for phrase in ("clause 3", "descriptive", "open_holdout", "2026-10-01"):
-        assert phrase in rep.HOLDOUT_LINE
+        assert phrase in render.HOLDOUT_LINE
     assert "run-time only, sha-pinned" in text  # sidecar-backed blocks are labelled
     assert "Overlay schedule (report-only)" in text and "Stress variants (report-only)" in text
 
@@ -361,8 +368,9 @@ def test_frozen_set_missing_a_rule_day_is_refused(world: rw.World, tmp_path: Pat
     short.write_text(rw.amendment_text(world.truth_sha, dates=rw.rule_days()[:-1]))
     sha = hashlib.sha256(short.read_bytes()).hexdigest()
     cfg = _fresh(world, tmp_path, amendment=short, amendment_sha=sha)
-    with pytest.raises(FrozenSetRefused, match="last|rule|differs"):
-        drv.run(cfg)
+    with pytest.raises(drv.RunVoided, match="last|rule|differs") as info:
+        drv.run(cfg)  # needs the truth CSV's last FINAL day: decided by score, after the claim
+    assert isinstance(info.value.cause, FrozenSetRefused)
 
 
 @pytest.mark.parametrize(
@@ -430,8 +438,9 @@ def test_delta_over_10min_aborts_before_scoring_and_voids_run(
     monkeypatch.setattr(rep, "load_truth", lambda *a, **k: touched.append("truth"))
     monkeypatch.setattr(eb, "simulate_station_day", lambda *a, **k: touched.append("sim"))
     cfg = _fresh(world, tmp_path / "r")
-    with pytest.raises(DeltaBoundExceeded, match="S-7"):
+    with pytest.raises(drv.RunVoided, match="S-7") as info:
         drv.run(cfg)
+    assert isinstance(info.value.cause, DeltaBoundExceeded)
     assert touched == []  # neither a simulation nor the truth file was reached
     assert _void_dir(cfg).is_dir() and not cfg.out_dir.exists()
     kinds = [e["kind"] for e in _ledger(cfg)]
@@ -442,8 +451,9 @@ def test_delta_over_10min_aborts_before_scoring_and_voids_run(
 def test_inverted_direction_voids_run_s2(tmp_path: Path) -> None:
     world = rw.build_world(tmp_path / "w", capture=rw.build_capture(tmp_path / "w", inverted=True))
     cfg = _fresh(world, tmp_path / "r")
-    with pytest.raises(StopS2):
+    with pytest.raises(drv.RunVoided) as info:
         drv.run(cfg)
+    assert isinstance(info.value.cause, StopS2)
     void = _void_dir(cfg)
     agreement = json.loads((void / "wp0_agreement.json").read_text())  # written BEFORE the STOP
     assert agreement["direction"]["verdict"] == "INVERTED"
@@ -456,8 +466,9 @@ def test_rss_over_four_gib_aborts_and_voids_run(
 ) -> None:
     monkeypatch.setattr(drv, "current_rss_bytes", lambda: 5 * 2**30)
     cfg = _fresh(world, tmp_path)
-    with pytest.raises(drv.MemoryAbort, match="S-5"):
+    with pytest.raises(drv.RunVoided, match="S-5") as info:
         drv.run(cfg)
+    assert isinstance(info.value.cause, drv.MemoryAbort)
     assert _void_dir(cfg).is_dir()
 
 
@@ -466,7 +477,7 @@ def test_a_void_run_may_be_rerun_only_with_a_dated_addendum(
 ) -> None:
     monkeypatch.setattr(drv, "current_rss_bytes", lambda: 5 * 2**30)
     cfg = _fresh(world, tmp_path)
-    with pytest.raises(drv.MemoryAbort):
+    with pytest.raises(drv.RunVoided):
         drv.run(cfg)
     monkeypatch.undo()
     monkeypatch.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
@@ -494,20 +505,20 @@ def test_bench_mode_skips_scoring_and_writes_no_episode_or_rate_output(
         return real(*a, **k)
 
     monkeypatch.setattr(rep, "load_truth", spy)
-    cfg = _fresh(world, tmp_path, bench=1, stations=("SFO",), days=(rw.DAY, rw.DIRECTION_DAY))
+    cfg = _fresh(world, tmp_path, bench=4, stations=("SFO",), days=(rw.DAY, rw.DIRECTION_DAY))
     summary = drv.run(cfg)
     assert touched == []
     names = {p.name for p in cfg.out_dir.iterdir()}
     assert names == {"bench.json", "progress.jsonl", "run_manifest.json"}
     bench = json.loads((cfg.out_dir / "bench.json").read_text())
-    assert len(bench["station_days"]) == 1
-    only = bench["station_days"][0]
     session = CatalogSession(world.capture, tmp_path / "plan_work")
     plans = session.plan([rw.DAY, rw.DIRECTION_DAY], ["SFO"])
-    heavier = max(plans, key=lambda k: plans[k].catalog_bytes)
-    assert only["climate_day"] == heavier[1].isoformat()  # chosen by capture bytes only
-    assert only["catalog_bytes"] == plans[heavier].catalog_bytes
-    assert only["catalog_bytes"] > 0 and only["elapsed_s"] >= 0 and only["peak_rss_bytes"] > 0
+    assert len(bench["station_days"]) == 2  # N = 4 over two replayed days: both are timed
+    by_day = {r["climate_day"]: r for r in bench["station_days"]}
+    for (_, day), plan in plans.items():  # weights are capture bytes only
+        assert by_day[day.isoformat()]["catalog_bytes"] == plan.catalog_bytes > 0
+    only = bench["station_days"][0]
+    assert only["elapsed_s"] >= 0 and only["peak_rss_bytes"] > 0
     assert {"projected_total_s", "projected_peak_rss_bytes", "s5_exceeded"} <= set(bench)
     assert summary.label is None
     assert _ledger(cfg) == []  # bench never claims the verdict ledger
@@ -593,7 +604,7 @@ def test_driver_scores_only_after_simulation_completes(
     assert order.count("sim") >= 2 and "truth" not in order[:-1]
 
 
-def test_driver_streams_episodes_without_accumulating(
+def test_driver_writes_each_episode_to_disk_before_the_next_is_pulled(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_sim = eb.simulate_station_day
@@ -642,8 +653,9 @@ def test_a_late_first_print_contradicting_the_frozen_block_voids_the_run(
     late = int(dt.datetime(2026, 9, 17, 18, 0, tzinfo=dt.UTC).timestamp()) * 10**9
     monkeypatch.setattr(drv, "first_print_instant", lambda *a, **k: late)
     cfg = _fresh(world, tmp_path)
-    with pytest.raises(drv.InputRefused, match="replayable day"):
+    with pytest.raises(drv.RunVoided, match="replayable day") as info:
         drv.run(cfg)
+    assert isinstance(info.value.cause, drv.InputRefused)
     assert _void_dir(cfg).is_dir()
 
 
@@ -655,21 +667,37 @@ def test_episodes_jsonl_has_one_line_per_primary_episode_and_valid_leakage_field
     assert all(l["depth_ts_used_ns"] <= l["t0_ns"] for l in placed)
 
 
-def test_simulator_transitive_import_closure_excludes_truth() -> None:
-    closure = drv.import_closure(
-        "scripts.analysis.maker_stage0_events_build", prefix="scripts.analysis.maker_stage0_"
-    )
-    assert "scripts.analysis.maker_stage0_fill" in closure  # the walk reaches the simulator
-    assert "scripts.analysis.maker_stage0_adapter" in closure
-    forbidden = {
-        "scripts.analysis.maker_stage0_inputs",
-        "scripts.analysis.maker_stage0_verify_first",
-        "scripts.analysis.maker_stage0_report",
-        "scripts.analysis.maker_stage0_driver",
-        "scripts.analysis.maker_stage0_verdict",
-        "scripts.analysis.maker_stage0_tables",
-    }
-    assert not (forbidden & closure), sorted(forbidden & closure)
+SIM_PREFIX = "scripts.analysis.maker_stage0_"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TRUTH_NAMES = {"load_truth", "TruthTable", "load_tail_truth"}
+SIM_ROOTS = ("station_loop", "runio", "events_build", "adapter", "modes", "catalog_read")
+
+
+def test_simulation_loop_import_closure_never_reaches_truth() -> None:
+    union: set[str] = set()
+    for root in SIM_ROOTS:
+        closure = drv.import_closure(SIM_PREFIX + root, prefix=SIM_PREFIX)
+        assert SIM_PREFIX + "fill" in drv.import_closure(
+            SIM_PREFIX + "events_build", prefix=SIM_PREFIX
+        )
+        banned = {
+            SIM_PREFIX + n
+            for n in ("report", "driver", "verify_first", "render", "preflight", "finish", "pins")
+        }
+        assert not (banned & closure), (root, sorted(banned & closure))
+        union |= closure
+    for name in sorted(union):  # no module the loop can reach even IMPORTS the truth loader
+        path = REPO_ROOT.joinpath(*name.split(".")).with_suffix(".py")
+        if not path.is_file():  # `from pkg.mod import NAME` also yields "pkg.mod.NAME"
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = {
+            a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names
+        }
+        assert not (imported & TRUTH_NAMES), (name, sorted(imported & TRUTH_NAMES))
+    strict = drv.import_closure(SIM_PREFIX + "events_build", prefix=SIM_PREFIX)
+    assert SIM_PREFIX + "adapter" in strict
+    assert not ({SIM_PREFIX + "inputs", SIM_PREFIX + "tables", SIM_PREFIX + "verdict"} & strict)
 
 
 def test_import_closure_walk_catches_a_helper_that_imports_truth(tmp_path: Path) -> None:
@@ -680,6 +708,18 @@ def test_import_closure_walk_catches_a_helper_that_imports_truth(tmp_path: Path)
     (pkg / "truthy.py").write_text("X = 1\n")
     found = drv.import_closure("pkg.a", prefix="pkg.", root=tmp_path)
     assert found == {"pkg.a", "pkg.b", "pkg.truthy"}
+
+
+def test_import_closure_ignores_imports_that_only_exist_for_type_checking(tmp_path: Path) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.py").write_text(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from pkg import truthy\n"
+        "from pkg import real\n"
+    )
+    (pkg / "real.py").write_text("X = 1\n")
+    (pkg / "truthy.py").write_text("X = 1\n")
+    assert drv.import_closure("pkg.a", prefix="pkg.", root=tmp_path) == {"pkg.a", "pkg.real"}
 
 
 def test_theta_comes_from_the_venue_schedule_not_a_literal() -> None:
@@ -696,7 +736,11 @@ def test_bracketed_unit_runs_both_hypotheses_and_converts_sizes_per_hypothesis(
     summary = drv.run(cfg)
     rows = _rows(cfg.out_dir / "station_days.csv")
     assert {r["unit_hypothesis"] for r in rows} == {"USD_NOTIONAL_TAKER", "USD_NOTIONAL_YES"}
-    day = {r["unit_hypothesis"]: r for r in rows if r["climate_day"] == "2026-09-29"}
+    day = {
+        r["unit_hypothesis"]: r
+        for r in rows
+        if r["climate_day"] == "2026-09-29" and r["station"] == "SFO"
+    }
     # the bid sits above the displayed NO level, so nothing is ahead; a 3-notional print is 12
     # contracts under the taker reading and still consumes our own unit.
     assert {d["filled_pairs_base"] for d in day.values()} == {"1"}
@@ -741,7 +785,7 @@ def test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict(
 def test_theta_outside_zero_to_point_two_is_refused_before_the_ledger(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(drv, "theta_for_day", lambda _day: 0.25)
+    monkeypatch.setattr(pf, "theta_for_day", lambda _day: 0.25)
     cfg = _fresh(world, tmp_path)
     with pytest.raises(drv.InputRefused, match="theta"):
         drv.run(cfg)
@@ -750,9 +794,9 @@ def test_theta_outside_zero_to_point_two_is_refused_before_the_ledger(
 
 def test_replayed_station_days_carry_both_denominator_columns(e2e: Run) -> None:
     rows = _rows(e2e.run_dir / "station_days.csv")
-    day = next(r for r in rows if r["climate_day"] == "2026-09-29")
+    day = next(r for r in rows if r["climate_day"] == "2026-09-29" and r["station"] == "SFO")
     assert int(day["rung_trials_attempted"]) >= 1 and int(day["n_no_book_wants"]) >= 0
-    unreplayed = next(r for r in rows if r["climate_day"] == "2026-09-25")
+    unreplayed = next(r for r in rows if r["climate_day"] == "2026-09-25" and r["station"] == "SFO")
     assert unreplayed["n_no_book_wants"] in ("", "0")
 
 
@@ -767,3 +811,375 @@ def test_truth_token_is_one_function_and_a_missing_final_is_blank_at_any_age() -
     }  # fmt: skip
     assert rep.day_truth(70)["truth_final"] is True
     assert not hasattr(rep, "UNRESOLVED_AFTER_DAYS")
+
+
+# --- review fixes: listing abstention (pmr H1) -------------------------------------------------
+
+
+def test_a_ladder_listed_after_d_minus_1_noon_is_a_listing_abstention_not_a_bid(
+    tmp_path: Path,
+) -> None:
+    late = rw.build_capture(tmp_path / "w", listed_iso="2026-09-28T13:00:00")
+    cfg = _fresh(rw.build_world(tmp_path / "w", capture=late), tmp_path / "r")
+    summary = drv.run(cfg)
+    rows = _rows(cfg.out_dir / "station_days.csv")
+    day = next(r for r in rows if r["station"] == "SFO" and r["climate_day"] == "2026-09-29")
+    assert day["covered"] == "true" and day["bid_bearing"] == "false"  # covered, never bid
+    assert int(day["n_attempts"] or 0) == 0 and int(day["n_episodes"] or 0) == 0
+    assert summary.label == "STOP-S4-NO-BID-BEARING-DAYS"  # the only bid-bearing day is gone
+    assert "listing_abstained: 1" in (cfg.out_dir / "report.md").read_text()
+    assert not [
+        r for r in _rows(cfg.out_dir / "scored_episodes.csv") if r["climate_day"] == "2026-09-29"
+    ]
+
+
+def test_a_ladder_listed_in_time_reports_zero_listing_abstentions(e2e: Run) -> None:
+    assert "listing_abstained: 0" in (e2e.run_dir / "report.md").read_text()
+
+
+# --- review fixes: licence of the tail-only stations (pmr H3) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "parity", [(("NYC", 0),), (("SFO", 0), ("NYC", 1)), (("XYZ", 0),)], ids=["nyc", "mixed", "xyz"]
+)
+def test_tail_only_refuses_a_station_outside_the_maker_set_before_any_read(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parity: tuple[Any, ...]
+) -> None:
+    def read(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a read happened before the station licence was checked")
+
+    monkeypatch.setattr(rep, "load_tail_truth", read)
+    monkeypatch.setattr(drv, "_preflight", read)
+    cfg = _fresh(world, tmp_path, tail_only=True, parity=parity)
+    with pytest.raises(drv.InputRefused, match="NYC|XYZ|MAKER"):
+        drv.run(cfg)
+    assert not cfg.out_dir.exists()
+
+
+# --- review fixes: typed exit codes (py H1) ----------------------------------------------------
+
+BOOM = "boom-original-cause"
+ERRORS: list[BaseException] = [
+    EventError(BOOM), LeakageError(BOOM), LocalDayViolation(BOOM), PNoStoreReadError(Path(BOOM)),
+    VerdictRefused(BOOM), CsvCellError(BOOM), CsvColumnError(BOOM), OSError(BOOM),
+    ValueError(BOOM), RuntimeError(BOOM), StationRefusedError(BOOM), InputRefused(BOOM),
+    DeltaBoundExceeded(BOOM), drv.MemoryAbort(BOOM),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("exc", ERRORS, ids=lambda e: type(e).__name__)
+def test_every_post_claim_failure_is_a_typed_void(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    def fail(*_a: Any, **_k: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(drv, "_wp0", fail)
+    cfg = _fresh(world, tmp_path)
+    with pytest.raises(drv.RunVoided) as info:
+        drv.run(cfg)
+    assert info.value.cause is exc and type(exc).__name__ in str(info.value)
+    assert _void_dir(cfg).is_dir() and not cfg.out_dir.exists()
+    assert [e["kind"] for e in _ledger(cfg)] == ["verdict_run_start", "void"]
+
+
+@pytest.mark.parametrize("exc", ERRORS, ids=lambda e: type(e).__name__)
+def test_every_pre_claim_failure_propagates_raw_and_leaves_the_ledger_untouched(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    def fail(*_a: Any, **_k: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(drv, "_preflight", fail)
+    cfg = _fresh(world, tmp_path)
+    with pytest.raises(type(exc)):
+        drv.run(cfg)
+    _assert_untouched(cfg)
+
+
+def test_a_failing_void_keeps_the_original_cause_in_the_message(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_a: Any, **_k: Any) -> Any:
+        raise LeakageError(BOOM)
+
+    def no_void(*_a: Any, **_k: Any) -> Any:
+        raise LedgerRefused("cannot rename the run directory")
+
+    monkeypatch.setattr(drv, "_wp0", fail)
+    monkeypatch.setattr(drv, "void_run_dir", no_void)
+    with pytest.raises(drv.RunVoided) as info:
+        drv.run(_fresh(world, tmp_path))
+    assert isinstance(info.value.cause, LeakageError)
+    assert BOOM in str(info.value) and "cannot rename" in str(info.value)
+
+
+# --- review fixes: determinism (py H2) and the capture-hashed manifest (py H3) -----------------
+
+MASKED_REPORT_LINES = (
+    "# MAKER-S2 Stage 0 replay:",  # run_id
+    "| code_sha (git_commit)",  # the fixture repo's commit sha (commit time)
+    "| verdict ledger",  # absolute ledger path
+    "| progress.jsonl",  # sidecar sha: wall-clock and RSS per station-day
+)
+MASKED_S3_KEYS = ("code_sha",)
+
+
+def _mask_report(text: str) -> str:
+    return "\n".join(
+        "<masked>" if line.startswith(MASKED_REPORT_LINES) else line for line in text.splitlines()
+    )
+
+
+def _mask_s3(text: str) -> dict[str, Any]:
+    return {k: v for k, v in json.loads(text).items() if k not in MASKED_S3_KEYS}
+
+
+def test_full_run_is_deterministic(world: rw.World, tmp_path: Path) -> None:
+    first = _fresh(world, tmp_path / "a", name="run_a")
+    second = _fresh(world, tmp_path / "b", name="run_b")
+    drv.run(first)
+    drv.run(second)
+    a, b = first.out_dir, second.out_dir
+    for name in ("station_days.csv", "scored_episodes.csv", "catalog_slice_manifest.json"):
+        assert (a / name).read_bytes() == (b / name).read_bytes(), name
+    assert _mask_s3((a / "s3_inputs.json").read_text()) == _mask_s3(
+        (b / "s3_inputs.json").read_text()
+    )
+    ra, rb = (_mask_report((d / "report.md").read_text()).splitlines() for d in (a, b))
+    assert [(x, y) for x, y in zip(ra, rb, strict=True) if x != y] == []
+
+
+def test_catalog_slice_manifest_hashes_the_capture_files_by_relative_path(e2e: Run) -> None:
+    files = json.loads((e2e.run_dir / "catalog_slice_manifest.json").read_text())["files"]
+    assert files
+    for entry in files:
+        assert set(entry) == {"path", "size", "sha256"}  # no mtime, no absolute path
+        source = e2e.world.capture / entry["path"]
+        assert not Path(entry["path"]).is_absolute() and source.is_file()
+        assert entry["size"] == source.stat().st_size
+        assert entry["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert not [e for e in files if "work" in e["path"] or "replay" in e["path"]]
+
+
+def test_lru_eviction_removes_scratch_and_a_reconverted_instance_keeps_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = rw.build_capture(tmp_path / "w", second_instance=True)
+    scratch = tmp_path / "scratch"
+    manifest = CatalogSliceManifest()
+    session = CatalogSession(capture, scratch, manifest, keep=1)
+    plan = session.plan([rw.DAY], ["SFO"])[("SFO", rw.DAY)]
+    assert plan.instances == ("inst-a", "inst-b")
+    window = query_window_ns("SFO", rw.DAY)
+    converted: list[str] = []
+    real = ingest_core.default_convert
+
+    def spy(source: Any, instance: str, data_cls: Any, *a: Any, **k: Any) -> Any:
+        converted.append(instance)
+        return real(source, instance, data_cls, *a, **k)
+
+    monkeypatch.setattr(catalog_read, "default_convert", spy)
+    session.read(plan, window)  # a converted, then evicted when b arrives
+    assert sorted(p.name for p in (scratch / "replay").iterdir()) == ["inst-b"]
+    first = manifest.to_dict()
+    session.read(plan, window)  # a re-converted (new mtimes), b evicted, b re-converted
+    assert sorted(p.name for p in (scratch / "replay").iterdir()) == ["inst-b"]
+    assert sorted(set(converted)) == ["inst-a", "inst-b"] and converted.count("inst-a") == 2 * len(
+        catalog_read.REPLAY_STREAMS
+    )  # every stream of a was converted twice
+    assert manifest.to_dict() == first  # same capture bytes: same manifest, no "changed" error
+    session.close()
+    assert not list((scratch / "replay").iterdir())
+
+
+# --- review fixes: preflight completeness (pmr M2, M3) -----------------------------------------
+
+
+@pytest.mark.parametrize("what", ["cross_check", "nbp_manifest", "spec", "uv_lock", "node_log_dir"])
+def test_a_missing_pinned_input_is_refused_before_the_ledger_claim(
+    world: rw.World, tmp_path: Path, what: str
+) -> None:
+    cfg = _fresh(world, tmp_path)
+    missing = tmp_path / "does_not_exist"
+    over: dict[str, Any] = {
+        "cross_check": {"truth_cross_check": missing},
+        "nbp_manifest": {"nbp_root": missing},
+        "spec": {"spec": missing},
+        "uv_lock": {},
+        "node_log_dir": {"node_log_dir": missing},
+    }[what]
+    if what == "uv_lock":
+        (cfg.repo_root / "uv.lock").unlink()
+    cfg = dataclasses.replace(cfg, **over)
+    with pytest.raises(drv.InputRefused):
+        drv.run(cfg)
+    _assert_untouched(cfg)
+
+
+def test_a_frozen_station_day_without_a_census_row_is_refused_before_the_ledger(
+    world: rw.World, tmp_path: Path
+) -> None:
+    from tests.fixtures.maker_stage0 import make_census_fixture as fx
+
+    rows = [r for r in rw.census_rows() if not (r.station == "MIA" and r.climate_day == rw.DAY)]
+    fx.write_census_fixture(tmp_path / "census.jsonl", rows)
+    cfg = dataclasses.replace(_fresh(world, tmp_path), census_days=tmp_path / "census.jsonl")
+    with pytest.raises(FrozenSetRefused, match="MIA"):
+        drv.run(cfg)
+    _assert_untouched(cfg)
+
+
+def test_a_duplicate_census_row_for_a_frozen_station_day_is_refused(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.analysis import maker_stage0_preflight as pf
+    from scripts.analysis.maker_stage0_inputs import CensusLoad
+
+    rows = rw.census_rows()
+    monkeypatch.setattr(pf, "load_census_days", lambda _p: CensusLoad((*rows, rows[0]), 0))
+    cfg = _fresh(world, tmp_path)
+    with pytest.raises(FrozenSetRefused, match="duplicate"):
+        drv.run(cfg)
+    _assert_untouched(cfg)
+
+
+# --- review fixes: bench licence and projection (pmr M4) ---------------------------------------
+
+
+@pytest.mark.parametrize("n", [1, 3, 5, 100])
+def test_bench_refuses_a_count_other_than_four_or_eight(
+    world: rw.World, tmp_path: Path, n: int
+) -> None:
+    cfg = _fresh(world, tmp_path, bench=n, stations=("SFO",), days=(rw.DAY,))
+    with pytest.raises(drv.SubsetRefused, match="4"):
+        drv.run(cfg)
+    assert not cfg.out_dir.exists()
+
+
+def test_bench_weighs_replayed_days_only_and_runs_every_variant(
+    world: rw.World, tmp_path: Path
+) -> None:
+    cfg = _fresh(world, tmp_path, bench=8, stations=("SFO", "LAX"), days=(rw.DAY, rw.DIRECTION_DAY))
+    drv.run(cfg)
+    bench = json.loads((cfg.out_dir / "bench.json").read_text())
+    assert {r["station"] for r in bench["station_days"]} == {"SFO"}  # LAX is never listed
+    assert bench["n_replayable_station_days"] == 2
+    assert bench["variants"] == ["primary", "overlay", "plus60", "poll_lag", "delta0"]
+
+
+# --- review fixes: provenance (pmr M7), atomic writes, mutually exclusive modes ----------------
+
+
+def test_the_tail_csv_source_and_episodes_jsonl_are_pinned(world: rw.World, tmp_path: Path) -> None:
+    tail = tmp_path / "tail_reliability.csv"
+    tail.write_text("station,climate_day,vector,p_yes,outcome\n")
+    cfg = _fresh(world, tmp_path / "r", tail_csv=tail)
+    drv.run(cfg)
+    pins = json.loads((cfg.out_dir / "pins.json").read_text())
+    assert pins["tail_csv_source"]["sha256"] == hashlib.sha256(tail.read_bytes()).hexdigest()
+    episodes = (cfg.out_dir / "episodes.jsonl").read_bytes()
+    assert pins["episodes_jsonl"]["sha256"] == hashlib.sha256(episodes).hexdigest()
+
+
+def test_result_files_are_written_atomically(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.analysis.maker_stage0_inputs as inputs
+
+    written: list[str] = []
+    real = inputs.write_text_atomic
+
+    def spy(path: Path, text: str) -> Path:
+        written.append(path.name)
+        return real(path, text)
+
+    monkeypatch.setattr(fin, "write_text_atomic", spy)
+    drv.run(_fresh(world, tmp_path))
+    assert {"s3_inputs.json", "report.md", "station_days.csv", "scored_episodes.csv",
+            "tail_reliability.csv"} <= set(written)  # fmt: skip
+
+
+@pytest.mark.parametrize("mode", ["bench", "tail", "verify"])
+def test_report_only_modes_clean_up_on_failure(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    def fail(*_a: Any, **_k: Any) -> Any:
+        raise OSError("disk full")
+
+    options: dict[str, dict[str, Any]] = {
+        "bench": {"bench": 4, "stations": ("SFO",), "days": (rw.DAY,)},
+        "tail": {"tail_only": True, "parity": (("SFO", 0),)},
+        "verify": {"verify_first": True},
+    }
+    over = options[mode]
+    monkeypatch.setattr(modes_mod, "simulate", fail)
+    monkeypatch.setattr(rep, "load_tail_truth", fail)
+    monkeypatch.setattr(drv, "verify_first_s6", fail)
+    cfg = _fresh(world, tmp_path, **over)
+    with pytest.raises(OSError, match="disk full"):
+        drv.run(cfg)
+    assert not cfg.out_dir.exists() and not cfg.work_root.exists()
+
+
+# --- review fixes: RSS watch (py MED 5) --------------------------------------------------------
+
+
+def test_peak_rss_is_checked_inside_the_day_not_only_after_it(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(drv, "peak_rss_bytes", lambda: 5 * 2**30)  # a mid-day spike
+    cfg = _fresh(world, tmp_path)
+    with pytest.raises(drv.RunVoided, match="S-5") as info:
+        drv.run(cfg)
+    assert isinstance(info.value.cause, drv.MemoryAbort)
+
+
+def test_progress_lines_carry_the_ru_maxrss_delta_per_station_day(e2e: Run) -> None:
+    lines = [json.loads(x) for x in (e2e.run_dir / "progress.jsonl").read_text().splitlines()]
+    assert all(e["rss_peak_delta_bytes"] >= 0 and e["peak_rss_bytes"] > 0 for e in lines)
+
+
+# --- review fixes: disclosures (pmr D1-D8) -----------------------------------------------------
+
+
+def test_the_report_carries_every_disclosure_obligation(e2e: Run) -> None:
+    text = (e2e.run_dir / "report.md").read_text()
+    assert "## Disclosures" in text
+    for needle in (
+        "abstain NO_VECTOR:", "abstain UNKNOWN_ERA:", "abstain NONFINITE_P_YES:",  # D2, separate
+        "buyer prints floored to 0 (CONTRACTS):", "depth levels raised by ceil (CONTRACTS):",  # D4
+        "CLI FINAL as a proxy for venue resolution", "no VOID or UNRESOLVED handling",  # D5
+        "no-FINAL station-days excluded:", "inclusive",
+        "theta is constant per climate day", "taker_fee_coefficient_as_of",  # D8
+        "documented exception", "no-book rungs are not priced",  # D8, M6
+        "listing_abstained:", "unknown-delta station-days:",
+        "r3 L154",  # D1
+    ):  # fmt: skip
+        assert needle in text, needle
+
+
+def test_the_s4_stop_report_discloses_the_consumed_ledger_entry(tmp_path: Path) -> None:
+    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
+    cfg = _fresh(world, tmp_path / "r")
+    drv.run(cfg)
+    text = (cfg.out_dir / "report.md").read_text()
+    for needle in ("ledger entry is consumed", "no label", "n_sd = 0", "new dated declaration"):
+        assert needle in text, needle
+
+
+def test_tail_only_csv_is_written_atomically(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    written: list[str] = []
+    real = rep.write_text_atomic
+
+    def spy(path: Path, text: str) -> Path:
+        written.append(path.name)
+        return real(path, text)
+
+    monkeypatch.setattr(rep, "write_text_atomic", spy)
+    monkeypatch.setattr(drv, "TAIL_RANGE", (rw.DAY, rw.DAY))
+    drv.run(_fresh(world, tmp_path, tail_only=True, parity=(("SFO", 0),)))
+    assert "tail_reliability.csv" in written

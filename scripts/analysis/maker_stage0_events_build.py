@@ -8,10 +8,12 @@ truncation rows, per recorder instance) into a totally ordered stream with seq 0
 ``clock_events`` adds the cuts and forecast releases of one variant with seq N.. so the two merge
 without re-sequencing the data. Conventions (all conservative for the fill rate):
 
-* a later recorder instance takes over at its first depth frame: the earlier instance's later events
-  are dropped and its open gaps end at the hand-over (the sim's "current instance" is single);
+* a later recorder instance takes over at its START, its first in-window event of ANY kind (depth
+  frame, print, gap or truncation row): the earlier instance's later events are dropped and its
+  open gaps end at the hand-over (the sim's "current instance" is single);
 * one print per ``trade_id`` (first instance wins), ``NO_AGGRESSOR`` prints are never emitted;
-* print sizes floor to whole contracts (fewer credited), depth sizes ceil (a longer queue);
+* print sizes floor to whole contracts (fewer credited), depth sizes ceil (a longer queue); the
+  number of prints floored to zero and of depth levels raised by the ceil are counted per build;
 * a depth level is a YES level; a bid level is converted for a SELLER taker, an ask for a BUYER;
 * per rung, the last frame before the window is kept as the opening book.
 """
@@ -139,6 +141,10 @@ class DataEvents:
     n_depth_frames: int  # frames INSIDE the window (coverage), not the opening books
     rungs_with_books: frozenset[str]
     n_no_aggressor: int = 0
+    n_levels: int = 0  # depth levels emitted (D4 denominator)
+    n_levels_ceil_raised: int = 0  # levels whose size the ceil raised (a longer queue)
+    n_prints: int = 0  # prints emitted
+    n_prints_floored_zero: int = 0  # prints that the floor credited as zero contracts
 
     @property
     def n_events(self) -> int:
@@ -163,25 +169,44 @@ def _cents(price: Decimal) -> int:
     return cents
 
 
+@dataclass
+class _Tally:
+    """Rounding counts of one ``build_data_events`` call (D4 disclosure)."""
+
+    levels: int = 0
+    levels_raised: int = 0
+    prints: int = 0
+    prints_floored_zero: int = 0
+
+
 def _levels(
-    raw: Iterable[tuple[Decimal, Decimal]], size_of: SizeConverter, taker: str
+    raw: Iterable[tuple[Decimal, Decimal]], size_of: SizeConverter, taker: str, tally: _Tally
 ) -> tuple[Level, ...]:
     out: list[Level] = []
     for price, size in raw:
         if size <= 0 or not 0 < price < 1:
             continue  # size-0 pad levels, or a price outside the open unit interval
-        contracts = math.ceil(size_of(size, price, taker))
+        exact = size_of(size, price, taker)
+        contracts = math.ceil(exact)
+        tally.levels += 1
+        tally.levels_raised += contracts != exact
         out.append((_cents(price), contracts))
     return tuple(out)
 
 
 def _first_ts(sl: InstanceSlice) -> int:
-    stamps = [f.ts_ns for f in sl.frames] or [p.ts_ns for p in sl.prints]
+    """The instance's START: its first in-window event of any kind."""
+    stamps = [
+        *(f.ts_ns for f in sl.frames),
+        *(p.ts_ns for p in sl.prints),
+        *(g.start_ns for g in sl.gaps),
+        *(t.ts_ns for t in sl.truncations),
+    ]
     return min(stamps) if stamps else _END_OF_TIME
 
 
 def _segments(slices: Sequence[InstanceSlice]) -> list[tuple[InstanceSlice, int, int]]:
-    """(slice, start, end): a later instance's first event ends the earlier one's segment."""
+    """(slice, start, end): a later instance's start (first event) ends the earlier segment."""
     ordered = sorted(slices, key=lambda s: (_first_ts(s), s.instance_id))
     firsts = [_first_ts(s) for s in ordered]
     return [
@@ -198,8 +223,9 @@ def _flags(sl: InstanceSlice) -> dict[tuple[str, int], tuple[bool, bool]]:
 
 
 def _frame_events(
-    sl: InstanceSlice, lo: int, hi: int, window: tuple[int, int], size_of: SizeConverter
-) -> tuple[list[tuple[int, Kind, Event]], int]:
+    sl: InstanceSlice, lo: int, hi: int, window: tuple[int, int], size_of: SizeConverter,
+    tally: _Tally,
+) -> tuple[list[tuple[int, Kind, Event]], int]:  # fmt: skip
     flags, kept, inside = _flags(sl), {}, 0
     rows: list[tuple[int, Kind, Event]] = []
     for frame in sorted(sl.frames, key=lambda f: f.ts_ns):
@@ -208,9 +234,9 @@ def _frame_events(
         if frame.ts_ns < window[0]:
             kept[frame.rung] = frame  # only the last pre-window book per rung survives
             continue
-        rows.append(_depth_row(frame, sl.instance_id, flags, size_of))
+        rows.append(_depth_row(frame, sl.instance_id, flags, size_of, tally))
         inside += 1
-    rows.extend(_depth_row(f, sl.instance_id, flags, size_of) for f in kept.values())
+    rows.extend(_depth_row(f, sl.instance_id, flags, size_of, tally) for f in kept.values())
     return rows, inside
 
 
@@ -219,12 +245,13 @@ def _depth_row(
     instance: str,
     flags: dict[tuple[str, int], tuple[bool, bool]],
     size_of: SizeConverter,
+    tally: _Tally,
 ) -> tuple[int, Kind, Event]:
     asks_t, bids_t = flags.get((frame.rung, frame.ts_ns), (False, False))
     payload = DepthFrame(
         rung_id=frame.rung, ts_ns=frame.ts_ns,
-        yes_bids=_levels(frame.bids, size_of, SELLER),
-        yes_asks=_levels(frame.asks, size_of, BUYER),
+        yes_bids=_levels(frame.bids, size_of, SELLER, tally),
+        yes_asks=_levels(frame.asks, size_of, BUYER, tally),
         asks_truncated=asks_t, bids_truncated=bids_t, instance_id=instance,
     )  # fmt: skip
     return frame.ts_ns, Kind.DEPTH, Event(frame.ts_ns, Kind.DEPTH, 0, payload)
@@ -232,7 +259,7 @@ def _depth_row(
 
 def _print_events(
     sl: InstanceSlice, lo: int, hi: int, window: tuple[int, int], size_of: SizeConverter,
-    seen: set[str],
+    seen: set[str], tally: _Tally,
 ) -> tuple[list[tuple[int, Kind, Event]], int]:  # fmt: skip
     rows: list[tuple[int, Kind, Event]] = []
     dropped = 0
@@ -245,7 +272,10 @@ def _print_events(
         if pr.trade_id in seen:
             continue
         seen.add(pr.trade_id)
-        size = math.floor(size_of(pr.size, pr.price, pr.aggressor))
+        exact = size_of(pr.size, pr.price, pr.aggressor)
+        size = math.floor(exact)
+        tally.prints += 1
+        tally.prints_floored_zero += size == 0 and exact > 0
         payload = Print(pr.rung, _cents(pr.price), size, pr.aggressor, sl.instance_id)
         rows.append((pr.ts_ns, Kind.PRINT, Event(pr.ts_ns, Kind.PRINT, 0, payload)))
     return rows, dropped
@@ -277,10 +307,11 @@ def build_data_events(
     """One hypothesis' totally ordered data events (frames, prints, gaps) inside ``window``."""
     rows: list[tuple[int, Kind, Event]] = []
     seen: set[str] = set()
+    tally = _Tally()
     inside = no_aggressor = 0
     for sl, lo, hi in _segments(slices):
-        frames, n = _frame_events(sl, lo, hi, window, size_of)
-        prints, skipped = _print_events(sl, lo, hi, window, size_of, seen)
+        frames, n = _frame_events(sl, lo, hi, window, size_of, tally)
+        prints, skipped = _print_events(sl, lo, hi, window, size_of, seen, tally)
         rows += [*frames, *prints, *_gap_events(sl, lo, hi, window)]
         inside, no_aggressor = inside + n, no_aggressor + skipped
     rows.sort(key=lambda r: (r[0], r[1]))  # stable: source order breaks ties
@@ -288,7 +319,10 @@ def build_data_events(
         Event(ts, kind, seq, event.payload) for seq, (ts, kind, event) in enumerate(rows)
     )
     books = frozenset(e.payload.rung_id for e in events if isinstance(e.payload, DepthFrame))
-    return DataEvents(events, inside, books, no_aggressor)
+    return DataEvents(
+        events, inside, books, no_aggressor,
+        tally.levels, tally.levels_raised, tally.prints, tally.prints_floored_zero,
+    )  # fmt: skip
 
 
 # --- clock events -------------------------------------------------------------------------------

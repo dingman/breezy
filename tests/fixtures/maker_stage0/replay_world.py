@@ -51,10 +51,21 @@ def _t(iso: str) -> int:
     return _ns(iso)
 
 
-def build_capture(root: Path, *, inverted: bool = False, big_offset_s: int | None = None) -> Path:
-    """One CLEAN recorder instance; ``inverted`` flips the direction sample (S-2)."""
+def build_capture(
+    root: Path,
+    *,
+    inverted: bool = False,
+    big_offset_s: int | None = None,
+    listed_iso: str = "2026-09-28T08:00:00",
+    second_instance: bool = False,
+) -> Path:
+    """One CLEAN recorder instance; ``inverted`` flips the direction sample (S-2).
+
+    ``listed_iso`` is when the replayed ladder was listed (after 2026-09-28T12:00Z the ladder is a
+    listing abstention); ``second_instance`` adds ``inst-b`` holding the same ladder (LRU tests).
+    """
     capture = root / "capture"
-    listed = _t("2026-09-28T08:00:00")
+    listed = _t(listed_iso)
     rungs = {r: _instrument(_slug("sfo", r, DAY.isoformat()), listed) for r in RUNGS}
     dir_rung = _instrument(
         _slug("sfo", "gte60lt61f", DIRECTION_DAY.isoformat()), _t("2026-09-16T08:00:00")
@@ -97,6 +108,13 @@ def build_capture(root: Path, *, inverted: bool = False, big_offset_s: int | Non
         records=records,
         offsets=offsets,
     )
+    if second_instance:
+        later = [
+            _depth(inst, "0.150", "0.250", _t("2026-09-28T23:30:00")) for inst in rungs.values()
+        ]
+        _write_instance(
+            capture, "inst-b", instruments=list(rungs.values()), records=later, offsets=[]
+        )
     return capture
 
 
@@ -168,9 +186,19 @@ class World:
     node_log_dir: Path
 
 
+OTHER_STATIONS = ("LAX", "MDW", "MIA")
+
+
 def census_rows(**changes: Any) -> list[Any]:
+    """SFO rows (the replayed station) plus never-listed rows for the other frozen stations."""
     days = [FIRST_DAY + dt.timedelta(days=i) for i in range((LAST_DAY - FIRST_DAY).days + 1)]
-    return [fx.census_row(STATION, d, **changes) for d in days]
+    rows = [fx.census_row(STATION, d, **changes) for d in days]
+    rows += [
+        fx.census_row(s, d, reason="NEVER_LISTED", covered_bidlive=False)
+        for s in OTHER_STATIONS
+        for d in days
+    ]
+    return rows
 
 
 def build_world(

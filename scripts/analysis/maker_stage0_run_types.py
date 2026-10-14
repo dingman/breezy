@@ -6,14 +6,18 @@ import datetime as dt
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from breezy.analysis.maker_tape_census import CensusedDay
-from scripts.analysis.maker_stage0_frozen import FrozenDateSet
+from scripts.analysis.maker_stage0_inputs import InputRefused
 from scripts.analysis.maker_stage0_model import ModelPin
 from scripts.analysis.maker_stage0_nodelog import NodeLogScan
 
+if TYPE_CHECKING:  # annotation only: the frozen-set module names the truth table type
+    from scripts.analysis.maker_stage0_frozen import FrozenDateSet
+
 __all__ = [
+    "BENCH_COUNTS",
     "MIN_FREE_BYTES",
     "RSS_ABORT_BYTES",
     "S5_MAX_SECONDS",
@@ -23,12 +27,14 @@ __all__ = [
     "RunConfig",
     "RunDirExists",
     "RunSummary",
+    "RunVoided",
     "SubsetRefused",
 ]
 
 MIN_FREE_BYTES: Final[int] = 10 * 2**30  # E4
 RSS_ABORT_BYTES: Final[int] = 4 * 2**30  # S-5
 S5_MAX_SECONDS: Final[float] = 6 * 3600.0
+BENCH_COUNTS: Final[tuple[int, ...]] = (4, 8)  # the licence allows these two sample sizes only
 
 
 class SubsetRefused(ValueError):
@@ -47,15 +53,30 @@ class MemoryAbort(RuntimeError):
     """S-5: resident memory exceeded 4 GiB mid-run; the run is void."""
 
 
+class RunVoided(RuntimeError):
+    """A failure AFTER the ledger claim: the run directory is voided (CLI exit 3).
+
+    ``cause`` is the original failure; ``void_failure`` is set when renaming the run directory
+    ALSO failed, so the message never loses the real cause.
+    """
+
+    def __init__(self, cause: BaseException, *, void_failure: BaseException | None = None) -> None:
+        detail = f"{type(cause).__name__}: {cause}"
+        if void_failure is not None:
+            detail += (
+                f" [voiding the run directory ALSO failed: "
+                f"{type(void_failure).__name__}: {void_failure}]"
+            )
+        super().__init__(detail)
+        self.cause = cause
+        self.void_failure = void_failure
+
+
 @dataclass(frozen=True, kw_only=True)
 class RunConfig:
-    census_days: Path
-    trade_unit: Path
     catalog_root: Path
     nbp_root: Path
-    truth: Path
     truth_cross_check: Path
-    node_log_dir: Path
     out_dir: Path
     repo_root: Path
     amendment: Path
@@ -63,6 +84,10 @@ class RunConfig:
     spec: Path
     ledger: Path
     work_root: Path
+    census_days: Path | None = None  # absent only for --verify-first
+    trade_unit: Path | None = None
+    truth: Path | None = None
+    node_log_dir: Path | None = None
     addendum: Path | None = None
     addendum_sha: str | None = None
     stations: tuple[str, ...] | None = None
@@ -74,6 +99,13 @@ class RunConfig:
     tail_csv: Path | None = None
     argv: tuple[str, ...] = ()
     min_free_bytes: int = MIN_FREE_BYTES
+
+    def need(self, name: str) -> Path:
+        """A path that the chosen mode requires; absence is a typed refusal, never a sentinel."""
+        value: Path | None = getattr(self, name)
+        if value is None:
+            raise InputRefused(f"--{name.replace('_', '-')} is required for this run")
+        return value
 
 
 @dataclass(frozen=True)

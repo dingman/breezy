@@ -40,7 +40,18 @@ __all__ = [
 
 #: The only keys a progress event may carry: no fill, rate, label or episode field (delta (c)).
 PROGRESS_FIELDS: Final[frozenset[str]] = frozenset(
-    {"index", "of", "station", "climate_day", "status", "elapsed_s", "rss_bytes", "n_events"}
+    {
+        "index",
+        "of",
+        "station",
+        "climate_day",
+        "status",
+        "elapsed_s",
+        "rss_bytes",
+        "n_events",
+        "rss_peak_delta_bytes",
+        "peak_rss_bytes",
+    }
 )
 _NS: Final[int] = 10**9
 
@@ -114,8 +125,26 @@ def import_closure(module: str, *, prefix: str, root: Path | None = None) -> set
     return seen
 
 
+def _is_type_checking(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _walk_runtime(node: ast.AST) -> Iterable[ast.AST]:
+    """Every node that can execute: ``if TYPE_CHECKING:`` bodies never run, so they are skipped."""
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if _is_type_checking(child):
+            continue
+        yield from _walk_runtime(child)
+
+
 def _imports(tree: ast.AST, here: str) -> Iterable[str]:
-    for node in ast.walk(tree):
+    for node in _walk_runtime(tree):
         if isinstance(node, ast.Import):
             yield from (alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:

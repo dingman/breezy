@@ -143,14 +143,26 @@ def test_delta_shift_hides_a_vector_until_strictly_after_release_plus_delta(
     assert visible.forecast_valid is True and visible.desired
 
 
-def test_wanted_rung_without_a_book_is_tracked_not_dropped(tmp_path: Path) -> None:
+def test_a_rung_without_a_book_is_counted_but_never_priced_or_ranked(tmp_path: Path) -> None:
     tracker = ad.WantTracker()
     selector, _ = _selector(tmp_path, tracker=tracker)
     books = _books()
     del books["ge86"]
     decision = selector(_ctx(books))
-    assert "ge86" in {d.rung_id for d in decision.desired}
-    assert tracker.wanted_without_book == {"ge86"}
+    assert "ge86" not in {d.rung_id for d in decision.desired}  # no attempt without a book
+    assert tracker.wanted_without_book == {"ge86"}  # counted in n_no_book_wants only
+    assert decision.desired == (Desired("r84", 76),)
+    assert decision.desired[0].rung_id == rule.k1_rung(("r84",))  # cannot become K1 or displace
+
+
+def test_abstentions_are_counted_per_reason_on_the_tracker(tmp_path: Path) -> None:
+    tracker = ad.WantTracker()
+    selector, store = _selector(tmp_path, tracker=tracker)
+    early = pno_fx._ns(DAY, 0, 0) - 20 * NS_H  # before any released vector
+    reason = classify_p_no(store, "SFO", DAY, early, stress="none").reason  # type: ignore[union-attr]
+    selector(_ctx(_books(), now=early))
+    selector(_ctx(_books(), now=early))
+    assert dict(tracker.abstentions) == {reason: 2}
 
 
 def test_book_helpers_read_best_no_bid_and_no_ask() -> None:

@@ -1,16 +1,18 @@
 """MAKER-S2 WP6: one station-day, every unit hypothesis and every variant (no truth, no verdict).
 
-Plan r3 WP6 flow step (1) + r4 delta (d)(e)(g)(i)1/(i)3. The PRIMARY variant streams its episodes
-into the ``EpisodeSink`` (one write per episode, nothing retained but the per-rung position fold)
-and yields the verdict rows; the report-only variants (logged-relaunch overlay, +60 min and
-poll-lag availability stress, Delta = 0) re-run the same raw data and write only their own rows.
+Plan r3 WP6 flow step (1) + r4 delta (d)(e)(g)(i)1/(i)3. The PRIMARY variant writes its episodes
+into the ``EpisodeSink`` one at a time (WP4 returns one station-day's episode list per variant, so
+the memory bound is one station-day x one variant of episodes; across station-days only the
+per-rung position fold, ``out.seeds`` and ``out.rows`` are retained) and yields the verdict rows;
+the report-only variants (logged-relaunch overlay, +60 min and poll-lag availability stress,
+Delta = 0) re-run the same raw data and write only their own rows.
 The raw capture slice is read once per station-day and each hypothesis' event stream is built once.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -62,7 +64,7 @@ from scripts.analysis.maker_stage0_schedule import (
 from scripts.analysis.maker_stage0_tables import sd_row_from_summary
 from scripts.analysis.maker_stage0_verdict import SdRow
 
-__all__ = ["VARIANTS", "LoopContext", "LoopOutput", "run_station_day"]
+__all__ = ["VARIANTS", "LoopContext", "LoopOutput", "replays", "run_station_day"]
 
 PRIMARY: Final[str] = "primary"
 #: name -> (schedule, availability stress, Delta forced to zero)
@@ -97,6 +99,9 @@ class LoopContext:
     calibration: LiveCalibration
     sink: EpisodeSink | None
     variants: Sequence[str] = tuple(VARIANTS)
+    #: station-days listed after D-1 12:00Z: replayed (covered) but never bid (listing abstention)
+    abstained: frozenset[tuple[str, dt.date]] = frozenset()
+    watch: Callable[[], None] | None = None  # called after every (hypothesis, variant) pass
 
 
 @dataclass
@@ -104,8 +109,24 @@ class LoopOutput:
     rows: dict[str, list[SdRow]] = field(default_factory=dict)
     seeds: list[PositionSeed] = field(default_factory=list)
     consumed: set[tuple[int, str]] = field(default_factory=set)
-    abstentions: dict[str, int] = field(default_factory=dict)
+    abstentions: dict[str, int] = field(default_factory=dict)  # primary decisions, by reason
     parity: dict[str, int] = field(default_factory=dict)
+    listing_abstained: list[str] = field(default_factory=list)  # "STATION YYYY-MM-DD"
+    rounding: dict[str, dict[str, int]] = field(default_factory=dict)  # by unit hypothesis
+    unknown_delta: int = 0  # station-days with no clock-offset sample (Delta taken as 0)
+
+    def add_rounding(self, unit: str, data: DataEvents) -> None:
+        mine = self.rounding.setdefault(
+            unit, {"levels": 0, "levels_ceil_raised": 0, "prints": 0, "prints_floored_zero": 0}
+        )
+        mine["levels"] += data.n_levels
+        mine["levels_ceil_raised"] += data.n_levels_ceil_raised
+        mine["prints"] += data.n_prints
+        mine["prints_floored_zero"] += data.n_prints_floored_zero
+
+    def add_abstentions(self, counts: Mapping[str, int]) -> None:
+        for reason, n in counts.items():
+            self.abstentions[reason] = self.abstentions.get(reason, 0) + n
 
     def add_row(self, variant: str, row: SdRow) -> None:
         self.rows.setdefault(variant, []).append(row)
@@ -162,7 +183,7 @@ def _unreplayed(
     )  # fmt: skip
 
 
-def _replays(cr: CensusedDay, status: LogStatus | None) -> bool:
+def replays(cr: CensusedDay, status: LogStatus | None) -> bool:
     return cr.reason == "COVERED" and cr.covered_bidlive and status is not LogStatus.OUTAGE
 
 
@@ -182,6 +203,8 @@ def _prepare(ctx: LoopContext, key: tuple[str, dt.date], out: LoopOutput) -> _Pr
     window = query_window_ns(station, day)
     slices = ctx.session.read(plan, window)
     rungs, edges = _ladder(plan.instruments)
+    if key in ctx.abstained:  # listing abstention: the book is replayed, no forecast is consulted
+        return _Prepared(slices, None, edges, {})
     store = PNoStore.from_root(
         ctx.nbp_root, stations=[station], days=[day], calibration=ctx.calibration,
         ladders={key: rungs},
@@ -216,13 +239,12 @@ def _selector_for(
     return build_selector(cfg, tracker)
 
 
-def _stream(ctx: LoopContext, replay: ReplayResult, key: Key, unit: str, out: LoopOutput) -> None:
+def _stream(sink: EpisodeSink, replay: ReplayResult, key: Key, unit: str, out: LoopOutput) -> None:
     """Write every episode before the next is pulled; keep only the per-rung position fold."""
-    assert ctx.sink is not None
     fold = PositionFold(key[0], key[1], unit)
     for episode in replay.result.episodes:
         assert_before_local_midnight(episode, key[0], key[1])
-        ctx.sink.write(episode)
+        sink.write(episode)
         fold.add(episode)
     out.seeds += fold.seeds()
 
@@ -253,8 +275,10 @@ def _run_variant(
         live_from_ns=sched.window_start_ns,
         delta_ns=delta,
     )
-    if name == PRIMARY and ctx.sink is not None:
-        _stream(ctx, replay, key, unit.name, out)
+    if name == PRIMARY:
+        out.add_abstentions(tracker.abstentions)
+        if ctx.sink is not None:
+            _stream(ctx.sink, replay, key, unit.name, out)
     cr = ctx.census[key]
     row = sd_row_from_summary(
         replay.result.summary,
@@ -278,16 +302,21 @@ def _no_selector(_ctx: DecisionContext, /) -> Decision:
 def run_station_day(ctx: LoopContext, key: tuple[str, dt.date], out: LoopOutput) -> int:
     """Simulate ``key`` for every hypothesis and variant; returns the primary event count."""
     cr, status = ctx.census[key], ctx.statuses.get(key[1])
-    if not _replays(cr, status):
+    if not replays(cr, status):
         for unit in ctx.units:
             for name in ctx.variants:
                 out.add_row(name, _unreplayed(unit.name, key, cr, status))
         return 0
     prep = _prepare(ctx, key, out)
+    if key in ctx.abstained and ctx.plans.get(key) is not None:
+        out.listing_abstained.append(f"{key[0]} {key[1].isoformat()}")
     n_events = 0
     for unit in ctx.units:
         data = _data(prep, unit, key)
+        out.add_rounding(unit.name, data)
         for name in ctx.variants:
             count = _run_variant(ctx, name, key, unit, prep, data, out)
             n_events = n_events or count
+            if ctx.watch is not None:
+                ctx.watch()
     return n_events

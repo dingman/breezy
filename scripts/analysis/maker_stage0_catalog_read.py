@@ -6,8 +6,12 @@ recorder instance is converted by ``default_convert`` into a scratch ``ParquetDa
 instrument and absolute ns, and deleted. ``plan`` converts only the instrument definitions to find
 which instances hold each station-day; ``read`` keeps at most ``keep`` converted instances alive
 (day-major iteration touches each instance on consecutive station-days) so no instance is
-converted more than once in a normal run. Every parquet the queries touch is hashed into the
-caller's ``CatalogSliceManifest``. The reader returns plain records (``maker_stage0_events_build``);
+converted more than once in a normal run. ``_catalog`` converts whole instances, so bytes outside
+the frozen set (NYC, 2026-10-01) reach scratch although they are never queried, hashed or read
+into a record. The CAPTURE's source files (by path relative to the
+capture root, size and sha256; never the scratch conversion, which differs in path and mtime on
+every run and every LRU re-conversion) behind each query are hashed into the caller's
+``CatalogSliceManifest``. The reader returns plain records (``maker_stage0_events_build``);
 it never imports the simulator, the truth loader or the report.
 """
 
@@ -20,7 +24,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from nautilus_trader.model.data import OrderBookDepth10, TradeTick
 from nautilus_trader.model.instruments import BinaryOption
@@ -41,10 +45,12 @@ from scripts.analysis.maker_stage0_events_build import (
     RawPrint,
     RawTruncation,
 )
-from scripts.analysis.maker_stage0_pins import CatalogSliceManifest
 from scripts.analysis.maker_stage0_pno_store import site
 from scripts.analysis.maker_stage0_probe import _for_each_clean_instance
 from scripts.analysis.maker_stage0_probe_core import StationDay, station_day_key
+
+if TYPE_CHECKING:  # annotation only: the pins module imports the frozen-set module
+    from scripts.analysis.maker_stage0_pins import CatalogSliceManifest
 
 __all__ = ["CatalogSession", "StationDayPlan", "query_window_ns"]
 
@@ -57,6 +63,12 @@ REPLAY_STREAMS: Final[tuple[type, ...]] = (
     DepthTruncation,
 )
 _BYTE_STREAMS: Final[tuple[str, ...]] = ("order_book_depths", "trade_tick")
+#: capture stream directories (one subdirectory per instrument) a read consumes
+_HASHED_STREAMS: Final[tuple[str, ...]] = (
+    *_BYTE_STREAMS,
+    "custom_quote_tape_gap",
+    "custom_depth_truncation",
+)
 _NS: Final[int] = 10**9
 
 
@@ -148,7 +160,7 @@ class CatalogSession:
     def _read_instance(
         self, instance: str, rungs: Sequence[str], window: tuple[int, int]
     ) -> InstanceSlice:
-        work, work_dir = self._catalog(instance)
+        work, _work_dir = self._catalog(instance)
         wanted = frozenset(rungs)
         frames: list[RawFrame] = []
         prints: list[RawPrint] = []
@@ -178,15 +190,18 @@ class CatalogSession:
             if str(key.instrument_id) in wanted
             for g in records
         ]
-        self._hash_consumed(work_dir, wanted)
+        self._hash_consumed(instance, wanted)
         return InstanceSlice(instance, frames, prints, gaps, truncations)
 
-    def _hash_consumed(self, work_dir: Path, rungs: frozenset[str]) -> None:
+    def _hash_consumed(self, instance: str, rungs: frozenset[str]) -> None:
         if self.manifest is None:
             return
-        for path in sorted((work_dir / "data").glob("*/*/*.parquet")):
-            if path.parent.name in rungs:
-                self.manifest.add(path)
+        base = self.capture_root / DEFAULT_SUBDIRECTORY / instance
+        for stream in _HASHED_STREAMS:
+            for rung in sorted(rungs):
+                for path in sorted((base / stream / rung).glob("*")):
+                    if path.is_file():
+                        self.manifest.add_capture_file(self.capture_root, path)
 
 
 def _levels(orders: Sequence[Any]) -> tuple[tuple[Decimal, Decimal], ...]:

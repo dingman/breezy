@@ -1,74 +1,53 @@
-"""MAKER-S2 WP6: scoring (the ONLY place truth is loaded), the tail table and the Markdown report.
+"""MAKER-S2 WP6: scoring and the tail table (the ONLY module that loads truth).
 
 Plan r3 WP6 flow steps (2)-(3), r4 delta (f)(g)(i)6. Nothing here runs before every station-day is
-simulated: the driver calls ``score`` once, after its simulation loop. The simulator's import
-closure (``maker_stage0_events_build``) cannot reach this module. ``render_report`` consumes the
-three reproducible CSVs through ``tables_from_csvs`` so the report is byte-reproducible from them.
+simulated: the driver calls ``score`` once, after its simulation loop. The simulation loop's import
+closure (``station_loop``, ``runio``, ``events_build``, ``adapter``, ``modes``) cannot reach this
+module, and the truth loader is named nowhere else. The Markdown lives in ``maker_stage0_render``.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.maker_tape_census import CensusedDay
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
+from breezy.strategy.ladder_ev.quantile_density import Rung
 from scripts.analysis import maker_stage0_verdict as vd
 from scripts.analysis.maker_stage0_frozen import FrozenDateSet, verify_set_matches_rule
-from scripts.analysis.maker_stage0_inputs import TruthTable, load_truth
+from scripts.analysis.maker_stage0_inputs import TruthTable, load_truth, write_text_atomic
+from scripts.analysis.maker_stage0_modes import write_manifest
 from scripts.analysis.maker_stage0_pno import AbstainReason, classify_p_no, release_instants
 from scripts.analysis.maker_stage0_pno_store import PNoStore
+from scripts.analysis.maker_stage0_run_types import Pre, RunConfig, RunSummary
 from scripts.analysis.maker_stage0_runio import PositionSeed
 from scripts.analysis.maker_stage0_stats import TAIL_EDGES, TailRow
-from scripts.analysis.maker_stage0_tables import BANNER, RUNTIME_ONLY_LABEL
+from scripts.analysis.maker_stage0_tables import tail_rows_to_csv
 
 __all__ = [
-    "BANNER",
-    "HOLDOUT_LINE",
-    "S3_KEYS",
-    "STOP_S4",
     "Scored",
     "day_truth",
     "load_tail_truth",
     "load_truth",
-    "render_report",
-    "render_stop_report",
+    "no_final_days",
+    "run_tail",
     "score",
-    "stop_s3_inputs",
+    "tail_bands",
     "tail_rows_for",
     "truth_token",
-    "variant_section",
+    "write_text_atomic",
 ]
 
-STOP_S4: Final[str] = "STOP-S4-NO-BID-BEARING-DAYS"  # r4 (a) S-4: a REPORTED stop, not a void
-#: the ``s3_inputs.json`` keys (``build_s3_inputs``); a stop writes the verdict, null elsewhere
-S3_KEYS: Final[tuple[str, ...]] = (
-    "b", "base_k1", "base_station_day_rate", "base_station_day_rate_ci_cluster_boot",
-    "bid_bearing_share_of_covered_listed", "code_sha", "fill_icc_rung_trial",
-    "fill_icc_rung_trial_k1", "fill_icc_station_day", "max_rungs_hypothesis", "n0_climate_dates",
-    "n_eff_gov", "n_stressed_fills", "r_lo", "r_lo_by_hypothesis", "r_lo_k1",
-    "r_lo_k1_lcb_cluster_boot", "r_lo_lcb_by_hypothesis", "r_lo_lcb_cluster_boot", "r_lo_position",
-    "r_lo_se_cluster_boot", "r_lo_station_day", "realised_bid_iqr", "realised_bid_median_base",
-    "two_fill_share", "unit_hypothesis", "verdict",
-)  # fmt: skip
 OUTCOME_YES: Final[str] = "YES"
 TAIL_P_YES_MAX: Final[float] = TAIL_EDGES[-1]
-HOLDOUT_LINE: Final[str] = (
-    "Holdout touch: replay days 2026-09-18..2026-09-30 and tail days 2026-07-01..2026-09-17 lie "
-    "inside the frozen NBP holdout [2026-07-01, 2026-10-02); they are read under clause 3 of the "
-    "holdout ruling as descriptive evidence only. 2026-10-01 is sealed and never read; "
-    "2026-10-02..2026-10-13 statistics are disclosed contamination for AUT-4 forward windows. "
-    "This run fits nothing and never calls open_holdout."
-)
-_VARIANT_FILES: Final[tuple[tuple[str, str, str], ...]] = (
-    ("overlay", "overlay_station_days.csv", "Overlay schedule (report-only)"),
-    ("plus60", "stress_plus60_station_days.csv", "+60 min availability stress (report-only)"),
-    ("poll_lag", "stress_poll_lag_station_days.csv", "Poll-lag stress (report-only)"),
-    ("delta0", "delta0_station_days.csv", "Delta = 0 re-run (report-only)"),
-)
+TAIL_BAND_FLOOR_F: Final[int] = 10
+TAIL_BAND_CEIL_F: Final[int] = 125
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +62,8 @@ def day_truth(tmax_f: int | None) -> dict[str, object]:
 
     A day with no FINAL row is blank (excluded from 6.9 and counted) at ANY age. ``UNRESOLVED``
     (spec 6.5, past D+14 = loss) and ``VOID`` need venue resolution state that the pinned truth CSV
-    does not carry, so no row is ever scored either here (see ``DEVIATIONS`` in the driver).
+    does not carry, so no row is ever scored either here (see ``DEVIATIONS`` in the driver and the
+    report's disclosures).
     """
     return {
         "truth_final": tmax_f is not None, "truth_tmax_f": tmax_f, "void": False,
@@ -184,162 +164,49 @@ def tail_rows_for(
     return rows
 
 
-# --- Markdown -----------------------------------------------------------------------------------
+def no_final_days(rows: Iterable[vd.SdRow]) -> int:
+    """Distinct COVERED station-days with no FINAL row (excluded from 6.9, disclosed)."""
+    return len({(r.station, r.climate_day) for r in rows if r.covered and not r.truth_final})
 
 
-def _station_day_rate(rows: Sequence[vd.SdRow], pick: str) -> float | None:
-    den = [r for r in rows if vd.in_denominator(r)]
-    if not den:
-        return None
-    return sum(vd.nz(getattr(r, pick)) >= 1 for r in den) / len(den)
+# --- tail-only ----------------------------------------------------------------------------------
 
 
-def _fmt(x: float | None) -> str:
-    return "n/a" if x is None else f"{x:.4f}"
+def tail_bands(parity: int) -> dict[str, tuple[int, int]]:
+    """Every inclusive 2 F band on the station's parity (no open tails)."""
+    first = TAIL_BAND_FLOOR_F + ((parity - TAIL_BAND_FLOOR_F) % 2)
+    return {f"{lo}-{lo + 1}": (lo, lo + 1) for lo in range(first, TAIL_BAND_CEIL_F, 2)}
 
 
-def _label(rows: Sequence[vd.SdRow], hypotheses: Sequence[str]) -> str:
-    try:
-        return vd.decide(vd.analyse_all(rows, [], hypotheses), hypotheses).label
-    except vd.NoBidBearingDays:
-        return "n/a (no bid-bearing days)"
-
-
-def variant_section(
-    title: str,
-    name: str,
-    sidecar: str,
-    rows: Sequence[vd.SdRow],
-    primary: Sequence[vd.SdRow],
-    hypotheses: Sequence[str],
-) -> str:
-    """Rates beside the primary for one report-only variant, labelled run-time only."""
-    base = {(r.station, r.climate_day, r.unit_hypothesis): r for r in primary}
-    out = [f"### {title}", f"{RUNTIME_ONLY_LABEL}: {sidecar} (never sets the label)", ""]
-    head = "| hypothesis | n_sd | base day rate | stressed day rate | days changed vs primary |"
-    out += [head, "|---|---|---|---|---|"]
-    for hyp in sorted({r.unit_hypothesis for r in rows}):
-        mine = [r for r in rows if r.unit_hypothesis == hyp]
-        changed = sum(
-            (r.filled_pairs_base, r.filled_pairs_stress)
-            != (b.filled_pairs_base, b.filled_pairs_stress)
-            for r in mine
-            if (b := base.get((r.station, r.climate_day, r.unit_hypothesis))) is not None
-        )
-        n_sd = sum(vd.in_denominator(r) for r in mine)
-        out.append(
-            f"| {hyp} | {n_sd} | {_fmt(_station_day_rate(mine, 'filled_pairs_base'))} | "
-            f"{_fmt(_station_day_rate(mine, 'filled_pairs_stress'))} | {changed} |"
-        )
-    primary_label = _label(primary, hypotheses)
-    out.append(
-        f"\nrate-rows V-row outcome: {_label(rows, hypotheses)} "
-        f"(primary: {primary_label}); {name}\n"
+def run_tail(
+    cfg: RunConfig, pre: Pre, calibration: LiveCalibration, tail_range: tuple[dt.date, dt.date]
+) -> RunSummary:
+    """Report-only: the tail-reliability CSV, nothing else (no fill, rate, episode or label)."""
+    cfg.out_dir.mkdir(parents=True)
+    first, last = tail_range
+    days = [first + dt.timedelta(days=i) for i in range((last - first).days + 1)]
+    parity = dict(cfg.parity or ())
+    truth = load_tail_truth(
+        cfg.need("truth"),
+        cfg.truth_cross_check,
+        cfg.work_root / "tail_truth",
+        pre.frozen.truth_csv_sha256,
+        {(s, d) for s in parity for d in days},
     )
-    return "\n".join(out)
-
-
-def _pins_block(pins: Mapping[str, Any]) -> str:
-    def sha(key: str) -> str:
-        item = pins.get(key)
-        return str(item["sha256"]) if isinstance(item, Mapping) else str(item)
-
-    rows = [
-        ("code_sha (git_commit)", str(pins["git_commit"])),
-        ("amendment FINAL sha256", str(pins["amendment_final_sha256"])),
-        ("truth CSV sha256 (frozen block)", str(pins["truth_csv_sha256_frozen_block"])),
-        ("census", sha("census")), ("trade unit", sha("trade_unit")),
-        ("artefact", sha("artefact")), ("deploy manifest", sha("deploy_manifest")),
-        ("evidence doc", sha("evidence_doc")), ("spec", sha("spec")), ("uv.lock", sha("uv_lock")),
-        ("NBP manifest", sha("nbp_manifest")),
-        ("NBP consumed cycles", str(pins["nbp_consumed"]["sha256"])),
-        ("process schedule", sha("process_schedule")),
-        ("catalog slice manifest", sha("catalog_slice_manifest")),
-        ("package set", str(pins["installed_package_set_sha256"])),
-        ("verdict ledger", str(pins["ledger_path"])),
-        ("theta pin site", str(pins["theta_pin_site"])),
-    ]  # fmt: skip
-    table = "\n".join(f"| {k} | `{v}` |" for k, v in rows)
-    sidecars = "\n".join(
-        f"| {name} | {RUNTIME_ONLY_LABEL} | `{pin['sha256']}` |"
-        for name, pin in sorted(pins["sidecars"].items())
-    )
-    return (
-        f"## Pins\n\n| input | sha256 / value |\n|---|---|\n{table}\n\n"
-        f"| sidecar | label | sha256 |\n|---|---|---|\n{sidecars}\n"
-    )
-
-
-def render_report(
-    blocks: Mapping[str, str],
-    pins: Mapping[str, Any],
-    variants: Mapping[str, Sequence[vd.SdRow]],
-    primary: Sequence[vd.SdRow],
-    *,
-    run_id: str,
-    hypotheses: Sequence[str],
-) -> str:
-    """The evidence Markdown: verdict, tables (verbatim reproducible blocks), pins, holdout line."""
-    parts = [
-        f"# MAKER-S2 Stage 0 replay: {run_id}\n",
-        f"{BANNER}\n",
-        "## Verdict\n",
-        blocks["verdict"],
-    ]
-    for key, title in (
-        ("v0", "V0 and fitted ICC"), ("rates", "Fill rates"), ("hours", "Bid-live hours"),
-        ("s69", "Section 6.9"), ("expectancy", "Net expectancy"), ("bids", "Realised bids"),
-        ("tail", "Tail reliability"), ("delta", "Clock offset (Delta)"),
-        ("coverage", "Coverage sensitivity"), ("non_covered", "Non-COVERED days"),
-    ):  # fmt: skip
-        parts += [f"## {title}\n", blocks[key]]
-    parts += ["## S3 inputs\n", "```json\n" + blocks["s3"] + "```\n"]
-    parts.append("## Report-only variants\n")
-    parts += [
-        variant_section(title, name, sidecar, variants.get(name, ()), primary, hypotheses)
-        for name, sidecar, title in _VARIANT_FILES
-        if name in variants
-    ]
-    parts += [
-        "## Stress variants (report-only)\n",
-        "See the +60 min, poll-lag and Delta = 0 blocks above.\n",
-    ]
-    parts += ["## Run-time only blocks\n"]
-    parts += [
-        blocks[k]
-        for k in (
-            "overlay",
-            "wp0_agreement",
-            "stress_plus60",
-            "stress_poll_lag",
-            "progress",
-            "bench",
-        )
-    ]
-    parts += [_pins_block(pins), "## Holdout\n", HOLDOUT_LINE + "\n"]
-    return "\n".join(parts)
-
-
-def stop_s3_inputs() -> dict[str, object]:
-    """S-4: the verdict alone; every other key is null so S3 cannot read a number into a stop."""
-    return {k: STOP_S4 if k == "verdict" else None for k in S3_KEYS}
-
-
-def render_stop_report(pins: Mapping[str, Any], *, run_id: str, reason: str) -> str:
-    """The S-4 report: the verdict, why, the pins and the holdout line (no tables to render)."""
-    return "\n".join(
-        [
-            f"# MAKER-S2 Stage 0 replay: {run_id}\n",
-            f"{BANNER}\n",
-            "## Verdict\n",
-            f"Verdict: {STOP_S4}\n",
-            f"{reason}\n",
-            (
-                "This is a REPORTED stop (r4 (a) S-4), not a void: the ledger entry stands and "
-                "there is no re-run without a new dated declaration.\n"
-            ),
-            _pins_block(pins),
-            "## Holdout\n",
-            HOLDOUT_LINE + "\n",
-        ]
-    )
+    rows: list[TailRow] = []
+    for station, p in sorted(parity.items()):
+        bands = tail_bands(p)
+        rungs = [Rung(rung_id=i, lo=lo, hi=hi) for i, (lo, hi) in bands.items()]
+        for day in days:
+            store = PNoStore.from_root(
+                cfg.nbp_root,
+                stations=[station],
+                days=[day],
+                calibration=calibration,
+                ladders={(station, day): rungs},
+            )
+            rows += tail_rows_for(store, station, day, truth.finals.get((station, day)), bands)
+    shutil.rmtree(cfg.work_root, ignore_errors=True)
+    write_text_atomic(cfg.out_dir / "tail_reliability.csv", tail_rows_to_csv(rows))
+    write_manifest(cfg, pre, "tail-only", ["preflight", "tail"], parity)
+    return RunSummary(cfg.out_dir, None, pre.code_sha, "tail-only")

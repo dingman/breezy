@@ -121,7 +121,7 @@ def test_a_trade_id_yields_one_print_and_a_copy_in_another_instances_segment_is_
     pr = eb.RawPrint("t1", "R", 15, D("0.25"), D("3"), "BUYER")  # inside a's segment [10, 20)
     twin = dataclasses.replace(pr, ts_ns=16)  # same trade_id re-delivered by the same instance
     a = _slice("a", frames=(_frame(ts=10),), prints=(pr, twin))
-    b = _slice("b", frames=(_frame(ts=20),), prints=(pr,))
+    b = _slice("b", frames=(_frame(ts=20),), prints=(dataclasses.replace(pr, ts_ns=25),))
     prints = [e.payload for e in _build(a, b).events if isinstance(e.payload, Print)]
     assert len(prints) == 1 and prints[0].instance_id == "a"
 
@@ -211,3 +211,41 @@ def test_replay_counts_wanted_rungs_that_never_had_a_book() -> None:
     )  # fmt: skip
     assert got.n_no_book_wants == 1  # B had a book, A never did
     assert got.n_events == 1 and got.result.summary.n_attempts == 0
+
+
+def test_hand_over_is_at_the_later_instances_first_event_of_any_kind() -> None:
+    quiet = _slice(
+        "a",
+        frames=(_frame(ts=100),),
+        prints=(eb.RawPrint("t1", "R", 10, D("0.25"), D("3"), "BUYER"),),
+    )  # its FIRST event is a print at 10; its first frame is only at 100
+    busy = _slice("b", frames=(_frame(ts=50),))
+    frames = [
+        (e.ts_ns, e.payload.instance_id)
+        for e in _build(quiet, busy).events
+        if isinstance(e.payload, DepthFrame)
+    ]
+    assert frames == [(50, "b")]  # b took over at its start (50); a's frame at 100 is dropped
+
+
+def test_a_gap_or_truncation_row_counts_as_an_instances_first_event() -> None:
+    older = _slice("a", frames=(_frame(ts=100),), gaps=(eb.RawGap("R", 5, 8),))
+    younger = _slice("b", frames=(_frame(ts=50),))
+    frames = [e.payload.instance_id for e in _build(older, younger).events
+              if isinstance(e.payload, DepthFrame)]  # fmt: skip
+    assert frames == ["b"]
+    assert "first depth frame" not in (eb.__doc__ or "")
+
+
+def test_rounding_counters_report_floored_prints_and_ceil_raised_levels() -> None:
+    def half(size: Decimal, price: Decimal, aggressor: str | None) -> Decimal:
+        return size / 2
+
+    frame = eb.RawFrame("R", 100, ((D("0.15"), D("3")),), ((D("0.25"), D("4")),))
+    prints = (
+        eb.RawPrint("t1", "R", 100, D("0.25"), D("1"), "BUYER"),  # 0.5 -> floors to 0
+        eb.RawPrint("t2", "R", 100, D("0.25"), D("3"), "BUYER"),  # 1.5 -> 1
+    )
+    built = _build(_slice(frames=(frame,), prints=prints), size_of=half)
+    assert built.n_levels == 2 and built.n_levels_ceil_raised == 1  # 1.5 -> 2 raised; 2 exact
+    assert built.n_prints == 2 and built.n_prints_floored_zero == 1

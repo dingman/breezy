@@ -8,13 +8,16 @@ part of the ladder), and maps WP3's ``REASON_*`` vocabulary onto WP4's ``DROP_RE
 
 A live rung that is outranked but still individually eligible stays desired: the spec cancels on
 the p_min / b_floor / stale / day conditions only, and a re-price is a ``REPLACED`` in WP4. The
-K1 rung (``k1_rung`` of the ranked selection) leads ``desired``. Rungs wanted that never had a book
-are recorded in the tracker (WP5 ``n_no_book_wants``).
+K1 rung (``k1_rung`` of the ranked selection) leads ``desired``. A rung with no displayed book is
+NOT priced or ranked (it cannot become K1, displace a bookable rung or get an attempt); the rungs
+the rule WOULD have wanted without one are recorded in the tracker (WP5 ``n_no_book_wants``) and
+nowhere else. The tracker also counts abstentions per reason at decision instants.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final
@@ -91,6 +94,7 @@ class WantTracker:
     """Records (never decides) rungs the rule wanted while no book existed for them."""
 
     wanted_without_book: set[str] = field(default_factory=set)
+    abstentions: Counter[str] = field(default_factory=Counter)  # decision instants, by reason
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -161,7 +165,9 @@ def _desired(
     return tuple(Desired(r, round(b * CENTS)) for r, b in priced if b is not None)
 
 
-def _abstain(served: AbstainReason) -> Decision:
+def _abstain(served: AbstainReason, tracker: WantTracker | None) -> Decision:
+    if tracker is not None:
+        tracker.abstentions[served.reason] += 1
     return Decision(drop_reason=drop_reason_for(served.reason), forecast_valid=False)
 
 
@@ -169,7 +175,7 @@ def _decide(cfg: SelectorConfig, tracker: WantTracker | None, ctx: DecisionConte
     shift = abs(cfg.delta_ns)
     served = classify_p_no(cfg.store, cfg.station, cfg.day, ctx.now_ns - shift, stress=cfg.stress)
     if isinstance(served, AbstainReason):
-        return _abstain(served)
+        return _abstain(served, tracker)
     age = ctx.now_ns - (served.available_at_ns + shift)
     gate = rule.forecast_gate(served.vector.climate_day, cfg.day, age)
     if gate is not None:
@@ -182,10 +188,12 @@ def _priced(
 ) -> Decision:
     p_yes = served.p_yes_point_live
     bids, reasons = _price_rungs(p_yes, ctx, cfg.theta)
-    chosen = rule.select_rungs(p_yes, bids, lower_edges_f=cfg.lower_edges_f)
-    if tracker is not None:
-        tracker.wanted_without_book.update(r for r in chosen if r not in ctx.books)
-    desired = _desired(chosen, bids, ctx)
+    if tracker is not None:  # hindsight, write-only: what the rule would want without a book
+        wanted = rule.select_rungs(p_yes, bids, lower_edges_f=cfg.lower_edges_f)
+        tracker.wanted_without_book.update(r for r in wanted if r not in ctx.books)
+    bookable = {r: (b if r in ctx.books else None) for r, b in bids.items()}
+    chosen = rule.select_rungs(p_yes, bookable, lower_edges_f=cfg.lower_edges_f)
+    desired = _desired(chosen, bookable, ctx)
     return Decision(
         desired=desired,
         forecast_valid=True,
