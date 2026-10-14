@@ -226,7 +226,7 @@ class CatalogSession:
 
 @lru_cache(maxsize=1 << 16)
 def _level(price: str, size: str) -> tuple[Decimal, Decimal]:
-    """One shared (price, size) pair: the book repeats a few thousand distinct levels a million times."""
+    """One shared (price, size) pair: a book repeats few distinct levels, many times over."""
     return Decimal(price), Decimal(size)
 
 
