@@ -151,10 +151,26 @@ class CatalogSession:
                 self._open.move_to_end(instance)
                 return work
             self._evict(instance)
+        # Cost accepted: a station-day reconverts its instances (memory-bounded, ~86 s each on the
+        # 15 GB one; 96 station-days ~ 2.3 h fits the 21600 s cap), so `keep` is not a hot path.
         source = ParquetDataCatalog(str(self.capture_root))
         work_dir = self.work_root / "replay" / instance
         work_dir.mkdir(parents=True, exist_ok=False)
         work = ParquetDataCatalog(str(work_dir))
+        try:
+            self._convert(source, work, instance, rungs)
+        except BaseException:
+            shutil.rmtree(work_dir, ignore_errors=True)  # never registered, so close() cannot
+            raise
+        self._open[instance] = (work, work_dir, rungs)
+        while len(self._open) > self.keep:
+            self._evict(next(iter(self._open)))
+        return work
+
+    @staticmethod
+    def _convert(
+        source: ParquetDataCatalog, work: ParquetDataCatalog, instance: str, rungs: frozenset[str]
+    ) -> None:
         for data_cls in REPLAY_STREAMS:
             default_convert(
                 source,
@@ -164,10 +180,6 @@ class CatalogSession:
                 target=work,
                 **scope_kwargs(data_cls, sorted(rungs)),
             )
-        self._open[instance] = (work, work_dir, rungs)
-        while len(self._open) > self.keep:
-            self._evict(next(iter(self._open)))
-        return work
 
     def _evict(self, instance: str) -> None:
         _work, work_dir, _rungs = self._open.pop(instance)

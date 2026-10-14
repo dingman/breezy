@@ -83,7 +83,11 @@ def test_the_scoped_slice_equals_the_whole_instance_slice(
     want = reference.read(plan, window)
     reference.close()
     assert got == want
-    assert any(s.frames and s.prints for s in got) and any(s.gaps for s in got)
+    assert any(s.frames and s.prints for s in got) and any(s.truncations for s in got)
+    assert any(g.end_ns is None for s in got for g in s.gaps)  # an unresolved gap survives
+    seen = {f.rung for s in got for f in s.frames} | {p.rung for s in got for p in s.prints}
+    assert seen <= set(plan.instruments)  # no NO leg, direction rung or substring rung leaks
+    assert not [r for r in seen if r.endswith(("^no", "fx"))]
 
 
 def test_a_cached_instance_is_reconverted_for_a_wider_rung_set(
@@ -132,3 +136,99 @@ def test_the_memoized_preflight_scan_reuses_a_report_until_a_file_changes(
     assert scans == ["inst-a", "inst-a"]
     with pytest.raises(PreflightError):
         scoped.scan_instance_memoized(capture, "no-such-instance", DEFAULT_SUBDIRECTORY)
+
+
+def _whole_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = ingest_core.default_convert
+
+    def whole(source: Any, instance: str, data_cls: Any, *a: Any, **k: Any) -> Any:
+        k.pop("identifiers", None)
+        return real(source, instance, data_cls, *a, **k)
+
+    monkeypatch.setattr(probe, "default_convert", whole)
+
+
+def test_first_print_and_probe_match_the_whole_instance_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = rw.build_capture(tmp_path / "w")
+    days = {rw.DAY, rw.DIRECTION_DAY}
+    first = probe.first_print_instant(capture, days, work_root=tmp_path / "a1")
+    report = probe.probe(capture, days, ("SFO",), work_root=tmp_path / "a2", first_print_ns=first)
+    _whole_probe(monkeypatch)
+    want_first = probe.first_print_instant(capture, days, work_root=tmp_path / "b1")
+    want = probe.probe(capture, days, ("SFO",), work_root=tmp_path / "b2", first_print_ns=first)
+    assert first == want_first
+    assert report.to_dict() == want.to_dict()
+    only_day = probe.first_print_instant(capture, [rw.DAY], work_root=tmp_path / "c1")
+    assert only_day == rw._t("2026-09-28T21:00:00")  # the earlier NO-leg print is never licensed
+
+
+def test_a_flat_layout_instance_is_still_read_by_first_print(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = rw.build_capture(tmp_path / "w")
+    stream = capture / "live" / "inst-a" / "trade_tick"
+    for n, path in enumerate(sorted(stream.rglob("*.feather"))):
+        path.rename(stream.parent / f"trade_tick_{n}.feather")
+    for rung_dir in [d for d in stream.iterdir() if d.is_dir()]:
+        rung_dir.rmdir()
+    stream.rmdir()  # flat layout: no per-rung directory, native falls back to trade_tick_*.feather
+    scoped_first = probe.first_print_instant(capture, [rw.DAY], work_root=tmp_path / "a")
+    _whole_probe(monkeypatch)
+    assert scoped_first == probe.first_print_instant(capture, [rw.DAY], work_root=tmp_path / "b")
+    assert scoped_first == rw._t("2026-09-28T21:00:00")
+
+
+def test_a_non_instrument_directory_name_is_never_licensed() -> None:
+    keep = scoped.licensed_rung_filter([rw.DAY], ["SFO"])
+    assert keep("not an instrument id") is False
+    assert keep(OUT_OF_PLAN) is False
+    assert keep(_slug("sfo", "gte86f", rw.DAY.isoformat()) + ".POLYMARKET_US") is True
+
+
+def test_a_failed_conversion_removes_its_scratch_dir_and_a_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = rw.build_capture(tmp_path / "w")
+    scratch = tmp_path / "scratch"
+    session = CatalogSession(capture, scratch)
+    plan = session.plan([rw.DAY], ["SFO"])[("SFO", rw.DAY)]
+    window = query_window_ns("SFO", rw.DAY)
+    real = ingest_core.default_convert
+
+    def boom(source: Any, instance: str, data_cls: Any, *a: Any, **k: Any) -> Any:
+        if data_cls is TradeTick:
+            raise RuntimeError("conversion failed")
+        return real(source, instance, data_cls, *a, **k)
+
+    monkeypatch.setattr(catalog_read, "default_convert", boom)
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        session.read(plan, window)
+    assert not (scratch / "replay" / "inst-a").exists()
+    monkeypatch.setattr(catalog_read, "default_convert", real)
+    assert session.read(plan, window)[0].frames  # not FileExistsError
+    session.close()
+
+
+def test_default_convert_scopes_only_when_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = rw.build_capture(tmp_path / "w")
+    source = ParquetDataCatalog(str(capture))
+    seen: list[Any] = []
+    real = ParquetDataCatalog._list_feather_data_files
+
+    def spy(self: Any, kind: str, instance_id: str, data_cls: Any, identifiers: Any = None) -> Any:
+        seen.append(identifiers)
+        return real(self, kind, instance_id, data_cls, identifiers)
+
+    monkeypatch.setattr(ParquetDataCatalog, "_list_feather_data_files", spy)
+    everything = ParquetDataCatalog(str(tmp_path / "all"))
+    ingest_core.default_convert(source, "inst-a", TradeTick, "live", target=everything)
+    assert seen == [None]  # native called exactly as before: no identifier filter
+    assert everything.query(data_cls=TradeTick)
+    nothing = ParquetDataCatalog(str(tmp_path / "none"))
+    seen.clear()
+    ingest_core.default_convert(source, "inst-a", TradeTick, "live", target=nothing, identifiers=[])
+    assert seen == [] and nothing.query(data_cls=TradeTick) == []  # [] must not mean "no filter"

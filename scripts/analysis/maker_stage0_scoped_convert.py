@@ -29,6 +29,7 @@ from scripts.analysis.maker_stage0_probe_core import station_day_key
 
 __all__ = [
     "PER_RUNG_STREAMS",
+    "check_work_root",
     "convert_scoped",
     "licensed_rung_filter",
     "licensed_rungs",
@@ -57,13 +58,13 @@ def licensed_rungs(
 ) -> list[str] | None:
     """Subdirectory (= instrument id) names of ``data_cls`` under ``instance_dir`` passing ``keep``.
 
-    ``None`` for a flat (non-partitioned) type: nothing to scope.
+    ``None`` (convert unscoped) for a flat type and for a per-rung type whose directory is absent:
+    native then falls back to the flat ``<type>_*.feather`` files, which a scoped empty list would
+    silently skip.
     """
-    if data_cls not in PER_RUNG_STREAMS:
-        return None
     stream_dir = instance_dir / class_to_filename(data_cls)
-    if not stream_dir.is_dir():
-        return []
+    if data_cls not in PER_RUNG_STREAMS or not stream_dir.is_dir():
+        return None
     return sorted(p.name for p in stream_dir.iterdir() if p.is_dir() and keep(p.name))
 
 
@@ -73,7 +74,11 @@ def licensed_rung_filter(
     """Instrument-id predicate: the rung is a YES leg of a declared ``stations`` x ``days`` day."""
 
     def keep(rung: str) -> bool:
-        return station_day_key(InstrumentId.from_str(rung), days, stations) is not None
+        try:
+            instrument_id = InstrumentId.from_str(rung)
+        except ValueError:  # not an instrument directory: never licensed, never aborts the pass
+            return False
+        return station_day_key(instrument_id, days, stations) is not None
 
     return keep
 
@@ -132,3 +137,17 @@ def scan_instance_memoized(
     report = scan_instance(catalog_root, instance_id, subdirectory)
     _SCANS[key] = (signature, report)
     return report
+
+
+def check_work_root(work_root: Path, catalog_root: Path) -> None:
+    resolved, root = work_root.resolve(), catalog_root.resolve()
+    if resolved == root or root in resolved.parents:
+        raise ValueError(
+            f"work root {work_root} is inside the capture root {catalog_root}; "
+            "the capture is read-only evidence"
+        )
+    if resolved in root.parents:
+        raise ValueError(
+            f"capture root {catalog_root} is inside the work root {work_root}; "
+            "scratch cleanup must never reach the capture"
+        )

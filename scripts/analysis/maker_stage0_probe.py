@@ -241,20 +241,6 @@ def _read_prints(
     ]
 
 
-def _check_work_root(work_root: Path, catalog_root: Path) -> None:
-    resolved, root = work_root.resolve(), catalog_root.resolve()
-    if resolved == root or root in resolved.parents:
-        raise ValueError(
-            f"work root {work_root} is inside the capture root {catalog_root}; "
-            "the capture is read-only evidence"
-        )
-    if resolved in root.parents:
-        raise ValueError(
-            f"capture root {catalog_root} is inside the work root {work_root}; "
-            "scratch cleanup must never reach the capture"
-        )
-
-
 def _for_each_clean_instance(
     catalog_root: Path,
     work_root: Path,
@@ -269,7 +255,7 @@ def _for_each_clean_instance(
     that are malformed or not CLEAN are recorded in ``skipped`` with the reason, never dropped.
     ``keep_rung`` (S-5) limits the per-rung streams converted to the ids it accepts (None: all).
     """
-    _check_work_root(work_root, catalog_root)
+    sc.check_work_root(work_root, catalog_root)
     source = ParquetDataCatalog(str(catalog_root))
     now_ns = time.time_ns()
     for instance_id in list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY):
@@ -322,8 +308,14 @@ def first_print_instant(
             if licensed[rung]:
                 stamps.append(t.ts_event)
 
-    keep = sc.licensed_rung_filter(day_set, station_set)
-    _for_each_clean_instance(catalog_root, work_root, (TradeTick,), visit, {}, keep)
+    _for_each_clean_instance(
+        catalog_root,
+        work_root,
+        (TradeTick,),
+        visit,
+        {},
+        sc.licensed_rung_filter(day_set, station_set),
+    )
     return min(stamps) if stamps else None
 
 
@@ -372,8 +364,10 @@ def probe(
     def visit(work: ParquetDataCatalog, instance_id: str) -> None:
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
-    keep = sc.licensed_rung_filter(day_set, station_set)
-    _for_each_clean_instance(catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, keep)
+    rung_filter = sc.licensed_rung_filter(day_set, station_set)
+    _for_each_clean_instance(
+        catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, rung_filter
+    )
     frames = {rung: sorted(fs, key=lambda f: f.ts_ns) for rung, fs in ledger.frames.items()}
     unique = unique_prints(ledger.prints)
     rows = [_coverage((s, d), ledger) for s in stations for d in sorted(day_set)]
