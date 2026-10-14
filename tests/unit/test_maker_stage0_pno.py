@@ -34,6 +34,7 @@ from breezy.strategy.ladder_ev.quantile_density import (
     build_cdf,
 )
 from scripts.analysis import maker_stage0_pno as pno
+from scripts.analysis import maker_stage0_pno_store as pno_store
 from scripts.analysis.maker_stage0_pno import (
     STALE_H,
     PNoStore,
@@ -263,7 +264,7 @@ def test_only_three_pinned_cycles_are_read(tmp_path: Path, monkeypatch: pytest.M
         read.append(path.name)
         return real(path)
 
-    monkeypatch.setattr("scripts.analysis.maker_stage0_pno.read_partition", spy)
+    monkeypatch.setattr("scripts.analysis.maker_stage0_pno_store.read_partition", spy)
     store = _store(root)
     assert sorted(read) == [
         "nbp_20260928_13z.parquet",
@@ -475,10 +476,17 @@ def test_gapped_ladder_falls_back_but_other_value_errors_propagate(
     def boom(*_args: object, **_kwargs: object) -> object:
         raise ValueError("needs at least one draw")
 
-    monkeypatch.setattr(pno, "rung_probability_interval", boom)
+    monkeypatch.setattr(pno_store, "rung_probability_interval", boom)
     with pytest.raises(ValueError, match=r"p_yes failed for LAX 2026-09-29.*at least one draw"):
         _classify(_store(root), AT_1650)
 
 
 def test_site_is_cached() -> None:
     assert pno.site("LAX") is pno.site("LAX")
+
+
+def test_pno_module_line_counts_under_ceiling() -> None:
+    ceiling = 400
+    for module in (pno, pno_store):
+        lines = Path(module.__file__ or "").read_text().count("\n")
+        assert lines < ceiling, f"{module.__name__} has {lines} lines (ceiling {ceiling})"
