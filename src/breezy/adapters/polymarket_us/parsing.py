@@ -223,12 +223,13 @@ TRADE_KNOWN_KEYS: frozenset[str] = frozenset(
 )
 
 #: Unit of a print's ``quantity`` -- and so of ``TradeTick.size`` -- on this
-#: venue: ``"UNRESOLVED"`` until the first live print is cross-checked against
-#: the REST fill quantity for the same trade (contracts vs dollars). Any
-#: consumer of ``TradeTick.size`` (the resting-bid study first) MUST check this
-#: constant before treating a size as a contract count. The data client keeps
-#: the raw ``quantity`` object verbatim as bounded evidence for that check.
-TRADE_QUANTITY_UNIT: str = "UNRESOLVED"
+#: venue: ``"CONTRACTS"``. Resolved 2026-10-14 by
+#: ``scripts/analysis/trade_quantity_unit_crosscheck.py`` (evidence:
+#: ``docs/evidence/MAKER-S1_preconditions_2026-10-14.md``): 25 counted of 28
+#: pinned own create-path fills were each matched to a unique recorded print
+#: and only CONTRACTS survived; the dollars-inversion check HOLDS on every
+#: match. The parser performs NO unit conversion -- the tape stays byte-stable.
+TRADE_QUANTITY_UNIT: str = "CONTRACTS"
 
 #: Venue ``state`` values that mean the contract has reached a terminal
 #: settlement, so ``settlementPx`` is the final value rather than a daily mark.
@@ -947,7 +948,8 @@ def parse_trade_tick(
     risk. It cannot be reconciled with the venue and must never be presented
     as if it could.
 
-    **``size`` is unit-unresolved** -- see :data:`TRADE_QUANTITY_UNIT`.
+    **``size`` is in contracts** per :data:`TRADE_QUANTITY_UNIT` (resolved by
+    the own-fill crosscheck); no conversion is applied here.
     """
     trade = _require_mapping(payload, TRADE_CONTAINER_KEY, context="trade payload")
     expected_slug = instrument.id.symbol.value
@@ -1002,14 +1004,14 @@ def parse_trade_tick(
 
 
 def _parse_trade_quantity(value: object, *, field: str) -> Decimal:
-    """Read a print's ``quantity`` as a decimal, unit UNRESOLVED.
+    """Read a print's ``quantity`` as a decimal; the unit is CONTRACTS.
 
     The snapshot types ``quantity`` as ``Amount{value, currency}`` -- the
     venue's cash-quantity shape elsewhere -- while the book payload's ``qty``
     is a bare decimal. Both shapes are accepted; the value is carried into
-    ``TradeTick.size`` WITHOUT asserting whether it is contracts or dollars
-    (:data:`TRADE_QUANTITY_UNIT`). The currency label is not consulted here
-    because refusing on it would settle the unit question by assumption.
+    ``TradeTick.size`` unchanged: the unit is CONTRACTS per
+    :data:`TRADE_QUANTITY_UNIT`, and no conversion is performed. The currency
+    label is not consulted here.
     """
     raw: object = value
     if isinstance(value, Mapping):

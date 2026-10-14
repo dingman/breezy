@@ -428,14 +428,15 @@ class TestTradeTick:
         assert a.trade_id != different.trade_id
         assert 1 <= len(a.trade_id.value) <= 36
 
-    def test_the_print_size_unit_is_declared_unresolved(self) -> None:
-        """``trade.quantity`` is wrapped as ``Amount{value, currency: "USD"}``,
-        the venue's CASH-quantity shape elsewhere (orders overview, create-order,
-        preview), while contract counts are bare numbers. Whether a print's
-        ``quantity`` is contracts or dollars is therefore UNRESOLVED until the
-        first live print is cross-checked against the REST fill quantity for
-        the same trade; consumers of ``TradeTick.size`` must check this flag."""
-        assert TRADE_QUANTITY_UNIT == "UNRESOLVED"
+    def test_the_print_size_unit_is_resolved_by_own_fill_crosscheck(self) -> None:
+        """The own-fill crosscheck (25 counted of 28 create-path fills, each matched
+        to one recorded print, inversion HOLDS) resolved ``trade.quantity`` to
+        CONTRACTS; the S1 evidence doc must name that verdict."""
+        assert TRADE_QUANTITY_UNIT == "CONTRACTS"
+        evidence_dir = Path(__file__).resolve().parents[2] / "docs" / "evidence"
+        docs = sorted(evidence_dir.glob("MAKER-S1_preconditions_*.md"))
+        assert docs, "no MAKER-S1_preconditions_*.md evidence doc"
+        assert any("TRADE_QUANTITY_UNIT = CONTRACTS" in d.read_text(encoding="utf-8") for d in docs)
 
     def test_a_bare_decimal_quantity_is_accepted_alongside_the_documented_amount_object(
         self, open_instrument: BinaryOption
