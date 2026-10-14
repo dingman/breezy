@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
 from functools import partial
@@ -23,8 +24,11 @@ from scripts.analysis.maker_stage0_fill_events import StationDaySummary
 class SdRow:
     """``station_days.csv`` (r4 (g)); replay fields are None where the day was not replayed.
 
-    ``rung_trials_attempted`` (position-unit denominator) and ``n_no_book_wants`` (WP4 re-check M1:
-    wanted rungs that never had a book) are appended after the contract columns.
+    Two columns are appended after the contract columns and are REQUIRED in ``station_days.csv``
+    (a missing column is a ``CsvColumnError``; there is no default, so a stale file cannot shrink
+    the position denominator): ``rung_trials_attempted`` and ``n_no_book_wants``. The position-unit
+    denominator is ``rung_trials_attempted + n_no_book_wants``; ``n_no_book_wants`` counts RUNGS
+    (not days) that were wanted but never had a book (WP4 re-check M1; spec :215-216).
     """
 
     station: str
@@ -79,7 +83,13 @@ class SdRow:
 
 @dataclass(frozen=True, kw_only=True)
 class PosRow:
-    """``scored_episodes.csv`` row; ``truth_final`` is "", YES, NO, VOID or UNRESOLVED."""
+    """``scored_episodes.csv`` row; ``truth_final`` is "", YES, NO, VOID or UNRESOLVED.
+
+    Truth-token rule (WP6 derives this AND ``SdRow.truth_final/void/unresolved_d14`` from ONE
+    function): a day with no CLI FINAL truth row is ``""`` (excluded from 6.9 and counted, r4 delta
+    (b)); ``UNRESOLVED`` is reserved for a FINAL row that spec 6.5 scores as a loss at D+14.
+    ``p_yes_point_live`` may be None only on a ``""`` or VOID row; elsewhere it is a refusal.
+    """
 
     position_id: str
     rung_trial_id: str
@@ -113,52 +123,104 @@ _SHARED: Final[tuple[str, ...]] = tuple(
 # --- CSV --------------------------------------------------------------------------------------
 
 
-def _cell(value: object) -> str:
+class CsvCellError(ValueError):
+    """A malformed CSV cell or row, located by row (1-based physical line) and column."""
+
+
+class CsvColumnError(ValueError):
+    """A required column is absent from the CSV header."""
+
+
+def _cell(value: object, column: str, *, nullable_text: bool) -> str:
     if value is None:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
-    return repr(value) if isinstance(value, float) else str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            raise CsvCellError(f"column {column!r}: nan is not a CSV value")
+        return repr(value)
+    if value == "" and nullable_text:
+        raise CsvCellError(f"column {column!r}: '' would read back as None")
+    return str(value)
 
 
 def _coerce(raw: str, hint: object) -> object:
     args = get_args(hint)
     base = next((a for a in args if a is not type(None)), hint)
     if raw == "":
-        if type(None) in args or base is str:
-            return None if type(None) in args else ""
+        if type(None) in args:
+            return None
+        if base is str:
+            return ""
         raise ValueError("blank cell in a non-null column")
     if base is bool:
         if raw not in ("true", "false"):
             raise ValueError(f"bad boolean cell {raw!r}")
         return raw == "true"
-    return cast(Callable[[str], object], base)(raw)
+    value = cast(Callable[[str], object], base)(raw)
+    if isinstance(value, float) and math.isnan(value):
+        raise ValueError(f"nan cell {raw!r}")
+    return value
 
 
 def _to_csv(cls: type, rows: Sequence[object]) -> str:
+    """Blank = None; a ``str | None`` field may not hold '' (it would read back as None)."""
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     names = [f.name for f in fields(cls)]
+    optional_text = {
+        k
+        for k, h in get_type_hints(cls).items()
+        if str in get_args(h) and type(None) in get_args(h)
+    }
     writer.writerow(names)
-    writer.writerows([_cell(getattr(row, n)) for n in names] for row in rows)
+    for row in rows:
+        values = [getattr(row, n) for n in names]
+        writer.writerow(
+            _cell(v, n, nullable_text=n in optional_text)
+            for n, v in zip(names, values, strict=True)
+        )
     return out.getvalue()
 
 
-def _from_csv[T](text: str, ctor: Callable[..., T], optional: Sequence[str] = ()) -> list[T]:
+def _parse_row[T](
+    ctor: Callable[..., T], hints: dict[str, Any], index: dict[str, int], cells: list[str], n: int
+) -> T:
+    kwargs: dict[str, object] = {}
+    for key, hint in hints.items():
+        try:
+            kwargs[key] = _coerce(cells[index[key]], hint)
+        except (ValueError, TypeError) as exc:
+            raise CsvCellError(f"row {n} column {key!r}: {cells[index[key]]!r}: {exc}") from exc
+    return ctor(**kwargs)
+
+
+def _from_csv[T](text: str, ctor: Callable[..., T]) -> list[T]:
+    """Every field is a required column; a ragged row or malformed cell raises ``CsvCellError``."""
     hints = get_type_hints(ctor)
-    reader = csv.DictReader(io.StringIO(text))
-    missing = set(hints) - set(reader.fieldnames or ()) - set(optional)
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader, [])
+    missing = sorted(set(hints) - set(header))
     if missing:
-        raise ValueError(f"csv is missing columns {sorted(missing)}")
-    return [ctor(**{k: _coerce(row[k], hints[k]) for k in hints if k in row}) for row in reader]
+        raise CsvColumnError(f"csv is missing required columns {missing}")
+    index = {name: i for i, name in enumerate(header)}
+    out: list[T] = []
+    for cells in reader:
+        if not cells:  # a blank line
+            continue
+        if len(cells) != len(header):
+            raise CsvCellError(
+                f"row {reader.line_num} has {len(cells)} cells, header has {len(header)}"
+            )
+        out.append(_parse_row(ctor, hints, index, cells, reader.line_num))
+    return out
 
 
 sd_rows_to_csv = partial(_to_csv, SdRow)
 pos_rows_to_csv = partial(_to_csv, PosRow)
 tail_rows_to_csv = partial(_to_csv, st.TailRow)
-read_station_days_csv = partial(
-    _from_csv, ctor=SdRow, optional=("rung_trials_attempted", "n_no_book_wants")
-)
+read_station_days_csv = partial(_from_csv, ctor=SdRow)
 read_scored_csv = partial(_from_csv, ctor=PosRow)
 read_tail_csv = partial(_from_csv, ctor=st.TailRow)
 
@@ -177,7 +239,7 @@ def sd_row_from_summary(
     void: bool | None = None,
     unresolved_d14: bool | None = None,
     theta: float | None = None,
-    n_no_book_wants: int = 0,
+    n_no_book_wants: int,
 ) -> SdRow:
     """A replayed row from WP4's summary; WP6 supplies the census, depth and truth fields."""
     copied: dict[str, Any] = {name: getattr(s, name) for name in _SHARED}

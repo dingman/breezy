@@ -19,6 +19,8 @@ from breezy.analysis.maker_tape_census import N_EFF_FLOOR
 from scripts.analysis import maker_stage0_stats as st
 from scripts.analysis import maker_stage0_verdict as vd
 from scripts.analysis.maker_stage0_rows import (
+    CsvCellError,
+    CsvColumnError,
     pos_rows_to_csv,
     read_scored_csv,
     read_station_days_csv,
@@ -28,15 +30,13 @@ from scripts.analysis.maker_stage0_rows import (
     tail_rows_to_csv,
 )
 
+# own public API plus the re-exports that keep the pre-split import paths alive
 __all__ = [
-    "pos_rows_to_csv",
-    "read_scored_csv",
-    "read_station_days_csv",
-    "read_tail_csv",
-    "sd_row_from_summary",
-    "sd_rows_to_csv",
-    "tail_rows_to_csv",
-]  # re-exports: public import paths survive the WP5 split
+    "BANNER", "REPRODUCIBLE_BLOCKS", "RUNTIME_ONLY_BLOCKS", "RUNTIME_ONLY_LABEL", "UNPINNED",
+    "CsvCellError", "CsvColumnError", "pos_rows_to_csv", "read_scored_csv",
+    "read_station_days_csv", "read_tail_csv", "render_tables", "sd_row_from_summary",
+    "sd_rows_to_csv", "tables_from_csvs", "tail_rows_to_csv",
+]  # fmt: skip
 
 NS_PER_S: Final[int] = 1_000_000_000
 UNPINNED: Final[str] = "UNPINNED-RERUN"
@@ -192,6 +192,8 @@ def render_s69(r: vd.Section69) -> str:
     )  # fmt: skip
     return (
         f"state: {r.state} (pooled; strata never set it)\n"
+        "Tests A and B are each run at alpha 0.05, uncorrected: the combined false-FAIL rate can "
+        "reach about 0.10.\n"
         f"n filled {r.n_filled}, n unfilled {r.n_unfilled}, expected losses "
         f"{r.expected_losses:.4f}, observed losses filled {r.losses_filled} "
         f"unfilled {r.losses_unfilled}\n{tests}\n"
@@ -238,6 +240,8 @@ def render_tail(t: st.TailTable) -> str:
     return _md(["bin", "n", "dates", "mean p", "observed", "Clopper-Pearson"], rows) + (
         f"pooled n {t.n}, expected {t.expected:.4f}, observed {t.observed}, "
         f"two-sided exact p {_f(t.p_value, 6)}\n"
+        "Anti-conservative: bands of one vector are correlated, so the exact p is too small "
+        "(report-only; never sets a label).\n"
     )
 
 
@@ -287,13 +291,19 @@ def render_tables(
     poss: Sequence[vd.PosRow],
     tail: Sequence[st.TailRow],
     *,
+    hypotheses: Sequence[str],
     code_sha: str = UNPINNED,
 ) -> dict[str, str]:
-    analyses = vd.analyse_all(sds, poss)
-    decision = vd.decide(analyses)
+    """``hypotheses`` is the WP1 unit loader's set; a missing or extra one is a refusal."""
+    analyses = vd.analyse_all(sds, poss, hypotheses)
+    decision = vd.decide(analyses, hypotheses)
     tail_table = st.tail_table(tail)
     s3 = vd.build_s3_inputs(decision, analyses, code_sha=code_sha)
-    s69 = "".join(f"#### {a.name}\n{render_s69(a.s69)}\n" for a in analyses)
+    s69 = "".join(
+        f"#### {a.name}\n{render_s69(a.s69)}\n"
+        f"#### {a.name} STRESSED fills (report-only; never a label)\n{render_s69(a.s69_stress)}\n"
+        for a in analyses
+    )
     blocks = {
         "v0": render_v0(analyses),
         "verdict": render_verdict(decision, analyses, tail_table),
@@ -313,12 +323,18 @@ def render_tables(
 
 
 def tables_from_csvs(
-    scored_csv: Path, station_days_csv: Path, tail_csv: Path, *, code_sha: str = UNPINNED
+    scored_csv: Path,
+    station_days_csv: Path,
+    tail_csv: Path,
+    *,
+    hypotheses: Sequence[str],
+    code_sha: str = UNPINNED,
 ) -> dict[str, str]:
-    """``maker_stage0_stats --scored``: every reproducible table from the three CSVs."""
+    """Rerun entry (the WP7 driver's ``--scored``): every reproducible table from the 3 CSVs."""
     return render_tables(
         read_station_days_csv(station_days_csv.read_text(encoding="utf-8")),
         read_scored_csv(scored_csv.read_text(encoding="utf-8")),
         read_tail_csv(tail_csv.read_text(encoding="utf-8")),
+        hypotheses=hypotheses,
         code_sha=code_sha,
     )
