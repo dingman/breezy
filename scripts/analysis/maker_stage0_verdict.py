@@ -1,11 +1,9 @@
-"""MAKER-S2 WP5: rows, per-hypothesis analysis, the frozen verdict table and ``s3_inputs``.
+"""MAKER-S2 WP5: per-hypothesis analysis, the frozen verdict table and ``s3_inputs``.
 
-Plan ``docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md`` 1.1 + WP5 and r4 delta
-(a) V0, (e) denominator, (f) ``s3_inputs.json``, (g) CSV contract, (i)4/(i)6. Spec v0.3 6.0
-(``docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md`` :211-230) and 6.9 (:290-304).
-
-Pure. ``n_eff_gov`` / ``is_underpowered`` come from ``maker_stage0_inputs`` (never recomputed).
-Section 6.9 and the expectancy use the BASE rule (``p_yes_point_live`` is the base pass's vector).
+Plan ``docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md`` WP5 + r4 delta (a) V0,
+(e), (f), (g), (i)4/(i)6; spec v0.3 6.0 (:211-230) and 6.9 (:290-304). Pure. ``n_eff_gov`` /
+``is_underpowered`` come from ``maker_stage0_inputs``. Rows: ``maker_stage0_rows``; 6.9:
+``maker_stage0_scored`` (both re-exported). 6.9 and the expectancy use the BASE rule.
 """
 
 from __future__ import annotations
@@ -14,11 +12,37 @@ import datetime as dt
 import math
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Final
 
 from scripts.analysis import maker_stage0_stats as st
 from scripts.analysis.maker_stage0_inputs import is_underpowered, n_eff_gov
+from scripts.analysis.maker_stage0_rows import PosRow, SdRow, in_denominator, nz
+from scripts.analysis.maker_stage0_scored import (
+    NO_FINAL,
+    OUTCOME_NO,
+    OUTCOME_VOID,
+    BidStats,
+    Section69,
+    bid_stats,
+    days_to_200,
+    section_69,
+)
+
+__all__ = [
+    "NO_FINAL",
+    "OUTCOME_NO",
+    "OUTCOME_VOID",
+    "BidStats",
+    "PosRow",
+    "SdRow",
+    "Section69",
+    "bid_stats",
+    "days_to_200",
+    "in_denominator",
+    "nz",
+    "section_69",
+]  # re-exports: public import paths survive the WP5 split
 
 UNDERPOWERED: Final[str] = "UNDERPOWERED-WAIT"
 NO_GO_FILL: Final[str] = "NO-GO (fill)"
@@ -33,150 +57,13 @@ _ROW_LABELS: Final[dict[str, str]] = {
     "V3": NO_GO_STRESS,
     "V4": NOT_KILLED_UNSCREENED,
 }
-OUTCOME_NO: Final[str] = "NO"
-OUTCOME_VOID: Final[str] = "VOID"  # excluded from section 6.9; refund 0 in the expectancy
-NO_FINAL: Final[str] = ""  # no CLI FINAL: excluded from section 6.9 and counted
-_LOSSES: Final[frozenset[str]] = frozenset({"YES", "UNRESOLVED"})  # unresolved past D+14 = LOSS
-_OUTCOMES: Final[frozenset[str]] = _LOSSES | {OUTCOME_NO, OUTCOME_VOID, NO_FINAL}
 COVERAGE_LIVE_SHARE: Final[float] = 0.5  # (i)4: covered_live_h >= 0.5 * process_live_h
 GAP_SHARE_LIMIT: Final[float] = 0.5
-TARGET_POSITIONS: Final[int] = 200
 MAX_RUNGS_HYPOTHESIS: Final[int] = 2
 
 
 class NoBidBearingDays(ValueError):
     """S-4 (r4 (a)): n_sd = 0 is degenerate; no rate is computable."""
-
-
-# --- rows -------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, kw_only=True)
-class SdRow:
-    """``station_days.csv`` (r4 (g)); replay fields are None where the day was not replayed.
-
-    ``rung_trials_attempted`` (position-unit denominator) and ``n_no_book_wants`` (WP4 re-check M1:
-    wanted rungs that never had a book) are appended after the contract columns.
-    """
-
-    station: str
-    climate_day: str
-    cluster_id: str
-    unit_hypothesis: str
-    census_reason: str | None = None
-    covered_bidlive: bool = False
-    covered: bool = False
-    outage_excluded: bool = False
-    node_log_absent: bool = False
-    bid_bearing: bool | None = None
-    guard_refused_only: bool | None = None
-    n_depth_frames: int | None = None
-    has_depth_frame: bool | None = None
-    n_attempts: int | None = None
-    n_episodes: int | None = None
-    n_refused: int | None = None
-    n_process_cuts: int | None = None
-    n_gtd_cuts: int | None = None
-    rung_trials_posted: int | None = None
-    rung_trials_filled_base: int | None = None
-    rung_trials_filled_stress: int | None = None
-    process_live_h: float | None = None
-    forecast_valid_h: float | None = None
-    gap_h: float | None = None
-    covered_live_h: float | None = None
-    gap_share: float | None = None
-    filled_pairs_base: int | None = None
-    filled_pairs_stress: int | None = None
-    k1_rung_id: str | None = None
-    k1_filled_base: int | None = None
-    k1_filled_stress: int | None = None
-    bid_median_fills_stress: float | None = None
-    nogo_driving: bool | None = None
-    positions_filled_k2_base: int | None = None
-    positions_filled_k2_stress: int | None = None
-    positions_filled_k1_base: int | None = None
-    positions_filled_k1_stress: int | None = None
-    delta_ns: int | None = None
-    truth_final: bool | None = None
-    truth_tmax_f: int | None = None
-    void: bool | None = None
-    unresolved_d14: bool | None = None
-    theta: float | None = None
-    rung_trials_attempted: int | None = None
-    n_no_book_wants: int | None = None
-
-    def cluster_key(self, cluster: str) -> object:
-        return self.climate_day
-
-
-@dataclass(frozen=True, kw_only=True)
-class PosRow:
-    """``scored_episodes.csv`` row; ``truth_final`` is "", YES, NO, VOID or UNRESOLVED."""
-
-    position_id: str
-    rung_trial_id: str
-    station: str
-    climate_day: str
-    unit_hypothesis: str
-    bid: float
-    filled_base: bool
-    filled_stress: bool
-    p_yes_point_live: float | None
-    truth_final: str
-
-    def cluster_key(self, cluster: str) -> object:
-        return self.climate_day
-
-
-def nz(value: float | None) -> float:
-    return 0.0 if value is None else float(value)
-
-
-def in_denominator(row: SdRow) -> bool:
-    """Covered, not outage-excluded, bid-bearing (or with a never-booked want; WP4 M1)."""
-    booked = bool(row.bid_bearing) or nz(row.n_no_book_wants) > 0
-    return row.covered and not row.outage_excluded and booked
-
-
-# --- section 6.9 over scored rows -------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Section69(st.Screen):
-    """The pooled screen plus the exclusions the report must count (r4 (i)6)."""
-
-    excluded_no_final_filled: int
-    excluded_no_final_unfilled: int
-    excluded_no_final_days: int
-    n_void_excluded: int
-
-
-def section_69(rows: Sequence[PosRow]) -> Section69:
-    kept: list[st.ScreenRow] = []
-    no_final = {True: 0, False: 0}
-    no_final_days: set[tuple[str, str]] = set()
-    voids = 0
-    for r in rows:
-        if r.truth_final not in _OUTCOMES:
-            raise ValueError(f"unknown settlement token {r.truth_final!r} on {r.position_id}")
-        if r.truth_final == OUTCOME_VOID:
-            voids += 1
-        elif r.truth_final == NO_FINAL:
-            no_final[r.filled_base] += 1
-            no_final_days.add((r.station, r.climate_day))
-        elif r.p_yes_point_live is None:
-            raise ValueError(f"scored row {r.position_id} has no p_yes_point_live")
-        else:
-            loss = r.truth_final in _LOSSES
-            kept.append(st.ScreenRow(r.p_yes_point_live, loss, r.filled_base, r.climate_day))
-    screen = st.pooled_screen(kept)
-    return Section69(
-        **{f.name: getattr(screen, f.name) for f in fields(screen)},
-        excluded_no_final_filled=no_final[True],
-        excluded_no_final_unfilled=no_final[False],
-        excluded_no_final_days=len(no_final_days),
-        n_void_excluded=voids,
-    )
 
 
 # --- rates ------------------------------------------------------------------------------------
@@ -274,23 +161,6 @@ def expectancy(fills: Sequence[PosRow], theta: Mapping[tuple[str, str], float]) 
     )  # fmt: skip
 
 
-@dataclass(frozen=True)
-class BidStats:
-    b: float | None
-    iqr: tuple[float, float] | None
-    n_stressed_fills: int
-    median_base: float | None
-
-
-def bid_stats(rows: Sequence[PosRow]) -> BidStats:
-    stressed = [r.bid for r in rows if r.filled_stress]
-    base = [r.bid for r in rows if r.filled_base]
-    return BidStats(
-        st.lower_median(stressed), st.inverted_cdf_iqr(stressed), len(stressed),
-        st.lower_median(base),
-    )  # fmt: skip
-
-
 # --- coverage sensitivity, days to 200 --------------------------------------------------------
 
 
@@ -317,17 +187,6 @@ def coverage_sensitivity(den: Sequence[SdRow]) -> Coverage:
         len(den), len(kept), pt["base_sd"], pt["stress_sd"], pt["base_pos"], pt["stress_pos"],
         len(nogo), gappy,
     )  # fmt: skip
-
-
-def days_to_200(rows: Sequence[SdRow]) -> dict[str, float | None]:
-    """200 / (positions per distinct covered climate date); None when nothing fills."""
-    live = [r for r in rows if r.covered and not r.outage_excluded]
-    dates = len({r.climate_day for r in live})
-    out: dict[str, float | None] = {}
-    for key in ("k2_base", "k2_stress", "k1_base", "k1_stress"):
-        total = sum(nz(getattr(r, f"positions_filled_{key}")) for r in live)
-        out[key] = TARGET_POSITIONS * dates / total if total > 0 else None
-    return out
 
 
 # --- per-hypothesis analysis ------------------------------------------------------------------

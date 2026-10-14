@@ -789,3 +789,22 @@ def test_wp5_modules_do_not_import_the_truth_loader() -> None:
             for a in n.names
         }
         assert not imported & {"load_truth", "TruthTable"}, name
+
+
+def test_wp5_module_line_counts_under_ceiling() -> None:
+    root = Path(__file__).resolve().parents[2] / "scripts/analysis"
+    for name in ("rows", "scored", "stats", "tables", "verdict"):
+        path = root / f"maker_stage0_{name}.py"
+        assert len(path.read_text().splitlines()) < 400, name
+
+
+def test_wp5_split_reexports_keep_public_import_paths() -> None:
+    from scripts.analysis import maker_stage0_rows as rw
+
+    for name in ("SdRow", "PosRow", "nz", "in_denominator"):
+        assert getattr(vd, name) is getattr(rw, name)
+    for name in (
+        "sd_rows_to_csv", "pos_rows_to_csv", "tail_rows_to_csv", "read_station_days_csv",
+        "read_scored_csv", "read_tail_csv", "sd_row_from_summary",
+    ):  # fmt: skip
+        assert getattr(tb, name) is getattr(rw, name)
