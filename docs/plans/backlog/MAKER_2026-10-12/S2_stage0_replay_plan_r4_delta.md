@@ -325,6 +325,14 @@ All are resolved: 1 → (a); 2 → (f) and (n)2; 3 → (n)1; 4 → amendment §2
 ## (p) Final-round disposition (2026-10-13; `reviews/S2-r4-pmr-final.md`, `reviews/S2-r4-mle-final.md`)
 Both READY-WITH-EDITS, text only. Applied by the coordinator: MLE E-1 → (a); E-2 → (c); E-3 → (g); E-4 → (k). PMR E-A → (d), (i)1, amendment §1; E-B → (f); E-C → (f), (n)4; E-D → (c), amendment §3; E-E → amendment §2; E-F → amendment §1. (o)2 resolved by E-1 (public `summarise` API). **Status: READY.** Build on the (k) list may start; the amendment goes FINAL only after the frozen block is filled.
 
+## (q) WP1 pinned readings (2026-10-14; `reviews/S2-WP1-mle-review.md` rulings; frozen before any run)
+1. **Outage rule, permit clause.** "Permit line inside the window" means the permit's validity `[issued_at, expires_at)` MEETS [16:50Z, 02:50Z); a node booted before 16:50Z whose permit is still valid is LIVE, not an outage.
+2. **Boot `asctime` is UTC.** The scan checks the file's first timestamp is within 120 s of the filename's UTC stamp (`breezy-trade-YYYYMMDDTHHMMSSZ.log`); a mismatch makes the day `node_log_absent` (reason recorded), never OUTAGE.
+3. **Launch grace.** A log whose first line is the boot line and starts within 10 min after 16:50Z counts as fully covering the window; any other partial file is `node_log_absent`.
+4. **Launch vs relaunch.** The first in-window boot is the launch; later boots are relaunches (overlay only; never sets the label); a boot that dies before minting a permit is not a relaunch cut unless a later permit follows.
+5. **Addendum forbidden set (stricter than amendment §3, pinned here).** A `.void` run directory may be re-run only if its void-time `tree_sha256` (recorded in the ledger) still matches AND none of `scored_episodes.csv`, `s3_inputs.json`, `verdict.*`, `station_days.csv`, `stress_*_station_days.csv`, `overlay_station_days.csv`, the report `.md` exists. The ledger claim is a single flocked check-and-append.
+6. **Truth licence filter.** `load_truth` parses only the frozen-set (station, day) keys; sealed 2026-10-01 and days > 2026-10-13 are never parsed; conflict messages carry no tmax values.
+
 ## (o) Rev 2 residual notes (for the verification round)
 1. Verify-first day fixed at 2026-06-30 (last fit-slice day); whether the NBP store and truth CSV hold rows for it is checked at run-time step 5 and fails closed (dated addendum before step 5 if missing).
 2. `_n_eff` is private in S1; the plan imports only `RHO_ASSUMED`/`N_EFF_FLOOR` and tests equality against `_n_eff`. If a lint rule blocks a test importing a private name, S1 needs a public alias (S1-owned code).
