@@ -8,6 +8,7 @@ static ``POLYMARKET_US_MARKET_SLUGS`` implementation cannot pass.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -910,3 +911,114 @@ async def test_a_raising_failure_alert_never_aborts_discovery() -> None:
     await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES + 1)
 
     _assert_registered_cohort_loaded(provider, registered, boston)
+
+
+# -- MAKER-S4 WP1 step 0: 71-market listing characterisation (L-33) ------------------------------
+# The 2026-10-13 WP0 listing: 60 daily `tc-temp-<city>high-<date>-<bounds>` markets plus 11
+# non-daily `futures` markets. Synthetic payloads; no venue contact.
+
+_WP1S0_DAILY_CITIES: tuple[tuple[str, str], ...] = (
+    ("nyc", "New York"),
+    ("mia", "Miami"),
+    ("mdw", "Chicago"),
+    ("lax", "Los Angeles"),
+    ("sfo", "San Francisco"),
+)
+_WP1S0_CITY_CODES: tuple[str, ...] = tuple(token for token, _name in _WP1S0_DAILY_CITIES)
+_WP1S0_DATE = "2026-10-20"
+_WP1S0_YEAR_RANK_QUESTION = "Will 2026 be the hottest year on record globally?"
+_WP1S0_SJC_SLUG = "tc-temp-sjc-dec-lt40"
+
+
+def _wp1s0_daily_markets() -> list[dict[str, Any]]:
+    return [
+        _weather_market(token, name, climate_date=_WP1S0_DATE, bounds=f"gte{low}lt{low + 1}f")
+        for token, name in _WP1S0_DAILY_CITIES
+        for low in range(60, 72)
+    ]
+
+
+def _wp1s0_non_daily_markets() -> list[dict[str, Any]]:
+    markets: list[dict[str, Any]] = []
+    for year in (2026, 2027):
+        for rank in ("1st", "2nd", "3rd", "4th", "lte5th"):
+            market = market_with_slug(f"trc-yr-httst-rnk-glbl-{year}-{rank}")
+            market["question"] = f"Will {year} be the hottest year on record globally?"
+            markets.append(market)
+    sjc = market_with_slug(_WP1S0_SJC_SLUG)
+    sjc["question"] = "Will the highest temperature in San Jose in December be below 40°F?"
+    markets.append(sjc)
+    return markets
+
+
+def _wp1s0_listing() -> list[dict[str, Any]]:
+    return [*_wp1s0_daily_markets(), *_wp1s0_non_daily_markets()]
+
+
+@pytest.mark.asyncio
+async def test_discovery_on_71_market_listing_yields_60_daily_and_skips_11_non_daily_without_raising() -> (  # noqa: E501
+    None
+):
+    listing = _wp1s0_listing()
+    assert len(listing) == 71
+    provider, _transport, _logger = provider_for_pages(
+        [page_with(*listing)],
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=100, city_codes=_WP1S0_CITY_CODES),
+    )
+
+    discovered, sightings = await provider._discover_markets()
+
+    expected = [str(m["slug"]) for m in _wp1s0_daily_markets()]
+    assert [market.slug for market in discovered] == expected
+    assert len(expected) == 60
+    assert sightings == ()
+    skipped = {str(m["slug"]) for m in listing} - {market.slug for market in discovered}
+    assert len(skipped) == 11
+    assert _WP1S0_SJC_SLUG in skipped
+
+
+def test_non_daily_slug_whose_question_matches_daily_grammar_still_raises() -> None:
+    market = market_with_slug("trc-yr-httst-rnk-glbl-2026-1st")
+    market["question"] = "Highest temperature in Phoenix on 2026-10-20"
+
+    with pytest.raises(VenuePayloadError, match="does not match the observed weather grammar"):
+        _weather_market_payloads(page_with(market), _WP1S0_CITY_CODES)
+
+
+def test_daily_shaped_slug_that_fails_to_parse_raises() -> None:
+    market = market_with_slug("tc-temp-laxhigh-2026-13-45-gte89lt90f")
+    market["question"] = "Highest temperature in Los Angeles on 2026-13-45?"
+
+    with pytest.raises(VenuePayloadError):
+        _weather_market_payloads(page_with(market), _WP1S0_CITY_CODES)
+
+
+def test_tolerance_audit_fee_drift_pull_filter_drops_the_11_non_daily_markets() -> None:
+    import asyncio
+    import importlib.util
+
+    path = REPO_ROOT / "scripts" / "venue" / "fee_drift_evidence_pull.py"
+    spec = importlib.util.spec_from_file_location("wp1s0_fee_drift_pull", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    class _Client:
+        async def get_public(
+            self, path: str, *, query: Mapping[str, Any] | None = None, quota_key: str
+        ) -> Mapping[str, Any]:
+            return page_with(*_wp1s0_listing())
+
+    _raw, weather = asyncio.run(module.list_weather_markets(_Client(), limit=100))
+
+    assert [m["slug"] for m in weather] == [str(m["slug"]) for m in _wp1s0_daily_markets()]
+
+
+def test_tolerance_audit_capture_audit_station_day_returns_none_on_the_11_non_daily_slugs() -> None:
+    from breezy.analysis.capture_audit import _station_day
+
+    non_daily = [str(m["slug"]) for m in _wp1s0_non_daily_markets()]
+    assert len(non_daily) == 11
+    assert all(_station_day(slug) is None for slug in non_daily)
+    assert _station_day("tc-temp-nychigh-2026-10-20-gte60lt61f") is not None
