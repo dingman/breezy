@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -32,14 +33,12 @@ from breezy.strategy.ladder_ev.quantile_density import (
     apply_emos,
     build_cdf,
 )
+from scripts.analysis import maker_stage0_pno as pno
 from scripts.analysis.maker_stage0_pno import (
     STALE_H,
-    AlignmentLine,
     PNoStore,
     StationRefusedError,
-    VintageAgeLine,
     load_p_no,
-    verify_first_s6,
 )
 from scripts.analysis.nbp_backfill import derive_rows_for_bulletin
 
@@ -192,7 +191,7 @@ def test_13z_day_d_cycle_never_feeds_day_d(tmp_path: Path) -> None:
     store = _store(root)
     at = _ns(DAY, 15, 0)  # the 13Z D cycle is available (14:04Z); the 01Z D vector is 12.9 h old
     assert load_p_no(store, "LAX", DAY, at, stress="none") is None
-    assert store.abstentions["forecast_stale"] == 1
+    assert store.abstention_counts[("none", "forecast_stale")] == 1
     assert all(cycle != _ns(DAY, 13) for cycle, _ in store.consumed_cycles())
 
 
@@ -209,13 +208,13 @@ def test_vector_for_another_climate_day_abstains_day_mismatch(tmp_path: Path) ->
     _write(root, next_day)
     store = _store(root)
     assert load_p_no(store, "LAX", DAY, _ns(DAY, 3, 0), stress="none") is None
-    assert store.abstentions["forecast_day_mismatch"] == 1
+    assert store.abstention_counts[("none", "forecast_day_mismatch")] == 1
 
 
 def test_vector_not_yet_available_is_invisible(tmp_path: Path) -> None:
     store = _store(_build_root(tmp_path))
     assert load_p_no(store, "LAX", DAY, _ns(dt.date(2026, 9, 28), 14, 3), stress="none") is None
-    assert store.abstentions["no_vector"] == 1
+    assert store.abstention_counts[("none", "forecast_not_yet_available")] == 1
 
 
 def test_available_at_must_precede_decision_instant(tmp_path: Path) -> None:
@@ -236,13 +235,13 @@ def test_vector_older_than_8h_is_stale(tmp_path: Path) -> None:
     assert fresh is not None
     assert fresh.vintage_age_s == STALE_H * 3600
     assert load_p_no(store, "LAX", DAY, limit + 1, stress="none") is None
-    assert store.abstentions["forecast_stale"] == 1
+    assert store.abstention_counts[("none", "forecast_stale")] == 1
 
 
 def test_unknown_era_yields_none(tmp_path: Path) -> None:
     store = _store(_build_root(tmp_path), calibration=_calibration(("v4.2",)))
     assert load_p_no(store, "LAX", DAY, _ns(dt.date(2026, 9, 28), 16, 50), stress="none") is None
-    assert store.abstentions["unknown_era"] == 1
+    assert store.abstention_counts[("none", "unknown_era")] == 1
 
 
 def test_only_three_pinned_cycles_are_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,23 +323,162 @@ def test_consumed_cycles_are_reported_for_pins(tmp_path: Path) -> None:
     )
 
 
-def test_verify_first_runs_only_on_2026_06_30_and_emits_no_fill_output(tmp_path: Path) -> None:
-    june = dt.date(2026, 6, 30)
-    shift = (june - DAY).days
-    root = tmp_path / "june"
-    for hour in (13, 19, 1):
-        _write(root, _shift(_derive(hour, LAST_MODIFIED[hour]), shift))
-    with pytest.raises(ValueError, match="2026-06-30"):
-        verify_first_s6(root, DAY)
-    report = verify_first_s6(root, june)
-    assert report.climate_day == june
-    assert {line.station for line in report.alignment} == {"LAX", "MDW", "MIA", "SFO"}
-    assert all(line.matches_climate_day_for_txn for line in report.alignment)
-    assert {line.instant for line in report.vintage_age} == {"16:50Z D-1", "00:00Z D", "02:50Z D"}
-    assert all(line.within_tolerance for line in report.vintage_age)
-    names = {f.name for f in dataclasses.fields(report)}
-    assert names == {"climate_day", "alignment", "vintage_age"}
-    forbidden = ("fill", "bid", "episode", "p_no", "p_yes", "truth")
-    lines: tuple[AlignmentLine | VintageAgeLine, ...] = (*report.alignment, *report.vintage_age)
-    for line in lines:
-        assert not any(w in f.name for f in dataclasses.fields(line) for w in forbidden)
+D_MINUS_1 = dt.date(2026, 9, 28)
+AT_1650 = _ns(D_MINUS_1, 16, 50)
+
+
+def _classify(
+    store: PNoStore, ts: int, *, stress: pno.Stress = "none", station: str = "LAX"
+) -> object:
+    return pno.classify_p_no(store, station, DAY, ts, stress=stress)
+
+
+def test_classify_returns_reason_per_call(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    early = _classify(store, _ns(D_MINUS_1, 14, 3))
+    assert early == pno.AbstainReason("forecast_not_yet_available", "LAX", DAY, "none")
+    assert isinstance(_classify(store, AT_1650), pno.PNoAtInstant)
+    stale = _classify(store, _ns(DAY, 12, 0))
+    assert isinstance(stale, pno.AbstainReason) and stale.reason == "forecast_stale"
+    assert load_p_no(store, "LAX", DAY, _ns(DAY, 12, 0), stress="none") is None
+
+
+def test_no_vector_when_station_day_has_no_licensed_vectors(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path, hours=()))
+    result = _classify(store, AT_1650)
+    assert isinstance(result, pno.AbstainReason) and result.reason == "no_vector"
+
+
+def test_abstentions_are_a_set_keyed_by_station_day_and_stress(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    before = _ns(D_MINUS_1, 14, 3)
+    _classify(store, before)
+    _classify(store, before)
+    _classify(store, before, stress="poll_lag")
+    assert store.abstentions == {
+        ("LAX", DAY, "none", "forecast_not_yet_available"),
+        ("LAX", DAY, "poll_lag", "forecast_not_yet_available"),
+    }
+    assert store.abstention_counts[("none", "forecast_not_yet_available")] == 2
+    assert store.abstention_counts[("poll_lag", "forecast_not_yet_available")] == 1
+    assert store.abstention_counts[("plus60", "forecast_not_yet_available")] == 0
+
+
+def test_covered_but_never_forecast_visible_shrinks_when_served(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    days = [("LAX", DAY)]
+    _classify(store, _ns(D_MINUS_1, 14, 3))
+    assert pno.covered_but_never_forecast_visible(store, days, stress="none") == frozenset(days)
+    _classify(store, AT_1650)
+    assert pno.covered_but_never_forecast_visible(store, days, stress="none") == frozenset()
+    assert pno.covered_but_never_forecast_visible(store, days, stress="plus60") == frozenset(days)
+
+
+def test_nan_draw_abstains_nonfinite_p_yes(tmp_path: Path) -> None:
+    nan = dataclasses.replace(
+        _calibration(), draws_by_version={"v5.0": (EmosParams(float("nan"), 0.0, 1.0),)}
+    )
+    store = _store(_build_root(tmp_path), calibration=nan)
+    result = _classify(store, AT_1650)
+    assert isinstance(result, pno.AbstainReason) and result.reason == "nonfinite_p_yes"
+    assert store.abstention_counts[("none", "nonfinite_p_yes")] == 1
+
+
+def test_p_yes_outside_unit_interval_is_nonfinite_abstention() -> None:
+    assert pno.p_yes_is_valid({"a": pno.PYes(0.5, 0.4, 0.6)})
+    assert not pno.p_yes_is_valid({"a": pno.PYes(1.5, 0.4, 0.6)})
+    assert not pno.p_yes_is_valid({"a": pno.PYes(0.5, float("inf"), 0.6)})
+
+
+def test_p_yes_mapping_is_immutable(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    result = _classify(store, AT_1650)
+    assert isinstance(result, pno.PNoAtInstant)
+    with pytest.raises(TypeError):
+        result.bounds["r82"] = pno.PYes(0.0, 0.0, 0.0)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.p_yes_point_live["r82"] = 0.0  # type: ignore[index]
+
+
+def test_release_instants_lists_every_licensed_vector_sorted(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    expected = (_ns(D_MINUS_1, 14, 4), _ns(D_MINUS_1, 20, 17), _ns(DAY, 2, 4))
+    assert pno.release_instants(store, "LAX", DAY, stress="none") == expected
+
+
+def test_release_instants_apply_stress_shift(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    lag = DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS * 10**9
+    base = pno.release_instants(store, "LAX", DAY, stress="none")
+    assert pno.release_instants(store, "LAX", DAY, stress="poll_lag") == tuple(
+        t + lag for t in base
+    )
+
+
+def test_release_instants_plus60_shifts_only_floor_governed(tmp_path: Path) -> None:
+    root = _build_root(tmp_path, last_modified={13: LAST_MODIFIED[13], 19: None, 1: None})
+    store = _store(root)
+    got = pno.release_instants(store, "LAX", DAY, stress="plus60")
+    floor = PUBLICATION_LAG_FLOOR_NS
+    assert got == (
+        _ns(D_MINUS_1, 14, 4),
+        _ns(D_MINUS_1, 19) + floor + 3600 * 10**9,
+        _ns(DAY, 1) + floor + 3600 * 10**9,
+    )
+
+
+def test_assert_decision_before_rejects_a_later_decision() -> None:
+    pno.assert_decision_before(10, 11)
+    pno.assert_decision_before(10, 10)
+    with pytest.raises(ValueError, match="decision"):
+        pno.assert_decision_before(11, 10)
+
+
+def test_unloaded_station_day_raises_named_error(tmp_path: Path) -> None:
+    store = _store(_build_root(tmp_path))
+    other = dt.date(2026, 9, 30)
+    with pytest.raises(pno.StationDayNotLoadedError, match="LAX.*2026-09-30"):
+        pno.classify_p_no(store, "LAX", other, AT_1650, stress="none")
+    with pytest.raises(pno.StationDayNotLoadedError):
+        pno.classify_p_no(store, "MIA", DAY, AT_1650, stress="none")
+
+
+def test_corrupt_partition_is_wrapped_with_path(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    bad = partition_path(root, D_MINUS_1, 19)
+    bad.write_bytes(b"not a parquet file")
+    with pytest.raises(pno.PNoStoreReadError, match="nbp_20260928_19z"):
+        _store(root)
+
+
+def test_missing_partition_is_logged_and_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = _build_root(tmp_path, hours=(13, 1))
+    with caplog.at_level(logging.WARNING):
+        store = _store(root)
+    assert store.missing_cycles == frozenset({(D_MINUS_1, 19)})
+    assert "19" in caplog.text and "missing" in caplog.text
+
+
+def test_gapped_ladder_falls_back_but_other_value_errors_propagate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _build_root(tmp_path)
+    gapped = (Rung("lt80", None, 79), Rung("r84", 84, None))  # gap 80..83
+    store = PNoStore.from_root(
+        root, stations=("LAX",), days=[DAY], calibration=_calibration(),
+        ladders={("LAX", DAY): gapped},
+    )  # fmt: skip
+    assert isinstance(_classify(store, AT_1650), pno.PNoAtInstant)
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("needs at least one draw")
+
+    monkeypatch.setattr(pno, "rung_probability_interval", boom)
+    with pytest.raises(ValueError, match=r"p_yes failed for LAX 2026-09-29.*at least one draw"):
+        _classify(_store(root), AT_1650)
+
+
+def test_site_is_cached() -> None:
+    assert pno.site("LAX") is pno.site("LAX")
