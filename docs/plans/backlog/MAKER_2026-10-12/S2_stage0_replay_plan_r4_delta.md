@@ -333,6 +333,14 @@ Both READY-WITH-EDITS, text only. Applied by the coordinator: MLE E-1 → (a); E
 5. **Addendum forbidden set (stricter than amendment §3, pinned here).** A `.void` run directory may be re-run only if its void-time `tree_sha256` (recorded in the ledger) still matches AND none of `scored_episodes.csv`, `s3_inputs.json`, `verdict.*`, `station_days.csv`, `stress_*_station_days.csv`, `overlay_station_days.csv`, the report `.md` exists. The ledger claim is a single flocked check-and-append.
 6. **Truth licence filter.** `load_truth` parses only the frozen-set (station, day) keys; sealed 2026-10-01 and days > 2026-10-13 are never parsed; conflict messages carry no tmax values.
 
+## (r) WP5 contract additions (2026-10-14; `reviews/S2-WP5-pmr-review.md`, `S2-WP5-python-review.md`; applied 98c57c5e)
+1. `station_days.csv` gains two REQUIRED columns after the (g) list: `rung_trials_attempted` (WP4) and `n_no_book_wants` (count of wanted RUNGS that never had a book; WP6 computes). Position-unit denominator = `rung_trials_attempted + n_no_book_wants`. Missing column or blank cell on a denominator row → refusal; an empty position unit on a non-empty denominator → refusal (never silently the station-day label).
+2. Hypothesis set is passed in from the WP1 unit loader (`analyse_all(sd, pos, hypotheses)`, `decide(analyses, hypotheses)`, `render_tables`/`tables_from_csvs(..., hypotheses=…)`); a hypothesis with no rows or rows for an unknown hypothesis → refusal.
+3. Truth tokens in `scored_episodes.csv` `truth_final`: `""` = no FINAL truth row (excluded from §6.9 and counted); `YES`/`NO`; `VOID`; `UNRESOLVED` only for a FINAL row the spec §6.5 D+14 rule scores as a loss. WP6 derives both truth fields from one function. A missing `p_yes_point_live` on a settled fill → refusal.
+4. VOID: excluded from §6.9 and from `win_rate`/`mean_p_no`; stays in the expectancy with w=0 and the fee charged; `n_void` reported. §6.9 is also rendered on STRESSED fills, report-only. Tests A and B are each at 0.05 uncorrected (stated in the report). Tail test footnoted anti-conservative. `r_lo*` null-if-any-hypothesis-not-estimable; S3 treats null as REFUSE.
+5. `tail_reliability.csv` columns: `station,climate_day,vector,p_yes,outcome`. CSV codec: `CsvCellError` names row (1-based physical line) and column; ragged rows, `nan`, and `""` in `str | None` fields are refused (lossless round trip, property-tested).
+6. θ range check belongs to the WP6 driver (refuse θ outside [0, 0.2]).
+
 ## (o) Rev 2 residual notes (for the verification round)
 1. Verify-first day fixed at 2026-06-30 (last fit-slice day); whether the NBP store and truth CSV hold rows for it is checked at run-time step 5 and fails closed (dated addendum before step 5 if missing).
 2. `_n_eff` is private in S1; the plan imports only `RHO_ASSUMED`/`N_EFF_FLOOR` and tests equality against `_n_eff`. If a lint rule blocks a test importing a private name, S1 needs a public alias (S1-owned code).
