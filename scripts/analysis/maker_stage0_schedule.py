@@ -11,9 +11,11 @@ Plan r4 delta (d). One schedule source decides the label: the PRIMARY (nominal) 
 (``node_log_absent``)
   and full-day outage days keep the PRIMARY schedule.
 
-A boot line is the day's LAUNCH (no cut) unless the node was already up when the window opened
-(a permit issued before ``start`` that is still valid then): then every in-window boot is a
-relaunch.
+The first in-window boot line is the day's LAUNCH (no cut) unless the node was already up when
+the window opened (a still-valid permit issued before ``start``, or a boot before ``start`` in a
+log that runs through the window end): then every in-window boot is a relaunch candidate. A later
+boot is a ``RELAUNCH`` cut only if it minted a permit (a boot that dies first is surfaced by
+``boots_without_permit``, never cut). Logs failing the UTC file-name check are absent.
 """
 
 from __future__ import annotations
@@ -26,12 +28,15 @@ from pathlib import Path
 from typing import Any, Final
 
 from breezy.runtime.trade_supervisor_core import STOP_PRIOR_UTC
+from scripts.analysis.maker_stage0_inputs import write_text_atomic
 from scripts.analysis.maker_stage0_nodelog import (
     LogStatus,
     NodeLogScan,
+    boot_minted_permit,
     boots_in_window,
     classify_day,
-    permit_meets_window,
+    node_up_at_start,
+    usable,
 )
 from scripts.analysis.nbp_shadow_parity_pure import permit_window_for_day
 
@@ -105,18 +110,15 @@ def day_log_status(
 
 def _relaunch_instants(scans: Sequence[NodeLogScan], base: DaySchedule) -> list[int]:
     boots = boots_in_window(scans, base.window)
-    already_up = any(
-        p.issued_ns < base.window_start_ns and permit_meets_window(p, base.window)
-        for scan in scans
-        for p in scan.permits
-    )
-    return boots if already_up else boots[1:]
+    candidates = boots if node_up_at_start(scans, base.window) else boots[1:]
+    return [b for b in candidates if boot_minted_permit(scans, b)]
 
 
 def overlay_schedule(
     days: Iterable[dt.date], scans: Sequence[NodeLogScan]
 ) -> dict[dt.date, DaySchedule]:
     """Report-only: PRIMARY plus a ``RELAUNCH`` cut per logged mid-day boot on covered LIVE days."""
+    scans = usable(scans)
     status = day_log_status(days, scans)
     out: dict[dt.date, DaySchedule] = {}
     for day, state in status.items():
@@ -149,7 +151,5 @@ def write_schedule(
     path: Path, schedule: Mapping[dt.date, DaySchedule], *, kind: str = "PRIMARY"
 ) -> Path:
     """Deterministic JSON (``process_schedule.json`` / ``process_schedule_overlay.json``)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(schedule_to_dict(schedule, kind=kind), indent=2, sort_keys=True)
-    path.write_text(body + "\n", encoding="utf-8")
-    return path
+    return write_text_atomic(path, body + "\n")

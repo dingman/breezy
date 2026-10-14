@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -25,8 +26,9 @@ from scripts.analysis.maker_stage0_frozen import (
 )
 from scripts.analysis.maker_stage0_inputs import TruthTable
 from scripts.analysis.maker_stage0_ledger import (
+    FORBIDDEN_RESULT_GLOBS,
     LedgerRefused,
-    append_ledger_entry,
+    claim_verdict_run,
     ledger_refuses,
     load_addendum,
     tree_digest,
@@ -167,6 +169,33 @@ def test_replay_refuses_day_outside_frozen_set_or_amendment_sha_mismatch(tmp_pat
         load_amendment(path, good)
 
 
+def _amendment(tmp_path: Path, text: str) -> tuple[Path, str]:
+    path = tmp_path / "amend.md"
+    path.write_text(text)
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_an_amendment_without_a_positive_final_status_line_is_refused(tmp_path: Path) -> None:
+    body = _block(_fields()).replace("Status: **FINAL**\n", "")
+    path, sha = _amendment(tmp_path, body)
+    with pytest.raises(FrozenSetRefused, match="FINAL"):
+        load_amendment(path, sha)
+    path, sha = _amendment(tmp_path, body.replace("# ruling\n", "# ruling\nStatus: pending\n"))
+    with pytest.raises(FrozenSetRefused, match="FINAL"):
+        load_amendment(path, sha)
+    plain, sha = _amendment(tmp_path, _block(_fields()).replace("**FINAL**", "FINAL"))
+    assert load_amendment(plain, sha).first_replayable_day == FIRST
+
+
+def test_an_unreadable_or_non_utf8_amendment_is_refused_typed(tmp_path: Path) -> None:
+    with pytest.raises(FrozenSetRefused, match="amendment"):
+        load_amendment(tmp_path / "nope.md", SHA)
+    bad = tmp_path / "bad.md"
+    bad.write_bytes(b"Status: FINAL \xff\xfe\n")
+    with pytest.raises(FrozenSetRefused, match="utf-8"):
+        load_amendment(bad, hashlib.sha256(bad.read_bytes()).hexdigest())
+
+
 # --- rule ---------------------------------------------------------------------------------
 
 
@@ -213,6 +242,26 @@ def test_frozen_dataclass_is_immutable() -> None:
 # --- ledger -------------------------------------------------------------------------------
 
 NOW = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.UTC)
+CODE = "c" * 40
+
+
+def _claim(
+    ledger: Path,
+    runs: Path,
+    run_id: str,
+    addendum: object = None,
+    *,
+    sha: str = SHA,
+) -> str | None:
+    return claim_verdict_run(
+        ledger,
+        amendment_sha=sha,
+        run_id=run_id,
+        code_sha=CODE,
+        now=NOW,
+        runs_root=runs,
+        addendum=addendum,  # type: ignore[arg-type]
+    )
 
 
 def _run(runs_root: Path, run_id: str, *, void: bool, files: tuple[str, ...] = ()) -> Path:
@@ -228,63 +277,116 @@ def _addendum(path: Path, run_id: str) -> tuple[Path, str]:
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _voided(tmp_path: Path, run_id: str, files: tuple[str, ...]) -> tuple[Path, Path, Path]:
+    """A claimed run that died: claim, create its dir, void it through the helper."""
+    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
+    assert _claim(ledger, runs, run_id) is None
+    run = _run(runs, run_id, void=False, files=files)
+    void_run_dir(run, ledger=ledger, now=NOW)
+    return ledger, runs, runs / f"{run_id}.void"
+
+
 def test_verdict_ledger_refuses_second_run_without_void_addendum(tmp_path: Path) -> None:
     ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
     assert ledger_refuses(ledger, SHA, runs) is None  # no ledger yet
-    append_ledger_entry(ledger, amendment_sha=SHA, run_id="r1", code_sha="c" * 40, now=NOW)
-    reason = ledger_refuses(ledger, SHA, runs)
+    assert _claim(ledger, runs, "r1") is None
+    reason = _claim(ledger, runs, "r2")
     assert reason is not None and "r1" in reason
+    assert len(ledger.read_text().splitlines()) == 1  # the refused claim appended nothing
     # An entry for a different amendment does not block this one.
-    assert ledger_refuses(ledger, "ef" * 32, runs) is None
-    # The entry is a keyed JSON line.
-    (line,) = ledger.read_text().splitlines()
-    assert json.loads(line)["amendment_sha"] == SHA
+    assert _claim(ledger, runs, "r3", sha="ef" * 32) is None
+    first = json.loads(ledger.read_text().splitlines()[0])
+    assert first["amendment_sha"] == SHA and first["kind"] == "verdict_run_start"
+    assert (tmp_path / "verdict_ledger.jsonl.lock").exists()
 
 
 def test_second_run_is_allowed_with_an_addendum_naming_a_void_run(tmp_path: Path) -> None:
-    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
-    append_ledger_entry(ledger, amendment_sha=SHA, run_id="r1", code_sha="c" * 40, now=NOW)
-    _run(runs, "r1", void=True, files=("progress.jsonl", "episodes.jsonl"))
+    ledger, runs, _ = _voided(tmp_path, "r1", ("progress.jsonl", "episodes.jsonl"))
     path, sha = _addendum(tmp_path / "add.md", "r1")
     addendum = load_addendum(path, sha)
-    assert ledger_refuses(ledger, SHA, runs, addendum) is None
+    assert _claim(ledger, runs, "r2", addendum) is None
+    last = json.loads(ledger.read_text().splitlines()[-1])
+    assert last["run_id"] == "r2" and last["addendum_sha"] == sha
     # The addendum is consumed once it is recorded with the next entry.
-    append_ledger_entry(
-        ledger, amendment_sha=SHA, run_id="r2", code_sha="d" * 40, now=NOW, addendum_sha=sha
-    )
     _run(runs, "r2", void=True)
     reason = ledger_refuses(ledger, SHA, runs, addendum)
     assert reason is not None and "already used" in reason
 
 
 def test_addendum_must_name_the_latest_run(tmp_path: Path) -> None:
-    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
-    append_ledger_entry(ledger, amendment_sha=SHA, run_id="r1", code_sha="c" * 40, now=NOW)
-    _run(runs, "r0", void=True)
+    ledger, runs, _ = _voided(tmp_path, "r1", ("progress.jsonl",))
     path, sha = _addendum(tmp_path / "add.md", "r0")
-    reason = ledger_refuses(ledger, SHA, runs, load_addendum(path, sha))
+    reason = _claim(ledger, runs, "r2", load_addendum(path, sha))
     assert reason is not None and "latest" in reason
 
 
 @pytest.mark.parametrize(
-    "forbidden", ["scored_episodes.csv", "s3_inputs.json", "verdict.json", "verdict.md"]
+    "forbidden",
+    [
+        "scored_episodes.csv",
+        "s3_inputs.json",
+        "verdict.json",
+        "verdict.md",
+        "station_days.csv",
+        "stress_plus60_station_days.csv",
+        "stress_poll_lag_station_days.csv",
+        "overlay_station_days.csv",
+        "report.md",
+        "NOGO.md",
+    ],
 )
 def test_ledger_refuses_addendum_for_run_with_result_files(tmp_path: Path, forbidden: str) -> None:
-    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
-    append_ledger_entry(ledger, amendment_sha=SHA, run_id="r1", code_sha="c" * 40, now=NOW)
-    _run(runs, "r1", void=True, files=("progress.jsonl", forbidden))
+    ledger, runs, _ = _voided(tmp_path, "r1", ("progress.jsonl", forbidden))
     path, sha = _addendum(tmp_path / "add.md", "r1")
-    reason = ledger_refuses(ledger, SHA, runs, load_addendum(path, sha))
+    reason = _claim(ledger, runs, "r2", load_addendum(path, sha))
     assert reason is not None and forbidden in reason
+
+
+def test_the_forbidden_set_is_the_widened_one() -> None:
+    assert {"station_days.csv", "overlay_station_days.csv", "*.md"} <= set(FORBIDDEN_RESULT_GLOBS)
+    assert "stress_*_station_days.csv" in FORBIDDEN_RESULT_GLOBS
 
 
 def test_ledger_refuses_addendum_for_a_run_directory_not_void_renamed(tmp_path: Path) -> None:
     ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
-    append_ledger_entry(ledger, amendment_sha=SHA, run_id="r1", code_sha="c" * 40, now=NOW)
+    assert _claim(ledger, runs, "r1") is None
     _run(runs, "r1", void=False)
     path, sha = _addendum(tmp_path / "add.md", "r1")
-    reason = ledger_refuses(ledger, SHA, runs, load_addendum(path, sha))
+    reason = _claim(ledger, runs, "r2", load_addendum(path, sha))
     assert reason is not None and ".void" in reason
+
+
+def test_a_renamed_finished_run_with_its_results_deleted_is_refused(tmp_path: Path) -> None:
+    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
+    assert _claim(ledger, runs, "r1") is None
+    done = _run(
+        runs, "r1", void=False, files=("progress.jsonl", "scored_episodes.csv", "verdict.json")
+    )
+    done.rename(runs / "r1.void")  # hand rename: void_run_dir never recorded it
+    for name in ("scored_episodes.csv", "verdict.json"):
+        (runs / "r1.void" / name).unlink()
+    path, sha = _addendum(tmp_path / "add.md", "r1")
+    reason = _claim(ledger, runs, "r2", load_addendum(path, sha))
+    assert reason is not None and "void record" in reason
+    assert len(ledger.read_text().splitlines()) == 1
+
+
+def test_a_voided_run_changed_after_voiding_is_refused_by_digest(tmp_path: Path) -> None:
+    ledger, runs, void = _voided(tmp_path, "r1", ("progress.jsonl", "episodes.jsonl"))
+    path, sha = _addendum(tmp_path / "add.md", "r1")
+    addendum = load_addendum(path, sha)
+    (void / "progress.jsonl").write_text("tampered")
+    reason = _claim(ledger, runs, "r2", addendum)
+    assert reason is not None and "changed since" in reason
+    (void / "progress.jsonl").write_text("x")  # restored bytes: the digest matches again
+    assert _claim(ledger, runs, "r2", addendum) is None
+
+
+def test_a_result_file_added_to_a_voided_run_is_refused(tmp_path: Path) -> None:
+    ledger, runs, void = _voided(tmp_path, "r1", ("progress.jsonl",))
+    path, sha = _addendum(tmp_path / "add.md", "r1")
+    (void / "verdict.json").write_text("{}")
+    assert _claim(ledger, runs, "r2", load_addendum(path, sha)) is not None
 
 
 def test_a_corrupt_ledger_refuses_rather_than_allows(tmp_path: Path) -> None:
@@ -292,6 +394,8 @@ def test_a_corrupt_ledger_refuses_rather_than_allows(tmp_path: Path) -> None:
     ledger.write_text("{torn\n")
     with pytest.raises(LedgerRefused, match="unreadable"):
         ledger_refuses(ledger, SHA, tmp_path / "runs")
+    with pytest.raises(LedgerRefused, match="unreadable"):
+        _claim(ledger, tmp_path / "runs", "r1")
 
 
 def test_addendum_sha_mismatch_or_missing_run_id_is_refused(tmp_path: Path) -> None:
@@ -304,14 +408,47 @@ def test_addendum_sha_mismatch_or_missing_run_id_is_refused(tmp_path: Path) -> N
         load_addendum(bare, hashlib.sha256(bare.read_bytes()).hexdigest())
 
 
-def test_void_run_dir_renames_and_never_opens_episodes(tmp_path: Path) -> None:
+def test_an_unreadable_or_non_utf8_addendum_is_refused_typed(tmp_path: Path) -> None:
+    with pytest.raises(LedgerRefused, match="addendum"):
+        load_addendum(tmp_path / "nope.md", SHA)
+    bad = tmp_path / "bad.md"
+    bad.write_bytes(b"voided_run_id: r1\n\xff\xfe")
+    with pytest.raises(LedgerRefused, match="utf-8"):
+        load_addendum(bad, hashlib.sha256(bad.read_bytes()).hexdigest())
+
+
+def test_concurrent_claims_have_exactly_one_winner(tmp_path: Path) -> None:
+    ledger, runs = tmp_path / "verdict_ledger.jsonl", tmp_path / "runs"
+    workers = 8
+    barrier = threading.Barrier(workers)
+    results: list[str | None] = []
+
+    def attempt(index: int) -> None:
+        barrier.wait()
+        results.append(_claim(ledger, runs, f"r{index}"))
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results.count(None) == 1 and len(results) == workers
+    assert len(ledger.read_text().splitlines()) == 1
+
+
+def test_void_run_dir_renames_records_and_never_opens_episodes(tmp_path: Path) -> None:
+    ledger = tmp_path / "verdict_ledger.jsonl"
     run = _run(
         tmp_path, "r9", void=False, files=("progress.jsonl", "episodes.jsonl", "run_manifest.json")
     )
     (run / "episodes.jsonl").write_text("SECRET-FILL-DATA")
-    voided = void_run_dir(run)
+    voided = void_run_dir(run, ledger=ledger, now=NOW)
     assert voided.path.name == "r9.void" and voided.path.is_dir() and not run.exists()
     assert "episodes.jsonl" in voided.unopened
+    record = json.loads(ledger.read_text().splitlines()[-1])
+    assert record["kind"] == "void" and record["run_id"] == "r9"
+    assert record["tree_sha256"] == voided.tree_sha256
+    assert record["files"] == ["episodes.jsonl", "progress.jsonl", "run_manifest.json"]
     # The digest covers the unopened file by name and size only: its bytes cannot matter.
     before = voided.tree_sha256
     (voided.path / "episodes.jsonl").write_text("DIFFERENT-BYTES!")  # same size, other content
@@ -319,4 +456,20 @@ def test_void_run_dir_renames_and_never_opens_episodes(tmp_path: Path) -> None:
     (voided.path / "progress.jsonl").write_text("changed")
     assert tree_digest(voided.path) != before
     with pytest.raises(LedgerRefused, match="already"):
-        void_run_dir(voided.path)
+        void_run_dir(voided.path, ledger=ledger, now=NOW)
+
+
+def test_void_run_dir_refuses_a_missing_directory_and_symlinks(tmp_path: Path) -> None:
+    ledger = tmp_path / "verdict_ledger.jsonl"
+    with pytest.raises(LedgerRefused, match="not a directory"):
+        void_run_dir(tmp_path / "nope", ledger=ledger, now=NOW)
+    run = _run(tmp_path, "r8", void=False, files=("episodes.jsonl",))
+    (run / "alias.txt").symlink_to(run / "episodes.jsonl")
+    with pytest.raises(LedgerRefused, match="symlink"):
+        void_run_dir(run, ledger=ledger, now=NOW)
+    assert run.is_dir() and not (tmp_path / "r8.void").exists() and not ledger.exists()
+    real = _run(tmp_path, "r7", void=False)
+    link = tmp_path / "r6"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(LedgerRefused, match="not a directory|symlink"):
+        void_run_dir(link, ledger=ledger, now=NOW)

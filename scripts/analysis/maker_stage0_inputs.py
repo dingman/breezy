@@ -19,8 +19,9 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import os
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +52,7 @@ __all__ = [
     "per_date_counts",
     "sha256_bytes",
     "sha256_file",
+    "write_text_atomic",
 ]
 
 MAKER_STATIONS: Final[tuple[str, ...]] = ("LAX", "MDW", "MIA", "SFO")
@@ -89,6 +91,18 @@ def sha256_file(path: Path) -> str:
         while chunk := handle.read(_CHUNK):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def write_text_atomic(path: Path, text: str) -> Path:
+    """Write ``text`` to a ``.tmp`` sibling, fsync, then ``os.replace``: never a truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return path
 
 
 # --- census -------------------------------------------------------------------------------
@@ -144,6 +158,10 @@ class UnitHypothesis:
     """One reading of a trade print's ``size``; converts it to contracts."""
 
     name: str
+
+    def __post_init__(self) -> None:
+        if self.name not in UNIT_HYPOTHESES:
+            raise UnitRefused(f"unknown unit hypothesis {self.name!r}; known {UNIT_HYPOTHESES}")
 
     def to_contracts(
         self, size: Decimal, yes_price: Decimal, aggressor: str | None = None
@@ -227,24 +245,45 @@ class TruthTable:
     n_overlap: int
 
 
-def _final_rows(text: str) -> dict[TruthKey, int]:
+def _csv_rows(text: str) -> Iterable[tuple[int, dict[str, str]]]:
+    """Structurally valid rows only: a short row or a stray extra cell is refused, not dropped."""
     reader = csv.DictReader(text.splitlines())
     if not TRUTH_COLUMNS <= set(reader.fieldnames or ()):
         raise InputRefused(f"truth csv lacks a required column: {sorted(TRUTH_COLUMNS)}")
-    by_key: dict[TruthKey, list[tuple[bool, int]]] = defaultdict(list)
     for raw in reader:
-        station = raw["station"]
-        if station == _EXCLUDED_STATION or raw["tmax_f"] == "" or raw["tmax_flag"] != "":
+        if None in raw or None in raw.values():
+            raise InputRefused(f"truth csv row {reader.line_num} is truncated or has extra cells")
+        yield reader.line_num, {str(k): str(v) for k, v in raw.items()}
+
+
+def _final_rows(text: str, keys: Collection[TruthKey]) -> dict[TruthKey, int]:
+    """FINAL-grade values for ``keys`` only: every other row is never parsed (licence)."""
+    licensed = {(station, day.isoformat()): (station, day) for station, day in keys}
+    by_key: dict[TruthKey, list[tuple[bool, int]]] = defaultdict(list)
+    for number, raw in _csv_rows(text):
+        key = licensed.get((raw["station"], raw["climate_day"]))
+        if key is None or key[0] == _EXCLUDED_STATION:
             continue
-        correction = _flag(raw["correction_flag"])
-        key = (station, dt.date.fromisoformat(raw["climate_day"]))
-        by_key[key].append((correction, int(raw["tmax_f"])))
+        if raw["tmax_f"] == "" or raw["tmax_flag"] != "":
+            continue
+        by_key[key].append(
+            (_flag(raw["correction_flag"], number), _tmax(raw["tmax_f"], key, number))
+        )
     return {key: _revision(key, rows) for key, rows in by_key.items()}
 
 
-def _flag(raw: str) -> bool:
+def _tmax(cell: str, key: TruthKey, number: int) -> int:
+    try:
+        return int(cell)
+    except ValueError as exc:  # the cell itself is never echoed
+        raise InputRefused(
+            f"truth csv row {number} ({key[0]} {key[1]}): tmax_f is not an integer"
+        ) from exc
+
+
+def _flag(raw: str, number: int) -> bool:
     if raw not in ("True", "False"):
-        raise InputRefused(f"correction_flag {raw!r} is not True/False")
+        raise InputRefused(f"truth csv row {number}: correction_flag {raw!r} is not True/False")
     return raw == "True"
 
 
@@ -253,19 +292,31 @@ def _revision(key: TruthKey, rows: list[tuple[bool, int]]) -> int:
     corrected = {tmax for flag, tmax in rows if flag}
     pool = corrected or {tmax for _, tmax in rows}
     if len(pool) != 1:
-        raise TruthConflict(f"conflicting truth rows for {key[0]} {key[1]}: {sorted(pool)}")
+        raise TruthConflict(f"conflicting truth rows for {key[0]} {key[1]} ({len(pool)} values)")
     return next(iter(pool))
 
 
-def _cross_check_finals(path: Path) -> dict[TruthKey, int]:
-    import pyarrow.parquet as pq  # deferred: the cheap entry import stays cheap
+def _cross_check_finals(path: Path, keys: Collection[TruthKey]) -> dict[TruthKey, int]:
+    import pyarrow as pa  # deferred: the cheap entry import stays cheap
+    import pyarrow.parquet as pq
 
-    table = pq.read_table(path, columns=["station", "climate_day", "status", "tmax_f"])
+    columns = ["station", "climate_day", "status", "tmax_f"]
+    try:
+        kind = pq.ParquetFile(path).schema_arrow.field("climate_day").type
+        if not pa.types.is_date(kind):
+            raise InputRefused(f"cross-check climate_day is {kind}, not a date: refusing")
+        days = sorted({day for _, day in keys})
+        table = pq.read_table(path, columns=columns, filters=[("climate_day", "in", days)])
+    except (OSError, KeyError, pa.ArrowException) as exc:
+        raise InputRefused(
+            f"cross-check parquet {path.name} unreadable ({type(exc).__name__})"
+        ) from exc
     finals: dict[TruthKey, int] = {}
     for record in table.to_pylist():
-        if record["status"] != "FINAL" or record["tmax_f"] is None:
+        key = (record["station"], record["climate_day"])
+        if key not in keys or record["status"] != "FINAL" or record["tmax_f"] is None:
             continue
-        finals[(record["station"], record["climate_day"])] = int(record["tmax_f"])
+        finals[key] = int(record["tmax_f"])
     return finals
 
 
@@ -274,27 +325,42 @@ def load_truth(
     cross_check: Path,
     run_dir: Path,
     *,
+    keys: Collection[TruthKey],
     expected_csv_sha256: str | None = None,
 ) -> TruthTable:
-    """FINAL-grade truth; the CSV is copied into ``run_dir`` (from the bytes hashed) and pinned.
+    """FINAL-grade truth for ``keys``; the CSV is copied into ``run_dir`` and pinned.
 
-    The stale ``settlement_truth.parquet`` is an overlap cross-check only: on any shared
-    station-day the two sources must agree on ``tmax_f`` or :class:`TruthConflict` is raised
-    (before anything is written).
+    Only the frozen-set ``(station, day)`` keys are ever parsed (the licence): other rows -- the
+    sealed 2026-10-01, days after 2026-10-13 -- are hashed with the file but never read as
+    values. The stale ``settlement_truth.parquet`` is an overlap cross-check only: on any shared
+    key the two sources must agree on ``tmax_f`` or :class:`TruthConflict` is raised; an empty
+    overlap is refused (the check would be vacuous). Nothing is written before every check
+    passes, and no message carries a ``tmax`` value.
     """
-    data = csv_path.read_bytes()
+    if not keys:
+        raise InputRefused("load_truth needs the frozen-set keys; got none")
+    try:
+        data = csv_path.read_bytes()
+    except OSError as exc:
+        raise InputRefused(f"truth csv {csv_path.name} unreadable ({type(exc).__name__})") from exc
     digest = sha256_bytes(data)
     if expected_csv_sha256 is not None and digest != expected_csv_sha256:
         raise InputRefused(f"truth csv sha256 {digest} != pinned {expected_csv_sha256}")
-    finals = _final_rows(data.decode("utf-8"))
-    other = _cross_check_finals(cross_check)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InputRefused(f"truth csv {csv_path.name} is not utf-8") from exc
+    try:
+        finals = _final_rows(text, keys)
+    except csv.Error as exc:
+        raise InputRefused(f"truth csv {csv_path.name} is not parseable csv: {exc}") from exc
+    other = _cross_check_finals(cross_check, keys)
     overlap = finals.keys() & other.keys()
+    if not overlap:
+        raise InputRefused("truth cross-check has no overlap with the licensed keys: vacuous")
     for key in sorted(overlap):
         if finals[key] != other[key]:
-            raise TruthConflict(
-                f"truth sources disagree for {key[0]} {key[1]}: csv {finals[key]} "
-                f"vs parquet {other[key]}"
-            )
+            raise TruthConflict(f"truth sources disagree for {key[0]} {key[1]}")
     run_dir.mkdir(parents=True, exist_ok=True)
     copy = run_dir / TRUTH_COPY_NAME
     copy.write_bytes(data)

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from breezy.runtime.trade_supervisor_core import (
     LAUNCH_UTC,
@@ -19,8 +22,11 @@ from scripts.analysis.maker_stage0_nodelog import (
     BOOT_LINE_RE,
     PERMIT_LINE_RE,
     LogStatus,
+    PermitLine,
     boot_to_permit_latencies_ns,
+    boots_without_permit,
     classify_day,
+    permit_meets_window,
     scan_node_log,
 )
 from scripts.analysis.maker_stage0_schedule import (
@@ -68,9 +74,19 @@ def _nautilus(ns: int) -> str:
     )
 
 
-def _log(path: Path, *lines: str) -> Path:
-    path.write_text("\n".join(lines) + "\n")
-    return path
+def _log(path: Path, *lines: str, skew_s: int = 0, name: str | None = None) -> Path:
+    """Write ``lines`` to ``breezy-trade-<UTC stamp of the first line>.log`` (as the node does).
+
+    ``path`` only supplies the directory; ``skew_s`` moves the file-name stamp away from the
+    first line, ``name`` overrides the whole file name.
+    """
+    first = dt.datetime.strptime(lines[0][:19].replace("T", " "), "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=dt.UTC
+    )
+    stamped = first - dt.timedelta(seconds=skew_s)
+    target = path.parent / (name or f"breezy-trade-{stamped:%Y%m%dT%H%M%S}Z.log")
+    target.write_text("\n".join(lines) + "\n")
+    return target
 
 
 def _window(day: dt.date) -> tuple[int, int]:
@@ -186,10 +202,136 @@ def test_node_booted_before_the_window_has_no_in_window_boot_but_a_permit(tmp_pa
     # A later boot inside the window is a relaunch in that case.
     relaunch = start + 2 * 3600 * NS
     log2 = _log(
-        tmp_path / "n2.log", _boot(early), _permit(early), _boot(relaunch), _nautilus(end + 60 * NS)
+        tmp_path / "n2.log",
+        _boot(early),
+        _permit(early),
+        _boot(relaunch),
+        _permit(relaunch + NS),
+        _nautilus(end + 60 * NS),
     )
     cuts = overlay_schedule([D], [scan_node_log(log2)])[D].cuts
     assert [c.instant_ns for c in cuts if c.kind == "RELAUNCH"] == [relaunch]
+
+
+# --- pinned readings (plan delta (d), review M2-M4) ---------------------------------------
+
+
+def test_permit_validity_is_half_open_issued_inclusive_expires_exclusive() -> None:
+    window = (1000 * NS, 2000 * NS)
+    assert permit_meets_window(PermitLine(0, 900 * NS, 1001 * NS), window)
+    assert not permit_meets_window(PermitLine(0, 900 * NS, 1000 * NS), window)  # expires at start
+    assert permit_meets_window(PermitLine(0, 1999 * NS, 3000 * NS), window)
+    assert not permit_meets_window(PermitLine(0, 2000 * NS, 3000 * NS), window)  # issued at end
+
+
+def test_a_log_whose_file_name_stamp_disagrees_with_its_first_line_is_node_log_absent(
+    tmp_path: Path,
+) -> None:
+    start, end = _window(D)
+    lines = (_boot(start + 30 * NS), _permit(start + 31 * NS), _nautilus(end + 60 * NS))
+    near = scan_node_log(_log(tmp_path / "a.log", *lines, skew_s=119))
+    assert near.rejected is None
+    assert classify_day([near], (start, end)) is LogStatus.LIVE
+    far = scan_node_log(_log(tmp_path / "b.log", *lines, skew_s=-121))
+    assert far.rejected is not None and "120 s" in far.rejected
+    assert classify_day([far], (start, end)) is LogStatus.NODE_LOG_ABSENT
+    # A local-time host would shift asctime by hours: the same check catches it.
+    shifted = scan_node_log(_log(tmp_path / "c.log", *lines, skew_s=-7 * 3600))
+    assert classify_day([shifted], (start, end)) is LogStatus.NODE_LOG_ABSENT
+    assert overlay_schedule([D], [far])[D] == primary_schedule(D)
+
+
+def test_a_log_without_a_utc_file_name_stamp_cannot_be_verified_and_is_absent(
+    tmp_path: Path,
+) -> None:
+    start, end = _window(D)
+    log = _log(tmp_path / "n.log", _boot(start + 30 * NS), _nautilus(end + 60 * NS), name="n.log")
+    scan = scan_node_log(log)
+    assert scan.rejected is not None and "file name" in scan.rejected
+    assert classify_day([scan], (start, end)) is LogStatus.NODE_LOG_ABSENT
+
+
+def test_the_real_repo_fixture_log_passes_the_file_name_check() -> None:
+    assert scan_node_log(REAL_LOG).rejected is None
+
+
+def test_launch_grace_applies_only_when_the_first_line_is_the_boot_line(tmp_path: Path) -> None:
+    start, end = _window(D)
+    boot_first = _log(tmp_path / "a.log", _boot(start + 500 * NS), _nautilus(end + 60 * NS))
+    scan = scan_node_log(boot_first)
+    assert scan.first_is_boot
+    assert classify_day([scan], (start, end)) is LogStatus.LIVE
+    # The same late start behind a non-boot first line leaves up to 10 min unobserved.
+    other_first = _log(
+        tmp_path / "b.log",
+        _nautilus(start + 500 * NS),
+        _boot(start + 501 * NS),
+        _nautilus(end + 60 * NS),
+    )
+    scan2 = scan_node_log(other_first)
+    assert not scan2.first_is_boot
+    assert classify_day([scan2], (start, end)) is LogStatus.NODE_LOG_ABSENT
+    # Past the grace even a boot-first log does not cover.
+    late = scan_node_log(
+        _log(tmp_path / "c.log", _boot(start + 601 * NS), _nautilus(end + 60 * NS))
+    )
+    assert classify_day([late], (start, end)) is LogStatus.NODE_LOG_ABSENT
+
+
+def test_a_hand_boot_before_the_window_in_a_covering_log_is_up_not_outage(tmp_path: Path) -> None:
+    start, end = _window(D)
+    early = start - 900 * NS  # orders-off node: boot line, no permit line
+    log = _log(tmp_path / "n.log", _boot(early), _nautilus(end + 60 * NS))
+    scan = scan_node_log(log)
+    assert classify_day([scan], (start, end)) is LogStatus.LIVE
+    # A boot before the window in a log that stops mid-window does not make the day LIVE.
+    stops = scan_node_log(_log(tmp_path / "m.log", _boot(early), _nautilus(end - 3600 * NS)))
+    assert classify_day([stops], (start, end)) is LogStatus.NODE_LOG_ABSENT
+    # And a later in-window boot is then a relaunch (it minted a permit).
+    relaunch = start + 2 * 3600 * NS
+    log2 = _log(
+        tmp_path / "n2.log",
+        _boot(early),
+        _boot(relaunch),
+        _permit(relaunch + NS),
+        _nautilus(end + 60 * NS),
+    )
+    cuts = overlay_schedule([D], [scan_node_log(log2)])[D].cuts
+    assert [c.instant_ns for c in cuts if c.kind == "RELAUNCH"] == [relaunch]
+
+
+def test_a_boot_that_never_mints_a_permit_is_not_a_relaunch_cut(tmp_path: Path) -> None:
+    start, end = _window(D)
+    dead, live = start + 3600 * NS, start + 2 * 3600 * NS
+    log = _log(
+        tmp_path / "n.log",
+        _boot(start + 30 * NS),
+        _permit(start + 31 * NS),
+        _boot(dead),  # died at the permit mint: no permit line before the next boot
+        _boot(live),
+        _permit(live + NS),
+        _boot(end - 3600 * NS),  # a trailing boot with no permit at all
+        _nautilus(end + 60 * NS),
+    )
+    scans = [scan_node_log(log)]
+    cuts = overlay_schedule([D], scans)[D].cuts
+    assert [c.instant_ns for c in cuts if c.kind == "RELAUNCH"] == [live]
+    # The dead boots are surfaced for the report, never silently dropped.
+    assert boots_without_permit(scans, (start, end)) == [dead, end - 3600 * NS]
+
+
+def test_the_first_in_window_boot_is_the_launch_even_without_a_permit(tmp_path: Path) -> None:
+    start, end = _window(D)
+    second = start + 2 * 3600 * NS
+    log = _log(
+        tmp_path / "n.log",
+        _boot(start + 30 * NS),
+        _boot(second),
+        _permit(second + NS),
+        _nautilus(end + 60 * NS),
+    )
+    cuts = overlay_schedule([D], [scan_node_log(log)])[D].cuts
+    assert [c.instant_ns for c in cuts if c.kind == "RELAUNCH"] == [second]
 
 
 # --- outage / absence ---------------------------------------------------------------------
@@ -317,3 +459,18 @@ def test_schedule_json_is_deterministic_and_keyed_by_day(tmp_path: Path) -> None
     assert day["window_start_ns"] < day["window_end_ns"] and day["cuts"][0]["kind"]
     assert schedule_to_dict(process_schedule([D]))["days"][D.isoformat()] == day
     assert body["schedule"] == "PRIMARY"
+
+
+def test_schedule_json_is_written_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "process_schedule.json"
+    out.write_text("OLD")
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        write_schedule(out, process_schedule([D]))
+    assert out.read_text() == "OLD"

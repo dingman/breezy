@@ -47,6 +47,7 @@ _BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```FROZEN_DATE_SET[ \t]*\n(.*?)
 _OPEN_FENCE: Final[str] = "```FROZEN_DATE_SET"
 _SHA_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 _DRAFT_RE: Final[re.Pattern[str]] = re.compile(r"^Status:\s*\*{0,2}\s*DRAFT", re.MULTILINE)
+_FINAL_RE: Final[re.Pattern[str]] = re.compile(r"^Status:\s*\*{0,2}\s*FINAL\b", re.MULTILINE)
 _PLACEHOLDER: Final[str] = "<FILL"
 _NYC: Final[str] = "NYC"
 
@@ -161,13 +162,21 @@ def parse_frozen_block(text: str) -> FrozenDateSet:
 
 def load_amendment(path: Path, expected_sha: str) -> FrozenDateSet:
     """Read the FINAL amendment, check its sha256 against the pinned one, parse its block."""
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise FrozenSetRefused(f"amendment {path.name} unreadable ({type(exc).__name__})") from exc
     digest = sha256_bytes(data)
     if digest != expected_sha:
         raise FrozenSetRefused(f"amendment sha {digest} != pinned {expected_sha}")
-    text = data.decode("utf-8")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FrozenSetRefused(f"amendment {path.name} is not utf-8") from exc
     if _DRAFT_RE.search(text):
         raise FrozenSetRefused("the amendment is still DRAFT; only FINAL bytes license the reads")
+    if _FINAL_RE.search(text) is None:
+        raise FrozenSetRefused("the amendment has no positive 'Status: FINAL' line")
     return parse_frozen_block(text)
 
 

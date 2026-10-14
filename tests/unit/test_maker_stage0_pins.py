@@ -8,22 +8,25 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS
+from scripts.analysis.maker_stage0_frozen import FrozenSetRefused
+from scripts.analysis.maker_stage0_model import ModelRefused, load_model
 from scripts.analysis.maker_stage0_pins import (
+    CANONICAL_SIDECARS,
     CLEAN_TREE_PATHSPECS,
     REQUIRED_PIN_KEYS,
     CatalogSliceManifest,
     DirtyTree,
-    ModelRefused,
+    PinRefused,
     PinSources,
     assert_clean_tree,
     git_commit,
-    load_model,
     package_set_sha256,
     pin_inputs,
     seal_sidecars,
@@ -234,7 +237,18 @@ def test_package_set_sha_is_order_and_case_independent() -> None:
 # --- pins ---------------------------------------------------------------------------------
 
 
-def _sources(tmp_path: Path, repo: Path) -> PinSources:
+def _amendment_text(truth_sha: str) -> str:
+    return (
+        "# ruling\nStatus: **FINAL**\n\n```FROZEN_DATE_SET\n"
+        "stations: LAX MDW MIA SFO\nfirst_replayable_day: 2026-09-18\n"
+        f"truth_csv_path: /x/truth.csv\ntruth_csv_sha256: {truth_sha}\n"
+        "last_final_day: 2026-09-19\ndates:\n2026-09-18\n2026-09-19\n```\n"
+    )
+
+
+def _sources(
+    tmp_path: Path, repo: Path, *, sidecars: tuple[str, ...] = CANONICAL_SIDECARS
+) -> PinSources:
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     files = {}
@@ -253,13 +267,15 @@ def _sources(tmp_path: Path, repo: Path) -> PinSources:
     ):
         files[name] = inputs / f"{name}.dat"
         files[name].write_text(f"bytes of {name}\n")
+    truth_sha = hashlib.sha256(files["truth_copy"].read_bytes()).hexdigest()
+    files["amendment"].write_text(_amendment_text(truth_sha))
     return PinSources(
         repo_root=repo,
         census=files["census"],
         trade_unit=files["unit"],
         truth_copy=files["truth_copy"],
         truth_cross_check=files["truth_cross_check"],
-        truth_csv_sha256="3" * 64,
+        truth_csv_sha256=truth_sha,
         nbp_manifest=files["nbp_manifest"],
         nbp_consumed=(("2026092901", "aa"), ("2026092813", "bb")),
         process_schedule=files["process_schedule"],
@@ -267,7 +283,7 @@ def _sources(tmp_path: Path, repo: Path) -> PinSources:
         amendment_final=files["amendment"],
         ledger_path=tmp_path / "derived" / "verdict_ledger.jsonl",
         node_logs=(files["node_a"], files["node_b"]),
-        sidecar_names=("overlay_station_days.csv", "wp0_agreement.json"),
+        sidecar_names=sidecars,
         argv=("maker_stage0_run.py", "--verdict"),
         theta_pin_site="deploy/families/pm_us_crh_fq_v1.json:taker_fee_coefficient",
         spec=repo / "docs/strategies/SPEC.md",
@@ -284,7 +300,6 @@ def test_pins_cover_every_mutable_input(tmp_path: Path) -> None:
     for key, path in [
         ("census", src.census),
         ("trade_unit", src.trade_unit),
-        ("truth_csv", src.truth_copy),
         ("truth_cross_check", src.truth_cross_check),
         ("nbp_manifest", src.nbp_manifest),
         ("process_schedule", src.process_schedule),
@@ -322,7 +337,7 @@ def test_pins_include_clean_tree_package_set_argv_node_logs_ledger_and_sidecars(
     assert pins["clean_tree"] == {"clean": True, "pathspecs": list(CLEAN_TREE_PATHSPECS)}
     assert pins["installed_package_set_sha256"] == package_set_sha256(src.packages)
     assert pins["argv"] == ["maker_stage0_run.py", "--verdict"]
-    assert pins["truth_csv_sha256_frozen_block"] == "3" * 64
+    assert pins["truth_csv_sha256_frozen_block"] == pins["truth_csv"]["sha256"]
     assert pins["amendment_final_sha256"] == pins["amendment_final"]["sha256"]
     assert pins["ledger_path"] == str(src.ledger_path)
     assert pins["theta_pin_site"] == src.theta_pin_site
@@ -331,8 +346,7 @@ def test_pins_include_clean_tree_package_set_argv_node_logs_ledger_and_sidecars(
     ]
     assert all(len(n["sha256"]) == 64 and n["size"] > 0 for n in pins["node_logs"])
     assert pins["sidecars"] == {
-        "overlay_station_days.csv": {"run_time_only": True, "sha256": None},
-        "wp0_agreement.json": {"run_time_only": True, "sha256": None},
+        name: {"run_time_only": True, "sha256": None} for name in CANONICAL_SIDECARS
     }
     assert pins["model"]["artefact_sha256"] == ARTEFACT_SHA
 
@@ -356,23 +370,65 @@ def test_pins_are_deterministic_and_written_sorted(tmp_path: Path) -> None:
     assert list(json.loads(first.read_text())) == sorted(json.loads(first.read_text()))
 
 
-def test_seal_sidecars_fills_each_named_sidecar_and_refuses_unnamed_ones(tmp_path: Path) -> None:
+def test_seal_sidecars_fills_each_named_sidecar_and_refuses_missing_ones(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     src = _sources(tmp_path, repo)
     pins = pin_inputs(src)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    (run_dir / "overlay_station_days.csv").write_text("a,b\n")
-    (run_dir / "wp0_agreement.json").write_text("{}")
+    for name in CANONICAL_SIDECARS:
+        (run_dir / name).write_text(f"{name}\n")
     sealed = seal_sidecars(pins, run_dir)
     assert sealed["sidecars"]["overlay_station_days.csv"] == {
         "run_time_only": True,
-        "sha256": hashlib.sha256(b"a,b\n").hexdigest(),
+        "sha256": hashlib.sha256(b"overlay_station_days.csv\n").hexdigest(),
     }
     assert pins["sidecars"]["wp0_agreement.json"]["sha256"] is None  # input not mutated
     (run_dir / "wp0_agreement.json").unlink()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(PinRefused, match="wp0_agreement"):
         seal_sidecars(pins, run_dir)
+    with pytest.raises(PinRefused, match="sidecars"):
+        seal_sidecars({}, run_dir)
+
+
+def test_pins_require_the_canonical_sidecar_names(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    assert set(CANONICAL_SIDECARS) == {
+        "overlay_station_days.csv",
+        "process_schedule_overlay.json",
+        "wp0_agreement.json",
+        "stress_plus60_station_days.csv",
+        "stress_poll_lag_station_days.csv",
+        "progress.jsonl",
+    }
+    src = _sources(tmp_path, repo, sidecars=("overlay_station_days.csv", "wp0_agreement.json"))
+    with pytest.raises(PinRefused, match="process_schedule_overlay.json"):
+        pin_inputs(src)
+
+
+def test_pins_assert_the_truth_copy_sha_equals_the_frozen_block_sha(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    src = _sources(tmp_path, repo)
+    src.truth_copy.write_text("a different truth copy\n")
+    with pytest.raises(PinRefused, match="truth"):
+        pin_inputs(src)
+
+
+def test_pins_assert_the_caller_sha_equals_the_amendment_block_sha(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    src = _sources(tmp_path, repo)
+    src.amendment_final.write_text(_amendment_text("9" * 64))  # block names another truth file
+    with pytest.raises(PinRefused, match="truth"):
+        pin_inputs(src)
+
+
+def test_pins_reparse_the_amendment_and_refuse_a_non_final_one(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    src = _sources(tmp_path, repo)
+    text = src.amendment_final.read_text().replace("**FINAL**", "**DRAFT rev 3**")
+    src.amendment_final.write_text(text)
+    with pytest.raises(FrozenSetRefused, match="DRAFT"):
+        pin_inputs(src)
 
 
 # --- catalog slice manifest ---------------------------------------------------------------
@@ -405,3 +461,72 @@ def test_catalog_slice_manifest_refuses_a_file_that_changed_between_reads(tmp_pa
     a.write_bytes(b"two!")
     with pytest.raises(ValueError, match="changed"):
         manifest.add(a)
+
+
+# --- hardening (review fixes) -------------------------------------------------------------
+
+
+def test_git_that_hangs_or_is_absent_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def hang(*args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    with pytest.raises(DirtyTree, match="timed out"):
+        assert_clean_tree(tmp_path)
+    assert seen["timeout"] == 30
+
+    def absent(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", absent)
+    with pytest.raises(DirtyTree, match="git"):
+        git_commit(tmp_path)
+
+
+def test_clean_tree_sees_untracked_files_even_when_git_is_configured_to_hide_them(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    _git(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "tests" / "fixtures" / "hidden.txt").write_text("h")
+    with pytest.raises(DirtyTree, match="hidden.txt"):
+        assert_clean_tree(repo)
+
+
+def test_package_set_sha_normalises_names_per_pep_503() -> None:
+    assert package_set_sha256([("Foo_Bar.baz", "1")]) == package_set_sha256([("foo-bar-baz", "1")])
+
+
+def test_pins_json_is_written_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "pins.json").write_text("OLD")
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        write_pins(run_dir, {"a": 1})
+    assert (run_dir / "pins.json").read_text() == "OLD"  # never a truncated file
+
+
+def test_catalog_manifest_is_written_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "catalog_slice_manifest.json"
+    out.write_text("OLD")
+    manifest = CatalogSliceManifest()
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        manifest.write(out)
+    assert out.read_text() == "OLD"

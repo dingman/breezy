@@ -1,19 +1,13 @@
 """MAKER-S2 WP1: ``load_model``, the clean-tree assertion and ``pin_inputs`` (-> ``pins.json``).
 
 Plan r3 WP1 + r4 delta (c)(g). Pins are content hashes of every mutable input; a verdict run that
-cannot pin an input, or whose tree is dirty, does not start.
-
-``load_model`` takes the artefact path and sha from the deploy manifest, then asserts against the
-NBP validate evidence doc: its ``artefact_sha256`` (the bullet and the JSON block's
-``artefact.sha256``) equals the loaded artefact's sha256, the v5.0 era's ``v5_fit_slice``
-``last_climate_day`` equals ``DEFAULT_SPLITS.v5_fit_slice.end`` (2026-06-30), and no era's
-``last_climate_day`` is later than that. Any failure, or an unparseable doc, refuses.
+cannot pin an input, whose tree is dirty, whose truth copy is not the frozen block's file, or
+whose canonical sidecar set is incomplete, does not start. ``load_model`` lives in
+``maker_stage0_model``. Every file written here is written atomically (``.tmp`` + ``os.replace``).
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 import os
 import re
@@ -24,22 +18,26 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Final
 
-from breezy.analysis.nbp_calibration import DEFAULT_SPLITS
-from scripts.analysis.maker_stage0_inputs import sha256_bytes, sha256_file
+from scripts.analysis.maker_stage0_frozen import load_amendment
+from scripts.analysis.maker_stage0_inputs import sha256_bytes, sha256_file, write_text_atomic
+from scripts.analysis.maker_stage0_model import (
+    DEPLOY_MANIFEST_REL,
+    EVIDENCE_DOC_REL,
+    ModelPin,
+    load_model,
+)
 
 __all__ = [
+    "CANONICAL_SIDECARS",
     "CLEAN_TREE_PATHSPECS",
-    "FIT_WINDOW_END",
     "REQUIRED_PIN_KEYS",
     "CatalogSliceManifest",
     "DirtyTree",
-    "ModelPin",
-    "ModelRefused",
+    "PinRefused",
     "PinSources",
     "assert_clean_tree",
     "git_commit",
     "installed_packages",
-    "load_model",
     "package_set_sha256",
     "pin_inputs",
     "seal_sidecars",
@@ -53,17 +51,18 @@ CLEAN_TREE_PATHSPECS: Final[tuple[str, ...]] = (
     "pyproject.toml",
     "uv.lock",
 )
-FIT_WINDOW_END: Final[dt.date] = dt.date(2026, 6, 30)
-DEPLOY_MANIFEST_REL: Final[str] = "deploy/families/pm_us_crh_fq_v1.json"
-EVIDENCE_DOC_REL: Final[str] = "docs/evidence/NBP_S2_VALIDATE_RESULT_2026-09-30.md"
 UV_LOCK_REL: Final[str] = "uv.lock"
-_V5_ERA: Final[str] = "v5.0"
-_V5_SPLIT: Final[str] = "v5_fit_slice"
-_BULLET_RE: Final[re.Pattern[str]] = re.compile(
-    r"^- artefact_sha256: `([0-9a-f]{64})`", re.MULTILINE
+GIT_TIMEOUT_S: Final[int] = 30
+#: The run-time-only sidecars every verdict run must declare (sealed by ``seal_sidecars``).
+CANONICAL_SIDECARS: Final[tuple[str, ...]] = (
+    "overlay_station_days.csv",
+    "process_schedule_overlay.json",
+    "progress.jsonl",
+    "stress_plus60_station_days.csv",
+    "stress_poll_lag_station_days.csv",
+    "wp0_agreement.json",
 )
-_JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```json\n(.*?)\n```", re.DOTALL)
-_CHUNK: Final[int] = 1 << 20
+_PEP503_RE: Final[re.Pattern[str]] = re.compile(r"[-_.]+")
 
 REQUIRED_PIN_KEYS: Final[tuple[str, ...]] = (
     "amendment_final",
@@ -98,8 +97,8 @@ class DirtyTree(RuntimeError):
     """``git status --porcelain`` over the declared scope is non-empty (or git is unusable)."""
 
 
-class ModelRefused(ValueError):
-    """The model artefact or its evidence doc failed an assertion."""
+class PinRefused(ValueError):
+    """An input cannot be pinned: it contradicts the frozen block or the canonical set."""
 
 
 # --- git ----------------------------------------------------------------------------------
@@ -109,21 +108,35 @@ def _git(repo_root: Path, *args: str) -> str:
     # GIT_CEILING_DIRECTORIES stops discovery above ``repo_root``: a plain directory must not
     # silently adopt an enclosing repository.
     env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(repo_root.parent)}
-    done = subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DirtyTree(f"git {args[0]} timed out after {GIT_TIMEOUT_S} s in {repo_root}") from exc
+    except OSError as exc:  # git absent / not executable
+        raise DirtyTree(
+            f"git {args[0]} could not run ({type(exc).__name__}) in {repo_root}"
+        ) from exc
     if done.returncode != 0:
         raise DirtyTree(f"git {args[0]} failed in {repo_root}: {done.stderr.strip()[:200]}")
     return done.stdout
 
 
 def assert_clean_tree(repo_root: Path, pathspecs: Sequence[str] = CLEAN_TREE_PATHSPECS) -> None:
-    """Refuse unless ``git status --porcelain -- <pathspecs>`` is empty (untracked included)."""
-    dirty = _git(repo_root, "status", "--porcelain", "--", *pathspecs).strip()
+    """Refuse unless ``git status --porcelain -- <pathspecs>`` is empty (untracked included).
+
+    ``--untracked-files=all`` overrides ``status.showUntrackedFiles`` so a configured ``no``
+    cannot hide a new file.
+    """
+    dirty = _git(
+        repo_root, "status", "--porcelain", "--untracked-files=all", "--", *pathspecs
+    ).strip()
     if dirty:
         raise DirtyTree(f"working tree is not clean over {list(pathspecs)}:\n{dirty}")
 
@@ -136,8 +149,8 @@ def git_commit(repo_root: Path) -> str:
 
 
 def package_set_sha256(pairs: Iterable[tuple[str, str]]) -> str:
-    """sha256 of the sorted ``name==version`` lines (names lower-cased)."""
-    lines = sorted(f"{name.lower()}=={version}" for name, version in pairs)
+    """sha256 of the sorted ``name==version`` lines (names PEP 503-normalised)."""
+    lines = sorted(f"{_PEP503_RE.sub('-', name).lower()}=={version}" for name, version in pairs)
     return sha256_bytes("\n".join(lines).encode())
 
 
@@ -151,98 +164,6 @@ def installed_packages() -> tuple[tuple[str, str], ...]:
     return tuple(sorted(found))
 
 
-# --- model --------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class ModelPin:
-    family_id: str
-    artefact_path: Path
-    artefact_sha256: str
-    manifest_path: Path
-    manifest_sha256: str
-    evidence_doc_path: Path
-    evidence_doc_sha256: str
-    fit_window_end: dt.date
-
-
-def _parse_doc(text: str) -> tuple[str, str, Mapping[str, Any]]:
-    try:
-        bullet = _BULLET_RE.search(text)
-        block = _JSON_BLOCK_RE.search(text)
-        if bullet is None or block is None:
-            raise ValueError("no artefact_sha256 bullet or JSON block")
-        body = json.loads(block.group(1))
-        return bullet.group(1), str(body["artefact"]["sha256"]), dict(body["fit_provenance"])
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ModelRefused(f"evidence doc unparseable: {type(exc).__name__}: {exc}") from exc
-
-
-def _last_day(era: str, split: str, entry: Mapping[str, Any]) -> dt.date:
-    try:
-        return dt.date.fromisoformat(str(entry["last_climate_day"]))
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ModelRefused(f"evidence doc unparseable: {era} {split} last_climate_day") from exc
-
-
-def _assert_fit_window(provenance: Mapping[str, Any]) -> None:
-    era = provenance.get(_V5_ERA)
-    v5 = era.get(_V5_SPLIT) if isinstance(era, dict) else None
-    if v5 is None:
-        raise ModelRefused(f"evidence doc has no {_V5_ERA} {_V5_SPLIT} entry")
-    last = _last_day(_V5_ERA, _V5_SPLIT, v5)
-    if last != DEFAULT_SPLITS.v5_fit_slice.end or last != FIT_WINDOW_END:
-        raise ModelRefused(
-            f"fit window mismatch: doc {last}, DEFAULT_SPLITS {DEFAULT_SPLITS.v5_fit_slice.end}, "
-            f"pinned {FIT_WINDOW_END}"
-        )
-    for era_name, splits in provenance.items():
-        for split, entry in dict(splits).items():
-            day = _last_day(str(era_name), str(split), entry)
-            if day > FIT_WINDOW_END:
-                raise ModelRefused(
-                    f"{era_name} {split} last_climate_day {day} is after {FIT_WINDOW_END}"
-                )
-
-
-def load_model(
-    repo_root: Path,
-    *,
-    manifest_rel: str = DEPLOY_MANIFEST_REL,
-    evidence_doc_rel: str = EVIDENCE_DOC_REL,
-) -> ModelPin:
-    """Artefact path and sha from the deploy manifest, asserted against the evidence doc."""
-    manifest_path = repo_root / manifest_rel
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        artefact_path = repo_root / str(manifest["density_artefact_path"])
-        pinned = str(manifest["density_artefact_sha256"])
-        family_id = str(manifest["family_id"])
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise ModelRefused(f"deploy manifest unusable: {type(exc).__name__}") from exc
-    loaded = sha256_file(artefact_path)
-    if loaded != pinned:
-        raise ModelRefused(f"manifest density_artefact_sha256 {pinned} != artefact bytes {loaded}")
-    doc_path = repo_root / evidence_doc_rel
-    doc_bytes = doc_path.read_bytes()
-    bullet, block_sha, provenance = _parse_doc(doc_bytes.decode("utf-8"))
-    if not bullet == block_sha == loaded:
-        raise ModelRefused(
-            f"evidence doc artefact_sha256 bullet {bullet} / block {block_sha} != loaded {loaded}"
-        )
-    _assert_fit_window(provenance)
-    return ModelPin(
-        family_id=family_id,
-        artefact_path=artefact_path,
-        artefact_sha256=loaded,
-        manifest_path=manifest_path,
-        manifest_sha256=sha256_file(manifest_path),
-        evidence_doc_path=doc_path,
-        evidence_doc_sha256=sha256_bytes(doc_bytes),
-        fit_window_end=FIT_WINDOW_END,
-    )
-
-
 # --- catalog slice manifest ---------------------------------------------------------------
 
 
@@ -254,10 +175,7 @@ class CatalogSliceManifest:
 
     def add(self, path: Path) -> None:
         before = path.stat()
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            while chunk := handle.read(_CHUNK):
-                digest.update(chunk)
+        digest = sha256_file(path)
         after = path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise ValueError(f"{path} changed while it was hashed")
@@ -265,7 +183,7 @@ class CatalogSliceManifest:
             "path": str(path),
             "size": after.st_size,
             "mtime_ns": after.st_mtime_ns,
-            "sha256": digest.hexdigest(),
+            "sha256": digest,
         }
         known = self._entries.get(str(path))
         if known is not None and known != entry:
@@ -276,11 +194,7 @@ class CatalogSliceManifest:
         return {"files": [self._entries[key] for key in sorted(self._entries)]}
 
     def write(self, path: Path) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        return path
+        return write_text_atomic(path, json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
 # --- pins ---------------------------------------------------------------------------------
@@ -335,15 +249,34 @@ def _model_pin(model: ModelPin) -> dict[str, Any]:
     }
 
 
+def _assert_canonical_sidecars(names: Sequence[str]) -> None:
+    missing = sorted(set(CANONICAL_SIDECARS) - set(names))
+    if missing:
+        raise PinRefused(f"sidecars lack the canonical names {missing}")
+
+
+def _assert_truth_matches_frozen_block(src: PinSources, amendment_sha: str, truth_sha: str) -> None:
+    """Re-parse the FINAL amendment; the pinned truth copy must be the block's file."""
+    block_sha = load_amendment(src.amendment_final, amendment_sha).truth_csv_sha256
+    if not truth_sha == block_sha == src.truth_csv_sha256:
+        raise PinRefused(
+            f"truth copy sha {truth_sha} / frozen block {block_sha} / caller "
+            f"{src.truth_csv_sha256} disagree"
+        )
+
+
 def pin_inputs(src: PinSources) -> dict[str, Any]:
     """Hash every mutable input; refuses a dirty tree, a bad model or an unreadable input."""
     root = src.repo_root
     assert_clean_tree(root)
+    _assert_canonical_sidecars(src.sidecar_names)
     model = load_model(
         root, manifest_rel=src.deploy_manifest_rel, evidence_doc_rel=src.evidence_doc_rel
     )
     packages = installed_packages() if src.packages is None else src.packages
     amendment = _file_pin(src.amendment_final)
+    truth = _file_pin(src.truth_copy)
+    _assert_truth_matches_frozen_block(src, amendment["sha256"], truth["sha256"])
     return {
         "amendment_final": amendment,
         "amendment_final_sha256": amendment["sha256"],
@@ -367,23 +300,29 @@ def pin_inputs(src: PinSources) -> dict[str, Any]:
         "theta_pin_site": src.theta_pin_site,
         "trade_unit": _file_pin(src.trade_unit),
         "truth_cross_check": _file_pin(src.truth_cross_check),
-        "truth_csv": _file_pin(src.truth_copy),
+        "truth_csv": truth,
         "truth_csv_sha256_frozen_block": src.truth_csv_sha256,
         "uv_lock": _file_pin(root / UV_LOCK_REL),
     }
 
 
 def write_pins(run_dir: Path, pins: Mapping[str, Any]) -> Path:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    out = run_dir / "pins.json"
-    out.write_text(json.dumps(pins, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return out
+    return write_text_atomic(
+        run_dir / "pins.json", json.dumps(pins, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def seal_sidecars(pins: Mapping[str, Any], run_dir: Path) -> dict[str, Any]:
     """Fill each run-time-only sidecar's sha256 from ``run_dir`` (returns a new mapping)."""
-    sealed = {
-        name: {"run_time_only": True, "sha256": sha256_file(run_dir / name)}
-        for name in pins["sidecars"]
-    }
+    names = pins.get("sidecars")
+    if not isinstance(names, Mapping):
+        raise PinRefused("pins carry no 'sidecars' mapping to seal")
+    sealed: dict[str, Any] = {}
+    for name in names:
+        try:
+            sealed[name] = {"run_time_only": True, "sha256": sha256_file(run_dir / name)}
+        except OSError as exc:
+            raise PinRefused(
+                f"sidecar {name} unreadable in {run_dir} ({type(exc).__name__})"
+            ) from exc
     return {**pins, "sidecars": sealed}

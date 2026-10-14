@@ -24,6 +24,8 @@ from scripts.analysis.maker_stage0_inputs import (
     InputRefused,
     TradeUnit,
     TruthConflict,
+    TruthTable,
+    UnitHypothesis,
     UnitRefused,
     is_underpowered,
     load_census_days,
@@ -201,9 +203,15 @@ def test_unit_file_that_is_not_json_is_refused(tmp_path: Path) -> None:
         load_trade_unit(path)
 
 
+def test_unknown_unit_hypothesis_name_is_refused() -> None:
+    with pytest.raises(UnitRefused, match="BOGUS"):
+        UnitHypothesis("BOGUS")
+
+
 # --- truth --------------------------------------------------------------------------------
 
 _CSV_HEAD = "station,climate_day,tmax_f,tmax_flag,correction_flag,product_sha256\n"
+SEALED = dt.date(2026, 10, 1)
 
 
 def _csv(path: Path, *rows: str) -> Path:
@@ -236,6 +244,28 @@ def _pq_row(station: str, day: str, tmax: int | None, status: str = "FINAL") -> 
     }
 
 
+def _keys(*pairs: tuple[str, dt.date]) -> frozenset[tuple[str, dt.date]]:
+    return frozenset(pairs) or frozenset({("SFO", DAY)})
+
+
+def _load(
+    tmp_path: Path,
+    csv_path: Path,
+    rows: list[dict[str, object]] | None = None,
+    *,
+    expected_csv_sha256: str | None = None,
+) -> TruthTable:
+    chosen = rows if rows is not None else [_pq_row("SFO", "2026-09-20", 70)]
+    cross = _parquet(tmp_path / "x.parquet", chosen)
+    return load_truth(
+        csv_path,
+        cross,
+        tmp_path / "run",
+        keys=_keys(),
+        expected_csv_sha256=expected_csv_sha256,
+    )
+
+
 def test_load_truth_keeps_final_rows_copies_and_pins_the_csv(tmp_path: Path) -> None:
     csv_path = _csv(
         tmp_path / "truth.csv",
@@ -245,8 +275,9 @@ def test_load_truth_keeps_final_rows_copies_and_pins_the_csv(tmp_path: Path) -> 
     )
     cross = _parquet(tmp_path / "x.parquet", [_pq_row("SFO", "2026-09-20", 71)])
     run_dir = tmp_path / "run"
-    table = load_truth(csv_path, cross, run_dir)
-    assert table.finals == {("SFO", dt.date(2026, 9, 20)): 71}
+    keys = _keys(("SFO", DAY), ("LAX", DAY), ("NYC", DAY))
+    table = load_truth(csv_path, cross, run_dir, keys=keys)
+    assert table.finals == {("SFO", DAY): 71}
     assert table.csv_sha256 == hashlib.sha256(csv_path.read_bytes()).hexdigest()
     assert table.run_copy.read_bytes() == csv_path.read_bytes()
     assert table.run_copy.parent == run_dir
@@ -254,24 +285,12 @@ def test_load_truth_keeps_final_rows_copies_and_pins_the_csv(tmp_path: Path) -> 
     assert table.cross_check_sha256 == hashlib.sha256(cross.read_bytes()).hexdigest()
 
 
-def test_truth_conflict_between_sources_raises(tmp_path: Path) -> None:
+def test_truth_conflict_between_sources_raises_without_printing_values(tmp_path: Path) -> None:
     csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,71,,False,aa")
-    cross = _parquet(tmp_path / "x.parquet", [_pq_row("SFO", "2026-09-20", 72)])
-    with pytest.raises(TruthConflict, match="SFO"):
-        load_truth(csv_path, cross, tmp_path / "run")
+    with pytest.raises(TruthConflict, match="SFO") as info:
+        _load(tmp_path, csv_path, [_pq_row("SFO", "2026-09-20", 72)])
+    assert "71" not in str(info.value) and "72" not in str(info.value)
     assert not (tmp_path / "run" / "truth_cli_finals.csv").exists()
-
-
-def test_truth_cross_check_ignores_rows_the_csv_lacks_and_non_final_rows(tmp_path: Path) -> None:
-    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-30,70,,False,aa")
-    cross = _parquet(
-        tmp_path / "x.parquet",
-        [
-            _pq_row("SFO", "2026-09-30", 99, status="PRELIMINARY_ONLY"),
-            _pq_row("LAX", "2026-08-01", 80),
-        ],
-    )
-    assert load_truth(csv_path, cross, tmp_path / "run").n_overlap == 0
 
 
 def test_a_correction_row_takes_the_final_revision(tmp_path: Path) -> None:
@@ -280,27 +299,139 @@ def test_a_correction_row_takes_the_final_revision(tmp_path: Path) -> None:
         "SFO,2026-09-20,70,,False,aa",
         "SFO,2026-09-20,72,,True,bb",
     )
-    cross = _parquet(tmp_path / "x.parquet", [])
-    assert load_truth(csv_path, cross, tmp_path / "run").finals[("SFO", DAY)] == 72
+    table = _load(tmp_path, csv_path, [_pq_row("SFO", "2026-09-20", 72)])
+    assert table.finals[("SFO", DAY)] == 72
 
 
-def test_two_conflicting_uncorrected_rows_raise(tmp_path: Path) -> None:
+def test_two_conflicting_uncorrected_rows_raise_without_printing_values(tmp_path: Path) -> None:
     csv_path = _csv(
         tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa", "SFO,2026-09-20,72,,False,bb"
     )
-    with pytest.raises(TruthConflict):
-        load_truth(csv_path, _parquet(tmp_path / "x.parquet", []), tmp_path / "run")
+    with pytest.raises(TruthConflict) as info:
+        _load(tmp_path, csv_path)
+    assert "70" not in str(info.value) and "72" not in str(info.value)
 
 
 def test_truth_csv_with_a_missing_column_is_refused(tmp_path: Path) -> None:
     csv_path = tmp_path / "t.csv"
     csv_path.write_text("station,climate_day,tmax_f\nSFO,2026-09-20,70\n")
     with pytest.raises(InputRefused, match="column"):
-        load_truth(csv_path, _parquet(tmp_path / "x.parquet", []), tmp_path / "run")
+        _load(tmp_path, csv_path)
 
 
 def test_truth_csv_sha_must_match_the_pinned_sha_when_given(tmp_path: Path) -> None:
     csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
-    cross = _parquet(tmp_path / "x.parquet", [])
     with pytest.raises(InputRefused, match="sha256"):
-        load_truth(csv_path, cross, tmp_path / "run", expected_csv_sha256="0" * 64)
+        _load(tmp_path, csv_path, expected_csv_sha256="0" * 64)
+
+
+def test_rows_outside_the_licensed_keys_are_never_parsed(tmp_path: Path) -> None:
+    # The sealed day and a post-10-13 day carry values that would raise if parsed.
+    csv_path = _csv(
+        tmp_path / "t.csv",
+        "SFO,2026-09-20,70,,False,aa",
+        "SFO,2026-10-01,SEALED-ABC,,False,bb",
+        "SFO,2026-10-14,70.5,,False,cc",
+        "DEN,2026-09-20,zzz,,False,dd",
+    )
+    table = _load(tmp_path, csv_path)
+    assert table.finals == {("SFO", DAY): 70}
+    assert table.csv_sha256 == hashlib.sha256(csv_path.read_bytes()).hexdigest()
+
+
+def test_cross_check_rows_outside_the_licensed_keys_are_not_compared(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    rows = [_pq_row("SFO", "2026-09-20", 70), _pq_row("SFO", "2026-10-01", 1)]
+    assert _load(tmp_path, csv_path, rows).n_overlap == 1
+
+
+def test_load_truth_refuses_an_empty_key_set(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    cross = _parquet(tmp_path / "x.parquet", [_pq_row("SFO", "2026-09-20", 70)])
+    with pytest.raises(InputRefused, match="keys"):
+        load_truth(csv_path, cross, tmp_path / "run", keys=frozenset())
+
+
+@pytest.mark.parametrize(
+    "row",
+    ["SFO,2026-09-20", "SFO,2026-09-20,70,,False,aa,EXTRA"],
+    ids=["truncated", "extra-cell"],
+)
+def test_a_malformed_csv_row_is_refused_not_dropped(tmp_path: Path, row: str) -> None:
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa", row)
+    with pytest.raises(InputRefused, match="row 3"):
+        _load(tmp_path, csv_path)
+
+
+@pytest.mark.parametrize("tmax", ["abc", "70.0", "9" * 40 + "x"])
+def test_a_non_integer_tmax_on_a_licensed_row_is_refused_without_the_value(
+    tmp_path: Path, tmax: str
+) -> None:
+    csv_path = _csv(tmp_path / "t.csv", f"SFO,2026-09-20,{tmax},,False,aa")
+    with pytest.raises(InputRefused, match="SFO") as info:
+        _load(tmp_path, csv_path)
+    assert tmax not in str(info.value)
+
+
+def test_a_bad_correction_flag_is_refused(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,maybe,aa")
+    with pytest.raises(InputRefused, match="correction_flag"):
+        _load(tmp_path, csv_path)
+
+
+def test_a_non_utf8_csv_is_refused(tmp_path: Path) -> None:
+    csv_path = tmp_path / "t.csv"
+    csv_path.write_bytes(_CSV_HEAD.encode() + b"SFO,2026-09-20,70,,False,\xff\xfe\n")
+    with pytest.raises(InputRefused, match="utf-8"):
+        _load(tmp_path, csv_path)
+
+
+def test_a_missing_truth_csv_or_cross_check_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(InputRefused, match="truth csv"):
+        _load(tmp_path, tmp_path / "nope.csv")
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    with pytest.raises(InputRefused, match="cross-check"):
+        load_truth(csv_path, tmp_path / "nope.parquet", tmp_path / "run", keys=_keys())
+
+
+def test_an_unreadable_or_schema_broken_cross_check_is_refused(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    garbage = tmp_path / "garbage.parquet"
+    garbage.write_bytes(b"not a parquet file")
+    with pytest.raises(InputRefused, match="cross-check"):
+        load_truth(csv_path, garbage, tmp_path / "run", keys=_keys())
+    lacking = tmp_path / "lacking.parquet"
+    pq.write_table(pa.table({"station": ["SFO"]}), lacking)
+    with pytest.raises(InputRefused, match="cross-check"):
+        load_truth(csv_path, lacking, tmp_path / "run", keys=_keys())
+
+
+def test_a_cross_check_whose_climate_day_is_not_a_date_is_refused(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    stringly = tmp_path / "str.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "station": ["SFO"],
+                "climate_day": ["2026-09-20"],
+                "status": ["FINAL"],
+                "tmax_f": [70],
+            }
+        ),
+        stringly,
+    )
+    with pytest.raises(InputRefused, match="date"):
+        load_truth(csv_path, stringly, tmp_path / "run", keys=_keys())
+
+
+def test_a_cross_check_with_no_overlap_is_refused_as_vacuous(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "t.csv", "SFO,2026-09-20,70,,False,aa")
+    with pytest.raises(InputRefused, match="overlap"):
+        _load(tmp_path, csv_path, [_pq_row("LAX", "2026-08-01", 80)])
+    assert not (tmp_path / "run" / "truth_cli_finals.csv").exists()
