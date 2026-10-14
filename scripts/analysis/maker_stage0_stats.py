@@ -82,6 +82,8 @@ def rate_ratio_test_b(n_f: int, n_u: int, l_f: int, l_u: int) -> float:
 
     Given ``L = L_f + L_u``, ``L_f ~ Bin(L, pi0)``, one-sided exact; ``L = 0`` cannot fail.
     """
+    if min(l_f, l_u) < 0 or l_f > n_f or l_u > n_u:
+        raise ValueError(f"losses ({l_f}, {l_u}) inconsistent with rows ({n_f}, {n_u})")
     if l_f + l_u == 0 or n_f == 0:
         return 1.0
     pi0 = rate_ratio_pi0(n_f, n_u)
@@ -270,11 +272,12 @@ class IccFit:
 def anova_icc(groups: Mapping[str, Sequence[float]]) -> IccFit:
     """One-way ANOVA ICC over climate-date clusters, truncated to [0, 1].
 
-    Undefined when n0 < 2, n_sd = n0 (MSW has 0 df), or ``MSB + (m0 - 1) MSW`` is 0.
+    Undefined when n0 < 2, n_sd = n0 (MSW has 0 df), ``MSB + (m0 - 1) MSW`` is 0, or any value
+    is not finite (a NaN must never clip to rho = 0).
     """
     kept = {key: values for key, values in groups.items() if values}
     n0, n_sd = len(kept), sum(len(v) for v in kept.values())
-    if n0 < 2 or n_sd == n0:
+    if n0 < 2 or n_sd == n0 or not all(math.isfinite(v) for vs in kept.values() for v in vs):
         return IccFit(n_sd, n0, None, None, None, None, None, None)
     grand = math.fsum(v for values in kept.values() for v in values) / n_sd
     means = {key: math.fsum(values) / len(values) for key, values in kept.items()}

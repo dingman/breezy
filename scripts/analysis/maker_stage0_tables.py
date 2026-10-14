@@ -8,21 +8,35 @@ labelled "run-time only, sha-pinned". The only I/O is the CSV re-read of a path 
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import statistics
 from collections import defaultdict
-from collections.abc import Callable, Sequence
-from dataclasses import fields
-from functools import partial
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Final, cast, get_args, get_type_hints
+from typing import Final
 
 from breezy.analysis.maker_tape_census import N_EFF_FLOOR
 from scripts.analysis import maker_stage0_stats as st
 from scripts.analysis import maker_stage0_verdict as vd
-from scripts.analysis.maker_stage0_fill_events import StationDaySummary
+from scripts.analysis.maker_stage0_rows import (
+    CsvCellError,
+    CsvColumnError,
+    pos_rows_to_csv,
+    read_scored_csv,
+    read_station_days_csv,
+    read_tail_csv,
+    sd_row_from_summary,
+    sd_rows_to_csv,
+    tail_rows_to_csv,
+)
+
+# own public API plus the re-exports that keep the pre-split import paths alive
+__all__ = [
+    "BANNER", "REPRODUCIBLE_BLOCKS", "RUNTIME_ONLY_BLOCKS", "RUNTIME_ONLY_LABEL", "UNPINNED",
+    "CsvCellError", "CsvColumnError", "pos_rows_to_csv", "read_scored_csv",
+    "read_station_days_csv", "read_tail_csv", "render_tables", "sd_row_from_summary",
+    "sd_rows_to_csv", "tables_from_csvs", "tail_rows_to_csv",
+]  # fmt: skip
 
 NS_PER_S: Final[int] = 1_000_000_000
 UNPINNED: Final[str] = "UNPINNED-RERUN"
@@ -37,95 +51,6 @@ REPRODUCIBLE_BLOCKS: Final[tuple[str, ...]] = (
     "coverage", "non_covered",
 )  # fmt: skip
 BANNER: Final[str] = "EXPLORATORY: never promotion evidence; Stage 0 never emits a go verdict."
-_SHARED: Final[tuple[str, ...]] = tuple(
-    f.name for f in fields(vd.SdRow) if f.name in {g.name for g in fields(StationDaySummary)}
-)
-
-# --- CSV --------------------------------------------------------------------------------------
-
-
-def _cell(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return repr(value) if isinstance(value, float) else str(value)
-
-
-def _coerce(raw: str, hint: object) -> object:
-    args = get_args(hint)
-    base = next((a for a in args if a is not type(None)), hint)
-    if raw == "":
-        if type(None) in args or base is str:
-            return None if type(None) in args else ""
-        raise ValueError("blank cell in a non-null column")
-    if base is bool:
-        if raw not in ("true", "false"):
-            raise ValueError(f"bad boolean cell {raw!r}")
-        return raw == "true"
-    return cast(Callable[[str], object], base)(raw)
-
-
-def _to_csv(cls: type, rows: Sequence[object]) -> str:
-    out = io.StringIO()
-    writer = csv.writer(out, lineterminator="\n")
-    names = [f.name for f in fields(cls)]
-    writer.writerow(names)
-    writer.writerows([_cell(getattr(row, n)) for n in names] for row in rows)
-    return out.getvalue()
-
-
-def _from_csv[T](text: str, ctor: Callable[..., T], optional: Sequence[str] = ()) -> list[T]:
-    hints = get_type_hints(ctor)
-    reader = csv.DictReader(io.StringIO(text))
-    missing = set(hints) - set(reader.fieldnames or ()) - set(optional)
-    if missing:
-        raise ValueError(f"csv is missing columns {sorted(missing)}")
-    return [ctor(**{k: _coerce(row[k], hints[k]) for k in hints if k in row}) for row in reader]
-
-
-sd_rows_to_csv = partial(_to_csv, vd.SdRow)
-pos_rows_to_csv = partial(_to_csv, vd.PosRow)
-tail_rows_to_csv = partial(_to_csv, st.TailRow)
-read_station_days_csv = partial(
-    _from_csv, ctor=vd.SdRow, optional=("rung_trials_attempted", "n_no_book_wants")
-)
-read_scored_csv = partial(_from_csv, ctor=vd.PosRow)
-read_tail_csv = partial(_from_csv, ctor=st.TailRow)
-
-
-def sd_row_from_summary(
-    s: StationDaySummary,
-    *,
-    census_reason: str,
-    covered_bidlive: bool,
-    covered: bool,
-    outage_excluded: bool,
-    node_log_absent: bool,
-    n_depth_frames: int,
-    truth_final: bool | None = None,
-    truth_tmax_f: int | None = None,
-    void: bool | None = None,
-    unresolved_d14: bool | None = None,
-    theta: float | None = None,
-    n_no_book_wants: int = 0,
-) -> vd.SdRow:
-    """A replayed row from WP4's summary; WP6 supplies the census, depth and truth fields."""
-    copied: dict[str, Any] = {name: getattr(s, name) for name in _SHARED}
-    in_den = covered and not outage_excluded and (s.bid_bearing or n_no_book_wants > 0)
-    return vd.SdRow(
-        **copied, cluster_id=s.climate_day, census_reason=census_reason,
-        covered_bidlive=covered_bidlive, covered=covered, outage_excluded=outage_excluded,
-        node_log_absent=node_log_absent, n_depth_frames=n_depth_frames,
-        has_depth_frame=n_depth_frames > 0, nogo_driving=in_den and s.filled_pairs_stress == 0,
-        positions_filled_k2_base=s.filled_pairs_base,
-        positions_filled_k2_stress=s.filled_pairs_stress,
-        positions_filled_k1_base=s.k1_filled_base, positions_filled_k1_stress=s.k1_filled_stress,
-        truth_final=truth_final, truth_tmax_f=truth_tmax_f, void=void,
-        unresolved_d14=unresolved_d14, theta=theta, n_no_book_wants=n_no_book_wants,
-    )  # fmt: skip
-
-
 # --- rendering helpers ------------------------------------------------------------------------
 
 
@@ -267,6 +192,8 @@ def render_s69(r: vd.Section69) -> str:
     )  # fmt: skip
     return (
         f"state: {r.state} (pooled; strata never set it)\n"
+        "Tests A and B are each run at alpha 0.05, uncorrected: the combined false-FAIL rate can "
+        "reach about 0.10.\n"
         f"n filled {r.n_filled}, n unfilled {r.n_unfilled}, expected losses "
         f"{r.expected_losses:.4f}, observed losses filled {r.losses_filled} "
         f"unfilled {r.losses_unfilled}\n{tests}\n"
@@ -313,6 +240,8 @@ def render_tail(t: st.TailTable) -> str:
     return _md(["bin", "n", "dates", "mean p", "observed", "Clopper-Pearson"], rows) + (
         f"pooled n {t.n}, expected {t.expected:.4f}, observed {t.observed}, "
         f"two-sided exact p {_f(t.p_value, 6)}\n"
+        "Anti-conservative: bands of one vector are correlated, so the exact p is too small "
+        "(report-only; never sets a label).\n"
     )
 
 
@@ -362,13 +291,19 @@ def render_tables(
     poss: Sequence[vd.PosRow],
     tail: Sequence[st.TailRow],
     *,
+    hypotheses: Sequence[str],
     code_sha: str = UNPINNED,
 ) -> dict[str, str]:
-    analyses = vd.analyse_all(sds, poss)
-    decision = vd.decide(analyses)
+    """``hypotheses`` is the WP1 unit loader's set; a missing or extra one is a refusal."""
+    analyses = vd.analyse_all(sds, poss, hypotheses)
+    decision = vd.decide(analyses, hypotheses)
     tail_table = st.tail_table(tail)
     s3 = vd.build_s3_inputs(decision, analyses, code_sha=code_sha)
-    s69 = "".join(f"#### {a.name}\n{render_s69(a.s69)}\n" for a in analyses)
+    s69 = "".join(
+        f"#### {a.name}\n{render_s69(a.s69)}\n"
+        f"#### {a.name} STRESSED fills (report-only; never a label)\n{render_s69(a.s69_stress)}\n"
+        for a in analyses
+    )
     blocks = {
         "v0": render_v0(analyses),
         "verdict": render_verdict(decision, analyses, tail_table),
@@ -388,12 +323,18 @@ def render_tables(
 
 
 def tables_from_csvs(
-    scored_csv: Path, station_days_csv: Path, tail_csv: Path, *, code_sha: str = UNPINNED
+    scored_csv: Path,
+    station_days_csv: Path,
+    tail_csv: Path,
+    *,
+    hypotheses: Sequence[str],
+    code_sha: str = UNPINNED,
 ) -> dict[str, str]:
-    """``maker_stage0_stats --scored``: every reproducible table from the three CSVs."""
+    """Rerun entry (the WP7 driver's ``--scored``): every reproducible table from the 3 CSVs."""
     return render_tables(
         read_station_days_csv(station_days_csv.read_text(encoding="utf-8")),
         read_scored_csv(scored_csv.read_text(encoding="utf-8")),
         read_tail_csv(tail_csv.read_text(encoding="utf-8")),
+        hypotheses=hypotheses,
         code_sha=code_sha,
     )

@@ -1,24 +1,45 @@
-"""MAKER-S2 WP5: rows, per-hypothesis analysis, the frozen verdict table and ``s3_inputs``.
+"""MAKER-S2 WP5: per-hypothesis analysis, the frozen verdict table and ``s3_inputs``.
 
-Plan ``docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md`` 1.1 + WP5 and r4 delta
-(a) V0, (e) denominator, (f) ``s3_inputs.json``, (g) CSV contract, (i)4/(i)6. Spec v0.3 6.0
-(``docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md`` :211-230) and 6.9 (:290-304).
-
-Pure. ``n_eff_gov`` / ``is_underpowered`` come from ``maker_stage0_inputs`` (never recomputed).
-Section 6.9 and the expectancy use the BASE rule (``p_yes_point_live`` is the base pass's vector).
+Plan ``docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md`` WP5 + r4 delta (a) V0,
+(e), (f), (g), (i)4/(i)6; spec v0.3 6.0 (:211-230) and 6.9 (:290-304). Pure. ``n_eff_gov`` /
+``is_underpowered`` come from ``maker_stage0_inputs``. Rows: ``maker_stage0_rows``; 6.9:
+``maker_stage0_scored`` (both re-exported). 6.9 and the expectancy use the BASE rule.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import math
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Final
 
 from scripts.analysis import maker_stage0_stats as st
 from scripts.analysis.maker_stage0_inputs import is_underpowered, n_eff_gov
+from scripts.analysis.maker_stage0_rows import PosRow, SdRow, in_denominator, nz
+from scripts.analysis.maker_stage0_scored import (
+    NO_FINAL,
+    OUTCOME_NO,
+    OUTCOME_VOID,
+    BidStats,
+    Expectancy,
+    Section69,
+    VerdictRefused,
+    bid_stats,
+    days_to_200,
+    expectancy,
+    section_69,
+)
+
+# own public API plus the re-exports that keep the pre-split import paths alive
+__all__ = [
+    "FILL_FLOOR", "NOT_KILLED", "NOT_KILLED_UNSCREENED", "NO_FINAL", "NO_GO_ADVERSE",
+    "NO_GO_FILL", "NO_GO_STRESS", "OUTCOME_NO", "OUTCOME_VOID", "UNDERPOWERED", "BidStats",
+    "Coverage", "Decision", "Expectancy", "HypAnalysis", "NoBidBearingDays", "PosRow", "Rate",
+    "SdRow", "Section69", "VerdictRefused", "analyse_all", "analyse_hypothesis", "bid_stats",
+    "build_s3_inputs", "comparisons", "coverage_sensitivity", "days_to_200", "decide",
+    "expectancy", "in_denominator", "nz", "section_69", "verdict_label",
+]  # fmt: skip
 
 UNDERPOWERED: Final[str] = "UNDERPOWERED-WAIT"
 NO_GO_FILL: Final[str] = "NO-GO (fill)"
@@ -33,150 +54,13 @@ _ROW_LABELS: Final[dict[str, str]] = {
     "V3": NO_GO_STRESS,
     "V4": NOT_KILLED_UNSCREENED,
 }
-OUTCOME_NO: Final[str] = "NO"
-OUTCOME_VOID: Final[str] = "VOID"  # excluded from section 6.9; refund 0 in the expectancy
-NO_FINAL: Final[str] = ""  # no CLI FINAL: excluded from section 6.9 and counted
-_LOSSES: Final[frozenset[str]] = frozenset({"YES", "UNRESOLVED"})  # unresolved past D+14 = LOSS
-_OUTCOMES: Final[frozenset[str]] = _LOSSES | {OUTCOME_NO, OUTCOME_VOID, NO_FINAL}
 COVERAGE_LIVE_SHARE: Final[float] = 0.5  # (i)4: covered_live_h >= 0.5 * process_live_h
 GAP_SHARE_LIMIT: Final[float] = 0.5
-TARGET_POSITIONS: Final[int] = 200
 MAX_RUNGS_HYPOTHESIS: Final[int] = 2
 
 
 class NoBidBearingDays(ValueError):
     """S-4 (r4 (a)): n_sd = 0 is degenerate; no rate is computable."""
-
-
-# --- rows -------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, kw_only=True)
-class SdRow:
-    """``station_days.csv`` (r4 (g)); replay fields are None where the day was not replayed.
-
-    ``rung_trials_attempted`` (position-unit denominator) and ``n_no_book_wants`` (WP4 re-check M1:
-    wanted rungs that never had a book) are appended after the contract columns.
-    """
-
-    station: str
-    climate_day: str
-    cluster_id: str
-    unit_hypothesis: str
-    census_reason: str | None = None
-    covered_bidlive: bool = False
-    covered: bool = False
-    outage_excluded: bool = False
-    node_log_absent: bool = False
-    bid_bearing: bool | None = None
-    guard_refused_only: bool | None = None
-    n_depth_frames: int | None = None
-    has_depth_frame: bool | None = None
-    n_attempts: int | None = None
-    n_episodes: int | None = None
-    n_refused: int | None = None
-    n_process_cuts: int | None = None
-    n_gtd_cuts: int | None = None
-    rung_trials_posted: int | None = None
-    rung_trials_filled_base: int | None = None
-    rung_trials_filled_stress: int | None = None
-    process_live_h: float | None = None
-    forecast_valid_h: float | None = None
-    gap_h: float | None = None
-    covered_live_h: float | None = None
-    gap_share: float | None = None
-    filled_pairs_base: int | None = None
-    filled_pairs_stress: int | None = None
-    k1_rung_id: str | None = None
-    k1_filled_base: int | None = None
-    k1_filled_stress: int | None = None
-    bid_median_fills_stress: float | None = None
-    nogo_driving: bool | None = None
-    positions_filled_k2_base: int | None = None
-    positions_filled_k2_stress: int | None = None
-    positions_filled_k1_base: int | None = None
-    positions_filled_k1_stress: int | None = None
-    delta_ns: int | None = None
-    truth_final: bool | None = None
-    truth_tmax_f: int | None = None
-    void: bool | None = None
-    unresolved_d14: bool | None = None
-    theta: float | None = None
-    rung_trials_attempted: int | None = None
-    n_no_book_wants: int | None = None
-
-    def cluster_key(self, cluster: str) -> object:
-        return self.climate_day
-
-
-@dataclass(frozen=True, kw_only=True)
-class PosRow:
-    """``scored_episodes.csv`` row; ``truth_final`` is "", YES, NO, VOID or UNRESOLVED."""
-
-    position_id: str
-    rung_trial_id: str
-    station: str
-    climate_day: str
-    unit_hypothesis: str
-    bid: float
-    filled_base: bool
-    filled_stress: bool
-    p_yes_point_live: float | None
-    truth_final: str
-
-    def cluster_key(self, cluster: str) -> object:
-        return self.climate_day
-
-
-def nz(value: float | None) -> float:
-    return 0.0 if value is None else float(value)
-
-
-def in_denominator(row: SdRow) -> bool:
-    """Covered, not outage-excluded, bid-bearing (or with a never-booked want; WP4 M1)."""
-    booked = bool(row.bid_bearing) or nz(row.n_no_book_wants) > 0
-    return row.covered and not row.outage_excluded and booked
-
-
-# --- section 6.9 over scored rows -------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Section69(st.Screen):
-    """The pooled screen plus the exclusions the report must count (r4 (i)6)."""
-
-    excluded_no_final_filled: int
-    excluded_no_final_unfilled: int
-    excluded_no_final_days: int
-    n_void_excluded: int
-
-
-def section_69(rows: Sequence[PosRow]) -> Section69:
-    kept: list[st.ScreenRow] = []
-    no_final = {True: 0, False: 0}
-    no_final_days: set[tuple[str, str]] = set()
-    voids = 0
-    for r in rows:
-        if r.truth_final not in _OUTCOMES:
-            raise ValueError(f"unknown settlement token {r.truth_final!r} on {r.position_id}")
-        if r.truth_final == OUTCOME_VOID:
-            voids += 1
-        elif r.truth_final == NO_FINAL:
-            no_final[r.filled_base] += 1
-            no_final_days.add((r.station, r.climate_day))
-        elif r.p_yes_point_live is None:
-            raise ValueError(f"scored row {r.position_id} has no p_yes_point_live")
-        else:
-            loss = r.truth_final in _LOSSES
-            kept.append(st.ScreenRow(r.p_yes_point_live, loss, r.filled_base, r.climate_day))
-    screen = st.pooled_screen(kept)
-    return Section69(
-        **{f.name: getattr(screen, f.name) for f in fields(screen)},
-        excluded_no_final_filled=no_final[True],
-        excluded_no_final_unfilled=no_final[False],
-        excluded_no_final_days=len(no_final_days),
-        n_void_excluded=voids,
-    )
 
 
 # --- rates ------------------------------------------------------------------------------------
@@ -192,11 +76,18 @@ class Rate:
 
 
 _Pick = Callable[[SdRow], float]
+
+
+def position_trials(r: SdRow) -> float:
+    """Position-unit denominator: attempted rungs plus wanted rungs that never had a book."""
+    return nz(r.rung_trials_attempted) + nz(r.n_no_book_wants)
+
+
 RATE_SPECS: Final[dict[str, tuple[_Pick, _Pick]]] = {
     "base_sd": (lambda r: float(nz(r.filled_pairs_base) >= 1), lambda r: 1.0),
     "stress_sd": (lambda r: float(nz(r.filled_pairs_stress) >= 1), lambda r: 1.0),
-    "base_pos": (lambda r: nz(r.filled_pairs_base), lambda r: nz(r.rung_trials_attempted)),
-    "stress_pos": (lambda r: nz(r.filled_pairs_stress), lambda r: nz(r.rung_trials_attempted)),
+    "base_pos": (lambda r: nz(r.filled_pairs_base), position_trials),
+    "stress_pos": (lambda r: nz(r.filled_pairs_stress), position_trials),
     "base_k1": (lambda r: nz(r.k1_filled_base), lambda r: 1.0),
     "stress_k1": (lambda r: nz(r.k1_filled_stress), lambda r: 1.0),
 }
@@ -213,82 +104,16 @@ def _rate(rows: Sequence[SdRow], num: _Pick, size: _Pick) -> Rate:
     return Rate(k, n, k / n if n else None, st.wilson_interval(k, n), boot)
 
 
-def _stricter(a: Rate, b: Rate) -> float:
-    return min((x for x in (a.point, b.point) if x is not None), default=0.0)
-
-
-# --- expectancy and bids ----------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Fill:
-    climate_day: str
-    win: float
-    net: float
-    p_no: float
-
-    def cluster_key(self, cluster: str) -> object:
-        return self.climate_day
-
-
-@dataclass(frozen=True)
-class Expectancy:
-    """Base-rule fills: win rate beside mean model p_NO, and ``w - (b + theta b (1 - b))``."""
-
-    n_fills: int
-    n_excluded_no_final: int
-    wins: int
-    win_rate: float | None
-    mean_p_no: float | None
-    win_rate_boot: st.BootInterval | None
-    win_rate_cp: tuple[float, float] | None
-    net_mean: float | None
-    net_upper_bound: float | None  # one-sided 95% (climate-date cluster bootstrap)
-
-
-def _mean(fills: Sequence[_Fill], pick: Callable[[_Fill], float]) -> float:
-    return math.fsum(pick(f) for f in fills) / len(fills) if fills else 0.0
-
-
-def expectancy(fills: Sequence[PosRow], theta: Mapping[tuple[str, str], float]) -> Expectancy:
-    scored: list[_Fill] = []
-    for r in (r for r in fills if r.truth_final != NO_FINAL):
-        if (r.station, r.climate_day) not in theta:
-            raise ValueError(f"no theta for scored fill {r.position_id}")
-        fee = theta[(r.station, r.climate_day)] * r.bid * (1.0 - r.bid)
-        win = float(r.truth_final == OUTCOME_NO)
-        scored.append(
-            _Fill(r.climate_day, win, win - (r.bid + fee), 1.0 - (r.p_yes_point_live or 0))
-        )
-    n, wins = len(scored), round(sum(f.win for f in scored))
-
-    def mean_of(pick: Callable[[_Fill], float]) -> Callable[[Sequence[_Fill]], float]:
-        return lambda rows: _mean(rows, pick)
-
-    return Expectancy(
-        n, len(fills) - n, wins, wins / n if n else None,
-        _mean(scored, lambda f: f.p_no) if n else None,
-        st.cluster_interval(scored, mean_of(lambda f: f.win)), st.clopper_pearson(wins, n),
-        _mean(scored, lambda f: f.net) if n else None,
-        st.cluster_upper_bound(scored, mean_of(lambda f: f.net)),
-    )  # fmt: skip
-
-
-@dataclass(frozen=True)
-class BidStats:
-    b: float | None
-    iqr: tuple[float, float] | None
-    n_stressed_fills: int
-    median_base: float | None
-
-
-def bid_stats(rows: Sequence[PosRow]) -> BidStats:
-    stressed = [r.bid for r in rows if r.filled_stress]
-    base = [r.bid for r in rows if r.filled_base]
-    return BidStats(
-        st.lower_median(stressed), st.inverted_cdf_iqr(stressed), len(stressed),
-        st.lower_median(base),
-    )  # fmt: skip
+def _stricter(day_unit: Rate, position_unit: Rate, *, n_den: int) -> float:
+    """The lower of the two units; an empty unit on a non-empty denominator is a refusal."""
+    if n_den == 0:
+        return 0.0
+    points: list[float] = []
+    for label, unit in (("station-day", day_unit), ("position", position_unit)):
+        if unit.point is None:
+            raise VerdictRefused(f"{label} unit has n=0 on {n_den} denominator station-days")
+        points.append(unit.point)
+    return min(points)
 
 
 # --- coverage sensitivity, days to 200 --------------------------------------------------------
@@ -319,17 +144,6 @@ def coverage_sensitivity(den: Sequence[SdRow]) -> Coverage:
     )  # fmt: skip
 
 
-def days_to_200(rows: Sequence[SdRow]) -> dict[str, float | None]:
-    """200 / (positions per distinct covered climate date); None when nothing fills."""
-    live = [r for r in rows if r.covered and not r.outage_excluded]
-    dates = len({r.climate_day for r in live})
-    out: dict[str, float | None] = {}
-    for key in ("k2_base", "k2_stress", "k1_base", "k1_stress"):
-        total = sum(nz(getattr(r, f"positions_filled_{key}")) for r in live)
-        out[key] = TARGET_POSITIONS * dates / total if total > 0 else None
-    return out
-
-
 # --- per-hypothesis analysis ------------------------------------------------------------------
 
 
@@ -349,6 +163,7 @@ class HypAnalysis:
     icc_rung_trial_k1: st.IccFit
     fitted_icc_disagrees: bool
     s69: Section69
+    s69_stress: Section69  # report-only: the same screen over STRESSED fills; never a label
     expectancy: Expectancy
     two_fill_share: float | None
     bids: BidStats
@@ -357,7 +172,8 @@ class HypAnalysis:
 
     @property
     def r_lo(self) -> float:
-        return self.rates["stress_sd"].point or 0.0
+        point = self.rates["stress_sd"].point
+        return 0.0 if point is None else point
 
 
 def _by_day(pairs: Sequence[tuple[str, float]]) -> dict[str, list[float]]:
@@ -367,10 +183,19 @@ def _by_day(pairs: Sequence[tuple[str, float]]) -> dict[str, list[float]]:
     return dict(out)
 
 
+def _require_denominator_columns(name: str, den: Sequence[SdRow]) -> None:
+    """A blank denominator cell on a denominator row would silently shrink the position unit."""
+    for r in den:
+        for col in ("rung_trials_attempted", "n_no_book_wants"):
+            if getattr(r, col) is None:
+                raise VerdictRefused(f"{name}: {r.station} {r.climate_day} has no {col}")
+
+
 def analyse_hypothesis(
     name: str, sd_rows: Sequence[SdRow], pos_rows: Sequence[PosRow]
 ) -> HypAnalysis:
     den = [r for r in sd_rows if in_denominator(r)]
+    _require_denominator_columns(name, den)
     keys = {(r.station, r.climate_day) for r in den}
     pos = [p for p in pos_rows if (p.station, p.climate_day) in keys]
     per_date = _by_day([(r.climate_day, 1.0) for r in den])
@@ -387,8 +212,8 @@ def analyse_hypothesis(
         covered_days=sum(1 for r in sd_rows if r.covered and not r.outage_excluded),
         n_never_booked_days=sum(1 for r in den if not r.bid_bearing),
         rates=rates,
-        base_rate=_stricter(rates["base_sd"], rates["base_pos"]),
-        stress_rate=_stricter(rates["stress_sd"], rates["stress_pos"]),
+        base_rate=_stricter(rates["base_sd"], rates["base_pos"], n_den=len(den)),
+        stress_rate=_stricter(rates["stress_sd"], rates["stress_pos"], n_den=len(den)),
         icc_station_day=fit,
         icc_rung_trial=st.anova_icc(
             _by_day([(p.climate_day, float(p.filled_stress)) for p in pos])
@@ -399,6 +224,7 @@ def analyse_hypothesis(
         fitted_icc_disagrees=fit.n_eff_hat is not None
         and is_underpowered(fit.n_eff_hat) != is_underpowered(eff),
         s69=section_69(pos),
+        s69_stress=section_69(pos, stressed=True),
         expectancy=expectancy([p for p in pos if p.filled_base], theta),
         two_fill_share=(
             sum(1 for r in stress_days if nz(r.filled_pairs_stress) >= 2) / len(stress_days)
@@ -411,8 +237,22 @@ def analyse_hypothesis(
     )
 
 
-def analyse_all(sd_rows: Sequence[SdRow], pos_rows: Sequence[PosRow]) -> list[HypAnalysis]:
-    names = sorted({r.unit_hypothesis for r in sd_rows})
+def _check_hypotheses(found: Sequence[str], expected: Sequence[str], what: str) -> list[str]:
+    """The set comes from the WP1 unit loader; a missing or extra hypothesis is a refusal."""
+    names = sorted(expected)
+    if not names or len(set(names)) != len(names):
+        raise VerdictRefused(f"expected hypothesis set must be non-empty and unique: {names}")
+    absent, extra = sorted(set(names) - set(found)), sorted(set(found) - set(names))
+    if absent or extra:
+        raise VerdictRefused(f"{what}: hypotheses without rows {absent}, unexpected {extra}")
+    return names
+
+
+def analyse_all(
+    sd_rows: Sequence[SdRow], pos_rows: Sequence[PosRow], hypotheses: Sequence[str]
+) -> list[HypAnalysis]:
+    """One analysis per hypothesis in ``hypotheses`` (from the unit loader), sorted by name."""
+    names = _check_hypotheses([r.unit_hypothesis for r in sd_rows], hypotheses, "station-days")
     return [
         analyse_hypothesis(
             n,
@@ -465,8 +305,9 @@ def _rank(label: str) -> int:
     return 1 if label == NOT_KILLED_UNSCREENED else 2
 
 
-def decide(analyses: Sequence[HypAnalysis]) -> Decision:
+def decide(analyses: Sequence[HypAnalysis], hypotheses: Sequence[str]) -> Decision:
     """V0 on the minimum ``n_eff_gov``; else NO-GO > UNSCREENED > NOT-KILLED, ties to lower r_lo."""
+    _check_hypotheses([a.name for a in analyses], hypotheses, "analyses")
     if not analyses or any(a.n_sd == 0 for a in analyses):
         raise NoBidBearingDays("no covered bid-bearing station-day: no verdict is computable")
     weakest = min(analyses, key=lambda a: (a.n_eff_gov, a.r_lo))
@@ -497,14 +338,30 @@ def _min_or_none(values: Sequence[float | None]) -> float | None:
     return min(defined) if len(defined) == len(values) and defined else None
 
 
+def _point(rate: Rate) -> float:
+    return 0.0 if rate.point is None else rate.point
+
+
+def _worst_boot(analyses: Sequence[HypAnalysis]) -> st.BootInterval | None:
+    """The stressed-day bootstrap of the min-LCB hypothesis; None if any is not estimable."""
+    boots = [a.rates["stress_sd"].boot for a in analyses]
+    defined = [b for b in boots if b is not None]
+    return min(defined, key=lambda b: b.low) if defined and len(defined) == len(boots) else None
+
+
 def build_s3_inputs(
     decision: Decision, analyses: Sequence[HypAnalysis], *, code_sha: str
 ) -> dict[str, object]:
-    """Every ``r_lo*`` key is the minimum over hypotheses; the rest come from the governing one."""
+    """Every ``r_lo*`` key is the minimum over hypotheses; the rest come from the governing one.
+
+    ``r_lo_position``, ``r_lo_lcb_cluster_boot``, ``r_lo_k1_lcb_cluster_boot`` and
+    ``r_lo_se_cluster_boot`` are null when ANY hypothesis is not estimable (< 5 climate dates):
+    S3 must treat null as REFUSE, never as 0 and never as f_pass = f_kill.
+    """
     gov = next(a for a in analyses if a.name == decision.governing)
     lcbs = {a.name: _lcb(a, "stress_sd") for a in analyses}
     # the SE comes from the hypothesis attaining the minimum LCB, never the smallest SD
-    worst = min(analyses, key=lambda a: _lcb(a, "stress_sd") or 0.0).rates["stress_sd"].boot
+    worst = _worst_boot(analyses)
     r_by = {a.name: a.r_lo for a in analyses}
     base_boot, bids = gov.rates["base_sd"].boot, gov.bids
     return {
@@ -515,8 +372,8 @@ def build_s3_inputs(
         "r_lo_by_hypothesis": r_by,
         "r_lo_lcb_cluster_boot": _min_or_none(list(lcbs.values())),
         "r_lo_lcb_by_hypothesis": lcbs,
-        "r_lo_se_cluster_boot": None if worst is None or None in lcbs.values() else worst.se,
-        "r_lo_k1": min(a.rates["stress_k1"].point or 0.0 for a in analyses),
+        "r_lo_se_cluster_boot": None if worst is None else worst.se,
+        "r_lo_k1": min(_point(a.rates["stress_k1"]) for a in analyses),
         "base_k1": gov.rates["base_k1"].point,
         "r_lo_k1_lcb_cluster_boot": _min_or_none([_lcb(a, "stress_k1") for a in analyses]),
         "fill_icc_rung_trial_k1": gov.icc_rung_trial_k1.rho,

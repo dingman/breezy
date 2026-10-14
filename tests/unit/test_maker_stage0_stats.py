@@ -210,3 +210,39 @@ def test_stats_module_imports_no_truth_loader() -> None:
     }
     assert "load_truth" not in imported
     assert "TruthTable" not in imported
+
+
+# --- review fixes: hand values and edge cases --------------------------------------------------
+
+
+def test_power_line_hand_computed_critical_count_and_power() -> None:
+    # three fills at p = .1: margin q = .15 -> P(L >= 3) = .15^3 = .003375 < .05 but
+    # P(L >= 2) = 3 * .15^2 * .85 + .003375 = .06075 >= .05, so the critical count is 3.
+    # Power at k: q = k * .1 -> P(L = 3) = q^3: .003375 (k=1.5), .008 (k=2), .027 (k=3).
+    line = st.power_line([0.1, 0.1, 0.1])
+    assert line.critical_count == 3
+    assert [row.power for row in line.rows] == pytest.approx([0.003375, 0.008, 0.027])
+    assert line.fills_needed_for_ten_expected_losses == 100
+
+
+def test_single_value_median_and_iqr() -> None:
+    assert st.lower_median([0.7]) == 0.7
+    assert st.inverted_cdf_iqr([0.7]) == (0.7, 0.7)
+
+
+def test_anova_icc_with_nan_input_is_undefined_never_zero() -> None:
+    fit = st.anova_icc({"a": [1.0, math.nan], "b": [0.0, 1.0], "c": [1.0, 0.0]})
+    assert fit.rho is None and fit.n_eff_hat is None and fit.deff_hat is None
+    assert fit.msb is None and fit.msw is None
+
+
+def test_anova_icc_with_no_groups_or_only_empty_groups_is_undefined() -> None:
+    assert st.anova_icc({}).rho is None
+    assert st.anova_icc({"a": [], "b": []}).n0 == 0
+
+
+def test_rate_ratio_test_b_refuses_more_losses_than_rows() -> None:
+    with pytest.raises(ValueError, match="losses"):
+        st.rate_ratio_test_b(2, 5, 3, 0)
+    with pytest.raises(ValueError, match="losses"):
+        st.rate_ratio_test_b(5, 2, 0, 3)
