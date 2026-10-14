@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from scripts.analysis import maker_stage0_rule as rule
+from scripts.analysis.maker_stage0_pno import STALE_H
 
 THETA = 0.0695
 NS_H = 3_600 * 1_000_000_000
@@ -34,7 +35,7 @@ def test_rule_constants_match_spec_v03() -> None:
     assert rule.B_CAP == 0.80
     assert rule.E_MIN == 0.10
     assert rule.B_FLOOR == 0.70
-    assert rule.STALE_H == 8
+    assert STALE_H == 8  # WP2 owns it; WP3 imports the same object
     assert rule.MAX_RUNGS == 2
     assert rule.CANCEL_LST == dt.time(9, 0)
 

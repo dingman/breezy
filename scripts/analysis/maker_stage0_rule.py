@@ -17,12 +17,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from scripts.analysis.maker_stage0_pno import STALE_H
+
 # Spec lines 72-73.
 P_MIN: Final[float] = 0.94
 B_CAP: Final[float] = 0.80
 E_MIN: Final[float] = 0.10
 B_FLOOR: Final[float] = 0.70
-STALE_H: Final[int] = 8
 MAX_RUNGS: Final[int] = 2
 CANCEL_LST: Final[dt.time] = dt.time(9, 0)
 
