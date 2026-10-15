@@ -17,7 +17,9 @@ projects ``a * n_days + b * total_bytes``. It is used only when the fit is non-d
 Memory. ``ru_maxrss`` is a ratchet, so its per-row delta is not a growth rate (the old mean-delta
 screen projected 47.5 GB for a flat ~2.1 GB process), and the slope of end-of-row RSS over run
 order is confounded by the heaviest day landing early. A leak is growth that persists when the
-SAME work is repeated, so the leak rate is
+SAME work is repeated, so the leak rate is (``rss`` is the row's ``parent_rss_bytes``, the driver
+process, when the row has it -- an isolated child's own RSS restarts from zero every day and
+could never show a leak -- else ``rss_bytes``)
 
     max(0, rss_end(repeat row) - rss_end(first replay of that day)) / rows between them
 
@@ -89,6 +91,11 @@ def _affine(timed: Sequence[Mapping[str, Any]], total: int, total_weight: int) -
     return fit[0] * total + fit[1] * total_weight, len(timed)
 
 
+def _resident(row: Mapping[str, Any]) -> int:
+    """The driver's own RSS after the row (isolated runs); the row's RSS where it is the same."""
+    return int(row.get("parent_rss_bytes", row["rss_bytes"]))
+
+
 def _leak_rate(rows: Sequence[Mapping[str, Any]]) -> int:
     for index, row in enumerate(rows):
         if not _is_repeat(row):
@@ -96,7 +103,7 @@ def _leak_rate(rows: Sequence[Mapping[str, Any]]) -> int:
         for first_index, first in enumerate(rows[:index]):
             same = (first["station"], first["climate_day"]) == (row["station"], row["climate_day"])
             if same and not _is_repeat(first):
-                growth = row["rss_bytes"] - first["rss_bytes"]
+                growth = _resident(row) - _resident(first)
                 return max(0, int(growth / (index - first_index)))
     return 0
 
@@ -113,7 +120,7 @@ def project_bench(
     leak = _leak_rate(rows)
     peak = max((r["peak_rss_bytes"] for r in rows), default=0)
     projected = peak + leak * max(0, total - len(timed))
-    resident = [float(r["rss_bytes"]) for r in timed[DIAGNOSTIC_WARMUP_ROWS:]]
+    resident = [float(_resident(r)) for r in timed[DIAGNOSTIC_WARMUP_ROWS:]]
     fit = _ols(list(range(len(resident))), resident)
     slope = 0 if fit is None else max(0, int(fit[1]))
     exceeded = seconds > S5_MAX_SECONDS or projected > RSS_ABORT_BYTES

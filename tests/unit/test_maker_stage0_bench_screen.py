@@ -18,7 +18,8 @@ import pytest
 
 from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis.maker_stage0_bench_screen import project_bench
-from scripts.analysis.maker_stage0_run_types import RSS_ABORT_BYTES, S5_MAX_SECONDS
+from scripts.analysis.maker_stage0_isolate import DayMeasure
+from scripts.analysis.maker_stage0_run_types import RSS_ABORT_BYTES, S5_MAX_SECONDS, MemoryAbort
 
 GB = 10**9
 TOTAL = 88
@@ -202,3 +203,63 @@ def test_write_bench_records_both_projections_and_the_leak_fields(tmp_path: Path
 def test_degenerate_row_counts_do_not_raise(rows: list[dict[str, Any]]) -> None:
     out = project_bench(rows, TOTAL)
     assert out.leak_rate_bytes_per_row == 0
+
+
+# --- isolated runs: the driver process is the one that can leak (review) -----------------------
+
+
+def _isolated_bench(parent_growth_mb: int) -> list[dict[str, Any]]:
+    """Child RSS restarts every day (flat, ~1.5 GB); the parent grows ``parent_growth_mb`` a row."""
+    rows = [_row(1.5, 2.4, day=d) for d in ("2026-10-03", "2026-10-04", "2026-10-09")]
+    rows.append(_row(1.5, 2.4, day="2026-10-04", repeat=True))
+    for index, row in enumerate(rows):
+        row["parent_rss_bytes"] = int(0.7 * GB) + index * parent_growth_mb * 10**6
+    return rows
+
+
+def test_a_growing_parent_trips_the_leak_screen_over_88_rows_though_children_are_flat() -> None:
+    out = project_bench(_isolated_bench(100), TOTAL)
+    assert out.leak_rate_bytes_per_row > 0 and out.s5_exceeded is True
+
+
+def test_a_flat_parent_does_not_exceed_the_memory_screen() -> None:
+    out = project_bench(_isolated_bench(0), TOTAL)
+    assert out.leak_rate_bytes_per_row == 0 and out.s5_exceeded is False
+
+
+def _simulate(rss_fn: Any, tmp_path: Path, runner: Any, n_rows: int) -> list[dict[str, Any]]:
+    from scripts.analysis.maker_stage0_runio import ProgressLog
+
+    keys = [("SFO", dt.date(2026, 10, 1) + dt.timedelta(days=i)) for i in range(n_rows)]
+    progress = ProgressLog(tmp_path / "progress.jsonl")
+    try:
+        ctx: Any = None  # the stub runners never read the context or the output
+        return modes.simulate(ctx, keys, progress, ctx, rss_fn, lambda: 0, runner=runner)
+    finally:
+        progress.close()
+
+
+def _child_flat(_ctx: Any, _key: Any, _out: Any) -> DayMeasure:
+    return DayMeasure(1, int(1.5 * GB), int(2.0 * GB), 0)
+
+
+def test_the_parent_series_is_in_every_progress_row_and_drives_the_abort(tmp_path: Path) -> None:
+    rss = iter(range(10**9, 10**12, 100 * 10**6))  # the parent gains 100 MB a row
+    with pytest.raises(MemoryAbort, match="S-5"):
+        _simulate(lambda: next(rss), tmp_path, _child_flat, 88)
+    lines = [json.loads(x) for x in (tmp_path / "progress.jsonl").read_text().splitlines()]
+    assert lines and all("parent_rss_bytes" in e and e["rss_bytes"] == int(1.5 * GB) for e in lines)
+    assert [e["parent_rss_bytes"] for e in lines] == sorted(e["parent_rss_bytes"] for e in lines)
+
+
+def test_a_flat_parent_never_aborts(tmp_path: Path) -> None:
+    timings = _simulate(lambda: 700 * 10**6, tmp_path, _child_flat, 12)
+    assert {t["parent_rss_bytes"] for t in timings} == {700 * 10**6}
+
+
+def test_child_peak_plus_parent_counts_against_the_ceiling(tmp_path: Path) -> None:
+    def heavy(_ctx: Any, _key: Any, _out: Any) -> DayMeasure:
+        return DayMeasure(1, GB, 3 * GB, 0)
+
+    with pytest.raises(MemoryAbort, match="S-5"):
+        _simulate(lambda: 2 * GB, tmp_path, heavy, 1)  # 3 + 2 GB together, each under 4 GiB

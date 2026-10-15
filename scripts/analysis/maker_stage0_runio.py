@@ -48,6 +48,7 @@ PROGRESS_FIELDS: Final[frozenset[str]] = frozenset(
         "status",
         "elapsed_s",
         "rss_bytes",
+        "parent_rss_bytes",
         "n_events",
         "rss_peak_delta_bytes",
         "peak_rss_bytes",

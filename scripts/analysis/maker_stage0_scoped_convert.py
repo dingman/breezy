@@ -118,6 +118,16 @@ def _signature(directory: Path) -> tuple[tuple[str, int, int], ...]:
     )
 
 
+def scans_snapshot() -> dict[tuple[str, str, str], Any]:
+    """The process-local scan memo, for a station-day child that must not rescan every byte."""
+    return dict(_SCANS)
+
+
+def scans_install(snapshot: dict[tuple[str, str, str], Any]) -> None:
+    """Adopt a parent's memo; entries stay keyed by file signature, so a touched file rescans."""
+    _SCANS.update(snapshot)
+
+
 def scan_instance_memoized(
     catalog_root: Path, instance_id: str, subdirectory: str = DEFAULT_SUBDIRECTORY
 ) -> PreflightReport:

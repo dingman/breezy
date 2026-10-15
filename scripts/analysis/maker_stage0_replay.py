@@ -104,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spec", type=Path, help=f"default <repo root>/{DEFAULT_SPEC}")
     p.add_argument("--addendum", type=Path)
     p.add_argument("--addendum-sha")
+    p.add_argument(
+        "--no-isolate", action="store_true", help="debug: simulate in-process (memory unbounded)"
+    )
     p.add_argument("--stations", type=_csv, help="bench only")
     p.add_argument("--days", type=_days, help="bench only")
     modes = p.add_mutually_exclusive_group()
@@ -158,6 +161,7 @@ def parse_args(argv: Sequence[str] | None = None) -> drv.RunConfig:
         verify_first=ns.verify_first,
         parity=ns.parity,
         tail_csv=ns.tail_csv,
+        isolate=not ns.no_isolate,
         argv=shown,
     )
 
