@@ -27,6 +27,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCa
 from scripts.analysis.maker_stage0_bench_screen import project_bench
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_inputs import load_trade_unit
+from scripts.analysis.maker_stage0_isolate import DayMeasure, DayRunner, isolated_runner
 from scripts.analysis.maker_stage0_release import release_free_heap
 from scripts.analysis.maker_stage0_run_types import (
     BENCH_COUNTS,
@@ -154,6 +155,24 @@ def build_context(
     return ctx, overlay
 
 
+def in_process_runner(rss_fn: Callable[[], int], peak_fn: Callable[[], int]) -> DayRunner:
+    """The station-day in THIS process (tests, ``--no-isolate``): memory unbounded across days."""
+
+    def run(ctx: LoopContext, key: Key, out: LoopOutput) -> DayMeasure:
+        peak_before = peak_fn()
+        n_events = run_station_day(ctx, key, out)
+        release_free_heap()  # S-5: the day's freed heap goes back before RSS is read
+        rss, peak = rss_fn(), peak_fn()
+        return DayMeasure(n_events, rss, peak, max(0, peak - peak_before))
+
+    return run
+
+
+def day_runner(cfg: RunConfig) -> DayRunner | None:
+    """S-5: each station-day in its own child process unless the run asks for in-process."""
+    return isolated_runner(cfg.work_root / "children") if cfg.isolate else None
+
+
 def simulate(
     ctx: LoopContext,
     keys: Sequence[Key],
@@ -161,23 +180,25 @@ def simulate(
     out: LoopOutput,
     rss_fn: Callable[[], int],
     peak_fn: Callable[[], int] = peak_rss_bytes,
+    runner: DayRunner | None = None,
 ) -> list[dict[str, Any]]:
     """Every station-day in order: one progress line each (no fill/rate/label), RSS watched.
 
-    Per station-day the ``ru_maxrss`` delta is recorded; the in-day peak check runs inside
-    ``run_station_day`` (``ctx.watch``) and again here when the line is written.
+    ``runner`` executes one station-day and reports its own memory (an isolated child's, or this
+    process's by default); the in-day peak check runs inside ``run_station_day`` (``ctx.watch``)
+    and again here when the line is written.
     """
+    run = runner if runner is not None else in_process_runner(rss_fn, peak_fn)
     timings: list[dict[str, Any]] = []
     for index, key in enumerate(keys, 1):
-        started, peak_before = time.monotonic(), peak_fn()
-        n_events = run_station_day(ctx, key, out)
-        release_free_heap()  # S-5: the day's freed heap goes back before RSS is read
-        elapsed, rss, peak = time.monotonic() - started, rss_fn(), peak_fn()
+        started = time.monotonic()
+        day = run(ctx, key, out)
+        elapsed, rss, peak = time.monotonic() - started, day.rss_bytes, day.peak_bytes
         measured: dict[str, Any] = {
             "elapsed_s": round(elapsed, 3),
             "rss_bytes": rss,
-            "n_events": n_events,
-            "rss_peak_delta_bytes": max(0, peak - peak_before),
+            "n_events": day.n_events,
+            "rss_peak_delta_bytes": day.peak_delta_bytes,
             "peak_rss_bytes": peak,
         }
         if key in keys[: index - 1]:
@@ -222,7 +243,9 @@ def run_bench(
         }
         chosen = sorted(heaviest(weights, count or 0), key=lambda k: (k[1], k[0]))
         keys = [*chosen, *heaviest(weights, 1)]  # the heaviest day again: the leak screen's repeat
-        timings = simulate(ctx, keys, progress, LoopOutput(), rss_fn, peak_fn)
+        timings = simulate(
+            ctx, keys, progress, LoopOutput(), rss_fn, peak_fn, runner=day_runner(cfg)
+        )
     finally:
         progress.close()
         session.close()

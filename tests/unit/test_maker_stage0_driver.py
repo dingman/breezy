@@ -465,7 +465,7 @@ def test_rss_over_four_gib_aborts_and_voids_run(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(drv, "current_rss_bytes", lambda: 5 * 2**30)
-    cfg = _fresh(world, tmp_path)
+    cfg = _fresh(world, tmp_path, isolate=False)
     with pytest.raises(drv.RunVoided, match="S-5") as info:
         drv.run(cfg)
     assert isinstance(info.value.cause, drv.MemoryAbort)
@@ -476,7 +476,7 @@ def test_a_void_run_may_be_rerun_only_with_a_dated_addendum(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(drv, "current_rss_bytes", lambda: 5 * 2**30)
-    cfg = _fresh(world, tmp_path)
+    cfg = _fresh(world, tmp_path, isolate=False)
     with pytest.raises(drv.RunVoided):
         drv.run(cfg)
     monkeypatch.undo()
@@ -604,7 +604,7 @@ def test_driver_scores_only_after_simulation_completes(
     monkeypatch.setattr(eb, "simulate_station_day", sim)
     monkeypatch.setattr(rep, "load_truth", truth)
     monkeypatch.setattr(drv, "verify_first_s6", never)
-    drv.run(_fresh(world, tmp_path))
+    drv.run(_fresh(world, tmp_path, isolate=False))
     assert order.count("truth") == 1 and order[-1] == "truth"
     assert order.count("sim") >= 2 and "truth" not in order[:-1]
 
@@ -613,7 +613,7 @@ def test_driver_writes_each_episode_to_disk_before_the_next_is_pulled(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_sim = eb.simulate_station_day
-    cfg = _fresh(world, tmp_path)
+    cfg = _fresh(world, tmp_path, isolate=False)
     episodes_path = cfg.out_dir / "episodes.jsonl"
     early_pulls: list[int] = []
     spies: list[Spy] = []
@@ -1151,7 +1151,7 @@ def test_peak_rss_is_checked_inside_the_day_not_only_after_it(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(drv, "peak_rss_bytes", lambda: 5 * 2**30)  # a mid-day spike
-    cfg = _fresh(world, tmp_path)
+    cfg = _fresh(world, tmp_path, isolate=False)
     with pytest.raises(drv.RunVoided, match="S-5") as info:
         drv.run(cfg)
     assert isinstance(info.value.cause, drv.MemoryAbort)

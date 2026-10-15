@@ -15,7 +15,7 @@ import datetime as dt
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.maker_tape_census import CensusedDay
@@ -41,6 +41,7 @@ from scripts.analysis.maker_stage0_events_build import (
 from scripts.analysis.maker_stage0_fill_events import (
     Decision,
     DecisionContext,
+    Episode,
     ForecastVector,
     RungSelector,
 )
@@ -49,7 +50,6 @@ from scripts.analysis.maker_stage0_nodelog import LogStatus
 from scripts.analysis.maker_stage0_pno import AbstainReason, classify_p_no, release_instants
 from scripts.analysis.maker_stage0_pno_store import PNoStore, Stress, site
 from scripts.analysis.maker_stage0_runio import (
-    EpisodeSink,
     PositionFold,
     PositionSeed,
     theta_for_day,
@@ -64,7 +64,15 @@ from scripts.analysis.maker_stage0_schedule import (
 from scripts.analysis.maker_stage0_tables import sd_row_from_summary
 from scripts.analysis.maker_stage0_verdict import SdRow
 
-__all__ = ["VARIANTS", "LoopContext", "LoopOutput", "replays", "run_station_day"]
+__all__ = [
+    "VARIANTS",
+    "EpisodeWriter",
+    "Key",
+    "LoopContext",
+    "LoopOutput",
+    "replays",
+    "run_station_day",
+]
 
 PRIMARY: Final[str] = "primary"
 #: name -> (schedule, availability stress, Delta forced to zero)
@@ -85,6 +93,10 @@ _NS: Final[int] = 10**9
 Key = tuple[str, dt.date]
 
 
+class EpisodeWriter(Protocol):
+    def write(self, episode: Episode) -> None: ...
+
+
 @dataclass
 class LoopContext:
     units: Sequence[UnitHypothesis]
@@ -97,7 +109,7 @@ class LoopContext:
     session: CatalogSession
     nbp_root: Path
     calibration: LiveCalibration
-    sink: EpisodeSink | None
+    sink: EpisodeWriter | None
     variants: Sequence[str] = tuple(VARIANTS)
     #: station-days listed after D-1 12:00Z: replayed (covered) but never bid (listing abstention)
     abstained: frozenset[tuple[str, dt.date]] = frozenset()
@@ -239,7 +251,9 @@ def _selector_for(
     return build_selector(cfg, tracker)
 
 
-def _stream(sink: EpisodeSink, replay: ReplayResult, key: Key, unit: str, out: LoopOutput) -> None:
+def _stream(
+    sink: EpisodeWriter, replay: ReplayResult, key: Key, unit: str, out: LoopOutput
+) -> None:
     """Write every episode before the next is pulled; keep only the per-rung position fold."""
     fold = PositionFold(key[0], key[1], unit)
     for episode in replay.result.episodes:

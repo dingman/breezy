@@ -212,6 +212,16 @@ class CatalogSliceManifest:
             raise ValueError(f"{path} changed between reads")
         self._entries[rel], self._stamps[rel] = entry, stamp
 
+    def merge(self, other: CatalogSliceManifest) -> None:
+        """Absorb another manifest's entries (a station-day child's); a differing entry is fatal."""
+        for key, entry in other._entries.items():
+            known = self._entries.get(key)
+            if known is not None and known != entry:
+                raise ValueError(f"{key} changed between reads")
+            self._entries[key] = entry
+            if key in other._stamps:
+                self._stamps[key] = other._stamps[key]
+
     def to_dict(self) -> dict[str, Any]:
         return {"files": [self._entries[key] for key in sorted(self._entries)]}
 

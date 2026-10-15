@@ -53,8 +53,13 @@ def test_the_driver_releases_the_heap_after_every_station_day(
     world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
-    cfg = drv_fx._fresh(
-        world, tmp_path, bench=4, stations=("SFO",), days=(rw.DAY, rw.DIRECTION_DAY)
+    cfg = drv_fx._fresh(  # the in-process runner: the isolated child trims in its own process
+        world,
+        tmp_path,
+        bench=4,
+        stations=("SFO",),
+        days=(rw.DAY, rw.DIRECTION_DAY),
+        isolate=False,
     )
     monkeypatch.setattr(
         modes, "heaviest", lambda w, n: [runio.heaviest(w, 1)[0]] * (PASSES - 1 if n > 1 else 1)

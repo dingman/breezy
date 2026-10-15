@@ -274,7 +274,15 @@ def _simulate_all(
         write_schedule(run_dir / "process_schedule.json", ctx.primary)
         write_schedule(run_dir / "process_schedule_overlay.json", overlay, kind="OVERLAY")
         keys = sorted(pre.census, key=lambda k: (k[1], k[0]))
-        modes.simulate(ctx, keys, progress, out, current_rss_bytes, peak_rss_bytes)
+        modes.simulate(
+            ctx,
+            keys,
+            progress,
+            out,
+            current_rss_bytes,
+            peak_rss_bytes,
+            runner=modes.day_runner(cfg),
+        )
     finally:
         progress.close()
         sink.close()

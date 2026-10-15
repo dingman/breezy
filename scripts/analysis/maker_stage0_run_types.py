@@ -99,6 +99,7 @@ class RunConfig:
     tail_csv: Path | None = None
     argv: tuple[str, ...] = ()
     min_free_bytes: int = MIN_FREE_BYTES
+    isolate: bool = True  # S-5: one child process per station-day; False only for in-process tests
 
     def need(self, name: str) -> Path:
         """A path that the chosen mode requires; absence is a typed refusal, never a sentinel."""
