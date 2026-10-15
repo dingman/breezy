@@ -37,7 +37,6 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueClockOffset,
 )
 from breezy.analysis import maker_tape_census as core
-from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
     PreflightError,
@@ -48,6 +47,13 @@ from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.runtime.quote_tape_ingest_core import default_convert
 from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis.cli_basis_offer_gate_scan import classify_instance
+from scripts.analysis.maker_stage0_probe_frames import (
+    FrameSpill,
+    count_truncations,
+    fold_directions,
+    read_depth_frames,
+)
+from scripts.analysis.maker_stage0_release import release_free_heap
 
 from scripts.analysis.maker_stage0_probe_core import (  # isort: skip
     CensusCounts, CensusViolation, DirectionResult, Frame, Gap, InstanceDayDelta, SideTally,
@@ -83,6 +89,7 @@ CLOCKS: Final[Mapping[str, str]] = {
     "forecast_available_at_ns": "UTC-anchored",
 }
 _Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
+_ONE_DAY: Final = dt.timedelta(days=1)
 
 
 # --- Report ---------------------------------------------------------------------------
@@ -136,8 +143,8 @@ class ProbeReport:
 # --- I/O ------------------------------------------------------------------------------
 @dataclass
 class _Ledger:
+    frames: FrameSpill  # S-5: gap-free frames live on disk, never in the ledger
     prints: dict[str, list[core.PrintRecord]] = field(default_factory=dict)
-    frames: dict[str, list[Frame]] = field(default_factory=lambda: defaultdict(list))
     depth_frames: int = 0
     truncated_frames: int = 0
     spans: dict[StationDay, list[core.AliveSpan]] = field(default_factory=lambda: defaultdict(list))
@@ -157,11 +164,16 @@ def _maker_window(station: str, day: dt.date) -> core.MakerWindow:
     return core.maker_window_ns(climate_day=day, std_utc_offset_hours=offset)
 
 
+def _focus(key: StationDay) -> tuple[int, int]:
+    """The rung's own query range: [D-1 12:00Z, end of the D+1 window]."""
+    station, day = key
+    return _maker_window(station, day).start_ns, _maker_window(station, day + _ONE_DAY).end_ns
+
+
 def _query_bounds(days: Collection[dt.date], stations: Collection[str]) -> tuple[int, int]:
     """[D-1 12:00Z of the first day, end of the D+1 window of the last day] in ns."""
-    one_day = dt.timedelta(days=1)
     start = min(_maker_window(s, d).start_ns for s in stations for d in days)
-    end = max(_maker_window(s, d + one_day).end_ns for s in stations for d in days)
+    end = max(_maker_window(s, d + _ONE_DAY).end_ns for s in stations for d in days)
     return start, end
 
 
@@ -187,11 +199,11 @@ def _read_instance(
         gaps[str(partition.instrument_id)].extend(
             Gap(g.started_ns, g.ended_ns if g.resolved else None) for g in records
         )
-    for rung in rungs:
-        _read_frames(work, rung, gaps[rung], bounds, ledger)
-    ledger.truncated_frames += sum(
-        str(_unwrap(t).instrument_id) in rungs for t in work.query(data_cls=DepthTruncation)
-    )
+    for rung, key in rungs.items():
+        ledger.depth_frames += read_depth_frames(
+            work, rung, gaps[rung], bounds, _focus(key), ledger.frames
+        )
+    ledger.truncated_frames += count_truncations(work, rungs, instance_id)
     ledger.prints[instance_id] = _read_prints(work, rungs, bounds)
     samples = [
         (_unwrap(o).ts_init, _unwrap(o).offset_ns) for o in work.query(data_cls=VenueClockOffset)
@@ -207,21 +219,6 @@ def _read_instance(
             stamps = [ts for ts, _offset in samples]
             ledger.spans[key].append(core.AliveSpan(min(stamps), max(stamps), station_gaps))
         ledger.samples[key][instance_id] = samples
-
-
-def _read_frames(
-    work: ParquetDataCatalog,
-    rung: str,
-    gaps: list[Gap],
-    bounds: tuple[int, int],
-    ledger: _Ledger,
-) -> None:
-    depths = work.query(
-        data_cls=OrderBookDepth10, identifiers=[rung], start=bounds[0], end=bounds[1]
-    )
-    ledger.depth_frames += len(depths)
-    frames = [Frame(d.ts_event, mid_of(d)) for d in depths]  # only (ts, mid) is retained
-    ledger.frames[rung].extend(gap_free_frames(frames, gaps))
 
 
 def _read_prints(
@@ -281,6 +278,7 @@ def _for_each_clean_instance(
             visit(work, instance_id)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            release_free_heap()  # S-5: the instance's freed heap goes back before the next one
 
 
 def first_print_instant(
@@ -338,11 +336,6 @@ def _coverage(
     return row, [replace(d, station=station, climate_day=day.isoformat()) for d in deltas.values()]
 
 
-def _station_of(record: core.PrintRecord) -> str | None:
-    facts = bucket_facts_from_instrument_id(record.rung)
-    return None if facts is None else facts.settlement_station
-
-
 def probe(
     catalog_root: Path,
     days: Collection[dt.date],
@@ -358,22 +351,26 @@ def probe(
     driver can write ``wp0_agreement.json`` before the S-2 STOP raises. The positive control is
     a subset of the pooled sample (not independent) -- read it as a per-station view.
     """
-    ledger, day_set, station_set = _Ledger(), frozenset(days), frozenset(stations)
+    sc.check_work_root(work_root, catalog_root)
+    ledger = _Ledger(FrameSpill(work_root / "_frames"))
+    day_set, station_set = frozenset(days), frozenset(stations)
     skipped: dict[str, str] = {}
 
     def visit(work: ParquetDataCatalog, instance_id: str) -> None:
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
     rung_filter = sc.licensed_rung_filter(day_set, station_set)
-    _for_each_clean_instance(
-        catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, rung_filter
-    )
-    frames = {rung: sorted(fs, key=lambda f: f.ts_ns) for rung, fs in ledger.frames.items()}
-    unique = unique_prints(ledger.prints)
+    try:
+        _for_each_clean_instance(
+            catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, rung_filter
+        )
+        unique = unique_prints(ledger.prints)
+        direction, control = fold_directions(unique, ledger.frames, control_station)
+    finally:
+        ledger.frames.close()
     rows = [_coverage((s, d), ledger) for s in stations for d in sorted(day_set)]
     deltas = [d for _row, ds in rows for d in ds]
     known = [r.delta_ns for r, _ds in rows if r.delta_ns is not None]
-    control = [r for r in unique if _station_of(r) == control_station]
     return ProbeReport(
         days=tuple(sorted(d.isoformat() for d in day_set)),
         stations=tuple(stations),
@@ -381,8 +378,8 @@ def probe(
         first_replayable_day=(
             None if first_print_ns is None else first_replayable_day(first_print_ns).isoformat()
         ),
-        direction=direction_result(unique, frames),
-        control=direction_result(control, frames),
+        direction=direction,
+        control=control,
         census=count_census(ledger.prints),
         depth_frames=ledger.depth_frames,
         truncated_frames=ledger.truncated_frames,
