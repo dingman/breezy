@@ -55,12 +55,14 @@ from scripts.analysis.maker_stage0_probe_frames import (
 )
 from scripts.analysis.maker_stage0_release import release_free_heap
 
+from scripts.analysis.maker_stage0_clock_offset import (  # isort: skip
+    InstanceDayDelta, delta_summary, instance_day_deltas, station_day_delta,
+)  # fmt: skip
 from scripts.analysis.maker_stage0_probe_core import (  # isort: skip
-    CensusCounts, CensusViolation, DirectionResult, Frame, Gap, InstanceDayDelta, SideTally,
-    StationDay, StationDayCoverage, StopS2, classify_direction, count_census, direction_result,
-    distribution, enforce_direction, first_replayable_day, gap_free_frames, instance_day_deltas,
-    flat_fields, ladder_parity, listing_abstain, live_and_gap_hours, mid_of, reassert_census,
-    station_day_delta, station_day_key, unique_prints,
+    CensusCounts, CensusViolation, DirectionResult, Frame, Gap, SideTally, StationDay,
+    StationDayCoverage, StopS2, classify_direction, count_census, direction_result, distribution,
+    enforce_direction, first_replayable_day, gap_free_frames, flat_fields, ladder_parity,
+    listing_abstain, live_and_gap_hours, mid_of, reassert_census, station_day_key, unique_prints,
 )  # fmt: skip
 
 __all__ = [
@@ -153,6 +155,7 @@ class _Ledger:
         default_factory=lambda: defaultdict(dict)
     )
     rungs: dict[StationDay, set[str]] = field(default_factory=lambda: defaultdict(set))
+    backwards: dict[str, int] = field(default_factory=dict)  # rung -> ts_event-backwards frames
 
 
 def _unwrap(item: Any) -> Any:
@@ -201,7 +204,7 @@ def _read_instance(
         )
     for rung, key in rungs.items():
         ledger.depth_frames += read_depth_frames(
-            work, rung, gaps[rung], bounds, _focus(key), ledger.frames
+            work, rung, gaps[rung], bounds, _focus(key), ledger.frames, backwards=ledger.backwards
         )
     ledger.truncated_frames += count_truncations(work, rungs, instance_id)
     ledger.prints[instance_id] = _read_prints(work, rungs, bounds)
@@ -331,7 +334,7 @@ def _coverage(
     row = StationDayCoverage(
         station, day.isoformat(), live, gap, listing,
         listing_abstain(listing, window.start_ns), station_day_delta(deltas),
-        maker_live, maker_gap,
+        maker_live, maker_gap, sum(ledger.backwards.get(r, 0) for r in ledger.rungs.get(key, ())),
     )  # fmt: skip
     return row, [replace(d, station=station, climate_day=day.isoformat()) for d in deltas.values()]
 
@@ -385,7 +388,11 @@ def probe(
         truncated_frames=ledger.truncated_frames,
         coverage=tuple(row for row, _ds in rows),
         delta_instance_days=tuple(deltas),
-        delta_distribution={**distribution(known), "n_unknown": len(rows) - len(known)},
+        delta_distribution={
+            **distribution(known),
+            **delta_summary(deltas),
+            "n_unknown": len(rows) - len(known),
+        },
         ladder_parity=ladder_parity(ledger.rungs, stations),
         skipped=skipped,
     )

@@ -734,3 +734,72 @@ def test_station_day_key_admits_only_yes_leg_maker_station_days_in_scope() -> No
     assert key(_slug("nyc"), days, {"LAX", "NYC"}) is None  # firewall
     assert key(_slug("lax"), {dt.date(2026, 9, 23)}, {"LAX"}) is None  # undeclared day
     assert key(_slug("lax"), days, {"SFO"}) is None  # unrequested station
+
+
+# --------------------------------------------------------------------------------------
+# S-7 estimator: dense samples through the real writer path; n_backwards_ts_event
+# --------------------------------------------------------------------------------------
+
+
+def test_dense_offset_samples_report_the_despiked_delta_and_the_raw_one(tmp_path: Path) -> None:
+    t = _ns("2026-09-22T01:00:00")
+    dense = [(t, 165_000_000), (t + 45 * _NS, 789_800_000_000), (t + 90 * _NS, 193_000_000)]
+    capture = _capture(tmp_path, offsets=dense)
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert _delta_of(report) == 10_193_000_000
+    (row,) = [d for d in report.delta_instance_days if d.station == "LAX"]
+    assert (row.delta_ns, row.raw_delta_ns) == (10_193_000_000, 789_800_000_000)
+    assert (row.n_despiked, row.n_unconfirmable, row.samples) == (1, 2, 3)
+    assert report.delta_distribution["max"] == 10_193_000_000
+    assert report.delta_distribution["raw_max"] == 789_800_000_000
+    assert report.delta_distribution["n_despiked"] == 1
+    payload = report.to_dict()["delta_instance_days"][0]
+    assert {"raw_delta_ns", "n_despiked", "n_unconfirmable"} <= set(payload)
+
+
+def test_sparse_samples_keep_the_old_behaviour_and_report_nothing_despiked(tmp_path: Path) -> None:
+    report = p.probe(_capture(tmp_path), {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert report.delta_distribution["raw_max"] == 5 * _NS
+    assert report.delta_distribution["n_despiked"] == 0
+
+
+def _depth_at(instrument: BinaryOption, event_ts: int, init_ts: int) -> OrderBookDepth10:
+    base = _depth(instrument, "0.490", "0.510", init_ts)
+    return OrderBookDepth10(
+        base.instrument_id, base.bids, base.asks, base.bid_counts, base.ask_counts,
+        base.flags, base.sequence, event_ts, init_ts,
+    )  # fmt: skip
+
+
+def test_backwards_ts_event_depth_frames_are_counted_per_rung_and_summed_per_station_day(
+    tmp_path: Path,
+) -> None:
+    t = _ns
+    lax = _instrument(_slug("lax"), t("2026-09-21T11:00:00"))
+    lax2 = _instrument(_slug("lax", "gte90lt91f"), t("2026-09-21T11:00:00"))
+    records: list[Any] = []
+    for inst in (lax, lax2):
+        records += [
+            _depth_at(inst, t("2026-09-22T05:00:00"), t("2026-09-22T05:00:00")),
+            _depth_at(inst, t("2026-09-22T05:30:00"), t("2026-09-22T05:30:00")),
+            _depth_at(inst, t("2026-09-22T05:10:00"), t("2026-09-22T05:31:00")),  # stale: backwards
+            _depth_at(inst, t("2026-09-22T05:10:00"), t("2026-09-22T05:32:00")),  # equal: not below
+        ]
+    capture = tmp_path / "capture"
+    _write_instance(capture, "inst-a", instruments=[lax, lax2], records=records, offsets=[])
+
+    report = p.probe(capture, {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    (row,) = report.coverage
+    assert report.depth_frames == 8
+    assert row.n_backwards_ts_event == 2
+    assert report.to_dict()["coverage"][0]["n_backwards_ts_event"] == 2
+
+
+def test_a_monotone_depth_stream_has_zero_backwards_ts_event(tmp_path: Path) -> None:
+    report = p.probe(_capture(tmp_path), {_DAY}, ("LAX",), work_root=tmp_path / "work")
+
+    assert [c.n_backwards_ts_event for c in report.coverage] == [0]

@@ -2,7 +2,8 @@
 
 Plan: docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md WP0 (L108-117) and
 S2_stage0_replay_plan_r4_delta.md (e), (i)3. The direction check, census re-assertions and the
-clock-offset delta live here; ``maker_stage0_probe`` is the I/O layer that feeds them.
+coverage rows live here (the clock-offset delta: ``maker_stage0_clock_offset``);
+``maker_stage0_probe`` is the I/O layer that feeds them.
 Inverted or inconclusive direction is an S-2 STOP (``StopS2``), never a recorded flip.
 """
 
@@ -32,7 +33,6 @@ INVERT_MAX: Final[float] = 0.1
 MIN_DEFINED_PER_SIDE: Final[int] = 200
 FIRST_REPLAYABLE_CUTOFF_UTC: Final[tuple[int, int]] = (16, 50)  # D-1 16:50Z, per plan section 3
 _P95_PERCENT: Final[int] = 95
-_Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
 StationDay = tuple[str, dt.date]
 
 
@@ -256,43 +256,6 @@ def reassert_census(counts: CensusCounts) -> CensusCounts:
     return counts
 
 
-# --- Clock offset ---------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
-class InstanceDayDelta:
-    """Delta = max |offset_ns| over one recorder instance's samples in a station-day window."""
-
-    delta_ns: int
-    samples: int
-    min_offset_ns: int
-    max_offset_ns: int
-    instance: str = ""
-    station: str = ""
-    climate_day: str = ""
-
-
-def instance_day_deltas(
-    samples_by_instance: Mapping[str, _Samples], window: tuple[int, int]
-) -> dict[str, InstanceDayDelta]:
-    """Per instance: Delta over its samples with ``window[0] <= ts_init < window[1]``.
-
-    An instance with no sample in the window has NO entry (unknown, never zero).
-    """
-    out: dict[str, InstanceDayDelta] = {}
-    for instance, samples in samples_by_instance.items():
-        offsets = [o for ts, o in samples if window[0] <= ts < window[1]]
-        if offsets:
-            out[instance] = InstanceDayDelta(
-                max(abs(o) for o in offsets), len(offsets), min(offsets), max(offsets),
-                instance=instance,
-            )  # fmt: skip
-    return out
-
-
-def station_day_delta(per_instance: Mapping[str, InstanceDayDelta]) -> int | None:
-    """Max over instances; None (unknown, NOT zero) when no instance has a sample."""
-    return max((d.delta_ns for d in per_instance.values()), default=None)
-
-
 # --- Pure rules shared with the I/O layer -----------------------------------------------
 def station_day_key(
     instrument_id: InstrumentId, days: Collection[dt.date], stations: Collection[str]
@@ -373,6 +336,7 @@ class StationDayCoverage:
     delta_ns: int | None  # None = unknown (no sample in the window), never 0
     maker_live_hours: float = 0.0
     maker_gap_overlap_hours: float = 0.0
+    n_backwards_ts_event: int = 0  # report-only: depth frames whose ts_event < the previous one's
 
 
 def hours(intervals: Iterable[tuple[int, int]]) -> float:

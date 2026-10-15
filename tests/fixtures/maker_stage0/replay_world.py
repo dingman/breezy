@@ -57,6 +57,7 @@ def build_capture(
     *,
     inverted: bool = False,
     big_offset_s: int | None = None,
+    extra_offsets: tuple[tuple[str, float], ...] = (),
     listed_iso: str = "2026-09-28T08:00:00",
     second_instance: bool = False,
 ) -> Path:
@@ -104,6 +105,7 @@ def build_capture(
     ]
     if big_offset_s is not None:
         offsets.append((_t("2026-09-29T01:30:00"), big_offset_s * 10**9))
+    offsets.extend((_t(iso), round(seconds * 10**9)) for iso, seconds in extra_offsets)
     _write_instance(
         capture,
         "inst-a",

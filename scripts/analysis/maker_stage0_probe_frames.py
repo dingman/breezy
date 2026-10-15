@@ -171,6 +171,12 @@ def time_slices(
         yield from _steps(f_hi + 1, hi, coarse)
 
 
+def count_backwards(previous: int | None, stamps: Sequence[int]) -> int:
+    """Steps in ``[previous, *stamps]`` whose stamp is below the one before it."""
+    chain = stamps if previous is None else [previous, *stamps]
+    return sum(later < earlier for earlier, later in itertools.pairwise(chain))
+
+
 def read_depth_frames(
     work: ParquetDataCatalog,
     rung: str,
@@ -180,17 +186,24 @@ def read_depth_frames(
     spill: FrameSpill,
     fine: int = FINE_SLICE_NS,
     coarse: int = COARSE_SLICE_NS,
+    backwards: dict[str, int] | None = None,
 ) -> int:
     """Spill the rung's gap-free (ts, mid) frames slice by slice; returns the depth frame count.
 
     Only one slice of ``OrderBookDepth10`` objects is materialised at a time (S-5). The slices
     partition ``bounds`` and the query is ordered by its bound column, so the appended sequence is
-    the unsliced one.
+    the unsliced one. ``backwards`` (report-only) accumulates, per rung, the frames whose
+    ``ts_event`` is below the previous frame's in that receipt order (no frame is refused or moved).
     """
     total = 0
+    previous: int | None = None
     for start, end in time_slices(bounds, focus, fine, coarse):
         depths = work.query(data_cls=OrderBookDepth10, identifiers=[rung], start=start, end=end)
         total += len(depths)
+        stamps = [d.ts_event for d in depths]
+        if backwards is not None:
+            backwards[rung] = backwards.get(rung, 0) + count_backwards(previous, stamps)
+        previous = stamps[-1] if stamps else previous
         frames = [Frame(d.ts_event, mid_of(d)) for d in depths]  # only (ts, mid) is kept
         spill.append(rung, gap_free_frames(frames, gaps))
     return total

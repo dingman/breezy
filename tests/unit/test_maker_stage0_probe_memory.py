@@ -101,8 +101,24 @@ def _world(tmp_path: Path) -> Path:
     return capture
 
 
+# Report-only keys added after the base commit by the S-7 estimator change (clock-offset
+# neighbour clamp, n_backwards_ts_event); everything else must stay byte-identical to the base.
+_S7_ADDED_KEYS = frozenset(
+    {"raw_delta_ns", "n_despiked", "n_unconfirmable", "n_backwards_ts_event", "raw_max"}
+)
+
+
+def _without_s7_keys(node: object) -> object:
+    if isinstance(node, dict):
+        return {k: _without_s7_keys(v) for k, v in node.items() if k not in _S7_ADDED_KEYS}
+    if isinstance(node, list):
+        return [_without_s7_keys(v) for v in node]
+    return node
+
+
 def _digest(payload: dict[str, object]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    stripped = _without_s7_keys(payload)
+    return hashlib.sha256(json.dumps(stripped, sort_keys=True).encode()).hexdigest()
 
 
 def test_the_probe_report_is_unchanged_by_the_frame_spill(tmp_path: Path) -> None:

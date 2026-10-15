@@ -448,6 +448,37 @@ def test_delta_over_10min_aborts_before_scoring_and_voids_run(
     assert not [n for n in RESULT_FILES if (_void_dir(cfg) / n).exists()]
 
 
+def _dense_spike_cfg(tmp_path: Path, *spike_isos: str) -> drv.RunConfig:
+    """Fixture capture plus 0.1 s samples at 45 s spacing around 01:30Z with 700 s at the spikes."""
+    around = [("2026-09-29T01:29:15", 0.1), ("2026-09-29T01:31:30", 0.1)]
+    spikes = tuple((iso, 700.0) for iso in spike_isos)
+    world = rw.build_world(
+        tmp_path / "w",
+        capture=rw.build_capture(tmp_path / "w", extra_offsets=(*around, *spikes)),
+    )
+    return _fresh(world, tmp_path / "r")
+
+
+def test_isolated_700s_spike_with_dense_neighbours_no_longer_voids_the_run(
+    tmp_path: Path,
+) -> None:
+    cfg = _dense_spike_cfg(tmp_path, "2026-09-29T01:30:00")
+
+    drv.run(cfg)  # S-7 estimator: an isolated stale frame is clamped, the run proceeds
+
+    assert not _void_dir(cfg).exists() and cfg.out_dir.is_dir()
+
+
+def test_two_consecutive_700s_samples_still_void_the_run(tmp_path: Path) -> None:
+    cfg = _dense_spike_cfg(tmp_path, "2026-09-29T01:30:00", "2026-09-29T01:30:45")
+
+    with pytest.raises(drv.RunVoided, match="S-7") as info:
+        drv.run(cfg)
+
+    assert isinstance(info.value.cause, DeltaBoundExceeded)
+    assert _void_dir(cfg).is_dir() and not cfg.out_dir.exists()
+
+
 def test_inverted_direction_voids_run_s2(tmp_path: Path) -> None:
     world = rw.build_world(tmp_path / "w", capture=rw.build_capture(tmp_path / "w", inverted=True))
     cfg = _fresh(world, tmp_path / "r")
