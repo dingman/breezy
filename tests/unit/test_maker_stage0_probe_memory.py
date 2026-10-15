@@ -116,6 +116,14 @@ def _without_s7_keys(node: object) -> object:
     return node
 
 
+def _all_keys(node: object) -> set[str]:
+    if isinstance(node, dict):
+        return set(node) | {k for v in node.values() for k in _all_keys(v)}
+    if isinstance(node, list):
+        return {k for v in node for k in _all_keys(v)}
+    return set()
+
+
 def _digest(payload: dict[str, object]) -> str:
     stripped = _without_s7_keys(payload)
     return hashlib.sha256(json.dumps(stripped, sort_keys=True).encode()).hexdigest()
@@ -128,6 +136,7 @@ def test_the_probe_report_is_unchanged_by_the_frame_spill(tmp_path: Path) -> Non
 
     assert report.direction.verdict == _BASE_DIRECTION
     assert _digest(report.to_dict()) == _BASE_DIGEST
+    assert _S7_ADDED_KEYS <= _all_keys(report.to_dict())  # stripping must not hide a dropped field
     lax = p.probe(capture, {_DAY}, ("LAX", "SFO"), work_root=tmp_path / "w2", control_station="LAX")
     assert _digest(lax.to_dict()) == _BASE_DIGEST_LAX_CONTROL
     assert not (tmp_path / "work" / "_frames").exists()  # the scratch store is removed
@@ -401,3 +410,50 @@ def test_a_stale_frame_store_from_a_killed_run_is_replaced(
     assert "stale probe frame store" in caplog.text
     assert spill.load("r") == [] and not (stale / "000000.frames").exists()
     spill.close()
+
+
+def test_count_backwards_carries_across_slices_and_is_strictly_less_than() -> None:
+    assert pf.count_backwards(None, []) == 0
+    assert pf.count_backwards(None, [5, 3, 4, 2]) == 2
+    assert pf.count_backwards(10, [9]) == 1  # the pair straddles the slice boundary
+    assert pf.count_backwards(10, [10, 10]) == 0  # equal stamps are not backwards
+    assert pf.count_backwards(10, []) == 0 and pf.count_backwards(10, [11]) == 0
+
+
+def test_backwards_count_is_independent_of_slice_width_with_a_pair_on_the_boundary(
+    tmp_path: Path,
+) -> None:
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+    from breezy.runtime.quote_tape_ingest_core import default_convert
+
+    base = _ns("2026-09-22T03:00:00")
+    lax = _instrument(_slug("lax"), base)
+    # ts_init 0 s, 1 s, 5 s, 6 s ...; the stale frame (ts_event back to 0.5 s) arrives at 5 s and
+    # 1 s slices put it first in its slice with an EMPTY slice between it and its predecessor.
+    plan = [(0, 0), (1, 1), (5, 0.5), (6, 6), (7, 7), (9, 8.5)]  # (ts_init s, ts_event s)
+    records = [
+        _frame(lax, "0.390", "0.410", "10", base + int(ev * _SEC), base + i * _SEC)
+        for i, ev in plan
+    ]
+    capture = tmp_path / "cap"
+    _write_instance(capture, "i", instruments=[lax], records=records, offsets=[(base, 0)])
+    work = ParquetDataCatalog(str(tmp_path / "work"))
+    default_convert(
+        ParquetDataCatalog(str(capture)), "i", OrderBookDepth10, DEFAULT_SUBDIRECTORY, target=work
+    )
+    rung, bounds = str(lax.id), (base - _SEC, base + 12 * _SEC)
+
+    def counted(width: int, name: str) -> int:
+        seen: dict[str, int] = {}
+        spill = pf.FrameSpill(tmp_path / name)
+        pf.read_depth_frames(
+            work, rung, [], bounds, (base, base + 6 * _SEC), spill, width, width, backwards=seen
+        )
+        return seen[rung]
+
+    whole = counted(10**15, "whole")
+    assert whole == 1  # only 1.0 -> 0.5 steps back; 0.5 -> 6 -> 7 -> 8.5 are forward
+    for width in (_SEC // 2, _SEC, 2 * _SEC, 3 * _SEC):
+        assert counted(width, f"w{width}") == whole
