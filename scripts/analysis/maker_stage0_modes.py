@@ -27,6 +27,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCa
 from scripts.analysis.maker_stage0_bench_screen import project_bench
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_inputs import load_trade_unit
+from scripts.analysis.maker_stage0_release import release_free_heap
 from scripts.analysis.maker_stage0_run_types import (
     BENCH_COUNTS,
     RSS_ABORT_BYTES,
@@ -170,6 +171,7 @@ def simulate(
     for index, key in enumerate(keys, 1):
         started, peak_before = time.monotonic(), peak_fn()
         n_events = run_station_day(ctx, key, out)
+        release_free_heap()  # S-5: the day's freed heap goes back before RSS is read
         elapsed, rss, peak = time.monotonic() - started, rss_fn(), peak_fn()
         measured: dict[str, Any] = {
             "elapsed_s": round(elapsed, 3),
