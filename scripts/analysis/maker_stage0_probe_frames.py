@@ -17,6 +17,8 @@ book) is a reserved exponent. The scratch lives under the probe's ``work_root`` 
 
 from __future__ import annotations
 
+import itertools
+import logging
 import shutil
 import struct
 from collections import defaultdict
@@ -61,10 +63,20 @@ def _encode(frame: Frame) -> bytes:
     return _RECORD.pack(frame.ts_ns, coefficient, exponent)
 
 
+_LOG = logging.getLogger(__name__)
+
+
+class TruncationIntervalOverlap(ValueError):
+    """Two truncation files' intervals overlap: slicing them would count a row twice."""
+
+
 class FrameSpill:
     """Append-only per-rung frame files with a stable, sorted read-back."""
 
     def __init__(self, directory: Path) -> None:
+        if directory.exists():  # a hard kill left it: the work root is this run's own scratch
+            _LOG.warning("removing stale probe frame store %s", directory)
+            shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=False)
         self._dir = directory
         self._files: dict[str, Path] = {}
@@ -187,7 +199,7 @@ def read_depth_frames(
 TRUNCATION_SLICE_NS: Final[int] = _HOUR_NS
 
 
-def count_truncations(work: ParquetDataCatalog, rungs: Collection[str]) -> int:
+def count_truncations(work: ParquetDataCatalog, rungs: Collection[str], instance: str) -> int:
     """How many ``DepthTruncation`` rows belong to ``rungs``, read one time slice at a time.
 
     An instance holds millions of truncation rows (1.9M = 1.8 GB resident when queried whole, the
@@ -195,7 +207,13 @@ def count_truncations(work: ParquetDataCatalog, rungs: Collection[str]) -> int:
     are disjoint and inclusive-bounded, so every row is counted once, as in the whole query.
     """
     wanted, total = frozenset(rungs), 0
-    for lo, hi in work.get_intervals(DepthTruncation):
+    intervals = sorted(work.get_intervals(DepthTruncation))
+    for (_, prev_hi), (next_lo, _) in itertools.pairwise(intervals):
+        if next_lo <= prev_hi:  # fail closed: never merge, never double count
+            raise TruncationIntervalOverlap(
+                f"instance {instance}: DepthTruncation file intervals overlap {intervals}"
+            )
+    for lo, hi in intervals:
         for start, end in _steps(lo, hi, TRUNCATION_SLICE_NS):
             rows = work.query(data_cls=DepthTruncation, start=start, end=end)
             total += sum(str(getattr(t, "data", t).instrument_id) in wanted for t in rows)

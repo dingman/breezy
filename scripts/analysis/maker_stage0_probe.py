@@ -203,7 +203,7 @@ def _read_instance(
         ledger.depth_frames += read_depth_frames(
             work, rung, gaps[rung], bounds, _focus(key), ledger.frames
         )
-    ledger.truncated_frames += count_truncations(work, rungs)
+    ledger.truncated_frames += count_truncations(work, rungs, instance_id)
     ledger.prints[instance_id] = _read_prints(work, rungs, bounds)
     samples = [
         (_unwrap(o).ts_init, _unwrap(o).offset_ns) for o in work.query(data_cls=VenueClockOffset)

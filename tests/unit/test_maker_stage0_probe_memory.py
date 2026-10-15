@@ -312,8 +312,76 @@ def test_truncations_are_counted_slice_by_slice_exactly_as_in_one_query(
         ParquetDataCatalog(str(capture)), "i", DepthTruncation, DEFAULT_SUBDIRECTORY, target=work
     )
 
-    whole = pf.count_truncations(work, {str(lax.id)})
+    whole = pf.count_truncations(work, {str(lax.id)}, "i")
     monkeypatch.setattr(pf, "TRUNCATION_SLICE_NS", _SEC // 3)
-    sliced = pf.count_truncations(work, {str(lax.id)})
+    sliced = pf.count_truncations(work, {str(lax.id)}, "i")
 
     assert whole == sliced == 15
+
+
+def _truncation_work(tmp_path: Path, spans: list[tuple[str, int]]) -> tuple[object, str]:
+    """One work catalog fed by one instance per ``(name, start offset s)``: a file each."""
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.adapters.polymarket_us.tape_records import DepthTruncation
+    from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+    from breezy.runtime.quote_tape_ingest_core import default_convert
+
+    base = _ns("2026-09-22T03:00:00")
+    lax = _instrument(_slug("lax"), base)
+    capture, work = tmp_path / "cap", ParquetDataCatalog(str(tmp_path / "work"))
+    for name, offset in spans:
+        records = [
+            DepthTruncation(
+                lax.id, 12, 14, 6, base + (offset + k) * _SEC, base + (offset + k) * _SEC
+            )
+            for k in range(10)
+        ]
+        _write_instance(capture, name, instruments=[lax], records=records, offsets=[(base, 0)])
+        default_convert(
+            ParquetDataCatalog(str(capture)),
+            name,
+            DepthTruncation,
+            DEFAULT_SUBDIRECTORY,
+            target=work,
+        )
+    return work, str(lax.id)
+
+
+def test_two_truncation_files_are_sliced_without_double_counting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from breezy.adapters.polymarket_us.tape_records import DepthTruncation
+
+    work, rung = _truncation_work(tmp_path, [("i", 0), ("j", 100)])  # disjoint spans
+    assert len(work.get_intervals(DepthTruncation)) == 2  # type: ignore[attr-defined]
+    whole = len(work.query(data_cls=DepthTruncation))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(pf, "TRUNCATION_SLICE_NS", _SEC // 3)
+
+    assert pf.count_truncations(work, {rung}, "i+j") == whole == 20  # type: ignore[arg-type]
+
+
+def test_overlapping_truncation_intervals_fail_closed_naming_the_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work, rung = _truncation_work(tmp_path, [("i", 0)])
+    monkeypatch.setattr(work, "get_intervals", lambda *_a, **_k: [(0, 50), (50, 90)])
+
+    with pytest.raises(pf.TruncationIntervalOverlap, match="instance inst-x"):
+        pf.count_truncations(work, {rung}, "inst-x")  # type: ignore[arg-type]
+
+
+def test_a_stale_frame_store_from_a_killed_run_is_replaced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    stale = tmp_path / "work" / "_frames"
+    stale.mkdir(parents=True)
+    (stale / "000000.frames").write_bytes(b"old")
+
+    with caplog.at_level("WARNING"):
+        spill = pf.FrameSpill(stale)
+
+    assert "stale probe frame store" in caplog.text
+    assert spill.load("r") == [] and not (stale / "000000.frames").exists()
+    spill.close()
