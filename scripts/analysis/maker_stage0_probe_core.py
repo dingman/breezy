@@ -143,6 +143,37 @@ def _agrees(side: str, price: Decimal, mid: Decimal) -> bool:
     return price >= mid if side == core.BUYER else price <= mid
 
 
+class DirectionFold:
+    """Direction tallies over any partition of the prints (counts and ages add); ``add`` may take
+    one rung's prints with only that rung's frames, since a print's prior frame is its rung's."""
+
+    def __init__(self) -> None:
+        self._counts = {core.BUYER: [0, 0, 0, 0], core.SELLER: [0, 0, 0, 0]}  # agree/dis/undef/tie
+        self._ages: list[int] = []
+
+    def add(
+        self, prints: Iterable[core.PrintRecord], frames_by_rung: Mapping[str, Sequence[Frame]]
+    ) -> None:
+        stamps = {rung: [f.ts_ns for f in fs] for rung, fs in frames_by_rung.items()}
+        for record in prints:
+            if record.aggressor not in self._counts:
+                continue
+            row = self._counts[record.aggressor]
+            index = bisect_left(stamps.get(record.rung, ()), record.ts_event_ns) - 1
+            frame = frames_by_rung[record.rung][index] if index >= 0 else None
+            if frame is None or frame.mid is None:
+                row[2] += 1
+                continue
+            self._ages.append(record.ts_event_ns - frame.ts_ns)
+            row[0 if _agrees(record.aggressor, record.price_yes, frame.mid) else 1] += 1
+            row[3] += record.price_yes == frame.mid
+
+    def result(self) -> DirectionResult:
+        buyer, seller = self._counts[core.BUYER], self._counts[core.SELLER]
+        result = classify_direction(SideTally(*buyer), SideTally(*seller))
+        return replace(result, mid_age_ns=distribution(self._ages))
+
+
 def direction_result(
     prints: Iterable[core.PrintRecord], frames_by_rung: Mapping[str, Sequence[Frame]]
 ) -> DirectionResult:
@@ -151,23 +182,9 @@ def direction_result(
     The prior frame is the last one STRICTLY before the print. Ties agree (frozen) and are
     counted separately; the age of every defined mid is recorded (report-only).
     """
-    stamps = {rung: [f.ts_ns for f in fs] for rung, fs in frames_by_rung.items()}
-    counts = {core.BUYER: [0, 0, 0, 0], core.SELLER: [0, 0, 0, 0]}  # agree, disagree, undef, tie
-    ages: list[int] = []
-    for record in prints:
-        if record.aggressor not in counts:
-            continue
-        row = counts[record.aggressor]
-        index = bisect_left(stamps.get(record.rung, ()), record.ts_event_ns) - 1
-        frame = frames_by_rung[record.rung][index] if index >= 0 else None
-        if frame is None or frame.mid is None:
-            row[2] += 1
-            continue
-        ages.append(record.ts_event_ns - frame.ts_ns)
-        row[0 if _agrees(record.aggressor, record.price_yes, frame.mid) else 1] += 1
-        row[3] += record.price_yes == frame.mid
-    result = classify_direction(SideTally(*counts[core.BUYER]), SideTally(*counts[core.SELLER]))
-    return replace(result, mid_age_ns=distribution(ages))
+    fold = DirectionFold()
+    fold.add(prints, frames_by_rung)
+    return fold.result()
 
 
 def classify_direction(buyer: SideTally, seller: SideTally) -> DirectionResult:
