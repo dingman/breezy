@@ -13,6 +13,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import struct
+import time
 from collections.abc import Callable
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -25,6 +27,8 @@ from scripts.analysis import maker_stage0_isolate as iso
 from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis import maker_stage0_runio as runio
 from scripts.analysis import maker_stage0_scoped_convert as sc
+from scripts.analysis.maker_stage0_events_build import LocalDayViolation
+from scripts.analysis.maker_stage0_station_loop import LoopOutput
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.unit import test_maker_stage0_driver as drv_fx
 from tests.unit import test_maker_stage0_pno as pno_fx
@@ -57,12 +61,25 @@ def child_dies(conn: Connection, *_a: Any) -> None:
 
 
 def child_raises(conn: Connection, *_a: Any) -> None:
-    conn.send(("err", "ValueError", "boom", "traceback text"))
+    conn.send(("err", None, "ValueError", "boom", "traceback text"))
     conn.close()
 
 
+def child_stalls_mid_send(conn: Connection, *_a: Any) -> None:
+    os.write(conn.fileno(), struct.pack("!i", 1000) + b"x" * 10)  # a header and 10 of 1000 bytes
+    time.sleep(600)
+
+
+def child_raises_local_day_violation(conn: Connection, *_a: Any) -> None:
+    try:
+        raise LocalDayViolation("episode past local midnight")
+    except Exception as exc:  # noqa: BLE001 - mirrors the child's own handler
+        conn.send(("err", iso._portable(exc), type(exc).__name__, str(exc), "tb"))
+        conn.close()
+
+
 def child_echoes_scan_memo(conn: Connection, *args: Any) -> None:
-    conn.send(("err", "ValueError", f"memo keys {sorted(args[-1])}", ""))
+    conn.send(("err", None, "ValueError", f"memo keys {sorted(args[-1])}", ""))
     conn.close()
 
 
@@ -83,21 +100,87 @@ def _run(world: rw.World, tmp_path: Path, **over: Any) -> drv.RunConfig:
     return cfg
 
 
-def test_isolated_outputs_are_byte_identical_to_the_in_process_path(
-    world: rw.World, tmp_path: Path
+VOLATILE = {"run_manifest.json", "pins.json", "progress.jsonl"}  # times, code sha, paths, RSS
+WORLDS: dict[str, dict[str, Any]] = {
+    "base": {},
+    "second_instance": {"second_instance": True},  # two instances: LRU reuse vs a fresh child
+    "listing_abstained": {"listed_iso": "2026-09-28T13:00:00"},  # abstained + non-replayed days
+}
+
+
+def _capture_out(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    seen: list[Any] = []
+    real = getattr(drv, "finish")  # noqa: B009 - not exported by the driver
+
+    def spy(cfg: Any, pre: Any, out: Any, *a: Any, **k: Any) -> Any:
+        seen.append(out)
+        return real(cfg, pre, out, *a, **k)
+
+    monkeypatch.setattr(drv, "finish", spy, raising=True)
+    return seen
+
+
+def _comparable(out: Any) -> dict[str, Any]:
+    """Every LoopOutput field, order-sensitive where the order reaches an artefact."""
+    return {
+        "rows": {k: list(v) for k, v in out.rows.items()},
+        "seeds": list(out.seeds),
+        "consumed": sorted(out.consumed),
+        "abstentions": list(out.abstentions.items()),
+        "parity": list(out.parity.items()),
+        "listing_abstained": list(out.listing_abstained),
+        "rounding": {k: list(v.items()) for k, v in out.rounding.items()},
+        "unknown_delta": out.unknown_delta,
+    }
+
+
+def _normalised(cfg: drv.RunConfig, name: str) -> bytes:
+    """The artefact with run-specific values blanked: code sha, base dir, volatile files' shas."""
+    code_sha = json.loads((cfg.out_dir / "run_manifest.json").read_text())["git_commit"]
+    data = (cfg.out_dir / name).read_bytes()
+    data = data.replace(code_sha.encode(), b"<CODE>")
+    data = data.replace(str(cfg.out_dir.parent.parent).encode(), b"<BASE>")
+    for volatile in VOLATILE:
+        data = data.replace(_sha(cfg.out_dir / volatile).encode(), b"<VOLATILE>")
+    return data
+
+
+@pytest.mark.parametrize("variant", list(WORLDS))
+def test_isolated_run_equals_the_in_process_run_in_every_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
-    child = _run(world, tmp_path / "child", isolate=True)
-    local = _run(world, tmp_path / "local", isolate=False)
-    for name in OUTPUTS:
-        assert _sha(child.out_dir / name) == _sha(local.out_dir / name), name
-    assert (child.out_dir / "catalog_slice_manifest.json").read_text() == (
-        local.out_dir / "catalog_slice_manifest.json"
-    ).read_text()
+    root = tmp_path / "world"
+    built = rw.build_world(root, capture=rw.build_capture(root, **WORLDS[variant]))
+    seen = _capture_out(monkeypatch)
+    child = _run(built, tmp_path / "child", isolate=True)
+    local = _run(built, tmp_path / "local", isolate=False)
+    assert _comparable(seen[0]) == _comparable(seen[1])
+    names = {p.name for p in child.out_dir.iterdir()}
+    assert names == {p.name for p in local.out_dir.iterdir()}
+    for name in sorted(names - VOLATILE):
+        assert _normalised(child, name) == _normalised(local, name), name
+    assert set(OUTPUTS) <= names
     lines = [json.loads(x) for x in (child.out_dir / "progress.jsonl").read_text().splitlines()]
-    assert [(e["index"], e["of"]) for e in lines] == [
-        (i, len(lines)) for i in range(1, len(lines) + 1)
+    mine = [json.loads(x) for x in (local.out_dir / "progress.jsonl").read_text().splitlines()]
+    identity = ("index", "of", "station", "climate_day", "status", "n_events")
+    assert [{k: e[k] for k in identity} for e in lines] == [
+        {k: e[k] for k in identity} for e in mine
     ]
-    assert all(set(e) <= runio.PROGRESS_FIELDS for e in lines)
+    assert [e["index"] for e in lines] == list(range(1, len(lines) + 1))
+    assert all(set(e) <= runio.PROGRESS_FIELDS and "parent_rss_bytes" in e for e in lines)
+
+
+def test_the_first_day_wins_the_ladder_parity_when_children_are_absorbed() -> None:
+    first, second, merged = LoopOutput(), LoopOutput(), LoopOutput()
+    first.parity["SFO"], second.parity["SFO"], second.parity["LAX"] = 0, 1, 1
+    first.abstentions["A"], second.abstentions["B"], second.abstentions["A"] = 2, 5, 3
+    first.rounding["CONTRACTS"] = {"levels": 4}
+    second.rounding["CONTRACTS"] = {"levels": 6}
+    for part in (first, second):
+        iso._absorb(merged, part)
+    assert merged.parity == {"SFO": 0, "LAX": 1} and list(merged.parity) == ["SFO", "LAX"]
+    assert list(merged.abstentions.items()) == [("A", 5), ("B", 5)]
+    assert merged.rounding == {"CONTRACTS": {"levels": 10}}
 
 
 def test_progress_rows_carry_the_childs_memory_and_s5_reads_it(
@@ -186,3 +269,29 @@ def test_a_repeated_station_day_starts_from_a_fresh_process(
     assert len(ends) == 4
     assert max(ends) - min(ends) <= REPEAT_RSS_BOUND, ends
     assert all(r["peak_rss_bytes"] > 0 for r in rows)
+
+
+def test_a_child_that_stalls_mid_send_cannot_block_the_receive(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(iso, "_child_main", child_stalls_mid_send)
+    monkeypatch.setattr(
+        modes, "day_runner", lambda cfg: iso.isolated_runner(cfg.work_root / "children", 3.0)
+    )
+    started = time.monotonic()
+    with pytest.raises(drv.RunVoided, match="timed out"):
+        drv.run(drv_fx._fresh(world, tmp_path))
+    assert time.monotonic() - started < 120
+
+
+def test_a_typed_in_day_error_keeps_its_type_and_voids_the_run(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(iso, "_child_main", child_raises_local_day_violation)
+    cfg = drv_fx._fresh(world, tmp_path)
+    with pytest.raises(drv.RunVoided, match="LocalDayViolation") as info:
+        drv.run(cfg)
+    assert type(info.value.cause) is LocalDayViolation  # not IsolatedDayFailed: exit mapping same
+    assert "past local midnight" in str(info.value.cause)
+    assert drv_fx._void_dir(cfg).is_dir() and not cfg.out_dir.exists()
+    assert [e["kind"] for e in drv_fx._ledger(cfg)] == ["verdict_run_start", "void"]

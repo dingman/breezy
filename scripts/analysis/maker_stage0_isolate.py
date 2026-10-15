@@ -17,17 +17,19 @@ from __future__ import annotations
 
 import dataclasses
 import multiprocessing as mp
+import pickle
 import shutil
+import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from scripts.analysis.maker_stage0_fill_events import Episode
 from scripts.analysis.maker_stage0_release import release_free_heap
-from scripts.analysis.maker_stage0_run_types import MemoryAbort
 from scripts.analysis.maker_stage0_runio import peak_rss_bytes, read_rss_bytes
 from scripts.analysis.maker_stage0_scoped_convert import scans_install, scans_snapshot
 from scripts.analysis.maker_stage0_station_loop import (
@@ -36,6 +38,9 @@ from scripts.analysis.maker_stage0_station_loop import (
     LoopOutput,
     run_station_day,
 )
+
+if TYPE_CHECKING:  # annotation only: the pins module stays out of the loop's import closure
+    from scripts.analysis.maker_stage0_pins import CatalogSliceManifest
 
 __all__ = ["DAY_TIMEOUT_S", "DayMeasure", "DayRunner", "IsolatedDayFailed", "isolated_runner"]
 
@@ -75,7 +80,7 @@ class _DayReport:
     measure: DayMeasure
     out: LoopOutput
     episodes: list[Episode]
-    manifest: Any  # the child's CatalogSliceManifest (or None)
+    manifest: CatalogSliceManifest | None  # the child's capture-file hashes, if the run keeps them
 
 
 def _run_in_child(
@@ -98,6 +103,14 @@ def _run_in_child(
     return _DayReport(measure, local, episodes, ctx.session.manifest)
 
 
+def _portable(exc: Exception) -> Exception | None:
+    """``exc`` itself when it survives a pickle round trip, so typed in-day errors cross intact."""
+    try:
+        return pickle.loads(pickle.dumps(exc))  # type: ignore[no-any-return]
+    except Exception:  # noqa: BLE001 - fall back to the name and text
+        return None
+
+
 def _child_main(
     conn: Connection,
     ctx: LoopContext,
@@ -109,7 +122,7 @@ def _child_main(
     try:
         conn.send(("ok", _run_in_child(ctx, key, work_dir, want_episodes, scans)))
     except Exception as exc:  # noqa: BLE001 - reported, never swallowed: the parent voids the run
-        conn.send(("err", type(exc).__name__, str(exc), traceback.format_exc()))
+        conn.send(("err", _portable(exc), type(exc).__name__, str(exc), traceback.format_exc()))
     finally:
         conn.close()
 
@@ -130,24 +143,36 @@ def _absorb(out: LoopOutput, local: LoopOutput) -> None:
     out.unknown_delta += local.unknown_delta
 
 
-def _receive(proc: Any, conn: Connection, key: Key, timeout_s: float) -> _DayReport:
+def _recv(conn: Connection, box: list[Any]) -> None:
+    try:
+        box.append(conn.recv())
+    except (EOFError, OSError) as exc:
+        box.append(exc)
+
+
+def _receive(proc: BaseProcess, conn: Connection, key: Key, timeout_s: float) -> _DayReport:
+    """The child's result; the whole receive (not just its first byte) is bounded by the timeout."""
     where = f"{key[0]} {key[1].isoformat()}"
-    if not conn.poll(timeout_s):
+    box: list[Any] = []
+    reader = threading.Thread(target=_recv, args=(conn, box), daemon=True)
+    reader.start()
+    reader.join(timeout_s)
+    if reader.is_alive():  # killing the child closes its pipe end, which ends the blocked read
         proc.kill()
+        reader.join(_JOIN_S)
         proc.join(_JOIN_S)
         raise IsolatedDayFailed(f"{where}: child timed out after {timeout_s:.0f} s")
-    try:
-        message = conn.recv()
-    except (EOFError, OSError) as exc:
-        proc.join(_JOIN_S)
+    proc.join(_JOIN_S)
+    message = box[0]
+    if isinstance(message, BaseException):
         raise IsolatedDayFailed(
             f"{where}: child died without a result (exit code {proc.exitcode})"
-        ) from exc
-    proc.join(_JOIN_S)
+        ) from message
     if message[0] == "err":
-        _, name, text, trace = message
-        if name == "MemoryAbort":
-            raise MemoryAbort(text)
+        _, exc, name, text, trace = message
+        if exc is not None:  # typed in-day errors (MemoryAbort, LocalDayViolation, ...) unchanged
+            exc.add_note(f"raised in the {where} child:\n{trace}")
+            raise exc
         raise IsolatedDayFailed(f"{where}: child raised {name}: {text}\n{trace}")
     if proc.exitcode != 0:
         raise IsolatedDayFailed(f"{where}: child exit code {proc.exitcode} after its result")
@@ -163,6 +188,7 @@ def isolated_runner(work_root: Path, timeout_s: float = DAY_TIMEOUT_S) -> DayRun
         work_dir = work_root / f"day_{key[0]}_{key[1].isoformat()}"
         parent = ctx.session
         manifest = None if parent.manifest is None else type(parent.manifest)()
+        # ``skipped`` is a planning-pass record (unreadable instances); a replay never reads it
         session = type(parent)(parent.capture_root, work_dir, manifest, parent.keep)
         child_ctx = dataclasses.replace(ctx, session=session, sink=None, watch=None)
         receiver, sender = spawn.Pipe(duplex=False)
@@ -178,6 +204,8 @@ def isolated_runner(work_root: Path, timeout_s: float = DAY_TIMEOUT_S) -> DayRun
             receiver.close()
             if proc.is_alive():
                 proc.kill()
+                proc.join(_JOIN_S)
+            proc.close()
             shutil.rmtree(work_dir, ignore_errors=True)
         _absorb(out, report.out)
         if ctx.sink is not None:

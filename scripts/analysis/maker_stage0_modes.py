@@ -187,16 +187,28 @@ def simulate(
     ``runner`` executes one station-day and reports its own memory (an isolated child's, or this
     process's by default); the in-day peak check runs inside ``run_station_day`` (``ctx.watch``)
     and again here when the line is written.
+
+    Memory fields. ``rss_bytes`` is the day's own process at its end (an isolated child's);
+    ``peak_rss_bytes`` is that process's ``ru_maxrss``, which a spawned child INHERITS from the
+    parent's high-water mark, so it is never below the parent's peak. ``parent_rss_bytes`` is this
+    (driver) process after the day's results were absorbed and its heap trimmed: it is the only
+    series that can leak across station-days when children are isolated, so the repeat-day screen
+    reads it. S-5 aborts on the largest of the three and on ``peak + parent_rss`` (the host sees
+    parent and child together; the cgroup cap is the real ceiling).
     """
     run = runner if runner is not None else in_process_runner(rss_fn, peak_fn)
     timings: list[dict[str, Any]] = []
     for index, key in enumerate(keys, 1):
         started = time.monotonic()
         day = run(ctx, key, out)
+        if runner is not None:
+            release_free_heap()  # the driver's own heap after absorbing the child's results
+        parent_rss = rss_fn()
         elapsed, rss, peak = time.monotonic() - started, day.rss_bytes, day.peak_bytes
         measured: dict[str, Any] = {
             "elapsed_s": round(elapsed, 3),
             "rss_bytes": rss,
+            "parent_rss_bytes": parent_rss,
             "n_events": day.n_events,
             "rss_peak_delta_bytes": day.peak_delta_bytes,
             "peak_rss_bytes": peak,
@@ -207,7 +219,7 @@ def simulate(
         where = {"station": key[0], "climate_day": iso}
         progress.write({"index": index, "of": len(keys), **where, "status": "done", **measured})
         timings.append({**where, **measured})
-        worst = max(rss, peak)
+        worst = max(rss, peak, parent_rss, peak + parent_rss if runner is not None else 0)
         if worst > RSS_ABORT_BYTES:
             raise MemoryAbort(f"S-5: resident memory {worst} exceeds {RSS_ABORT_BYTES} at {key}")
     return timings

@@ -219,6 +219,7 @@ class CatalogSliceManifest:
             if known is not None and known != entry:
                 raise ValueError(f"{key} changed between reads")
             self._entries[key] = entry
+            # the stamp is the (size, mtime) a later parent read short-circuits on; keep the child's
             if key in other._stamps:
                 self._stamps[key] = other._stamps[key]
 

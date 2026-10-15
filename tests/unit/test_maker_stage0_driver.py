@@ -203,7 +203,7 @@ def test_progress_events_carry_no_fill_or_rate_fields(e2e: Run) -> None:
     assert lines
     allowed = {
         "index", "of", "station", "climate_day", "status", "elapsed_s", "rss_bytes", "n_events",
-        "rss_peak_delta_bytes", "peak_rss_bytes",
+        "rss_peak_delta_bytes", "peak_rss_bytes", "parent_rss_bytes",
     }  # fmt: skip
     for event in lines:
         assert set(event) <= allowed

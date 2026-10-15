@@ -80,7 +80,9 @@ def test_the_driver_releases_the_heap_after_every_station_day(
     monkeypatch.setattr(drv, "current_rss_bytes", rss)
     drv.run(cfg)
     assert len(calls) == PASSES
-    assert seen_by_rss == list(range(1, PASSES + 1))  # released BEFORE each row's RSS is read
+    # the runner reads the day's RSS and `simulate` then reads the driver's: two reads a row, and
+    # the release has happened before the first of them
+    assert seen_by_rss[::2] == list(range(1, PASSES + 1))
 
 
 def test_release_free_heap_reports_whether_the_allocator_could_be_trimmed() -> None:
