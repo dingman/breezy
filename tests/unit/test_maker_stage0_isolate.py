@@ -24,6 +24,7 @@ from scripts.analysis import maker_stage0_driver as drv
 from scripts.analysis import maker_stage0_isolate as iso
 from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis import maker_stage0_runio as runio
+from scripts.analysis import maker_stage0_scoped_convert as sc
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.unit import test_maker_stage0_driver as drv_fx
 from tests.unit import test_maker_stage0_pno as pno_fx
@@ -60,10 +61,15 @@ def child_raises(conn: Connection, *_a: Any) -> None:
     conn.close()
 
 
+def child_echoes_scan_memo(conn: Connection, *args: Any) -> None:
+    conn.send(("err", "ValueError", f"memo keys {sorted(args[-1])}", ""))
+    conn.close()
+
+
 def child_reports_fixed_memory(
-    conn: Connection, ctx: Any, key: Any, work_dir: Path, want_episodes: bool
+    conn: Connection, ctx: Any, key: Any, work_dir: Path, want_episodes: bool, scans: Any
 ) -> None:
-    report = iso._run_in_child(ctx, key, work_dir, want_episodes)
+    report = iso._run_in_child(ctx, key, work_dir, want_episodes, scans)
     fixed = dataclasses.replace(
         report.measure, rss_bytes=CHILD_RSS, peak_bytes=CHILD_PEAK, peak_delta_bytes=CHILD_PEAK - 1
     )
@@ -143,6 +149,15 @@ def test_a_child_failure_voids_the_run_loudly(
     assert isinstance(info.value.cause, iso.IsolatedDayFailed)
     assert needle in str(info.value)
     assert drv_fx._void_dir(cfg).is_dir()
+
+
+def test_the_child_inherits_the_parents_preflight_scan_memo(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sc._SCANS, ("root", "live", "sentinel-instance"), (("sig",), None))
+    monkeypatch.setattr(iso, "_child_main", child_echoes_scan_memo)
+    with pytest.raises(drv.RunVoided, match="sentinel-instance"):
+        drv.run(drv_fx._fresh(world, tmp_path))
 
 
 def test_a_child_that_times_out_voids_the_run(

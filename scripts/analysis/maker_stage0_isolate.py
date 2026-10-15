@@ -2,7 +2,8 @@
 
 Allocator retention across station-days (glibc keeps freed heap; bench 4 grew ~170 MB per day even
 with ``malloc_trim``) cannot grow past one day when each day starts in a new interpreter. The parent
-keeps the preamble, the sink, the progress log and the manifest; the child (``spawn``, never fork:
+keeps the preamble (its scan memo is handed to each child), the
+sink, the progress log and the manifest; the child (``spawn``, never fork:
 pyarrow and Nautilus threads are live in the parent) receives the picklable ``LoopContext`` with a
 fresh ``CatalogSession`` under its own scratch dir, runs the SAME ``run_station_day`` into a local
 ``LoopOutput``, and sends back that output, the primary episodes in write order, its capture-file
@@ -28,6 +29,7 @@ from scripts.analysis.maker_stage0_fill_events import Episode
 from scripts.analysis.maker_stage0_release import release_free_heap
 from scripts.analysis.maker_stage0_run_types import MemoryAbort
 from scripts.analysis.maker_stage0_runio import peak_rss_bytes, read_rss_bytes
+from scripts.analysis.maker_stage0_scoped_convert import scans_install, scans_snapshot
 from scripts.analysis.maker_stage0_station_loop import (
     Key,
     LoopContext,
@@ -76,9 +78,12 @@ class _DayReport:
     manifest: Any  # the child's CatalogSliceManifest (or None)
 
 
-def _run_in_child(ctx: LoopContext, key: Key, work_dir: Path, want_episodes: bool) -> _DayReport:
+def _run_in_child(
+    ctx: LoopContext, key: Key, work_dir: Path, want_episodes: bool, scans: dict[Any, Any]
+) -> _DayReport:
     from scripts.analysis.maker_stage0_modes import peak_watch  # lazy: modes imports this module
 
+    scans_install(scans)  # the parent's preflight scans (~70 s per large instance) are not redone
     base_peak = peak_rss_bytes()
     collector = _Collector() if want_episodes else None
     local = LoopOutput()
@@ -94,10 +99,15 @@ def _run_in_child(ctx: LoopContext, key: Key, work_dir: Path, want_episodes: boo
 
 
 def _child_main(
-    conn: Connection, ctx: LoopContext, key: Key, work_dir: Path, want_episodes: bool
+    conn: Connection,
+    ctx: LoopContext,
+    key: Key,
+    work_dir: Path,
+    want_episodes: bool,
+    scans: dict[Any, Any],
 ) -> None:
     try:
-        conn.send(("ok", _run_in_child(ctx, key, work_dir, want_episodes)))
+        conn.send(("ok", _run_in_child(ctx, key, work_dir, want_episodes, scans)))
     except Exception as exc:  # noqa: BLE001 - reported, never swallowed: the parent voids the run
         conn.send(("err", type(exc).__name__, str(exc), traceback.format_exc()))
     finally:
@@ -157,7 +167,8 @@ def isolated_runner(work_root: Path, timeout_s: float = DAY_TIMEOUT_S) -> DayRun
         child_ctx = dataclasses.replace(ctx, session=session, sink=None, watch=None)
         receiver, sender = spawn.Pipe(duplex=False)
         proc = spawn.Process(
-            target=_child_main, args=(sender, child_ctx, key, work_dir, ctx.sink is not None)
+            target=_child_main,
+            args=(sender, child_ctx, key, work_dir, ctx.sink is not None, scans_snapshot()),
         )
         proc.start()
         sender.close()
