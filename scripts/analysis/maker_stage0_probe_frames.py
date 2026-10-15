@@ -20,20 +20,34 @@ from __future__ import annotations
 import shutil
 import struct
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
 
+from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.analysis.maker_tape_census import PrintRecord
-from scripts.analysis.maker_stage0_probe_core import DirectionFold, DirectionResult, Frame
+from scripts.analysis.maker_stage0_probe_core import (
+    DirectionFold,
+    DirectionResult,
+    Frame,
+    Gap,
+    gap_free_frames,
+    mid_of,
+)
 
-__all__ = ["FrameSpill", "fold_directions"]
+__all__ = ["FrameSpill", "count_truncations", "fold_directions", "read_depth_frames", "time_slices"]
 
 _RECORD: Final[struct.Struct] = struct.Struct("<qqi")
 _NO_MID: Final[int] = 2**31 - 1  # exponent sentinel: the frame's mid is None
 _READ_RECORDS: Final[int] = 1 << 16  # records per read chunk (1.5 MiB)
+_HOUR_NS: Final[int] = 3_600 * 1_000_000_000
+FINE_SLICE_NS: Final[int] = 2 * _HOUR_NS  # inside the rung's own station-day window
+COARSE_SLICE_NS: Final[int] = 48 * _HOUR_NS  # everywhere else in the query bounds
 
 
 def _encode(frame: Frame) -> bytes:
@@ -115,3 +129,74 @@ def fold_directions(
         pooled.add(group, frames)
         control.add([r for r in group if _station_of(r) == control_station], frames)
     return pooled.result(), control.result()
+
+
+def _steps(lo: int, hi: int, width: int) -> Iterator[tuple[int, int]]:
+    for start in range(lo, hi + 1, width):
+        yield start, min(start + width - 1, hi)
+
+
+def time_slices(
+    bounds: tuple[int, int],
+    focus: tuple[int, int],
+    fine: int = FINE_SLICE_NS,
+    coarse: int = COARSE_SLICE_NS,
+) -> Iterator[tuple[int, int]]:
+    """Disjoint inclusive ``(start, end)`` ns slices whose union is exactly ``bounds``.
+
+    ``focus`` (the rung's own window) is cut ``fine``, the rest ``coarse``; ``query`` bounds are
+    inclusive at both ends, so adjacent slices touch at ``end + 1`` and a frame is in one slice.
+    """
+    lo, hi = bounds
+    f_lo, f_hi = max(focus[0], lo), min(focus[1], hi)
+    if f_lo > f_hi:
+        yield from _steps(lo, hi, coarse)
+        return
+    if lo < f_lo:
+        yield from _steps(lo, f_lo - 1, coarse)
+    yield from _steps(f_lo, f_hi, fine)
+    if f_hi < hi:
+        yield from _steps(f_hi + 1, hi, coarse)
+
+
+def read_depth_frames(
+    work: ParquetDataCatalog,
+    rung: str,
+    gaps: Sequence[Gap],
+    bounds: tuple[int, int],
+    focus: tuple[int, int],
+    spill: FrameSpill,
+    fine: int = FINE_SLICE_NS,
+    coarse: int = COARSE_SLICE_NS,
+) -> int:
+    """Spill the rung's gap-free (ts, mid) frames slice by slice; returns the depth frame count.
+
+    Only one slice of ``OrderBookDepth10`` objects is materialised at a time (S-5). The slices
+    partition ``bounds`` and the query is ordered by its bound column, so the appended sequence is
+    the unsliced one.
+    """
+    total = 0
+    for start, end in time_slices(bounds, focus, fine, coarse):
+        depths = work.query(data_cls=OrderBookDepth10, identifiers=[rung], start=start, end=end)
+        total += len(depths)
+        frames = [Frame(d.ts_event, mid_of(d)) for d in depths]  # only (ts, mid) is kept
+        spill.append(rung, gap_free_frames(frames, gaps))
+    return total
+
+
+TRUNCATION_SLICE_NS: Final[int] = _HOUR_NS
+
+
+def count_truncations(work: ParquetDataCatalog, rungs: Collection[str]) -> int:
+    """How many ``DepthTruncation`` rows belong to ``rungs``, read one time slice at a time.
+
+    An instance holds millions of truncation rows (1.9M = 1.8 GB resident when queried whole, the
+    S-5 OOM), so the file intervals the catalog already knows are cut into hour slices; the slices
+    are disjoint and inclusive-bounded, so every row is counted once, as in the whole query.
+    """
+    wanted, total = frozenset(rungs), 0
+    for lo, hi in work.get_intervals(DepthTruncation):
+        for start, end in _steps(lo, hi, TRUNCATION_SLICE_NS):
+            rows = work.query(data_cls=DepthTruncation, start=start, end=end)
+            total += sum(str(getattr(t, "data", t).instrument_id) in wanted for t in rows)
+    return total

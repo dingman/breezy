@@ -11,6 +11,7 @@ never touched.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -542,7 +543,12 @@ def test_queries_for_depth_and_trades_are_bounded_to_the_day_window(
     bounded = {OrderBookDepth10, TradeTick}
     calls = [c for c in seen if c[0] in bounded]
     assert {c[0] for c in calls} == bounded
-    assert all((c[1], c[2]) == (start, end) for c in calls)
+    trades = [c for c in calls if c[0] is TradeTick]
+    assert all((c[1], c[2]) == (start, end) for c in trades)
+    # S-5: depth is read in disjoint inclusive slices whose union is exactly the day window
+    depth = sorted({(c[1], c[2]) for c in calls if c[0] is OrderBookDepth10})  # per rung, same
+    assert depth[0][0] == start and depth[-1][1] == end
+    assert all(nxt[0] == prev[1] + 1 for prev, nxt in itertools.pairwise(depth))
     assert report.depth_frames == 3  # the 09-20 frame is never loaded
 
 

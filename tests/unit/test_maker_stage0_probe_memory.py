@@ -11,6 +11,7 @@ are ever alive.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +46,12 @@ _BASE_DIRECTION = "INSUFFICIENT"  # the world is thin on purpose: the tallies ar
 
 def _one_sided(instrument: BinaryOption, ts: int) -> OrderBookDepth10:
     """A frame whose best bid has no size: ``mid_of`` is None."""
+    return _frame(instrument, "0.400", "0.600", "0", ts, ts)
+
+
+def _frame(
+    instrument: BinaryOption, bid: str, ask: str, bid_size: str, ts_event: int, ts_init: int
+) -> OrderBookDepth10:
 
     def side(px: str, size: str, order_side: OrderSide) -> list[BookOrder]:
         levels = [(px, size)] + [("0.000", "0")] * (_LEVELS - 1)
@@ -55,14 +62,14 @@ def _one_sided(instrument: BinaryOption, ts: int) -> OrderBookDepth10:
 
     return OrderBookDepth10(
         instrument_id=instrument.id,
-        bids=side("0.400", "0", OrderSide.BUY),
-        asks=side("0.600", "10", OrderSide.SELL),
+        bids=side(bid, bid_size, OrderSide.BUY),
+        asks=side(ask, "10", OrderSide.SELL),
         bid_counts=[1] * _LEVELS,
         ask_counts=[1] * _LEVELS,
         flags=0,
         sequence=0,
-        ts_event=ts,
-        ts_init=ts,
+        ts_event=ts_event,
+        ts_init=ts_init,
     )
 
 
@@ -218,3 +225,95 @@ def test_the_rung_fold_equals_the_all_at_once_direction_result() -> None:
 
 def _print(rung: str, side: str, price: str, ts: int, trade_id: str) -> PrintRecord:
     return PrintRecord(trade_id, ts, Decimal(price), side, rung, Decimal(1))
+
+
+_SEC = 1_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("bounds", "focus"),
+    [
+        ((0, 99), (30, 59)),  # focus inside
+        ((0, 99), (-50, 20)),  # focus overlaps the low edge
+        ((0, 99), (80, 500)),  # ... the high edge
+        ((0, 99), (200, 300)),  # focus outside: all coarse
+        ((10, 10), (10, 10)),  # a single instant
+    ],
+)
+def test_time_slices_partition_the_bounds_exactly(
+    bounds: tuple[int, int], focus: tuple[int, int]
+) -> None:
+    slices = list(pf.time_slices(bounds, focus, fine=7, coarse=13))
+
+    assert slices[0][0] == bounds[0] and slices[-1][1] == bounds[1]
+    assert all(a <= b for a, b in slices)
+    assert all(nxt[0] == prev[1] + 1 for prev, nxt in itertools.pairwise(slices))
+
+
+def test_chunked_depth_reads_equal_the_unchunked_read_at_every_boundary(
+    tmp_path: Path,
+) -> None:
+    """The native ``query`` bounds are inclusive at both ends (on ``ts_init``) and ordered by it:
+    frames sit exactly on slice edges, share a ``ts_event`` with different ``ts_init`` and mid, and
+    the chunked (ts, mid) sequence is still the unchunked one, tie order included."""
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+    from breezy.runtime.quote_tape_ingest_core import default_convert
+
+    base = _ns("2026-09-22T03:00:00")
+    lax = _instrument(_slug("lax"), base)
+    mids = [("0.390", "0.410"), ("0.440", "0.460"), ("0.490", "0.510"), ("0.590", "0.610")]
+    records = [
+        _frame(lax, *mids[k % 4], "10", base + (k // 2) * _SEC, base + k * _SEC // 2 + 7)
+        for k in range(24)  # pairs share a ts_event; ts_init edges fall on and around 1 s slices
+    ] + [_frame(lax, "0.100", "0.120", "10", base + 3 * _SEC, base + 2 * _SEC)]  # event after init
+    capture = tmp_path / "cap"
+    _write_instance(capture, "i", instruments=[lax], records=records, offsets=[(base, 0)])
+    work = ParquetDataCatalog(str(tmp_path / "work"))
+    default_convert(
+        ParquetDataCatalog(str(capture)), "i", OrderBookDepth10, DEFAULT_SUBDIRECTORY, target=work
+    )
+    rung, bounds = str(lax.id), (base - _SEC, base + 40 * _SEC)
+
+    def stored(fine: int, coarse: int, name: str) -> tuple[int, list[tuple[int, Decimal | None]]]:
+        spill = pf.FrameSpill(tmp_path / name)
+        n = pf.read_depth_frames(
+            work, rung, [], bounds, (base, base + 20 * _SEC), spill, fine, coarse
+        )
+        return n, [(f.ts_ns, f.mid) for f in spill.load(rung)]
+
+    whole = stored(10**15, 10**15, "whole")
+    for width in (_SEC // 2, _SEC, 3 * _SEC // 2, 5 * _SEC):
+        assert stored(width, width, f"w{width}") == whole
+    assert whole[0] == len(records)
+
+
+def test_truncations_are_counted_slice_by_slice_exactly_as_in_one_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.adapters.polymarket_us.tape_records import DepthTruncation
+    from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+    from breezy.runtime.quote_tape_ingest_core import default_convert
+
+    base = _ns("2026-09-22T03:00:00")
+    lax = _instrument(_slug("lax"), base)
+    other = _instrument(_slug("lax", "gte90lt91f"), base)
+    records = [
+        DepthTruncation(inst.id, 12, 14, 6, base + k * _SEC // 2, base + k * _SEC // 2)
+        for k, inst in zip(range(30), [lax, other] * 15, strict=True)
+    ]
+    capture = tmp_path / "cap"
+    _write_instance(capture, "i", instruments=[lax, other], records=records, offsets=[(base, 0)])
+    work = ParquetDataCatalog(str(tmp_path / "work"))
+    default_convert(
+        ParquetDataCatalog(str(capture)), "i", DepthTruncation, DEFAULT_SUBDIRECTORY, target=work
+    )
+
+    whole = pf.count_truncations(work, {str(lax.id)})
+    monkeypatch.setattr(pf, "TRUNCATION_SLICE_NS", _SEC // 3)
+    sliced = pf.count_truncations(work, {str(lax.id)})
+
+    assert whole == sliced == 15
