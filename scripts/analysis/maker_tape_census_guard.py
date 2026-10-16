@@ -10,6 +10,9 @@ Ledger lines carry exactly ``sha, mode, from, to, rows_chain_sha256, ts``:
   and before any instance is touched; its chain is the chain over the rows committed so far;
 * the POST-read line (mode ``..._post``) commits the invocation's rows into the chain.
 
+The earlier-full-run check plus the append is single-writer: the C4 trigger lock is the
+writer, so no file lock is taken here.
+
 An invocation that fails after its pre-read line counts over its whole [from, to] (disclosed).
 """
 
@@ -24,15 +27,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from breezy.analysis import maker_tape_census as core
 from breezy.analysis.maker_search_declarations import (
     SEARCH_DECLARATIONS,
     declaration_row,
     is_trigger_check_token,
 )
 
-_DERIVED: Final[Path] = Path.home() / ".local/share/breezy/derived/maker_stage0"
-DEFAULT_READ_LEDGER: Final[Path] = _DERIVED / "search_read_ledger.jsonl"
-DEFAULT_TRIGGER_CLOSE: Final[Path] = _DERIVED / "trigger_close.json"
+
+def default_read_ledger() -> Path:
+    return Path.home() / ".local/share/breezy/derived/maker_stage0/search_read_ledger.jsonl"
+
+
+def default_trigger_close() -> Path:
+    return Path.home() / ".local/share/breezy/derived/maker_stage0/trigger_close.json"
+
+
+DEFAULT_READ_LEDGER: Final[Path] = default_read_ledger()
+DEFAULT_TRIGGER_CLOSE: Final[Path] = default_trigger_close()
 GENESIS_CHAIN: Final[str] = hashlib.sha256(b"").hexdigest()
 LEDGER_FIELDS: Final[tuple[str, ...]] = ("sha", "mode", "from", "to", "rows_chain_sha256", "ts")
 COUNT_FIELDS: Final[tuple[str, ...]] = ("station", "climate_day", "reason", "first_seen_ns")
@@ -58,7 +70,7 @@ def utc_today() -> dt.date:
     return dt.datetime.now(dt.UTC).date()
 
 
-def count_fields(row: Any) -> dict[str, object]:
+def count_fields(row: core.CensusedDay) -> dict[str, object]:
     """The four counts-only fields of a census row (the whole of what counts-only emits)."""
     return {
         "station": row.station,
@@ -158,8 +170,8 @@ def begin_second_look(
     limit = (today or utc_today()) - dt.timedelta(days=_LAG_DAYS)
     if day_to > limit:
         raise ValueError(f"range end {day_to} is after today - 2 ({limit}); instance not rotated")
-    if read_ledger is None:
-        raise ValueError("a second-look census needs a read-ledger path")
+    read_ledger = read_ledger if read_ledger is not None else default_read_ledger()
+    trigger_close = trigger_close if trigger_close is not None else default_trigger_close()
     end = _close_end(trigger_close)
     if end is not None and day_to > end:
         raise ValueError(f"range end {day_to} is after E ({end}) from trigger_close")
@@ -190,6 +202,8 @@ def commit_rows(session: SecondLookRead | None, rows: Iterable[Mapping[str, obje
 
 def write_counts_only(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
     """Counts-only output: four fields per line, nothing else, sealed 0400."""
+    if path.exists():
+        raise ValueError(f"counts-only output {path} already exists; refusing to replace it")
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "".join(
         json.dumps({k: row[k] for k in COUNT_FIELDS}, sort_keys=True, separators=(",", ":")) + "\n"

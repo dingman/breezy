@@ -13,7 +13,7 @@ census constant by a unit test.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Final, NamedTuple
+from typing import Final, NamedTuple
 
 MAKER_STATIONS: Final[frozenset[str]] = frozenset({"LAX", "MDW", "MIA", "SFO"})
 
@@ -56,6 +56,6 @@ def declaration_row(station: str, day: dt.date) -> int | None:
     return None
 
 
-def is_trigger_check_token(token: Any) -> bool:
+def is_trigger_check_token(token: object) -> bool:
     """The trigger-check marker contract: a non-blank string."""
     return isinstance(token, str) and bool(token.strip())

@@ -26,12 +26,21 @@ import maker_tape_census as census_script  # type: ignore[import-not-found]
 import maker_tape_census_guard as guard  # type: ignore[import-not-found]
 
 _DOC_A = REPO_ROOT / "docs/evidence/RULING_MAKER-S2_second_look_SEARCH_declaration_2026-10-16.md"
+_REAL_HOME = Path.home()  # captured at import, before the autouse fixture patches it
 _SHA1 = reg.SEARCH_DECLARATIONS[0].sha256
 _SHA2 = reg.SEARCH_DECLARATIONS[1].sha256
 _S = dt.date(2026, 10, 14)
 _TODAY = dt.date(2026, 10, 20)
 _LEDGER_FIELDS = {"sha", "mode", "from", "to", "rows_chain_sha256", "ts"}
 _COUNT_FIELDS = {"station", "climate_day", "reason", "first_seen_ns"}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Library callers passing None resolve to the defaults under HOME: keep them in tmp."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
 
 
 def _capture(tmp_path: Path) -> Path:
@@ -78,8 +87,8 @@ def test_census_refuses_range_end_after_check_date_minus_two(tmp_path: Path) -> 
     _run(tmp_path, today=dt.date(2026, 10, 16))  # 10-14 == 10-16 - 2 is allowed
     assert ledger.exists()
 
-    with pytest.raises(ValueError, match="read-ledger"):
-        _run(tmp_path, read_ledger=None)
+    _run(tmp_path, read_ledger=None)  # None resolves to the default path (under the patched home)
+    assert guard.default_read_ledger().exists()
 
 
 def test_census_records_every_second_look_invocation_before_reading(
@@ -248,7 +257,7 @@ def test_counts_only_outside_trigger_check_refused(tmp_path: Path) -> None:
 
 
 def test_read_ledger_default_path_is_pinned() -> None:
-    expected = Path.home() / ".local/share/breezy/derived/maker_stage0/search_read_ledger.jsonl"
+    expected = _REAL_HOME / ".local/share/breezy/derived/maker_stage0/search_read_ledger.jsonl"
 
     assert guard.DEFAULT_READ_LEDGER == expected
     assert (
@@ -308,3 +317,28 @@ def test_v1_invocation_unaffected_by_guard(tmp_path: Path) -> None:
 
     assert not ledger.exists()
     assert run.rows == plain.rows
+
+
+def test_guard_none_trigger_close_resolves_to_default(tmp_path: Path, _isolated_home: Path) -> None:
+    default = guard.default_trigger_close()
+    assert default == _isolated_home / ".local/share/breezy/derived/maker_stage0/trigger_close.json"
+    default.parent.mkdir(parents=True)
+    default.write_text(json.dumps({"E": "2026-10-15", "crossed": False}))
+
+    with pytest.raises(ValueError, match="after E"):
+        _run(tmp_path, trigger_close=None, day_to=dt.date(2026, 10, 16))
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_counts_only_refuses_to_overwrite_existing_file(tmp_path: Path) -> None:
+    out = tmp_path / "counts.jsonl"
+    rows = [
+        {"station": "LAX", "climate_day": "2026-10-14", "reason": "COVERED", "first_seen_ns": 1}
+    ]
+
+    guard.write_counts_only(out, rows)
+    first = out.read_bytes()
+    with pytest.raises(ValueError, match="already exists"):
+        guard.write_counts_only(out, rows)
+    assert out.read_bytes() == first
+    assert not list(tmp_path.glob("*.tmp"))

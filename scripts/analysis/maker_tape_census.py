@@ -542,7 +542,7 @@ def _emit_counts_only(args: argparse.Namespace, run: CensusRun) -> int:
     """Counts-only: four fields to a sealed file, no summary, no provenance, exit 0."""
     if args.output is not None:
         guard.write_counts_only(args.output.expanduser(), [guard.count_fields(r) for r in run.rows])
-    print(f"maker-s2-census: counts-only rows={len(run.rows)}")
+    print(f"maker-s1-census: counts-only rows={len(run.rows)}")
     return 0
 
 
@@ -573,6 +573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.counts_only:
             return _emit_counts_only(args, run)
         return _emit_full(args, run, declaration)
+    except ValueError as exc:
+        print(f"maker-s1-census: REFUSED {type(exc).__name__}: {exc}", file=sys.stderr)
+        return _EXIT_REFUSED
     except OSError as exc:
         print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_FAILED
