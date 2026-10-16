@@ -22,6 +22,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from typing import Any, Final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import maker_tape_census_guard as guard  # type: ignore[import-not-found]
 from cli_basis_offer_gate_scan import classify_instance  # type: ignore[import-not-found]
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.instruments import BinaryOption
@@ -44,6 +46,7 @@ from breezy.adapters.polymarket_us.symbology import REGISTRY_VENUE_KEY
 from breezy.adapters.polymarket_us.tape_records import QuoteTapeGap, VenueClockOffset
 from breezy.analysis import maker_tape_census as core
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
+from breezy.analysis.maker_search_declarations import TRIGGER_CHECK_ENV
 from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
     PreflightError,
@@ -257,31 +260,24 @@ def _plan_rows(
     return plan
 
 
-def run_census(
-    *,
+def _second_look_guard(
+    plan: dict[_StationDay, tuple[str, core.MakerWindow]], **kwargs: Any
+) -> guard.SecondLookRead | None:
+    """Refuse or ledger a second-look invocation (registry row >= 1); None for row 0."""
+    return guard.begin_second_look(keys=tuple(plan), **kwargs)
+
+
+def _scan_instances(
     catalog_root: Path,
     work_root: Path,
-    stations: Sequence[str],
-    day_from: dt.date,
-    day_to: dt.date,
-    declaration_sha256: str | None,
-) -> CensusRun:
-    plan = _plan_rows(stations, day_from, day_to, declaration_sha256)
-    _check_work_root(work_root, catalog_root)
-    read_days = frozenset(
-        day
-        for (_, day), (_, window) in plan.items()
-        if window.start_ns >= core.TRADE_CAPTURE_START_NS
-    )
-    scope = _Scope(read_days, frozenset(stations))
-    ledger: dict[_StationDay, _Accumulator] = defaultdict(_Accumulator)
-    counts: Counter[str] = Counter()
-    read: list[str] = []
+    scope: _Scope,
+    ledger: dict[_StationDay, _Accumulator],
+    counts: Counter[str],
+    read: list[str],
+) -> None:
     source = ParquetDataCatalog(str(catalog_root))
-    instance_ids = list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY) if read_days else ()
-    created_root = not work_root.exists()
+    instance_ids = list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY) if scope.days else ()
     now_ns = time.time_ns()
-
     for position, instance_id in enumerate(instance_ids, start=1):
         try:
             verdict = classify_instance(
@@ -315,6 +311,45 @@ def run_census(
             read.append(instance_id)
         finally:
             _cleanup_work_catalog(work_dir)
+
+
+def run_census(
+    *,
+    catalog_root: Path,
+    work_root: Path,
+    stations: Sequence[str],
+    day_from: dt.date,
+    day_to: dt.date,
+    declaration_sha256: str | None,
+    counts_only: bool = False,
+    read_ledger: Path | None = None,
+    today: dt.date | None = None,
+    trigger_close: Path | None = None,
+    trigger_check_token: str | None = None,
+) -> CensusRun:
+    plan = _plan_rows(stations, day_from, day_to, declaration_sha256)
+    _check_work_root(work_root, catalog_root)
+    session = _second_look_guard(
+        plan,
+        counts_only=counts_only,
+        day_from=day_from,
+        day_to=day_to,
+        read_ledger=read_ledger,
+        today=today,
+        trigger_close=trigger_close,
+        trigger_check_token=trigger_check_token,
+    )
+    read_days = frozenset(
+        day
+        for (_, day), (_, window) in plan.items()
+        if window.start_ns >= core.TRADE_CAPTURE_START_NS
+    )
+    scope = _Scope(read_days, frozenset(stations))
+    ledger: dict[_StationDay, _Accumulator] = defaultdict(_Accumulator)
+    counts: Counter[str] = Counter()
+    read: list[str] = []
+    created_root = not work_root.exists()
+    _scan_instances(catalog_root, work_root, scope, ledger, counts, read)
     if created_root:
         with contextlib.suppress(OSError):
             work_root.rmdir()
@@ -322,6 +357,7 @@ def run_census(
     rows = tuple(
         _row(key, plan[key], ledger.get(key)) for key in sorted(plan, key=lambda k: (k[0], k[1]))
     )
+    guard.commit_rows(session, [guard.count_fields(r) for r in rows])
     return CensusRun(
         rows, core.summarise(rows), counts, tuple(read), scope.discarded, _dedupe_prints(ledger)
     )
@@ -471,29 +507,59 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--to", dest="day_to", required=True)
     parser.add_argument("--stations", default=_DEFAULT_STATIONS)
     parser.add_argument("--search-declaration", type=Path, default=None)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=None)  # required unless --counts-only
+    parser.add_argument("--counts-only", action="store_true")
+    parser.add_argument("--read-ledger", type=Path, default=guard.DEFAULT_READ_LEDGER)
+    parser.add_argument("--trigger-close", type=Path, default=guard.DEFAULT_TRIGGER_CLOSE)
     parser.add_argument("--prints-out", type=Path, default=None)
     parser.add_argument("--catalog-root", type=Path, default=DEFAULT_CATALOG_ROOT)
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
     return parser.parse_args(argv)
 
 
+def _run_from_args(args: argparse.Namespace) -> tuple[CensusRun, str | None]:
+    if args.output is None and not args.counts_only:
+        raise ValueError("--output is required unless --counts-only")
+    declaration: str | None = None
+    if args.search_declaration is not None:
+        declaration = hashlib.sha256(args.search_declaration.expanduser().read_bytes()).hexdigest()
+    run = run_census(
+        catalog_root=args.catalog_root.expanduser(),
+        work_root=args.work_root.expanduser(),
+        stations=tuple(s.strip().upper() for s in args.stations.split(",") if s.strip()),
+        day_from=dt.date.fromisoformat(args.day_from),
+        day_to=dt.date.fromisoformat(args.day_to),
+        declaration_sha256=declaration,
+        counts_only=args.counts_only,
+        read_ledger=args.read_ledger.expanduser(),
+        trigger_close=args.trigger_close.expanduser(),
+        trigger_check_token=os.environ.get(TRIGGER_CHECK_ENV),
+    )
+    return run, declaration
+
+
+def _emit_counts_only(args: argparse.Namespace, run: CensusRun) -> int:
+    """Counts-only: four fields to a sealed file, no summary, no provenance, exit 0."""
+    if args.output is not None:
+        guard.write_counts_only(args.output.expanduser(), [guard.count_fields(r) for r in run.rows])
+    print(f"maker-s2-census: counts-only rows={len(run.rows)}")
+    return 0
+
+
+def _emit_full(args: argparse.Namespace, run: CensusRun, declaration: str | None) -> int:
+    core.write_censused_days(args.output.expanduser(), run.rows)
+    written = 0
+    if args.prints_out is not None:
+        written, _ = write_prints(args.prints_out.expanduser(), run.prints)
+    print("census_provenance: " + json.dumps(_provenance(args, declaration, run), sort_keys=True))
+    print("\n".join(_report(run.summary, run, written)))
+    return _EXIT_UNSCREENED if run.summary.s5_unscreened else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    declaration: str | None = None
     try:
-        if args.search_declaration is not None:
-            declaration = hashlib.sha256(
-                args.search_declaration.expanduser().read_bytes()
-            ).hexdigest()
-        run = run_census(
-            catalog_root=args.catalog_root.expanduser(),
-            work_root=args.work_root.expanduser(),
-            stations=tuple(s.strip().upper() for s in args.stations.split(",") if s.strip()),
-            day_from=dt.date.fromisoformat(args.day_from),
-            day_to=dt.date.fromisoformat(args.day_to),
-            declaration_sha256=declaration,
-        )
+        run, declaration = _run_from_args(args)
     except (core.FirewallRefused, ValueError) as exc:
         print(f"maker-s1-census: REFUSED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_REFUSED
@@ -504,20 +570,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"maker-s1-census: FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_FAILED
     try:
-        core.write_censused_days(args.output.expanduser(), run.rows)
+        if args.counts_only:
+            return _emit_counts_only(args, run)
+        return _emit_full(args, run, declaration)
     except OSError as exc:
         print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_FAILED
-    written = 0
-    if args.prints_out is not None:
-        try:
-            written, _ = write_prints(args.prints_out.expanduser(), run.prints)
-        except OSError as exc:
-            print(f"maker-s1-census: IO_FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
-            return _EXIT_FAILED
-    print("census_provenance: " + json.dumps(_provenance(args, declaration, run), sort_keys=True))
-    print("\n".join(_report(run.summary, run, written)))
-    return _EXIT_UNSCREENED if run.summary.s5_unscreened else 0
 
 
 if __name__ == "__main__":

@@ -32,6 +32,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal, NamedTuple
 
+from breezy.analysis.maker_search_declarations import (
+    SEARCH_DECLARATIONS,
+    SearchDeclared,
+    declaration_row,
+)
+
 __all__ = [
     "AliveSpan",
     "CensusSummary",
@@ -62,20 +68,9 @@ PRE_FREEZE_END: Final[dt.date] = dt.date(2026, 9, 25)  # same value as nbp_marke
 MAKER_STATIONS: Final[frozenset[str]] = frozenset({"LAX", "MDW", "MIA", "SFO"})
 
 
-class SearchDeclared(NamedTuple):
-    stations: frozenset[str]
-    first_day: dt.date
-    last_day: dt.date
-
-
-SEARCH_DECLARED: Final[SearchDeclared] = SearchDeclared(
-    MAKER_STATIONS, dt.date(2026, 9, 26), dt.date(2026, 10, 13)
-)
-#: sha256 over the committed bytes of
-#: ``docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md`` (6068a00e).
-SEARCH_DECLARATION_SHA256: Final[str] = (
-    "38663caad38e455ab1512ca91a049f97d31c2dcfb1477c42db02ceca407abbc6"
-)
+#: Row 0 of the registry (the 10-12 declaration, 6068a00e); re-exported for existing callers.
+SEARCH_DECLARED: Final[SearchDeclared] = SEARCH_DECLARATIONS[0]
+SEARCH_DECLARATION_SHA256: Final[str] = SEARCH_DECLARED.sha256
 
 # --- Maker window (spec section 3) ----------------------------------------------------
 #: Trade capture starts 2026-09-17T09:00Z (journal evidence, plan section 7).
@@ -188,11 +183,10 @@ def require_firewall_clearance(
         raise FirewallRefused(f"station {station!r} is outside the maker stations")
     if day <= PRE_FREEZE_END:
         return "PRE_FREEZE"
-    if station not in SEARCH_DECLARED.stations or not (
-        SEARCH_DECLARED.first_day <= day <= SEARCH_DECLARED.last_day
-    ):
+    row = declaration_row(station, day)
+    if row is None:
         raise FirewallRefused(f"{station} {day.isoformat()} is post-freeze and not SEARCH-declared")
-    if declaration_sha256 != SEARCH_DECLARATION_SHA256:
+    if declaration_sha256 != SEARCH_DECLARATIONS[row].sha256:
         raise FirewallRefused(
             f"{station} {day.isoformat()} is post-freeze and the supplied declaration "
             "sha256 does not match the pinned value"
