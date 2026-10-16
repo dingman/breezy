@@ -94,6 +94,10 @@ from iem_cli_revisions import (  # type: ignore[import-not-found]
     atomic_write,
     sha256_hex,
 )
+from iem_cli_window_text import (  # type: ignore[import-not-found]
+    add_window_text_arguments,
+    run_window_text,
+)
 from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     IEM_ALLOWED_HOSTS,
     IEM_MIN_INTERVAL_NS,
@@ -647,6 +651,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             command.add_argument("--catalog-base", default=str(DEFAULT_CATALOG_DIR))
         else:
             command.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    add_window_text_arguments(
+        sub.add_parser("window-text", help="cache one validated fmt=text window per maker station")
+    )
     return parser.parse_args(argv)
 
 
@@ -713,6 +720,31 @@ def _run_fetch(
     return _fetch_exit_code(outcomes)
 
 
+def _run_window_text(
+    args: argparse.Namespace, *, clock: Callable[[], int], fetcher: CliTextFetcher | None
+) -> int:
+    """C6b: paced text transport + cache lock + atomic write live in ``iem_cli_window_text``."""
+    resolved = fetcher or IemCliTransport(
+        budget=RequestBudget(limit=max(1, len(args.city or ())) * MAX_ATTEMPTS),
+        pacer=IemPacer(clock=clock, min_interval_ns=IEM_MIN_INTERVAL_NS),
+        user_agent=USER_AGENT,
+        clock=clock,
+    )
+
+    async def fetch_text(url: str, station: str) -> tuple[str | None, str]:
+        got = await _get_text(resolved, url, asyncio.sleep, station)
+        if isinstance(got, StationOutcome):
+            return None, str(got.detail["message"])
+        return got.text, ""
+
+    try:
+        code: int = run_window_text(args, fetch_text=fetch_text)
+        return code
+    except RequestBudgetExceededError as exc:
+        print(f"aborted: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+
+
 def _run_dataset(args: argparse.Namespace, *, clock: Callable[[], int]) -> int:
     cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
     try:
@@ -744,6 +776,8 @@ def main(
         return EXIT_LAUNCH_WINDOW
     if args.command == "fetch":
         return _run_fetch(args, clock=resolved_clock, fetcher=fetcher)
+    if args.command == "window-text":
+        return _run_window_text(args, clock=resolved_clock, fetcher=fetcher)
     return _run_dataset(args, clock=resolved_clock)
 
 

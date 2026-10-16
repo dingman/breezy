@@ -85,6 +85,14 @@ from settlement_alignment_study import (
     issue_utc_from_iem_filename,
     parse_issued_at,
 )
+from settlement_text_window import (  # type: ignore[import-not-found]
+    MAKER_S2B_CITIES,
+    MAKER_S2B_LIMIT,
+    MAKER_S2B_WINDOW_END,
+    MAKER_S2B_WINDOW_START,
+    text_window_members,
+    text_window_url,
+)
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.normalize.classify import (
@@ -246,9 +254,14 @@ class ArchiveWindow:
     start: dt.date
     end: dt.date
     limit: int
+    #: True for a ``fmt=text`` window cached as a ``.txt`` (the C6b s2b window).
+    text: bool = False
 
     @property
     def url(self) -> str:
+        if self.text:
+            text_url: str = text_window_url(self.cli_location, self.start, self.end, self.limit)
+            return text_url
         return afos_url(self.cli_location, self.start, self.end, limit=self.limit)
 
     def days(self) -> tuple[dt.date, ...]:
@@ -279,9 +292,18 @@ _STATION_YEARS: Final[tuple[int, ...]] = (2021, 2022, 2023, 2024, 2025)
 _EXTENSION_WINDOW_START: Final[dt.date] = dt.date(2026, 1, 1)
 _EXTENSION_WINDOW_END: Final[dt.date] = dt.date(2026, 9, 28)
 
+#: MAKER-S2 second look (unit C6b): the block-2 cross-check window, a TEXT window
+#: (the IEM transport is text-only) emitted only for the maker stations. Fixed
+#: dates for the same reason as the extension window above.
+_MAKER_S2B_WINDOW_START: Final[dt.date] = MAKER_S2B_WINDOW_START
+_MAKER_S2B_WINDOW_END: Final[dt.date] = MAKER_S2B_WINDOW_END
+
 
 def archive_windows(
-    cities: Sequence[str] | None = None, *, include_extension: bool = False
+    cities: Sequence[str] | None = None,
+    *,
+    include_extension: bool = False,
+    include_maker_s2b: bool = False,
 ) -> tuple[ArchiveWindow, ...]:
     """Every AFOS window the settlement-alignment cache is known to hold.
 
@@ -297,6 +319,11 @@ def archive_windows(
     Any future scheduled rebuild (nightly extension job, cron, systemd
     timer) MUST pass ``--include-extension``, or it silently reverts to the
     truncated pre-SL-5 window set.
+
+    ``include_maker_s2b=True`` additionally yields the C6b text window
+    2026-09-29..2026-11-15 for the maker stations ONLY (never NYC, whatever
+    ``cities`` selects). Off by default; ``main`` opts in via
+    ``--include-maker-s2b-window``.
     """
     registry = default_registry()
     windows: list[ArchiveWindow] = []
@@ -337,12 +364,23 @@ def archive_windows(
                     limit=3_000,
                 )
             )
+        if include_maker_s2b and city in MAKER_S2B_CITIES:
+            windows.append(
+                ArchiveWindow(
+                    city=city,
+                    cli_location=cli_location,
+                    start=_MAKER_S2B_WINDOW_START,
+                    end=_MAKER_S2B_WINDOW_END,
+                    limit=MAKER_S2B_LIMIT,
+                    text=True,
+                )
+            )
     return tuple(windows)
 
 
 def window_zip_path(cache_dir: Path, window: ArchiveWindow) -> Path:
     """The content-addressed cache path for ``window``; refuses on a miss."""
-    path = cache_path_for_url(cache_dir, window.url, suffix=".zip")
+    path = cache_path_for_url(cache_dir, window.url, suffix=".txt" if window.text else ".zip")
     if not path.is_file():
         raise ArchiveCoverageError(
             f"{window.city} {window.start}..{window.end}: archive window absent from the "
@@ -584,6 +622,10 @@ def read_window_issuances(
     the survivor twice). Reading each ``ZipInfo`` directly sees both; the
     digest dedupe then collapses them only if their bytes are genuinely equal.
     """
+    if zip_path.suffix == ".txt":
+        return _read_text_window(
+            text_path=zip_path, city=city, site=site, expected_sha256=expected_zip_sha256
+        )
     issuances: list[ArchiveIssuance] = []
     refusals: list[ArchiveRefusal] = []
     if expected_zip_sha256 is not None:
@@ -617,6 +659,48 @@ def read_window_issuances(
                         message=str(exc),
                     )
                 )
+    return tuple(issuances), tuple(refusals)
+
+
+def _read_text_window(
+    *, text_path: Path, city: str, site: SettlementSite, expected_sha256: str | None
+) -> tuple[tuple[ArchiveIssuance, ...], tuple[ArchiveRefusal, ...]]:
+    """The ``.txt`` twin of the zip reader: one cached ``fmt=text`` body, read-only.
+
+    Digest first (same sidecar discipline), then the existing splitter via
+    ``text_window_members`` and the SAME ``issuance_from_member`` per product, so a
+    refusal is collected, never swallowed. The splitter rewrites the WMO sequence to
+    ``000``; ``wmo_transmission_sequence`` is therefore not provenance on this path.
+    """
+    if expected_sha256 is not None:
+        verify_zip_digest(text_path, expected_sha256)
+    try:
+        raw_text = text_path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ArchiveCoverageError(f"{text_path}: cached text window is not UTF-8: {exc}") from exc
+    issuances: list[ArchiveIssuance] = []
+    refusals: list[ArchiveRefusal] = []
+    for member_name, member_bytes in text_window_members(raw_text, site.cli_location):
+        try:
+            issuances.append(
+                issuance_from_member(
+                    city=city,
+                    site=site,
+                    member_bytes=member_bytes,
+                    member_name=member_name,
+                    source_zip=text_path.name,
+                )
+            )
+        except SettlementTruthError as exc:
+            refusals.append(
+                ArchiveRefusal(
+                    city=city,
+                    source_zip=text_path.name,
+                    source_member=member_name,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
     return tuple(issuances), tuple(refusals)
 
 
@@ -1262,20 +1346,58 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "it is reached only when this flag is set."
         ),
     )
+    parser.add_argument(
+        "--include-maker-s2b-window",
+        action="store_true",
+        help=(
+            "Also read the MAKER-S2 block-2 cross-check TEXT window 2026-09-29..2026-11-15 "
+            "(cached .txt from `iem_cli_fetch.py window-text`). Opt-in, OFF by default. "
+            "Requires --city restricted to the maker stations (LAX MDW MIA SFO) and an "
+            "explicit non-default --output-dir, so the shared dataset is never overwritten."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def require_s2b_scope(args: argparse.Namespace) -> None:
+    """Refuse an s2b run that is not maker-only with its own explicit output dir."""
+    cities = tuple(dict.fromkeys(args.city or ()))
+    if not cities or not set(cities) <= set(MAKER_S2B_CITIES):
+        raise SettlementTruthError(
+            "--include-maker-s2b-window requires --city restricted to the maker stations "
+            f"({' '.join(MAKER_S2B_CITIES)}); refusing an unfiltered or non-maker run"
+        )
+    if Path(args.output_dir).expanduser().resolve(strict=False) == DEFAULT_OUTPUT_DIR.resolve(
+        strict=False
+    ):
+        raise SettlementTruthError(
+            "--include-maker-s2b-window requires an explicit --output-dir other than the shared "
+            f"dataset directory {DEFAULT_OUTPUT_DIR}; refusing to overwrite it"
+        )
+
+
+def _selected_windows(
+    args: argparse.Namespace, requested_cities: tuple[str, ...] | None
+) -> tuple[ArchiveWindow, ...]:
+    """Pass only the opt-in keywords that were actually requested (see the SL-5 tests)."""
+    options: dict[str, bool] = {}
+    if args.include_extension:
+        options["include_extension"] = True
+    if args.include_maker_s2b_window:
+        options["include_maker_s2b"] = True
+    return archive_windows(requested_cities, **options)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.include_maker_s2b_window:
+        require_s2b_scope(args)
     registry = default_registry()
     requested_cities = validate_requested_cities(args.city, registry)
     output_dir = validate_output_dir(Path(args.output_dir))
     cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
     archive_digests = read_archive_digest_sidecar(cache_dir)
-    if args.include_extension:
-        windows = archive_windows(requested_cities, include_extension=True)
-    else:
-        windows = archive_windows(requested_cities)
+    windows = _selected_windows(args, requested_cities)
     if not windows:
         raise SettlementTruthError(
             "selected cities produced zero archive windows; refusing to write"
