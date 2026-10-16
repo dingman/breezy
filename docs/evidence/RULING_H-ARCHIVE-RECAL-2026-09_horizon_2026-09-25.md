@@ -164,3 +164,6 @@ An independent pass by `mle-reviewer` returned **CONFIRMED-WITH-NOTES**.
 
 ## SEARCH declaration MAKER-S1 (2026-10-12)
 - 2026-10-12 SEARCH declaration (MAKER S1): LAX/MDW/MIA/SFO climate days 2026-09-26..2026-10-13, 72 station-days declared SEARCH and forfeited for CONFIRM (the 14 exit-window days show no Depth10 read, so none is credited as already spent); EDGE-4 revival ~2026-11-24 -> ~2026-12-08; see `docs/evidence/RULING_MAKER-S1_SEARCH_declaration_2026-10-12.md`.
+
+## SEARCH declaration MAKER-S2 second look (2026-10-16)
+- 2026-10-16 SEARCH declaration (MAKER S2 second look, FINAL): LAX/MDW/MIA/SFO climate days from 2026-10-14 to E (first outcome-blind counts-only crossing of n_eff proxy T = 34; cap 2026-11-15; expected ≈ 2026-11-04..11-06) declared SEARCH and forfeited for CONFIRM — realised forfeiture 4×(max invoked day − 2026-10-14 + 1), ceiling 132 station-days (2026-10-13 is an orphan, read by nobody); disjoint from the 2026-09-26..10-13 block above; EDGE-4 revival moves with E; see `docs/evidence/RULING_MAKER-S2_second_look_SEARCH_declaration_2026-10-16.md` (sha256 bc15908052ff223abc889859133edb4645d4a6642b5fae559c0101251df9a05b). A second dated section follows at `close`.
