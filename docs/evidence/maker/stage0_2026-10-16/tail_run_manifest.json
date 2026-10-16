@@ -1,0 +1,44 @@
+{
+  "argv": [
+    "/home/jon/breezy/scripts/analysis/maker_stage0_replay.py",
+    "--tail-only",
+    "--parity",
+    "LAX:0,MDW:1,MIA:0,SFO:0",
+    "--census-days",
+    "/home/jon/.local/share/breezy/derived/maker/s1/censused_days.jsonl",
+    "--trade-unit",
+    "/home/jon/.local/share/breezy/derived/maker/s1/trade_quantity_unit.json",
+    "--truth",
+    "/home/jon/.local/share/breezy/derived/maker_stage0_inputs/truth_cli_finals_2026-10-14.csv",
+    "--node-log-dir",
+    "/home/jon/.local/share/breezy/logs",
+    "--out-dir",
+    "/home/jon/.local/share/breezy/derived/maker_stage0/tail/tail-20261016T062622Z",
+    "--amendment",
+    "docs/evidence/RULING_MAKER-S1_SEARCH_declaration_amendment_2026-10-13.md",
+    "--amendment-sha",
+    "cf9a4dad826f61016b2616d32fbc1ca82f73b339b7da8e74fb6a9f25f4c818d0"
+  ],
+  "code_sha": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "free_disk_end_bytes": 83708407808,
+  "free_disk_start_bytes": 83729088512,
+  "git_commit": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "iterations": 2000,
+  "ladder_lower_parity": {
+    "LAX": 0,
+    "MDW": 1,
+    "MIA": 0,
+    "SFO": 0
+  },
+  "mode": "tail-only",
+  "nautilus_version": "1.231.0",
+  "peak_rss_bytes": 435838976,
+  "phases": [
+    "preflight",
+    "tail"
+  ],
+  "python": "3.13.13",
+  "run_id": "tail-20261016T062622Z",
+  "seed": 20260919,
+  "wall_time_s": 23.99021545983851
+}

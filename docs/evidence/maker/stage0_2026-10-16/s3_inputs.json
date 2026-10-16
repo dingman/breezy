@@ -1,0 +1,39 @@
+{
+  "b": 0.8,
+  "base_k1": 0.06818181818181818,
+  "base_station_day_rate": 0.13636363636363635,
+  "base_station_day_rate_ci_cluster_boot": [
+    0.024390243902439025,
+    0.25
+  ],
+  "bid_bearing_share_of_covered_listed": 0.5,
+  "code_sha": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "fill_icc_rung_trial": 0.09620492458387014,
+  "fill_icc_rung_trial_k1": 0.0,
+  "fill_icc_station_day": 0.09812199737953127,
+  "max_rungs_hypothesis": 2,
+  "n0_climate_dates": 12,
+  "n_eff_gov": 18.733333333333334,
+  "n_stressed_fills": 7,
+  "r_lo": 0.13636363636363635,
+  "r_lo_by_hypothesis": {
+    "CONTRACTS": 0.13636363636363635
+  },
+  "r_lo_k1": 0.06818181818181818,
+  "r_lo_k1_lcb_cluster_boot": 0.0,
+  "r_lo_lcb_by_hypothesis": {
+    "CONTRACTS": 0.024390243902439025
+  },
+  "r_lo_lcb_cluster_boot": 0.024390243902439025,
+  "r_lo_position": 0.08139534883720931,
+  "r_lo_se_cluster_boot": 0.05792425718297517,
+  "r_lo_station_day": 0.13636363636363635,
+  "realised_bid_iqr": [
+    0.74,
+    0.8
+  ],
+  "realised_bid_median_base": 0.8,
+  "two_fill_share": 0.16666666666666666,
+  "unit_hypothesis": "CONTRACTS",
+  "verdict": "UNDERPOWERED-WAIT"
+}

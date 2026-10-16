@@ -1,0 +1,78 @@
+{
+  "by_count_exceeds_cap": false,
+  "code_sha": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "leak_rate_bytes_per_row": 1144149,
+  "n_fit_rows": 2,
+  "n_replayable_station_days": 88,
+  "n_time_fit_rows": 0,
+  "projected_peak_rss_bytes": 2550972388,
+  "projected_total_s": 6874.564095186263,
+  "projected_total_s_by_count": 20614.307999999997,
+  "rss_slope_bytes_per_row": 0,
+  "s5_exceeded": false,
+  "station_days": [
+    {
+      "catalog_bytes": 3884743616,
+      "climate_day": "2026-10-03",
+      "elapsed_s": 203.119,
+      "n_events": 278054,
+      "parent_rss_bytes": 573362176,
+      "peak_rss_bytes": 1865678848,
+      "rss_bytes": 825466880,
+      "rss_peak_delta_bytes": 1152688128,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 6338990992,
+      "climate_day": "2026-10-04",
+      "elapsed_s": 333.292,
+      "n_events": 467444,
+      "parent_rss_bytes": 573370368,
+      "peak_rss_bytes": 2431549440,
+      "rss_bytes": 912183296,
+      "rss_peak_delta_bytes": 1718558720,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 4107398920,
+      "climate_day": "2026-10-09",
+      "elapsed_s": 216.046,
+      "n_events": 253792,
+      "parent_rss_bytes": 573382656,
+      "peak_rss_bytes": 1762406400,
+      "rss_bytes": 764059648,
+      "rss_peak_delta_bytes": 1049415680,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 3734779008,
+      "climate_day": "2026-10-11",
+      "elapsed_s": 184.557,
+      "n_events": 192438,
+      "parent_rss_bytes": 573374464,
+      "peak_rss_bytes": 1488666624,
+      "rss_bytes": 703819776,
+      "rss_peak_delta_bytes": 775675904,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 6338990992,
+      "climate_day": "2026-10-04",
+      "elapsed_s": 332.534,
+      "n_events": 467444,
+      "parent_rss_bytes": 576802816,
+      "peak_rss_bytes": 2454863872,
+      "repeat_of_first": true,
+      "rss_bytes": 922542080,
+      "rss_peak_delta_bytes": 1741873152,
+      "station": "SFO"
+    }
+  ],
+  "variants": [
+    "primary",
+    "overlay",
+    "plus60",
+    "poll_lag",
+    "delta0"
+  ]
+}

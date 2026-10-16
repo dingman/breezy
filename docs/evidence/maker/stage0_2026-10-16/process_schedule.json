@@ -1,0 +1,437 @@
+{
+  "days": {
+    "2026-09-18": {
+      "cuts": [
+        {
+          "instant_ns": 1789689600000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1789699800000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1789749600000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1789699800000000000,
+      "window_start_ns": 1789663800000000000
+    },
+    "2026-09-19": {
+      "cuts": [
+        {
+          "instant_ns": 1789776000000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1789786200000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1789836000000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1789786200000000000,
+      "window_start_ns": 1789750200000000000
+    },
+    "2026-09-20": {
+      "cuts": [
+        {
+          "instant_ns": 1789862400000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1789872600000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1789922400000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1789872600000000000,
+      "window_start_ns": 1789836600000000000
+    },
+    "2026-09-21": {
+      "cuts": [
+        {
+          "instant_ns": 1789948800000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1789959000000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790008800000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1789959000000000000,
+      "window_start_ns": 1789923000000000000
+    },
+    "2026-09-22": {
+      "cuts": [
+        {
+          "instant_ns": 1790035200000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790045400000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790095200000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790045400000000000,
+      "window_start_ns": 1790009400000000000
+    },
+    "2026-09-23": {
+      "cuts": [
+        {
+          "instant_ns": 1790121600000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790131800000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790181600000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790131800000000000,
+      "window_start_ns": 1790095800000000000
+    },
+    "2026-09-24": {
+      "cuts": [
+        {
+          "instant_ns": 1790208000000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790218200000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790268000000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790218200000000000,
+      "window_start_ns": 1790182200000000000
+    },
+    "2026-09-25": {
+      "cuts": [
+        {
+          "instant_ns": 1790294400000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790304600000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790354400000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790304600000000000,
+      "window_start_ns": 1790268600000000000
+    },
+    "2026-09-26": {
+      "cuts": [
+        {
+          "instant_ns": 1790380800000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790391000000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790440800000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790391000000000000,
+      "window_start_ns": 1790355000000000000
+    },
+    "2026-09-27": {
+      "cuts": [
+        {
+          "instant_ns": 1790467200000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790477400000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790527200000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790477400000000000,
+      "window_start_ns": 1790441400000000000
+    },
+    "2026-09-28": {
+      "cuts": [
+        {
+          "instant_ns": 1790553600000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790563800000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790613600000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790563800000000000,
+      "window_start_ns": 1790527800000000000
+    },
+    "2026-09-29": {
+      "cuts": [
+        {
+          "instant_ns": 1790640000000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790650200000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790700000000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790650200000000000,
+      "window_start_ns": 1790614200000000000
+    },
+    "2026-09-30": {
+      "cuts": [
+        {
+          "instant_ns": 1790726400000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790736600000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790786400000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790736600000000000,
+      "window_start_ns": 1790700600000000000
+    },
+    "2026-10-02": {
+      "cuts": [
+        {
+          "instant_ns": 1790899200000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790909400000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1790959200000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790909400000000000,
+      "window_start_ns": 1790873400000000000
+    },
+    "2026-10-03": {
+      "cuts": [
+        {
+          "instant_ns": 1790985600000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1790995800000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791045600000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1790995800000000000,
+      "window_start_ns": 1790959800000000000
+    },
+    "2026-10-04": {
+      "cuts": [
+        {
+          "instant_ns": 1791072000000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791082200000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791132000000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791082200000000000,
+      "window_start_ns": 1791046200000000000
+    },
+    "2026-10-05": {
+      "cuts": [
+        {
+          "instant_ns": 1791158400000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791168600000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791218400000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791168600000000000,
+      "window_start_ns": 1791132600000000000
+    },
+    "2026-10-06": {
+      "cuts": [
+        {
+          "instant_ns": 1791244800000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791255000000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791304800000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791255000000000000,
+      "window_start_ns": 1791219000000000000
+    },
+    "2026-10-07": {
+      "cuts": [
+        {
+          "instant_ns": 1791331200000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791341400000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791391200000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791341400000000000,
+      "window_start_ns": 1791305400000000000
+    },
+    "2026-10-08": {
+      "cuts": [
+        {
+          "instant_ns": 1791417600000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791427800000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791477600000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791427800000000000,
+      "window_start_ns": 1791391800000000000
+    },
+    "2026-10-09": {
+      "cuts": [
+        {
+          "instant_ns": 1791504000000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791514200000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791564000000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791514200000000000,
+      "window_start_ns": 1791478200000000000
+    },
+    "2026-10-10": {
+      "cuts": [
+        {
+          "instant_ns": 1791590400000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791600600000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791650400000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791600600000000000,
+      "window_start_ns": 1791564600000000000
+    },
+    "2026-10-11": {
+      "cuts": [
+        {
+          "instant_ns": 1791676800000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791687000000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791736800000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791687000000000000,
+      "window_start_ns": 1791651000000000000
+    },
+    "2026-10-12": {
+      "cuts": [
+        {
+          "instant_ns": 1791763200000000000,
+          "kind": "GTD_MIDNIGHT"
+        },
+        {
+          "instant_ns": 1791773400000000000,
+          "kind": "PERMIT_EXPIRY"
+        },
+        {
+          "instant_ns": 1791823200000000000,
+          "kind": "STOP_PRIOR"
+        }
+      ],
+      "window_end_ns": 1791773400000000000,
+      "window_start_ns": 1791737400000000000
+    }
+  },
+  "schedule": "PRIMARY"
+}

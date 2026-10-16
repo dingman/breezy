@@ -1,0 +1,122 @@
+{
+  "by_count_exceeds_cap": false,
+  "code_sha": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "leak_rate_bytes_per_row": 14932377,
+  "n_fit_rows": 6,
+  "n_replayable_station_days": 88,
+  "n_time_fit_rows": 8,
+  "projected_peak_rss_bytes": 3717529552,
+  "projected_total_s": 8768.249859501919,
+  "projected_total_s_by_count": 19391.427,
+  "rss_slope_bytes_per_row": 14651274,
+  "s5_exceeded": false,
+  "station_days": [
+    {
+      "catalog_bytes": 3660621232,
+      "climate_day": "2026-10-02",
+      "elapsed_s": 202.232,
+      "n_events": 274965,
+      "parent_rss_bytes": 578572288,
+      "peak_rss_bytes": 1892151296,
+      "rss_bytes": 781398016,
+      "rss_peak_delta_bytes": 1178218496,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 3884743616,
+      "climate_day": "2026-10-03",
+      "elapsed_s": 203.568,
+      "n_events": 278054,
+      "parent_rss_bytes": 578584576,
+      "peak_rss_bytes": 1762021376,
+      "rss_bytes": 779874304,
+      "rss_peak_delta_bytes": 1048088576,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 3386819128,
+      "climate_day": "2026-10-04",
+      "elapsed_s": 210.368,
+      "n_events": 344453,
+      "parent_rss_bytes": 578502656,
+      "peak_rss_bytes": 2007552000,
+      "rss_bytes": 821731328,
+      "rss_peak_delta_bytes": 1293619200,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 6338990992,
+      "climate_day": "2026-10-04",
+      "elapsed_s": 333.755,
+      "n_events": 467444,
+      "parent_rss_bytes": 578510848,
+      "peak_rss_bytes": 2455932928,
+      "rss_bytes": 964071424,
+      "rss_peak_delta_bytes": 1742000128,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 3656304408,
+      "climate_day": "2026-10-06",
+      "elapsed_s": 229.907,
+      "n_events": 426913,
+      "parent_rss_bytes": 578519040,
+      "peak_rss_bytes": 2522939392,
+      "rss_bytes": 986771456,
+      "rss_peak_delta_bytes": 1809006592,
+      "station": "SFO"
+    },
+    {
+      "catalog_bytes": 3567353336,
+      "climate_day": "2026-10-07",
+      "elapsed_s": 181.834,
+      "n_events": 209738,
+      "parent_rss_bytes": 618110976,
+      "peak_rss_bytes": 1680904192,
+      "rss_bytes": 853606400,
+      "rss_peak_delta_bytes": 966971392,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 4107398920,
+      "climate_day": "2026-10-09",
+      "elapsed_s": 217.358,
+      "n_events": 253792,
+      "parent_rss_bytes": 636903424,
+      "peak_rss_bytes": 1780277248,
+      "rss_bytes": 779542528,
+      "rss_peak_delta_bytes": 1066344448,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 3734779008,
+      "climate_day": "2026-10-11",
+      "elapsed_s": 183.835,
+      "n_events": 192438,
+      "parent_rss_bytes": 638107648,
+      "peak_rss_bytes": 1509965824,
+      "rss_bytes": 745615360,
+      "rss_peak_delta_bytes": 796033024,
+      "station": "MDW"
+    },
+    {
+      "catalog_bytes": 6338990992,
+      "climate_day": "2026-10-04",
+      "elapsed_s": 334.802,
+      "n_events": 467444,
+      "parent_rss_bytes": 653172736,
+      "peak_rss_bytes": 2506416128,
+      "repeat_of_first": true,
+      "rss_bytes": 934191104,
+      "rss_peak_delta_bytes": 1791705088,
+      "station": "SFO"
+    }
+  ],
+  "variants": [
+    "primary",
+    "overlay",
+    "plus60",
+    "poll_lag",
+    "delta0"
+  ]
+}

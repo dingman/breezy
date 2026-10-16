@@ -1,0 +1,1042 @@
+{
+  "amendment_final": {
+    "path": "docs/evidence/RULING_MAKER-S1_SEARCH_declaration_amendment_2026-10-13.md",
+    "sha256": "cf9a4dad826f61016b2616d32fbc1ca82f73b339b7da8e74fb6a9f25f4c818d0",
+    "size": 7739
+  },
+  "amendment_final_sha256": "cf9a4dad826f61016b2616d32fbc1ca82f73b339b7da8e74fb6a9f25f4c818d0",
+  "argv": [
+    "/home/jon/breezy/scripts/analysis/maker_stage0_replay.py",
+    "--census-days",
+    "/home/jon/.local/share/breezy/derived/maker/s1/censused_days.jsonl",
+    "--trade-unit",
+    "/home/jon/.local/share/breezy/derived/maker/s1/trade_quantity_unit.json",
+    "--truth",
+    "/home/jon/.local/share/breezy/derived/maker_stage0_inputs/truth_cli_finals_2026-10-14.csv",
+    "--node-log-dir",
+    "/home/jon/.local/share/breezy/logs",
+    "--catalog-root",
+    "/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us",
+    "--nbp-root",
+    "/home/jon/.local/share/breezy/derived/nbp",
+    "--truth-cross-check",
+    "/home/jon/.local/share/breezy/derived/settlement-truth/settlement_truth.parquet",
+    "--out-dir",
+    "/home/jon/.local/share/breezy/derived/maker_stage0/s2v-20261016T020707Z",
+    "--amendment",
+    "docs/evidence/RULING_MAKER-S1_SEARCH_declaration_amendment_2026-10-13.md",
+    "--amendment-sha",
+    "cf9a4dad826f61016b2616d32fbc1ca82f73b339b7da8e74fb6a9f25f4c818d0",
+    "--addendum",
+    "docs/evidence/RULING_MAKER-S1_SEARCH_amendment_addendum_2026-10-15_s2v-20261015T161506Z.md",
+    "--addendum-sha",
+    "6fc033d3ced165e496aaec51ca10e311c37a091fa046f5504a0d69896219f11b"
+  ],
+  "artefact": {
+    "path": "/home/jon/breezy/deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+    "sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
+    "size": 60987
+  },
+  "catalog_slice_manifest": {
+    "path": "/home/jon/.local/share/breezy/derived/maker_stage0/s2v-20261016T020707Z/catalog_slice_manifest.json",
+    "sha256": "149098d8437577ec76db0031838b6d7e65761b56f9b9a8f8927ec6a7634baf00",
+    "size": 2313422
+  },
+  "census": {
+    "path": "/home/jon/.local/share/breezy/derived/maker/s1/censused_days.jsonl",
+    "sha256": "bce597f2bedcf345bceadfcc50030aeac89d64e2754b319378a57d9b4ea91a71",
+    "size": 87357
+  },
+  "clean_tree": {
+    "clean": true,
+    "pathspecs": [
+      "scripts/analysis",
+      "src",
+      "tests",
+      "pyproject.toml",
+      "uv.lock"
+    ]
+  },
+  "deploy_manifest": {
+    "path": "/home/jon/breezy/deploy/families/pm_us_crh_fq_v1.json",
+    "sha256": "324c01f8e66d9b349d1b833c2e2dbb6037d560f45a379b7f2554e31251df18e0",
+    "size": 845
+  },
+  "episodes_jsonl": {
+    "path": "/home/jon/.local/share/breezy/derived/maker_stage0/s2v-20261016T020707Z/episodes.jsonl",
+    "sha256": "c4e9cb484d9b9126fe04226c45dc33bebf00d9b69f73d7fd63776075e8274658",
+    "size": 2715567
+  },
+  "evidence_doc": {
+    "path": "/home/jon/breezy/docs/evidence/NBP_S2_VALIDATE_RESULT_2026-09-30.md",
+    "sha256": "b2827ff172f67c12a76419cb46ebc4382c44530de9edbe2fae83cd9a2726dc0d",
+    "size": 21901
+  },
+  "git_commit": "2380042fb66fe2ca4264ce0cc83e21e6e9b3e40c",
+  "installed_package_set_sha256": "30126a7b40d029d60b7a242fecc69601981ac23adfa362668aa5946d051e3998",
+  "ledger_path": "/home/jon/.local/share/breezy/derived/maker_stage0/verdict_ledger.jsonl",
+  "model": {
+    "artefact_sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
+    "evidence_doc_sha256": "b2827ff172f67c12a76419cb46ebc4382c44530de9edbe2fae83cd9a2726dc0d",
+    "family_id": "pm_us_crh_fq_v1",
+    "fit_window_end": "2026-06-30",
+    "manifest_sha256": "324c01f8e66d9b349d1b833c2e2dbb6037d560f45a379b7f2554e31251df18e0"
+  },
+  "nbp_consumed": {
+    "cycles": [
+      [
+        "1790686800000000000",
+        "7bd3c9fb011024589b177faa94b03e5bd27aef343d2fb1fc6aa4e2160d3282b0"
+      ],
+      [
+        "1790708400000000000",
+        "c347bd1d6bc3a22362851d1539744e75cae568959d9886098704a76f44aaf21d"
+      ],
+      [
+        "1790730000000000000",
+        "9e32b6629aba910ba997fb5f3c35952f5da918e2ac0a39aaec141c7f64fa9eea"
+      ],
+      [
+        "1790859600000000000",
+        "98acbc03efa6be477b8c1ae2327029232ec290a6a0d78c3444975e9d0718b5e8"
+      ],
+      [
+        "1790881200000000000",
+        "787e7b9dc5869caf8ea5cbe7506893d9d76596333462352ad46dbe68befa0689"
+      ],
+      [
+        "1790902800000000000",
+        "6adfcf649381d832665cc9ed7e47f05b00de3a7065da4ff8b975bb16b023d1aa"
+      ],
+      [
+        "1790946000000000000",
+        "3e0351da012b7472263bd563676caa54cc88c4083699de6d1bfa8b63e51c4af9"
+      ],
+      [
+        "1790967600000000000",
+        "aea5f1cd9992f3e6d864ad8999e1a07f58cc60594e77af5c4b8463fd8c82e654"
+      ],
+      [
+        "1790989200000000000",
+        "282ac92a7809b8978e8386a8ce234cc24d5583880e1a34efe07f13865e268585"
+      ],
+      [
+        "1791032400000000000",
+        "96c8de619a1ab62496050ef489d54b80322d9f1086605faef375edee072156bf"
+      ],
+      [
+        "1791054000000000000",
+        "bd0afde95ab82f57f70099e1274d05ebf34e923ca376b10f0bf2086a3a8d8afe"
+      ],
+      [
+        "1791075600000000000",
+        "0121470ae130ced99e37407dfb1df5c446b9bce2a6a5a60d7fe4ab88bcb15e94"
+      ],
+      [
+        "1791118800000000000",
+        "6dbcd6035842008201b4ff1712a5eec938aba5043b19cb10c970f219b48fbd11"
+      ],
+      [
+        "1791140400000000000",
+        "a5edc501ba0150e921400bfcae875e1f64cdf520939f5f32b4175ed61b64824f"
+      ],
+      [
+        "1791162000000000000",
+        "cf30391be4042f298e9ef2927900228e382467d0fad3932d92ebf8917242fa74"
+      ],
+      [
+        "1791205200000000000",
+        "91ef055e36f02cce8ac1bca490c0ddca894333315c415beadd8c87cc8ee65faa"
+      ],
+      [
+        "1791226800000000000",
+        "3f5cedc0deb3e779d96c78e7912685db5bddfaf77b2cd5c65ce22aaf51e0dc86"
+      ],
+      [
+        "1791248400000000000",
+        "65438d7cb216e866a563a2f951288f0500f629186ddb097302e32f26d35b20d1"
+      ],
+      [
+        "1791291600000000000",
+        "d9bf54c7e9990db99168bba48d00505361d25977fd3397629ce448a86d89275e"
+      ],
+      [
+        "1791313200000000000",
+        "3454c5cfe59fe5f2a2659dc81e5f5d9cfeae8201ccbc2e7904760ed6f37337bc"
+      ],
+      [
+        "1791334800000000000",
+        "62a2799d61656edd7c65df1bf3e1cde1f122caf505f525585da9e54ccfe6f38b"
+      ],
+      [
+        "1791378000000000000",
+        "d37b2712f9ee960a32be90e72c72eed9180920a1af8cc894d1c8cd6b7b472cfa"
+      ],
+      [
+        "1791399600000000000",
+        "b1a0ad4388dca4441245524faf7a28a2542de97426a6e261d9a6a9453ff04d6b"
+      ],
+      [
+        "1791421200000000000",
+        "0887749fbfd1c0f892abb886aceec1c400a5efcf5035b9ce759307c550b247e1"
+      ],
+      [
+        "1791464400000000000",
+        "eab87b532dd6bea5be8b313d90add5e2746062922cfc4e3d89490ef4741ed5ff"
+      ],
+      [
+        "1791486000000000000",
+        "3b9b94dfca67e7f7bcee9e030632be9555cb7d2c77dadf908b56fe3ba58c58ef"
+      ],
+      [
+        "1791507600000000000",
+        "4e36c79d7d4087d7f3d9a735f329f8639e839e985e0a06ccb7c1ceecb064f4a0"
+      ],
+      [
+        "1791550800000000000",
+        "2519028125fe593de971597800dce0da19a9e7ce9650c642daa89cd9a3344f6b"
+      ],
+      [
+        "1791572400000000000",
+        "dd97523d296c28c80a1af6e2ae9ba112df118c56b9013a35c078d6af9e6a7d99"
+      ],
+      [
+        "1791594000000000000",
+        "5cda7ca27874fefb655416d5082bb9633a26034eabd0d2750b738066335d4c04"
+      ],
+      [
+        "1791637200000000000",
+        "8d75ff9d1641706d28a3b05be2d618d01a343acd5f4ef1686f0d185f6da3714c"
+      ],
+      [
+        "1791658800000000000",
+        "1c60b39edc40e5e84eb68c4efbdc301a647befbbdb02d86515bd30373ece8de3"
+      ],
+      [
+        "1791680400000000000",
+        "8c2b5f66aeff1663a0f114f5a39e7adb3549081bea9a796ce08dca86f46e602f"
+      ],
+      [
+        "1791723600000000000",
+        "fb468870c79104375faf906d30162295848969ea632c4ddf743b0bbba68b6edc"
+      ],
+      [
+        "1791745200000000000",
+        "100af8944ff56eb3e34394c28cfa09f6f66f885c502a4485af145cdfc43f4089"
+      ],
+      [
+        "1791766800000000000",
+        "d12fa312a805e033deb768144d254fb0ed51312a499f635972e259be4ed0e841"
+      ]
+    ],
+    "sha256": "3aff5316909c6c085ce301c0e62cc4a51e14eb69f22039207127c6a3557c58fd"
+  },
+  "nbp_manifest": {
+    "path": "/home/jon/.local/share/breezy/derived/nbp/_manifest.json",
+    "sha256": "9b6f304e9883eddd7b6928f4a75ee9dd05f3c5000a2babaf3e347fbc70379de8",
+    "size": 2482046
+  },
+  "node_logs": [
+    {
+      "byte_range": [
+        0,
+        137
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T172121Z.log",
+      "sha256": "f52bc67aa556ef72ade8ce1b8ea2d81fbf635ffd4d30411507028cb5dd50509c",
+      "size": 137
+    },
+    {
+      "byte_range": [
+        0,
+        50356
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T172324Z.log",
+      "sha256": "19f7fe61abe7ce20bb015d4e77640e42d2c217b3199b50a33b7a82c20dc64ba8",
+      "size": 50356
+    },
+    {
+      "byte_range": [
+        0,
+        25767
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T173617Z.log",
+      "sha256": "389e3689063b87f306206219302d42eeb2b3765f732c235c1488dcdd0027f01a",
+      "size": 25767
+    },
+    {
+      "byte_range": [
+        0,
+        54946
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T175007Z.log",
+      "sha256": "89aaf1785889b17f004e9bdd5aced87c051fdf1800351edf359af3b436e1075a",
+      "size": 54946
+    },
+    {
+      "byte_range": [
+        0,
+        54411
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T175214Z.log",
+      "sha256": "135681b5e20e283f87e1e5ee4b55c101dfd8948bce66a9358f8704b753c6c773",
+      "size": 54411
+    },
+    {
+      "byte_range": [
+        0,
+        434386
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T175426Z.log",
+      "sha256": "9a85fd5c01ff343620c675aa91e6556229aa296c4cfb102972c44aadbaa3e496",
+      "size": 434386
+    },
+    {
+      "byte_range": [
+        0,
+        481404
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260904T220652Z.log",
+      "sha256": "aab7aedbe0df9f500491f2b4cfad7fe1706aa555b9d0c069a431f04725234881",
+      "size": 481404
+    },
+    {
+      "byte_range": [
+        0,
+        172832
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T165018Z.log",
+      "sha256": "e10d02fe5c91998828dc8554902cb2fcdd5270d56f0337ae25da762bc8235404",
+      "size": 172832
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T174623Z.log",
+      "sha256": "3dcf41873f07dd8e669d6df9138f8346a1ad18bf54b0409e0e2756b6d6b7b4b8",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T174725Z.log",
+      "sha256": "dd8d652c21a886a880e7917c06f504055c35a32397d2ff2d522af7cb6c0921b7",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T175106Z.log",
+      "sha256": "b86b5bf77a396a4a233525e2f181f8da8d4947b9001d51620149e18b2536b1b7",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25499
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T175441Z.log",
+      "sha256": "bd87ffcb2daf8dca0d1253eb5ae9a7e25fd2c9c9af19cef56cecdef41c0bfabe",
+      "size": 25499
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T175816Z.log",
+      "sha256": "ba7a52a9891aee1917ee4e6f39a42cc0972b1fb2d88eee67b14e0b8bd335940d",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T180151Z.log",
+      "sha256": "02ffbb99a62210f6bdeeb645e5631eae6f83127bce8e41b5984ee3f893741da7",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T180526Z.log",
+      "sha256": "e62cb045f9d35a76539edc46abd7f0aa411c6b974c194e951eaa69c973208d2a",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        26764
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T180901Z.log",
+      "sha256": "686f2437274fb79dd217ae5e69824fbe0bcdbfbedbb12ede3efbe6c7341bdf0e",
+      "size": 26764
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T181237Z.log",
+      "sha256": "179215788afc7db1cc5333d17654e906302744228a0c5380adfba031332aa83a",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T181612Z.log",
+      "sha256": "cb092bd77e9c76b77c8437334394b95e2eb59f466bfd9a7e375dd97b57e7373d",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25678
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T182700Z.log",
+      "sha256": "f4480aeca9971e7542702cf09354b9ba653e4993a53780a0276d7bc3f14a9557",
+      "size": 25678
+    },
+    {
+      "byte_range": [
+        0,
+        29295
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T183730Z.log",
+      "sha256": "be65f3a1bc008777be432fde3df701a65360de8b22db870381dda23c439291af",
+      "size": 29295
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T184800Z.log",
+      "sha256": "84af2270e7ebe6d7bc61fd03299f44b204e3e9ae292189c85ecc85729433f31c",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        25501
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T185830Z.log",
+      "sha256": "9ae998b961d0eb8f9a2f8211dfc00ef6f57de59b2068a3f215269931e017c3d7",
+      "size": 25501
+    },
+    {
+      "byte_range": [
+        0,
+        26950
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T190900Z.log",
+      "sha256": "a22b112cf8ae0a1a0d14fe07ebf5b7aa36a37802784ca7c6ba775b14b12c3516",
+      "size": 26950
+    },
+    {
+      "byte_range": [
+        0,
+        27498
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T191930Z.log",
+      "sha256": "d112d9f9464173548023e512b9608144eccf2b345e02b9c15556e82499a29d32",
+      "size": 27498
+    },
+    {
+      "byte_range": [
+        0,
+        31983
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T193000Z.log",
+      "sha256": "a41ce1754b44e579312aa9baa49140752a52222c69b30f80326c6fcad9315a8a",
+      "size": 31983
+    },
+    {
+      "byte_range": [
+        0,
+        25500
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T194030Z.log",
+      "sha256": "2c0bcbfe1aa18e7ef89af52bb1fbbe5dc1aa18883a5c3c1770b10add56b84d73",
+      "size": 25500
+    },
+    {
+      "byte_range": [
+        0,
+        766261
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260905T195100Z.log",
+      "sha256": "b07bef6a75e9d0e3aa44cb7ff87f00e17e0a32ffe904a90d1c011d9d8ddf98cf",
+      "size": 766261
+    },
+    {
+      "byte_range": [
+        0,
+        2470966
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260906T165009Z.log",
+      "sha256": "574a23784b5334ec36e8a1f17962af1a541232e9569d1184a2fa7d7db9a0b925",
+      "size": 2470966
+    },
+    {
+      "byte_range": [
+        0,
+        297
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260907T165045Z.log",
+      "sha256": "2b3a20c02925aa62398e8c6c77e9a211df685b8bafb0067936e9243bd17eaf08",
+      "size": 297
+    },
+    {
+      "byte_range": [
+        0,
+        2096385
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260910T165057Z.log",
+      "sha256": "14e3b9330490c6e0f4cfbb9d9c9f146b075e9a2b5996aa62e79f25aa4e5809d9",
+      "size": 2096385
+    },
+    {
+      "byte_range": [
+        0,
+        2409191
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260911T165022Z.log",
+      "sha256": "fc8ee7c9b31bce1d3e5adde65bc27c0f1b861f8bc6945ad12f42528bb00b12ce",
+      "size": 2409191
+    },
+    {
+      "byte_range": [
+        0,
+        93409
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260912T020400Z.log",
+      "sha256": "b71118da4c4a1c19b1bde6ca6b3b28994a823b53341c33b028a12a3e7a5ecc3d",
+      "size": 93409
+    },
+    {
+      "byte_range": [
+        0,
+        83419
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260912T022344Z.log",
+      "sha256": "aaef27c798b74977f5181b03151cc82f02ed70fd6e49671e29b8f9f1ce23646c",
+      "size": 83419
+    },
+    {
+      "byte_range": [
+        0,
+        1660718
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260912T022609Z.log",
+      "sha256": "fdf9552e07106b02e827a7a445c479d1cb84f22e05ef206e65d1a7fa28b3097d",
+      "size": 1660718
+    },
+    {
+      "byte_range": [
+        0,
+        2112169
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260912T165030Z.log",
+      "sha256": "34db53795f7e83b26b1062fcd4e0f324f5057e4b38dfaa02e79116d0fdb29ef3",
+      "size": 2112169
+    },
+    {
+      "byte_range": [
+        0,
+        2622661
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260913T165011Z.log",
+      "sha256": "a042ce804944962bc9451b8aae629f6f53289d1f99f2c08c5397de00f51642a1",
+      "size": 2622661
+    },
+    {
+      "byte_range": [
+        0,
+        452040
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260914T165021Z.log",
+      "sha256": "27dc54ff2b13ae7e160dc9fd4eefdbd59f887037167c462e21835463937bb6ae",
+      "size": 452040
+    },
+    {
+      "byte_range": [
+        0,
+        2706603
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260915T165059Z.log",
+      "sha256": "46176ef1ca54a9a2a6ca3f3c6b401165da348e06603adbfff62f8de40d5e3a42",
+      "size": 2706603
+    },
+    {
+      "byte_range": [
+        0,
+        2853342
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260916T165024Z.log",
+      "sha256": "ed7dc8533f0f367ffb8f041a1f9101d7dd273921e8b0ce282bedd55e4f416838",
+      "size": 2853342
+    },
+    {
+      "byte_range": [
+        0,
+        1076816
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260917T165020Z.log",
+      "sha256": "a3e0b8338abe7dfcb9d533998fdcd7c55f6f9139e22c3c671fbcffafab54ecda",
+      "size": 1076816
+    },
+    {
+      "byte_range": [
+        0,
+        26541
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260918T165005Z.log",
+      "sha256": "2dc544676287e9bdab1a6e765a283f6df390885f17d2e99bce5a435ce72ca28c",
+      "size": 26541
+    },
+    {
+      "byte_range": [
+        0,
+        42650
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260918T165120Z.log",
+      "sha256": "5db6a61f323c922428b35384fe23f98d4ab60f902b90509a650d7e7d7c551dc1",
+      "size": 42650
+    },
+    {
+      "byte_range": [
+        0,
+        2149021
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260919T165018Z.log",
+      "sha256": "ff66aab5fdca03a235d0562275970d663040c0a8b5bff744f5029678c7c85f02",
+      "size": 2149021
+    },
+    {
+      "byte_range": [
+        0,
+        2421522
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260920T165028Z.log",
+      "sha256": "93f359b567ed64aa9a1a00a32aaa4a37b2904712f2fd4d16f966a391e32e2054",
+      "size": 2421522
+    },
+    {
+      "byte_range": [
+        0,
+        2997444
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260921T165055Z.log",
+      "sha256": "e0490fb1cef2a40d21e67e7d8e63b1dad73c0d97a2fc3aad9fc3fcfcb2d09f16",
+      "size": 2997444
+    },
+    {
+      "byte_range": [
+        0,
+        3334751
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260922T165020Z.log",
+      "sha256": "5f3249c94608b3a04d7ed01415fb036cabe51e58d02ca2b2a4d70ee43821e278",
+      "size": 3334751
+    },
+    {
+      "byte_range": [
+        0,
+        3679389
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260923T165046Z.log",
+      "sha256": "7b478feb3e08cc05d6561c4be221587fc41bc702b029f1ddf34f457d2619fe39",
+      "size": 3679389
+    },
+    {
+      "byte_range": [
+        0,
+        297
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260924T183812Z.log",
+      "sha256": "fdbc8fb51fb3607368c7c418d7bf874c213375be057dd43333124d95b1af3509",
+      "size": 297
+    },
+    {
+      "byte_range": [
+        0,
+        107534
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260924T185902Z.log",
+      "sha256": "1aa57c70fd879fe7e4236bb0186eb4a7f5f09c1f98b3f8fca7f6a8def21b1a14",
+      "size": 107534
+    },
+    {
+      "byte_range": [
+        0,
+        1245103
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260924T201520Z.log",
+      "sha256": "601b861fe4a0390d4944b046848365369b2314c65d493acaa09c51a34fdbd556",
+      "size": 1245103
+    },
+    {
+      "byte_range": [
+        0,
+        607
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260925T165034Z.log",
+      "sha256": "60446c5f6692897d1d166787f6406e3c11044fb5e9ca415ec06cefb27734cac5",
+      "size": 607
+    },
+    {
+      "byte_range": [
+        0,
+        5767850
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260926T165018Z.log",
+      "sha256": "522a345ef9ec5ff629a1128ea529536cc6ef426ea1f004d3fa657e343b5d8c47",
+      "size": 5767850
+    },
+    {
+      "byte_range": [
+        0,
+        3839990
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260927T165036Z.log",
+      "sha256": "8fcb004cc2ff1ca64ff2abd385fdd5be9a47a5123ba850921a8cd7509e7fa9d2",
+      "size": 3839990
+    },
+    {
+      "byte_range": [
+        0,
+        5486388
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260928T165022Z.log",
+      "sha256": "5c18960b22ccfa25ebe6b0c838365bd6d043e05b5cb4920e0ddb50df580be813",
+      "size": 5486388
+    },
+    {
+      "byte_range": [
+        0,
+        9367538
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260929T165048Z.log",
+      "sha256": "8f8dfd1e6f15e1004ba0d7b276e15e004825711c06c3460abf5bc28440603534",
+      "size": 9367538
+    },
+    {
+      "byte_range": [
+        0,
+        6165165
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20260930T165014Z.log",
+      "sha256": "580c5b0ac53d11a798fa89f17925f92f713dfd2b96fcdc595603f45ebead2267",
+      "size": 6165165
+    },
+    {
+      "byte_range": [
+        0,
+        309344
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261001T151202Z.log",
+      "sha256": "520e7014462773332b97b6f2387b20c9e246fbc879cd833552d99042a15a7dc2",
+      "size": 309344
+    },
+    {
+      "byte_range": [
+        0,
+        12736027
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261001T160158Z.log",
+      "sha256": "1df750b4238d8331cff2162d2152c09b823a1bb648787d0135c40bc75c73b86a",
+      "size": 12736027
+    },
+    {
+      "byte_range": [
+        0,
+        1163576811
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261001T165011Z.log",
+      "sha256": "6f76affc9cb8cf3c4e7face63a160c5ea66f72c2cce82315f5591263d0fa1165",
+      "size": 1163576811
+    },
+    {
+      "byte_range": [
+        0,
+        80698336
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261002T165039Z.log",
+      "sha256": "6b0e1e2dc6af1563adc73a780a9c144aaf09b5d3ee881a33d04ae72498f14cd9",
+      "size": 80698336
+    },
+    {
+      "byte_range": [
+        0,
+        24659706
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261002T200526Z.log",
+      "sha256": "d0f6501e9c16d49bbc63eb1c20d14e51a52b17cb2f67654091ed04d6efcbcdb8",
+      "size": 24659706
+    },
+    {
+      "byte_range": [
+        0,
+        898756879
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261002T205521Z.log",
+      "sha256": "babc0cbea942fe414de7eace682e4affbb5cf4dc37ab5ac1fceccba1910c3781",
+      "size": 898756879
+    },
+    {
+      "byte_range": [
+        0,
+        1426510025
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261003T165045Z.log",
+      "sha256": "2a227f84c15d44ba38612bdededefc7a5cc92b1a965628c0f50222652a4e8914",
+      "size": 1426510025
+    },
+    {
+      "byte_range": [
+        0,
+        829070867
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261004T165012Z.log",
+      "sha256": "ee4a17f0c4b50cd4125f5cda1a476f5c8da2744e4cdc7ade21837efad73a6bc0",
+      "size": 829070867
+    },
+    {
+      "byte_range": [
+        0,
+        1016029347
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261005T165040Z.log",
+      "sha256": "18ca5c2a617ec42b2e0ffb5d0e69d175b9e97dc5b96ceac206eaa749d94138eb",
+      "size": 1016029347
+    },
+    {
+      "byte_range": [
+        0,
+        1004813160
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261006T165024Z.log",
+      "sha256": "77560213bf2ff01d912e2fae4b7e2f956d9259b46479c09dd62aded4ea60ee83",
+      "size": 1004813160
+    },
+    {
+      "byte_range": [
+        0,
+        736428756
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261007T165024Z.log",
+      "sha256": "c89b1a4b55c47ca7214d76c9805db1798645769af3cca580c3ad17180ee596fd",
+      "size": 736428756
+    },
+    {
+      "byte_range": [
+        0,
+        846970726
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261008T165023Z.log",
+      "sha256": "5e88851264c50cb890e853c457fd39472df5e298890d728390087bfc3717a5be",
+      "size": 846970726
+    },
+    {
+      "byte_range": [
+        0,
+        688001553
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261009T165033Z.log",
+      "sha256": "01283860c408bc3cd851d38e37c3d1c9a2c054df6a8a87ddc7bc98f2bf1564a3",
+      "size": 688001553
+    },
+    {
+      "byte_range": [
+        0,
+        852157635
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261010T165011Z.log",
+      "sha256": "84616d16a4b427df0e52a8c429f390962a3c85370b63bad671a9f716c870f6e3",
+      "size": 852157635
+    },
+    {
+      "byte_range": [
+        0,
+        673743523
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261011T165028Z.log",
+      "sha256": "b14d1c9600c24470f10d0ff63a9e970ba3cfb160005420fe779c3883267fadea",
+      "size": 673743523
+    },
+    {
+      "byte_range": [
+        0,
+        774100911
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261012T165028Z.log",
+      "sha256": "4fd4a72a89bd0e23c19c4512b684aac6daed4455e865d5f12de8f51a1ce0e36f",
+      "size": 774100911
+    },
+    {
+      "byte_range": [
+        0,
+        580009108
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261013T165027Z.log",
+      "sha256": "10001b8d2375035dfe0de6151dd1422172a8caccad499a4a75ec2b223a268f8c",
+      "size": 580009108
+    },
+    {
+      "byte_range": [
+        0,
+        637421917
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261014T165027Z.log",
+      "sha256": "3acb8b7560d45a3242f8b0c830cf7fea684ce237d28a8a15b5e6841d15b94338",
+      "size": 637421917
+    },
+    {
+      "byte_range": [
+        0,
+        257408697
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-20261015T165026Z.log",
+      "sha256": "c06ff92e93324963da34c00e30a36adb79e84b5cc55a7c3ed9d80cb65b3f817e",
+      "size": 257408697
+    },
+    {
+      "byte_range": [
+        0,
+        0
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-supervisor-20260905T002531Z.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "byte_range": [
+        0,
+        619
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-supervisor-stdout-20260905T004018Z.log",
+      "sha256": "77362e7ba4ec8b6bc84f68355f4121f32dfb618c6aaa118b6158d1e7f27cb33c",
+      "size": 619
+    },
+    {
+      "byte_range": [
+        0,
+        715
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-supervisor.launch-2026-09-07.log",
+      "sha256": "830c75cd8a4eb965104121c6b7d1219b7b3f0c3f5d247a0348857fdb764292e3",
+      "size": 715
+    },
+    {
+      "byte_range": [
+        0,
+        55502
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/breezy-trade-supervisor.log",
+      "sha256": "7781246a213bc681962d10d77e0d7babcca6cd951d0e9693587a620e4ba8d2e2",
+      "size": 55502
+    },
+    {
+      "byte_range": [
+        0,
+        432320
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/quote_tape_20260901.log",
+      "sha256": "d6724f199e4d02068688bddf7f13e2b4b9d95e57fa01a200da2cc8af136d8f62",
+      "size": 432320
+    },
+    {
+      "byte_range": [
+        0,
+        1161037
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/quote_tape_20260901_b.log",
+      "sha256": "e466031d0ca34491d5ae5b2b89325a4bf57ba133b47d43792c0bad1df338e5d5",
+      "size": 1161037
+    },
+    {
+      "byte_range": [
+        0,
+        256462
+      ],
+      "path": "/home/jon/.local/share/breezy/logs/quote_tape_20260901_c.log",
+      "sha256": "15293280729b6012d279da1bab9591bfce82e9424dcb7e90c24ce5a0c29a0cf8",
+      "size": 256462
+    }
+  ],
+  "process_schedule": {
+    "path": "/home/jon/.local/share/breezy/derived/maker_stage0/s2v-20261016T020707Z/process_schedule.json",
+    "sha256": "d4bff99a561fe097a95892eba6ba714130b24429ee178285c34227baff63867a",
+    "size": 10508
+  },
+  "sidecars": {
+    "delta0_station_days.csv": {
+      "run_time_only": true,
+      "sha256": "6457b8a4f87edd2443023b4136eb8801e85881ecdcbc2a90ce9d5b9117b001a3"
+    },
+    "overlay_station_days.csv": {
+      "run_time_only": true,
+      "sha256": "18316a2b30de168ea366b9977ca536448483f949d451099fb4d53378f004e238"
+    },
+    "process_schedule_overlay.json": {
+      "run_time_only": true,
+      "sha256": "d4e46ccc207900a03eee8ac1833831f0e25d1e3e0a1dede6c611babef090d1a6"
+    },
+    "progress.jsonl": {
+      "run_time_only": true,
+      "sha256": "f0b7481e413553a8c8ba766230eabaf2f7f42581f497cadf7683a154c39192a0"
+    },
+    "stress_plus60_station_days.csv": {
+      "run_time_only": true,
+      "sha256": "18316a2b30de168ea366b9977ca536448483f949d451099fb4d53378f004e238"
+    },
+    "stress_poll_lag_station_days.csv": {
+      "run_time_only": true,
+      "sha256": "421cae2754bb7241460fc51ba54a8948bef205e49af352c35f8536c232317af4"
+    },
+    "wp0_agreement.json": {
+      "run_time_only": true,
+      "sha256": "845de87f9510affc29a5ee395ade080f374ead827213f5c1cd15f20087878b5b"
+    }
+  },
+  "spec": {
+    "path": "/home/jon/breezy/docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md",
+    "sha256": "7d154314165fbae8349272ed54160fd20a636405beb65d09efa1108d9e250136",
+    "size": 26607
+  },
+  "tail_csv_source": null,
+  "theta_pin_site": "src/breezy/adapters/polymarket_us/fees.py::taker_fee_coefficient_as_of (post-drift schedule)",
+  "trade_unit": {
+    "path": "/home/jon/.local/share/breezy/derived/maker/s1/trade_quantity_unit.json",
+    "sha256": "6459e9f6384af85af69efca1f70f7a8e8155e343fc18551d85c94d1d9afd4835",
+    "size": 20817
+  },
+  "truth_cross_check": {
+    "path": "/home/jon/.local/share/breezy/derived/settlement-truth/settlement_truth.parquet",
+    "sha256": "e425d478cdd83d39fa9d7b4b1218be0a9f5b22331ac956ccae23bbcb68165e47",
+    "size": 1117335
+  },
+  "truth_csv": {
+    "path": "/home/jon/.local/share/breezy/derived/maker_stage0/s2v-20261016T020707Z/truth_cli_finals.csv",
+    "sha256": "947b244a87b192bce8f6f7b772f3447a85398e3a67abbb06c8b41a97202100f8",
+    "size": 279225
+  },
+  "truth_csv_sha256_frozen_block": "947b244a87b192bce8f6f7b772f3447a85398e3a67abbb06c8b41a97202100f8",
+  "uv_lock": {
+    "path": "/home/jon/breezy/uv.lock",
+    "sha256": "8f16bb3c4d4e76b9c6aca554d1e3d10ad17b3cc6ace75fe920fa946e2416af3e",
+    "size": 501366
+  }
+}
