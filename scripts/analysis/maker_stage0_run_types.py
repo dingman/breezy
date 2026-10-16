@@ -131,3 +131,5 @@ class Pre:
     code_sha: str
     free_start: int
     started: float = field(default_factory=time.monotonic)
+    # v2 only (C6/NB1): "STATION:DAY" COVERED-but-not-counted-at-trigger days, disclosed not refused
+    v2_disclosed: tuple[str, ...] = ()

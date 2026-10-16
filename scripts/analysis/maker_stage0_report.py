@@ -20,7 +20,11 @@ from breezy.analysis.maker_tape_census import CensusedDay
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.ladder_ev.quantile_density import Rung
 from scripts.analysis import maker_stage0_verdict as vd
-from scripts.analysis.maker_stage0_frozen import FrozenDateSet, verify_set_matches_rule
+from scripts.analysis.maker_stage0_frozen import (
+    FrozenDateSet,
+    truth_keys,
+    verify_set_matches_rule,
+)
 from scripts.analysis.maker_stage0_inputs import TruthTable, load_truth, write_text_atomic
 from scripts.analysis.maker_stage0_modes import write_manifest
 from scripts.analysis.maker_stage0_pno import AbstainReason, classify_p_no, release_instants
@@ -115,7 +119,10 @@ def score(
     run_dir: Path,
 ) -> Scored:
     """Load FINAL truth for the replayed station-days; called once, post-simulation."""
-    keys = {(r.station, dt.date.fromisoformat(r.climate_day)) for r in sd_rows}
+    if frozen.block == 2:  # v2: the exact key set the pre-claim agreement already proved
+        keys = truth_keys(frozen.stations, frozen.dates)
+    else:
+        keys = {(r.station, dt.date.fromisoformat(r.climate_day)) for r in sd_rows}
     truth = load_truth(
         truth_csv, cross_check, run_dir, keys=keys, expected_csv_sha256=frozen.truth_csv_sha256
     )

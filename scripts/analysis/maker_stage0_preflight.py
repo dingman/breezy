@@ -161,8 +161,9 @@ def preflight(cfg: RunConfig, mode: str) -> Pre:
         raise DiskLow(f"E4: {free} bytes free < {cfg.min_free_bytes}")
     if sha256_file(cfg.need("truth")) != fs.truth_csv_sha256:
         raise InputRefused("truth CSV sha256 differs from the frozen block's pinned sha")
+    disclosed: tuple[str, ...] = ()
     if needs_v2_checks(fs, mode):
-        check_v2_before_claim(
+        found = check_v2_before_claim(
             fs,
             repo_root=cfg.repo_root,
             truth_csv=cfg.need("truth"),
@@ -170,9 +171,12 @@ def preflight(cfg: RunConfig, mode: str) -> Pre:
             census_days=cfg.need("census_days"),
             census=census.values(),
         )
+        disclosed = tuple(f"{station}:{day.isoformat()}" for station, day in found)
     load_trade_unit(cfg.need("trade_unit"))
     model = load_model(cfg.repo_root)
     if mode != "bench":
         assert_clean_tree(cfg.repo_root)
     scans, paths = scan_logs(cfg.need("node_log_dir"))
-    return Pre(fs, census, scans, paths, model, git_commit(cfg.repo_root), free)
+    return Pre(
+        fs, census, scans, paths, model, git_commit(cfg.repo_root), free, v2_disclosed=disclosed
+    )
