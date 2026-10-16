@@ -63,9 +63,14 @@ FORBIDDEN_RESULT_GLOBS: Final[tuple[str, ...]] = (
 #: Hashed by name and size only: a voided run's fills are never read.
 UNOPENED_FILES: Final[tuple[str, ...]] = ("episodes.jsonl",)
 _RUN_ID_RE: Final[re.Pattern[str]] = re.compile(r"^voided_run_id:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
-_KEYS_BY_KIND: Final[Mapping[str, frozenset[str]]] = {
-    KIND_START: frozenset({"amendment_sha", "run_id", "code_sha", "ts", "kind", "addendum_sha"}),
-    KIND_VOID: frozenset({"run_id", "ts", "kind", "tree_sha256", "files"}),
+_START_KEYS: Final[frozenset[str]] = frozenset(
+    {"amendment_sha", "run_id", "code_sha", "ts", "kind", "addendum_sha"}
+)
+#: Per kind, the exact accepted key sets. A start entry is the legacy six keys, or those six plus
+#: ``block_first_day`` (never null: a claim without a block omits the key). All else is refused.
+_KEYS_BY_KIND: Final[Mapping[str, frozenset[frozenset[str]]]] = {
+    KIND_START: frozenset({_START_KEYS, _START_KEYS | {"block_first_day"}}),
+    KIND_VOID: frozenset({frozenset({"run_id", "ts", "kind", "tree_sha256", "files"})}),
 }
 
 Entry = Mapping[str, object]
@@ -135,6 +140,13 @@ def _stamp(now: dt.datetime) -> str:
     return now.astimezone(dt.UTC).isoformat()
 
 
+def _check_block_first_day(value: object) -> None:
+    """A recorded block day is an ISO date string; null or anything else is refused."""
+    if not isinstance(value, str):
+        raise TypeError("block_first_day")
+    dt.date.fromisoformat(value)
+
+
 def _read_entries(ledger: Path) -> list[Entry]:
     if not ledger.exists():
         return []
@@ -146,10 +158,12 @@ def _read_entries(ledger: Path) -> list[Entry]:
             entry = json.loads(line)
             kind = entry.get("kind") if isinstance(entry, dict) else None
             expected = _KEYS_BY_KIND.get(kind) if isinstance(kind, str) else None
-            if expected is None or set(entry) != expected:
+            if expected is None or frozenset(entry) not in expected:
                 raise ValueError("entry keys")
+            if "block_first_day" in entry:
+                _check_block_first_day(entry["block_first_day"])
             entries.append(entry)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         raise LedgerRefused(
             f"ledger {ledger} is unreadable ({type(exc).__name__}): refusing"
         ) from exc
@@ -197,10 +211,23 @@ def _addendum_refusal(
     return _void_refusal(entries, void_dir, addendum.run_id)
 
 
+def _is_mine(entry: Entry, amendment_sha: str, block_first_day: str | None) -> bool:
+    """A start entry for this amendment, or for this block (``None`` never matches ``None``)."""
+    if entry["kind"] != KIND_START:
+        return False
+    if entry["amendment_sha"] == amendment_sha:
+        return True
+    return block_first_day is not None and entry.get("block_first_day") == block_first_day
+
+
 def _refusal(
-    entries: list[Entry], amendment_sha: str, runs_root: Path, addendum: Addendum | None
+    entries: list[Entry],
+    amendment_sha: str,
+    runs_root: Path,
+    addendum: Addendum | None,
+    block_first_day: str | None = None,
 ) -> str | None:
-    mine = [e for e in entries if e["kind"] == KIND_START and e["amendment_sha"] == amendment_sha]
+    mine = [e for e in entries if _is_mine(e, amendment_sha, block_first_day)]
     if not mine:
         return None
     if addendum is None:
@@ -212,13 +239,17 @@ def _refusal(
 
 
 def ledger_refuses(
-    ledger: Path, amendment_sha: str, runs_root: Path, addendum: Addendum | None = None
+    ledger: Path,
+    amendment_sha: str,
+    runs_root: Path,
+    addendum: Addendum | None = None,
+    block_first_day: str | None = None,
 ) -> str | None:
     """Advisory, unlocked read: ``None`` when a run may start, else the refusal reason.
 
     The driver must start a run only through :func:`claim_verdict_run`.
     """
-    return _refusal(_read_entries(ledger), amendment_sha, runs_root, addendum)
+    return _refusal(_read_entries(ledger), amendment_sha, runs_root, addendum, block_first_day)
 
 
 def claim_verdict_run(
@@ -230,26 +261,32 @@ def claim_verdict_run(
     now: dt.datetime,
     runs_root: Path,
     addendum: Addendum | None = None,
+    block_first_day: str | None = None,
 ) -> str | None:
     """Check the policy and append the start entry under one lock; ``None`` = claimed.
+
+    ``block_first_day`` (ISO date) also guards the block: a second start for the same block is
+    refused across amendment shas unless a dated addendum names its voided latest run.
 
     A returned string is the refusal reason and nothing was written.
     """
     with _locked(ledger):
-        reason = _refusal(_read_entries(ledger), amendment_sha, runs_root, addendum)
+        reason = _refusal(
+            _read_entries(ledger), amendment_sha, runs_root, addendum, block_first_day
+        )
         if reason is not None:
             return reason
-        _append(
-            ledger,
-            {
-                "amendment_sha": amendment_sha,
-                "run_id": run_id,
-                "code_sha": code_sha,
-                "ts": _stamp(now),
-                "kind": KIND_START,
-                "addendum_sha": None if addendum is None else addendum.sha256,
-            },
-        )
+        entry: dict[str, object] = {
+            "amendment_sha": amendment_sha,
+            "run_id": run_id,
+            "code_sha": code_sha,
+            "ts": _stamp(now),
+            "kind": KIND_START,
+            "addendum_sha": None if addendum is None else addendum.sha256,
+        }
+        if block_first_day is not None:
+            entry["block_first_day"] = block_first_day
+        _append(ledger, entry)
     return None
 
 
