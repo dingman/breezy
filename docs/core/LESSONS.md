@@ -334,4 +334,10 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-10-16
 **Last updated:** 2026-10-16
 
+### L-61 — A unit-file change is a whole-tree change; a oneshot is bounded by TimeoutStartSec only (2026-10-16)
+**Mistake:** The MAKER-S2 trigger unit (`deploy/systemd/breezy-maker-s2-trigger.{service,timer}`) passed its focused gate, then the full gate failed seven whole-tree guards: `RuntimeMaxSec` never bounds a `Type=oneshot` service, so the launch-window, oneshot-rule and runtime-bound tests saw an unbounded 10:05Z run; the timer lacked its `TIMER_MAX_INTERVAL_S` row; adding that row changed the `aut6.health` code-identity closure; a new test tripped the mypy ratchet. One 90-minute gate was lost.
+**Prevention:** Bound every `Type=oneshot` unit with `TimeoutStartSec` (never `RuntimeMaxSec`); and for ANY unit, timer or `src/breezy/runtime` change, name in the implementer brief and run before merge: `test_truth_units`, `test_autonomy_units_health`, `test_launch_window_table`, `test_autonomy_owner_placeholders`, `test_monitor_watch`, `test_code_identity_pins*`, `test_mypy_ratchet`, `test_runtime_import_isolation` and `test_persistence_import_free` — a re-pin that follows is a reviewed one-line edit, never a skipped test.
+**Applied:** 2026-10-16
+**Last updated:** 2026-10-16
+
 Full pre-consolidation text (how-to-apply checks, amendments): docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md
