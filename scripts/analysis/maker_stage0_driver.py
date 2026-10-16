@@ -39,7 +39,7 @@ from __future__ import annotations
 import datetime as dt
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     LiveCalibration,
@@ -51,6 +51,7 @@ from scripts.analysis import maker_stage0_rule as rule
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession
 from scripts.analysis.maker_stage0_fill_events import assert_delta_within_bound
 from scripts.analysis.maker_stage0_finish import finish, run_verify_first
+from scripts.analysis.maker_stage0_first_replayable import check_first_replayable
 from scripts.analysis.maker_stage0_frozen import load_amendment
 from scripts.analysis.maker_stage0_inputs import InputRefused
 from scripts.analysis.maker_stage0_ledger import (
@@ -121,6 +122,7 @@ class Wp0:
     deltas: dict[Key, int]
     abstained: frozenset[Key]
     unknown_delta: int
+    first_replayable_observed: str | None = None
 
 
 def current_rss_bytes() -> int:
@@ -159,6 +161,8 @@ def _report_only(cfg: RunConfig, mode: str) -> RunSummary:
         frozen = load_amendment(cfg.amendment, cfg.amendment_sha)  # the licence for the read
         return run_verify_first(cfg, verify_first_s6, VERIFY_FIRST_DAY, len(frozen.dates))
     pre = _preflight(cfg, mode)
+    if mode == "tail-only" and pre.frozen.block == 2:
+        raise InputRefused("--tail-only is not licensed for a v2 block (Doc B section 1)")
     if mode == "bench":
         calibration = load_calibration(pre.model)
         return modes.run_bench(cfg, pre, calibration, current_rss_bytes, peak_rss_bytes)
@@ -182,6 +186,7 @@ def _run_verdict(cfg: RunConfig, pre: Pre, now: Callable[[], dt.datetime]) -> Ru
         now=now(),
         runs_root=cfg.out_dir.parent,
         addendum=addendum,
+        block_first_day=cfg.block_first_day,
     )
     if refusal is not None:
         raise LedgerRefused(refusal)
@@ -222,17 +227,16 @@ def _wp0(cfg: RunConfig, pre: Pre) -> Wp0:
     )
     write_json(cfg.out_dir / "wp0_agreement.json", probed.to_dict())
     probed.require_clean()
-    if probed.first_replayable_day != pre.frozen.first_replayable_day.isoformat():
-        raise InputRefused(
-            f"first print implies replayable day {probed.first_replayable_day}, the frozen "
-            f"block says {pre.frozen.first_replayable_day}"
-        )
+    refusal = check_first_replayable(probed, pre.frozen)
+    if refusal is not None:
+        raise InputRefused(refusal)
     assert_delta_within_bound(d.delta_ns for d in probed.delta_instance_days)  # S-7
     keyed = [(c, (c.station, dt.date.fromisoformat(c.climate_day))) for c in probed.coverage]
     return Wp0(
         deltas={key: c.delta_ns or 0 for c, key in keyed},
         abstained=frozenset(key for c, key in keyed if _listing_abstains(c, key[1])),
         unknown_delta=sum(c.delta_ns is None for c, _ in keyed),
+        first_replayable_observed=probed.first_replayable_day,
     )
 
 
@@ -244,13 +248,15 @@ def _execute(cfg: RunConfig, pre: Pre) -> RunSummary:
     try:
         wp0 = _wp0(cfg, pre)  # S-2 / S-7 abort here, before any episode file exists
         out.unknown_delta = wp0.unknown_delta
+        observed = wp0.first_replayable_observed
         phases += ["probe", "s7"]
         _simulate_all(cfg, pre, session, wp0, out)
         phases.append("simulate")
     finally:
         session.close()
         shutil.rmtree(cfg.work_root, ignore_errors=True)
-    return finish(cfg, pre, out, manifest, phases)
+    summary = finish(cfg, pre, out, manifest, phases)
+    return replace(summary, first_replayable_observed=observed)
 
 
 def _simulate_all(

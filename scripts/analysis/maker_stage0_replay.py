@@ -18,6 +18,7 @@ Exit codes: 0 done, 2 refused before any ledger claim, 3 the run was voided (``<
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from typing import Final
 from breezy.analysis.maker_tape_census import FirewallRefused
 from scripts.analysis import maker_stage0_driver as drv
 from scripts.analysis.maker_stage0_frozen import (
+    FrozenDateSet,
     FrozenSetRefused,
     parse_frozen_block,
     parse_frozen_block_v2,
@@ -173,18 +175,34 @@ def parse_args(argv: Sequence[str] | None = None) -> drv.RunConfig:
     )
 
 
-def _parsed_block(path: Path) -> int | None:
-    """The block number (1 or 2) of a readable amendment, else ``None`` (the driver owns that)."""
+def _parsed_frozen(path: Path) -> FrozenDateSet | None:
+    """The parsed frozen block of a readable amendment, else ``None`` (the driver owns that)."""
     try:
         text = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     for parse in (parse_frozen_block_v2, parse_frozen_block):
         try:
-            return parse(text).block
+            return parse(text)
         except FrozenSetRefused:
             continue
     return None
+
+
+def _parsed_block(path: Path) -> int | None:
+    """The block number (1 or 2) of a readable amendment, else ``None``."""
+    frozen = _parsed_frozen(path)
+    return None if frozen is None else frozen.block
+
+
+def _with_block_first_day(cfg: drv.RunConfig) -> drv.RunConfig:
+    """Verdict mode on a v2 block: carry its first day so the ledger guards the block (C5)."""
+    if cfg.bench is not None or cfg.tail_only or cfg.verify_first:
+        return cfg
+    frozen = _parsed_frozen(cfg.amendment)
+    if frozen is None or frozen.block != 2:
+        return cfg
+    return dataclasses.replace(cfg, block_first_day=frozen.first_replayable_day.isoformat())
 
 
 def _v1_sha_pin(cfg: drv.RunConfig) -> str | None:
@@ -213,7 +231,7 @@ def main(
         print(f"REFUSED: {refusal}", file=sys.stderr)
         return EXIT_REFUSED
     try:
-        summary = drv.run(cfg)
+        summary = drv.run(_with_block_first_day(cfg))
     except drv.RunVoided as exc:  # before REFUSALS: RunVoided is a RuntimeError
         print(f"VOID: {exc} (run renamed <run_id>.void)", file=sys.stderr)
         return EXIT_VOID

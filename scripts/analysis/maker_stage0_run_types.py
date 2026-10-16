@@ -99,6 +99,7 @@ class RunConfig:
     tail_csv: Path | None = None
     argv: tuple[str, ...] = ()
     min_free_bytes: int = MIN_FREE_BYTES
+    block_first_day: str | None = None  # ISO day of a v2 block; None for v1 (six-key entry)
     isolate: bool = True  # S-5: one child process per station-day; False only for in-process tests
 
     def need(self, name: str) -> Path:
@@ -115,6 +116,7 @@ class RunSummary:
     label: str | None
     code_sha: str
     mode: str
+    first_replayable_observed: str | None = None
 
 
 @dataclass(frozen=True)

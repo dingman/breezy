@@ -266,3 +266,22 @@ def test_cli_pin_check_is_an_injectable_seam(
     seen = _recording_run(monkeypatch, tmp_path)
     assert cli.main(REQUIRED, pin_check=lambda _cfg: "seam says no") == 2
     assert "seam says no" in capsys.readouterr().err and not seen
+
+
+def test_cli_passes_block_first_day_for_a_v2_verdict_run_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.fixtures.maker_stage0.frozen_v2 import v2_fields, v2_text
+    from tests.unit.test_maker_stage0_frozen_v2 import V1_BLOCK
+
+    seen = _recording_run(monkeypatch, tmp_path)
+    v2 = tmp_path / "v2.md"
+    v2.write_text(v2_text(v2_fields()))
+    v1 = tmp_path / "v1.md"
+    v1.write_text("# v1\nStatus: FINAL\n\n" + V1_BLOCK)
+    assert cli.main(_amendment_argv(v2, "ab" * 32)) == 0
+    assert cli.main(_amendment_argv(v1, cli.V1_AMENDMENT_SHA256)) == 0
+    assert cli.main(_amendment_argv(v2, "ab" * 32, "--bench", "4")) == 0
+    assert seen[0].block_first_day is not None
+    dt.date.fromisoformat(seen[0].block_first_day)
+    assert seen[1].block_first_day is None and seen[2].block_first_day is None
