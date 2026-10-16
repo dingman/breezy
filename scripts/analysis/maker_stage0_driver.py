@@ -267,7 +267,7 @@ def _execute(cfg: RunConfig, pre: Pre) -> RunSummary:
         session.close()
         shutil.rmtree(cfg.work_root, ignore_errors=True)
     summary = finish(cfg, pre, out, manifest, phases)
-    return replace(summary, first_replayable_observed=observed)
+    return replace(summary, first_replayable_observed=observed, v2_disclosed=pre.v2_disclosed)
 
 
 def _simulate_all(

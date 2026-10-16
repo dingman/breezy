@@ -117,6 +117,7 @@ class RunSummary:
     code_sha: str
     mode: str
     first_replayable_observed: str | None = None
+    v2_disclosed: tuple[str, ...] = ()  # v2 only: COVERED-but-not-counted days (NB1)
 
 
 @dataclass(frozen=True)

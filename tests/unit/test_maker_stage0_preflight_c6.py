@@ -5,19 +5,23 @@ Fixture worlds only: no real catalog, truth, node log or network.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from scripts.analysis import maker_stage0_driver as drv
+from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis import maker_stage0_preflight as pf
 from scripts.analysis import maker_stage0_preflight_v2 as pf2
 from scripts.analysis import maker_stage0_report as rep
 from scripts.analysis.maker_stage0_frozen import load_amendment, truth_keys
 from scripts.analysis.maker_stage0_inputs import InputRefused, TruthConflict
-from scripts.analysis.maker_stage0_run_types import Pre, RunConfig
+from scripts.analysis.maker_stage0_run_types import Pre, RunConfig, RunSummary
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.fixtures.maker_stage0 import replay_world_v2 as rw2
 from tests.fixtures.maker_stage0.frozen_v2 import BLOCK_FIRST
@@ -73,6 +77,11 @@ def test_v2_truth_conflict_refused_before_claim(tmp_path: Path) -> None:
 def test_preflight_and_score_truth_keys_are_equal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Deliberate reading: v2 score keys are the ``truth_keys`` grid, not the replayed rows.
+
+    Per-row truth is unchanged; the grid is what preflight already proved, which removes the
+    post-claim FrozenSetRefused/TruthConflict risk. Hence a sparse ``sd_rows`` still loads the grid.
+    """
     cfg, world = _v2(tmp_path)
     fs = load_amendment(world.amendment, world.amendment_sha)
     seen: dict[str, set[tuple[str, dt.date]]] = {}
@@ -129,3 +138,50 @@ def test_v2_world_preflight_smoke(tmp_path: Path) -> None:
     assert set(pre.frozen.stations) == {"LAX", "MDW", "MIA", "SFO"}
     _assert_no_claim(cfg)
     assert world.trigger_rows.is_file()
+
+
+def _ledger_lines(cfg: RunConfig) -> list[str]:
+    return cfg.ledger.read_text().splitlines() if cfg.ledger.exists() else []
+
+
+def test_v2_preflight_refusal_precedes_claim_at_driver_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reached: list[str] = []
+    monkeypatch.setattr(drv, "_execute", lambda cfg, pre: reached.append("execute"))
+    bad, _ = _v2(tmp_path / "bad", overlap=False)
+    with pytest.raises(InputRefused, match="vacuous"):
+        drv.run(bad)
+    assert _ledger_lines(bad) == []
+    assert not bad.out_dir.exists()
+    assert reached == []
+    good, _ = _v2(tmp_path / "good")
+    drv.run(good)
+    assert reached == ["execute"]
+    assert len(_ledger_lines(good)) == 1
+
+
+def test_run_summary_carries_v2_disclosed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, _ = _v2(tmp_path, late=frozenset({("SFO", BLOCK_FIRST)}))
+    pre = pf.preflight(cfg, "verdict")
+
+    class _Session:
+        def __init__(self, *_a: Any) -> None: ...
+
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(drv, "CatalogSession", _Session)
+    monkeypatch.setattr(drv, "_wp0", lambda c, p: drv.Wp0({}, frozenset(), 0))
+    monkeypatch.setattr(drv, "_simulate_all", lambda *a: None)
+    monkeypatch.setattr(
+        drv, "finish", lambda c, p, *a: RunSummary(c.out_dir, None, p.code_sha, "verdict")
+    )
+    summary = drv._execute(cfg, pre)
+    assert summary.v2_disclosed == (f"SFO:{BLOCK_FIRST.isoformat()}",)
+    cfg.out_dir.mkdir(parents=True)
+    modes.write_manifest(cfg, pre, "verdict", ["preflight"], {})
+    written = json.loads((cfg.out_dir / "run_manifest.json").read_text())
+    assert written["v2_disclosed"] == [f"SFO:{BLOCK_FIRST.isoformat()}"]
+    clean = dataclasses.replace(pre, v2_disclosed=())
+    modes.write_manifest(cfg, clean, "verdict", ["preflight"], {})
+    assert "v2_disclosed" not in json.loads((cfg.out_dir / "run_manifest.json").read_text())

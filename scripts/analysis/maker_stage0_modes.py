@@ -86,7 +86,9 @@ def write_manifest(
     parity: dict[str, int],
     verdict: str | None = None,
 ) -> None:
-    extra = {} if verdict is None else {"verdict": verdict}
+    extra: dict[str, Any] = {} if verdict is None else {"verdict": verdict}
+    if pre.v2_disclosed:  # v2 only; a v1 manifest keeps its exact keys
+        extra["v2_disclosed"] = list(pre.v2_disclosed)
     write_json(
         cfg.out_dir / "run_manifest.json",
         {

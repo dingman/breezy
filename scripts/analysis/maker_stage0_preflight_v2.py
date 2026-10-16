@@ -13,6 +13,7 @@ import datetime as dt
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import Final
 
 from breezy.analysis.maker_tape_census import CensusedDay
 from scripts.analysis.maker_stage0_frozen import FrozenDateSet, truth_keys, verify_set_matches_rule
@@ -27,8 +28,15 @@ from scripts.analysis.maker_stage0_trigger_rule import (
 __all__ = ["check_v2_before_claim", "needs_v2_checks"]
 
 
+V2_BLOCK: Final[int] = 2
+
+
+def is_v2_block(fs: FrozenDateSet) -> bool:
+    return fs.block == V2_BLOCK
+
+
 def needs_v2_checks(fs: FrozenDateSet, mode: str) -> bool:
-    return fs.block == 2 and mode == "verdict"
+    return is_v2_block(fs) and mode == "verdict"
 
 
 def _pinned(path: Path, expected: str | None, what: str) -> None:

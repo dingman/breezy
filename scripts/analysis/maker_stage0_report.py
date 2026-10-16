@@ -29,6 +29,7 @@ from scripts.analysis.maker_stage0_inputs import TruthTable, load_truth, write_t
 from scripts.analysis.maker_stage0_modes import write_manifest
 from scripts.analysis.maker_stage0_pno import AbstainReason, classify_p_no, release_instants
 from scripts.analysis.maker_stage0_pno_store import PNoStore
+from scripts.analysis.maker_stage0_preflight_v2 import is_v2_block
 from scripts.analysis.maker_stage0_run_types import Pre, RunConfig, RunSummary
 from scripts.analysis.maker_stage0_runio import PositionSeed
 from scripts.analysis.maker_stage0_stats import TAIL_EDGES, TailRow
@@ -118,8 +119,14 @@ def score(
     cross_check: Path,
     run_dir: Path,
 ) -> Scored:
-    """Load FINAL truth for the replayed station-days; called once, post-simulation."""
-    if frozen.block == 2:  # v2: the exact key set the pre-claim agreement already proved
+    """Load FINAL truth for the replayed station-days; called once, post-simulation.
+
+    v1 reads the replayed ``sd_rows`` keys. v2 deliberately reads the whole ``truth_keys`` grid
+    (stations x frozen dates): the exact key set the pre-claim agreement already proved, so a
+    post-claim ``FrozenSetRefused``/``TruthConflict`` from a key-set mismatch cannot arise. The
+    per-row truth tokens are unchanged (each ``sd_rows`` row still looks up its own key).
+    """
+    if is_v2_block(frozen):
         keys = truth_keys(frozen.stations, frozen.dates)
     else:
         keys = {(r.station, dt.date.fromisoformat(r.climate_day)) for r in sd_rows}
