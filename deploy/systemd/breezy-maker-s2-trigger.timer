@@ -1,0 +1,17 @@
+[Unit]
+Description=10:05 UTC trigger for the Breezy MAKER-S2 second-look trigger check (PARKED)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/maker_stage0_trigger.py
+
+[Timer]
+Unit=breezy-maker-s2-trigger.service
+
+# 10:05 UTC is free on the existing schedule (tests/unit/test_deploy_timer_hours.py) and far
+# from the protected window [16:35Z, 01:15Z). UTC is stated explicitly. Persistent=false: a
+# missed day is caught up by the next run, which covers every unchecked day in one census.
+OnCalendar=*-*-* 10:05:00 UTC
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

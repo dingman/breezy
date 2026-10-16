@@ -59,12 +59,15 @@ def first_crossing(
 def _row_of(record: object, number: int) -> TriggerRow:
     if not isinstance(record, dict) or set(record) != _KEYS:
         raise InputRefused(f"trigger row {number}: keys must be exactly {sorted(_KEYS)}")
+    for key in ("station", "climate_day", "reason"):
+        if not isinstance(record[key], str):  # NB3: rows are hash-pinned, so no coercion
+            raise InputRefused(f"trigger row {number}: {key} must be a string")
+    seen = record["first_seen_ns"]
+    if seen is not None and type(seen) is not int:
+        raise InputRefused(f"trigger row {number}: first_seen_ns must be an int or null")
     try:
         return TriggerRow(
-            str(record["station"]),
-            dt.date.fromisoformat(str(record["climate_day"])),
-            str(record["reason"]),
-            None if record["first_seen_ns"] is None else int(record["first_seen_ns"]),
+            record["station"], dt.date.fromisoformat(record["climate_day"]), record["reason"], seen
         )
     except (ValueError, TypeError) as exc:
         raise InputRefused(f"trigger row {number}: malformed value ({type(exc).__name__})") from exc

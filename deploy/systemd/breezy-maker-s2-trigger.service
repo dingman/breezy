@@ -1,0 +1,42 @@
+[Unit]
+# MAKER-S2 second look (C4): the daily trigger check
+# (docs/plans/backlog/MAKER_2026-10-12/S2_second_look_plan_r3.md section 3 "C4"),
+# started by breezy-maker-s2-trigger.timer. PARKED: committed, never enabled by the commit.
+#
+# `check` runs ONE counts-only census over the unchecked days up to today-2 and appends the
+# four-field rows to ~/.local/share/breezy/derived/maker_stage0/trigger/trigger_rows.jsonl.
+# It holds trigger.lock (flock) and hands the census a fresh nonce as its trigger-check token.
+# `close` is a manual step and is never run by this unit.
+Description=Breezy MAKER-S2 second-look trigger check (counts-only census, single writer)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/maker_stage0_trigger.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/MAKER_2026-10-12/S2_second_look_plan_r3.md
+
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Environment=PYTHONPATH=/home/jon/breezy/src:/home/jon/breezy
+
+# U-8 measured one single-day census at 1566 s wall and 4.5 GB peak; the first run (10-21)
+# covers six days in one pass. MemoryHigh/MemoryMax sit inside the 12G/16G studies slice.
+MemoryHigh=6G
+MemoryMax=8G
+LimitNOFILE=524288
+
+# Worst case 3 h from 10:05Z ends before 15:10Z. A killed check still counts toward the
+# forfeiture (its pre-read ledger line is already written) and is disclosed.
+RuntimeMaxSec=10800
+
+Slice=breezy-studies.slice
+UMask=0077
+
+ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.maker_stage0_trigger check
+
+# The log directory must exist (see README): systemd does not create it.
+StandardOutput=append:%h/.local/share/breezy/derived/maker_stage0/trigger/logs/check.log
+StandardError=append:%h/.local/share/breezy/derived/maker_stage0/trigger/logs/check.log
+SyslogIdentifier=breezy-maker-s2-trigger
+
+# NOTE: no [Install] section. Started BY the timer; enable only the timer.

@@ -1983,3 +1983,33 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 - **Launch window.** 11:40 and 12:40 are outside 16:30-17:10Z
   (`tests/unit/test_launch_window_table.py`) and free of every other timer tick
   (`tests/unit/test_deploy_timer_hours.py`).
+
+## `breezy-maker-s2-trigger` — MAKER-S2 second-look trigger check (2026-10-16, PREPARED, NOT ACTIVATED)
+
+| Unit | Tick (UTC) | Command | Egress | Bounds |
+|---|---|---|---|---|
+| `breezy-maker-s2-trigger.{service,timer}` | 10:05 | `python -m scripts.analysis.maker_stage0_trigger check` | none (offline census) | `MemoryHigh=6G`/`MemoryMax=8G`, `RuntimeMaxSec=10800`, `LimitNOFILE=524288`, `Slice=breezy-studies.slice` |
+
+- **What.** `check` finds the unchecked climate days (`max(checked_through+1, S)` to
+  `min(today-2, last_day)`, `S` and `last_day` from registry row 1), runs ONE counts-only census over
+  them, appends the four-field rows in date order and stops at the first crossing of the trigger rule
+  (`TRIGGER_THRESHOLD`, `maker_stage0_trigger_rule.py`), writing a terminal `CROSSED` row. Later days of
+  that batch are discarded unread (they still count toward forfeiture). Every later `check` is refused.
+  A day's census costs about 1566 s and 4.5 GB peak (U-8); the first run covers six days.
+- **State** under `~/.local/share/breezy/derived/maker_stage0/trigger/`: `trigger_rows.jsonl`
+  (append-only), `checked_through.txt`, `counts/` (sealed per-run counts files), `trigger.lock`, and
+  `logs/check.log` (create `logs/` before the first run: `StandardOutput=append:` does not).
+- **Lock and token.** `check` takes `trigger.lock` with `flock(LOCK_EX|LOCK_NB)` (refuses if held or if
+  the file is gone after acquisition), writes a fresh nonce into it and exports the nonce as
+  `BREEZY_MAKER_S2_TRIGGER_CHECK` to the census child only. The census guard accepts any non-blank
+  token, so the nonce is a convention that makes a stray counts-only call visible, not a control.
+- **`close` is manual and never run by the unit.** `python -m scripts.analysis.maker_stage0_trigger
+  close [--repo-copy PATH]` runs only after a crossing or once `checked_through` reaches the cap. It
+  writes `trigger_close.json` (`E`, `crossed`, `rows_sha256`, `rows_chain_sha256`, `closed_at`; once only),
+  prints the forfeiture re-verified against the read-ledger (`4 x (max invoked day - S + 1)`), and copies
+  the rows up to `E` for the coordinator to commit.
+- **Parked; how to enable.** The coordinator, after merge and a gate reading `EXIT=0`, symlinks both
+  files into `~/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
+  `systemctl --user enable --now breezy-maker-s2-trigger.timer`. To park again:
+  `systemctl --user disable --now breezy-maker-s2-trigger.timer`. Nothing in the commit installs them.
+- **Launch window.** 10:05 is outside 16:30-17:10Z and free of every other timer tick.

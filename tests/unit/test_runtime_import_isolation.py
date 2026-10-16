@@ -142,6 +142,8 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.maker_stage0_nodelog",  # MAKER-S2 WP1 node-log scan
     "scripts.analysis.maker_stage0_schedule",  # MAKER-S2 WP1 process schedule
     "scripts.analysis.maker_stage0_catalog_read",  # MAKER-S2 WP6 capture reader
+    # MAKER-S2 second look C4: the parked trigger unit's `-m` entry (WIDENED by this one row).
+    "scripts.analysis.maker_stage0_trigger",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
