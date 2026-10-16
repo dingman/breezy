@@ -119,11 +119,23 @@ def load_prints(path: Path) -> tuple[list[Print], int]:
 
 
 def firewall_clearance(declaration_sha256: str) -> Clearance:
-    """WP1's ``require_firewall_clearance`` bound to the declaration hash."""
+    """WP1's ``require_firewall_clearance`` bound to the declaration hash.
+
+    The library path clears days only through registry row 0; any row >= 1 (the second-look
+    declarations) is refused here, by sha at construction and by day at clearance time.
+    """
     census = importlib.import_module("breezy.analysis.maker_tape_census")
+    registry = importlib.import_module("breezy.analysis.maker_search_declarations")
     refused = census.FirewallRefused
+    if declaration_sha256 in {row.sha256 for row in registry.SEARCH_DECLARATIONS[1:]}:
+        raise ClearanceRefused("the second-look declaration is not clearable by this crosscheck")
 
     def clearance(station: str, day: dt.date) -> None:
+        row = registry.declaration_row(station, day)
+        if row is not None and row >= 1:
+            raise ClearanceRefused(
+                f"{station} {day.isoformat()} belongs to a second-look declaration row"
+            )
         try:
             census.require_firewall_clearance(station, day, declaration_sha256)
         except refused as exc:
