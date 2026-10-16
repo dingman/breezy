@@ -27,7 +27,7 @@ LimitNOFILE=524288
 
 # Worst case 3 h from 10:05Z ends before 15:10Z. A killed check still counts toward the
 # forfeiture (its pre-read ledger line is already written) and is disclosed.
-RuntimeMaxSec=10800
+TimeoutStartSec=10800
 
 Slice=breezy-studies.slice
 UMask=0077

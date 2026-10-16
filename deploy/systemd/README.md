@@ -1988,7 +1988,7 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 
 | Unit | Tick (UTC) | Command | Egress | Bounds |
 |---|---|---|---|---|
-| `breezy-maker-s2-trigger.{service,timer}` | 10:05 | `python -m scripts.analysis.maker_stage0_trigger check` | none (offline census) | `MemoryHigh=6G`/`MemoryMax=8G`, `RuntimeMaxSec=10800`, `LimitNOFILE=524288`, `Slice=breezy-studies.slice` |
+| `breezy-maker-s2-trigger.{service,timer}` | 10:05 | `python -m scripts.analysis.maker_stage0_trigger check` | none (offline census) | `MemoryHigh=6G`/`MemoryMax=8G`, `TimeoutStartSec=10800`, `LimitNOFILE=524288`, `Slice=breezy-studies.slice` |
 
 - **What.** `check` finds the unchecked climate days (`max(checked_through+1, S)` to
   `min(today-2, last_day)`, `S` and `last_day` from registry row 1), runs ONE counts-only census over

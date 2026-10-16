@@ -24,7 +24,8 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
     {
         # re-pin after 688b582f (TRADE_QUANTITY_UNIT = CONTRACTS, MAKER-S1 WP3); was e4bed04e...6f2b
         "aut2.label": "db374704e225d89c1a532c48553774c1d2c36c889d09a836c681008df1e27b2c",
-        "aut6.health": "b6df288bed4bb34fcd77e2b39629b50431fc790fa0c0ae7b4ff599a8fe4ab17a",
+        # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
+        "aut6.health": "c615691d3f11b7dc837dbdd6fd2aac7756b4ea61ab35f90df0ff6c1aa56b2b9a",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()

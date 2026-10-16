@@ -22,7 +22,7 @@ def test_trigger_unit_files_pin_caps_and_calendar() -> None:
     svc = _directives(_SERVICE)
     timer = _directives("breezy-maker-s2-trigger.timer")
     assert svc["Type"] == ["oneshot"]
-    assert svc["MemoryMax"] == ["8G"] and svc["RuntimeMaxSec"] == ["10800"]
+    assert svc["MemoryMax"] == ["8G"] and svc["TimeoutStartSec"] == ["10800"]
     assert svc["Slice"] == ["breezy-studies.slice"]
     assert svc["LimitNOFILE"] == ["524288"]
     assert re.search(r"-m scripts\.analysis\.maker_stage0_trigger check$", svc["ExecStart"][0])

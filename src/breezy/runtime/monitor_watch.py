@@ -70,6 +70,7 @@ TIMER_MAX_INTERVAL_S: Final[Mapping[str, tuple[int, int]]] = {
     "breezy-family-tally@.timer": (86_400, 60),
     "breezy-fee-evidence-pull.timer": (86_400, 60),
     "breezy-hypothesis-triage.timer": (86_400, 60),
+    "breezy-maker-s2-trigger.timer": (86_400, 60),
     "breezy-nbp-learning-nightly.timer": (86_400, 60),
     "breezy-portfolio-roi.timer": (86_400, 60),
     "breezy-position-monitor-report.timer": (86_400, 60),

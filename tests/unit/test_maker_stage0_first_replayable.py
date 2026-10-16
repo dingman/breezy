@@ -14,6 +14,8 @@ import pytest
 from scripts.analysis import maker_stage0_driver as drv
 from scripts.analysis.maker_stage0_first_replayable import check_first_replayable
 from scripts.analysis.maker_stage0_inputs import InputRefused
+from scripts.analysis.maker_stage0_preflight import preflight as _real_preflight
+from scripts.analysis.maker_stage0_run_types import Pre
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.unit import test_maker_stage0_pno as pno_fx
 from tests.unit.test_maker_stage0_driver import _fresh, _ledger
@@ -41,9 +43,9 @@ def _probed(day: str | None) -> Any:
 
 
 def _shift_frozen(monkeypatch: pytest.MonkeyPatch, **change: Any) -> None:
-    real = drv._preflight
+    real = _real_preflight
 
-    def patched(cfg: drv.RunConfig, mode: str) -> drv.Pre:
+    def patched(cfg: drv.RunConfig, mode: str) -> Pre:
         pre = real(cfg, mode)
         return dataclasses.replace(pre, frozen=dataclasses.replace(pre.frozen, **change))
 
