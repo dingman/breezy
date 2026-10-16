@@ -28,13 +28,18 @@ __all__ = [
     "assert_in_frozen_set",
     "load_amendment",
     "parse_frozen_block",
+    "parse_frozen_block_v2",
     "rule_dates",
+    "rule_dates_v2",
+    "truth_keys",
     "verify_set_matches_rule",
 ]
 
 SEALED_DAY: Final[dt.date] = dt.date(2026, 10, 1)
 LAST_ALLOWED_DAY: Final[dt.date] = dt.date(2026, 10, 13)
 FIRST_REPLAYABLE_CHOICES: Final[tuple[dt.date, ...]] = (dt.date(2026, 9, 18), dt.date(2026, 9, 19))
+SECOND_LOOK_FIRST_DAY: Final[dt.date] = dt.date(2026, 10, 14)
+SECOND_LOOK_MAX_DAY: Final[dt.date] = dt.date(2026, 11, 15)
 _FIELDS: Final[tuple[str, ...]] = (
     "stations",
     "first_replayable_day",
@@ -43,8 +48,27 @@ _FIELDS: Final[tuple[str, ...]] = (
     "last_final_day",
     "dates",
 )
+_FIELDS_V2: Final[tuple[str, ...]] = (
+    "stations",
+    "block_first_day",
+    "trigger_day",
+    "trigger_rows_path",
+    "trigger_rows_sha256",
+    "census_days_path",
+    "census_days_sha256",
+    "truth_csv_path",
+    "truth_csv_sha256",
+    "cross_check_path",
+    "cross_check_sha256",
+    "last_final_day",
+    "dates",
+)
 _BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```FROZEN_DATE_SET[ \t]*\n(.*?)\n```", re.DOTALL)
-_OPEN_FENCE: Final[str] = "```FROZEN_DATE_SET"
+_BLOCK_V2_RE: Final[re.Pattern[str]] = re.compile(
+    r"^```FROZEN_DATE_SET_V2[ \t]*\n(.*?)\n```", re.DOTALL | re.MULTILINE
+)
+_OPEN_V1_RE: Final[re.Pattern[str]] = re.compile(r"```FROZEN_DATE_SET(?!_V2)")
+_OPEN_V2_FENCE: Final[str] = "```FROZEN_DATE_SET_V2"
 _SHA_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 _DRAFT_RE: Final[re.Pattern[str]] = re.compile(r"^Status:\s*\*{0,2}\s*DRAFT", re.MULTILINE)
 _FINAL_RE: Final[re.Pattern[str]] = re.compile(r"^Status:\s*\*{0,2}\s*FINAL\b", re.MULTILINE)
@@ -64,6 +88,14 @@ class FrozenDateSet:
     truth_csv_sha256: str
     last_final_day: dt.date
     dates: tuple[dt.date, ...]
+    block: int = 1
+    trigger_day: dt.date | None = None
+    trigger_rows_path: str | None = None
+    trigger_rows_sha256: str | None = None
+    census_days_path: str | None = None
+    census_days_sha256: str | None = None
+    cross_check_path: str | None = None
+    cross_check_sha256: str | None = None
 
 
 def rule_dates(first_replayable_day: dt.date, last_final_day: dt.date) -> tuple[dt.date, ...]:
@@ -74,12 +106,27 @@ def rule_dates(first_replayable_day: dt.date, last_final_day: dt.date) -> tuple[
     return tuple(d for d in days if d != SEALED_DAY)
 
 
-def _read_fields(body: str) -> dict[str, list[str]]:
+def rule_dates_v2(
+    block_first_day: dt.date, trigger_day: dt.date, last_final_day: dt.date
+) -> tuple[dt.date, ...]:
+    """The v2 rule: block_first_day .. min(trigger_day, last_final_day, 2026-11-15)."""
+    last = min(trigger_day, last_final_day, SECOND_LOOK_MAX_DAY)
+    span = (last - block_first_day).days + 1
+    return tuple(block_first_day + dt.timedelta(days=i) for i in range(max(span, 0)))
+
+
+def truth_keys(stations: Iterable[str], dates: Iterable[dt.date]) -> set[tuple[str, dt.date]]:
+    """The licensed ``(station, day)`` truth keys; preflight and score share this shape."""
+    days = tuple(dates)
+    return {(station, day) for station in stations for day in days}
+
+
+def _read_fields(body: str, wanted: tuple[str, ...] = _FIELDS) -> dict[str, list[str]]:
     fields: dict[str, list[str]] = {}
     current: str | None = None
     for line in body.splitlines():
         key, sep, rest = line.partition(":")
-        if sep and key in _FIELDS and not line.startswith(" "):
+        if sep and key in wanted and not line.startswith(" "):
             if key in fields:
                 raise FrozenSetRefused(f"field {key!r} appears twice")
             current = key
@@ -88,8 +135,8 @@ def _read_fields(body: str) -> dict[str, list[str]]:
             fields["dates"].append(line.strip())
         else:
             raise FrozenSetRefused(f"frozen block fields: unrecognised line {line!r}")
-    if set(fields) != set(_FIELDS):
-        raise FrozenSetRefused(f"frozen block fields {sorted(fields)} != {sorted(_FIELDS)}")
+    if set(fields) != set(wanted):
+        raise FrozenSetRefused(f"frozen block fields {sorted(fields)} != {sorted(wanted)}")
     return fields
 
 
@@ -134,9 +181,15 @@ def _check_dates(
     return tuple(dates)
 
 
+def _refuse_both_fences(text: str) -> None:
+    if _OPEN_V2_FENCE in text and _OPEN_V1_RE.search(text) is not None:
+        raise FrozenSetRefused("the amendment holds both FROZEN_DATE_SET fences: refused")
+
+
 def parse_frozen_block(text: str) -> FrozenDateSet:
     """Parse the one fenced ``FROZEN_DATE_SET`` block of the amendment text."""
-    if text.count(_OPEN_FENCE) != 1 or len(_BLOCK_RE.findall(text)) != 1:
+    _refuse_both_fences(text)
+    if len(_OPEN_V1_RE.findall(text)) != 1 or len(_BLOCK_RE.findall(text)) != 1:
         raise FrozenSetRefused("the amendment must hold exactly one FROZEN_DATE_SET block")
     body = _BLOCK_RE.findall(text)[0]
     if _PLACEHOLDER in body:
@@ -160,6 +213,72 @@ def parse_frozen_block(text: str) -> FrozenDateSet:
     )
 
 
+def _sha_field(fields: dict[str, list[str]], key: str) -> str:
+    value = _single(fields, key)
+    if _SHA_RE.fullmatch(value) is None:
+        raise FrozenSetRefused(f"{key} {value!r} is not a lowercase sha256")
+    return value
+
+
+def _check_dates_v2(
+    dates: Sequence[dt.date], first: dt.date, trigger: dt.date, last_final: dt.date
+) -> tuple[dt.date, ...]:
+    ceiling = min(trigger, last_final, SECOND_LOOK_MAX_DAY)
+    for day in dates:
+        if day <= LAST_ALLOWED_DAY:
+            raise FrozenSetRefused(f"{day} is a block-1 day (<= {LAST_ALLOWED_DAY})")
+        if not first <= day <= ceiling:
+            raise FrozenSetRefused(f"{day} is outside the rule [{first}, {ceiling}]")
+    if list(dates) != sorted(set(dates)):
+        raise FrozenSetRefused("dates must be strictly ascending, one per line, no duplicates")
+    if not dates:
+        raise FrozenSetRefused("the frozen block holds no dates")
+    return tuple(dates)
+
+
+def _check_days_v2(first: dt.date, trigger: dt.date, last_final: dt.date) -> None:
+    if first != SECOND_LOOK_FIRST_DAY:
+        raise FrozenSetRefused(f"block_first_day {first} != {SECOND_LOOK_FIRST_DAY}")
+    if trigger > SECOND_LOOK_MAX_DAY:
+        raise FrozenSetRefused(f"trigger_day {trigger} is after {SECOND_LOOK_MAX_DAY}")
+    if trigger < first:
+        raise FrozenSetRefused(f"trigger_day {trigger} precedes block_first_day {first}")
+    if last_final < trigger:
+        raise FrozenSetRefused(f"last_final_day {last_final} precedes trigger_day {trigger}")
+
+
+def parse_frozen_block_v2(text: str) -> FrozenDateSet:
+    """Parse the one fenced ``FROZEN_DATE_SET_V2`` block (the second-look block 2)."""
+    _refuse_both_fences(text)
+    if text.count(_OPEN_V2_FENCE) != 1 or len(_BLOCK_V2_RE.findall(text)) != 1:
+        raise FrozenSetRefused("the amendment must hold exactly one FROZEN_DATE_SET_V2 block")
+    body = _BLOCK_V2_RE.findall(text)[0]
+    if _PLACEHOLDER in body:
+        raise FrozenSetRefused("the frozen block still holds an unfilled <FILL placeholder")
+    fields = _read_fields(body, _FIELDS_V2)
+    first = _iso(_single(fields, "block_first_day"), "block_first_day")
+    trigger = _iso(_single(fields, "trigger_day"), "trigger_day")
+    last_final = _iso(_single(fields, "last_final_day"), "last_final_day")
+    _check_days_v2(first, trigger, last_final)
+    dates = [_iso(item, "date") for item in fields["dates"]]
+    return FrozenDateSet(
+        stations=_stations(_single(fields, "stations")),
+        first_replayable_day=first,
+        truth_csv_path=_single(fields, "truth_csv_path"),
+        truth_csv_sha256=_sha_field(fields, "truth_csv_sha256"),
+        last_final_day=last_final,
+        dates=_check_dates_v2(dates, first, trigger, last_final),
+        block=2,
+        trigger_day=trigger,
+        trigger_rows_path=_single(fields, "trigger_rows_path"),
+        trigger_rows_sha256=_sha_field(fields, "trigger_rows_sha256"),
+        census_days_path=_single(fields, "census_days_path"),
+        census_days_sha256=_sha_field(fields, "census_days_sha256"),
+        cross_check_path=_single(fields, "cross_check_path"),
+        cross_check_sha256=_sha_field(fields, "cross_check_sha256"),
+    )
+
+
 def load_amendment(path: Path, expected_sha: str) -> FrozenDateSet:
     """Read the FINAL amendment, check its sha256 against the pinned one, parse its block."""
     try:
@@ -177,6 +296,8 @@ def load_amendment(path: Path, expected_sha: str) -> FrozenDateSet:
         raise FrozenSetRefused("the amendment is still DRAFT; only FINAL bytes license the reads")
     if _FINAL_RE.search(text) is None:
         raise FrozenSetRefused("the amendment has no positive 'Status: FINAL' line")
+    if _OPEN_V2_FENCE in text and _OPEN_V1_RE.search(text) is None:
+        return parse_frozen_block_v2(text)
     return parse_frozen_block(text)
 
 
@@ -194,6 +315,9 @@ def verify_set_matches_rule(
     fs: FrozenDateSet, census: Iterable[CensusedDay], truth: TruthTable
 ) -> None:
     """The block equals the rule applied to the pinned truth CSV and the census."""
+    if fs.block == 2:
+        _verify_v2(fs, census, truth)
+        return
     if truth.csv_sha256 != fs.truth_csv_sha256:
         raise FrozenSetRefused(
             f"truth csv sha256 {truth.csv_sha256} != the block's {fs.truth_csv_sha256}"
@@ -212,5 +336,29 @@ def verify_set_matches_rule(
         raise FrozenSetRefused(f"frozen set differs from the rule: missing {missing} extra {extra}")
     census_days = {row.climate_day for row in census}
     absent = sorted(set(fs.dates) - census_days)
+    if absent:
+        raise FrozenSetRefused(f"the census holds no rows for set dates {absent}")
+
+
+def _verify_v2(fs: FrozenDateSet, census: Iterable[CensusedDay], truth: TruthTable) -> None:
+    """v2: ``min(last_final, trigger_day)`` on both sides (delta 2.2); the rule is the v2 rule."""
+    trigger = fs.trigger_day
+    if trigger is None:
+        raise FrozenSetRefused("a v2 frozen set needs a trigger_day")
+    if truth.csv_sha256 != fs.truth_csv_sha256:
+        raise FrozenSetRefused(
+            f"truth csv sha256 {truth.csv_sha256} != the block's {fs.truth_csv_sha256}"
+        )
+    last_final = max((day for _, day in truth.finals), default=None)
+    if last_final is None or min(last_final, trigger) != min(fs.last_final_day, trigger):
+        raise FrozenSetRefused(
+            f"last_final_day {fs.last_final_day} != the truth CSV's last FINAL day {last_final}"
+        )
+    expected = rule_dates_v2(fs.first_replayable_day, trigger, fs.last_final_day)
+    if fs.dates != expected:
+        missing = sorted(d.isoformat() for d in set(expected) - set(fs.dates))
+        extra = sorted(d.isoformat() for d in set(fs.dates) - set(expected))
+        raise FrozenSetRefused(f"frozen set differs from the rule: missing {missing} extra {extra}")
+    absent = sorted(set(fs.dates) - {row.climate_day for row in census})
     if absent:
         raise FrozenSetRefused(f"the census holds no rows for set dates {absent}")

@@ -34,6 +34,7 @@ from scripts.analysis.maker_stage0_model import load_model
 from scripts.analysis.maker_stage0_modes import free_bytes
 from scripts.analysis.maker_stage0_nodelog import NodeLogScan, scan_node_log
 from scripts.analysis.maker_stage0_pins import assert_clean_tree, git_commit
+from scripts.analysis.maker_stage0_preflight_v2 import check_v2_before_claim, needs_v2_checks
 from scripts.analysis.maker_stage0_run_types import (
     BENCH_COUNTS,
     DiskLow,
@@ -160,6 +161,15 @@ def preflight(cfg: RunConfig, mode: str) -> Pre:
         raise DiskLow(f"E4: {free} bytes free < {cfg.min_free_bytes}")
     if sha256_file(cfg.need("truth")) != fs.truth_csv_sha256:
         raise InputRefused("truth CSV sha256 differs from the frozen block's pinned sha")
+    if needs_v2_checks(fs, mode):
+        check_v2_before_claim(
+            fs,
+            repo_root=cfg.repo_root,
+            truth_csv=cfg.need("truth"),
+            cross_check=cfg.truth_cross_check,
+            census_days=cfg.need("census_days"),
+            census=census.values(),
+        )
     load_trade_unit(cfg.need("trade_unit"))
     model = load_model(cfg.repo_root)
     if mode != "bench":
