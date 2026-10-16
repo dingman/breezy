@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from scripts.analysis import maker_stage0_finish as fin
+from scripts.analysis import maker_stage0_modes as modes
+from scripts.analysis import maker_stage0_render as render
 from scripts.analysis import maker_stage0_verdict as vd
 
 _HOLD, _D5 = "SENTINEL-HOLDOUT-LINE", "SENTINEL-D5-LINE"
@@ -44,9 +46,9 @@ def _stub_world(monkeypatch: pytest.MonkeyPatch, *, stop: bool) -> None:
     monkeypatch.setattr(fin, "write_pins", lambda *_a: None)
     monkeypatch.setattr(fin, "tables_from_csvs", tables)
     monkeypatch.setattr(fin, "load_trade_unit", lambda _p: SimpleNamespace(hypotheses=list))
-    monkeypatch.setattr(fin.modes, "write_manifest", lambda *_a, **_k: None)
+    monkeypatch.setattr(modes, "write_manifest", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        fin.render,
+        render,
         "render_report",
         lambda *_a, holdout_line, d5_line, **_k: f"{holdout_line}\n{d5_line}\n",
     )
@@ -86,4 +88,4 @@ def test_finish_passes_block_lines_to_the_s4_stop_report(
     _stub_world(monkeypatch, stop=True)
     text = _run(tmp_path)
     assert f"{_HOLD}\n" in text and _D5 in text
-    assert fin.render.STOP_S4 in text
+    assert render.STOP_S4 in text
