@@ -7,14 +7,18 @@ observed day may legitimately differ; the value stays recorded in ``wp0_agreemen
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scripts.analysis.maker_stage0_frozen import FrozenDateSet
+    from scripts.analysis.maker_stage0_probe import ProbeReport
 
 __all__ = ["check_first_replayable"]
 
 
-def check_first_replayable(probed: Any, frozen: Any) -> str | None:
+def check_first_replayable(probed: ProbeReport, frozen: FrozenDateSet) -> str | None:
     """The refusal message for a v1 mismatch, else ``None`` (always ``None`` for a v2 block)."""
-    if getattr(frozen, "block", 1) != 1:
+    if frozen.block != 1:
         return None
     if probed.first_replayable_day == frozen.first_replayable_day.isoformat():
         return None

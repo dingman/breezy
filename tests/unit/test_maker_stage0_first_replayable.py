@@ -113,16 +113,36 @@ def test_check_first_replayable_is_pure(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_v2_claim_writes_block_first_day_from_pre_frozen(
-    world: rw.World,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _shift_frozen(monkeypatch, block=2, first_replayable_day=_OTHER_DAY)
     sentinel = drv.RunSummary(tmp_path, None, "x", "verdict")
     monkeypatch.setattr(drv, "_execute", lambda cfg, pre: sentinel)
     cfg = _fresh(world, tmp_path, block_first_day=_OTHER_DAY.isoformat())
     drv.run(cfg)
-    start = _ledger(cfg)[0]
-    assert start["block_first_day"] == _OTHER_DAY.isoformat()
+    assert _ledger(cfg)[0]["block_first_day"] == _OTHER_DAY.isoformat()
+    unset = _fresh(world, tmp_path / "u")  # cfg carries nothing: the value still comes from pre
+    drv.run(unset)
+    assert _ledger(unset)[0]["block_first_day"] == _OTHER_DAY.isoformat()
+
+
+def test_cfg_block_first_day_mismatch_refused_before_claim(
+    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _shift_frozen(monkeypatch, block=2, first_replayable_day=_OTHER_DAY)
+    cfg = _fresh(world, tmp_path, block_first_day=rw.FIRST_DAY.isoformat())
+    with pytest.raises(InputRefused, match="disagrees with the frozen block"):
+        drv.run(cfg)
+    assert not cfg.out_dir.exists()
+    assert not cfg.ledger.exists() or _ledger(cfg) == []
+
+
+def test_block_first_day_on_v1_block_refused(world: rw.World, tmp_path: Path) -> None:
+    cfg = _fresh(world, tmp_path, block_first_day=_OTHER_DAY.isoformat())
+    with pytest.raises(InputRefused, match="disagrees with the frozen block"):
+        drv.run(cfg)
+    assert not cfg.out_dir.exists()
+    assert not cfg.ledger.exists() or _ledger(cfg) == []
 
 
 def test_v1_claim_entry_keeps_six_keys(

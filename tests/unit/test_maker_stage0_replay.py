@@ -281,7 +281,8 @@ def test_cli_passes_block_first_day_for_a_v2_verdict_run_only(
     v1.write_text("# v1\nStatus: FINAL\n\n" + V1_BLOCK)
     assert cli.main(_amendment_argv(v2, "ab" * 32)) == 0
     assert cli.main(_amendment_argv(v1, cli.V1_AMENDMENT_SHA256)) == 0
-    assert cli.main(_amendment_argv(v2, "ab" * 32, "--bench", "4")) == 0
+    for mode in (["--bench", "4"], ["--tail-only"], ["--verify-first"]):
+        assert cli.main(_amendment_argv(v2, "ab" * 32, *mode)) == 0
     assert seen[0].block_first_day is not None
     dt.date.fromisoformat(seen[0].block_first_day)
-    assert seen[1].block_first_day is None and seen[2].block_first_day is None
+    assert all(cfg.block_first_day is None for cfg in seen[1:])

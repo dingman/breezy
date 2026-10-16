@@ -172,12 +172,23 @@ def _report_only(cfg: RunConfig, mode: str) -> RunSummary:
 # --- verdict ------------------------------------------------------------------------------------
 
 
+def _claim_block_day(cfg: RunConfig, pre: Pre) -> str | None:
+    """The claim's block day: derived from the frozen block, never trusted from ``cfg``."""
+    derived = pre.frozen.first_replayable_day.isoformat() if pre.frozen.block == 2 else None
+    if cfg.block_first_day is not None and cfg.block_first_day != derived:
+        raise InputRefused(
+            f"block_first_day {cfg.block_first_day!r} disagrees with the frozen block ({derived!r})"
+        )
+    return derived
+
+
 def _run_verdict(cfg: RunConfig, pre: Pre, now: Callable[[], dt.datetime]) -> RunSummary:
     addendum = None
     if cfg.addendum is not None:
         if cfg.addendum_sha is None:
             raise InputRefused("--addendum needs --addendum-sha")
         addendum = load_addendum(cfg.addendum, cfg.addendum_sha)
+    block_day = _claim_block_day(cfg, pre)
     refusal = claim_verdict_run(
         cfg.ledger,
         amendment_sha=cfg.amendment_sha,
@@ -186,7 +197,7 @@ def _run_verdict(cfg: RunConfig, pre: Pre, now: Callable[[], dt.datetime]) -> Ru
         now=now(),
         runs_root=cfg.out_dir.parent,
         addendum=addendum,
-        block_first_day=cfg.block_first_day,
+        block_first_day=block_day,
     )
     if refusal is not None:
         raise LedgerRefused(refusal)
