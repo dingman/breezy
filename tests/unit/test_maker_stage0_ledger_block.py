@@ -148,3 +148,27 @@ def test_null_block_first_day_entry_is_refused_on_read(tmp_path: Path) -> None:
     ledger.write_text(json.dumps(_start_entry(block_first_day=None)) + "\n")
     with pytest.raises(LedgerRefused):
         ledger_refuses(ledger, SHA_A, runs)
+
+
+def test_block_first_day_noncanonical_refused(tmp_path: Path) -> None:
+    ledger, runs = _paths(tmp_path)
+    for bad in ("20261014", "2026-10-4", "2026-W42-3"):
+        ledger.write_text(json.dumps(_start_entry(block_first_day=bad)) + "\n")
+        with pytest.raises(LedgerRefused):
+            ledger_refuses(ledger, SHA_A, runs)
+    ledger.unlink()
+    with pytest.raises(LedgerRefused):
+        _claim(ledger, runs, "r1", block="20261014")
+    assert not ledger.exists()  # refused before the append
+
+
+def test_block_first_day_non_string_refused(tmp_path: Path) -> None:
+    ledger, runs = _paths(tmp_path)
+    for bad in (20261014, ["2026-10-14"], True):
+        ledger.write_text(json.dumps(_start_entry(block_first_day=bad)) + "\n")
+        with pytest.raises(LedgerRefused):
+            ledger_refuses(ledger, SHA_A, runs)
+    ledger.unlink()
+    with pytest.raises(LedgerRefused):
+        _claim(ledger, runs, "r1", block=20261014)  # type: ignore[arg-type]
+    assert not ledger.exists()

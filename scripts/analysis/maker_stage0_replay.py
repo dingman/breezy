@@ -21,12 +21,17 @@ import argparse
 import datetime as dt
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
 
 from breezy.analysis.maker_tape_census import FirewallRefused
 from scripts.analysis import maker_stage0_driver as drv
+from scripts.analysis.maker_stage0_frozen import (
+    FrozenSetRefused,
+    parse_frozen_block,
+    parse_frozen_block_v2,
+)
 
 PROG: Final[str] = "maker_stage0_replay"
 HOME: Final[Path] = Path.home()
@@ -42,6 +47,8 @@ EXIT_OK: Final[int] = 0
 EXIT_REFUSED: Final[int] = 2
 EXIT_VOID: Final[int] = 3
 GIT_TIMEOUT_S: Final[int] = 30
+#: sha256 of the committed v1 declaration amendment: the only sha a block-1 verdict run may carry.
+V1_AMENDMENT_SHA256: Final[str] = "cf9a4dad826f61016b2616d32fbc1ca82f73b339b7da8e74fb6a9f25f4c818d0"
 #: Every failure BEFORE the ledger claim is a refusal (exit 2): the named refusals are all
 #: ValueError / RuntimeError subclasses, so the generic classes also cover EventError,
 #: LeakageError, LocalDayViolation, PNoStoreReadError, VerdictRefused, CSV errors and OSError.
@@ -166,8 +173,45 @@ def parse_args(argv: Sequence[str] | None = None) -> drv.RunConfig:
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _parsed_block(path: Path) -> int | None:
+    """The block number (1 or 2) of a readable amendment, else ``None`` (the driver owns that)."""
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for parse in (parse_frozen_block_v2, parse_frozen_block):
+        try:
+            return parse(text).block
+        except FrozenSetRefused:
+            continue
+    return None
+
+
+def _v1_sha_pin(cfg: drv.RunConfig) -> str | None:
+    """Verdict mode only: refuse a readable v1 block with another sha, or a v2 block with the
+    v1 sha. Unreadable or unparsable amendments are left to the driver's own refusals."""
+    if cfg.bench is not None or cfg.tail_only or cfg.verify_first:
+        return None
+    block = _parsed_block(cfg.amendment)
+    if block == 1 and cfg.amendment_sha != V1_AMENDMENT_SHA256:
+        return (
+            f"a v1 amendment block is pinned to sha {V1_AMENDMENT_SHA256}, got {cfg.amendment_sha}"
+        )
+    if block == 2 and cfg.amendment_sha == V1_AMENDMENT_SHA256:
+        return f"a v2 amendment block cannot carry the v1 pin sha {V1_AMENDMENT_SHA256}"
+    return None
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    pin_check: Callable[[drv.RunConfig], str | None] = _v1_sha_pin,
+) -> int:
     cfg = parse_args(argv)
+    refusal = pin_check(cfg)
+    if refusal is not None:
+        print(f"REFUSED: {refusal}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         summary = drv.run(cfg)
     except drv.RunVoided as exc:  # before REFUSALS: RunVoided is a RuntimeError

@@ -181,3 +181,88 @@ def test_verify_first_needs_no_replay_inputs_and_absent_ones_are_not_sentinels()
     cfg = cli.parse_args(argv)
     assert cfg.census_days is None and cfg.truth is None and cfg.node_log_dir is None
     assert cfg.trade_unit is None
+
+
+# --- C2b: the v1 amendment sha pin at the command-line layer ---------------------------------
+
+
+def _amendment_argv(path: Path, sha: str, *extra: str) -> list[str]:
+    argv = list(REQUIRED)
+    argv[argv.index("a.md")] = str(path)
+    argv[argv.index("ab" * 32)] = sha
+    return [*argv, *extra]
+
+
+def _recording_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[drv.RunConfig]:
+    seen: list[drv.RunConfig] = []
+
+    def run(cfg: drv.RunConfig) -> drv.RunSummary:
+        seen.append(cfg)
+        return drv.RunSummary(run_dir=tmp_path, label=None, code_sha="c0ffee", mode="verdict")
+
+    monkeypatch.setattr(drv, "run", run)
+    return seen
+
+
+def test_cli_refuses_v1_block_for_any_other_sha(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.unit.test_maker_stage0_frozen_v2 import V1_BLOCK
+
+    seen = _recording_run(monkeypatch, tmp_path)
+    amendment = tmp_path / "v1.md"
+    amendment.write_text("# v1\nStatus: FINAL\n\n" + V1_BLOCK)
+    assert cli.main(_amendment_argv(amendment, "ab" * 32)) == 2
+    err = capsys.readouterr().err
+    assert "REFUSED" in err and cli.V1_AMENDMENT_SHA256 in err and not seen
+    assert cli.main(_amendment_argv(amendment, cli.V1_AMENDMENT_SHA256)) == 0
+    assert len(seen) == 1
+
+
+def test_cli_refuses_v2_block_with_the_v1_sha(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.fixtures.maker_stage0.frozen_v2 import v2_fields, v2_text
+
+    seen = _recording_run(monkeypatch, tmp_path)
+    amendment = tmp_path / "v2.md"
+    amendment.write_text(v2_text(v2_fields()))
+    assert cli.main(_amendment_argv(amendment, cli.V1_AMENDMENT_SHA256)) == 2
+    assert "REFUSED" in capsys.readouterr().err and not seen
+    assert cli.main(_amendment_argv(amendment, "ab" * 32)) == 0
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("mode", [["--bench", "4"], ["--tail-only"], ["--verify-first"]])
+def test_cli_bench_and_verify_first_unaffected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: list[str]
+) -> None:
+    from tests.unit.test_maker_stage0_frozen_v2 import V1_BLOCK
+
+    seen = _recording_run(monkeypatch, tmp_path)
+    amendment = tmp_path / "v1.md"
+    amendment.write_text("# v1\nStatus: FINAL\n\n" + V1_BLOCK)
+    assert cli.main(_amendment_argv(amendment, "ab" * 32, *mode)) == 0
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "body", [None, b"\xff\xfe not utf-8", b"no block here", b"```FROZEN_DATE_SET\n```"]
+)
+def test_cli_unreadable_amendment_defers_to_driver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: bytes | None
+) -> None:
+    seen = _recording_run(monkeypatch, tmp_path)
+    amendment = tmp_path / "x.md"
+    if body is not None:
+        amendment.write_bytes(body)
+    assert cli.main(_amendment_argv(amendment, "ab" * 32)) == 0
+    assert len(seen) == 1  # the driver, not the CLI pin, owns every unreadable-amendment refusal
+
+
+def test_cli_pin_check_is_an_injectable_seam(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = _recording_run(monkeypatch, tmp_path)
+    assert cli.main(REQUIRED, pin_check=lambda _cfg: "seam says no") == 2
+    assert "seam says no" in capsys.readouterr().err and not seen

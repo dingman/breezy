@@ -144,7 +144,8 @@ def _check_block_first_day(value: object) -> None:
     """A recorded block day is an ISO date string; null or anything else is refused."""
     if not isinstance(value, str):
         raise TypeError("block_first_day")
-    dt.date.fromisoformat(value)
+    if dt.date.fromisoformat(value).isoformat() != value:
+        raise ValueError("block_first_day is not canonical ISO")
 
 
 def _read_entries(ledger: Path) -> list[Entry]:
@@ -270,6 +271,13 @@ def claim_verdict_run(
 
     A returned string is the refusal reason and nothing was written.
     """
+    if block_first_day is not None:
+        try:
+            _check_block_first_day(block_first_day)
+        except (TypeError, ValueError) as exc:
+            raise LedgerRefused(
+                f"block_first_day {block_first_day!r} is not canonical ISO"
+            ) from exc
     with _locked(ledger):
         reason = _refusal(
             _read_entries(ledger), amendment_sha, runs_root, addendum, block_first_day
