@@ -64,7 +64,7 @@ class Env:
     def fake(
         self, *, day_from: dt.date, day_to: dt.date, out: Path, env: dict[str, str], **kw: Any
     ) -> int:
-        self.calls.append({"from": day_from, "to": day_to, "env": env, **kw})
+        self.calls.append({"from": day_from, "to": day_to, "env": env, "out": out, **kw})
         days = [day_from + dt.timedelta(days=i) for i in range((day_to - day_from).days + 1)]
         guard.write_counts_only(out, [r for d in days for r in self.rows_for(d)])
         return 0
@@ -225,3 +225,57 @@ def test_check_nothing_to_do_before_s_plus_two(
     assert env.run("check", today=(S + _ONE).isoformat()) == 0  # to = S-1 < S
     assert "nothing to check" in capsys.readouterr().out
     assert env.calls == []
+
+
+def test_rerun_after_partial_append_never_duplicates_rows(env: Env) -> None:
+    env.work.mkdir(parents=True)
+    first_day = _covered(S, n=1)
+    (env.work / "trigger_rows.jsonl").write_text(_line(first_day[0]) + "\n")  # crash window
+    assert env.run("check", today="2026-10-21") == 0
+    days = [r["climate_day"] for r in env.rows() if "CROSSED" not in r]
+    assert days.count(S.isoformat()) == 1  # S was never appended twice
+    assert env.calls[0]["from"] == S + _ONE  # resumed after the last appended row
+
+
+def test_rerun_skips_days_already_present_in_an_overlapping_census(env: Env) -> None:
+    env.work.mkdir(parents=True)
+    (env.work / "trigger_rows.jsonl").write_text("".join(_line(r) + "\n" for r in _covered(S)))
+    (env.work / "checked_through.txt").write_text((S - _ONE).isoformat() + "\n")
+    assert env.run("check", today="2026-10-21") == 0
+    assert [r["climate_day"] for r in env.rows() if "CROSSED" not in r].count(S.isoformat()) == 4
+
+
+def test_each_attempt_writes_its_own_counts_file(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trig, "first_crossing", lambda rows: None)
+    assert env.run("check", today="2026-10-16") == 0
+    (env.work / "checked_through.txt").unlink()  # simulate a crash before the state update
+    (env.work / "trigger_rows.jsonl").unlink()
+    assert env.run("check", today="2026-10-16") == 0  # same range: no sealed-file deadlock
+    assert len({c["out"] for c in env.calls}) == 2
+
+
+def test_corrupt_rows_file_refused(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    env.work.mkdir(parents=True)
+    bad = {**_covered(S, n=1)[0], "station": 7}
+    rows = env.work / "trigger_rows.jsonl"
+    rows.write_text(json.dumps(bad) + "\n")
+    assert env.run("check", today="2026-10-21") == 2
+    rows.write_text(json.dumps({"CROSSED": True}) + "\n")  # missing E
+    assert env.run("check", today="2026-10-21") == 2
+    assert env.run("close") == 2
+    assert env.calls == [] and "REFUSED" in capsys.readouterr().err
+
+
+def test_census_argv_matches_census_parser_flags(tmp_path: Path) -> None:
+    from scripts.analysis.maker_stage0_trigger_io import census_argv
+
+    argv = census_argv(
+        day_from=S, day_to=S, out=tmp_path / "o", read_ledger=tmp_path / "l",
+        trigger_close=tmp_path / "c", declaration=tmp_path / "d.md",
+    )  # fmt: skip
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "scripts" / "analysis" / "maker_tape_census.py").read_text()
+    flags = [a for a in argv if a.startswith("--")]
+    assert len(flags) == 7
+    for flag in flags:
+        assert f'add_argument("{flag}"' in source, flag

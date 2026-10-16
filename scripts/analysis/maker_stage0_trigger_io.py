@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from breezy.analysis.maker_search_declarations import SEARCH_DECLARATIONS
-from scripts.analysis.maker_stage0_trigger_rule import TriggerRow
+from scripts.analysis.maker_stage0_trigger_rule import TriggerRow, trigger_rows_from_records
 from scripts.analysis.maker_tape_census_guard import COUNT_FIELDS, read_ledger_lines
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -71,7 +71,10 @@ def canonical(row: Mapping[str, object]) -> str:
 
 
 def load_state(rows_path: Path) -> tuple[list[dict[str, Any]], dt.date | None]:
-    """Data rows in file order, and E of the terminal CROSSED row (None before a crossing)."""
+    """Data rows in file order, and E of the terminal CROSSED row (None before a crossing).
+
+    Every reloaded data row is re-validated strictly (hash-pinned rows are never coerced).
+    """
     rows: list[dict[str, Any]] = []
     crossed: dt.date | None = None
     if not rows_path.exists():
@@ -80,20 +83,18 @@ def load_state(rows_path: Path) -> tuple[list[dict[str, Any]], dt.date | None]:
         if not text.strip():
             continue
         record = json.loads(text)
-        if "CROSSED" in record:
+        if isinstance(record, dict) and "CROSSED" in record:
+            if set(record) != {"CROSSED", "E"} or record["CROSSED"] is not True:
+                raise TriggerRefused("malformed terminal CROSSED row")
             crossed = dt.date.fromisoformat(record["E"])
         else:
             rows.append(record)
+    trigger_rows_from_records(rows)  # raises InputRefused on any malformed reloaded row
     return rows, crossed
 
 
 def as_trigger_rows(records: Iterable[Mapping[str, Any]]) -> list[TriggerRow]:
-    return [
-        TriggerRow(
-            r["station"], dt.date.fromisoformat(r["climate_day"]), r["reason"], r["first_seen_ns"]
-        )
-        for r in records
-    ]
+    return trigger_rows_from_records(records)
 
 
 def row_dict(row: TriggerRow) -> dict[str, Any]:
@@ -121,25 +122,30 @@ def write_checked_through(work_root: Path, day: dt.date) -> None:
     (work_root / CHECKED_NAME).write_text(day.isoformat() + "\n", encoding="utf-8")
 
 
-def run_counts_only(  # pragma: no cover - the live census; tests replace it
+def census_argv(
     *,
     day_from: dt.date,
     day_to: dt.date,
     out: Path,
-    env: dict[str, str],
     read_ledger: Path,
     trigger_close: Path,
     declaration: Path,
-) -> int:
-    """One counts-only census over [day_from, day_to]; ``env`` carries the lock nonce."""
-    out.parent.mkdir(parents=True, exist_ok=True)
-    argv = [
+) -> list[str]:
+    """The counts-only census command line (flags pinned against its parser by a test)."""
+    return [
         sys.executable, "-m", "scripts.analysis.maker_tape_census",
         "--from", day_from.isoformat(), "--to", day_to.isoformat(), "--counts-only",
         "--output", str(out), "--read-ledger", str(read_ledger),
         "--trigger-close", str(trigger_close), "--search-declaration", str(declaration),
     ]  # fmt: skip
-    return subprocess.run(argv, env=env, cwd=REPO_ROOT, check=False).returncode
+
+
+def run_counts_only(  # pragma: no cover - the live census; tests replace it
+    *, env: dict[str, str], **kwargs: Any
+) -> int:
+    """One counts-only census over [day_from, day_to]; ``env`` carries the lock nonce."""
+    kwargs["out"].parent.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(census_argv(**kwargs), env=env, cwd=REPO_ROOT, check=False).returncode
 
 
 def forfeiture(ledger: Path, end: dt.date) -> int:

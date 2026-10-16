@@ -20,18 +20,17 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from breezy.analysis.maker_search_declarations import SEARCH_DECLARATIONS, TRIGGER_CHECK_ENV
+from breezy.analysis.maker_search_declarations import TRIGGER_CHECK_ENV
 from scripts.analysis import maker_stage0_trigger_io as tio
 from scripts.analysis import maker_tape_census_guard as guard
 from scripts.analysis.maker_stage0_inputs import InputRefused
-from scripts.analysis.maker_stage0_trigger_io import TriggerRefused, run_counts_only
+from scripts.analysis.maker_stage0_trigger_io import ROW, TriggerRefused, run_counts_only
 from scripts.analysis.maker_stage0_trigger_rule import (
     first_crossing,
     n_eff_proxy,
     read_trigger_rows,
 )
 
-ROW = SEARCH_DECLARATIONS[1]  # Doc A: the second-look registry row
 _ONE_DAY = dt.timedelta(days=1)
 _EXIT_REFUSED = 2
 
@@ -47,7 +46,10 @@ def _append_days(
 ) -> dt.date | None:
     """Append day by day, evaluating the crossing after each; returns E when it crossed."""
     ordered = sorted(new, key=lambda r: (str(r["climate_day"]), str(r["station"])))
+    done = {str(r["climate_day"]) for r in seen}  # idempotent: a re-run never duplicates a day
     for day, group in itertools.groupby(ordered, key=lambda r: str(r["climate_day"])):
+        if day in done:
+            continue
         batch = list(group)
         tio.append_lines(work / tio.ROWS_NAME, [tio.canonical(r) for r in batch])
         seen.extend(batch)
@@ -67,12 +69,15 @@ def _check(args: argparse.Namespace) -> int:
         seen, crossed = tio.load_state(work / tio.ROWS_NAME)
         if crossed is not None:
             raise TriggerRefused(f"already crossed at E={crossed}; no further check is allowed")
-        window = _window(tio.read_checked_through(work), args.today or guard.utc_today())
+        last_row = max((dt.date.fromisoformat(r["climate_day"]) for r in seen), default=None)
+        stamped = [d for d in (tio.read_checked_through(work), last_row) if d is not None]
+        window = _window(max(stamped, default=None), args.today or guard.utc_today())
         if window is None:
             print("trigger: nothing to check")
             return 0
         first, last = window
-        counts = work / "counts" / f"{first}_{last}.jsonl"
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")  # one file per attempt
+        counts = work / "counts" / f"{first}_{last}_{stamp}.jsonl"
         env = {**os.environ, TRIGGER_CHECK_ENV: nonce}  # the child's env only; ours is untouched
         code = run_counts_only(
             day_from=first, day_to=last, out=counts, env=env, read_ledger=args.read_ledger,
@@ -92,6 +97,10 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _close(args: argparse.Namespace) -> int:
+    """Seal E once. ``rows_chain_sha256`` chains the rows <= E only (from GENESIS), so it is NOT
+    comparable to the read-ledger's per-invocation chain; ``rows_sha256`` is the verification
+    object.
+    """
     if args.trigger_close.exists():
         raise TriggerRefused(f"{args.trigger_close} exists; close is once-only")
     rows, crossed = tio.load_state(args.work_root / tio.ROWS_NAME)
@@ -137,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(sys.argv[1:] if argv is None else argv)
     try:
         return _check(args) if args.command == "check" else _close(args)
-    except (TriggerRefused, InputRefused, ValueError, OSError) as exc:
+    except (TriggerRefused, InputRefused, ValueError, KeyError, OSError) as exc:
         print(f"trigger: REFUSED {type(exc).__name__}: {exc}", file=sys.stderr)
         return _EXIT_REFUSED
 

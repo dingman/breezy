@@ -73,6 +73,11 @@ def _row_of(record: object, number: int) -> TriggerRow:
         raise InputRefused(f"trigger row {number}: malformed value ({type(exc).__name__})") from exc
 
 
+def trigger_rows_from_records(records: Iterable[object]) -> list[TriggerRow]:
+    """Strictly validate parsed records (the same checks ``read_trigger_rows`` applies)."""
+    return [_row_of(record, number) for number, record in enumerate(records, start=1)]
+
+
 def read_trigger_rows(path: Path) -> list[TriggerRow]:
     """A JSONL of exactly the four counts-only keys; any other key is refused."""
     try:
@@ -80,4 +85,4 @@ def read_trigger_rows(path: Path) -> list[TriggerRow]:
         records = [json.loads(line) for line in lines if line.strip()]
     except (OSError, ValueError) as exc:
         raise InputRefused(f"trigger rows {path.name} unreadable ({type(exc).__name__})") from exc
-    return [_row_of(record, number) for number, record in enumerate(records, start=1)]
+    return trigger_rows_from_records(records)

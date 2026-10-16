@@ -2007,7 +2007,14 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
   close [--repo-copy PATH]` runs only after a crossing or once `checked_through` reaches the cap. It
   writes `trigger_close.json` (`E`, `crossed`, `rows_sha256`, `rows_chain_sha256`, `closed_at`; once only),
   prints the forfeiture re-verified against the read-ledger (`4 x (max invoked day - S + 1)`), and copies
-  the rows up to `E` for the coordinator to commit.
+  the rows up to `E` for the coordinator to commit. `rows_chain_sha256` is the chain over rows <= `E`
+  only (from the genesis chain), NOT comparable to the read-ledger's per-invocation chain;
+  `rows_sha256` is the verification object.
+- **Crash recovery.** Each attempt writes its own sealed `counts/<first>_<last>_<utc-stamp>.jsonl`, so a
+  crash after the census never deadlocks on a 0400 file (the failed attempt still counts toward
+  forfeiture). Rows are appended day by day and a re-run resumes after the last appended row, so a crash
+  between append and the `checked_through.txt` write never duplicates rows. A corrupt rows file is
+  refused (exit 2) and must be inspected by hand.
 - **Parked; how to enable.** The coordinator, after merge and a gate reading `EXIT=0`, symlinks both
   files into `~/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
   `systemctl --user enable --now breezy-maker-s2-trigger.timer`. To park again:
