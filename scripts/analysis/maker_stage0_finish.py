@@ -16,6 +16,7 @@ from scripts.analysis import maker_stage0_modes as modes
 from scripts.analysis import maker_stage0_render as render
 from scripts.analysis import maker_stage0_report as report
 from scripts.analysis import maker_stage0_verdict as vd
+from scripts.analysis.maker_stage0_block_lines import block_lines
 from scripts.analysis.maker_stage0_inputs import load_trade_unit, sha256_file, write_text_atomic
 from scripts.analysis.maker_stage0_pins import (
     CANONICAL_SIDECARS,
@@ -113,6 +114,7 @@ def finish(
         unknown_delta=out.unknown_delta,
         no_final_days=report.no_final_days(scored.sd_rows),
     )
+    holdout_line, d5_line = block_lines(pre.frozen)
     hypotheses = [u.name for u in load_trade_unit(cfg.need("trade_unit")).hypotheses()]
     try:
         tables = tables_from_csvs(
@@ -123,12 +125,13 @@ def finish(
             code_sha=pre.code_sha,
         )
     except vd.NoBidBearingDays as exc:  # S-4: a reported stop, never a void
-        return _stop_s4(cfg, pre, pins, phases, out, str(exc), disclosures)
+        return _stop_s4(cfg, pre, pins, phases, out, str(exc), disclosures, (holdout_line, d5_line))
     write_text_atomic(d / "s3_inputs.json", tables["s3"])
     variants = {name: out.rows.get(name, []) for name in VARIANT_FILES}
     text = render.render_report(
         tables, pins, variants, scored.sd_rows,
         run_id=d.name, hypotheses=hypotheses, disclosures=disclosures,
+        holdout_line=holdout_line, d5_line=d5_line,
     )  # fmt: skip
     write_text_atomic(d / "report.md", text)
     phases.append("report")
@@ -138,11 +141,14 @@ def finish(
 
 def _stop_s4(
     cfg: RunConfig, pre: Pre, pins: dict[str, Any], phases: list[str], out: LoopOutput,
-    why: str, disclosures: render.Disclosures,
+    why: str, disclosures: render.Disclosures, lines: tuple[str, str],
 ) -> RunSummary:  # fmt: skip
     d = cfg.out_dir
     write_json(d / "s3_inputs.json", render.stop_s3_inputs())
-    text = render.render_stop_report(pins, run_id=d.name, reason=why, disclosures=disclosures)
+    text = render.render_stop_report(
+        pins, run_id=d.name, reason=why, disclosures=disclosures,
+        holdout_line=lines[0], d5_line=lines[1],
+    )  # fmt: skip
     write_text_atomic(d / "report.md", text)
     phases.append("report")
     modes.write_manifest(cfg, pre, "verdict", phases, out.parity, verdict=render.STOP_S4)

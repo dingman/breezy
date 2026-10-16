@@ -98,7 +98,7 @@ _D8 = (
 )
 
 
-def disclosures_block(d: Disclosures) -> str:
+def disclosures_block(d: Disclosures, d5_line: str = _D5) -> str:
     """The ``## Disclosures`` section: every WP6 ruling that the verdict is read against."""
     counts = {**dict.fromkeys(ABSTAIN_REASONS, 0), **d.abstentions}
     lines = [_D1, _D2, *(f"  - abstain {reason}: {n}" for reason, n in sorted(counts.items()))]
@@ -110,7 +110,7 @@ def disclosures_block(d: Disclosures) -> str:
         ]
     listed = f" ({', '.join(d.listing_abstained)})" if d.listing_abstained else ""
     lines += [
-        _D5,
+        d5_line,
         f"  - no-FINAL station-days excluded: {d.no_final_days}",
         _D6,
         _D8,
@@ -214,6 +214,8 @@ def render_report(
     run_id: str,
     hypotheses: Sequence[str],
     disclosures: Disclosures,
+    holdout_line: str = HOLDOUT_LINE,
+    d5_line: str = _D5,
 ) -> str:
     """The evidence Markdown: verdict, tables (verbatim reproducible blocks), pins, holdout line."""
     parts = [
@@ -252,8 +254,8 @@ def render_report(
             "bench",
         )
     ]
-    parts += [disclosures_block(disclosures), _pins_block(pins)]
-    parts += ["## Holdout\n", HOLDOUT_LINE + "\n"]
+    parts += [disclosures_block(disclosures, d5_line), _pins_block(pins)]
+    parts += ["## Holdout\n", holdout_line + "\n"]
     return "\n".join(parts)
 
 
@@ -263,7 +265,13 @@ def stop_s3_inputs() -> dict[str, object]:
 
 
 def render_stop_report(
-    pins: Mapping[str, Any], *, run_id: str, reason: str, disclosures: Disclosures
+    pins: Mapping[str, Any],
+    *,
+    run_id: str,
+    reason: str,
+    disclosures: Disclosures,
+    holdout_line: str = HOLDOUT_LINE,
+    d5_line: str = _D5,
 ) -> str:
     """The S-4 report: the verdict, why, the pins and the holdout line (no tables to render)."""
     return "\n".join(
@@ -279,9 +287,9 @@ def render_stop_report(
                 "dated declaration (a STOP run holds `scored_episodes.csv`, so an addendum "
                 "re-run is refused).\n"
             ),
-            disclosures_block(disclosures),
+            disclosures_block(disclosures, d5_line),
             _pins_block(pins),
             "## Holdout\n",
-            HOLDOUT_LINE + "\n",
+            holdout_line + "\n",
         ]
     )
