@@ -316,4 +316,22 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Prevention:** A host-path production default must refuse unless inside its exact unit name and not under pytest (`"pytest" in sys.modules`); before unlocking any such path, grep `tests/` for un-injected calls and quarantine spurious artefacts by move.
 **Applied:** 2026-10-11
 **Last updated:** 2026-10-11
+### L-58 — A unit cap is derived from the measured wall of the same job, never guessed (2026-10-16)
+**Mistake:** Bench 4 of the S2 replay was launched under a 1,800 s RuntimeMaxSec although the previous bench 4 had taken 3,072 s; systemd killed it and an hour of the launch window was lost.
+**Prevention:** Before `systemd-run`, read the last measured wall for that exact job from its log and set RuntimeMaxSec ≥ 1.75× it (window-bounded if needed); a cap below the measured wall is a launch error, never evidence about the job.
+**Applied:** 2026-10-16
+**Last updated:** 2026-10-16
+
+### L-59 — Validate a screen's input distribution on the block before the verdict run (2026-10-16)
+**Mistake:** The S-7 clock-offset screen was built on a per-instance max of single-frame offsets; one stale venue transactTime sample (789.8 s) voided the only verdict run after a 2 h preamble and burned a ledger claim, although the block's offsets were available days earlier.
+**Prevention:** For every pre-registered screen (S-*), compute its statistic on the frozen block offline (offsets, counts, timestamps only; no fills, rates or labels) before the verdict launch, and treat a trip on that dry run as a design question for the peer loop, not as a run-time surprise.
+**Applied:** 2026-10-16
+**Last updated:** 2026-10-16
+
+### L-60 — A power floor is predicted from the estimator the verdict uses, not from the census headline (2026-10-16)
+**Mistake:** S1's census reported n_eff_ub 38.4 on all COVERED station-days, so V0 was not expected; the pre-registered V0 counts only bid-bearing station-days (listed before D-1 12:00Z), which halved the sample to n_eff_gov 18.73 and produced UNDERPOWERED-WAIT after the full run.
+**Prevention:** Before launching a verdict run, recompute every floor with the verdict's own estimator and inclusion predicate (here `listed_in_time` ∧ COVERED), record the prediction in the procedure, and treat a predicted WAIT as a reason to extend the block first.
+**Applied:** 2026-10-16
+**Last updated:** 2026-10-16
+
 Full pre-consolidation text (how-to-apply checks, amendments): docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md
