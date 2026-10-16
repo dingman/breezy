@@ -7,28 +7,43 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MODULES = sorted((_ROOT / "scripts" / "analysis").glob("maker_stage0_*.py"))
-_DATE = re.compile(r"\bdate\(\s*2026\b|\b2026-\d\d-\d\d\b")
+_DATE = re.compile(r"\b(?:date|datetime)\(\s*2026\b|\b2026-\d\d-\d\d\b")
 # doc paths (contain "/" or end in ".md") are exempt: stripped before matching
 _DOC_PATH = re.compile(r"[\w.\-]*(?:/[\w.\-]*)+|[\w.\-]+\.md\b")
 
 #: the exact set of (file, line-substring) pairs for the intended literals
 ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
-        ("maker_stage0_frozen.py", "outside the rule, 2026-10-01 (sealed holdout day)"),
-        ("maker_stage0_frozen.py", "``min(2026-10-13, last FINAL day"),
+        (
+            "maker_stage0_frozen.py",
+            "outside the rule, 2026-10-01 (sealed holdout day), a date after 2026-10-13, an NYC",
+        ),
+        (
+            "maker_stage0_frozen.py",
+            "``min(2026-10-13, last FINAL day of the pinned truth CSV)``, 2026-10-01 excluded.",
+        ),
         ("maker_stage0_frozen.py", "SEALED_DAY: Final[dt.date] = dt.date(2026, 10, 1)"),
         ("maker_stage0_frozen.py", "LAST_ALLOWED_DAY: Final[dt.date] = dt.date(2026, 10, 13)"),
-        ("maker_stage0_frozen.py", "FIRST_REPLAYABLE_CHOICES"),
-        ("maker_stage0_frozen.py", "minus 2026-10-01."),
+        ("maker_stage0_frozen.py", "(dt.date(2026, 9, 18), dt.date(2026, 9, 19))"),
+        ("maker_stage0_frozen.py", "min(2026-10-13, last FINAL day), minus 2026-10-01."),
         ("maker_stage0_frozen.py", "SECOND_LOOK_FIRST_DAY: Final[dt.date] = dt.date(2026, 10, 14)"),
         ("maker_stage0_frozen.py", "SECOND_LOOK_MAX_DAY: Final[dt.date] = dt.date(2026, 11, 15)"),
         ("maker_stage0_frozen.py", "min(trigger_day, last_final_day, 2026-11-15)"),
-        ("maker_stage0_driver.py", "TAIL_RANGE: tuple[dt.date, dt.date] = (dt.date(2026, 7, 1)"),
-        ("maker_stage0_render.py", "Holdout touch: replay days 2026-09-18..2026-09-30"),
-        ("maker_stage0_render.py", "inside the frozen NBP holdout [2026-07-01, 2026-10-02)"),
-        ("maker_stage0_render.py", "2026-10-01 is sealed and never read"),
+        ("maker_stage0_driver.py", "(dt.date(2026, 7, 1), dt.date(2026, 9, 17))"),
+        (
+            "maker_stage0_render.py",
+            "replay days 2026-09-18..2026-09-30 and tail days 2026-07-01..2026-09-17 lie",
+        ),
+        ("maker_stage0_render.py", "holdout [2026-07-01, 2026-10-02);"),
+        (
+            "maker_stage0_render.py",
+            "descriptive evidence only. 2026-10-01 is sealed and never read;",
+        ),
         ("maker_stage0_render.py", "2026-10-02..2026-10-13 statistics are disclosed"),
-        ("maker_stage0_render.py", "days 2026-09-18..2026-09-30 are already past D+14"),
+        (
+            "maker_stage0_render.py",
+            "(days 2026-09-18..2026-09-30 are already past D+14 at run time)",
+        ),
         ("maker_stage0_block_lines.py", "holdout ruling 2026-10-03"),
         ("maker_stage0_runio.py", "(2026-09-17 00:00Z..17:00Z)"),
         ("maker_stage0_inputs.py", "sealed 2026-10-01, days after 2026-10-13"),

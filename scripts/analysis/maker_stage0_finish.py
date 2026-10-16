@@ -87,6 +87,16 @@ def _extra_pins(cfg: RunConfig, run_dir: Path) -> dict[str, Any]:
     return {"episodes_jsonl": _file_pin(run_dir / "episodes.jsonl"), "tail_csv_source": tail}
 
 
+def _disclosures(out: LoopOutput, scored: report.Scored) -> render.Disclosures:
+    return render.Disclosures(
+        abstentions=out.abstentions,
+        rounding=out.rounding,
+        listing_abstained=tuple(sorted(out.listing_abstained)),
+        unknown_delta=out.unknown_delta,
+        no_final_days=report.no_final_days(scored.sd_rows),
+    )
+
+
 def finish(
     cfg: RunConfig, pre: Pre, out: LoopOutput, manifest: CatalogSliceManifest, phases: list[str]
 ) -> RunSummary:
@@ -107,13 +117,7 @@ def finish(
     sources = pin_sources(cfg, pre, consumed, SIDECAR_NAMES)
     pins = {**seal_sidecars(pin_inputs(sources), d), **_extra_pins(cfg, d)}
     write_pins(d, pins)
-    disclosures = render.Disclosures(
-        abstentions=out.abstentions,
-        rounding=out.rounding,
-        listing_abstained=tuple(sorted(out.listing_abstained)),
-        unknown_delta=out.unknown_delta,
-        no_final_days=report.no_final_days(scored.sd_rows),
-    )
+    disclosures = _disclosures(out, scored)
     holdout_line, d5_line = block_lines(pre.frozen)
     hypotheses = [u.name for u in load_trade_unit(cfg.need("trade_unit")).hypotheses()]
     try:
