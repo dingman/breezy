@@ -1,5 +1,8 @@
 # G-14 — reboot-durable supervision for the quote tape and retired K1 study
 
+> **2026-10-19:** the quote tape lives at `/mnt/storage/breezy/catalog/quote_tape/polymarket_us`; `~/.local/share/breezy/catalog/quote_tape/polymarket_us` is a symlink to it and is LOAD-BEARING for `breezy-maker-s2-trigger.service` (the census takes only `--catalog-root`, default = that path). Do not remove it while MAKER S2 runs. The recorder/ingest units use the real path via `catalog-on-storage.conf` drop-ins. See `docs/plans/backlog/BLOCKERS_2026-10-19/plan_r2.md` B6(b).
+
+
 **Status: ACTIVATED; K1 scheduled unit RETIRED 2026-09-27 per
 `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md`.** (The 09-12
 header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26 12:40Z
