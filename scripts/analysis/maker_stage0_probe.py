@@ -1,4 +1,4 @@
-"""MAKER S2 WP0 -- the read-only Stage-0 probe (I/O layer and report).
+"""MAKER S2 WP0 -- the read-only Stage-0 probe (I/O layer).
 
 Plan: docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r3.md WP0 (L108-117) and
 S2_stage0_replay_plan_r4_delta.md (b), (e), (g), (i)3. Pure rules: ``maker_stage0_probe_core``.
@@ -11,6 +11,7 @@ The caller (the driver) enforces the licence: ``probe`` and ``first_print_instan
 ``station_day_key``). Depth and trade queries are bounded to [D-1 12:00Z, end of the D+1 window].
 Delta and live/gap hours use S1's bid-live window (``bidlive_window_ns``). The listing instant is
 the earliest ``BinaryOption.ts_init`` -- the field S1 uses for ``first_seen_ns``.
+``ProbeReport`` and ``CLOCKS`` live in ``maker_stage0_probe_report`` and are re-exported here.
 ``ProbeReport.require_clean`` raises the S-2 STOP after ``wp0_agreement.json`` is written.
 """
 
@@ -53,6 +54,7 @@ from scripts.analysis.maker_stage0_probe_frames import (
     fold_directions,
     read_depth_frames,
 )
+from scripts.analysis.maker_stage0_probe_report import CLOCKS, ProbeReport
 from scripts.analysis.maker_stage0_release import release_free_heap
 
 from scripts.analysis.maker_stage0_clock_offset import (  # isort: skip
@@ -61,13 +63,14 @@ from scripts.analysis.maker_stage0_clock_offset import (  # isort: skip
 from scripts.analysis.maker_stage0_probe_core import (  # isort: skip
     CensusCounts, CensusViolation, DirectionResult, Frame, Gap, SideTally, StationDay,
     StationDayCoverage, StopS2, classify_direction, count_census, direction_result, distribution,
-    enforce_direction, first_replayable_day, gap_free_frames, flat_fields, ladder_parity,
+    enforce_direction, first_replayable_day, gap_free_frames, ladder_parity,
     listing_abstain, live_and_gap_hours, mid_of, reassert_census, station_day_key, unique_prints,
 )  # fmt: skip
 
 __all__ = [
-    "CensusCounts", "CensusViolation", "DirectionResult", "Frame", "Gap", "InstanceDayDelta",
-    "ProbeReport", "SideTally", "StationDayCoverage", "StopS2", "classify_direction",
+    "CLOCKS", "CensusCounts", "CensusViolation", "DirectionResult", "Frame", "Gap",
+    "InstanceDayDelta", "ProbeReport", "SideTally", "StationDayCoverage", "StopS2",
+    "classify_direction",
     "count_census", "direction_result", "distribution", "enforce_direction",
     "first_print_instant", "first_replayable_day", "gap_free_frames", "instance_day_deltas",
     "ladder_parity", "listing_abstain", "live_and_gap_hours", "mid_of", "probe", "reassert_census",
@@ -82,64 +85,8 @@ _DIRECTION_STREAMS: Final[tuple[type, ...]] = (
     OrderBookDepth10,
     DepthTruncation,
 )
-CLOCKS: Final[Mapping[str, str]] = {
-    "depth_ts_event": "venue transactTime (parsing.py:777-779)",
-    "print_ts_event": "venue tradeTime (parsing.py:971)",
-    "gap_started_ns_ended_ns": "recorder node clock (data.py _clock.timestamp_ns), compared "
-    "with venue-clock frame ts_event; edge skew is bounded by delta_ns",
-    "listing_ns": "BinaryOption.ts_init, recorder receipt (same field as S1 first_seen_ns)",
-    "forecast_available_at_ns": "UTC-anchored",
-}
 _Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
 _ONE_DAY: Final = dt.timedelta(days=1)
-
-
-# --- Report ---------------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
-class ProbeReport:
-    """Everything WP0 measures; ``to_dict`` is the ``wp0_agreement.json`` sidecar."""
-
-    days: tuple[str, ...]
-    stations: tuple[str, ...]
-    first_print_ns: int | None
-    first_replayable_day: str | None
-    direction: DirectionResult
-    control: DirectionResult | None
-    census: CensusCounts
-    depth_frames: int
-    truncated_frames: int
-    coverage: tuple[StationDayCoverage, ...]
-    delta_instance_days: tuple[InstanceDayDelta, ...]
-    delta_distribution: Mapping[str, int | None]
-    ladder_parity: Mapping[str, Mapping[str, object]]
-    skipped: Mapping[str, str] = field(default_factory=dict)  # instance_id -> reason
-
-    def require_clean(self) -> None:
-        """Raise ``CensusViolation`` / ``StopS2``; the sidecar is written BEFORE this is called."""
-        reassert_census(self.census)
-        enforce_direction(self.direction)
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-serialisable sidecar payload."""
-        share = self.truncated_frames / self.depth_frames if self.depth_frames else None
-        return {
-            "days": list(self.days),
-            "stations": list(self.stations),
-            "first_print_ns": self.first_print_ns,
-            "first_replayable_day": self.first_replayable_day,
-            "direction": self.direction.to_dict(),
-            "positive_control": None if self.control is None else self.control.to_dict(),
-            "census": flat_fields(self.census),
-            "depth_frames": self.depth_frames,
-            "truncated_frames": self.truncated_frames,
-            "truncated_frame_share": share,
-            "coverage": [flat_fields(c) for c in self.coverage],
-            "delta_instance_days": [flat_fields(d) for d in self.delta_instance_days],
-            "delta_distribution": dict(self.delta_distribution),
-            "ladder_parity": {k: dict(v) for k, v in self.ladder_parity.items()},
-            "skipped_instances": dict(self.skipped),
-            "clocks": dict(CLOCKS),
-        }
 
 
 # --- I/O ------------------------------------------------------------------------------
