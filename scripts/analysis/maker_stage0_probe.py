@@ -87,6 +87,7 @@ _DIRECTION_STREAMS: Final[tuple[type, ...]] = (
 )
 _Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
 _ONE_DAY: Final = dt.timedelta(days=1)
+_ONE_DAY_NS: Final[int] = 86_400 * 1_000_000_000
 
 
 # --- I/O ------------------------------------------------------------------------------
@@ -125,6 +126,32 @@ def _query_bounds(days: Collection[dt.date], stations: Collection[str]) -> tuple
     start = min(_maker_window(s, d).start_ns for s in stations for d in days)
     end = max(_maker_window(s, d + _ONE_DAY).end_ns for s in stations for d in days)
     return start, end
+
+
+def prefilter_cutoff_ns(
+    days: Collection[dt.date],
+    stations: Collection[str],
+    *,
+    earliest_licensed_ns: int | None = None,
+) -> int | None:
+    """One day before the block (or the listing, if earlier); None when the block is empty."""
+    if not days or not stations:
+        return None
+    base = _query_bounds(days, stations)[0] - _ONE_DAY_NS
+    if earliest_licensed_ns is not None:
+        return min(base, earliest_licensed_ns)
+    return base
+
+
+def _prefilter_reason(instance_dir: Path, cutoff_ns: int) -> str | None:
+    """Skip when the newest feather is strictly older. Empty or ``OSError`` fails open."""
+    try:
+        newest = max((row[2] for row in sc._signature(instance_dir)), default=None)
+    except OSError:
+        return None
+    if newest is None or newest >= cutoff_ns:
+        return None
+    return f"prefilter: last_written_ns {newest} < cutoff_ns {cutoff_ns}"
 
 
 def _read_instance(
@@ -195,17 +222,27 @@ def _for_each_clean_instance(
     visit: Callable[[ParquetDataCatalog, str], None],
     skipped: dict[str, str],
     keep_rung: Callable[[str], bool] | None = None,
+    *,
+    written_since_ns: int | None = None,
 ) -> None:
     """Convert each CLEAN instance into a fresh scratch dir, visit it, delete it.
 
     ``work_root/<instance_id>`` must not exist (``FileExistsError``, left untouched). Instances
     that are malformed or not CLEAN are recorded in ``skipped`` with the reason, never dropped.
     ``keep_rung`` (S-5) limits the per-rung streams converted to the ids it accepts (None: all).
+    ``written_since_ns`` skips, before classify, when the newest feather is strictly older.
     """
     sc.check_work_root(work_root, catalog_root)
     source = ParquetDataCatalog(str(catalog_root))
     now_ns = time.time_ns()
     for instance_id in list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY):
+        instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
+        if (
+            written_since_ns is not None
+            and (reason := _prefilter_reason(instance_dir, written_since_ns)) is not None
+        ):
+            skipped[instance_id] = reason
+            continue
         try:
             verdict = classify_instance(
                 sc.scan_instance_memoized(catalog_root, instance_id, DEFAULT_SUBDIRECTORY),
@@ -223,7 +260,6 @@ def _for_each_clean_instance(
         )  # before the try: a foreign dir is never rmtree'd
         try:
             work = ParquetDataCatalog(str(work_dir))
-            instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
             sc.convert_scoped(default_convert, source, work, instance_dir, streams, keep_rung)
             visit(work, instance_id)
         finally:
@@ -256,6 +292,8 @@ def first_print_instant(
             if licensed[rung]:
                 stamps.append(t.ts_event)
 
+    # CensusCounts has no first_seen_ns and is folded after this scan.
+    cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     _for_each_clean_instance(
         catalog_root,
         work_root,
@@ -263,6 +301,7 @@ def first_print_instant(
         visit,
         {},
         sc.licensed_rung_filter(day_set, station_set),
+        written_since_ns=cutoff,
     )
     return min(stamps) if stamps else None
 
@@ -310,9 +349,17 @@ def probe(
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
     rung_filter = sc.licensed_rung_filter(day_set, station_set)
+    # CensusCounts has no first_seen_ns and is folded after this scan.
+    cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     try:
         _for_each_clean_instance(
-            catalog_root, work_root, _DIRECTION_STREAMS, visit, skipped, rung_filter
+            catalog_root,
+            work_root,
+            _DIRECTION_STREAMS,
+            visit,
+            skipped,
+            rung_filter,
+            written_since_ns=cutoff,
         )
         unique = unique_prints(ledger.prints)
         direction, control = fold_directions(unique, ledger.frames, control_station)
