@@ -50,7 +50,7 @@ SCORE_S = 7,400 × n_sd / 96. PROJ = PREAMBLE_S + SCORE_S.
 
 ## Sensitivity (coordinator's, not the plan formula)
 
-- Bytes grow ≈14.28 GB/day ≈ +336.2 s preamble/day.
+- Bytes grow ≈14.28 GB/day, the mean of the three full-day CLEAN instances eeb84acd, 8aec371e and 36dfb1ec ((14.80 + 13.84 + 14.20) / 3; :30-32), i.e. ≈ +336.2 s preamble/day (7,800 × 14.28 / 331.35). This is a healthy-day rate, not (B_now − B_run1) / elapsed days.
 - Run date E+3: 11-07 ≈ 22,015 s; 11-09 ≈ 23,304 s; 11-18 ≈ 29,105 s. All > 21,600 s.
 - The Doc A §8 bench exception is therefore expected to be in play at the Doc B FINAL re-measure.
 
@@ -110,7 +110,7 @@ Verdict: P HOLDS for CLEAN (70 of 70 pre-cutoff CLEAN instances precede every fi
 
 Prefilter keeps instances with newest mtime ≥ cutoff, all labels. At 10-20 that is 10 instances: 78.73 GB CLEAN (8) + 8.70 GB CORRUPT (70261a13) + 7.58 GB LIVE (3d5e9b3e) = 95.01 GB, i.e. 0.287 × B_run1 (331.35 GB, W1 :28). PREAMBLE_S = 7,800 × kept / B_run1; kept grows only through post-cutoff instances (pre-cutoff instances are rotated and immutable). SCORE_S = 7,400 × n_sd / 96 (W1 :49).
 
-Growth rate: CLEAN bytes written since the B_run1 cutoff (10-16 02:07Z) = B_now − B_run1 = 375,678,316,568 − 331,347,335,632 = 44.33 GB over 3.93 days (to 10-20 00:19Z) = **11.29 GB/day**. The W1 rate of 14.28 GB/day (W1 :53) does not reproduce from these byte totals.
+Growth rate: CLEAN bytes written since the B_run1 cutoff (10-16 02:07Z) = B_now − B_run1 = 375,678,316,568 − 331,347,335,632 = 44.33 GB over 3.93 days (to 10-20 00:19Z) = **11.29 GB/day**. This figure mixes windows: it includes eeb84acd bytes written before the 10-16 02:07Z cutoff, and it excludes the CORRUPT 70261a13 (8.70 GB) and LIVE 3d5e9b3e (7.58 GB) bytes that the prefilter keeps. The W1 rate of 14.28 GB/day (W1 :53) is the healthy-day mean of :30-32. Neither rate enters the C7 decision (:59), which uses B_now with no growth term.
 
 | rate (GB/day) | run (E) | n_sd | kept (GB) | PREAMBLE_S (s) | PROJ (s) |
 |---|---|---|---|---|---|
