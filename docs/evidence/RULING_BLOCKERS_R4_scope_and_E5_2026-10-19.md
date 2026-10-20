@@ -151,7 +151,49 @@ Filled at Commit 2.
 
 ## §B4 — RA-13 KILL vs MAKER (R4 scope)
 
-Filled at Commit 2 after the §B5 result.
+**DRAFT 1c — branches frozen before the §B5 result; decision line filled at Commit 2.**
+
+**Scope.** Decides whether the RA-13 programme KILL (2027-01-25) is pre-empted by an R4 event. Branches are pre-committed here, before the §B5 result exists. Nothing in this section reads a §B5 outcome.
+
+**RA-13's literal R4 text.** `RULING_RA-13_programme_kill_2026-09-27.md:53`: "R4: a new estimand that clears its power check at intake" (cited there as `[VERIFIED RULING_HUNT-1:38]`). Verified by opening the line.
+
+**HUNT-1:38, quoted in full (byte-exact; `RULING_HUNT-1_all_hours_hunting_2026-09-26.md:38`, trigger 4):**
+> A materially different family or estimand is proposed for off-window hours. That proposal enters through AUD-18 registration, never by widening the window.
+
+**Disposal chain (CONFIRMS RA-13 and HUNT-1, L-32: the prior rulings were read, not inferred from the backlog row).**
+1. HUNT-1 trigger 4 is the off-window clause. It is scoped to the hour-window hunt.
+2. RA-13 re-opens the trigger-4 path at `RULING_RA-13:18` ("a materially different estimand entering through AUD-18").
+3. RA-13 restates the test as intake at `:53` and cites HUNT-1:38 as provenance only.
+4. MAKER rests bids; it is not an hour-window hunt.
+5. Therefore R4 == ledger intake returns REGISTERED. HUNT-1:38 is not a second test.
+6. Both readings give NO under UNDERPOWERED. The literal reading (Grok's) and this reading agree.
+7. An E5 pass alone never files the shell; only the ruling does.
+
+**DECISION BRANCH — NO (pre-declared expected; mechanically the result of §B5 = UNDERPOWERED_NOT_REGISTERED).**
+- KILL fires at the first triage on or after 2027-01-25 (`RULING_RA-13:48`). The next action is K-2 (`RULING_RA-13:54,65`).
+- S2/S3 still run as evidence. They cannot defer the KILL and cannot be cited as R4 (`docs/plans/backlog/MAKER_2026-10-12/S5_shadow_run_and_gates_plan_r4_delta.md:56-58`: "S2/S3 artifacts are inputs to R4, never a substitute for it").
+- Calendar: `docs/core/PROGRESS.md:91` already carries the row `≤ 2027-01-24 | RA-13 R4 record (ledger REGISTERED + shell) or N/A (BLOCKERS B4)`. At Commit 2, on NO, annotate that row "(N/A per this ruling)". Do not add a second 2027-01-25 row. No date moves.
+
+**DECISION BRANCH — YES (conditional; applies only if §B5 returns REGISTERED).**
+- The R4 event is a REGISTERED record written through `register_and_persist` (`scripts/analysis/hypothesis_register.py:274-297`, verified: it reads the ledger, calls `register_hypothesis`, then rewrites the file with the record appended). That needs one reviewed constants row at freeze (deferred code row).
+- UNVERIFIED: whether RA-9 A-3 requires a schema v3 record for any REGISTERED look-taking record. The v2 refusal is at `src/breezy/analysis/hypothesis_ledger.py:1159-1165` (verified); v3 is refused while `HORIZON_TOLLING_LANDED` (`:166`) and `PATH_B_SOURCE_GATE_LANDED` (`:174`) are False (verified). The constants row must settle this.
+- YES is VOID unless the ledger record and the R4 shell are both committed on or before 2027-01-24.
+- The R4 shell holds only the L-38 counter and cap, plus the line "S5 report is advisory-only; PROPOSAL arms nothing; activation is the manual trio." No other content before freeze day.
+
+**Do NOT (binding).**
+- No amendment to RA-13's date (2027-01-25 stands).
+- No reading of the PREREG freeze as an R4 event.
+- No R4 shell content before freeze day other than the field list.
+
+**Risk table.**
+
+| Risk | Control |
+|---|---|
+| Motivated reading after block 2 (a REGISTERED-looking outcome reinterpreted as R4) | Branches frozen here, before §B5 result; deadline before 2026-11-04; B5 purity (L-34: the trigger is pinned; no re-look). |
+| YES without a counter | L-38 fields mandatory in the R4 shell (counter and cap). A stop rule whose counter cannot increment is a missing stop. |
+| Misreading a prior ruling | CONFIRMS cites above (L-32): RA-13:18, :48, :53, :54, :65 and HUNT-1:38 were opened and quoted, not paraphrased from the backlog row. |
+
+**DECISION: pending §B5 Result (Commit 2). Mechanical rule: status UNDERPOWERED_NOT_REGISTERED or any exception → NO; REGISTERED → YES.**
 
 ---
 
