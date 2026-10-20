@@ -30,12 +30,6 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-08-31
 **Last updated:** 2026-09-01
 
-### L-5 — A state document that outgrows re-verification becomes a source of false claims (2026-08-31)
-**Mistake:** PROGRESS.md grew to 1401 lines of closed items and restated evidence.
-**Prevention:** Keep docs/core/PROGRESS.md to OPEN items under 250 lines / 12 KB (`.claude/hooks/progress-size-gate.sh`), delete items on close, link evidence, consolidate rather than raise the budget, and archive superseded history to docs/core/archive/, never delete it.
-**Applied:** 2026-08-31
-**Last updated:** 2026-08-31
-
 ### L-6 — Promoting a shared flag to a kill switch inherits every producer (2026-09-01)
 **Mistake:** Shared boolean used as fatal exit had three writers; one fired on quiet markets.
 **Prevention:** Before wiring a boolean to an irreversible action, enumerate every assignment and classify each fatal or not, and split out a fatal class if any writer is routine; fail-closed on an imprecise signal turns noise into an outage.
@@ -311,11 +305,6 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-10-11
 **Last updated:** 2026-10-11
 
-### L-57 — A production-default path that a test can reach will write live state the moment its precondition flips (2026-10-11)
-**Mistake:** Pinned producer let a guard test reach the live production factory.
-**Prevention:** A host-path production default must refuse unless inside its exact unit name and not under pytest (`"pytest" in sys.modules`); before unlocking any such path, grep `tests/` for un-injected calls and quarantine spurious artefacts by move.
-**Applied:** 2026-10-11
-**Last updated:** 2026-10-11
 ### L-58 — A unit cap is derived from the measured wall of the same job, never guessed (2026-10-16)
 **Mistake:** S2 bench 4 ran under 1,800 s RuntimeMaxSec; prior run took 3,072 s.
 **Prevention:** Before `systemd-run`, read the last measured wall for that exact job from its log and set RuntimeMaxSec ≥ 1.75× it (window-bounded if needed); a cap below the measured wall is a launch error, never evidence about the job.
@@ -334,10 +323,12 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-10-16
 **Last updated:** 2026-10-16
 
-### L-61 — A unit-file change is a whole-tree change; a oneshot is bounded by TimeoutStartSec only (2026-10-16)
-**Mistake:** Trigger unit failed seven whole-tree guards: RuntimeMaxSec on a oneshot; TIMER row missing.
-**Prevention:** Bound every `Type=oneshot` unit with `TimeoutStartSec` (never `RuntimeMaxSec`); and for ANY unit, timer or `src/breezy/runtime` change, name in the implementer brief and run before merge: `test_truth_units`, `test_autonomy_units_health`, `test_launch_window_table`, `test_autonomy_owner_placeholders`, `test_monitor_watch`, `test_code_identity_pins*`, `test_mypy_ratchet`, `test_runtime_import_isolation` and `test_persistence_import_free` — a re-pin that follows is a reviewed one-line edit, never a skipped test.
-**Applied:** 2026-10-16
-**Last updated:** 2026-10-16
+### L-62 — A Grok --prompt-file brief is task text only; flags in it are passed as one argv token (2026-10-20)
+**Mistake:** Brief began "--background --cwd …"; grok exited 2 in 27 ms and the apostrophe truncated the prompt.
+**Prevention:** Grok --prompt-file briefs: task text only, no flag line; bridge flags (--background --write --cwd --prompt-file) on the run command; `grep -c "'" brief` must print 0 before dispatch; the poll agent checks `runs <id>` once at +60 s and reports failed runs immediately.
+**Applied:** 2026-10-20
+**Last updated:** 2026-10-20
 
 Full pre-consolidation text (how-to-apply checks, amendments): docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md
+
+Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-archive-2026-10-20.md
