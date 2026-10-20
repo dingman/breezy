@@ -63,9 +63,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-12 — Widen an exact-set barrier, never relax it
 **Mistake:** Exact-set barriers went red; shared pytest addopts edit changed a pinned filter.
-**Prevention:** WIDEN the expected set, never relax the comparison (no `==` to `in`, subset or allowlist); before editing shared config, grep `tests/` for the exact text, change pinned values only in a safety-reviewed item, and remember exact-set membership proves existence, not inertness.
+**Prevention:** WIDEN the expected set, never relax the comparison (no `==` to `in`, subset or allowlist); before editing shared config, grep `tests/` for the exact text, change pinned values only in a safety-reviewed item, and remember exact-set membership proves existence, not inertness; a scope guard's EXEMPT/allowlist set changes only in its own reviewed re-pin commit that a dated ruling cites, never in the code commit that needs the widening (10-20: C7 c5f7d3a2 widened EXEMPT from three to four files in the same commit, so the guard could not have caught it).
 **Applied:** 2026-09-01
-**Last updated:** 2026-09-27
+**Last updated:** 2026-10-20
 **Also:** formerly "L-54 — Shared test config is pinned by containment tests; any edit to it needs a search for its pins first (2026-09-27)"
 
 ### L-13 — An extremum statistic is not comparable across different sampling cadences (2026-09-02)
@@ -332,3 +332,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 Full pre-consolidation text (how-to-apply checks, amendments): docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md
 
 Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-archive-2026-10-20.md
+
+### L-63 — A planned reboot stops the recorder first; an unclean one condemns the open instance (2026-10-20)
+**Mistake:** The 2026-10-19 02:34Z host reboot killed `breezy-quote-tape.service` mid-write; six files in streams the census never reads were 8 bytes short, the classifier condemned the whole instance 70261a13 (10-18 09:00Z → 10-19), and the S2 trigger lost two covered dates (E 11-04 → 11-06).
+**Prevention:** Before any planned reboot run `systemctl --user stop breezy-quote-tape.service` and wait for the `Stopped` line (`deploy/systemd/README.md:89-102`); after any unclean reboot run the census on the open instance at once and accept the loss — never salvage or reclassify under a pre-registered classifier after seeing counts.
+**Applied:** 2026-10-20
+**Last updated:** 2026-10-20
