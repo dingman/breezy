@@ -68,15 +68,13 @@ Review record: 11 r1 reviews, 6 r2 verifications (`reviews/`), r3 = conformance 
 
 ## BACKLOG — BLOCKERS_2026-10-19 (operator 2026-10-19: "add each blocker; peer-reviewed, simplest plan")
 
-Plan: `docs/plans/backlog/BLOCKERS_2026-10-19/plan_r2.md` (5 blind r1 reviews + r2 verification in `reviews/`). Deliverable = ONE ruling `docs/evidence/RULING_BLOCKERS_R4_scope_and_E5_<date>.md` (B2+B3+B5+B4) + these lines. No code, no spec edit, no PREREG/date change.
+Closed 2026-10-20: B2 (unit convention ruled), B3 (300/200 pole kept, Kish rejected), B5 (dry call UNDERPOWERED_NOT_REGISTERED, budget 4), B4 (NO → KILL backstop 2027-01-25 stands) — docs/evidence/RULING_BLOCKERS_R4_scope_and_E5_2026-10-19.md
+
+Plan: `docs/plans/backlog/BLOCKERS_2026-10-19/plan_r2.md` (5 blind r1 reviews + r2 verification in `reviews/`). Deliverable = ONE ruling `docs/evidence/RULING_BLOCKERS_R4_scope_and_E5_2026-10-19.md` (B2+B3+B5+B4) + these lines. No code, no spec edit, no PREREG/date change.
 
 | # | ID | Blocker | Simplest action | Status |
 |---|---|---|---|---|
 | 1 | B1 | No family has edge; licence closed | Standing verdict stands as written above (NO FAMILY TRADES; re-open only T1/T2/T3 per `RULING_FQ-v2-NO-TRADE_2026-10-08.md`). "Done" may legitimately end at B4=NO → K-2 (`RULING_RA-13:48,54,65`) | RECORDED |
-| 2 | B2 | S2 label unit vs E1 feasibility unit | Ruling §B2: label = stricter unit (`maker_stage0_verdict.py:107-116,215-216`), `r_lo` = station-day; freeze-day S-1 convention `r = min(r_lo_position, 1−√(1−r_lo_station_day))` ruled BEFORE 11-04; no code/plan edit | OPEN, due < 11-04 |
-| 3 | B3 | S5 read target 300/200 is the pole | Ruling §B3: kept; effective-n rule REJECTED; spec §9.15 superseded by S5 r3 §8 (412/165/83 at k=2, c=1); no spec v0.4 (S2 pins the spec sha) | OPEN (ruling) |
-| 4 | B5 | E5 intake unpinned | Pins committed first (bound 0.08 = b 0.80/w 0.90 cell net 0.01 slippage; α 0.025; k_variants 1; n 200), then ONE pure `register_hypothesis` dry call on a ledger COPY (Grok read-only, python-reviewer checks). Pre-declared: UNDERPOWERED_NOT_REGISTERED (MDE ≈ 0.118) | OPEN, runs first |
-| 5 | B4 | RA-13 KILL 2027-01-25 vs MAKER (R4) | Ruling §B4 on `RULING_RA-13:53` literal text; R4 == ledger intake REGISTERED; HUNT-1:38 quoted and disposed as provenance. Pre-declared NO → KILL at first triage ≥ 01-25, next K-2; S2/S3 still run as evidence. YES only on REGISTERED and VOID unless ledger record + shell ≤ 2027-01-24 | OPEN, due < 11-04 |
 | 6 | B6 | Hygiene | (a) LEAVE `BREEZY_TRADING_ENABLED=1` (security signed): live permit mints on the code path if caps+operator id present; only barrier = orders 0 + strategy `phase0_permit_absent` (`strategy.py:636`); kernel guard allows a None permit — any new strategy, exit-seam arming, F9 or v2 resume must treat the live permit as already minted. (b) `~/.local/share/breezy/catalog/quote_tape/polymarket_us` symlink → /mnt/storage is LOAD-BEARING for the S2 trigger (census reads only `--catalog-root`); rollback dir absent; no code row. (c) S4 order-id charset stays fail-closed | RECORDED |
 
 Activation after S5 PASS remains manual (`BREEZY_SENDING_FAMILY_ID` + supervisor
@@ -88,7 +86,7 @@ restart + `live_orders_ruling`); no auto-arm path is built by this programme.
 | ≥ 2026-10-21 | F13 `source_lags_ns` freeze (T3 input) |
 | ≥ 2026-12-07 | M1-v3 single read-once (`no_longshot_pooled_test.py`, default `--out`); T1 route |
 | 2026-12-31 | Drop-in allowlist row expiry (`health_dropins.py:55`) → CRITICAL `allowlist_mismatch` unless renewed by a reviewed row; decide in December, never edit the drop-in |
-| ≤ 2027-01-24 | RA-13 R4 record (ledger REGISTERED + shell) or N/A (BLOCKERS B4) |
+| ≤ 2027-01-24 | RA-13 R4 record (ledger REGISTERED + shell) or N/A (BLOCKERS B4) (N/A per RULING_BLOCKERS_R4_scope_and_E5_2026-10-19.md: B4=NO) |
 | 2027-01-25 | NO-TRADE ruling review; RA-13 KILL backstop |
 
 ### Live-state watches (no build owed)

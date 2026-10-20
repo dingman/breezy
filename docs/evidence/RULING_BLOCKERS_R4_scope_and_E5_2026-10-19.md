@@ -2,7 +2,7 @@
 
 - **Type:** coordinator ruling.
 - **Source plan:** `docs/plans/backlog/BLOCKERS_2026-10-19/plan_r2.md` (r2.1 READY; peer reviews in `docs/plans/backlog/BLOCKERS_2026-10-19/reviews/`).
-- **Status:** DRAFT (Commit 1b of 2). §B5 pins FINAL at Commit 1b (no value changed from Commit 1). §B5 Result, §B4 and Peer verdicts on §B4 are placeholders until Commit 2.
+- **Status:** Commit 2 — content FINAL; peer verdicts on §B4/§B5 Result recorded in the next commit.
 - **Arms nothing. Sets no operator control.**
 
 Short names used below: `SPEC` = `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md`; `S5r3` = `docs/plans/backlog/MAKER_2026-10-12/S5_shadow_run_and_gates_plan_r3.md`; `S2r4d` = `docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r4_delta.md`; `S2r3` = `docs/plans/backlog/MAKER_2026-10-12/S2_second_look_plan_r3.md`; `verdict.py` = `scripts/analysis/maker_stage0_verdict.py`; `ledger.py` = `src/breezy/analysis/hypothesis_ledger.py`; `RA-13` = `docs/evidence/RULING_RA-13_programme_kill_2026-09-27.md`; `HUNT-1` = `docs/evidence/RULING_HUNT-1_all_hours_hunting_2026-09-26.md`; `DocA` = `docs/evidence/RULING_MAKER-S2_second_look_SEARCH_declaration_2026-10-16.md`.
@@ -145,13 +145,30 @@ Short names used below: `SPEC` = `docs/strategies/SPEC_pm_us_no_ladder_maker_202
 
 ## §B5 — Result
 
-Filled at Commit 2.
+- **Pin commit (1b):** `8f70d1d6c2863eb0cf8637500f260e01c3efaba6` (2026-10-20T00:09:23Z), earlier than the call timestamp 2026-10-20T00:12:04+00:00.
+- **Call:** ONE `register_hypothesis` call, run once via Grok read-only (`~/.claude/bin/grok-check.sh` EXIT=0), `/home/jon/breezy/.venv/bin/python -I`, `PYTHONPATH=/home/jon/breezy/src`, exit 0. The script imports only from `breezy.analysis.hypothesis_ledger`.
+- **Kwargs:** as pinned, no change (see the §B5 Pin table above). `existing_records` = `read_hypothesis_ledger` of the scratchpad copy; `disposition` default `NORMAL`; `registered_at` = 2026-10-20.
+- **Disclosed deviation (not hidden, not re-run):** `freeze_commit` echoed `592cd1c54eb0a3e351a8cd54ae1de51806993b2a` (Commit 1c, a docs-only descendant of 1b: ancestor check exit 0; `git diff 8f70d1d6 592cd1c5 -- src/` empty) rather than the 1b sha the Commit-1b pin row names. The call was launched before the coordinator's correction reached the runner. `freeze_commit` is echo-only: no branch of `register_hypothesis` reads it (signature `ledger.py:873-898`; status decision `:1125`), so the status is unaffected. The one-call rule (plan §B5) forbids a re-run. The original Commit-1 wording "HEAD 40-hex sha at the call" is satisfied exactly. Peers rule on acceptance at the final review.
+- **Ledger integrity:** SHA_BEFORE `e335384ef5156c0bb097631278375471b7cb21ae925aa787ee7e744c985d1cd5`; copy `e335384ef5156c0bb097631278375471b7cb21ae925aa787ee7e744c985d1cd5`; SHA_AFTER `e335384ef5156c0bb097631278375471b7cb21ae925aa787ee7e744c985d1cd5` (measured at Commit 2). Live ledger: 4 lines; `grep -c "H-MAKER-NO"` = 0 (no live append).
+- **stdout (verbatim, `/tmp/claude-1000/-home-jon-breezy/1676b5d2-4ba0-4fd7-9ec1-56bf76c71ea7/scratchpad/b5/stdout.txt`):**
+
+```text
+N_RECORDS 4
+IDS ['H-ARCHIVE-RECAL-2026-09', 'H-FORECAST-TAKER-RUNG-SCREEN-2026-09-20', 'H-NO-SIDE-2026-09', 'H-OFFWINDOW-T4-2026-09']
+BUDGET_REMAINING 4
+MDE 0.11806302799068735
+FREEZE_COMMIT 592cd1c54eb0a3e351a8cd54ae1de51806993b2a REGISTERED_AT 2026-10-20
+RESULT {"allocated_alpha": 0.0, "freeze_commit": "592cd1c54eb0a3e351a8cd54ae1de51806993b2a", "hypothesis_class": "pm_us_no_ladder_maker", "hypothesis_id": "H-MAKER-NO-2026-10", "is_zero_look": true, "k_variants": 1, "look_policy": "SINGLE_LOOK", "max_single_day_leg_share_cap": 0.2, "mde_at_allocated_alpha": 0.11806302799068735, "mde_fee_theta": 0.0695, "mde_plausibility_bound": 0.08, "mde_reference_ask": 0.8, "mde_slippage_allowance": 0.01, "mde_variance_bound": 0.25, "mde_variance_bound_justification": null, "min_station_days": 200, "order_quantity": 1, "per_variant_alpha": 0.0, "power_is_primary_only": true, "registered_at": "2026-10-20", "schema_version": 1, "station_day_statistic": "MEAN_EXCESS_PER_TAKE", "status": "UNDERPOWERED_NOT_REGISTERED"}
+```
+
+- **Outcome:** status `UNDERPOWERED_NOT_REGISTERED`; `is_zero_look` true; `allocated_alpha` 0.0; `per_variant_alpha` 0.0; `schema_version` 1; programme budget remaining 4. This matches the pre-declared outcome (§B5 "Pre-declared expected outcome").
+- **Re-derivation:** python-reviewer verdict: `recompute_mde` = 0.11806302799068735, identical to the call's value; z(0.99375) = 2.4977054744; z(0.8) = 0.8416212336. T4 cross-check 0.0964 at n=300 (`scripts/analysis/hypothesis_register.py:223`).
 
 ---
 
 ## §B4 — RA-13 KILL vs MAKER (R4 scope)
 
-**DRAFT 1c — branches frozen before the §B5 result; decision line filled at Commit 2.**
+**FINAL (Commit 2) — peer verdicts pending.**
 
 **Scope.** Decides whether the RA-13 programme KILL (2027-01-25) is pre-empted by an R4 event. Branches are pre-committed here, before the §B5 result exists. Nothing in this section reads a §B5 outcome.
 
@@ -193,7 +210,7 @@ Filled at Commit 2.
 | YES without a counter | L-38 fields mandatory in the R4 shell (counter and cap). A stop rule whose counter cannot increment is a missing stop. |
 | Misreading a prior ruling | CONFIRMS cites above (L-32): RA-13:18, :48, :53, :54, :65 and HUNT-1:38 were opened and quoted, not paraphrased from the backlog row. |
 
-**DECISION: pending §B5 Result (Commit 2). Mechanical rule: status UNDERPOWERED_NOT_REGISTERED or any exception → NO; REGISTERED → YES.**
+**DECISION: NO. §B5 returned UNDERPOWERED_NOT_REGISTERED (Commit 2); R4 is unmet. The NO branch applies: KILL fires at the first triage on or after 2027-01-25 (RULING_RA-13:48); next action K-2 (:54,65). S2/S3 still run as evidence and cannot defer the KILL or be cited as R4.** Mechanical rule (unchanged): status UNDERPOWERED_NOT_REGISTERED or any exception → NO; REGISTERED → YES.
 
 ---
 
