@@ -2,7 +2,7 @@
 
 - **Type:** coordinator ruling.
 - **Source plan:** `docs/plans/backlog/BLOCKERS_2026-10-19/plan_r2.md` (r2.1 READY; peer reviews in `docs/plans/backlog/BLOCKERS_2026-10-19/reviews/`).
-- **Status:** Commit 2 — content FINAL; peer verdicts on §B4/§B5 Result recorded in the next commit.
+- **Status:** FINAL (Commit 3). Peer verdicts recorded. Ruled: B2, B3, B5, B4=NO.
 - **Arms nothing. Sets no operator control.**
 
 Short names used below: `SPEC` = `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md`; `S5r3` = `docs/plans/backlog/MAKER_2026-10-12/S5_shadow_run_and_gates_plan_r3.md`; `S2r4d` = `docs/plans/backlog/MAKER_2026-10-12/S2_stage0_replay_plan_r4_delta.md`; `S2r3` = `docs/plans/backlog/MAKER_2026-10-12/S2_second_look_plan_r3.md`; `verdict.py` = `scripts/analysis/maker_stage0_verdict.py`; `ledger.py` = `src/breezy/analysis/hypothesis_ledger.py`; `RA-13` = `docs/evidence/RULING_RA-13_programme_kill_2026-09-27.md`; `HUNT-1` = `docs/evidence/RULING_HUNT-1_all_hours_hunting_2026-09-26.md`; `DocA` = `docs/evidence/RULING_MAKER-S2_second_look_SEARCH_declaration_2026-10-16.md`.
@@ -145,7 +145,8 @@ Short names used below: `SPEC` = `docs/strategies/SPEC_pm_us_no_ladder_maker_202
 
 ## §B5 — Result
 
-- **Pin commit (1b):** `8f70d1d6c2863eb0cf8637500f260e01c3efaba6` (2026-10-20T00:09:23Z), earlier than the call timestamp 2026-10-20T00:12:04+00:00.
+- **Pin commit (1b):** `8f70d1d6c2863eb0cf8637500f260e01c3efaba6` (2026-10-20T00:09:23Z), earlier than the call. 1b is the pin commit; 1c (`592cd1c5`) is HEAD at the call.
+- **Call timestamp source:** 2026-10-20T00:12:04+00:00 is recorded by the dispatching agent from `date -u --iso-8601=seconds` immediately before the call (post-call 00:12:18+00:00); corroborated by the scratchpad stdout.txt mtime `2026-10-20 00:12:04.554100422 +0000` (`stat -c '%y'`, recorded verbatim). The scratchpad is session-scoped; the verbatim stdout in this section is the durable record.
 - **Call:** ONE `register_hypothesis` call, run once via Grok read-only (`~/.claude/bin/grok-check.sh` EXIT=0), `/home/jon/breezy/.venv/bin/python -I`, `PYTHONPATH=/home/jon/breezy/src`, exit 0. The script imports only from `breezy.analysis.hypothesis_ledger`.
 - **Kwargs:** as pinned, no change (see the §B5 Pin table above). `existing_records` = `read_hypothesis_ledger` of the scratchpad copy; `disposition` default `NORMAL`; `registered_at` = 2026-10-20.
 - **Disclosed deviation (not hidden, not re-run):** `freeze_commit` echoed `592cd1c54eb0a3e351a8cd54ae1de51806993b2a` (Commit 1c, a docs-only descendant of 1b: ancestor check exit 0; `git diff 8f70d1d6 592cd1c5 -- src/` empty) rather than the 1b sha the Commit-1b pin row names. The call was launched before the coordinator's correction reached the runner. `freeze_commit` is echo-only: no branch of `register_hypothesis` reads it (signature `ledger.py:873-898`; status decision `:1125`), so the status is unaffected. The one-call rule (plan §B5) forbids a re-run. The original Commit-1 wording "HEAD 40-hex sha at the call" is satisfied exactly. Peers rule on acceptance at the final review.
@@ -168,9 +169,9 @@ RESULT {"allocated_alpha": 0.0, "freeze_commit": "592cd1c54eb0a3e351a8cd54ae1de5
 
 ## §B4 — RA-13 KILL vs MAKER (R4 scope)
 
-**FINAL (Commit 2) — peer verdicts pending.**
+**FINAL (Commit 3) — peer verdicts recorded.**
 
-**Scope.** Decides whether the RA-13 programme KILL (2027-01-25) is pre-empted by an R4 event. Branches are pre-committed here, before the §B5 result exists. Nothing in this section reads a §B5 outcome.
+**Scope.** Decides whether the RA-13 programme KILL (2027-01-25) is pre-empted by an R4 event. Branches are pre-committed here, before the §B5 result exists. The branches (Commit 1c) read no §B5 outcome; only the DECISION line (Commit 2) applies the pre-committed rule.
 
 **RA-13's literal R4 text.** `RULING_RA-13_programme_kill_2026-09-27.md:53`: "R4: a new estimand that clears its power check at intake" (cited there as `[VERIFIED RULING_HUNT-1:38]`). Verified by opening the line.
 
@@ -187,7 +188,7 @@ RESULT {"allocated_alpha": 0.0, "freeze_commit": "592cd1c54eb0a3e351a8cd54ae1de5
 7. An E5 pass alone never files the shell; only the ruling does.
 
 **DECISION BRANCH — NO (pre-declared expected; mechanically the result of §B5 = UNDERPOWERED_NOT_REGISTERED).**
-- KILL fires at the first triage on or after 2027-01-25 (`RULING_RA-13:48`). The next action is K-2 (`RULING_RA-13:54,65`).
+- KILL fires at the first triage on or after 2027-01-25 absent R1–R3 (RULING_RA-13:48 "with none of R1-R4 … having occurred") or a separate dated R4 ruling (S5 r4 delta :56). The next action is K-2 (`RULING_RA-13:54,65`).
 - S2/S3 still run as evidence. They cannot defer the KILL and cannot be cited as R4 (`docs/plans/backlog/MAKER_2026-10-12/S5_shadow_run_and_gates_plan_r4_delta.md:56-58`: "S2/S3 artifacts are inputs to R4, never a substitute for it").
 - Calendar: `docs/core/PROGRESS.md:91` already carries the row `≤ 2027-01-24 | RA-13 R4 record (ledger REGISTERED + shell) or N/A (BLOCKERS B4)`. At Commit 2, on NO, annotate that row "(N/A per this ruling)". Do not add a second 2027-01-25 row. No date moves.
 
@@ -210,7 +211,7 @@ RESULT {"allocated_alpha": 0.0, "freeze_commit": "592cd1c54eb0a3e351a8cd54ae1de5
 | YES without a counter | L-38 fields mandatory in the R4 shell (counter and cap). A stop rule whose counter cannot increment is a missing stop. |
 | Misreading a prior ruling | CONFIRMS cites above (L-32): RA-13:18, :48, :53, :54, :65 and HUNT-1:38 were opened and quoted, not paraphrased from the backlog row. |
 
-**DECISION: NO. §B5 returned UNDERPOWERED_NOT_REGISTERED (Commit 2); R4 is unmet. The NO branch applies: KILL fires at the first triage on or after 2027-01-25 (RULING_RA-13:48); next action K-2 (:54,65). S2/S3 still run as evidence and cannot defer the KILL or be cited as R4.** Mechanical rule (unchanged): status UNDERPOWERED_NOT_REGISTERED or any exception → NO; REGISTERED → YES.
+**DECISION: NO. §B5 returned UNDERPOWERED_NOT_REGISTERED (Commit 2); R4 is not met by H-MAKER-NO-2026-10 intake. The NO branch applies: KILL fires at the first triage on or after 2027-01-25 absent R1–R3 (RULING_RA-13:48 "with none of R1-R4 … having occurred") or a separate dated R4 ruling (S5 r4 delta :56); next action K-2 (:54,65). S2/S3 still run as evidence and cannot defer the KILL or be cited as R4.** Mechanical rule (unchanged): status UNDERPOWERED_NOT_REGISTERED or any exception → NO; REGISTERED → YES.
 
 ---
 
@@ -220,7 +221,14 @@ RESULT {"allocated_alpha": 0.0, "freeze_commit": "592cd1c54eb0a3e351a8cd54ae1de5
 - prediction-market-reviewer: REQUEST_CHANGES (warning; text only). Id KEEP. MDE 0.11806302799 and 412 / 165 / 83 re-derived.
 - python-reviewer: APPROVE. Id KEEP. All 12 NORMAL-path inputs supplied; `recompute_mde` = 0.11806302799068735.
 - architect: REQUEST_CHANGES (text only). Id KEEP.
-- All three ruled KEEP on every §B5 value. All requested text fixes are applied in Commit 1b. Final verdicts on §B4 are pending Commit 2.
+- All three ruled KEEP on every §B5 value. All requested text fixes are applied in Commit 1b. Final verdicts on §B4 are recorded in the final round below (Commit 3).
+
+**Final round (Commit 3; §B5 Result and §B4 text).**
+- prediction-market-reviewer: APPROVE on §B5 Result, deviation ACCEPT, §B4 NO, overall consistency (no CRITICAL/HIGH). Two optional text fixes applied in Commit 3.
+- architect: REQUEST_CHANGES (text only) → applied in Commit 3.
+- Deviation (`freeze_commit` echo `592cd1c5` vs the 1b pin row): ACCEPT under the rule "a deviation in an input that reaches no branch condition, with the result not persisted (ledger sha equal before/after), is a recording deviation: disclose, never repeat the trial (L-34 one-call rule)."
+- Pin-before-call: SUFFICIENT (`plan_r2.md:134`).
+- python-reviewer round-1 APPROVE stands (`recompute_mde` 0.11806302799068735).
 
 ---
 
