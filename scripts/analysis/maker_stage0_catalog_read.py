@@ -47,7 +47,7 @@ from scripts.analysis.maker_stage0_events_build import (
     RawTruncation,
 )
 from scripts.analysis.maker_stage0_pno_store import site
-from scripts.analysis.maker_stage0_probe import _for_each_clean_instance
+from scripts.analysis.maker_stage0_probe import _for_each_clean_instance, prefilter_cutoff_ns
 from scripts.analysis.maker_stage0_probe_core import StationDay, station_day_key
 from scripts.analysis.maker_stage0_scoped_convert import scope_kwargs
 
@@ -116,7 +116,14 @@ class CatalogSession:
                     found.setdefault(key, {}).setdefault(str(instrument.id), set()).add(instance)
 
         _for_each_clean_instance(
-            self.capture_root, self.work_root / "plan", (BinaryOption,), visit, self.skipped
+            self.capture_root,
+            self.work_root / "plan",
+            (BinaryOption,),
+            visit,
+            self.skipped,
+            written_since_ns=prefilter_cutoff_ns(days, stations),
+            days=days,
+            stations=stations,
         )
         return {key: self._station_day_plan(by_rung) for key, by_rung in sorted(found.items())}
 
