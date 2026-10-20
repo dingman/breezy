@@ -67,3 +67,56 @@ SCORE_S = 7,400 × n_sd / 96. PROJ = PREAMBLE_S + SCORE_S.
 - No block-2 bytes read (stat only).
 - S, E, E_max unchanged.
 - No operator control involved.
+
+## Premise P check (2026-10-20)
+
+Counts-only (`trigger_rows.jsonl`, `first_seen_ns`) and stat-only (newest `*.feather` mtime per instance under `live/`). No block-2 bytes read. Cutoff = 2026-10-12T12:00:00Z (epoch 1791806400), the value in delta r3.2 (`S2_second_look_plan_r3_delta_coordinator.md` §2 row 2.21). Assumption: `ts_init` ≤ the file's last write, so an instance last written before the cutoff cannot hold a definition or print listed after it. Clock skew is the only failure mode.
+
+Trigger rows (16 = 4 stations × 4 days, S..10-17; all `reason = COVERED`):
+
+| climate_day | station | first_seen_ns (ISO, UTC) | ≥ cutoff |
+|---|---|---|---|
+| 10-14 | LAX | 2026-10-13T10:00:13.336253Z | yes |
+| 10-14 | MDW | 2026-10-13T10:00:13.335475Z | yes |
+| 10-14 | MIA | 2026-10-13T10:00:13.334700Z | yes |
+| 10-14 | SFO | 2026-10-13T10:00:13.337123Z | yes |
+| 10-15 | LAX | 2026-10-14T10:00:13.859508Z | yes |
+| 10-15 | MDW | 2026-10-14T10:00:13.858013Z | yes |
+| 10-15 | MIA | 2026-10-14T10:00:13.857277Z | yes |
+| 10-15 | SFO | 2026-10-14T10:00:13.860259Z | yes |
+| 10-16 | LAX | 2026-10-15T10:00:13.929676Z | yes |
+| 10-16 | MDW | 2026-10-15T10:00:13.928117Z | yes |
+| 10-16 | MIA | 2026-10-15T10:00:13.927330Z | yes |
+| 10-16 | SFO | 2026-10-15T10:00:13.930460Z | yes |
+| 10-17 | LAX | 2026-10-16T10:00:13.998695Z | yes |
+| 10-17 | MDW | 2026-10-16T10:00:13.996970Z | yes |
+| 10-17 | MIA | 2026-10-16T10:00:13.996150Z | yes |
+| 10-17 | SFO | 2026-10-16T10:00:13.999540Z | yes |
+
+Result: earliest first_seen = 2026-10-13T10:00:13.334700Z, 22.0 h after the cutoff. All 16 rows are ≥ cutoff + 22 h.
+
+Instances (`live/`, 90 directories):
+
+- CLEAN post-cutoff (8; newest mtime ≥ cutoff): 47e3d9d7 (10-13 09:00Z), 0d5f0044 (10-14 09:00Z), 2b9746e1 (10-15 09:00Z), eeb84acd (10-16 09:00Z), 8aec371e (10-17 09:00Z), 36dfb1ec (10-18 09:00Z), 0e82bf30 (10-19 06:33Z), feab1995 (10-19 09:00Z).
+- CLEAN pre-cutoff: 70 of 78 (78 − 8). The 78 CLEAN label is the 10-19 census (W1 :19); the 70 is by subtraction, not re-derived.
+- CORRUPT pre-cutoff (4): 3543b049, 7f353f94, 887d2005, c230f4fc (mtimes 09-10 to 09-28). Excluded from the census regardless.
+- CORRUPT post-cutoff (1): 70261a13 (10-19 03:22Z, 8.70 GB).
+- EMPTY (6): 04a83cc0, 10551246, 1744b9cf, 1cdca371, 578e6ce1, 8a4b92e8. All pre-cutoff, 0 feather bytes.
+- LIVE (1): 3d5e9b3e (10-20 00:37Z, 7.58 GB, post-cutoff, excluded).
+
+Verdict: P HOLDS for CLEAN (70 of 70 pre-cutoff CLEAN instances precede every first_seen observed). Limit: the evidence covers the 16 rows S..10-17 only. Licensed days through E_max 11-15 are not yet observed, so C2 must refuse any pinned licensed row with first_seen < cutoff.
+
+## Post-C7 projection (coordinator formula, recomputed 2026-10-20)
+
+Prefilter keeps instances with newest mtime ≥ cutoff, all labels. At 10-20 that is 10 instances: 78.73 GB CLEAN (8) + 8.70 GB CORRUPT (70261a13) + 7.58 GB LIVE (3d5e9b3e) = 95.01 GB, i.e. 0.287 × B_run1 (331.35 GB, W1 :28). PREAMBLE_S = 7,800 × kept / B_run1; kept grows only through post-cutoff instances (pre-cutoff instances are rotated and immutable). SCORE_S = 7,400 × n_sd / 96 (W1 :49).
+
+Growth rate: CLEAN bytes written since the B_run1 cutoff (10-16 02:07Z) = B_now − B_run1 = 375,678,316,568 − 331,347,335,632 = 44.33 GB over 3.93 days (to 10-20 00:19Z) = **11.29 GB/day**. The W1 rate of 14.28 GB/day (W1 :53) does not reproduce from these byte totals.
+
+| rate (GB/day) | run (E) | n_sd | kept (GB) | PREAMBLE_S (s) | PROJ (s) |
+|---|---|---|---|---|---|
+| 11.29 | 11-09 (11-06) | 96 | 320.8 | 7,552 | 14,952 |
+| 11.29 | 11-18 (11-15) | 132 | 422.4 | 9,944 | 20,119 |
+| 14.28 | 11-09 (11-06) | 96 | 380.6 | 8,960 | 16,360 |
+| 14.28 | 11-18 (11-15) | 132 | 509.1 | 11,985 | 22,160 |
+
+Post-C7 sentence: at the observed rate, PROJ at E_max is ≈ 20,119 s (< 21,600 s), so C7 may suffice even for E_max; at the W1 rate it is ≈ 22,160 s (> 21,600 s). The delta's 16,800 s / 22,600 s figures are not reproduced by this formula. The E_max conclusion is rate-dependent and is settled by the Doc B FINAL re-measure, not by this projection.
