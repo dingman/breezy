@@ -26,6 +26,7 @@
   "scripts/analysis/maker_stage0_pins.py": "fee96c08e97006822232da039ccf9918cc382598ecd34ff98502ae881dd782f7",
   "scripts/analysis/maker_stage0_pno.py": "1401f98c7b73c84becd3f58219ae27cbd9760d7790329a247040f109e65b2ace",
   "scripts/analysis/maker_stage0_pno_store.py": "69700feb1e89e5178f414d21b174b9b9987f6afb3b72ab31538f26c2191507fd",
+  "scripts/analysis/maker_stage0_prefilter.py": "9d62f284546665a2b637ea80e509f8d4bcac2e844b0a6732b171dd4eb0ffe5ea",
   "scripts/analysis/maker_stage0_preflight.py": "0e9abbbeea293e1cce8401b787a907fc9357d5c40aa2de0735d27ea745a9d3ea",
   "scripts/analysis/maker_stage0_preflight_v2.py": "09584e0503339dd73307b61d99aa647155abe4823b6240af585610c693ba9805",
   "scripts/analysis/maker_stage0_pricing.py": "4622bb83c5e8900f10474ba90f5ef62d39be4aa3d341bc319f6296deabada744",

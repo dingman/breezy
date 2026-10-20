@@ -21,6 +21,7 @@ EXEMPT = frozenset(
         "scripts/analysis/maker_stage0_probe.py",
         "scripts/analysis/maker_stage0_probe_report.py",
         "scripts/analysis/maker_stage0_catalog_read.py",
+        "scripts/analysis/maker_stage0_prefilter.py",
     }
 )
 _PROBE = "scripts/analysis/maker_stage0_probe.py"

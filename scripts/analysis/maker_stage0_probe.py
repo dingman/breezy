@@ -18,6 +18,7 @@ the earliest ``BinaryOption.ts_init`` -- the field S1 uses for ``first_seen_ns``
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import shutil
 import time
 from collections import defaultdict
@@ -48,6 +49,7 @@ from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.runtime.quote_tape_ingest_core import default_convert
 from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis.cli_basis_offer_gate_scan import classify_instance
+from scripts.analysis.maker_stage0_prefilter import _prefilter_reason, prefilter_cutoff_ns
 from scripts.analysis.maker_stage0_probe_frames import (
     FrameSpill,
     count_truncations,
@@ -73,7 +75,8 @@ __all__ = [
     "classify_direction",
     "count_census", "direction_result", "distribution", "enforce_direction",
     "first_print_instant", "first_replayable_day", "gap_free_frames", "instance_day_deltas",
-    "ladder_parity", "listing_abstain", "live_and_gap_hours", "mid_of", "probe", "reassert_census",
+    "ladder_parity", "listing_abstain", "live_and_gap_hours", "mid_of", "prefilter_cutoff_ns",
+    "probe", "reassert_census",
     "station_day_delta", "station_day_key", "unique_prints",
 ]  # fmt: skip
 
@@ -87,7 +90,7 @@ _DIRECTION_STREAMS: Final[tuple[type, ...]] = (
 )
 _Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
 _ONE_DAY: Final = dt.timedelta(days=1)
-_ONE_DAY_NS: Final[int] = 86_400 * 1_000_000_000
+_LOG = logging.getLogger(__name__)
 
 
 # --- I/O ------------------------------------------------------------------------------
@@ -126,32 +129,6 @@ def _query_bounds(days: Collection[dt.date], stations: Collection[str]) -> tuple
     start = min(_maker_window(s, d).start_ns for s in stations for d in days)
     end = max(_maker_window(s, d + _ONE_DAY).end_ns for s in stations for d in days)
     return start, end
-
-
-def prefilter_cutoff_ns(
-    days: Collection[dt.date],
-    stations: Collection[str],
-    *,
-    earliest_licensed_ns: int | None = None,
-) -> int | None:
-    """One day before the block (or the listing, if earlier); None when the block is empty."""
-    if not days or not stations:
-        return None
-    base = _query_bounds(days, stations)[0] - _ONE_DAY_NS
-    if earliest_licensed_ns is not None:
-        return min(base, earliest_licensed_ns)
-    return base
-
-
-def _prefilter_reason(instance_dir: Path, cutoff_ns: int) -> str | None:
-    """Skip when the newest feather is strictly older. Empty or ``OSError`` fails open."""
-    try:
-        newest = max((row[2] for row in sc._signature(instance_dir)), default=None)
-    except OSError:
-        return None
-    if newest is None or newest >= cutoff_ns:
-        return None
-    return f"prefilter: last_written_ns {newest} < cutoff_ns {cutoff_ns}"
 
 
 def _read_instance(
@@ -224,6 +201,8 @@ def _for_each_clean_instance(
     keep_rung: Callable[[str], bool] | None = None,
     *,
     written_since_ns: int | None = None,
+    days: Collection[dt.date] = (),
+    stations: Collection[str] = (),
 ) -> None:
     """Convert each CLEAN instance into a fresh scratch dir, visit it, delete it.
 
@@ -239,7 +218,8 @@ def _for_each_clean_instance(
         instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
         if (
             written_since_ns is not None
-            and (reason := _prefilter_reason(instance_dir, written_since_ns)) is not None
+            and (reason := _prefilter_reason(instance_dir, written_since_ns, days, stations))
+            is not None
         ):
             skipped[instance_id] = reason
             continue
@@ -282,6 +262,7 @@ def first_print_instant(
     """
     day_set, station_set = frozenset(days), frozenset(stations)
     stamps: list[int] = []
+    skipped: dict[str, str] = {}
 
     def visit(work: ParquetDataCatalog, _instance: str) -> None:
         licensed: dict[str, bool] = {}
@@ -292,16 +273,23 @@ def first_print_instant(
             if licensed[rung]:
                 stamps.append(t.ts_event)
 
-    # CensusCounts has no first_seen_ns and is folded after this scan.
+    # Listing term is enforced by the definitions check.
     cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     _for_each_clean_instance(
         catalog_root,
         work_root,
         (TradeTick,),
         visit,
-        {},
+        skipped,
         sc.licensed_rung_filter(day_set, station_set),
         written_since_ns=cutoff,
+        days=day_set,
+        stations=station_set,
+    )
+    _LOG.info(
+        "prefilter: skipped %s of %s instances",
+        sum(1 for reason in skipped.values() if reason.startswith("prefilter:")),
+        len(list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)),
     )
     return min(stamps) if stamps else None
 
@@ -349,7 +337,7 @@ def probe(
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
     rung_filter = sc.licensed_rung_filter(day_set, station_set)
-    # CensusCounts has no first_seen_ns and is folded after this scan.
+    # Listing term is enforced by the definitions check.
     cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     try:
         _for_each_clean_instance(
@@ -360,6 +348,13 @@ def probe(
             skipped,
             rung_filter,
             written_since_ns=cutoff,
+            days=day_set,
+            stations=station_set,
+        )
+        _LOG.info(
+            "prefilter: skipped %s of %s instances",
+            sum(1 for reason in skipped.values() if reason.startswith("prefilter:")),
+            len(list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)),
         )
         unique = unique_prints(ledger.prints)
         direction, control = fold_directions(unique, ledger.frames, control_station)

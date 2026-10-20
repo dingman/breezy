@@ -18,6 +18,7 @@ it never imports the simulator, the truth loader or the report.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import shutil
 from collections import OrderedDict
 from collections.abc import Collection, Mapping, Sequence
@@ -36,7 +37,7 @@ from breezy.analysis.maker_tape_census import (
     bidlive_window_ns,
     maker_window_ns,
 )
-from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY, list_instance_ids
 from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.runtime.quote_tape_ingest_core import default_convert
 from scripts.analysis.maker_stage0_events_build import (
@@ -72,6 +73,7 @@ _HASHED_STREAMS: Final[tuple[str, ...]] = (
     "custom_depth_truncation",
 )
 _NS: Final[int] = 10**9
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,13 @@ class CatalogSession:
             visit,
             self.skipped,
             written_since_ns=prefilter_cutoff_ns(days, stations),
+            days=days,
+            stations=stations,
+        )
+        _LOG.info(
+            "prefilter: skipped %s of %s instances",
+            sum(1 for reason in self.skipped.values() if reason.startswith("prefilter:")),
+            len(list_instance_ids(self.capture_root, DEFAULT_SUBDIRECTORY)),
         )
         return {key: self._station_day_plan(by_rung) for key, by_rung in sorted(found.items())}
 

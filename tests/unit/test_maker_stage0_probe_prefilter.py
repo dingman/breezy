@@ -7,9 +7,11 @@ converted. A tie is kept. An empty or unreadable signature fails open (scan).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pytest
 from nautilus_trader.model.enums import AggressorSide
 
@@ -61,13 +63,6 @@ def _disable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(p, "_prefilter_reason", keep, raising=False)
 
 
-def _freeze_cutoff(monkeypatch: pytest.MonkeyPatch, cutoff: int) -> None:
-    def frozen(*_args: object, **_kwargs: object) -> int:
-        return cutoff
-
-    monkeypatch.setattr(p, "prefilter_cutoff_ns", frozen)
-
-
 def _minimal(capture: Path, instance_id: str, *, city: str = "lax") -> None:
     instrument = _instrument(_slug(city), _ns("2026-09-21T11:00:00"))
     _write_instance(
@@ -85,6 +80,32 @@ def _minimal(capture: Path, instance_id: str, *, city: str = "lax") -> None:
         ],
         offsets=[(_ns("2026-09-22T01:00:00"), 0)],
     )
+
+
+def _write_licensed_old(capture: Path) -> tuple[int, int]:
+    ts_init = _ns("2026-09-19T00:00:00")
+    print_ts = _ns("2026-09-22T05:40:00")
+    lax = _instrument(_slug("lax"), ts_init)
+    _write_instance(
+        capture,
+        "licensed",
+        instruments=[lax],
+        records=[
+            _depth(lax, "0.390", "0.410", print_ts),
+            _trade(lax, "lic", "0.500", AggressorSide.BUYER, print_ts),
+        ],
+        offsets=[(_ns("2026-09-22T01:00:00"), -5 * 1_000_000_000)],
+    )
+    _touch(capture / "live" / "licensed", ts_init)
+    return ts_init, print_ts
+
+
+def _raise_on_definition_read(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    mod = sys.modules[p._prefilter_reason.__module__]
+    monkeypatch.setattr(mod, "_read_definition_instrument_ids", boom, raising=False)
 
 
 def _probe_lax(capture: Path, work: Path) -> tuple[int | None, p.ProbeReport]:
@@ -112,7 +133,7 @@ def test_prefilter_skips_only_instances_last_written_before_the_block(
     assert cutoff == _ns("2026-09-20T12:00:00")
     capture = _capture(tmp_path)
     _minimal(capture, "tie")
-    _minimal(capture, "old")
+    _minimal(capture, "old", city="nyc")
     _touch(capture / "live" / "tie", cutoff)
     _touch(capture / "live" / "old", cutoff - 1)
     (capture / "live" / "bad-inst").mkdir()
@@ -268,15 +289,13 @@ def test_licensed_outputs_identical_with_and_without_prefilter(
     assert on_skipped["old"].startswith("prefilter:")
 
 
-def test_prefilter_positive_control_old_instance_with_licensed_listing_changes_listing_ns(
+def test_prefilter_keeps_old_instance_that_holds_a_licensed_listing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ts_init = _ns("2026-09-19T00:00:00")
     print_ts = _ns("2026-09-22T05:40:00")
-    base = p.prefilter_cutoff_ns([_DAY], _LAX)
-    licensed = p.prefilter_cutoff_ns([_DAY], _LAX, earliest_licensed_ns=ts_init)
-    assert base == _ns("2026-09-20T12:00:00")
-    assert licensed == ts_init
+    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
+    assert cutoff == _ns("2026-09-20T12:00:00")
     capture = tmp_path / "capture"
     lax = _instrument(_slug("lax"), ts_init)
     _write_instance(
@@ -290,27 +309,47 @@ def test_prefilter_positive_control_old_instance_with_licensed_listing_changes_l
         offsets=[(_ns("2026-09-22T01:00:00"), -5 * 1_000_000_000)],
     )
     _touch(capture / "live" / "licensed", ts_init)
-    assert ts_init < base
+    assert ts_init < cutoff
 
-    def run(label: str, cutoff: int) -> tuple[int | None, p.ProbeReport]:
-        _freeze_cutoff(monkeypatch, cutoff)
-        return _probe_lax(capture, tmp_path / label)
-
-    skipped_first, skipped = run("skip", base)
-    kept_first, kept = run("keep", licensed)
+    kept_first, kept = _probe_lax(capture, tmp_path / "on")
     _disable(monkeypatch)
-    full_first, full = _probe_lax(capture, tmp_path / "full")
+    off_first, off = _probe_lax(capture, tmp_path / "off")
 
-    assert skipped_first is None
-    assert skipped.coverage[0].listing_ns is None
-    assert skipped_first != full_first
-    assert skipped.coverage[0].listing_ns != full.coverage[0].listing_ns
-    assert any(reason.startswith("prefilter:") for reason in skipped.skipped.values())
-    assert kept_first == full_first == print_ts
-    assert kept.coverage[0].listing_ns == full.coverage[0].listing_ns == ts_init
-    assert kept.first_print_ns == full.first_print_ns == print_ts
-    assert _without_skipped(kept) == _without_skipped(full)
     assert "licensed" not in kept.skipped
+    assert all(not reason.startswith("prefilter:") for reason in kept.skipped.values())
+    assert kept_first == off_first == print_ts
+    assert kept.first_print_ns == off.first_print_ns == print_ts == kept_first
+    assert kept.coverage[0].listing_ns == off.coverage[0].listing_ns == ts_init
+    assert kept.coverage == off.coverage
+    assert kept.census == off.census
+    assert kept.direction == off.direction
+    assert _without_skipped(kept) == _without_skipped(off)
+
+
+def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _write_licensed_old(capture)
+    _raise_on_definition_read(monkeypatch, OSError("read failed"))
+
+    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    assert "licensed" not in report.skipped
+    assert report.coverage[0].listing_ns is not None
+
+
+def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_arrow_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _write_licensed_old(capture)
+    _raise_on_definition_read(monkeypatch, pa.ArrowInvalid("bad schema"))
+
+    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    assert "licensed" not in report.skipped
+    assert report.coverage[0].listing_ns is not None
 
 
 def test_plan_pass_skips_and_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -342,3 +381,26 @@ def test_plan_pass_skips_and_records(tmp_path: Path, monkeypatch: pytest.MonkeyP
         assert row.instruments == control_plan[key].instruments
         assert row.instances == control_plan[key].instances
         assert row.catalog_bytes == control_plan[key].catalog_bytes
+
+
+def test_plan_pass_keeps_old_instance_that_holds_a_licensed_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _write_licensed_old(capture)
+    session = catalog.CatalogSession(capture, tmp_path / "plan-on")
+
+    plan = session.plan([_DAY], _LAX)
+
+    assert "licensed" not in session.skipped
+    key = ("LAX", _DAY)
+    assert key in plan
+    assert "licensed" in plan[key].instances
+    _disable(monkeypatch)
+    control = catalog.CatalogSession(capture, tmp_path / "plan-off")
+    control_plan = control.plan([_DAY], _LAX)
+    assert plan.keys() == control_plan.keys()
+    for plan_key, row in plan.items():
+        assert row.instruments == control_plan[plan_key].instruments
+        assert row.instances == control_plan[plan_key].instances
+        assert row.catalog_bytes == control_plan[plan_key].catalog_bytes
