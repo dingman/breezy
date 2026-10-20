@@ -18,7 +18,6 @@ the earliest ``BinaryOption.ts_init`` -- the field S1 uses for ``first_seen_ns``
 from __future__ import annotations
 
 import datetime as dt
-import logging
 import shutil
 import time
 from collections import defaultdict
@@ -49,7 +48,7 @@ from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.runtime.quote_tape_ingest_core import default_convert
 from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis.cli_basis_offer_gate_scan import classify_instance
-from scripts.analysis.maker_stage0_prefilter import _prefilter_reason, prefilter_cutoff_ns
+from scripts.analysis.maker_stage0_prefilter import _prefilter_reason, log_prefilter
 from scripts.analysis.maker_stage0_probe_frames import (
     FrameSpill,
     count_truncations,
@@ -90,7 +89,7 @@ _DIRECTION_STREAMS: Final[tuple[type, ...]] = (
 )
 _Samples = Sequence[tuple[int, int]]  # (ts_init, signed offset_ns)
 _ONE_DAY: Final = dt.timedelta(days=1)
-_LOG = logging.getLogger(__name__)
+_ONE_DAY_NS: Final = 86_400 * 1_000_000_000
 
 
 # --- I/O ------------------------------------------------------------------------------
@@ -129,6 +128,13 @@ def _query_bounds(days: Collection[dt.date], stations: Collection[str]) -> tuple
     start = min(_maker_window(s, d).start_ns for s in stations for d in days)
     end = max(_maker_window(s, d + _ONE_DAY).end_ns for s in stations for d in days)
     return start, end
+
+
+def prefilter_cutoff_ns(days: Collection[dt.date], stations: Collection[str]) -> int | None:
+    """One day before the block's first query bound (C7 pre-filter); None for an empty block."""
+    if not days or not stations:
+        return None
+    return _query_bounds(days, stations)[0] - _ONE_DAY_NS
 
 
 def _read_instance(
@@ -209,17 +215,20 @@ def _for_each_clean_instance(
     ``work_root/<instance_id>`` must not exist (``FileExistsError``, left untouched). Instances
     that are malformed or not CLEAN are recorded in ``skipped`` with the reason, never dropped.
     ``keep_rung`` (S-5) limits the per-rung streams converted to the ids it accepts (None: all).
-    ``written_since_ns`` skips, before classify, when the newest feather is strictly older.
+    ``written_since_ns`` skips, before classify, an instance whose newest feather is strictly
+    older and that holds no licensed rung directory or definition (``maker_stage0_prefilter``).
     """
     sc.check_work_root(work_root, catalog_root)
     source = ParquetDataCatalog(str(catalog_root))
     now_ns = time.time_ns()
-    for instance_id in list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY):
+    instance_ids = list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)
+    fail_open: list[str] = []
+    for instance_id in instance_ids:
         instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
-        if (
-            written_since_ns is not None
-            and (reason := _prefilter_reason(instance_dir, written_since_ns, days, stations))
-            is not None
+        if written_since_ns is not None and (
+            reason := _prefilter_reason(
+                instance_dir, written_since_ns, days=days, stations=stations, fail_open=fail_open
+            )
         ):
             skipped[instance_id] = reason
             continue
@@ -245,6 +254,7 @@ def _for_each_clean_instance(
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             release_free_heap()  # S-5: the instance's freed heap goes back before the next one
+    log_prefilter(skipped, len(instance_ids), len(fail_open))
 
 
 def first_print_instant(
@@ -273,8 +283,6 @@ def first_print_instant(
             if licensed[rung]:
                 stamps.append(t.ts_event)
 
-    # Listing term is enforced by the definitions check.
-    cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     _for_each_clean_instance(
         catalog_root,
         work_root,
@@ -282,14 +290,9 @@ def first_print_instant(
         visit,
         skipped,
         sc.licensed_rung_filter(day_set, station_set),
-        written_since_ns=cutoff,
+        written_since_ns=prefilter_cutoff_ns(day_set, station_set),
         days=day_set,
         stations=station_set,
-    )
-    _LOG.info(
-        "prefilter: skipped %s of %s instances",
-        sum(1 for reason in skipped.values() if reason.startswith("prefilter:")),
-        len(list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)),
     )
     return min(stamps) if stamps else None
 
@@ -329,16 +332,15 @@ def probe(
     a subset of the pooled sample (not independent) -- read it as a per-station view.
     """
     sc.check_work_root(work_root, catalog_root)
-    ledger = _Ledger(FrameSpill(work_root / "_frames"))
     day_set, station_set = frozenset(days), frozenset(stations)
+    cutoff = prefilter_cutoff_ns(day_set, station_set)  # raises on an unknown station: no spill yet
+    ledger = _Ledger(FrameSpill(work_root / "_frames"))
     skipped: dict[str, str] = {}
 
     def visit(work: ParquetDataCatalog, instance_id: str) -> None:
         _read_instance(work, instance_id, day_set, station_set, ledger)
 
     rung_filter = sc.licensed_rung_filter(day_set, station_set)
-    # Listing term is enforced by the definitions check.
-    cutoff = prefilter_cutoff_ns(days, stations, earliest_licensed_ns=None)
     try:
         _for_each_clean_instance(
             catalog_root,
@@ -350,11 +352,6 @@ def probe(
             written_since_ns=cutoff,
             days=day_set,
             stations=station_set,
-        )
-        _LOG.info(
-            "prefilter: skipped %s of %s instances",
-            sum(1 for reason in skipped.values() if reason.startswith("prefilter:")),
-            len(list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)),
         )
         unique = unique_prints(ledger.prints)
         direction, control = fold_directions(unique, ledger.frames, control_station)

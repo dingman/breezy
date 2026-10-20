@@ -1,13 +1,24 @@
-"""C7 stat-only instance pre-filter.
+"""C7 instance pre-filter (verdict-blind: file stat plus definitions-name and rung-directory-name).
 
-An instance whose newest feather is strictly older than the licensed block is not
-converted. A tie is kept. An empty or unreadable signature fails open (scan).
+An old instance is skipped (never converted) only when ALL of these hold: its newest feather is
+strictly older than the licensed block (a tie is kept), it holds no readable licensed YES
+definition, and it holds no licensed per-rung stream directory. Any read error keeps it (fail
+open: WARNING with traceback, counted in the single per-pass log line).
+
+Every boundary case uses an UNLICENSED instance (NYC, or a station outside the requested ones)
+with real ``days``/``stations``: a licensed instance is rescued by the definitions or rung-directory
+check whatever its mtimes say, so it cannot probe the stat boundary (L-33).
 """
 
 from __future__ import annotations
 
+import ast
+import datetime as dt
+import inspect
+import logging
 import os
-import sys
+import shutil
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +27,9 @@ import pytest
 from nautilus_trader.model.enums import AggressorSide
 
 from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
+from breezy.registry.sites import SiteNotFoundError
 from scripts.analysis import maker_stage0_catalog_read as catalog
+from scripts.analysis import maker_stage0_prefilter as pf
 from scripts.analysis import maker_stage0_probe as p
 from scripts.analysis import maker_stage0_scoped_convert as sc
 from tests.fixtures.maker_stage0 import replay_world as rw
@@ -33,6 +46,9 @@ from tests.unit.test_maker_stage0_probe import (
 
 _LAX = ("LAX",)
 _SFO = ("SFO",)
+_DAYS = frozenset({_DAY})
+_ONE_DAY_NS = 86_400 * 1_000_000_000
+_PF_LOG = pf.__name__
 
 
 def _touch(instance_dir: Path, mtime_ns: int) -> None:
@@ -60,7 +76,24 @@ def _disable(monkeypatch: pytest.MonkeyPatch) -> None:
     def keep(*_args: object, **_kwargs: object) -> None:
         return None
 
-    monkeypatch.setattr(p, "_prefilter_reason", keep, raising=False)
+    monkeypatch.setattr(p, "_prefilter_reason", keep)
+
+
+def _cutoff() -> int:
+    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
+    assert cutoff is not None
+    return cutoff
+
+
+def _reason(instance_dir: Path, cutoff: int, *, fail_open: list[str] | None = None) -> str | None:
+    """The real decision for LAX x ``_DAY`` (real ``days``/``stations``, never the empty guard)."""
+    return pf._prefilter_reason(
+        instance_dir, cutoff, days=_DAYS, stations=frozenset(_LAX), fail_open=fail_open
+    )
+
+
+def _skip_reason(newest: int, cutoff: int) -> str:
+    return f"prefilter: last_written_ns {newest} < cutoff_ns {cutoff}"
 
 
 def _minimal(capture: Path, instance_id: str, *, city: str = "lax") -> None:
@@ -82,7 +115,16 @@ def _minimal(capture: Path, instance_id: str, *, city: str = "lax") -> None:
     )
 
 
+def _unlicensed(capture: Path, name: str, mtime_ns: int, *, city: str = "nyc") -> Path:
+    """An instance holding no LAX x ``_DAY`` data at all, every feather stamped ``mtime_ns``."""
+    _minimal(capture, name, city=city)
+    instance_dir = capture / "live" / name
+    _touch(instance_dir, mtime_ns)
+    return instance_dir
+
+
 def _write_licensed_old(capture: Path) -> tuple[int, int]:
+    """LAX definitions plus licensed depth/print rung directories, all feathers before the block."""
     ts_init = _ns("2026-09-19T00:00:00")
     print_ts = _ns("2026-09-22T05:40:00")
     lax = _instrument(_slug("lax"), ts_init)
@@ -100,12 +142,57 @@ def _write_licensed_old(capture: Path) -> tuple[int, int]:
     return ts_init, print_ts
 
 
-def _raise_on_definition_read(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
-    def boom(*_args: object, **_kwargs: object) -> object:
+def _write_defs_only_old(capture: Path) -> int:
+    """A licensed LAX definition and NO per-rung stream directory: only the definitions keep it."""
+    ts_init = _ns("2026-09-19T00:00:00")
+    lax = _instrument(_slug("lax"), ts_init)
+    _write_instance(
+        capture,
+        "defs-only",
+        instruments=[lax],
+        records=[],
+        offsets=[(_ns("2026-09-22T01:00:00"), -5 * 1_000_000_000)],
+    )
+    instance_dir = capture / "live" / "defs-only"
+    assert not (instance_dir / "trade_tick").exists()
+    assert not (instance_dir / "order_book_depths").exists()
+    _touch(instance_dir, ts_init)
+    return ts_init
+
+
+def _blank_definitions(instance_dir: Path) -> None:
+    """Rewrite the definitions feather as a schema-only (zero-row) stream: no licensed row."""
+    path = next(instance_dir.glob("binary_option_*.feather"))
+    with pa.OSFile(str(path), "rb") as source:
+        schema = pa.ipc.open_stream(source).schema
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_stream(sink, schema):
+        pass
+    with pa.OSFile(str(path), "rb") as source:
+        assert pa.ipc.open_stream(source).read_all().num_rows == 0
+
+
+def _write_rungs_without_definitions(
+    capture: Path, mtime_ns: int | None = None
+) -> tuple[Path, int]:
+    """Old instance: licensed ``trade_tick/<rung>/`` + depth directories, zero-row definitions."""
+    _ts_init, print_ts = _write_licensed_old(capture)
+    instance_dir = capture / "live" / "licensed"
+    _blank_definitions(instance_dir)
+    assert any((instance_dir / "trade_tick").iterdir())
+    _touch(instance_dir, _ns("2026-09-19T00:00:00") if mtime_ns is None else mtime_ns)
+    return instance_dir, print_ts
+
+
+def _read_calls(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> list[str]:
+    """Make the definitions reader raise ``error``; returns the list of paths it was asked for."""
+    calls: list[str] = []
+
+    def boom(path: Path) -> object:
+        calls.append(str(path))
         raise error
 
-    mod = sys.modules[p._prefilter_reason.__module__]
-    monkeypatch.setattr(mod, "_read_definition_instrument_ids", boom, raising=False)
+    monkeypatch.setattr(pf, "_read_definition_instrument_ids", boom)
+    return calls
 
 
 def _probe_lax(capture: Path, work: Path) -> tuple[int | None, p.ProbeReport]:
@@ -120,10 +207,124 @@ def _without_skipped(report: p.ProbeReport) -> dict[str, Any]:
     return body
 
 
+def _summary_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        message
+        for record in caplog.records
+        if (message := record.getMessage()).startswith("prefilter: skipped")
+    ]
+
+
+# --- structure ----------------------------------------------------------------------------
+
+
 def test_prefilter_cutoff_none_on_empty_inputs() -> None:
     assert p.prefilter_cutoff_ns([], ["LAX"]) is None
     assert p.prefilter_cutoff_ns([_DAY], []) is None
     assert p.prefilter_cutoff_ns((), ()) is None
+
+
+def test_cutoff_helper_is_defined_in_probe_beside_query_bounds() -> None:
+    assert p.prefilter_cutoff_ns.__module__ == p.__name__
+    assert list(inspect.signature(p.prefilter_cutoff_ns).parameters) == ["days", "stations"]
+    assert not hasattr(pf, "prefilter_cutoff_ns")
+
+
+def test_prefilter_module_never_imports_the_probe() -> None:
+    tree = ast.parse(Path(pf.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported |= {node.module or "", *(alias.name for alias in node.names)}
+        elif isinstance(node, ast.Import):
+            imported |= {alias.name for alias in node.names}
+    assert not {name for name in imported if name.rsplit(".", 1)[-1] == "maker_stage0_probe"}
+
+
+def test_prefilter_reason_scope_arguments_are_required_keyword_only() -> None:
+    params = inspect.signature(pf._prefilter_reason).parameters
+    for name in ("days", "stations"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params[name].default is inspect.Parameter.empty
+
+
+# --- the stat boundary, on UNLICENSED instances -----------------------------------------
+
+
+def test_prefilter_reason_keeps_an_unlicensed_instance_at_the_cutoff(tmp_path: Path) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-tie", cutoff)
+
+    assert _reason(instance_dir, cutoff) is None
+
+
+def test_prefilter_reason_skips_an_unlicensed_instance_one_ns_below_the_cutoff(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-old", cutoff - 1)
+
+    assert _reason(instance_dir, cutoff) == _skip_reason(cutoff - 1, cutoff)
+
+
+def test_prefilter_reason_keeps_an_unlicensed_instance_stamped_in_the_future(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-future", cutoff + _ONE_DAY_NS)
+
+    assert _reason(instance_dir, cutoff) is None
+
+
+@pytest.mark.parametrize("fresh_index", [0, 1, -1])
+def test_one_feather_at_the_cutoff_keeps_an_otherwise_older_instance(
+    tmp_path: Path, fresh_index: int
+) -> None:
+    """The NEWEST mtime decides, wherever that file sorts."""
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-mixed", cutoff - 1)
+    files = sorted(instance_dir.rglob("*.feather"))
+    assert len(files) >= 3
+    os.utime(files[fresh_index], ns=(cutoff, cutoff))
+
+    assert _reason(instance_dir, cutoff) is None
+
+
+def test_prefilter_reason_names_the_newest_mtime_not_the_oldest(tmp_path: Path) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-spread", cutoff - 1)
+    files = sorted(instance_dir.rglob("*.feather"))
+    assert len(files) >= 3
+    os.utime(files[0], ns=(cutoff - 9 * _ONE_DAY_NS, cutoff - 9 * _ONE_DAY_NS))
+    os.utime(files[1], ns=(cutoff - 5 * _ONE_DAY_NS, cutoff - 5 * _ONE_DAY_NS))
+
+    assert _reason(instance_dir, cutoff) == _skip_reason(cutoff - 1, cutoff)
+
+
+@pytest.mark.parametrize(
+    ("days", "stations"),
+    [((), frozenset(_LAX)), (_DAYS, ()), ((), ())],
+    ids=["no-days", "no-stations", "neither"],
+)
+def test_prefilter_reason_keeps_when_the_licensed_block_is_empty(
+    tmp_path: Path, days: Collection[dt.date], stations: Collection[str]
+) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-old", cutoff - 1)
+
+    assert pf._prefilter_reason(instance_dir, cutoff, days=days, stations=stations) is None
+
+
+def test_prefilter_reason_keeps_a_directory_with_no_feather_files(tmp_path: Path) -> None:
+    empty = tmp_path / "capture" / "live" / "empty"
+    empty.mkdir(parents=True)
+    fail_open: list[str] = []
+
+    assert _reason(empty, _cutoff(), fail_open=fail_open) is None
+    assert fail_open == []  # an empty signature is a keep, not a read error
+
+
+# --- the stat boundary through the probe passes -----------------------------------------
 
 
 def test_prefilter_skips_only_instances_last_written_before_the_block(
@@ -132,7 +333,7 @@ def test_prefilter_skips_only_instances_last_written_before_the_block(
     cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
     assert cutoff == _ns("2026-09-20T12:00:00")
     capture = _capture(tmp_path)
-    _minimal(capture, "tie")
+    _minimal(capture, "tie", city="nyc")
     _minimal(capture, "old", city="nyc")
     _touch(capture / "live" / "tie", cutoff)
     _touch(capture / "live" / "old", cutoff - 1)
@@ -144,9 +345,7 @@ def test_prefilter_skips_only_instances_last_written_before_the_block(
 
     _first, report = _probe_lax(capture, tmp_path / "work")
 
-    assert report.skipped["old"] == (
-        f"prefilter: last_written_ns {cutoff - 1} < cutoff_ns {cutoff}"
-    )
+    assert report.skipped["old"] == _skip_reason(cutoff - 1, cutoff)
     assert "tie" not in report.skipped
     assert "inst-a" not in report.skipped
     assert report.skipped["bad-inst"].startswith("PreflightError")
@@ -159,65 +358,86 @@ def test_prefilter_skips_only_instances_last_written_before_the_block(
 def test_prefilter_keeps_an_instance_whose_start_ends_an_earlier_span(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One feather at or after the cutoff keeps the instance (newest mtime, not oldest)."""
-    cutoff = _ns("2026-09-20T12:00:00")  # D-1 12:00Z minus one day; no call into the new seam
-    capture = _capture(tmp_path)
-    files = sorted((capture / "live" / "inst-a").rglob("*.feather"))
-    assert len(files) >= 2
-    for path in files:
-        os.utime(path, ns=(cutoff - 1, cutoff - 1))
-    os.utime(files[-1], ns=(cutoff, cutoff))
+    """One feather at or after the cutoff keeps an unlicensed instance (newest mtime)."""
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    instance_dir = _unlicensed(capture, "nyc-mixed", cutoff - 1)
+    os.utime(max(instance_dir.rglob("*.feather")), ns=(cutoff, cutoff))
+    seen = _spy(monkeypatch)
 
-    kept_first, kept = _probe_lax(capture, tmp_path / "on")
-    _disable(monkeypatch)
-    off_first, off = _probe_lax(capture, tmp_path / "off")
-
-    listed = _ns("2026-09-21T11:00:00")
-    assert kept.coverage[0].listing_ns == listed
-    assert off.coverage[0].listing_ns == listed
-    assert kept.coverage == off.coverage
-    assert kept.delta_instance_days == off.delta_instance_days
-    assert kept_first == off_first
-    assert "inst-a" not in kept.skipped
-
-
-def test_prefilter_tie_keeps(tmp_path: Path) -> None:
-    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
-    assert cutoff is not None
-    capture = _capture(tmp_path)
-    _touch(capture / "live" / "inst-a", cutoff)
-
-    assert p._prefilter_reason(capture / "live" / "inst-a", cutoff) is None
     _first, report = _probe_lax(capture, tmp_path / "work")
-    assert "inst-a" not in report.skipped
-    assert report.depth_frames == 3
-    assert report.coverage[0].listing_ns == _ns("2026-09-21T11:00:00")
+
+    assert "nyc-mixed" in seen
+    assert "nyc-mixed" not in report.skipped
 
 
-def test_prefilter_future_mtime_keeps(tmp_path: Path) -> None:
-    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
-    assert cutoff is not None
-    capture = _capture(tmp_path)
-    _touch(capture / "live" / "inst-a", cutoff + 86_400 * 1_000_000_000)
+def test_prefilter_tie_keeps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    instance_dir = _unlicensed(capture, "nyc-tie", cutoff)
+    seen = _spy(monkeypatch)
 
-    assert p._prefilter_reason(capture / "live" / "inst-a", cutoff) is None
+    assert _reason(instance_dir, cutoff) is None
     _first, report = _probe_lax(capture, tmp_path / "work")
-    assert "inst-a" not in report.skipped
-    assert report.depth_frames == 3
+    assert "nyc-tie" in seen
+    assert "nyc-tie" not in report.skipped
 
 
-def test_prefilter_oserror_keeps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
-    assert cutoff is not None
-    capture = _capture(tmp_path)
-    real = sc._signature
+def test_prefilter_future_mtime_keeps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    instance_dir = _unlicensed(capture, "nyc-future", cutoff + _ONE_DAY_NS)
+    seen = _spy(monkeypatch)
+
+    assert _reason(instance_dir, cutoff) is None
+    _first, report = _probe_lax(capture, tmp_path / "work")
+    assert "nyc-future" in seen
+    assert "nyc-future" not in report.skipped
+
+
+def test_prefilter_keeps_a_fresh_unlicensed_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _minimal(capture, "nyc-fresh", city="nyc")  # written just now: far above the cutoff
+    seen = _spy(monkeypatch)
+
+    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    assert "nyc-fresh" in seen
+    assert "nyc-fresh" not in report.skipped
+
+
+# --- fail open: read errors keep, warn, and are counted ---------------------------------
+
+
+def test_prefilter_oserror_keeps_warns_and_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture = tmp_path / "capture"
+    instance_dir = _unlicensed(capture, "nyc-old", _cutoff() - 1)
 
     def always_raise(_directory: Path) -> tuple[tuple[str, int, int], ...]:
         raise OSError("stat failed")
 
     monkeypatch.setattr(sc, "_signature", always_raise)
-    assert p._prefilter_reason(capture / "live" / "inst-a", cutoff) is None
+    fail_open: list[str] = []
+    with caplog.at_level(logging.WARNING, logger=_PF_LOG):
+        assert _reason(instance_dir, _cutoff(), fail_open=fail_open) is None
 
+    assert fail_open == ["nyc-old"]
+    (record,) = [r for r in caplog.records if r.name == _PF_LOG]
+    assert record.levelno == logging.WARNING
+    assert "nyc-old" in record.getMessage()
+    assert record.exc_info is not None
+    assert record.exc_info[0] is OSError
+
+
+def test_prefilter_oserror_in_a_pass_keeps_the_instance_and_counts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture = _capture(tmp_path)
+    real = sc._signature
     calls = {"n": 0}
 
     def one_shot(directory: Path) -> tuple[tuple[str, int, int], ...]:
@@ -228,11 +448,201 @@ def test_prefilter_oserror_keeps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(sc, "_signature", one_shot)
     seen = _spy(monkeypatch)
-    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    with caplog.at_level(logging.INFO):
+        _first, report = _probe_lax(capture, tmp_path / "work")
+
     assert calls["n"] == 1
     assert "inst-a" in seen
     assert "inst-a" not in report.skipped
     assert report.depth_frames == 3
+    assert _summary_lines(caplog) == [
+        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 1)",  # first-print pass
+        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 0)",  # probe pass
+    ]
+
+
+@pytest.mark.parametrize("payload", ["zero-byte", "truncated"])
+def test_prefilter_keeps_an_old_instance_whose_real_definitions_file_is_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, payload: str
+) -> None:
+    """A REAL damaged ``binary_option_*.feather`` (no monkeypatch) fails open, never skips."""
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    instance_dir = _unlicensed(capture, "nyc-damaged", cutoff - 1)
+    definitions = next(instance_dir.glob("binary_option_*.feather"))
+    data = definitions.read_bytes()
+    definitions.write_bytes(b"" if payload == "zero-byte" else data[: len(data) // 2])
+    os.utime(definitions, ns=(cutoff - 1, cutoff - 1))
+    fail_open: list[str] = []
+
+    with caplog.at_level(logging.WARNING, logger=_PF_LOG):
+        assert _reason(instance_dir, cutoff, fail_open=fail_open) is None
+
+    assert fail_open == ["nyc-damaged"]
+    (record,) = [r for r in caplog.records if r.name == _PF_LOG]
+    assert record.levelno == logging.WARNING
+    assert "nyc-damaged" in record.getMessage()
+    assert record.exc_info is not None
+    assert record.exc_info[0] is pa.ArrowInvalid
+
+
+def test_pass_over_a_damaged_old_instance_is_not_a_prefilter_skip_and_is_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    cutoff = _cutoff()
+    capture = _capture(tmp_path)
+    instance_dir = _unlicensed(capture, "nyc-damaged", cutoff - 1)
+    definitions = next(instance_dir.glob("binary_option_*.feather"))
+    definitions.write_bytes(b"")
+    os.utime(definitions, ns=(cutoff - 1, cutoff - 1))
+
+    with caplog.at_level(logging.INFO):
+        _first, report = _probe_lax(capture, tmp_path / "work")
+
+    # Kept by the prefilter; the later classify stage owns the verdict on the damaged file.
+    assert not report.skipped.get("nyc-damaged", "").startswith("prefilter:")
+    assert _summary_lines(caplog)[-1].endswith("(kept_by_fail_open 1)")
+
+
+def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _write_defs_only_old(capture)
+    calls = _read_calls(monkeypatch, OSError("read failed"))
+
+    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    assert calls  # the definitions reader really was reached
+    assert "defs-only" not in report.skipped
+    assert report.coverage[0].listing_ns is not None
+
+
+def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_arrow_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _write_defs_only_old(capture)
+    calls = _read_calls(monkeypatch, pa.ArrowInvalid("bad schema"))
+
+    _first, report = _probe_lax(capture, tmp_path / "work")
+
+    assert calls
+    assert "defs-only" not in report.skipped
+    assert report.coverage[0].listing_ns is not None
+
+
+# --- the three KEEP conditions beyond the stat gate -------------------------------------
+
+
+def test_prefilter_keeps_old_instance_whose_only_licensed_evidence_is_a_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    ts_init = _write_defs_only_old(capture)
+    assert ts_init < cutoff
+
+    assert _reason(capture / "live" / "defs-only", cutoff) is None
+    kept_first, kept = _probe_lax(capture, tmp_path / "on")
+    _disable(monkeypatch)
+    off_first, off = _probe_lax(capture, tmp_path / "off")
+
+    assert "defs-only" not in kept.skipped
+    assert kept_first == off_first
+    assert kept.coverage[0].listing_ns == off.coverage[0].listing_ns == ts_init
+    assert kept.coverage == off.coverage
+    assert _without_skipped(kept) == _without_skipped(off)
+
+
+def test_prefilter_keeps_old_instance_that_holds_a_licensed_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    ts_init, print_ts = _write_licensed_old(capture)
+    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
+    assert cutoff == _ns("2026-09-20T12:00:00")
+    assert ts_init < cutoff
+
+    kept_first, kept = _probe_lax(capture, tmp_path / "on")
+    _disable(monkeypatch)
+    off_first, off = _probe_lax(capture, tmp_path / "off")
+
+    assert "licensed" not in kept.skipped
+    assert all(not reason.startswith("prefilter:") for reason in kept.skipped.values())
+    assert kept_first == off_first == print_ts
+    assert kept.first_print_ns == off.first_print_ns == print_ts == kept_first
+    assert kept.coverage[0].listing_ns == off.coverage[0].listing_ns == ts_init
+    assert kept.coverage == off.coverage
+    assert kept.census == off.census
+    assert kept.direction == off.direction
+    assert _without_skipped(kept) == _without_skipped(off)
+
+
+def test_prefilter_keeps_old_instance_with_licensed_rung_dirs_and_no_licensed_definitions(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir, _print_ts = _write_rungs_without_definitions(tmp_path / "capture")
+    fail_open: list[str] = []
+
+    assert _reason(instance_dir, cutoff, fail_open=fail_open) is None
+    assert fail_open == []  # kept on the evidence, not by a read error
+
+
+def test_prefilter_keeps_the_fresh_twin_of_the_rungs_without_definitions_instance(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir, _print_ts = _write_rungs_without_definitions(tmp_path / "capture", cutoff + 1)
+
+    assert _reason(instance_dir, cutoff) is None
+
+
+@pytest.mark.parametrize("stream", ["trade_tick", "order_book_depths"])
+def test_any_per_rung_stream_directory_keeps_the_instance(tmp_path: Path, stream: str) -> None:
+    cutoff = _cutoff()
+    instance_dir, _print_ts = _write_rungs_without_definitions(tmp_path / "capture")
+    for other in {"trade_tick", "order_book_depths"} - {stream}:
+        shutil.rmtree(instance_dir / other)
+    _touch(instance_dir, cutoff - 1)
+
+    assert _reason(instance_dir, cutoff) is None
+
+
+@pytest.mark.parametrize("city", ["nyc", "sfo"])
+def test_prefilter_skips_old_zero_row_instance_whose_rung_dirs_are_not_licensed(
+    tmp_path: Path, city: str
+) -> None:
+    """NYC, or SFO when only LAX is requested: rung directories of another scope do not keep it."""
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "other-scope", cutoff - 1, city=city)
+    _blank_definitions(instance_dir)
+    _touch(instance_dir, cutoff - 1)
+    assert any((instance_dir / "trade_tick").iterdir())
+
+    assert _reason(instance_dir, cutoff) == _skip_reason(cutoff - 1, cutoff)
+
+
+def test_rungs_without_definitions_gives_the_same_first_print_with_the_prefilter_on_and_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture"
+    _instance_dir, print_ts = _write_rungs_without_definitions(capture)
+
+    on_first, on = _probe_lax(capture, tmp_path / "on")
+    _disable(monkeypatch)
+    off_first, off = _probe_lax(capture, tmp_path / "off")
+
+    assert on_first == off_first == print_ts
+    assert on.first_print_ns == off.first_print_ns == print_ts
+    assert on.first_replayable_day == off.first_replayable_day
+    assert "licensed" not in on.skipped
+    assert _without_skipped(on) == _without_skipped(off)
+
+
+# --- on/off equivalence of the licensed outputs -----------------------------------------
 
 
 def test_licensed_outputs_identical_with_and_without_prefilter(
@@ -278,7 +688,7 @@ def test_licensed_outputs_identical_with_and_without_prefilter(
     assert _without_skipped(on) == _without_skipped(off)
     assert set(on.skipped) - set(off.skipped) == {"old"}
     assert set(off.skipped) - set(on.skipped) == set()
-    assert on.skipped["old"] == f"prefilter: last_written_ns {cutoff - 1} < cutoff_ns {cutoff}"
+    assert on.skipped["old"] == _skip_reason(cutoff - 1, cutoff)
     assert on_plan.keys() == off_plan.keys()
     for key, row in on_plan.items():
         assert row.instruments == off_plan[key].instruments
@@ -289,74 +699,11 @@ def test_licensed_outputs_identical_with_and_without_prefilter(
     assert on_skipped["old"].startswith("prefilter:")
 
 
-def test_prefilter_keeps_old_instance_that_holds_a_licensed_listing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ts_init = _ns("2026-09-19T00:00:00")
-    print_ts = _ns("2026-09-22T05:40:00")
-    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
-    assert cutoff == _ns("2026-09-20T12:00:00")
-    capture = tmp_path / "capture"
-    lax = _instrument(_slug("lax"), ts_init)
-    _write_instance(
-        capture,
-        "licensed",
-        instruments=[lax],
-        records=[
-            _depth(lax, "0.390", "0.410", print_ts),
-            _trade(lax, "lic", "0.500", AggressorSide.BUYER, print_ts),
-        ],
-        offsets=[(_ns("2026-09-22T01:00:00"), -5 * 1_000_000_000)],
-    )
-    _touch(capture / "live" / "licensed", ts_init)
-    assert ts_init < cutoff
-
-    kept_first, kept = _probe_lax(capture, tmp_path / "on")
-    _disable(monkeypatch)
-    off_first, off = _probe_lax(capture, tmp_path / "off")
-
-    assert "licensed" not in kept.skipped
-    assert all(not reason.startswith("prefilter:") for reason in kept.skipped.values())
-    assert kept_first == off_first == print_ts
-    assert kept.first_print_ns == off.first_print_ns == print_ts == kept_first
-    assert kept.coverage[0].listing_ns == off.coverage[0].listing_ns == ts_init
-    assert kept.coverage == off.coverage
-    assert kept.census == off.census
-    assert kept.direction == off.direction
-    assert _without_skipped(kept) == _without_skipped(off)
-
-
-def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_oserror(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    capture = tmp_path / "capture"
-    _write_licensed_old(capture)
-    _raise_on_definition_read(monkeypatch, OSError("read failed"))
-
-    _first, report = _probe_lax(capture, tmp_path / "work")
-
-    assert "licensed" not in report.skipped
-    assert report.coverage[0].listing_ns is not None
-
-
-def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_arrow_invalid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    capture = tmp_path / "capture"
-    _write_licensed_old(capture)
-    _raise_on_definition_read(monkeypatch, pa.ArrowInvalid("bad schema"))
-
-    _first, report = _probe_lax(capture, tmp_path / "work")
-
-    assert "licensed" not in report.skipped
-    assert report.coverage[0].listing_ns is not None
+# --- the plan pass --------------------------------------------------------------------
 
 
 def test_plan_pass_skips_and_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Imported for plan(), not re-exported (mypy no-implicit-reexport).
-    assert catalog.__dict__["prefilter_cutoff_ns"] is p.prefilter_cutoff_ns
-    cutoff = p.prefilter_cutoff_ns([_DAY], _LAX)
-    assert cutoff is not None
+    cutoff = _cutoff()
     capture = _capture(tmp_path)
     _minimal(capture, "old", city="nyc")
     _touch(capture / "live" / "old", cutoff - 1)
@@ -366,9 +713,7 @@ def test_plan_pass_skips_and_records(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     plan = session.plan([_DAY], _LAX)
 
-    assert session.skipped["old"] == (
-        f"prefilter: last_written_ns {cutoff - 1} < cutoff_ns {cutoff}"
-    )
+    assert session.skipped["old"] == _skip_reason(cutoff - 1, cutoff)
     assert not (work / "plan" / "old").exists()
     assert "old" not in seen
     assert "inst-a" in seen
@@ -387,15 +732,15 @@ def test_plan_pass_keeps_old_instance_that_holds_a_licensed_listing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     capture = tmp_path / "capture"
-    _write_licensed_old(capture)
+    _write_defs_only_old(capture)
     session = catalog.CatalogSession(capture, tmp_path / "plan-on")
 
     plan = session.plan([_DAY], _LAX)
 
-    assert "licensed" not in session.skipped
+    assert "defs-only" not in session.skipped
     key = ("LAX", _DAY)
     assert key in plan
-    assert "licensed" in plan[key].instances
+    assert "defs-only" in plan[key].instances
     _disable(monkeypatch)
     control = catalog.CatalogSession(capture, tmp_path / "plan-off")
     control_plan = control.plan([_DAY], _LAX)
@@ -404,3 +749,44 @@ def test_plan_pass_keeps_old_instance_that_holds_a_licensed_listing(
         assert row.instruments == control_plan[plan_key].instruments
         assert row.instances == control_plan[plan_key].instances
         assert row.catalog_bytes == control_plan[plan_key].catalog_bytes
+
+
+def test_plan_pass_keeps_old_instance_with_licensed_rung_dirs_and_no_licensed_definitions(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture"
+    _write_rungs_without_definitions(capture)
+    session = catalog.CatalogSession(capture, tmp_path / "plan-on")
+
+    session.plan([_DAY], _LAX)
+
+    assert "licensed" not in session.skipped
+
+
+# --- one summary line per pass; no frame-store leak on a bad station --------------------
+
+
+def test_each_pass_logs_one_prefilter_summary_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture = _capture(tmp_path)
+    _unlicensed(capture, "nyc-old", _cutoff() - 1)
+
+    with caplog.at_level(logging.INFO):
+        p.first_print_instant(capture, [_DAY], work_root=tmp_path / "fp", stations=_LAX)
+        p.probe(capture, [_DAY], _LAX, work_root=tmp_path / "probe")
+        catalog.CatalogSession(capture, tmp_path / "plan").plan([_DAY], _LAX)
+
+    assert (
+        _summary_lines(caplog) == ["prefilter: skipped 1 of 2 instances (kept_by_fail_open 0)"] * 3
+    )
+
+
+def test_probe_with_an_unknown_station_leaves_no_frame_store(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+    work = tmp_path / "work"
+
+    with pytest.raises(SiteNotFoundError):
+        p.probe(capture, [_DAY], ("ZZZ",), work_root=work)
+
+    assert not (work / "_frames").exists()
