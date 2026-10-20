@@ -2,8 +2,9 @@
 
 An old instance is skipped (never converted) only when ALL of these hold: its newest feather is
 strictly older than the licensed block (a tie is kept), it holds no readable licensed YES
-definition, and it holds no licensed per-rung stream directory. Any read error keeps it (fail
-open: WARNING with traceback, counted in the single per-pass log line).
+definition, it holds no licensed per-rung stream directory, and it holds no flat per-rung stream
+file. Any read error keeps it (fail open: WARNING with traceback, counted in the single per-pass
+log line, as is every instance kept by content).
 
 Every boundary case uses an UNLICENSED instance (NYC, or a station outside the requested ones)
 with real ``days``/``stations``: a licensed instance is rescued by the definitions or rung-directory
@@ -24,7 +25,9 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.persistence.funcs import class_to_filename
 
 from breezy.persistence.feather_preflight import DEFAULT_SUBDIRECTORY
 from breezy.registry.sites import SiteNotFoundError
@@ -85,10 +88,21 @@ def _cutoff() -> int:
     return cutoff
 
 
-def _reason(instance_dir: Path, cutoff: int, *, fail_open: list[str] | None = None) -> str | None:
+def _reason(
+    instance_dir: Path,
+    cutoff: int,
+    *,
+    fail_open: list[str] | None = None,
+    kept_by_content: list[str] | None = None,
+) -> str | None:
     """The real decision for LAX x ``_DAY`` (real ``days``/``stations``, never the empty guard)."""
     return pf._prefilter_reason(
-        instance_dir, cutoff, days=_DAYS, stations=frozenset(_LAX), fail_open=fail_open
+        instance_dir,
+        cutoff,
+        days=_DAYS,
+        stations=frozenset(_LAX),
+        fail_open=fail_open,
+        kept_by_content=kept_by_content,
     )
 
 
@@ -183,6 +197,23 @@ def _write_rungs_without_definitions(
     return instance_dir, print_ts
 
 
+def _write_flat_per_rung_old(capture: Path) -> tuple[Path, int]:
+    """Old instance, zero-row definitions, licensed prints held ONLY as a flat per-rung file.
+
+    The recorder's per-instrument directories are moved to the flat ``<table>_<ts>.feather`` name
+    ``StreamingFeatherWriter._create_writer`` gives a flat file (it carries no instrument id).
+    """
+    instance_dir, print_ts = _write_rungs_without_definitions(capture)
+    (rung_file,) = (instance_dir / class_to_filename(TradeTick)).rglob("*.feather")
+    flat = instance_dir / f"{class_to_filename(TradeTick)}_{print_ts}.feather"
+    rung_file.rename(flat)
+    shutil.rmtree(instance_dir / class_to_filename(TradeTick))
+    shutil.rmtree(instance_dir / "order_book_depths")
+    _touch(instance_dir, _ns("2026-09-19T00:00:00"))
+    assert flat.parent == instance_dir
+    return instance_dir, print_ts
+
+
 def _read_calls(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> list[str]:
     """Make the definitions reader raise ``error``; returns the list of paths it was asked for."""
     calls: list[str] = []
@@ -192,6 +223,19 @@ def _read_calls(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> list[s
         raise error
 
     monkeypatch.setattr(pf, "_read_definition_instrument_ids", boom)
+    return calls
+
+
+def _definition_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Spy on the definitions reader (the real one still runs); returns the paths it was given."""
+    calls: list[str] = []
+    real = pf._read_definition_instrument_ids
+
+    def spy(path: Path) -> Any:
+        calls.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(pf, "_read_definition_instrument_ids", spy)
     return calls
 
 
@@ -207,12 +251,12 @@ def _without_skipped(report: p.ProbeReport) -> dict[str, Any]:
     return body
 
 
+def _summary_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith("prefilter: skipped")]
+
+
 def _summary_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [
-        message
-        for record in caplog.records
-        if (message := record.getMessage()).startswith("prefilter: skipped")
-    ]
+    return [record.getMessage() for record in _summary_records(caplog)]
 
 
 # --- structure ----------------------------------------------------------------------------
@@ -456,10 +500,11 @@ def test_prefilter_oserror_in_a_pass_keeps_the_instance_and_counts_it(
     assert "inst-a" in seen
     assert "inst-a" not in report.skipped
     assert report.depth_frames == 3
-    assert _summary_lines(caplog) == [
-        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 1)",  # first-print pass
-        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 0)",  # probe pass
-    ]
+    first_print_pass, probe_pass = (
+        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 1, kept_by_content 0)",
+        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 0, kept_by_content 0)",
+    )
+    assert _summary_lines(caplog) == [first_print_pass, probe_pass]
 
 
 @pytest.mark.parametrize("payload", ["zero-byte", "truncated"])
@@ -502,7 +547,7 @@ def test_pass_over_a_damaged_old_instance_is_not_a_prefilter_skip_and_is_counted
 
     # Kept by the prefilter; the later classify stage owns the verdict on the damaged file.
     assert not report.skipped.get("nyc-damaged", "").startswith("prefilter:")
-    assert _summary_lines(caplog)[-1].endswith("(kept_by_fail_open 1)")
+    assert _summary_lines(caplog)[-1].endswith("(kept_by_fail_open 1, kept_by_content 0)")
 
 
 def test_prefilter_keeps_licensed_instance_when_definitions_read_raises_oserror(
@@ -600,6 +645,71 @@ def test_prefilter_keeps_the_fresh_twin_of_the_rungs_without_definitions_instanc
     assert _reason(instance_dir, cutoff) is None
 
 
+@pytest.mark.parametrize("payload", ["zero-byte", "truncated"])
+def test_rung_directory_check_precedes_the_definitions_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    """Licensed rung directories keep the instance BEFORE the definitions file is opened.
+
+    The definitions file here is damaged: were it read first it would fail open (counted in
+    ``fail_open``); read second-or-never it cannot. Pins the cheap directory listing ahead of the
+    file read, so a damaged definitions file never turns into a read error the rungs already settle.
+    """
+    cutoff = _cutoff()
+    instance_dir, _print_ts = _write_rungs_without_definitions(tmp_path / "capture")
+    definitions = next(instance_dir.glob("binary_option_*.feather"))
+    data = definitions.read_bytes()
+    definitions.write_bytes(b"" if payload == "zero-byte" else data[: len(data) // 2])
+    _touch(instance_dir, _ns("2026-09-19T00:00:00"))
+    reads = _definition_reads(monkeypatch)
+    fail_open: list[str] = []
+
+    assert _reason(instance_dir, cutoff, fail_open=fail_open) is None
+
+    assert fail_open == []
+    assert reads == []  # the definitions reader was never reached
+
+
+def test_prefilter_keeps_old_instance_whose_only_licensed_evidence_is_a_flat_per_rung_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flat ``trade_tick_<ts>.feather`` names no instrument: any such file keeps (names only)."""
+    cutoff = _cutoff()
+    capture = tmp_path / "capture"
+    instance_dir, print_ts = _write_flat_per_rung_old(capture)
+    assert not (instance_dir / "trade_tick").exists()
+    assert not (instance_dir / "order_book_depths").exists()
+    (definitions,) = instance_dir.glob("binary_option_*.feather")
+    assert pf._read_definition_instrument_ids(definitions) == ()  # no licensed definition row
+    fail_open: list[str] = []
+    reads = _definition_reads(monkeypatch)
+
+    assert _reason(instance_dir, cutoff, fail_open=fail_open) is None
+    assert fail_open == []
+    assert reads == []  # names only: the flat file keeps it before any definitions read
+    kept_first, kept = _probe_lax(capture, tmp_path / "on")
+    _disable(monkeypatch)
+    off_first, off = _probe_lax(capture, tmp_path / "off")
+
+    assert "licensed" not in kept.skipped
+    assert kept_first == off_first == print_ts
+    assert kept.first_print_ns == off.first_print_ns == print_ts
+    assert _without_skipped(kept) == _without_skipped(off)
+
+
+def test_a_flat_non_per_rung_file_does_not_keep_an_old_unlicensed_instance(
+    tmp_path: Path,
+) -> None:
+    """Definitions and the venue clock are flat too; only per-rung stream names keep."""
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-flat", cutoff - 1, city="nyc")
+    flat = [p for p in instance_dir.glob("*.feather")]
+    assert flat  # binary_option_*.feather and the venue clock offsets
+    assert not any(f.name.startswith(class_to_filename(TradeTick) + "_") for f in flat)
+
+    assert _reason(instance_dir, cutoff) == _skip_reason(cutoff - 1, cutoff)
+
+
 @pytest.mark.parametrize("stream", ["trade_tick", "order_book_depths"])
 def test_any_per_rung_stream_directory_keeps_the_instance(tmp_path: Path, stream: str) -> None:
     cutoff = _cutoff()
@@ -640,6 +750,100 @@ def test_rungs_without_definitions_gives_the_same_first_print_with_the_prefilter
     assert on.first_replayable_day == off.first_replayable_day
     assert "licensed" not in on.skipped
     assert _without_skipped(on) == _without_skipped(off)
+
+
+# --- kept_by_content: the empirical premise-P violation signal -----------------------------
+
+
+def test_kept_by_content_counts_an_old_instance_kept_by_a_licensed_rung_directory(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir, _print_ts = _write_rungs_without_definitions(tmp_path / "capture")
+    kept_by_content: list[str] = []
+
+    assert _reason(instance_dir, cutoff, kept_by_content=kept_by_content) is None
+    assert kept_by_content == ["licensed"]
+
+
+def test_kept_by_content_counts_an_old_instance_kept_by_a_licensed_definition(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    _write_defs_only_old(tmp_path / "capture")
+    kept_by_content: list[str] = []
+
+    assert (
+        _reason(
+            tmp_path / "capture" / "live" / "defs-only", cutoff, kept_by_content=kept_by_content
+        )
+        is None
+    )
+    assert kept_by_content == ["defs-only"]
+
+
+def test_kept_by_content_counts_an_old_instance_kept_by_a_flat_per_rung_file(
+    tmp_path: Path,
+) -> None:
+    instance_dir, _print_ts = _write_flat_per_rung_old(tmp_path / "capture")
+    kept_by_content: list[str] = []
+
+    assert _reason(instance_dir, _cutoff(), kept_by_content=kept_by_content) is None
+    assert kept_by_content == ["licensed"]
+
+
+def test_kept_by_content_is_zero_for_an_old_unlicensed_instance_that_is_skipped(
+    tmp_path: Path,
+) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-old", cutoff - 1)
+    kept_by_content: list[str] = []
+
+    assert _reason(instance_dir, cutoff, kept_by_content=kept_by_content) == _skip_reason(
+        cutoff - 1, cutoff
+    )
+    assert kept_by_content == []
+
+
+def test_kept_by_content_is_zero_for_a_fresh_instance(tmp_path: Path) -> None:
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-fresh", cutoff + 1)
+    kept_by_content: list[str] = []
+
+    assert _reason(instance_dir, cutoff, kept_by_content=kept_by_content) is None
+    assert kept_by_content == []
+
+
+def test_kept_by_content_is_zero_when_a_read_error_kept_the_instance(tmp_path: Path) -> None:
+    """A read error is counted in ``fail_open``, never also as a content keep."""
+    cutoff = _cutoff()
+    instance_dir = _unlicensed(tmp_path / "capture", "nyc-damaged", cutoff - 1)
+    definitions = next(instance_dir.glob("binary_option_*.feather"))
+    definitions.write_bytes(b"")
+    os.utime(definitions, ns=(cutoff - 1, cutoff - 1))
+    fail_open: list[str] = []
+    kept_by_content: list[str] = []
+
+    assert (
+        _reason(instance_dir, cutoff, fail_open=fail_open, kept_by_content=kept_by_content) is None
+    )
+    assert fail_open == ["nyc-damaged"]
+    assert kept_by_content == []
+
+
+def test_the_pass_summary_counts_the_instance_kept_by_content(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture = tmp_path / "capture"
+    _write_rungs_without_definitions(capture)
+
+    with caplog.at_level(logging.INFO):
+        _probe_lax(capture, tmp_path / "work")
+
+    assert (
+        _summary_lines(caplog)
+        == ["prefilter: skipped 0 of 1 instances (kept_by_fail_open 0, kept_by_content 1)"] * 2
+    )
 
 
 # --- on/off equivalence of the licensed outputs -----------------------------------------
@@ -778,7 +982,62 @@ def test_each_pass_logs_one_prefilter_summary_line(
         catalog.CatalogSession(capture, tmp_path / "plan").plan([_DAY], _LAX)
 
     assert (
-        _summary_lines(caplog) == ["prefilter: skipped 1 of 2 instances (kept_by_fail_open 0)"] * 3
+        _summary_lines(caplog)
+        == ["prefilter: skipped 1 of 2 instances (kept_by_fail_open 0, kept_by_content 0)"] * 3
+    )
+
+
+def test_summary_line_is_info_when_nothing_was_kept_by_error_or_content(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture = _capture(tmp_path)
+    _unlicensed(capture, "nyc-old", _cutoff() - 1)
+
+    with caplog.at_level(logging.INFO, logger=_PF_LOG):
+        p.probe(capture, [_DAY], _LAX, work_root=tmp_path / "probe")
+
+    (record,) = _summary_records(caplog)
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == (
+        "prefilter: skipped 1 of 2 instances (kept_by_fail_open 0, kept_by_content 0)"
+    )
+
+
+def test_summary_line_is_a_warning_when_a_read_error_kept_an_instance(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No maker_stage0 script configures logging: only WARNING+ reaches stderr unconfigured."""
+    cutoff = _cutoff()
+    capture = _capture(tmp_path)
+    instance_dir = _unlicensed(capture, "nyc-damaged", cutoff - 1)
+    definitions = next(instance_dir.glob("binary_option_*.feather"))
+    definitions.write_bytes(b"")
+    os.utime(definitions, ns=(cutoff - 1, cutoff - 1))
+
+    with caplog.at_level(logging.INFO, logger=_PF_LOG):
+        p.probe(capture, [_DAY], _LAX, work_root=tmp_path / "probe")
+
+    (record,) = _summary_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "prefilter: skipped 0 of 2 instances (kept_by_fail_open 1, kept_by_content 0)"
+    )
+
+
+def test_summary_line_is_a_warning_when_an_old_instance_was_kept_by_content(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under premise P the count is 0: a non-zero one must be visible without logging config."""
+    capture = tmp_path / "capture"
+    _write_rungs_without_definitions(capture)
+
+    with caplog.at_level(logging.INFO, logger=_PF_LOG):
+        p.probe(capture, [_DAY], _LAX, work_root=tmp_path / "probe")
+
+    (record,) = _summary_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "prefilter: skipped 0 of 1 instances (kept_by_fail_open 0, kept_by_content 1)"
     )
 
 

@@ -216,18 +216,25 @@ def _for_each_clean_instance(
     that are malformed or not CLEAN are recorded in ``skipped`` with the reason, never dropped.
     ``keep_rung`` (S-5) limits the per-rung streams converted to the ids it accepts (None: all).
     ``written_since_ns`` skips, before classify, an instance whose newest feather is strictly
-    older and that holds no licensed rung directory or definition (``maker_stage0_prefilter``).
+    older and that holds no licensed rung directory, flat per-rung file or definition
+    (``maker_stage0_prefilter``).
     """
     sc.check_work_root(work_root, catalog_root)
     source = ParquetDataCatalog(str(catalog_root))
     now_ns = time.time_ns()
     instance_ids = list_instance_ids(catalog_root, DEFAULT_SUBDIRECTORY)
     fail_open: list[str] = []
+    kept_by_content: list[str] = []
     for instance_id in instance_ids:
         instance_dir = catalog_root / DEFAULT_SUBDIRECTORY / instance_id
         if written_since_ns is not None and (
             reason := _prefilter_reason(
-                instance_dir, written_since_ns, days=days, stations=stations, fail_open=fail_open
+                instance_dir,
+                written_since_ns,
+                days=days,
+                stations=stations,
+                fail_open=fail_open,
+                kept_by_content=kept_by_content,
             )
         ):
             skipped[instance_id] = reason
@@ -254,7 +261,7 @@ def _for_each_clean_instance(
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             release_free_heap()  # S-5: the instance's freed heap goes back before the next one
-    log_prefilter(skipped, len(instance_ids), len(fail_open))
+    log_prefilter(skipped, len(instance_ids), len(fail_open), len(kept_by_content))
 
 
 def first_print_instant(

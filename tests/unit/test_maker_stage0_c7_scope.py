@@ -2,10 +2,11 @@
 
 Verdict-closure byte pin (delta section 2.17). Importing the replay CLI and the
 station-day child must not grow, and every non-exempt file stays at its Commit-1 digest.
-EXEMPT is the four post-FINAL-editable files: probe, probe_report, catalog_read and (widened
-from three at c5f7d3a2) prefilter. A re-pin at Doc B FINAL is a reviewed diff of the JSON AND of
-the EXEMPT set. The closure is ``src/`` and ``scripts/`` modules only: an in-tree ``.venv``
-(the primary tree has one) is not part of the verdict closure.
+EXEMPT is the four pre-FINAL-editable files (probe, probe_report, catalog_read, and prefilter,
+widened from three at c5f7d3a2); at Doc B FINAL it shrinks to probe and probe_report, and that
+re-pin is a reviewed diff of the JSON AND of the EXEMPT set. An in-tree ``.venv`` (the primary
+tree has one) is the only path excluded from the verdict closure: any other repo module the child
+imports must be pinned, so a new top-level package fails the equality below instead of dropping out.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ for module in sys.modules.values():
     if not path.is_relative_to(root):
         continue
     rel = path.relative_to(root).as_posix()
-    if rel.startswith(("src/", "scripts/")):
+    if not rel.startswith(".venv/"):
         found[rel] = str(path)
 print(json.dumps(found, sort_keys=True))
 """
