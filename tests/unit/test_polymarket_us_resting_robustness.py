@@ -12,6 +12,7 @@ No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig`
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any, Final
@@ -451,4 +452,84 @@ async def test_cancel_all_that_cannot_send_with_no_target_still_logs_an_error(
     await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
     assert "OrderCancelRejected" not in _names(rig)
     assert client.log_lines("error", "Refusing cancel-all")
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_cancel_alert_log_and_detail_carry_a_redacted_id_and_a_validated_slug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G14: the ERROR line and the alert detail (which leaves the process) name the order by
+    a short prefix, never the full venue id."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    target = client._resting_target_of(_id_n(0))
+    assert target is not None
+    now_ns = (submit_chain.RETRY_ALERT_AGE_S + 1) * 1_000_000_000
+    client._note_cancel_refused(target, 0, now_ns)
+    (detail,) = client.resting_cancel_alerts
+    assert detail["venue_order_id"] == _id_n(0)[:4] + "…"
+    assert _id_n(0) not in json.dumps(dict(detail))
+    assert detail["slug"] == target.slug
+    lines = client.log_lines("error", "resting_cancel_alert")
+    assert lines and all(_id_n(0) not in line for line in lines)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_poisoned_slug_is_never_logged_or_alerted_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    target = client._resting_target_of(_id_n(0))
+    assert target is not None
+    evil = dataclasses.replace(target, slug="tc-x\nCRITICAL forged line")
+    now_ns = (submit_chain.RETRY_ALERT_AGE_S + 1) * 1_000_000_000
+    client._note_cancel_refused(evil, 0, now_ns)
+    (detail,) = client.resting_cancel_alerts
+    assert "forged" not in json.dumps(dict(detail))
+    assert all("forged" not in m and "\n" not in m for _lv, m in client.log_records)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize(
+    "bad_id",
+    ["evil\nCRITICAL forged line", "x" * 500, "café", "\x1b[31mred", ""],
+    ids=["newline", "overlong", "unicode", "escape", "empty"],
+)
+async def test_the_latch_log_never_echoes_an_invalid_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_id: str
+) -> None:
+    """G14 log-injection: an id that fails the allowlist is replaced, not logged."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    client._latch_resting_cancel_unconfirmed(bad_id, "id_or_slug_unusable")
+    lines = client.log_lines("error", "venue order")
+    assert lines
+    for line in lines:
+        assert "forged" not in line and "\x1b" not in line and "x" * 100 not in line
+        assert "<invalid-id>" in line
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_latch_log_redacts_a_valid_id_and_keeps_synthetic_ids_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    client._latch_resting_cancel_unconfirmed(_id_n(0), "cancel_not_confirmed")
+    client._latch_resting_cancel_unconfirmed("boot-sweep", "boot_sweep_reread_failed:X")
+    lines = client.log_lines("error", "venue order")
+    assert any(_id_n(0)[:4] + "…" in line for line in lines)
+    assert all(_id_n(0) not in line for line in lines)
+    assert any("boot-sweep" in line for line in lines)
     await client._disconnect()

@@ -498,6 +498,26 @@ def _redact_order_id(venue_order_id: str) -> str:
     return f"{venue_order_id[:_ORDER_ID_REDACT_PREFIX]}\u2026"
 
 
+def _loggable_order_id(venue_order_id: object) -> str:
+    """What a log line or an alert detail may say about an order id (B5 review G14): a
+    VALID venue id is redacted to its prefix; one of this client's own synthetic latch ids
+    is shown verbatim; anything else (an id that fails the allowlist, so possibly
+    attacker-shaped) is replaced, never echoed -- no log injection."""
+    if venue_order_id in _SYNTHETIC_LATCH_IDS:
+        return str(venue_order_id)
+    if isinstance(venue_order_id, str) and submit_chain.valid_venue_order_id(venue_order_id):
+        return _redact_order_id(venue_order_id)
+    return "<invalid-id>"
+
+
+def _loggable_slug(slug: object) -> str:
+    """A market slug as a log line or alert detail may carry it: a valid daily-high slug
+    verbatim, anything else replaced (B5 review G14)."""
+    if isinstance(slug, str) and submit_chain.is_daily_high_slug(slug):
+        return slug
+    return "<invalid-slug>"
+
+
 #: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
 #: reconciliation refusal is surfaced under, and its NAMED latches. Each
 #: refusal returns empty reports for its scope AND latches one of these --
@@ -1416,6 +1436,7 @@ _LEDGER_LATCH_ID: Final[str] = "ledger"
 #: ever be terminal, so a latch under this id is cleared ONLY by the next boot (a fresh
 #: process starts unlatched and its own sweep re-decides); it is never cleared mid-run.
 _BOOT_SWEEP_LATCH_ID: Final[str] = "boot-sweep"
+_SYNTHETIC_LATCH_IDS: Final[frozenset[str]] = frozenset({_LEDGER_LATCH_ID, _BOOT_SWEEP_LATCH_ID})
 
 
 def _binding_row_fields(row: object) -> tuple[str, str, str, int] | None:
@@ -8768,14 +8789,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 venue_id: {
                     "severity": "CRITICAL",
                     "event": "resting_cancel_alert",
-                    "venue_order_id": venue_id,
-                    "slug": target.slug,
+                    "venue_order_id": _loggable_order_id(venue_id),
+                    "slug": _loggable_slug(target.slug),
                     "age_s": str(age_ns // _NANOS_PER_SECOND),
                     "next": "cancel_loop_retrying_then_latch_resting_cancel_unconfirmed",
                 },
             }
             self._log.error(
-                f"resting_cancel_alert: venue order {venue_id} on {target.slug} is still open "
+                f"resting_cancel_alert: venue order {_loggable_order_id(venue_id)} on "
+                f"{_loggable_slug(target.slug)} is still open "
                 f"{age_ns // _NANOS_PER_SECOND} s after its first refused cancel"
             )
         deadline_ns = submit_chain.cancel_latch_deadline_ns(first_refused_ns, target.expire_time_ns)
@@ -8799,7 +8821,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``resting_query_unreadable``): a CRITICAL log naming the latch token, then the
         global durable refusal (deduped by reason) that refuses NEW rests only."""
         self._log.error(
-            f"{reason.split(':', 1)[0]}: venue order {venue_order_id} ({cause}); "
+            f"{reason.split(':', 1)[0]}: venue order {_loggable_order_id(venue_order_id)} "
+            f"({cause}); "
             "new rests are refused, cancels continue"
         )
         self._refuse(reason)
