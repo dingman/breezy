@@ -210,6 +210,14 @@ CANCEL_READ_EXPIRED: Final[str] = "EXPIRED"
 CANCEL_READ_FILLED: Final[str] = "FILLED"
 CANCEL_READ_OPEN: Final[str] = "OPEN"
 CANCEL_READ_UNREADABLE: Final[str] = "UNREADABLE"
+_CANCEL_TERMINAL_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "ORDER_STATE_FILLED",
+        "ORDER_STATE_CANCELED",
+        "ORDER_STATE_EXPIRED",
+        "ORDER_STATE_REJECTED",
+    }
+)
 _OPEN_ORDERS_KNOWN_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({"orders", "eof"})
 _CANCEL_OPEN_STATES: Final[frozenset[str]] = frozenset(
     {
@@ -734,13 +742,27 @@ def resting_echo_matches(
         return False
 
 
+def _cum_reaches_quantity(cum: Decimal, raw_quantity: object) -> bool:
+    """True iff the echoed ``quantity`` is a positive finite number and ``cum`` reaches it."""
+    if raw_quantity is None or isinstance(raw_quantity, bool):
+        return False
+    try:
+        quantity = Decimal(str(raw_quantity))
+    except (InvalidOperation, ValueError):
+        return False
+    return quantity.is_finite() and quantity > 0 and cum >= quantity
+
+
 def cancel_read_verdict(order: object) -> str:
     """What one GET of an order proves about its cancel (pure, never raises).
 
-    ``FILLED`` for ANY cumulative fill (even on an order the venue then cancelled:
-    the fill path owns it, a cancel never settles it); ``CANCELED`` / ``EXPIRED``
-    only for a zero-fill terminal state with ``cumQuantity`` PRESENT and zero;
-    ``OPEN`` for a live state; everything else (not an object, a missing or
+    ``FILLED`` for a cumulative fill on an order that is DONE -- a terminal state (even
+    one the venue cancelled: the fill path owns it, a cancel never settles it) or a
+    ``cumQuantity`` that has reached the echoed ``quantity``. A fill on a still-LIVE
+    state (a partial: the rest still rests) is ``OPEN``, so the cancel keeps retrying
+    (B5 review G4); a fill on an unknown state is ``UNREADABLE``. ``CANCELED`` /
+    ``EXPIRED`` only for a zero-fill terminal state with ``cumQuantity`` PRESENT and
+    zero; ``OPEN`` for a live state; everything else (not an object, a missing or
     non-numeric or negative ``cumQuantity``, an unknown state, a FILLED state
     with nothing filled) is ``UNREADABLE``. A bare 200 on the cancel POST is
     never an input here: only a read of the order is.
@@ -758,7 +780,9 @@ def cancel_read_verdict(order: object) -> str:
     if not cum.is_finite() or cum < 0:
         return CANCEL_READ_UNREADABLE
     if cum > 0:
-        return CANCEL_READ_FILLED
+        if state in _CANCEL_TERMINAL_STATES or _cum_reaches_quantity(cum, order.get("quantity")):
+            return CANCEL_READ_FILLED
+        return CANCEL_READ_OPEN if state in _CANCEL_OPEN_STATES else CANCEL_READ_UNREADABLE
     if state in ("ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED"):
         return CANCEL_READ_CANCELED
     if state == "ORDER_STATE_EXPIRED":

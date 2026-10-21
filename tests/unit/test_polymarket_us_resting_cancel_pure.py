@@ -40,10 +40,49 @@ def test_cancel_read_verdict_zero_fill_states(state: str, verdict: str) -> None:
     assert submit_chain.cancel_read_verdict(_order(state=state)) == verdict
 
 
-@pytest.mark.parametrize("state", ["ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_NEW"])
-def test_any_cumulative_fill_routes_to_the_fill_path(state: str) -> None:
+@pytest.mark.parametrize(
+    "state",
+    [
+        "ORDER_STATE_FILLED",
+        "ORDER_STATE_CANCELED",
+        "ORDER_STATE_EXPIRED",
+        "ORDER_STATE_REJECTED",
+    ],
+)
+def test_any_cumulative_fill_on_a_terminal_order_routes_to_the_fill_path(state: str) -> None:
     """A fill (even on an order the venue then cancelled) is never a clean cancel."""
     assert submit_chain.cancel_read_verdict(_order(state=state, cumQuantity=1)) == "FILLED"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "ORDER_STATE_NEW",
+        "ORDER_STATE_PARTIALLY_FILLED",
+        "ORDER_STATE_PENDING_CANCEL",
+        "ORDER_STATE_PENDING_NEW",
+    ],
+)
+def test_a_live_partial_fill_keeps_the_cancel_retrying(state: str) -> None:
+    """B5 review G4: part of the order has filled but the rest still RESTS -- the cancel
+    is not done, so the verdict is OPEN (never FILLED), whether or not the quantity echoes."""
+    with_qty = _order(state=state, cumQuantity=1, quantity=10)
+    assert submit_chain.cancel_read_verdict(with_qty) == "OPEN"
+    assert submit_chain.cancel_read_verdict(_order(state=state, cumQuantity=1)) == "OPEN"
+    odd_qty = _order(state=state, cumQuantity=1, quantity="n/a")
+    assert submit_chain.cancel_read_verdict(odd_qty) == "OPEN"
+
+
+@pytest.mark.parametrize("cum", [10, 11, "10", "10.0"])
+def test_a_live_state_whose_cum_reaches_the_quantity_is_filled(cum: Any) -> None:
+    """The state lags the fill: cum == quantity means nothing rests, so the fill path owns it."""
+    body = _order(state="ORDER_STATE_PARTIALLY_FILLED", cumQuantity=cum, quantity=10)
+    assert submit_chain.cancel_read_verdict(body) == "FILLED"
+
+
+def test_a_fill_on_an_unrecognised_state_is_unreadable_not_filled() -> None:
+    body = _order(state="ORDER_STATE_WEIRD", cumQuantity=1, quantity=10)
+    assert submit_chain.cancel_read_verdict(body) == "UNREADABLE"
 
 
 @pytest.mark.parametrize(

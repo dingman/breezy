@@ -29,6 +29,7 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     CancelSender,
     _auto_cancel,
     _names,
+    _payload,
     _rig,
     _set_state,
 )
@@ -364,4 +365,28 @@ async def test_an_unreadable_ledger_mid_loop_latches_instead_of_dropping_the_id_
     assert rig.sender.cancels == [], "nothing to post against an unreadable ledger"
     assert _LATCH in [r.reason for r in client._trading_refusals]
     assert client.log_lines("error", "resting_cancel_unconfirmed")
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_live_partial_fill_keeps_the_cancel_loop_retrying_until_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G4 at the client: PARTIALLY_FILLED (the rest still rests) is not a done cancel; once
+    the venue shows the order terminal WITH a fill, the fill path owns it (no event here)."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    _payload(rig, 0)["quantity"] = 10  # the rig's rest is for one contract; widen it
+    _set_state(rig, 0, "ORDER_STATE_PARTIALLY_FILLED", cum=1)
+    task = asyncio.ensure_future(client._cancel_resting_order([_id_n(0)]))
+    await asyncio.sleep(0.1)
+    assert not task.done(), "a live partial is retried, not dropped as filled"
+    assert len(rig.sender.cancels) >= 2
+    _set_state(rig, 0, "ORDER_STATE_CANCELED", cum=1)
+    assert await asyncio.wait_for(task, 2.0) == frozenset()
+    assert "OrderCanceled" not in _names(rig), "a fill is never settled by the cancel path"
+    assert client._ledger.has_open_exposure(intent_id)
     await client._disconnect()
