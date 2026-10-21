@@ -69,6 +69,8 @@ PRE_RESOLVER_CALLEES = frozenset(
         # WP-DR (2026-10-10): a pure date function, no I/O, no egress. ONE
         # named row added to the baseline; the delta stays pinned by `==`.
         "utc_day_for_ns",
+        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "self.generate_order_accepted",
         # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "self._bind_resting_order",
         # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2): NAMED rows added to the baseline,
