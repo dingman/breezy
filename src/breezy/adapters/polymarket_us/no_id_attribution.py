@@ -293,10 +293,10 @@ def _is_resting_candidate(order: Any, echo: NoIdEcho) -> bool:
     contradiction, so an operator's own order is never adopted as the bot's rest."""
     return (
         echo.resting
-        and getattr(order, "manual", None) is False
         and order.tif == GTD_TIF
         and order.quantity == _ONE
         and order.side == _VENUE_SIDE_FOR_ECHO.get((echo.outcome_side, echo.action))
+        and order.manual is False
     )
 
 
