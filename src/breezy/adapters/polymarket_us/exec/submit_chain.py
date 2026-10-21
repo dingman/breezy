@@ -868,6 +868,8 @@ def _unmappable_exit_shape_reason(
         return "only a 1-contract order is mappable; refusing"
     if price <= OPEN_PRICE_EXCLUSIVE_LOW or price >= OPEN_PRICE_EXCLUSIVE_HIGH:
         return "price must be strictly inside (0.00, 1.00); refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
     if getattr(order, "is_post_only", False):
         return "post-only is not mappable; refusing"
     if getattr(order, "is_reduce_only", False):
