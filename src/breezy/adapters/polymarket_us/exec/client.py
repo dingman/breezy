@@ -6957,12 +6957,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         report at all. That is the trade, stated rather than hidden.
         """
         if liquidity_side == LiquiditySide.MAKER:
-            self._refuse(
-                f"a MAKER reconciliation fill was priced for {instrument.id}: "
-                "Breezy is taker-only, so this is a fill it did not intend, and "
-                "the venue's documented maker coefficient is a REBATE -- the "
-                "TAKER coefficient charged here overstates the cost"
-            )
+            if self._maker_fill_is_a_bound_rest(instrument, last_qty, last_px):
+                # CC-1: a maker fill of one of OUR bound rests is the expected outcome of
+                # the resting-order path, not an event to alarm on. Priced at taker below.
+                self._log.warning(
+                    "reconciliation: a MAKER fill on "
+                    f"{base_slug_of(instrument.id)} matches a bound resting order "
+                    "(carve-out); priced at the taker figure, not refused"
+                )
+            else:
+                self._refuse(
+                    f"a MAKER reconciliation fill was priced for {instrument.id}: "
+                    "Breezy is taker-only, so this is a fill it did not intend, and "
+                    "the venue's documented maker coefficient is a REBATE -- the "
+                    "TAKER coefficient charged here overstates the cost"
+                )
         try:
             return polymarket_us_fee(instrument, last_qty, last_px)
         except FeeScheduleUnknownError as exc:
@@ -6980,6 +6989,38 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "on it, and this refusal freezes the instrument"
             )
             return None
+
+    def _maker_fill_is_a_bound_rest(
+        self, instrument: Instrument, last_qty: Quantity, last_px: Price
+    ) -> bool:
+        """CC-1 (S4 r4 WP5): is this MAKER reconciliation fill the expected fill of one of our
+        own bound rests? ALL of: the fill is for quantity 1; the instrument is that rest's
+        (base slug AND the rest's own leg instrument); the price EQUALS the rest's limit price
+        (Decimal equality, read from this run's cached order); the rest is unretired (still
+        in the ``resting:`` index). Default OFF and NEVER RAISES: an unreadable or unavailable
+        ledger (store closed, a bad row, any enumeration error), an unknown order or a
+        mismatch is ``False``, so the caller refuses exactly as before.
+        """
+        try:
+            if last_qty.as_decimal() != 1:
+                return False
+            ledger = self._enumerate_resting_ledger()
+            if ledger is None:
+                return False
+            slug = base_slug_of(instrument.id)
+            for target in ledger:
+                if not target.bound or target.slug != slug:
+                    continue
+                if target.instrument_id is not None and target.instrument_id != str(instrument.id):
+                    continue
+                cached = self._cache.order(ClientOrderId(target.client_order_id))
+                if cached is None or cached.price is None:
+                    continue
+                if cached.price.as_decimal() == last_px.as_decimal():
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - calculate_commission MUST NOT raise
+            return False
 
     # -- the order surface: refusal, and nothing else -----------------------
 
