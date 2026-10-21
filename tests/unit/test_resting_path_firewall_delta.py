@@ -74,12 +74,14 @@ def test_each_order_row_is_in_the_firewall_set_and_used_only_where_named(callee:
 
 @pytest.mark.parametrize("callee", sorted(ORDER_ROWS))
 def test_planting_an_order_row_into_another_order_coroutine_trips_the_pin(callee: str) -> None:
-    """Non-vacuity: the same call planted into ``_cancel_order`` is NOT within the
-    row's named coroutines, so the usage pin above would fail on it."""
+    """Non-vacuity: the same call planted into an order coroutine OUTSIDE the row's
+    named set (``_cancel_order``, or ``_modify_order`` for a row that names it) is not
+    within the row's coroutines, so the usage pin above would fail on it."""
     source = CLIENT_PATH.read_text(encoding="utf-8")
-    planted = _plant_into(source, "_cancel_order", f"{callee}(None)")
+    host = "_cancel_order" if "_cancel_order" not in ORDER_ROWS[callee] else "_modify_order"
+    planted = _plant_into(source, host, f"{callee}(None)")
     used = _order_references(planted, callee)
-    assert "_cancel_order" in used
+    assert host in used
     assert not used <= ORDER_ROWS[callee]
 
 
