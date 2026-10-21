@@ -6,3 +6,6 @@ No look-ahead (NBP availability Last-Modified ≥ 60 min floor, `chain.at(decisi
 ## r1 — security-reviewer: REQUEST_CHANGES (4H/5M/2L)
 H1 S-2 foreign-order check must be account-wide (manual sports DAY orders); decouple STOP. H2 slug regex `$`/Unicode digits; independent fullmatch+ASCII; replace bodiless `post_cancel_all`. H3 shadow day not shadow (permit mints; allowlist before shadow). H4 drop-in row/file order and rollback leaves resting orders. M1 probe script as unpermitted writer (one-shot, constants, clean-account GET, N5 exemption). M2 evidence/secret rules. M3 P16 0.80→0.89 own commit. M4 one reviewed row per r4 pin. M5 trace from one fixture insufficient. L1 verify DailySpendLedger at first boot. L2 absent harm file must veto.
 ## r2 verification — architect: REQUEST_CHANGES (16 residuals) → closed by plan_r3_delta.md
+## Build reviews
+- C1 d45f3bd8 python-reviewer APPROVE 8/10 (no divergence; MED test gaps b_max→None branch, round-vs-int cents; follow-up commit requested).
+- B1 3b5744eb security-reviewer APPROVE (no blockers; LOW: extend cancel-path tree scan beyond src/scripts; retire legacy probe `scripts/venue/polymarket_us_write_signing_probe.py:335` unscoped cancel-all — both carried to B7).
