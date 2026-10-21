@@ -349,22 +349,29 @@ def test_the_build_pins_are_filled_and_the_two_derived_pins_are_exact_literals()
     assert design["frozen_sha"] == "205fd542b8d601524893b5855ad49736f01436ad"
 
 
-def test_the_skeleton_pins_pass_the_runner_and_builder_validators_once_the_blocked_two_are_set(
-    tmp_path: Path,
-) -> None:
+def test_the_frozen_skeleton_pins_and_the_r29_floor_boundary_pass_the_validators() -> None:
+    """Both formerly blocked pins (``source_lags_ns``, ``source_breaks``) are set in the skeleton.
+
+    The skeleton as frozen passes the runner and builder validators unchanged; the same validators
+    also accept the exact R29 floor values with no observed breaks (the lowest legal shapes).
+    """
     design = _skeleton()
-    design["pins"]["source_lags_ns"] = {
+    skill._check_values(design)  # no Refusal: the exact JSON shapes the code validates
+    fb.load_pins(design)
+    assert all(design["pins"][k] is not None for k in skill.REQUIRED_PINS)
+
+    floor = _skeleton()
+    floor["pins"]["source_lags_ns"] = {
         "lamp-mdl": 60 * 60 * 10**9,
         "lav-iem": 90 * 60 * 10**9,
         "pfm": 60 * 60 * 10**9,
         "mos-gfs": 300 * 60 * 10**9,
         "obs": 15 * 60 * 10**9,
     }
-    design["pins"]["source_breaks"] = []
-
-    skill._check_values(design)  # no Refusal: the exact JSON shapes the code validates
-    fb.load_pins(design)
-    assert all(design["pins"][k] is not None for k in skill.REQUIRED_PINS)
+    floor["pins"]["source_breaks"] = []
+    skill._check_values(floor)
+    fb.load_pins(floor)
+    assert all(floor["pins"][k] is not None for k in skill.REQUIRED_PINS)
 
 
 def test_the_champion_cdf_method_is_read_from_the_committed_champion_config() -> None:
