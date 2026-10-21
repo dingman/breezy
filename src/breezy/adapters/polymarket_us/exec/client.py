@@ -1412,6 +1412,10 @@ class StartupPositionSnapshot:
 
 #: The synthetic latch id of a ledger enumeration failure (not a venue order id).
 _LEDGER_LATCH_ID: Final[str] = "ledger"
+#: The synthetic latch id of a boot-sweep failure (not a venue order id). No read of it can
+#: ever be terminal, so a latch under this id is cleared ONLY by the next boot (a fresh
+#: process starts unlatched and its own sweep re-decides); it is never cleared mid-run.
+_BOOT_SWEEP_LATCH_ID: Final[str] = "boot-sweep"
 
 
 def _binding_row_fields(row: object) -> tuple[str, str, str, int] | None:
@@ -8282,8 +8286,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ):
             self._log.error(
                 "resting sweep does not run: the sender is absent or canonical unverified; "
-                "no intent is swept and the arm gate keeps refusing"
+                "no intent is swept; resting_cancel_unconfirmed is latched (new rests and "
+                "the never-arm gate refuse, even for an own order)"
             )
+            self._latch_resting_cancel_unconfirmed(_BOOT_SWEEP_LATCH_ID, "boot_sweep_did_not_run")
             return
         ledger_ids = {t.venue_order_id for t in ledger}
         ledger_slugs = {t.slug for t in ledger if t.slug}
@@ -8314,7 +8320,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             records = parse_open_orders(payload)
         except Exception as exc:  # noqa: BLE001 - never raise out of `_connect`
             self._latch_resting_cancel_unconfirmed(
-                "boot-sweep", f"boot_sweep_reread_failed:{exc.__class__.__name__}"
+                _BOOT_SWEEP_LATCH_ID, f"boot_sweep_reread_failed:{exc.__class__.__name__}"
             )
             return
         noid_slugs = {c.wire_market_slug for c in noid}
@@ -8337,7 +8343,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         swept = [c.intent_id for c in noid if c.wire_market_slug not in busy]
         if len(swept) != len(noid):
             self._latch_resting_cancel_unconfirmed(
-                "boot-sweep", "boot_sweep_slug_not_empty_for_a_no_id_rest"
+                _BOOT_SWEEP_LATCH_ID, "boot_sweep_slug_not_empty_for_a_no_id_rest"
             )
         self._swept_resting_intent_ids = self._swept_resting_intent_ids | frozenset(swept)
 
