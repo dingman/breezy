@@ -535,3 +535,70 @@ def test_the_loop_is_referenced_only_by_the_cancel_coroutines() -> None:
     }
     planted = _plant_into(source, "_submit_order", f"self.{_CANCEL_LOOP}([])")
     assert "_submit_order" in _order_references(planted, f"self.{_CANCEL_LOOP}")
+
+
+# ---------------------------------------------------------------------------
+# Row N3: the slug cancel-all choke point
+# ---------------------------------------------------------------------------
+
+_SLUG_HELPER: Final[str] = "_cancel_slug_orders"
+_CANCEL_ALL_NAME: Final[str] = "self._order_sender.post_cancel_all"
+EXEC_SLUG_CANCEL_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        _CANCEL_ALL_NAME,
+        "self._log.warning",
+        "self._resting_ledger",
+        "self._write_signer.sign_headers",
+    }
+)
+
+
+def _functions_naming(source: str, needle: str) -> set[str]:
+    """Names of functions whose body contains a Call/Attribute reference to ``needle``."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Attribute) and inner.attr == needle) or (
+                isinstance(inner, ast.Name) and inner.id == needle
+            ):
+                found.add(node.name)
+    return found
+
+
+def test_the_slug_helper_callee_set_is_exact_with_the_one_cancel_all_name() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    callees = _callees(_function(source, _SLUG_HELPER))
+    assert callees == EXEC_SLUG_CANCEL_PERMITTED_CALLEES
+    assert [c for c in callees if "_order_sender" in c] == [_CANCEL_ALL_NAME]
+
+
+def test_post_cancel_all_is_named_only_in_the_slug_helper() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _functions_naming(source, "post_cancel_all") == {_SLUG_HELPER}
+    for host in ("_cancel_order", "_cancel_resting_order", "_retire_resting_row"):
+        planted = _plant_any(source, host, "self._order_sender.post_cancel_all(None)")
+        assert _functions_naming(planted, "post_cancel_all") == {_SLUG_HELPER, host}, host
+
+
+def test_the_slug_helper_is_reached_only_from_the_cancel_loop_and_never_from_submit() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _functions_naming(source, _SLUG_HELPER) == {"_cancel_resting_order"}
+    assert _order_references(source, f"self.{_SLUG_HELPER}") == set()
+    planted = _plant_into(source, "_submit_order", f"self.{_SLUG_HELPER}('x')")
+    assert "_submit_order" in _order_references(planted, f"self.{_SLUG_HELPER}")
+    assert "_submit_order" in _functions_naming(planted, _SLUG_HELPER)
+
+
+def test_the_slug_helper_refuses_to_send_before_the_pin_is_verified() -> None:
+    """The first statement is the disabled-until-proven return (a plant that moves the
+    send above it would change the first statement)."""
+    fn = _function(CLIENT_PATH.read_text(encoding="utf-8"), _SLUG_HELPER)
+    body = [
+        s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    first = body[0]
+    assert isinstance(first, ast.If)
+    assert "SLUG_SCOPED_CANCEL_ALL_VERIFIED" in ast.unparse(first.test)
+    assert "UNSCOPED_UNVERIFIED" in ast.unparse(first.body[0])
