@@ -40,8 +40,8 @@ from tests.unit.test_current_rung_hold_pre_arm_race import (
 from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 from tests.unit.test_polymarket_us_resting_submit import (
     _id_n,
-    _Rig,
     _rest_command,
+    _Rig,
     _submit_rest,
     _venue_order,
 )
@@ -81,9 +81,7 @@ class CancelSender(_SlowSender):
         return VenueResponse(status=200, headers={}, body=b"{}")
 
 
-async def _rig(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pin: bool = False
-) -> _Rig:
+async def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pin: bool = False) -> _Rig:
     monkeypatch.setattr(submit_chain, "GTD_EXPIRY_VERIFIED", True)
     monkeypatch.setattr(submit_chain, "SLUG_SCOPED_CANCEL_ALL_VERIFIED", pin)
     monkeypatch.setattr(submit_chain, "RESTING_CONFIRM_DEADLINE_NS", 20_000_000)
@@ -132,7 +130,9 @@ def _cancel_all_cmd(rig: _Rig, instrument_id: Any) -> CancelAllOrders:
 
 def _auto_cancel(rig: _Rig) -> None:
     """The venue honours every cancel POST: the order reads CANCELED afterwards."""
-    rig.sender.on_cancel = lambda order_id: _set_state(rig, int(order_id[-1]), "ORDER_STATE_CANCELED")
+    rig.sender.on_cancel = lambda order_id: _set_state(
+        rig, int(order_id[-1]), "ORDER_STATE_CANCELED"
+    )
 
 
 def _names(rig: _Rig) -> list[str]:
@@ -162,9 +162,7 @@ async def test_zero_fill_cancel_settles_exactly_once(
 
     monkeypatch.setattr(ledger_type, "settle", spy)
     released: list[Any] = []
-    monkeypatch.setattr(
-        ledger_type, "release_booking", lambda *a, **k: released.append(1)
-    )
+    monkeypatch.setattr(ledger_type, "release_booking", lambda *a, **k: released.append(1))
     _auto_cancel(rig)
     await client._cancel_order(_cancel_cmd(rig, command))
     assert _names(rig).count("OrderCanceled") == 1
@@ -186,7 +184,7 @@ async def test_zero_fill_cancel_settles_exactly_once(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-async def test_cancel_body_is_exactly_market_slug_of_the_bound_row_and_the_signature_covers_the_path(
+async def test_cancel_body_is_the_bound_rows_market_slug_and_the_signature_covers_the_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rig = await _rig(tmp_path, monkeypatch)
@@ -204,8 +202,12 @@ async def test_cancel_body_is_exactly_market_slug_of_the_bound_row_and_the_signa
     await client._cancel_order(_cancel_cmd(rig, command))
     row_slug = json.loads(client._store_get(f"{_ROW_PREFIX}{_id_n(0)}") or b"{}").get("slug")
     assert rig.sender.cancels == [
-        {"order_id": _id_n(0), "market_slug": submit_chain.build_resting_order_body(
-            command.order, build_no_leg_instrument())["marketSlug"]}
+        {
+            "order_id": _id_n(0),
+            "market_slug": submit_chain.build_resting_order_body(
+                command.order, build_no_leg_instrument()
+            )["marketSlug"],
+        }
     ]
     assert signed[-1] == ("POST", f"/v1/order/{_id_n(0)}/cancel")
     assert row_slug in (None, rig.sender.cancels[0]["market_slug"])
@@ -277,8 +279,14 @@ async def test_restore_only_for_this_process_ids_and_idempotent_per_venue_id(
     assert client._budget_was_restored(_id_n(0))
     # a second terminal for the SAME id (venue-initiated duplicate) restores nothing
     target = client_module.RestingTarget(
-        venue_order_id=_id_n(0), slug="x", client_order_id="O-1", intent_id="I-x",
-        instrument_id=None, strategy_id=None, expire_time_ns=0, bound=True,
+        venue_order_id=_id_n(0),
+        slug="x",
+        client_order_id="O-1",
+        intent_id="I-x",
+        instrument_id=None,
+        strategy_id=None,
+        expire_time_ns=0,
+        bound=True,
     )
     assert client._settle_resting_terminal(target, submit_chain.CANCEL_READ_EXPIRED) is False
     assert _remaining(rig) == restored
@@ -342,7 +350,9 @@ async def test_cancel_allowed_with_an_expired_permit_and_never_asserts_the_permi
     monkeypatch.setattr(client_module, "restore_live_trading_budget", expired)
     _auto_cancel(rig)
     await client._cancel_order(_cancel_cmd(rig, command))
-    assert _names(rig).count("OrderCanceled") == 1, "the cancel completes; only the restore is skipped"
+    assert _names(rig).count("OrderCanceled") == 1, (
+        "the cancel completes; only the restore is skipped"
+    )
     assert client._latch.open_slot_count() == 0
     await client._disconnect()
 
@@ -369,17 +379,34 @@ async def test_cancel_of_an_unknown_order_is_rejected_and_nothing_is_posted(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-async def test_cancel_is_rejected_while_the_sender_or_canonical_string_is_missing(
+async def test_cancel_is_rejected_while_the_sender_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rig = await _rig(tmp_path, monkeypatch)
     client = rig.client
     command = await _submit_rest(rig, 0)
-    monkeypatch.setattr(client_module.write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
+    client._order_sender = None
     await client._cancel_order(_cancel_cmd(rig, command))
     assert rig.sender.cancels == []
     assert "OrderCancelRejected" in _names(rig)
+    assert json.loads(client._store_get(_INDEX_KEY)) == [_id_n(0)], "nothing retired"
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_rejected_while_the_canonical_string_is_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``write_canonical_verified`` fixture: the module default (unverified) holds."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with caps():
+        rig = await _rig(tmp_path, monkeypatch)
+        command = _rest_command(rig.client)
+        await rig.client._cancel_order(_cancel_cmd(rig, command))
+        assert rig.sender.cancels == []
+        assert _names(rig).count("OrderCancelRejected") == 1
+        assert rig.client.log_lines("error", "canonical string is unverified")
+        await rig.client._disconnect()
 
 
 @pytest.mark.asyncio
@@ -538,7 +565,9 @@ async def test_refused_cancel_alerts_before_the_latch_then_escalates_and_latches
     alert = next(i for i, m in enumerate(lines) if "resting_cancel_alert" in m)
     latch = next(i for i, m in enumerate(lines) if "resting_cancel_unconfirmed" in m)
     assert alert < latch, "the non-latching alert precedes the latch (property: r4 section 9)"
-    assert rig.sender.cancel_alls, "the unconfirmed cancel escalated to the slug cancel-all (pin True)"
+    assert rig.sender.cancel_alls, (
+        "the unconfirmed cancel escalated to the slug cancel-all (pin True)"
+    )
     assert client.resting_cancel_alerts, "the health surface carries the alert"
     # the cancels continue while latched, and a later terminal read clears the latch
     _auto_cancel(rig)

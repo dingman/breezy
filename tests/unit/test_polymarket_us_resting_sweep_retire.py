@@ -33,14 +33,14 @@ from tests.unit.ambig_latch_rig import (
 )
 from tests.unit.test_ambig_no_id_resolver import _retirement
 from tests.unit.test_polymarket_us_resting_adopt import _no_id_rest
-from tests.unit.test_trade_cli_boot_line_visible import (
+from tests.unit.test_trade_cli import (  # noqa: F401  (autouse fixtures)
     TRADE_ENV,
     RecordingNode,
-    _clean_process_state,  # noqa: F401  (autouse fixtures)
-    _LateLiveSink,
-    _no_send_alert_sink,  # noqa: F401
-    _operator_order_ceiling,  # noqa: F401
+    _clean_process_state,
+    _no_send_alert_sink,
+    _operator_order_ceiling,
 )
+from tests.unit.test_trade_cli_boot_line_visible import _LateLiveSink
 
 SWEEP = submit_chain.RETIRE_BOOT_SWEEP_RESTING_NO_FILL
 
