@@ -19,6 +19,7 @@ from scripts.analysis.multisource_blend_inputs_lamp import basis_breaks
 from scripts.analysis.multisource_blend_inputs_pins import Pins
 
 __all__ = [
+    "FROZEN_LAG_BASIS",
     "LAG_BASIS",
     "lag_report",
     "lamp_breaks",
@@ -35,6 +36,11 @@ LAG_BASIS: Final[Mapping[str, str]] = {
     "mos-gfs": "runtime + 5 h",
     "obs": "report time + 15 min",
 }
+#: PIN-R6 freeze basis of every measured ``source_lags_ns`` value; ``{sha}`` is the prereg's stamp.
+FROZEN_LAG_BASIS: Final[str] = (
+    "frozen pin (PIN-R6): max(R29 floor, C1 nearest-rank p99); "
+    "evidence docs/evidence/f13/c1_lag_evidence_2026-10-21.json; frozen_sha {sha}"
+)
 
 
 def truth_concordance(f2: Path | None, truth: Mapping[tuple[str, dt.date], Any]) -> dict[str, Any]:
@@ -117,9 +123,15 @@ def lag_report(primary: Sequence[msb.FeatureRow], lag: Sequence[msb.FeatureRow])
     }
 
 
-def source_lags(pins: Pins) -> dict[str, Any]:
+def source_lags(pins: Pins, frozen_sha: str | None = None) -> dict[str, Any]:
+    """Each source's lag, basis and flag; a measured lag is final only under a frozen prereg."""
+    frozen = bool(frozen_sha)
     lags: dict[str, Any] = {
-        key: {"ns": ns, "basis": LAG_BASIS[key], "provisional": True}
+        key: {
+            "ns": ns,
+            "basis": FROZEN_LAG_BASIS.format(sha=frozen_sha) if frozen else LAG_BASIS[key],
+            "provisional": not frozen,
+        }
         for key, ns in pins.lags.items()
     }
     lags["nbp"] = {

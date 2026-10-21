@@ -9,10 +9,11 @@ temporary git repositories only.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -218,14 +219,29 @@ def _evidence(**overrides: Any) -> str:
 
 #: the freeze-time C1 evidence: the unmodified ``c1_lag_evidence.py`` output of 2026-10-21
 _C1_FREEZE_EVIDENCE = REPO_ROOT / "docs" / "evidence" / "f13" / "c1_lag_evidence_2026-10-21.json"
+_C1_FREEZE_EVIDENCE_SHA256: Final[str] = (
+    "792ff2a8417debefc0e0df9e6b4171b52e1e9b20a9b2c4d391ec050c72746d3b"
+)
+#: the historical-skips file the freeze evidence was measured against (a missing one moves pfm p99)
+_C1_HISTORICAL_SKIPS = REPO_ROOT / "docs" / "evidence" / "f13" / "c1_historical_skips_2026-10.json"
+_C1_HISTORICAL_SKIPS_SHA256: Final[str] = (
+    "d0c9d08870c95196098f302d831e4179c6b8a9fa2894aaf3ec6c15d42a3fbd1e"
+)
+_PFM_CENSORED_POLL_GAP: Final[int] = 26
 
 
 def test_each_frozen_lag_is_exactly_the_larger_of_the_r29_floor_and_the_c1_p99() -> None:
     pinned = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))["pins"]["source_lags_ns"]
-    evidence = json.loads(_C1_FREEZE_EVIDENCE.read_text(encoding="utf-8"))
+    evidence_bytes = _C1_FREEZE_EVIDENCE.read_bytes()
+    # the evidence the pins were derived from is the exact committed file, byte for byte
+    assert hashlib.sha256(evidence_bytes).hexdigest() == _C1_FREEZE_EVIDENCE_SHA256
+    skips_digest = hashlib.sha256(_C1_HISTORICAL_SKIPS.read_bytes()).hexdigest()
+    assert skips_digest == _C1_HISTORICAL_SKIPS_SHA256
+    evidence = json.loads(evidence_bytes)
     samples = evidence["lag_samples_ns"]
 
     assert evidence["ready"] is True
+    assert evidence["censored_poll_gap"]["pfm"] == _PFM_CENSORED_POLL_GAP
     assert set(pinned) == set(LAG_FLOORS_NS)
     for source, floor in LAG_FLOORS_NS.items():
         assert pinned[source] == max(floor, guards.observed_p99_ns(samples[source])), source
@@ -652,22 +668,25 @@ def test_a_prereg_outside_git_is_refused_by_the_guard(tmp_path: Path) -> None:
 
 # ------------------------------------------------------------------ PIN-R8c: frozen digest pin
 
-#: Set to the skeleton's ``skill.content_digest`` in the SAME commit that stamps the freeze. While
-#: the skeleton is UNFROZEN the test below skips; from the freeze on it is binding. The digest
-#: excludes ``frozen_sha``, so it is the digest of the content commit A as well as of the stamp B.
-FROZEN_CONTENT_SHA256: str | None = (
+#: The skeleton's ``skill.content_digest``, stamped in the same commit that froze it (2026-10-21).
+#: The digest excludes ``frozen_sha``, so it is the digest of the content commit A as well as of
+#: the stamp B. The test below is binding and never skips.
+FROZEN_CONTENT_SHA256: Final[str] = (
     "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7"
 )
 
 
 def test_the_frozen_skeleton_content_digest_is_pinned_to_a_constant() -> None:
     design = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
-    if design["frozen_sha"] == skill.UNFROZEN:
-        pytest.skip("the prereg skeleton is UNFROZEN; this pin becomes binding at the freeze")
-    assert FROZEN_CONTENT_SHA256 is not None, (
-        "the prereg is frozen: set FROZEN_CONTENT_SHA256 to skill.content_digest(prereg)"
-    )
+
     assert skill.content_digest(design) == FROZEN_CONTENT_SHA256
+
+
+def test_the_real_stamped_prereg_passes_the_runners_verified_load() -> None:
+    loaded = skill.load_verified_prereg(_PREREG_SRC)  # the real file, not a scratch prereg
+
+    assert loaded["frozen_sha"] != skill.UNFROZEN
+    assert loaded == json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
 
 
 def test_the_committed_prereg_equals_the_blob_at_its_frozen_commit() -> None:

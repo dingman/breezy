@@ -32,6 +32,7 @@ from breezy.analysis.multisource_blend_features import LeakageError
 from breezy.persistence.archive_cache import iem_mos_window_request
 from scripts.analysis import multisource_blend_features_build as fb
 from scripts.analysis import multisource_blend_skill as skill
+from scripts.analysis.multisource_blend_inputs_report import source_lags
 from tests.unit.featbuild_fixtures import (
     HOUR_NS,
     NS,
@@ -501,6 +502,70 @@ def test_every_lag_basis_is_flagged_provisional_in_the_report(tmp_path: Path) ->
     assert all(item["basis"] for item in lags.values())
     assert lags["pfm"]["ns"] == _LAGS_NS["pfm"] and lags["pfm"]["provisional"] is True
     assert lags["nbp"]["basis"].startswith("nominal")
+
+
+_MEASURED_LAG_SOURCES = ("lamp-mdl", "lav-iem", "pfm", "mos-gfs", "obs")
+_PRE_FREEZE_LAG_BASIS = {
+    "lamp-mdl": "nominal run time + max(60 min, C1 max)",
+    "lav-iem": "nominal run label + max(60 min, C1 max) + 30 min (label HH:00, real run HH:30)",
+    "pfm": "WMO issuance + 60 min (IEM entered time is not in the archive)",
+    "mos-gfs": "runtime + 5 h",
+    "obs": "report time + 15 min",
+}
+_FROZEN_LAG_BASIS = (
+    "frozen pin (PIN-R6): max(R29 floor, C1 nearest-rank p99); "
+    "evidence docs/evidence/f13/c1_lag_evidence_2026-10-21.json; frozen_sha {sha}"
+)
+
+
+def test_a_frozen_prereg_labels_each_measured_lag_with_the_pin_rule_and_is_not_provisional(
+    tmp_path: Path,
+) -> None:
+    world = _build_world(tmp_path, frozen=True)
+    sha = json.loads(world.prereg.read_text(encoding="utf-8"))["frozen_sha"]
+
+    assert _run(world) == fb.EXIT_OK
+
+    lags = world.report()["source_lags"]
+    for source in _MEASURED_LAG_SOURCES:
+        assert lags[source] == {
+            "ns": _LAGS_NS[source],
+            "basis": _FROZEN_LAG_BASIS.format(sha=sha),
+            "provisional": False,
+        }, source
+    assert lags["nbp"]["ns"] is None and lags["nbp"]["provisional"] is True
+    assert lags["nbp"]["basis"].startswith("nominal")
+
+
+def test_an_unfrozen_prereg_keeps_the_pre_freeze_lag_basis_and_provisional_flags(
+    tmp_path: Path,
+) -> None:
+    world = _build_world(tmp_path)  # UNFROZEN skeleton, scratch draft
+    _run(world)
+
+    lags = world.report()["source_lags"]
+
+    for source in _MEASURED_LAG_SOURCES:
+        assert lags[source] == {
+            "ns": _LAGS_NS[source],
+            "basis": _PRE_FREEZE_LAG_BASIS[source],
+            "provisional": True,
+        }, source
+    assert lags["nbp"]["provisional"] is True
+
+
+def test_source_lags_labels_follow_the_frozen_sha_it_is_given() -> None:
+    pins = fb.load_pins({"pins": _pins()})
+    sha = "b" * 40
+
+    unfrozen = source_lags(pins, frozen_sha=None)
+    frozen = source_lags(pins, frozen_sha=sha)
+
+    assert {k: v["basis"] for k, v in unfrozen.items() if k != "nbp"} == _PRE_FREEZE_LAG_BASIS
+    assert all(v["provisional"] is True for v in unfrozen.values())
+    assert all(frozen[k]["basis"] == _FROZEN_LAG_BASIS.format(sha=sha) for k in _LAGS_NS)
+    assert all(frozen[k]["provisional"] is False for k in _LAGS_NS)
+    assert frozen["nbp"] == unfrozen["nbp"]  # nominal either way: never a measured vintage
 
 
 # ------------------------------------------------------------------ holdout
