@@ -1853,6 +1853,10 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # send path.
         "_resolve_no_id_intent",
         "_no_id_trade_activity",
+        # S4 WP3 (ARM B4, pin row P4a): the bounded GET-confirm of a freshly created
+        # rest. GET-only (`EXEC_RESTING_CONFIRM_PERMITTED_CALLEES`, row N1, in
+        # `test_resting_path_firewall_delta.py`): no `_order_sender`, no signer.
+        "_confirm_resting_order",
         # The injected read protocol's own call signature.
         "__call__",
     }

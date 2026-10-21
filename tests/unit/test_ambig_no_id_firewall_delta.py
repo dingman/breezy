@@ -166,6 +166,8 @@ PRE_RESOLVER_COROUTINES = frozenset(
 PRE_PERMITTED_COROUTINES = frozenset(
     {
         "__call__",
+        # S4 WP3 (ARM B4, pin row P4a): NAMED row added to the baseline, never relaxed.
+        "_confirm_resting_order",
         "_batch_cancel_orders",
         "_cancel_all_orders",
         "_cancel_order",
