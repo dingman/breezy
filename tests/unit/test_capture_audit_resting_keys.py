@@ -18,7 +18,7 @@ from breezy.analysis.capture_audit_model import AuditInputError
 NAMESPACE = "exec/polymarket_us/"
 
 
-@pytest.mark.parametrize("key", [f"{NAMESPACE}resting/ABCDEF123456"])
+@pytest.mark.parametrize("key", [f"{NAMESPACE}resting/ABCDEF123456", f"{NAMESPACE}resting_index"])
 def test_a_resting_key_is_known_and_ignored_by_the_exec_view(key: str) -> None:
     view = exec_view._view_of([(key, b"{}")])
     assert view.fills == () and view.orders == () and view.resolvers == ()

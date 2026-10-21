@@ -58,6 +58,8 @@ KNOWN_EXEC_SUBPREFIXES: Final[tuple[str, ...]] = (
     # ARM maker-sharp B6 (S4 resting path, one named row): the per-order binding rows. Known and
     # ignored: they carry no fill, order id map or resolver context the audit joins on.
     f"{STATE_KEY_NAMESPACE}resting/",
+    # ARM maker-sharp B6 (one named row): the one resting-order index, known and ignored.
+    f"{STATE_KEY_NAMESPACE}resting_index",
 )
 
 
