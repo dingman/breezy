@@ -474,9 +474,14 @@ def test_the_new_functions_await_only_the_existing_get_seams() -> None:
 def test_store_set_occurs_exactly_once_in_the_scanned_bodies_with_the_pinned_key() -> None:
     assert "_adopt_no_id_venue_order" in firewall.EXEC_RESOLVER_COROUTINES
     sites = _store_set_sites(_client_tree())
-    assert [name for name, _ in sites] == ["_adopt_no_id_venue_order"]
-    key = sites[0][1].args[0]
-    assert ast.unparse(key) == "f'{RESOLVER_CONTEXT_KEY_PREFIX}{adopted.intent_id}'"
+    # S4 WP3 (ARM B4, pin row P21): WIDENED by exactly the binder's two writes
+    # (the binding row, then the index), each on its own pinned key; the adopt
+    # site and its key are unchanged.
+    assert [(name, ast.unparse(call.args[0])) for name, call in sites] == [
+        ("_adopt_no_id_venue_order", "f'{RESOLVER_CONTEXT_KEY_PREFIX}{adopted.intent_id}'"),
+        ("_bind_resting_order", "f'{RESTING_KEY_PREFIX}{venue_order_id}'"),
+        ("_bind_resting_order", "RESTING_INDEX_KEY"),
+    ]
 
 
 def test_the_real_client_has_no_resolver_violation() -> None:
@@ -503,7 +508,7 @@ def test_planting_a_second_store_set_fails_the_single_site_pin() -> None:
     source = CLIENT_PATH.read_text(encoding="utf-8")
     planted = _plant(source, "_resolve_no_order", "self._store_set('k', b'v')")
     names = [name for name, _ in _store_set_sites(ast.parse(planted))]
-    assert names != ["_adopt_no_id_venue_order"]
+    assert names != ["_adopt_no_id_venue_order", "_bind_resting_order", "_bind_resting_order"]
     assert names.count("_resolve_no_order") == 1
 
 
