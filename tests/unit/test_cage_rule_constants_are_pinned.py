@@ -1053,6 +1053,15 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         narrowed=599,
         why="S4 P16 (B5): age from the FIRST refused cancel at which the non-latching CRITICAL alert fires. Widening delays the operator signal; narrowing alerts on routine venue lag",
     ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): re-alert cadence of an unconfirmed cancel after the first alert
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_REALERT_S",
+        expected=1800,
+        widened=1801,
+        narrowed=1799,
+        why="S4 P16 (B5): re-alert cadence of an unconfirmed cancel after the first alert",
+    ),
 )
 
 _MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
@@ -1163,6 +1172,7 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # ARM maker-sharp B4 / S4 r4 P16: the GET-confirm deadline.
         "submit_chain.RESTING_CONFIRM_DEADLINE_S",
         "submit_chain.RESTING_CONFIRM_POLL_S",
+        "submit_chain.RETRY_REALERT_S",
         "submit_chain.RETRY_ALERT_AGE_S",
         "submit_chain.CANCEL_RETRY_BACKOFF_S",
         "submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED",
