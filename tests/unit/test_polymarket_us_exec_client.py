@@ -69,6 +69,7 @@ from nautilus_trader.execution.messages import (
     SubmitOrderList,
 )
 from nautilus_trader.execution.reports import ExecutionMassStatus, OrderStatusReport
+from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     LiquiditySide,
@@ -599,7 +600,11 @@ async def test_native_query_order_DOES_reach_the_send_seam_given_a_real_report(
     rig.client.generate_order_status_report = _fake_generate  # type: ignore[method-assign]
     rig.client._send_order_status_report = received.append
 
-    await rig.client._query_order(
+    # B6 (S4 pin row P10): the client now OVERRIDES `_query_order` (the resting-order
+    # poll), so the seam is proven on the NATIVE base method, called explicitly -- the
+    # premise of this test is the base's behaviour, which the override must never reach.
+    await LiveExecutionClient._query_order(
+        rig.client,
         QueryOrder(
             trader_id=TRADER_ID,
             strategy_id=STRATEGY_ID,
