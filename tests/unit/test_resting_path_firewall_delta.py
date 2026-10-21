@@ -264,3 +264,42 @@ def test_the_submit_prefix_pin_moves_when_a_statement_is_planted_into_the_prefix
     )
     planted = _plant_into(real, "_submit_order", "self._log.warning('planted')")
     assert _prefix_digest(real) != _prefix_digest(planted)
+
+
+# ---------------------------------------------------------------------------
+# Rows FW-1..FW-4: functions allowed to reference ``self._order_sender``
+# ---------------------------------------------------------------------------
+
+#: Functions ADDED to ``ORDER_SENDER_REFERENCE_PERMITTED_SCOPES`` (rows FW-1, FW-2),
+#: one named term per reviewed commit.
+SENDER_SCOPE_ROWS: Final[frozenset[str]] = frozenset({"_cancel_resting_order"})
+#: Functions ADDED to ``ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD`` (rows FW-3, FW-4).
+SENDER_HEAD_ROWS: Final[frozenset[str]] = frozenset()
+
+
+@pytest.mark.parametrize("name", sorted(SENDER_SCOPE_ROWS))
+def test_each_sender_scope_row_is_permitted_and_actually_references_the_sender(name: str) -> None:
+    assert name in firewall.ORDER_SENDER_REFERENCE_PERMITTED_SCOPES
+    referencing = firewall._functions_referencing_order_sender(
+        CLIENT_REL, CLIENT_PATH.read_text(encoding="utf-8")
+    )
+    assert name in referencing, f"{name} permits a reference nothing makes (dead permission)"
+
+
+@pytest.mark.parametrize("name", sorted(SENDER_HEAD_ROWS))
+def test_each_sender_head_row_is_pinned_in_the_exact_at_head_set(name: str) -> None:
+    assert name in firewall.ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD
+
+
+@pytest.mark.parametrize("name", sorted(SENDER_SCOPE_ROWS | SENDER_HEAD_ROWS))
+def test_planting_a_sender_reference_into_any_other_helper_is_still_flagged(name: str) -> None:
+    """Non-vacuity: the permission is BY NAME. The same reference planted into a
+    helper that is not a row trips the scan, and the shipped tree is clean."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    before = {v.detail for v in firewall.find_order_sender_reference_violations(CLIENT_REL, source)}
+    planted = _plant_any(
+        source, "_retire_resting_row", "self._order_sender.post_cancel_order(None)"
+    )
+    after = {v.detail for v in firewall.find_order_sender_reference_violations(CLIENT_REL, planted)}
+    assert [d for d in after - before if "_retire_resting_row" in d], after
+    assert name != "_retire_resting_row"

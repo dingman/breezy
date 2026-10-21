@@ -4452,6 +4452,8 @@ def test_the_correct_shape_is_accepted_by_the_shape_check() -> None:
 #: silently widening around it.
 ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
     frozenset({"__init__"}) | ORDER_LIFECYCLE_COROUTINES | EXEC_RESOLVER_COROUTINES
+    # S4 WP4 (ARM B5, pin row FW-1): a NAMED term per reviewed row, never relaxed.
+    | frozenset({"_cancel_resting_order"})
 )
 
 #: Pinned at HEAD (2026-09-26, before R-7-IMPL): the exact set of functions in
