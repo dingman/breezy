@@ -3935,6 +3935,14 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # `write_transport` verbs against an injected recording `_Client` double --
         # no real HttpClient, no socket.
         "tests/unit/test_polymarket_us_cancel_transport.py",
+        # ARM maker-sharp B3 / S4 WP1 (plan S4 r4 delta section 9): `test_polymarket_
+        # us_resting_order_shape.py` imports `exec.submit_chain` and `exec.endpoints`
+        # to drive the PURE resting shape, 9-key GTD body builder, `format_good_
+        # till_time` and `resting_echo_matches` over fixture instruments and
+        # `parse_order_status_report` output. WIDENED, not relaxed (L-6/L-12): the
+        # comparison is still `==`; the module carries no `SOCKET_RESTORING_MARKERS`,
+        # builds no client and no sender -- every function under test is pure.
+        "tests/unit/test_polymarket_us_resting_order_shape.py",
     }
 
 

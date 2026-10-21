@@ -18,6 +18,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, Protocol, cast
 
@@ -31,6 +32,9 @@ from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, Ve
 from breezy.adapters.polymarket_us.exec.endpoints import (
     order_by_id_path as endpoints_order_by_id_path,
 )
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    valid_venue_order_id as valid_venue_order_id,  # noqa: PLC0414
+)
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
 from breezy.adapters.polymarket_us.leg_prices import (
     Leg,
@@ -38,8 +42,8 @@ from breezy.adapters.polymarket_us.leg_prices import (
     instrument_price_for_leg,
     wire_price_for_leg,
 )
-from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
-from breezy.adapters.polymarket_us.symbology import leg_of
+from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO, parse_rfc3339_nanos
+from breezy.adapters.polymarket_us.symbology import base_slug_of, leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.domain.exec_intent import intent_fingerprint as intent_fingerprint  # noqa: PLC0414
 from breezy.persistence.exit_gate import family_declares_exit_rule, family_declares_no_leg_exit
@@ -121,6 +125,40 @@ ORDER_BODY_KEYS: Final[frozenset[str]] = frozenset(
         "synchronousExecution",
         "maxBlockTime",
     }
+)
+
+#: The resting (GTD) create-order body: the IOC keys minus the two synchronous
+#: ones plus ``goodTillTime``. A rest is submitted ASYNCHRONOUSLY (the venue's
+#: own best practice, WP0 note (e)) and confirmed by a GET, so neither
+#: ``synchronousExecution`` nor ``maxBlockTime`` is sent. Exactly nine keys.
+RESTING_ORDER_BODY_KEYS: Final[frozenset[str]] = (
+    ORDER_BODY_KEYS - frozenset({"synchronousExecution", "maxBlockTime"})
+) | frozenset({"goodTillTime"})
+
+#: The highest NO price a resting order may be posted at (the spec B_CAP). A
+#: re-valued, ruling-cited constant: see ``tests/unit/test_cage_rule_constants_are_pinned.py``.
+RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.80")
+
+#: Flipped to ``True`` only by a reviewed commit citing the positive-control
+#: artifact that proves the venue expires a GTD order at ``goodTillTime`` (S-6).
+#: Until then the resting shape refuses every order (fail closed).
+GTD_EXPIRY_VERIFIED: Final[bool] = False
+
+_TIF_GTD: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+_NANOS_PER_SECOND: Final[int] = 1_000_000_000
+_NANOS_PER_DAY: Final[int] = 86_400 * _NANOS_PER_SECOND
+#: ``goodTillTime`` is sent in whole seconds and the venue echoes whole seconds;
+#: the confirm accepts an echo within this many nanoseconds of what was sent.
+_GOOD_TILL_ECHO_TOLERANCE_NS: Final[int] = _NANOS_PER_SECOND
+
+#: The ONLY market grammar the resting path admits: ``tc-temp-<city3>high-<date>-<bounds>``.
+#: Deliberately its OWN pattern, ASCII-only and applied with ``fullmatch`` -- NOT
+#: ``symbology.parse_weather_slug`` (frozen; its ``$``/``match`` accepts a trailing
+#: newline, and it also admits daily-LOW slugs).
+_DAILY_HIGH_SLUG_RE: Final[re.Pattern[str]] = re.compile(
+    r"tc-temp-[a-z]{3}high-(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})"
+    r"-(?:(?:gte|lte|gt|lt)\d{1,3}){1,2}f",
+    re.ASCII,
 )
 
 _IOC_ZERO_FILL_TERMINAL_STATES: Final[frozenset[str]] = frozenset(
@@ -393,6 +431,205 @@ def build_order_body(order: object, instrument: object) -> dict[str, Any]:
     }
 
 
+def is_daily_high_slug(slug: object) -> bool:
+    """True only for a daily-HIGH weather slug: ASCII, ``fullmatch``, real date.
+
+    The resting path's own admission check (independent of the frozen
+    ``symbology`` parser): a trailing newline, a fullwidth digit, a LOW measure,
+    an impossible calendar date or a composite instrument symbol is refused.
+    """
+    if not isinstance(slug, str) or not slug.isascii():
+        return False
+    match = _DAILY_HIGH_SLUG_RE.fullmatch(slug)
+    if match is None:
+        return False
+    try:
+        date(int(match.group("y")), int(match.group("m")), int(match.group("d")))
+    except ValueError:
+        return False
+    return True
+
+
+def format_good_till_time(expire_ns: int) -> str:
+    """Render ``expire_ns`` (UNIX nanoseconds) as the request ``goodTillTime``.
+
+    RFC 3339 UTC whole seconds (``YYYY-MM-DDTHH:MM:SSZ``), FLOORED: the venue
+    never holds an order past the strategy's own ``expire_time``. Pure integer
+    arithmetic; a non-int, a bool or a non-positive value is a ``ValueError``.
+    """
+    if isinstance(expire_ns, bool) or not isinstance(expire_ns, int) or expire_ns <= 0:
+        raise ValueError("goodTillTime needs a positive integer nanosecond timestamp")
+    try:
+        moment = datetime.fromtimestamp(expire_ns // _NANOS_PER_SECOND, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("goodTillTime is outside the representable range") from None
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _resting_shape_reason(order: object, instrument: object) -> str | None:
+    """Every resting-shape rule that needs neither the clock nor the permit."""
+    if instrument is None or not isinstance(instrument, BinaryOption):
+        return "instrument is not a BinaryOption; refusing"
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    if not slug.strip():
+        return "instrument has no resolvable market slug; refusing"
+    if not is_daily_high_slug(slug):
+        return "resting orders are admitted only on a daily HIGH weather market; refusing"
+    if getattr(order, "order_type", None) is not OrderType.LIMIT:
+        return "only a LIMIT order is mappable; refusing"
+    if getattr(order, "time_in_force", None) is not TimeInForce.GTD:
+        return "only a GTD order is mappable as a resting order; refusing"
+    if getattr(order, "side", None) is not OrderSide.BUY:
+        return "only a BUY is mappable (a SELL is a naked short); refusing"
+    try:
+        quantity = order_quantity_decimal(order)
+        price = order_price_decimal(order)
+    except (TypeError, ValueError, InvalidOperation):
+        return "order price or quantity is unreadable; refusing"
+    if quantity != ONE:
+        return "only a 1-contract order is mappable; refusing"
+    if price <= OPEN_PRICE_EXCLUSIVE_LOW or price > RESTING_PRICE_CAP:
+        return "resting price must be inside (0.00, RESTING_PRICE_CAP]; refusing"
+    if getattr(order, "is_post_only", False):
+        return "post-only is not mappable; refusing"
+    if getattr(order, "is_reduce_only", False):
+        return "reduce-only is not mappable; refusing"
+    if getattr(order, "display_qty", None) is not None:
+        return "display_qty is not mappable; refusing"
+    has_trigger = getattr(order, "has_trigger_price", False)
+    if has_trigger is True or (callable(has_trigger) and has_trigger()):
+        return "trigger_price is not mappable; refusing"
+    expire_ns = getattr(order, "expire_time_ns", 0)
+    if isinstance(expire_ns, bool) or not isinstance(expire_ns, int) or expire_ns <= 0:
+        return "a GTD order needs a positive expire_time; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side != _OUTCOME_SIDE_NO:
+        return "only the NO leg is mappable as a resting order; refusing"
+    return None
+
+
+def unmappable_resting_order_reason(
+    order: object,
+    instrument: object,
+    *,
+    permit_expires_at_ns: int,
+    now_ns: int,
+    gtd_expiry_verified: bool,
+) -> str | None:
+    """Return a denial reason when the order is not an admissible rest, else None.
+
+    Admits only: LIMIT, BUY, qty 1, the NO leg of a daily-HIGH market, price in
+    (0, :data:`RESTING_PRICE_CAP`], ``TimeInForce.GTD`` (GTC refused), and
+    ``now < expire_time <= min(permit_expires_at_ns, end of the UTC day)``; no
+    post-only/reduce-only/display/trigger. Refuses outright while
+    ``gtd_expiry_verified`` is not ``True`` (the caller passes
+    :data:`GTD_EXPIRY_VERIFIED`). The IOC and exit shapes are untouched.
+    """
+    if gtd_expiry_verified is not True:
+        return "GTD expiry is unverified; this client refuses to rest an order"
+    reason = _resting_shape_reason(order, instrument)
+    if reason is not None:
+        return reason
+    for label, value in (("permit expiry", permit_expires_at_ns), ("now", now_ns)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"{label} must be a positive integer nanosecond timestamp; refusing"
+    expire_ns = int(getattr(order, "expire_time_ns", 0))
+    day_end_ns = (now_ns // _NANOS_PER_DAY + 1) * _NANOS_PER_DAY
+    if expire_ns <= now_ns:
+        return "expire_time must be in the future; refusing"
+    if expire_ns > min(permit_expires_at_ns, day_end_ns):
+        return "expire_time is past the permit expiry or the end of the UTC day; refusing"
+    return None
+
+
+def build_resting_order_body(order: object, instrument: object) -> dict[str, Any]:
+    """Return the exact nine-key resting CreateOrderRequest. Caller has mapped.
+
+    Re-applies the clock-free shape rules (the window and gate are the caller's:
+    ``unmappable_resting_order_reason``). ASYNC by construction: no
+    ``synchronousExecution``, no ``maxBlockTime``.
+    """
+    reason = _resting_shape_reason(order, instrument)
+    if reason is not None:
+        raise ValueError(reason)
+    price = order_price_decimal(order)
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    wire_price = wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
+    return {
+        "marketSlug": slug,
+        "type": _ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
+        "quantity": 1,
+        "tif": _TIF_GTD,
+        "outcomeSide": _OUTCOME_SIDE_NO,
+        "action": _ORDER_ACTION_BUY,
+        "manualOrderIndicator": _MANUAL_AUTOMATIC,
+        "goodTillTime": format_good_till_time(int(getattr(order, "expire_time_ns", 0))),
+    }
+
+
+def _echo_expire_ns(value: object, *, field: str) -> int:
+    return parse_rfc3339_nanos(value, field=field, error=ExecutionReportMappingError)
+
+
+def resting_echo_matches(
+    report: object, wire_echo: Mapping[str, Any], venue_order: Mapping[str, Any]
+) -> bool:
+    """True iff the venue's view of a rest matches the body we posted.
+
+    ``report`` is the native ``OrderStatusReport`` parsed from the confirm GET;
+    ``wire_echo`` is the body sent (:func:`build_resting_order_body`);
+    ``venue_order`` is the raw ``Order`` mapping of that same GET (the report
+    carries neither the slug nor ``goodTillTime``). Compared: slug (wire, venue
+    order and the report's instrument), outcome leg and BUY via the LEG MAPPING
+    (the NO leg is a venue SELL; a raw ``side`` comparison would be wrong),
+    price (the report's instrument-side price against the leg-translated wire
+    price), quantity, TIF GTD, and ``goodTillTime`` within one second. Anything
+    unreadable is ``False``; this never raises. It decides nothing about the
+    order STATE: the caller still requires ``ACCEPTED`` and ``filled_qty == 0``.
+    """
+    try:
+        leg = leg_of(getattr(report, "instrument_id"))  # noqa: B009
+        expected_side = _OUTCOME_SIDE_NO if leg == LEG_NO else _OUTCOME_SIDE_YES
+        slug = wire_echo["marketSlug"]
+        if (
+            wire_echo["outcomeSide"] != expected_side
+            or wire_echo["action"] != _ORDER_ACTION_BUY
+            or getattr(report, "order_side", None) is not OrderSide.BUY
+            or venue_order["marketSlug"] != slug
+            or base_slug_of(getattr(report, "instrument_id")) != slug  # noqa: B009
+            or wire_echo["tif"] != _TIF_GTD
+            or getattr(report, "time_in_force", None) is not TimeInForce.GTD
+        ):
+            return False
+        wire_price = Decimal(str(wire_echo["price"]["value"]))
+        report_price = getattr(report, "price", None)
+        if report_price is None or instrument_price_for_leg(leg, wire_price) != Decimal(
+            str(report_price)
+        ):
+            return False
+        report_quantity = getattr(report, "quantity", None)
+        if report_quantity is None or Decimal(str(report_quantity)) != Decimal(
+            str(wire_echo["quantity"])
+        ):
+            return False
+        sent = _echo_expire_ns(wire_echo["goodTillTime"], field="wire goodTillTime")
+        seen = _echo_expire_ns(venue_order["goodTillTime"], field="venue goodTillTime")
+        return abs(seen - sent) <= _GOOD_TILL_ECHO_TOLERANCE_NS
+    except (
+        ArithmeticError,
+        AttributeError,
+        ExecutionReportMappingError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
 class ExitAuthorizationLike(Protocol):
     """Structural shape this module needs from a strategy-authored exit
     authorisation (`breezy.strategy.current_rung_hold.exit_authorization.
@@ -576,7 +813,8 @@ def build_exit_order_body(
 
 
 def encode_order_body(body: Mapping[str, Any]) -> bytes:
-    if set(body) != ORDER_BODY_KEYS:
+    keys = set(body)
+    if keys != ORDER_BODY_KEYS and keys != RESTING_ORDER_BODY_KEYS:
         raise ValueError("order body key set does not match the venue schema")
     return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
 

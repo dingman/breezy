@@ -1885,3 +1885,155 @@ def test_parse_open_orders_never_reads_intent_or_outcome_side() -> None:
 
     assert "intent" not in OpenOrderRecord._fields
     assert not any("outcome" in f for f in OpenOrderRecord._fields)
+
+
+# ---------------------------------------------------------------------------
+# S4 WP1 (ARM maker-sharp B3): wire Order keys and the maker-commission helpers
+# ---------------------------------------------------------------------------
+
+_OBSERVED_WIRE_ORDER_KEYS = frozenset(
+    {
+        "action",
+        "avgPx",
+        "cashOrderQty",
+        "commissionNotionalTotalCollected",
+        "commissionsBasisPoints",
+        "createTime",
+        "cumQuantity",
+        "goodTillTime",
+        "id",
+        "insertTime",
+        "intent",
+        "lastTransactTime",
+        "leavesQuantity",
+        "makerCommissionsBasisPoints",
+        "manualOrderIndicator",
+        "marketMetadata",
+        "marketSlug",
+        "outcomeSide",
+        "price",
+        "quantity",
+        "side",
+        "state",
+        "tif",
+        "type",
+    }
+)
+
+
+def test_wire_order_keys_literal_is_the_24_observed_keys() -> None:
+    """WP0 note section 3 S-3: the wire Order carries 24 keys (additive pin)."""
+    assert reports_module.WIRE_ORDER_KEYS == _OBSERVED_WIRE_ORDER_KEYS
+    assert len(reports_module.WIRE_ORDER_KEYS) == 24
+    assert isinstance(reports_module.WIRE_ORDER_KEYS, frozenset)
+
+
+def test_wire_order_keys_is_the_snapshot_keys_plus_the_four_drift_keys() -> None:
+    assert reports_module.WIRE_ORDER_KEYS == (
+        reports_module._ORDER_KEYS | reports_module._ORDER_DRIFT_ALLOWED_KEYS
+    )
+
+
+def test_order_drift_allowlist_stays_exactly_four_keys() -> None:
+    """[CHAR] P11: no change to the order drift allowlist."""
+    assert reports_module._ORDER_DRIFT_ALLOWED_KEYS == {
+        "action",
+        "lastTransactTime",
+        "manualOrderIndicator",
+        "outcomeSide",
+    }
+
+
+def test_order_with_unsolicited_cancel_reason_is_refused() -> None:
+    """[CHAR] ``unsolicitedCancelReason`` is an Execution field, never an Order key."""
+    order = _resting_order(unsolicitedCancelReason="")
+    with pytest.raises(ExecutionReportMappingError):
+        reports_module._known_order(order, context="order status report")
+
+
+def _amount(value: str) -> dict[str, str]:
+    return {"value": value, "currency": "USD"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("0.02", Decimal("0.02")), ("-0.0125", Decimal("-0.0125")), ("0", Decimal(0))],
+)
+def test_resting_commission_total_is_signed(raw: str, expected: Decimal) -> None:
+    order = {"commissionNotionalTotalCollected": _amount(raw)}
+    assert reports_module.resting_commission_total(order) == expected
+
+
+def test_resting_commission_total_is_required() -> None:
+    with pytest.raises(ExecutionReportMappingError):
+        reports_module.resting_commission_total({})
+    with pytest.raises(ExecutionReportMappingError):
+        reports_module.resting_commission_total({"commissionNotionalTotalCollected": None})
+
+
+def test_resting_commission_total_refuses_a_non_usd_amount() -> None:
+    order = {"commissionNotionalTotalCollected": {"value": "0.02", "currency": "EUR"}}
+    with pytest.raises(ExecutionReportMappingError):
+        reports_module.resting_commission_total(order)
+
+
+def test_resting_commission_total_never_reads_bps_or_fee_coefficient() -> None:
+    """[CHAR] the realised total is the only commission source."""
+    order = {
+        "commissionNotionalTotalCollected": _amount("0.03"),
+        "commissionsBasisPoints": "9999",
+        "makerCommissionsBasisPoints": "9999",
+        "feeCoefficient": 0.5,
+    }
+    assert reports_module.resting_commission_total(order) == Decimal("0.03")
+
+
+def test_commission_bps_inert_accepts_string_zero() -> None:
+    order = {"commissionsBasisPoints": "0", "makerCommissionsBasisPoints": "0"}
+    assert reports_module.assert_commission_bps_inert(order) is None
+
+
+@pytest.mark.parametrize("bad", ["125", "0.0", "", 0, None, Decimal(0), False])
+def test_commission_bps_drift_flags_nonzero_and_nonstring_value_free(bad: object) -> None:
+    for field in ("commissionsBasisPoints", "makerCommissionsBasisPoints"):
+        order = {"commissionsBasisPoints": "0", "makerCommissionsBasisPoints": "0", field: bad}
+        drift = reports_module.assert_commission_bps_inert(order)
+        assert drift is not None
+        assert drift.fields == (field,)
+
+
+def test_commission_bps_drift_flags_an_absent_field_and_never_raises() -> None:
+    drift = reports_module.assert_commission_bps_inert({})
+    assert drift is not None
+    assert drift.fields == ("commissionsBasisPoints", "makerCommissionsBasisPoints")
+    assert reports_module.assert_commission_bps_inert({"commissionsBasisPoints": "7"}) is not None
+
+
+def test_commission_bps_drift_carries_no_venue_value() -> None:
+    drift = reports_module.assert_commission_bps_inert(
+        {"commissionsBasisPoints": "SECRET-VALUE-77", "makerCommissionsBasisPoints": "0"}
+    )
+    assert drift is not None
+    assert "SECRET-VALUE-77" not in repr(drift)
+
+
+def test_recognised_commission_clamps_negative_while_unverified() -> None:
+    assert reports_module.recognised_commission(Decimal("-0.0125"), sign_verified=False) == 0
+    assert reports_module.recognised_commission(Decimal(0), sign_verified=False) == 0
+    assert reports_module.recognised_commission(Decimal("0.03"), sign_verified=False) == Decimal(
+        "0.03"
+    )
+
+
+def test_recognised_commission_passes_the_raw_sign_once_verified() -> None:
+    assert reports_module.recognised_commission(Decimal("-0.0125"), sign_verified=True) == Decimal(
+        "-0.0125"
+    )
+    assert reports_module.recognised_commission(Decimal("0.03"), sign_verified=True) == Decimal(
+        "0.03"
+    )
+
+
+def test_recognised_commission_never_returns_a_negative_zero_or_a_rebate_when_unverified() -> None:
+    clamped = reports_module.recognised_commission(Decimal("-0"), sign_verified=False)
+    assert clamped == 0 and not clamped.is_signed()
