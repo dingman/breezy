@@ -192,6 +192,14 @@ PRE_PERMITTED_COROUTINES = frozenset(
         "__call__",
         # S4 WP3 (ARM B4, pin row P4a): NAMED row added to the baseline, never relaxed.
         "_confirm_resting_order",
+        # S4 WP4 (ARM B5, pin row P4e): copy of the inventory row.
+        "_sweep_resting_orders_at_boot",
+        # S4 WP4 (ARM B5, pin row P4c): copy of the inventory row.
+        "_cancel_slug_orders",
+        # S4 WP4 (ARM B5, pin row P4b): copy of the inventory row.
+        "_cancel_resting_order",
+        # S4 WP4 (ARM B5, pin row P4a): copy of the inventory row.
+        "_confirm_cancel_terminal",
         "_batch_cancel_orders",
         "_cancel_all_orders",
         "_cancel_order",
