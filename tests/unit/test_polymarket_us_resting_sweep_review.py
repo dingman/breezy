@@ -28,6 +28,7 @@ from tests.unit.ambig_latch_rig import (
     submit_chain,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender, _rig
 from tests.unit.test_polymarket_us_resting_robustness import hand_bind
 from tests.unit.test_polymarket_us_resting_submit import _id_n, _rest_command, _submit_rest
@@ -193,3 +194,71 @@ def test_flipping_the_slug_pin_requires_reconciling_the_never_cancelled_claim() 
         "the slug pin was flipped: reconcile the sweep docstring, r4 5.4 and spec 9.18 "
         "('unbound orders are never cancelled') before editing this test"
     )
+
+
+def _evidence_bytes(client: Any, open_orders: tuple[Any, ...] = ()) -> dict[str, Any]:
+    client._open_orders = open_orders
+    client._open_orders_read_refused = False
+    client._write_startup_position_evidence(
+        now_ns=client._clock.timestamp_ns(),
+        eof_complete=True,
+        position_read_refused=False,
+        raw_positions={},
+    )
+    raw = client._store_get(_EVIDENCE_KEY)
+    assert raw is not None
+    decoded: dict[str, Any] = json.loads(raw)
+    return decoded
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_empty_unlatched_book_writes_the_pre_s4_evidence_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 (K1 golden): the ``resting_cancel_unconfirmed`` key is written only when it carries
+    information -- latched, or an open order whose ownership the gate must judge. A flat book
+    with the latch clear writes EXACTLY the pre-S4 key set (``golden_exec_par_wp4_k1.json``
+    stays byte-identical), and the gate's verdict is unchanged: no open order, no effect."""
+    rig = await _rig(tmp_path, monkeypatch)
+    evidence = _evidence_bytes(rig.client)
+    assert "resting_cancel_unconfirmed" not in evidence
+    assert set(evidence) == {
+        "v",
+        "ts_ns",
+        "eof_complete",
+        "position_read_refused",
+        "fill_walk_complete",
+        "positions",
+        "open_orders_read_refused",
+        "open_orders",
+    }
+    assert startup_evidence_refusal_reason(evidence) is None
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_latch_key_is_written_for_an_open_order_or_a_latched_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    own = SimpleNamespace(
+        venue_order_id=_id_n(0),
+        market_slug=submit_chain.build_resting_order_body(command.order, build_no_leg_instrument())[
+            "marketSlug"
+        ],
+        state="ORDER_STATE_NEW",
+    )
+    open_book = _evidence_bytes(client, (own,))
+    assert open_book["resting_cancel_unconfirmed"] is False, "an own open order needs the key"
+    assert startup_evidence_refusal_reason(open_book) is None
+    client._latch_resting_cancel_unconfirmed(_id_n(0), "test")
+    latched = _evidence_bytes(client)
+    assert latched["resting_cancel_unconfirmed"] is True
+    assert startup_evidence_refusal_reason(latched) == "resting_cancel_unconfirmed"
+    await client._disconnect()

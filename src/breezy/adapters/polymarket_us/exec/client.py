@@ -6672,6 +6672,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             for r in self._trading_refusals
         )
 
+    def _resting_cancel_evidence(self) -> bool | None:
+        """The ``resting_cancel_unconfirmed`` value to RECORD in the startup evidence, or
+        ``None`` to omit the key. Written only when it carries information: ``True`` while
+        latched, ``False`` while an open order exists (the arm gate needs the explicit
+        ``False`` to exempt an own order). A flat book with the latch clear omits it, so
+        the row is byte-identical to the pre-S4 evidence (the K=1 golden) and the gate's
+        verdict is unchanged: an absent key refuses only when an order is open.
+        """
+        if self._resting_cancel_latched():
+            return True
+        return False if self._open_orders else None
+
     def _write_startup_position_evidence(
         self,
         *,
@@ -6716,7 +6728,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 for o in self._open_orders
             ),
-            resting_cancel_unconfirmed=self._resting_cancel_latched(),
+            resting_cancel_unconfirmed=self._resting_cancel_evidence(),
         )
         self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
         # R-9a (HF-4 rev2): the single writer of the watermark the resolver's
