@@ -194,7 +194,11 @@ RESOLVER_ROWS: Final[dict[str, frozenset[str]]] = {
     "submit_chain.resting_index_bytes": frozenset({"_bind_resting_order"}),
     "submit_chain.resting_binding_bytes": frozenset({"_bind_resting_order"}),
     "self._read_fill_index": frozenset({"_bind_resting_order"}),
-    "submit_chain.valid_venue_order_id": frozenset({"_bind_resting_order"}),
+    # B4 review F5 (NAMED element, widen only): the no-id resolver validates an
+    # adopted resting id at the adopt site.
+    "submit_chain.valid_venue_order_id": frozenset(
+        {"_bind_resting_order", "_resolve_no_id_intent"}
+    ),
     "submit_chain.resting_echo_matches": frozenset({"_resolve_ambiguous_intents"}),
     "self.generate_order_accepted": frozenset({"_bind_resting_order"}),
     "self._bind_resting_order": frozenset({"_resolve_ambiguous_intents"}),
@@ -231,6 +235,15 @@ def test_each_resolver_row_is_in_the_firewall_set_and_used_only_where_named(call
     used = _resolver_references(CLIENT_PATH.read_text(encoding="utf-8"), callee)
     assert used, f"{callee} must be referenced (a row nothing uses is dead permission)"
     assert used <= RESOLVER_ROWS[callee], (callee, used)
+
+
+def test_the_adopt_site_validation_row_is_used_exactly_where_named() -> None:
+    """B4 review F5: the widened element is not dead permission, and no third scanned
+    body picked it up."""
+    used = _resolver_references(
+        CLIENT_PATH.read_text(encoding="utf-8"), "submit_chain.valid_venue_order_id"
+    )
+    assert used == {"_bind_resting_order", "_resolve_no_id_intent"}
 
 
 @pytest.mark.parametrize("callee", sorted(RESOLVER_ROWS))

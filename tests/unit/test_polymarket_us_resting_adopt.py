@@ -242,6 +242,26 @@ async def test_a_manual_or_unmarked_open_order_is_never_adopted(
     await client._disconnect()
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_adopted_resting_id_failing_the_allowlist_is_a_contradiction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F5: the adopted id is validated at the adopt site, before it is
+    written into the durable resolver context."""
+    client, current, command = await _no_id_rest(tmp_path, monkeypatch)
+    context = read_context(client, current.intent_id)
+    _negative(client, open_orders=[_open_rest_row(context.created_ns, command, order_id="bad-id")])
+    client.advance(305)
+    await run_passes(client, 2)
+    detail = client._resolver_contradiction_details[current.intent_id]
+    assert detail["event"] == "resolver_evidence_contradiction"
+    assert detail["reason"] == "adopted_resting_id_invalid"
+    assert read_context(client, current.intent_id).venue_order_id == submit_chain.NO_VENUE_ORDER_ID
+    assert client._latch.current_open() is not None
+    await client._disconnect()
+
+
 def test_open_orders_path_constant_is_the_stubbed_one() -> None:
     """Non-vacuity of the stub wiring used above."""
     assert OPEN_ORDERS_PATH.startswith("/v1/")

@@ -4691,6 +4691,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         outcome_kind: str = verdict.kind
         outcome_token = f"{verdict.token}"
         manual_reason = ""
+        if (
+            outcome_kind == "ADOPT"
+            and context is not None
+            and context.resting
+            and not submit_chain.valid_venue_order_id(f"{verdict.order_id}")
+        ):
+            # A resting id is written into the durable resolver context and later
+            # spliced into GET and cancel paths: it must pass the allowlist HERE.
+            outcome_kind = "CONTRADICTION"
+            outcome_token = "adopted_resting_id_invalid"
 
         if outcome_kind == "NO_FILL":
             # The positions baseline, checked only when attribution is clean.
