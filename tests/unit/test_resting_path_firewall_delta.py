@@ -173,7 +173,9 @@ def test_planting_a_send_or_write_into_the_confirm_coroutine_is_flagged(statemen
 
 #: callee -> the scanned resolver bodies allowed to call it. Each key is a row
 #: ADDED to ``EXEC_RESOLVER_PERMITTED_CALLEES`` by its own commit; none is a send.
-RESOLVER_ROWS: Final[dict[str, frozenset[str]]] = {}
+RESOLVER_ROWS: Final[dict[str, frozenset[str]]] = {
+    "self._bind_resting_order": frozenset({"_resolve_ambiguous_intents"}),
+}
 #: The scanned resolver helper this item adds (row P6a): the ONE binder.
 BINDER: Final[str] = "_bind_resting_order"
 

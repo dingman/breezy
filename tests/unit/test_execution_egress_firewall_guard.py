@@ -2171,6 +2171,8 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
     {
         "asyncio.sleep",
         "self._resolver_poll_interval_secs",
+        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`).
+        "self._bind_resting_order",
         # Layers-contract review: `current()` + a bare `SubmitIntentState`
         # comparison would need `breezy.runtime.submit_intent` imported --
         # forbidden (`breezy.adapters` sits below `breezy.runtime`). Replaced
