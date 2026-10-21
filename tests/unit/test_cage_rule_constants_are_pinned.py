@@ -991,6 +991,15 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "re-valued to 0.89 by RULING_MAKER_sharp_v1_live_small_2026-10-21. "
         "A value change is a re-valuing and needs a ruling-cited commit",
     ),
+    # ARM maker-sharp B4 / S4 r4 P16 (one reviewed row, one commit): the bounded GET-confirm deadline for a fresh rest. Widening holds K=1 and the budget longer; narrowing HOLDs more rests to the resolver
+    RulePin(
+        module="submit_chain",
+        attr="RESTING_CONFIRM_DEADLINE_S",
+        expected=5,
+        widened=6,
+        narrowed=4,
+        why="S4 P16 (B4): the bounded GET-confirm deadline for a fresh rest. Widening holds K=1 and the budget longer; narrowing HOLDs more rests to the resolver",
+    ),
     # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): fail-closed
     # until the positive control proves the venue expires a GTD order at
     # goodTillTime (S-6). The flip is a reviewed commit citing that artifact.
@@ -1111,6 +1120,8 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # ARM maker-sharp B3 / S4 r3 P16: the resting price cap.
         "submit_chain.RESTING_PRICE_CAP",
         "submit_chain.GTD_EXPIRY_VERIFIED",
+        # ARM maker-sharp B4 / S4 r4 P16: the GET-confirm deadline.
+        "submit_chain.RESTING_CONFIRM_DEADLINE_S",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
