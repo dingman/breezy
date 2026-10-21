@@ -293,6 +293,8 @@ PRE_ORDER_CALLEES = frozenset(
         "submit_chain.build_resting_order_body",
         # S4 WP3 (ARM B4, pin row P1d-1): NAMED row added to the baseline, never relaxed.
         "submit_chain.unmappable_resting_order_reason",
+        # S4 WP4 (ARM B5, pin row P1e): NAMED row added to the baseline, never relaxed.
+        "self._resting_cancel_target",
         # S4 WP4 (ARM B5, pin row P1b): NAMED row added to the baseline, never relaxed.
         "self._cancel_resting_order",
         "submit_chain.venue_order_id",

@@ -34,6 +34,7 @@ CLIENT_REL: Final[str] = "src/breezy/adapters/polymarket_us/exec/client.py"
 #: callee -> the order coroutines allowed to reference it. Each key is a row
 #: ADDED to ``EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`` by its own commit.
 ORDER_ROWS: Final[dict[str, frozenset[str]]] = {
+    "self._resting_cancel_target": frozenset({"_cancel_order", "_cancel_all_orders"}),
     "self._cancel_resting_order": frozenset({"_cancel_order", "_cancel_all_orders"}),
     "self._bind_resting_order": frozenset({"_submit_order"}),
     "self._confirm_resting_order": frozenset({"_submit_order"}),
