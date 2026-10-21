@@ -59,7 +59,7 @@ BANNED_MODULES: dict[str, tuple[str, int, str]] = {
     ),
     "breezy.adapters.polymarket_us.exec": (
         "src/breezy/adapters/polymarket_us/exec/client.py",
-        1952,
+        1963,
         "class PolymarketUSExecutionClient",
     ),
     "breezy.adapters.polymarket_us.safety": (
@@ -74,7 +74,7 @@ BANNED_MODULES: dict[str, tuple[str, int, str]] = {
     ),
     "breezy.exec": (
         "src/breezy/adapters/polymarket_us/exec/client.py",
-        7582,
+        7716,
         "self._order_sender.post_order",
     ),
 }
