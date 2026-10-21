@@ -438,3 +438,100 @@ def test_the_cancel_confirm_callee_set_is_exact_and_egress_free() -> None:
 def test_planting_a_send_or_write_into_the_cancel_confirm_is_flagged(statement: str) -> None:
     planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _CANCEL_CONFIRM, statement)
     assert _cancel_confirm_violations(planted) != []
+
+
+# ---------------------------------------------------------------------------
+# Row N2: the cancel loop's exact callee set -- exactly ONE send callee
+# ---------------------------------------------------------------------------
+
+_CANCEL_LOOP: Final[str] = "_cancel_resting_order"
+#: The single send name the cancel loop may use (the banned-word exception).
+_CANCEL_SEND_NAME: Final[str] = "self._order_sender.post_cancel_order"
+EXEC_CANCEL_SEND_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        _CANCEL_SEND_NAME,
+        "asyncio.sleep",
+        "frozenset",
+        "list",
+        "pending.remove",
+        "self._cancel_slug_orders",
+        "self._clear_resting_cancel_latch",
+        "self._clock.timestamp_ns",
+        "self._confirm_cancel_terminal",
+        "self._latch_resting_cancel_unconfirmed",
+        "self._log.warning",
+        "self._note_cancel_refused",
+        "self._resting_target_of",
+        "self._settle_resting_terminal",
+        "self._write_signer.sign_headers",
+        "submit_chain.cancel_backoff_s",
+        "submit_chain.cancel_order_path",
+        "submit_chain.valid_venue_order_id",
+    }
+)
+#: The awaits the loop may make: its own sleep, the GET-only confirm, the one send, and
+#: the (disabled-until-verified) escalation helper.
+_CANCEL_LOOP_AWAITS: Final[frozenset[str]] = frozenset(
+    {
+        "asyncio.sleep",
+        "self._cancel_slug_orders",
+        "self._confirm_cancel_terminal",
+        _CANCEL_SEND_NAME,
+    }
+)
+_BANNED_VERB_WORDS: Final[tuple[str, ...]] = ("read", "send", "post", "request")
+
+
+def _cancel_loop_violations(source: str) -> list[str]:
+    fn = _function(source, _CANCEL_LOOP)
+    callees = _callees(fn)
+    found = sorted(callees - EXEC_CANCEL_SEND_PERMITTED_CALLEES)
+    # the banned-word loop of the order allowlist, with the ONE send name excepted
+    found += [
+        f"banned word in {c}"
+        for c in sorted(callees - {_CANCEL_SEND_NAME})
+        if any(w in c.replace("_order_sender", "") for w in _BANNED_VERB_WORDS)
+    ]
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            value = node.value
+            target = firewall._dotted_callee(value.func) if isinstance(value, ast.Call) else None
+            if target not in _CANCEL_LOOP_AWAITS:
+                found.append(f"await {target}")
+    return found
+
+
+def test_the_cancel_loop_callee_set_is_exact_with_exactly_one_send_name() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _cancel_loop_violations(source) == []
+    assert _callees(_function(source, _CANCEL_LOOP)) == EXEC_CANCEL_SEND_PERMITTED_CALLEES
+    sends = [c for c in EXEC_CANCEL_SEND_PERMITTED_CALLEES if "_order_sender" in c]
+    assert sends == [_CANCEL_SEND_NAME]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "await self._order_sender.post_order(None)",
+        "await self._order_sender.post_cancel_all(None)",
+        "await self._private_read('/x')",
+        "self.create_task(self._cancel_slug_orders('x'))",
+        "self._store_set('k', b'v')",
+        "await self._read_open_orders()",
+    ],
+)
+def test_planting_any_other_send_or_read_into_the_cancel_loop_is_flagged(statement: str) -> None:
+    planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _CANCEL_LOOP, statement)
+    assert _cancel_loop_violations(planted) != []
+
+
+def test_the_loop_is_referenced_only_by_the_cancel_coroutines() -> None:
+    """Row P1b's usage side for the non-order callers: the sweep (later row) and the two
+    order coroutines are the only places that name the loop; ``_submit_order`` never does."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _order_references(source, f"self.{_CANCEL_LOOP}") == {
+        "_cancel_order",
+        "_cancel_all_orders",
+    }
+    planted = _plant_into(source, "_submit_order", f"self.{_CANCEL_LOOP}([])")
+    assert "_submit_order" in _order_references(planted, f"self.{_CANCEL_LOOP}")
