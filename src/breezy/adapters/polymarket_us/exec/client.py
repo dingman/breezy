@@ -8541,9 +8541,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         Wins ``_retire_resting_row`` (a loser returns ``False`` and does nothing),
         settles the exposure via ``settle`` (never ``release_booking``), restores the
         permit slot ONLY for an id this process armed (idempotently per venue id), and
-        only THEN emits the native ``OrderCanceled`` / ``OrderExpired`` (only for an
-        order this run's cache knows; a failing emit is logged, never raised). A permit
-        that cannot restore (expired) is logged and skipped: a cancel never needs it.
+        only THEN emits the native ``OrderCanceled`` / ``OrderExpired`` / ``OrderRejected``
+        (per the venue's own terminal state, r4 section 6; only for an order this run's
+        cache knows; a failing emit is logged, never raised). A permit that cannot
+        restore (expired) is logged and skipped: a cancel never needs it.
         """
         venue_id = target.venue_order_id
         held = self._resting_bookings.get(venue_id)
@@ -8599,6 +8600,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         }
         if verdict == submit_chain.CANCEL_READ_EXPIRED:
             self.generate_order_expired(**events)
+        elif verdict == submit_chain.CANCEL_READ_REJECTED:
+            # r4 section 6: the venue's REJECTED is the native REJECTED status.
+            self.generate_order_rejected(
+                strategy_id=events["strategy_id"],
+                instrument_id=events["instrument_id"],
+                client_order_id=events["client_order_id"],
+                reason="venue state ORDER_STATE_REJECTED after acceptance",
+                ts_event=now_ns,
+            )
         else:
             self.generate_order_canceled(**events)
 
@@ -8696,6 +8706,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         if verdict in (
                             submit_chain.CANCEL_READ_CANCELED,
                             submit_chain.CANCEL_READ_EXPIRED,
+                            submit_chain.CANCEL_READ_REJECTED,
                         ):
                             if target.bound:
                                 self._settle_resting_terminal(target, verdict)

@@ -31,6 +31,7 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     CancelSender,
     _auto_cancel,
     _cancel_all_cmd,
+    _cancel_cmd,
     _names,
     _payload,
     _rig,
@@ -532,4 +533,41 @@ async def test_the_latch_log_redacts_a_valid_id_and_keeps_synthetic_ids_readable
     assert any(_id_n(0)[:4] + "…" in line for line in lines)
     assert all(_id_n(0) not in line for line in lines)
     assert any("boot-sweep" in line for line in lines)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_venue_rejected_zero_fill_rest_emits_order_rejected_and_settles_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 section 6 (verdicts = the native ``OrderStatus``): the venue's REJECTED maps to the
+    native REJECTED status, so the retirement emits ``OrderRejected`` -- never a
+    ``OrderCanceled`` the venue did not report. Nautilus accepts ACCEPTED -> REJECTED."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    rig.sender.on_cancel = lambda oid: _set_state(rig, 0, "ORDER_STATE_REJECTED")
+    await asyncio.wait_for(client._cancel_order(_cancel_cmd(rig, command)), 2.0)
+    assert _names(rig).count("OrderRejected") == 1
+    assert "OrderCanceled" not in _names(rig)
+    assert not client._ledger.has_open_exposure(intent_id)
+    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == []
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_rejected_read_with_a_fill_still_belongs_to_the_fill_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    rig.sender.on_cancel = lambda oid: _set_state(rig, 0, "ORDER_STATE_REJECTED", cum=1)
+    await asyncio.wait_for(client._cancel_order(_cancel_cmd(rig, command)), 2.0)
+    assert "OrderRejected" not in _names(rig) and "OrderCanceled" not in _names(rig)
+    assert client._ledger.has_open_exposure(intent_id)
     await client._disconnect()

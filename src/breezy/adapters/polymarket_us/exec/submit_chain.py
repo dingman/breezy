@@ -212,6 +212,9 @@ RESTING_QUERY_UNREADABLE_REASON: Final[str] = (
 #: Verdicts of :func:`cancel_read_verdict` (what a GET of a cancelled order proves).
 CANCEL_READ_CANCELED: Final[str] = "CANCELED"
 CANCEL_READ_EXPIRED: Final[str] = "EXPIRED"
+#: A zero-fill venue REJECTED (r4 section 6: verdicts follow the native ``OrderStatus``, so it
+#: is its own verdict and retires with ``OrderRejected``, not ``OrderCanceled``).
+CANCEL_READ_REJECTED: Final[str] = "REJECTED"
 CANCEL_READ_FILLED: Final[str] = "FILLED"
 CANCEL_READ_OPEN: Final[str] = "OPEN"
 CANCEL_READ_UNREADABLE: Final[str] = "UNREADABLE"
@@ -773,7 +776,9 @@ def cancel_read_verdict(
     state (a partial: the rest still rests) is ``OPEN``, so the cancel keeps retrying
     (B5 review G4); a fill on an unknown state is ``UNREADABLE``. ``CANCELED`` /
     ``EXPIRED`` only for a zero-fill terminal state with ``cumQuantity`` PRESENT and
-    zero; ``OPEN`` for a live state; everything else (not an object, a missing or
+    zero (a venue ``REJECTED`` is its own verdict, ``REJECTED``: the native
+    ``OrderStatus.REJECTED``, r4 section 6); ``OPEN`` for a live state; everything
+    else (not an object, a missing or
     non-numeric or negative ``cumQuantity``, an unknown state, a FILLED state
     with nothing filled) is ``UNREADABLE``. A bare 200 on the cancel POST is
     never an input here: only a read of the order is.
@@ -798,8 +803,10 @@ def cancel_read_verdict(
         if state in _CANCEL_TERMINAL_STATES or _cum_reaches_quantity(cum, order.get("quantity")):
             return CANCEL_READ_FILLED
         return CANCEL_READ_OPEN if state in _CANCEL_OPEN_STATES else CANCEL_READ_UNREADABLE
-    if state in ("ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED"):
+    if state == "ORDER_STATE_CANCELED":
         return CANCEL_READ_CANCELED
+    if state == "ORDER_STATE_REJECTED":
+        return CANCEL_READ_REJECTED
     if state == "ORDER_STATE_EXPIRED":
         return CANCEL_READ_EXPIRED
     if state in _CANCEL_OPEN_STATES:

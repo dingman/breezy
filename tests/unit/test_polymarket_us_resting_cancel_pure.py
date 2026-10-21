@@ -29,7 +29,9 @@ def _order(**overrides: Any) -> dict[str, Any]:
     ("state", "verdict"),
     [
         ("ORDER_STATE_CANCELED", "CANCELED"),
-        ("ORDER_STATE_REJECTED", "CANCELED"),
+        # B5 review (r4 section 6: verdicts follow the native OrderStatus): a venue REJECTED
+        # is its own verdict, so the client emits OrderRejected, not OrderCanceled.
+        ("ORDER_STATE_REJECTED", "REJECTED"),
         ("ORDER_STATE_EXPIRED", "EXPIRED"),
         ("ORDER_STATE_NEW", "OPEN"),
         ("ORDER_STATE_PENDING_CANCEL", "OPEN"),
