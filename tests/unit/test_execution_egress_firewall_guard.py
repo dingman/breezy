@@ -1864,6 +1864,8 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         "_confirm_cancel_terminal",
         # S4 WP4 (ARM B5, pin row P4c): the slug cancel-all choke point (row N3).
         "_cancel_slug_orders",
+        # S4 WP4 (ARM B5, pin row P4e): the boot sweep (row N4).
+        "_sweep_resting_orders_at_boot",
         # The injected read protocol's own call signature.
         "__call__",
     }
