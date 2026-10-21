@@ -1115,6 +1115,9 @@ def build_trade_node_config(
     resting_accept_admitted = supervisor_admits_retirement_reason(
         Path(state_store_path), "ACCEPTED_RESTING"
     )
+    sweep_retire_admitted = supervisor_admits_retirement_reason(
+        Path(state_store_path), "BOOT_SWEEP_RESTING_NO_FILL"
+    )
     exec_client_config = msgspec_replace(
         exec_client_config,
         state_store_opener=lambda: SqliteStateStore(state_store_path),
@@ -1126,6 +1129,7 @@ def build_trade_node_config(
         resolver_instrument_loader=resolver_instrument_loader,
         no_id_retire_admitted=no_id_retire_admitted,
         resting_accept_admitted=resting_accept_admitted,
+        sweep_retire_admitted=sweep_retire_admitted,
         max_concurrent_intents=(
             1 if submit_intent_latch is None else submit_intent_latch.max_slots()
         ),

@@ -1879,6 +1879,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         resolver_instrument_loader: Callable[[str], Any] | None = None,
         no_id_retire_admitted: bool = False,
         resting_accept_admitted: bool = False,
+        sweep_retire_admitted: bool = False,
         frozen_cost_budget_bucket: str | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
@@ -1997,6 +1998,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # a resting submit is denied before any venue contact (fail closed), so
         # no node can write a record the supervisor would read as corrupt (L-48).
         self._resting_accept_admitted: bool = bool(resting_accept_admitted)
+        # S4 WP4: whether the running supervisor can decode the
+        # `BOOT_SWEEP_RESTING_NO_FILL` retirement reason. Set once at node boot;
+        # `_resolve_no_order` refuses that reason without it (fail closed), so a
+        # swept no-id rest stays AMBIGUOUS rather than write a record the
+        # supervisor would read as corrupt.
+        self._sweep_retire_admitted: bool = bool(sweep_retire_admitted)
         #: EXEC-PAR 3.9: the D-PREREG-frozen cap/budget bucket LABEL (never a
         #: dollar value), handed in by the composition root. At boot with K > 1
         #: a live label above it, an unreadable label, or an absent frozen label
@@ -4861,16 +4868,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         positions: Mapping[str, Any] | None = None,
         *,
         slug: str = "",
+        reason: str = "RESOLVER_NO_ID_NO_FILL",
     ) -> None:
         """Retire a no-id intent that complete reads show neither an order nor a
         fill for. Mirrors :meth:`_resolve_terminal_zero` step for step.
 
-        Refuses unless the running supervisor can decode the new retirement
+        ``reason`` is the retirement name: the default keeps today's behaviour; the
+        S4 swept-rest reason ``BOOT_SWEEP_RESTING_NO_FILL`` is gated by its OWN
+        decode marker (``_sweep_retire_admitted``) instead.
+
+        Refuses unless the running supervisor can decode the retirement
         reason (``_no_id_retire_admitted``, fail-closed) and unless
         ``_resolved_no_id_ts_ns`` carries a complete negative pass from THIS run
         (the SAFETY H2 analogue). The AMBIGUOUS-refusal clear is the LAST step.
         """
-        if not self._no_id_retire_admitted:
+        sweep_reason = reason == submit_chain.RETIRE_BOOT_SWEEP_RESTING_NO_FILL
+        admitted = self._sweep_retire_admitted if sweep_reason else self._no_id_retire_admitted
+        if not admitted:
             already_blocked = intent_id in self._resolver_contradiction_details
             self._resolver_contradiction_details = {
                 **self._resolver_contradiction_details,
@@ -4941,8 +4955,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._ledger.abandon_open_exposure(intent_id)
                 settle_failed = True
         self._ambiguous_bookings.pop(intent_id, None)
-        self._retire(intent_id, "RESOLVER_NO_ID_NO_FILL", now_ns)
-        self._log.info(f"resolver: retired intent {intent_id} (RESOLVER_NO_ID_NO_FILL)")
+        self._retire(intent_id, reason, now_ns)
+        self._log.info(f"resolver: retired intent {intent_id} ({reason})")
         if booking is not None:
             # Same process only: on restart the ledger died with the process.
             if (
