@@ -940,6 +940,7 @@ def test_the_query_coroutine_is_defined_and_no_longer_declared_unimplemented() -
 POLL_HELPERS: Final[frozenset[str]] = frozenset(
     {
         "_book_filled_read",
+        "_rest_still_bound",
         "_resting_poll_target",
         "_resting_instrument",
         "_parse_resting_read",

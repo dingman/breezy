@@ -63,8 +63,8 @@ GOLDEN_KEYS: Final[frozenset[str]] = frozenset(
 
 def _station_of(instrument_id: str) -> str:
     """The station (city) segment of a daily-high slug: ``tc-temp-<city>high-...``."""
-    slug = InstrumentId.from_str(instrument_id).symbol.value.removesuffix("^no")
-    return slug.split("-")[2].removesuffix("high")
+    slug = str(InstrumentId.from_str(instrument_id).symbol.value).removesuffix("^no")
+    return str(slug.split("-")[2]).removesuffix("high")
 
 
 def select_maker_fills(records: list[Any], *, family_stations: frozenset[str]) -> list[Any]:

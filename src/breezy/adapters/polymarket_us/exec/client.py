@@ -9142,19 +9142,30 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.warning(f"resting poll: the read did not map ({exc.__class__.__name__})")
             self._note_resting_poll(venue_id, readable=False)
             return
-        self._note_resting_poll(venue_id, readable=True)
+        readable = True
         try:
             self._watch_commission_bps(target, body)
-            if verdict == submit_chain.CANCEL_READ_OPEN:
-                return
             if verdict == submit_chain.CANCEL_READ_FILLED:
                 if self._book_resting_fill(target, body, report):
                     self._clear_resting_cancel_latch(venue_id)
-                return
-            self._settle_resting_terminal(target, verdict)
-            self._clear_resting_cancel_latch(venue_id)
+                else:
+                    # not booked: either another path won (the row is gone), or this fill
+                    # cannot be booked yet (no usable price, the record write failed) and the
+                    # row is still bound -- that is a failed poll, counted toward the latch
+                    readable = not self._rest_still_bound(venue_id)
+            elif verdict != submit_chain.CANCEL_READ_OPEN:
+                self._settle_resting_terminal(target, verdict)
+                self._clear_resting_cancel_latch(venue_id)
         except Exception as exc:  # noqa: BLE001 - the poll never raises; the next one retries
             self._log.error(f"resting poll: acting on a read failed ({exc.__class__.__name__})")
+            readable = False
+        self._note_resting_poll(venue_id, readable=readable)
+
+    def _rest_still_bound(self, venue_order_id: str) -> bool:
+        """Is ``venue_order_id`` still in the ``resting:`` index? (SYNC; an unreadable index
+        counts as still bound: nothing was proven retired.)"""
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        return indexed is None or venue_order_id in indexed
 
     def _book_filled_read(self, venue_order_id: str, body: Mapping[str, Any]) -> None:
         """A FILLED terminal read made by the CANCEL path books the fill through the same

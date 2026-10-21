@@ -813,3 +813,46 @@ async def test_cancels_proceed_while_an_ambiguous_intent_is_open(
     assert _names(rig).count("OrderCanceled") == 1
     assert json.loads(client._store_get(_INDEX_KEY)) == []
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_fill_that_cannot_be_booked_counts_toward_the_unreadable_latch_then_books(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FILLED read with no usable average price books nothing (the row stays bound), is
+    NOT a clean poll (three in a row latch ``resting_query_unreadable``), and books as soon
+    as the venue shows a price; the latch then clears."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    _fill(rig, 0)
+    del _payload(rig, 0)["avgPx"]
+    for _ in range(3):
+        await client._query_order(_query(rig, command))
+    assert _filled_events(rig) == [] and _records(rig) == ()
+    assert json.loads(client._store_get(_INDEX_KEY)) == [_id_n(0)]
+    assert submit_chain.RESTING_QUERY_UNREADABLE_REASON in _reasons(rig)
+    _payload(rig, 0)["avgPx"] = _amount(WIRE_PX)
+    await client._query_order(_query(rig, command))
+    assert len(_filled_events(rig)) == 1 and len(_records(rig)) == 1
+    assert submit_chain.RESTING_QUERY_UNREADABLE_REASON not in _reasons(rig)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_fill_with_no_readable_commission_is_booked_unreconciled_at_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-48: never strand a real fill. An absent commission books exactly as the resolver
+    books an unknown fee: ``Money(0)``, ``venue_fee_raw`` None, ``fee_reconciled`` False."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0)
+    del _payload(rig, 0)["commissionNotionalTotalCollected"]
+    await rig.client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    (event,) = _filled_events(rig)
+    assert record.venue_fee_raw is None and record.fee_reconciled is False
+    assert record.cumulative_fee == Decimal(0) and event.commission.as_decimal() == Decimal(0)
+    assert record.fee_source == client_module.FEE_SOURCE_MODELLED_AT_FILL_TIME
+    await rig.client._disconnect()
