@@ -1857,6 +1857,9 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # rest. GET-only (`EXEC_RESTING_CONFIRM_PERMITTED_CALLEES`, row N1, in
         # `test_resting_path_firewall_delta.py`): no `_order_sender`, no signer.
         "_confirm_resting_order",
+        # S4 WP4 (ARM B5, pin row P4b): the RETRY-WHEN-OPEN cancel loop; scanned by
+        # EXEC_CANCEL_SEND_PERMITTED_CALLEES (row N2): one send callee, post_cancel_order.
+        "_cancel_resting_order",
         # The injected read protocol's own call signature.
         "__call__",
     }

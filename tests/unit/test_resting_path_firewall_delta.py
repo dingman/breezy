@@ -358,3 +358,25 @@ def test_planting_any_other_await_into_an_order_coroutine_is_flagged(
     planted = _plant_any(source, function, statement)
     new = [d for d in set(_send_path_violations(planted)) - before if "awaits" in d]
     assert any(function in d for d in new), new
+
+
+# ---------------------------------------------------------------------------
+# Rows P4a-e: the coroutine inventory (EXEC_PERMITTED_COROUTINE_NAMES)
+# ---------------------------------------------------------------------------
+
+#: Coroutines ADDED to the exact inventory, one named entry per reviewed commit.
+INVENTORY_ROWS: Final[frozenset[str]] = frozenset({"_cancel_resting_order"})
+
+
+@pytest.mark.parametrize("name", sorted(INVENTORY_ROWS))
+def test_each_inventory_row_is_declared_and_defined_and_the_equality_is_sensitive(
+    name: str,
+) -> None:
+    assert name in firewall.EXEC_PERMITTED_COROUTINE_NAMES
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    defined = {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef)}
+    assert name in defined, f"{name} is declared but not defined (dead permission)"
+    declared = firewall.EXEC_PERMITTED_COROUTINE_NAMES
+    # non-vacuity: without the row the inventory EQUALITY would fail on this name
+    assert defined | firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES == declared
+    assert defined | firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES != declared - {name}
