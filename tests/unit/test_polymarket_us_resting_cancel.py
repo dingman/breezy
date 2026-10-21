@@ -703,3 +703,51 @@ async def test_cancel_all_with_nothing_to_cancel_is_a_no_op_not_a_raise(
     assert rig.sender.cancels == [] and rig.sender.cancel_alls == []
     assert _names(rig) == []
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_three_failed_polls_latch_resting_query_unreadable_and_a_read_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WP5 poll reports each GET through ``_note_resting_poll``; three consecutive
+    failures for one id latch ``resting_query_unreadable`` (NEW rests refused, cancels
+    continue). A later readable poll of that id clears the latch."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    for _ in range(2):
+        client._note_resting_poll(_id_n(0), readable=False)
+    assert client._trading_refusals == [], "two failures are not enough"
+    client._note_resting_poll(_id_n(0), readable=False)
+    assert [r.reason for r in client._trading_refusals] == [
+        submit_chain.RESTING_QUERY_UNREADABLE_REASON
+    ]
+    assert client.log_lines("error", "resting_query_unreadable")
+    # NEW rests are refused ...
+    await client._submit_order(_rest_command(client))
+    assert "OrderDenied" in _names(rig)
+    # ... but the cancel path never consults the latch and still works
+    _auto_cancel(rig)
+    await client._cancel_order(_cancel_cmd(rig, command))
+    assert _names(rig).count("OrderCanceled") == 1
+    client._note_resting_poll(_id_n(0), readable=True)
+    assert client._trading_refusals == []
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_readable_poll_between_failures_resets_the_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    for readable in (False, False, True, False, False):
+        client._note_resting_poll(_id_n(0), readable=readable)
+    assert client._trading_refusals == []
+    # the count is per id: failures on two ids never add up
+    for vid in (_id_n(1), _id_n(2), _id_n(1), _id_n(2)):
+        client._note_resting_poll(vid, readable=False)
+    assert client._trading_refusals == []
+    await client._disconnect()

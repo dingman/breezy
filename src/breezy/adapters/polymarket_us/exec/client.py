@@ -2011,6 +2011,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._resting_cancel_alert_ns: dict[str, int] = {}
         # Intents whose slug the boot sweep confirmed empty (process-local; WP5 reads it).
         self._swept_resting_intent_ids: frozenset[str] = frozenset()
+        # Consecutive failed polls per bound id, and the ids latched
+        # `resting_query_unreadable` (the WP5 poll reports through `_note_resting_poll`).
+        self._resting_poll_failures: dict[str, int] = {}
+        self._unreadable_resting_ids: frozenset[str] = frozenset()
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
         # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
@@ -8545,6 +8549,40 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             "new rests are refused, cancels continue"
         )
         self._refuse(reason)
+
+    def _note_resting_poll(self, venue_order_id: str, *, readable: bool) -> None:
+        """Record one poll GET of a bound rest (SYNC; the WP5 ``_query_order`` reports here).
+
+        Three consecutive failures for one id latch ``resting_query_unreadable`` (NEW
+        rests refused, cancels continue); a readable poll resets that id's count and,
+        when it was the last latched id, clears the latch (the clearing path).
+        """
+        if readable:
+            self._resting_poll_failures = {
+                k: v for k, v in self._resting_poll_failures.items() if k != venue_order_id
+            }
+            if venue_order_id not in self._unreadable_resting_ids:
+                return
+            self._unreadable_resting_ids = self._unreadable_resting_ids - {venue_order_id}
+            if not self._unreadable_resting_ids:
+                self._trading_refusals = [
+                    r
+                    for r in self._trading_refusals
+                    if r.reason != submit_chain.RESTING_QUERY_UNREADABLE_REASON
+                ]
+                self._log.info("resting poll: every latched id read again; latch cleared")
+            return
+        failures = self._resting_poll_failures.get(venue_order_id, 0) + 1
+        self._resting_poll_failures = {**self._resting_poll_failures, venue_order_id: failures}
+        self._log.warning(f"resting poll: GET failed for a bound rest ({failures} in a row)")
+        if (
+            failures >= submit_chain.RESTING_POLL_FAILURE_LATCH_COUNT
+            and venue_order_id not in self._unreadable_resting_ids
+        ):
+            self._unreadable_resting_ids = self._unreadable_resting_ids | {venue_order_id}
+            self._latch_resting_order(
+                submit_chain.RESTING_QUERY_UNREADABLE_REASON, venue_order_id, f"{failures} failed polls"
+            )
 
     def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
         """A terminal read of ``venue_order_id`` drops its alert and, when it was the
