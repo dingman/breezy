@@ -188,6 +188,9 @@ def _log_boot_proof_lines(config: TradingNodeConfig) -> None:
     admitted = getattr(exec_config, "no_id_retire_admitted", None)
     if admitted is not None:
         logger.info("no_id_retire_admitted=%s", admitted)
+    resting_admitted = getattr(exec_config, "resting_accept_admitted", None)
+    if resting_admitted is not None:
+        logger.info("resting_accept_admitted=%s", resting_admitted)
 
 
 def _emit_node_assembly_failed_alert() -> None:

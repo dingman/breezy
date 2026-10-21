@@ -33,6 +33,7 @@ from breezy.adapters.polymarket_us.account_activity import parse_rfc3339_ns
 
 TRADE_TYPE: Final[str] = "ACTIVITY_TYPE_TRADE"
 IOC_TIF: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+GTD_TIF: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
 MANUAL_INDICATOR: Final[str] = "MANUAL_ORDER_INDICATOR_MANUAL"
 
 

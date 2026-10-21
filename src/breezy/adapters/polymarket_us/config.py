@@ -689,6 +689,10 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     #: the environment). Gates only a RETIREMENT path, never an order. Fail-closed
     #: default.
     no_id_retire_admitted: bool = False
+    #: S4 WP2/WP3: True only when the running supervisor's decode marker lists
+    #: ``ACCEPTED_RESTING`` (set at node boot, never from the environment).
+    #: Gates only a RESTING submit, never an IOC or exit order. Fail-closed default.
+    resting_accept_admitted: bool = False
     #: EXEC-PAR WP5b: Breezy-owned parallel-intent knobs, filled by
     #: ``build_trade_node_config`` from ``runtime.node_config`` ``Final``
     #: constants (never the environment, never an operator control). The

@@ -150,6 +150,25 @@ RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.89")
 #: Until then the resting shape refuses every order (fail closed).
 GTD_EXPIRY_VERIFIED: Final[bool] = False
 
+#: The bounded GET-confirm that turns a 200+id async create into a bound rest:
+#: poll ``GET /v1/order/{id}`` every ``RESTING_CONFIRM_POLL_S`` for up to
+#: ``RESTING_CONFIRM_DEADLINE_S`` seconds (provisional RulePins, not operator
+#: controls; pinned in ``tests/unit/test_cage_rule_constants_are_pinned.py``).
+RESTING_CONFIRM_DEADLINE_S: Final[int] = 5
+RESTING_CONFIRM_POLL_S: Final[float] = 0.5
+#: Derived (never re-pinned separately): the deadline in nanoseconds.
+RESTING_CONFIRM_DEADLINE_NS: Final[int] = RESTING_CONFIRM_DEADLINE_S * 1_000_000_000
+#: The two verdicts of the confirm. ``NEW_VERIFIED`` is the ONLY value that
+#: binds a rest; every other observation is a ``HOLD`` (the with-id resolver
+#: decides).
+RESTING_CONFIRM_NEW: Final[str] = "NEW_VERIFIED"
+RESTING_CONFIRM_HOLD: Final[str] = "HOLD"
+#: The denial when the running supervisor cannot decode ``ACCEPTED_RESTING``.
+RESTING_NOT_ADMITTED_REASON: Final[str] = (
+    "the running supervisor does not list the ACCEPTED_RESTING retirement reason; "
+    "this client refuses to rest an order"
+)
+
 _TIF_GTD: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
 _NANOS_PER_SECOND: Final[int] = 1_000_000_000
 _NANOS_PER_DAY: Final[int] = 86_400 * _NANOS_PER_SECOND
@@ -650,6 +669,26 @@ def resting_echo_matches(
         ValueError,
     ):
         return False
+
+
+def resting_binding_bytes(
+    *, intent_id: str, slug: str, client_order_id: str, expire_time_ns: int
+) -> bytes:
+    """The durable ``resting:{venue_order_id}`` row of a bound rest (pure)."""
+    return json.dumps(
+        {
+            "intentId": intent_id,
+            "slug": slug,
+            "clientOrderId": client_order_id,
+            "expireTimeNs": expire_time_ns,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def resting_index_bytes(venue_order_ids: list[str]) -> bytes:
+    """The durable ``resting:index`` value: the bound venue order ids (pure)."""
+    return json.dumps(venue_order_ids).encode("utf-8")
 
 
 class ExitAuthorizationLike(Protocol):

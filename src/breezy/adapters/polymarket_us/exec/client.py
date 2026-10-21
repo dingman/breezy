@@ -317,6 +317,7 @@ from breezy.adapters.polymarket_us.fees import (
     taker_fee_coefficient_of,
 )
 from breezy.adapters.polymarket_us.no_id_attribution import (
+    GTD_TIF,
     NoIdEcho,
     NoIdLeg,
     classify_no_id_evidence,
@@ -462,6 +463,13 @@ FILL_BY_FINGERPRINT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_by_fing
 #: observe it. Each `intent_id` is a fresh UUID4 hex (`SubmitIntentLatch.
 #: arm`), so an old key is never overwritten or collided with.
 RESOLVER_CONTEXT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resolver/"
+
+#: S4 WP3: venue order id -> the durable binding row of a BOUND resting order
+#: (``{intentId, slug, clientOrderId, expireTimeNs}``), and the one index key
+#: listing the bound ids (the store has no prefix scan; the index is read
+#: three-way like the fill index). Written ONLY by ``_bind_resting_order``.
+RESTING_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resting/"
+RESTING_INDEX_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}resting_index"
 
 #: C1 (plan rev 6.1): the strategy's never-arm/re-arm gate reads this key at
 #: `on_start` and after every resolver terminal-zero resolution
@@ -1171,6 +1179,42 @@ class AmbiguousResolverContext:
     #: price. Same AR-N6 trailing-optional shape: an OLD blob has no key and
     #: decodes ``None`` (not evaluable).
     wire_quantity: str | None = None
+    #: S4 WP3: True for a RESTING (GTD) order. Serialised ONLY when True, so an
+    #: IOC context's bytes are unchanged; absent decodes ``False`` (AR-N6).
+    resting: bool = False
+    #: The resting order's ``expire_time`` (UNIX ns), from which the
+    #: ``goodTillTime`` echo is re-derived. ``None`` unless ``resting``.
+    resting_expire_ns: int | None = None
+
+    @property
+    def resting_wire_echo(self) -> dict[str, Any] | None:
+        """The nine-key body view a resting confirm/bind matches the venue's
+        order against, re-derived from the durable context (so the with-id
+        resolver can bind after a restart), or ``None`` when not evaluable. A
+        property, so no scanned body builds it (no new callee)."""
+        if (
+            not self.resting
+            or self.resting_expire_ns is None
+            or self.wire_market_slug is None
+            or self.wire_price is None
+            or self.wire_outcome_side is None
+            or self.wire_action is None
+            or self.wire_quantity is None
+        ):
+            return None
+        try:
+            good_till = submit_chain.format_good_till_time(self.resting_expire_ns)
+        except ValueError:
+            return None
+        return {
+            "marketSlug": self.wire_market_slug,
+            "price": {"value": self.wire_price, "currency": "USD"},
+            "quantity": self.wire_quantity,
+            "tif": GTD_TIF,
+            "outcomeSide": self.wire_outcome_side,
+            "action": self.wire_action,
+            "goodTillTime": good_till,
+        }
 
     @property
     def wire_quantity_decimal(self) -> Decimal | None:
@@ -1205,8 +1249,12 @@ class AmbiguousResolverContext:
         )
 
     def to_bytes(self) -> bytes:
+        resting_keys: dict[str, Any] = (
+            {"resting": True, "restingExpireNs": self.resting_expire_ns} if self.resting else {}
+        )
         return json.dumps(
             {
+                **resting_keys,
                 "wireMarketSlug": self.wire_market_slug,
                 "wirePrice": self.wire_price,
                 "wireOutcomeSide": self.wire_outcome_side,
@@ -1284,6 +1332,15 @@ class AmbiguousResolverContext:
             baseline_ts_ns = None if raw_baseline_ts is None else int(raw_baseline_ts)
         except (TypeError, ValueError):
             baseline_ts_ns = None
+        # S4 WP3: trailing-optional resting marker (absent = IOC context).
+        resting = payload.get("resting") is True
+        raw_resting_expire = payload.get("restingExpireNs")
+        try:
+            resting_expire_ns = (
+                int(raw_resting_expire) if resting and raw_resting_expire is not None else None
+            )
+        except (TypeError, ValueError):
+            resting_expire_ns = None
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -1311,6 +1368,8 @@ class AmbiguousResolverContext:
                 baseline_durable_net=_optional_text("baselineDurableNet"),
                 baseline_ts_ns=baseline_ts_ns,
                 wire_quantity=_optional_text("wireQuantity"),
+                resting=resting,
+                resting_expire_ns=resting_expire_ns,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1509,6 +1568,11 @@ _RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = NON_FILL_TERMINAL_S
 #: of ``_RESOLVER_TERMINAL_STATUSES`` with ``filled_qty > 0`` (the
 #: terminal-fill case above).
 _RESOLVER_FILL_STATUSES: Final[frozenset[OrderStatus]] = frozenset({OrderStatus.FILLED})
+
+#: S4 WP3: venue states a resting confirm keeps polling through (not yet NEW).
+_RESTING_CONFIRM_PENDING_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED}
+)
 
 
 def _resolver_long_position_state(
@@ -1804,6 +1868,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         exit_manifest: FamilyManifest | None = None,
         resolver_instrument_loader: Callable[[str], Any] | None = None,
         no_id_retire_admitted: bool = False,
+        resting_accept_admitted: bool = False,
         frozen_cost_budget_bucket: str | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
@@ -1885,6 +1950,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: reassignment (set algebra on a frozenset, never `.add`), so the
         #: scanned order coroutine makes no new call.
         self._post_in_flight_intent_ids: frozenset[str] = frozenset()
+        # S4 WP3: bound resting orders. `_resting_bookings` maps a venue order id to
+        # `(intent_id, booking)` (the booking stays registered until a cancel/fill
+        # settles it); `_this_process_resting_ids` are the ids THIS process armed
+        # (the only ones whose permit slot a later cancel may restore);
+        # `_cancel_in_flight` are venue ids a cancel loop is working (the with-id
+        # resolver skips them, so it can neither bind nor retire one concurrently).
+        # All three are replaced, never mutated.
+        self._resting_bookings: dict[str, tuple[str, Any]] = {}
+        self._this_process_resting_ids: frozenset[str] = frozenset()
+        self._cancel_in_flight: frozenset[str] = frozenset()
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
@@ -1902,6 +1977,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `RESOLVER_NO_ID_NO_FILL` retirement reason. Set once at node boot;
         # `_resolve_no_order` refuses to retire without it (fail closed).
         self._no_id_retire_admitted: bool = bool(no_id_retire_admitted)
+        # S4 WP2/WP3: whether the running supervisor can decode the
+        # `ACCEPTED_RESTING` retirement reason. Set once at node boot; without it
+        # a resting submit is denied before any venue contact (fail closed), so
+        # no node can write a record the supervisor would read as corrupt (L-48).
+        self._resting_accept_admitted: bool = bool(resting_accept_admitted)
         #: EXEC-PAR 3.9: the D-PREREG-frozen cap/budget bucket LABEL (never a
         #: dollar value), handed in by the composition root. At boot with K > 1
         #: a live label above it, an unreadable label, or an absent frozen label
@@ -3253,6 +3333,24 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 except Exception as exc:  # noqa: BLE001 - never kill the polling task
                     self._note_resolver_error(current.intent_id, exc)
                 continue
+            # S4 WP3 (r4 WP3.4): a with-id context whose POST (+ confirm) is still
+            # in flight belongs to `_submit_order`; the resolver must not act on
+            # it. A definite step (pure `in`, the shape of the no-id skip). For an
+            # IOC intent a with-id context is only ever written AFTER the POST's
+            # `finally`, so this never fires for one.
+            if current.intent_id in self._post_in_flight_intent_ids:
+                self._log.debug(
+                    f"resolver: intent {current.intent_id} POST in flight; skipping"
+                )
+                continue
+            # S4 WP3 (r4 WP3.8): a cancel loop owns this venue id; the resolver
+            # can neither bind a PENDING_CANCEL order nor retire it concurrently.
+            if context.venue_order_id in self._cancel_in_flight:
+                self._log.debug(
+                    f"resolver: venue order for intent {current.intent_id} has a "
+                    "cancel in flight; skipping"
+                )
+                continue
             try:
                 order_payload = await self._private_read(
                     submit_chain.order_by_id_path(context.venue_order_id)
@@ -3373,6 +3471,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"resolver: venue order {context.venue_order_id} is "
                     f"PARTIALLY_FILLED (cum={report.filled_qty}); a live "
                     "state, never resolves -- stays AMBIGUOUS, keep polling"
+                )
+                continue
+
+            # S4 WP3 (r4 WP3.7): a resting context whose GET reads a clean matching
+            # NEW (no age floor) binds through the SAME binder `_submit_order` uses.
+            # Terminal-zero and fills fall through to the unchanged paths below.
+            if (
+                context.resting
+                and report.order_status is OrderStatus.ACCEPTED
+                and report.filled_qty.raw == 0
+                and context.resting_wire_echo is not None
+                and submit_chain.resting_echo_matches(
+                    report, context.resting_wire_echo, order_body
+                )
+            ):
+                self._bind_resting_order(
+                    context, context.venue_order_id, self._clock.timestamp_ns()
                 )
                 continue
 
@@ -6685,7 +6800,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # (that would hide the leak and re-open the unregistered-booking raise):
         # log it and count it; the entry stays, which is conservative because it
         # keeps its headroom held.
-        if self._ledger is not None and self._ledger.has_open_exposure(intent_id):
+        # S4 WP3 carve-out: a BOUND resting order keeps its exposure registered by
+        # design (it is settled once, on the cancel/fill that ends the rest), so
+        # `ACCEPTED_RESTING` retirement of an intent that holds a resting booking
+        # is not a leak. ANY other retirement with an open entry still counts.
+        is_bound_rest = retire_name == submit_chain.RETIRE_ACCEPTED_RESTING and any(
+            held[0] == intent_id for held in self._resting_bookings.values()
+        )
+        if (
+            self._ledger is not None
+            and not is_bound_rest
+            and self._ledger.has_open_exposure(intent_id)
+        ):
             # A direct increment, not `_note_resolver_error`: that helper takes an
             # exception and dedupes its ERROR per intent, and routing a non-raise
             # leak through it would need a synthetic exception (E14.9).
@@ -6723,7 +6849,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         wire_quantity: int | str | None = None,
         register_booking: bool = True,
         capture_holding_baseline: bool = False,
-    ) -> None:
+        resting: bool = False,
+        resting_expire_ns: int | None = None,
+    ) -> AmbiguousResolverContext:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
         same-process true-up. Inert sync callee, named in the E0-NOSEND
@@ -6784,10 +6912,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             baseline_venue_net=None if baseline is None else baseline.venue_net,
             baseline_durable_net=None if baseline is None else baseline.durable_net,
             baseline_ts_ns=None if baseline is None else baseline.ts_ns,
+            resting=resting,
+            resting_expire_ns=resting_expire_ns if resting else None,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         if register_booking:
             self._ambiguous_bookings[intent_id] = booking
+        return context
 
     def _holding_baseline(
         self, instrument_id: InstrumentId, slug: str, now_ns: int
@@ -6927,6 +7058,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # than risking an `exit_view` used uninitialised.
         is_exit_order = exit_rule_tag is not None and order.side == OrderSide.SELL
         exit_view: _AdapterExitAuthorization | None = None
+        is_resting_order = False
         if is_exit_order:
             # Every log line for an exit carries `exit=` and the rule
             # (brief requirement), unconditionally -- before any deny/allow
@@ -6963,6 +7095,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return self._deny(order, _EXIT_MANIFEST_ABSENT_REASON, now_ns)
             unmappable = submit_chain.unmappable_exit_order_reason(
                 order, instrument, exit_view, self._exit_manifest
+            )
+        elif order.time_in_force == TimeInForce.GTD:
+            # S4 WP3: a GTD entry is the RESTING shape. It is admitted only when the
+            # running supervisor can decode ACCEPTED_RESTING (fail closed); the
+            # IOC and exit shapes above and below are untouched. A missing permit
+            # reads as expiry 0, which the shape check refuses; the permit-absent
+            # denial below stays the authoritative reason for a real absence.
+            is_resting_order = True
+            if not self._resting_accept_admitted:
+                return self._deny(order, submit_chain.RESTING_NOT_ADMITTED_REASON, now_ns)
+            unmappable = submit_chain.unmappable_resting_order_reason(
+                order,
+                instrument,
+                permit_expires_at_ns=(
+                    0
+                    if submit_chain.permit_is_missing(self._permit)
+                    else self._permit.expires_at_ns
+                ),
+                now_ns=now_ns,
+                gtd_expiry_verified=submit_chain.GTD_EXPIRY_VERIFIED,
             )
         else:
             unmappable = submit_chain.unmappable_order_reason(order, instrument)
@@ -7032,6 +7184,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if is_exit_order:
             assert exit_view is not None  # narrowed by `is_exit_order` above
             body = submit_chain.build_exit_order_body(order, instrument, exit_view)
+        elif is_resting_order:
+            body = submit_chain.build_resting_order_body(order, instrument)
         else:
             body = submit_chain.build_order_body(order, instrument)
         # EXEC-PAR 3.3 step 5: the wire body must name the market the admission
@@ -7152,6 +7306,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
                 wire_quantity=body["quantity"],
+                resting=is_resting_order,
+                resting_expire_ns=order.expire_time_ns if is_resting_order else None,
             )
         except Exception:  # noqa: BLE001 - fail closed: never POST without a durable context
             if booking is not None:
@@ -7178,12 +7334,53 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             write_transport.ORDERS_PATH,
         )
         self._post_in_flight_intent_ids = self._post_in_flight_intent_ids | {intent.intent_id}
+        outcome: submit_chain.CreateOrderOutcome | None = None
+        resting_context: AmbiguousResolverContext | None = None
+        resting_verdict = submit_chain.RESTING_CONFIRM_HOLD
         try:
             response = await self._order_sender.post_order(
                 self._api_base_url,
                 headers=headers,
                 body=encoded,
             )
+            if is_resting_order:
+                # S4 WP3 (r4 WP3.4-5): classify and confirm INSIDE the one
+                # `try`/`finally`, so the in-flight mark covers POST + confirm (a
+                # held id would starve K=1, L-48). A 200+id for a rest is a
+                # with-id AMBIGUOUS: the with-id context (resting=True) is written
+                # BEFORE the confirm await, so a crash mid-confirm is resolved by
+                # the with-id resolver. Only a GET-verified NEW binds.
+                outcome = submit_chain.classify_create_order_outcome(
+                    response,
+                    instrument=instrument,
+                    account_id=self._issued_account_id,
+                    ts_init=now_ns,
+                    closing=False,
+                )
+                if (
+                    outcome.kind == submit_chain.KIND_AMBIGUOUS
+                    and outcome.venue_order_id is not None
+                ):
+                    resting_context = self._note_ambiguous_open(
+                        intent_id=intent.intent_id,
+                        venue_order_id=outcome.venue_order_id,
+                        order=order,
+                        notional_usd=order_notional,
+                        booking=booking,
+                        now_ns=now_ns,
+                        create_detail=outcome.detail,
+                        fill_parse_error=outcome.fill_parse_error,
+                        wire_market_slug=body["marketSlug"],
+                        wire_price=body["price"]["value"],
+                        wire_outcome_side=body["outcomeSide"],
+                        wire_action=body["action"],
+                        wire_quantity=body["quantity"],
+                        resting=True,
+                        resting_expire_ns=order.expire_time_ns,
+                    )
+                    resting_verdict = await self._confirm_resting_order(
+                        outcome.venue_order_id, body, instrument
+                    )
         except Exception as exc:
             self._refuse(
                 submit_chain.AMBIGUOUS_REASON,
@@ -7206,18 +7403,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         finally:
             self._post_in_flight_intent_ids = self._post_in_flight_intent_ids - {intent.intent_id}
-        outcome = submit_chain.classify_create_order_outcome(
-            response,
-            instrument=instrument,
-            account_id=self._issued_account_id,
-            ts_init=now_ns,
-            # INC-E2 response-side leg check: `is_exit_order` is the SAME
-            # tag-derived flag computed above (never re-derived here), so
-            # the response is checked against the closing-order echo table
-            # for exactly the orders the request side already tagged and
-            # mapped as a close.
-            closing=is_exit_order,
-        )
+        if outcome is None:
+            outcome = submit_chain.classify_create_order_outcome(
+                response,
+                instrument=instrument,
+                account_id=self._issued_account_id,
+                ts_init=now_ns,
+                # INC-E2 response-side leg check: `is_exit_order` is the SAME
+                # tag-derived flag computed above (never re-derived here), so
+                # the response is checked against the closing-order echo table
+                # for exactly the orders the request side already tagged and
+                # mapped as a close.
+                closing=is_exit_order,
+            )
         classified_line = (
             f"create-order classified kind={outcome.kind} {outcome.detail} "
             f"client_order_id={order.client_order_id.value}"
@@ -7249,6 +7447,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         retire_name = outcome.retirement_name
+        # S4 WP3: the venue confirmed a resting NEW with a matching echo. The
+        # binder (sync, no await) writes the binding row and index entry, retires
+        # ACCEPTED_RESTING, emits OrderSubmitted/OrderAccepted and releases K=1. If
+        # it cannot bind (an unreadable index) this falls through to the HOLD
+        # below: the with-id resolver decides.
+        if (
+            resting_verdict == submit_chain.RESTING_CONFIRM_NEW
+            and resting_context is not None
+            and outcome.venue_order_id is not None
+            and self._bind_resting_order(resting_context, outcome.venue_order_id, now_ns)
+        ):
+            return
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
             and outcome.fill is not None
@@ -7256,6 +7466,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             and outcome.filled_cost_usd is not None
         ):
             fill = outcome.fill
+            if is_resting_order:
+                # Spec section 3: a rest that crossed at create time is a TAKER
+                # fill, booked as today and counted separately from maker fills.
+                self._log.warning(
+                    "resting_order_crossed: a resting-shape order filled at create "
+                    f"time (taker) client_order_id={order.client_order_id.value}"
+                )
             # I1b (LIVE_FILL_SCORING_CHAIN_2026-09-05): `record_fill` is the
             # FIRST effectful action of this branch -- before `true_up_booking`,
             # `_retire`, `_generate_submitted` and `generate_order_filled` --
@@ -7580,9 +7797,152 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
                 wire_quantity=body["quantity"],
+                resting=is_resting_order,
+                resting_expire_ns=order.expire_time_ns if is_resting_order else None,
             )
         else:
             self._ambiguous_bookings[intent.intent_id] = booking
+
+    async def _confirm_resting_order(
+        self, venue_order_id: str, wire_echo: Mapping[str, Any], instrument: Any
+    ) -> str:
+        """S4 WP3: the bounded GET-confirm of a freshly created rest. GET-ONLY.
+
+        Polls ``GET /v1/order/{id}`` every ``RESTING_CONFIRM_POLL_S`` for up to
+        ``RESTING_CONFIRM_DEADLINE_S`` seconds and returns ``RESTING_CONFIRM_NEW``
+        only for a venue ``ACCEPTED`` order with nothing filled, whose echo
+        (slug, leg and BUY via the leg mapping, price, quantity, GTD tif,
+        ``goodTillTime``) matches ``wire_echo``. EVERYTHING else is
+        ``RESTING_CONFIRM_HOLD`` (the with-id resolver decides): an id that fails
+        the allowlist, a filled/partial/terminal/rejected read, an echo mismatch,
+        a non-GTD tif, a GET that never mapped before the deadline, a body that
+        is not an object. Never books a fill, never retires, never sends; a
+        cancellation propagates (the pre-confirm context keeps the intent
+        resolvable).
+        """
+        if not submit_chain.valid_venue_order_id(venue_order_id):
+            self._log.error("resting confirm: the venue order id failed the allowlist; holding")
+            return submit_chain.RESTING_CONFIRM_HOLD
+        deadline_ns = self._clock.timestamp_ns() + submit_chain.RESTING_CONFIRM_DEADLINE_NS
+        while True:
+            try:
+                payload = await self._private_read(submit_chain.order_by_id_path(venue_order_id))
+                nested = payload.get("order") if isinstance(payload, Mapping) else None
+                order_body = nested if isinstance(nested, Mapping) else payload
+                report = parse_order_status_report(
+                    order_body,
+                    instrument=instrument,
+                    account_id=self._issued_account_id,
+                    report_id=UUID4(),
+                    ts_init=self._clock.timestamp_ns(),
+                    closing=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unreadable GET is retried to the deadline
+                self._log.warning(
+                    f"resting confirm: GET did not map ({type(exc).__name__}); retrying"
+                )
+            else:
+                if report.order_status is OrderStatus.ACCEPTED:
+                    if report.filled_qty.raw == 0 and submit_chain.resting_echo_matches(
+                        report, wire_echo, order_body
+                    ):
+                        return submit_chain.RESTING_CONFIRM_NEW
+                    self._log.warning("resting confirm: not a clean matching NEW; holding")
+                    return submit_chain.RESTING_CONFIRM_HOLD
+                if report.order_status in _RESTING_CONFIRM_PENDING_STATUSES:
+                    self._log.debug("resting confirm: order not yet ACCEPTED; polling")
+                else:
+                    self._log.warning(
+                        "resting confirm: a non-NEW state (filled, partial or terminal); holding"
+                    )
+                    return submit_chain.RESTING_CONFIRM_HOLD
+            if self._clock.timestamp_ns() >= deadline_ns:
+                self._log.warning("resting confirm: deadline reached without a NEW; holding")
+                return submit_chain.RESTING_CONFIRM_HOLD
+            await asyncio.sleep(submit_chain.RESTING_CONFIRM_POLL_S)
+
+    def _bind_resting_order(
+        self, context: AmbiguousResolverContext, venue_order_id: str, now_ns: int
+    ) -> bool:
+        """S4 WP3: bind a venue-confirmed resting order. SYNC, no ``await``, no
+        sender. The ONLY writer of the ``resting`` rows. Called from
+        ``_submit_order`` (inline confirm) and from the with-id resolver (a GET
+        NEW of a ``resting`` context).
+
+        Steps, with no ``await`` between: (1) the binding row, then the index
+        entry (a three-way index read: an unreadable index refuses and binds
+        nothing); (2) rebind the process-local maps; (3) retire the intent
+        ``ACCEPTED_RESTING`` (releases the K=1 slot; the exposure stays registered
+        until a cancel/fill settles it); (4) emit ``OrderSubmitted`` (if still
+        INITIALIZED) and ``OrderAccepted``; (5) clear the global AMBIGUOUS
+        trading refusal iff no slot remains open (the A3 predicate of
+        ``_resolve_accept_fill``: another unresolved AMBIGUOUS intent keeps it).
+        Returns ``False`` (binding nothing) for an id failing the allowlist, a
+        context without a slug/expiry, or an unreadable index.
+        """
+        slug = context.wire_market_slug
+        expire_ns = context.resting_expire_ns
+        if (
+            not submit_chain.valid_venue_order_id(venue_order_id)
+            or slug is None
+            or expire_ns is None
+        ):
+            self._log.error("resting bind: refused (invalid id or an incomplete context)")
+            return False
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None:
+            return False
+        intent_id = context.intent_id
+        self._store_set(
+            f"{RESTING_KEY_PREFIX}{venue_order_id}",
+            submit_chain.resting_binding_bytes(
+                intent_id=intent_id,
+                slug=slug,
+                client_order_id=context.client_order_id,
+                expire_time_ns=expire_ns,
+            ),
+        )
+        self._store_set(
+            RESTING_INDEX_KEY,
+            submit_chain.resting_index_bytes(
+                indexed if venue_order_id in indexed else [*indexed, venue_order_id]
+            ),
+        )
+        armed_by_this_process = intent_id in self._ambiguous_bookings
+        booking = self._ambiguous_bookings.pop(intent_id, None)
+        self._resting_bookings = {**self._resting_bookings, venue_order_id: (intent_id, booking)}
+        if armed_by_this_process:
+            self._this_process_resting_ids = self._this_process_resting_ids | {venue_order_id}
+        self._retire(intent_id, submit_chain.RETIRE_ACCEPTED_RESTING, now_ns)
+        cached = self._cache.order(ClientOrderId(context.client_order_id))
+        if cached is None:
+            self._log.warning("resting bind: the order is not in this run's cache; no event")
+        else:
+            if cached.status is OrderStatus.INITIALIZED:
+                self._generate_submitted(cached, now_ns)
+            self.generate_order_accepted(
+                strategy_id=StrategyId(context.strategy_id),
+                instrument_id=InstrumentId.from_str(context.instrument_id),
+                client_order_id=ClientOrderId(context.client_order_id),
+                venue_order_id=VenueOrderId(venue_order_id),
+                ts_event=now_ns,
+            )
+        no_slot_open = self._latch.open_slot_count() == 0
+        kept_refusals = [
+            refusal
+            for refusal in self._trading_refusals
+            if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            or (refusal.instrument == "" and not no_slot_open)
+            or (refusal.instrument != "" and refusal.instrument != slug)
+        ]
+        if len(kept_refusals) != len(self._trading_refusals):
+            self._trading_refusals = kept_refusals
+            self._ambiguous_refusal_clears += 1
+            self._log.info(
+                "resting bind: cleared the AMBIGUOUS trading refusal "
+                f"({submit_chain.AMBIGUOUS_REASON!r}) for intent {intent_id}"
+            )
+        return True
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Refuse. There is nothing to cancel: nothing can be sent."""
