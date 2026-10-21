@@ -2030,6 +2030,8 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # a second exemption from a ban that means "no I/O verb here").
         "submit_chain.wire_fingerprint_bytes",
         "submit_chain.unmappable_order_reason",
+        # S4 WP3 (ARM B4, pin row P1d-2): referenced only from `_submit_order` (`test_resting_path_firewall_delta.py`).
+        "submit_chain.build_resting_order_body",
         # S4 WP3 (ARM B4, pin row P1d-1): the pure resting-shape classifier. Referenced
         # only from `_submit_order` (`test_resting_path_firewall_delta.py`).
         "submit_chain.unmappable_resting_order_reason",
@@ -3336,6 +3338,8 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # BL-10 (r1/r2 delta): see the definition site's comment above.
             "submit_chain.wire_fingerprint_bytes",
             "submit_chain.unmappable_order_reason",
+            # S4 WP3 (ARM B4, pin row P1d-2): see the definition site.
+            "submit_chain.build_resting_order_body",
             # S4 WP3 (ARM B4, pin row P1d-1): see the definition site's comment.
             "submit_chain.unmappable_resting_order_reason",
             "submit_chain.build_order_body",
