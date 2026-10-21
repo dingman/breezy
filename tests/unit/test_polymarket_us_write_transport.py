@@ -621,3 +621,92 @@ def test_write_canonical_string_verified_is_true_after_op4() -> None:
     from breezy.adapters.polymarket_us.write_transport import WRITE_CANONICAL_STRING_VERIFIED
 
     assert WRITE_CANONICAL_STRING_VERIFIED is True
+
+
+# --------------------------------------------------------------------------
+# 11. S4 WP4 (ARM B5): the two cancel verbs are refused by the OS egress block
+# --------------------------------------------------------------------------
+
+_CANCEL_SLUG = "tc-temp-nychigh-2026-10-21-gte70f"
+
+
+class _RawExceptionSpy:
+    """Wraps the REAL native ``HttpClient`` and keeps the raw pyo3 exception that the
+    transport later re-raises ``from None`` as a ``VenueTransportError``."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.raw: BaseException | None = None
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await self._real.post(*args, **kwargs)
+        except BaseException as exc:
+            self.raw = exc
+            raise
+
+
+def _real_spy_transport() -> tuple[Any, _RawExceptionSpy, str]:
+    """The REAL native client (captured by conftest before its own block), a spy over
+    it, and a TEST-NET base URL. The firewall attestation is REQUIRED: this FAILS, not
+    skips, without it -- a skip would read green on a host with no block."""
+    from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+    from tests.conftest import _ORIGINAL_PYO3_NETWORK_CLIENTS
+    from tests.unit.test_execution_egress_firewall_guard import (
+        CANARY_HOST,
+        CANARY_PORT,
+        os_egress_block_attested,
+    )
+
+    assert os_egress_block_attested(), (
+        "the cancel-verb OS-block proof needs BREEZY_TEST_OS_EGRESS_BLOCK=1 "
+        "(scripts/ci/run_tests_no_egress.sh); it must fail, not skip, without it"
+    )
+    real_cls = (_ORIGINAL_PYO3_NETWORK_CLIENTS or {}).get("HttpClient")
+    assert real_cls is not None, "the native HttpClient was not captured"
+    spy = _RawExceptionSpy(real_cls(timeout_secs=3))
+    return PolymarketUSWriteTransport(client=spy), spy, f"http://{CANARY_HOST}:{CANARY_PORT}"
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_order_is_refused_by_the_os_egress_block() -> None:
+    from breezy.adapters.polymarket_us.errors import VenueTransportError
+    from tests.unit.test_execution_egress_firewall_guard import classify_canary_failure
+
+    transport, spy, base = _real_spy_transport()
+    with pytest.raises(VenueTransportError):
+        await transport.post_cancel_order(
+            base,
+            headers={"x-dummy": "dummy"},
+            order_id="ZZZZZZZZZZZZ",  # nonexistent id
+            market_slug=_CANCEL_SLUG,
+        )
+    assert spy.raw is not None, "the request reached the native client"
+    assert classify_canary_failure(spy.raw).blocked, classify_canary_failure(spy.raw)
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_with_slugs_is_refused_by_the_os_egress_block() -> None:
+    from breezy.adapters.polymarket_us.errors import VenueTransportError
+    from tests.unit.test_execution_egress_firewall_guard import classify_canary_failure
+
+    transport, spy, base = _real_spy_transport()
+    with pytest.raises(VenueTransportError):
+        await transport.post_cancel_all(base, headers={"x-dummy": "dummy"}, slugs=[_CANCEL_SLUG])
+    assert spy.raw is not None
+    assert classify_canary_failure(spy.raw).blocked, classify_canary_failure(spy.raw)
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_with_empty_slugs_never_reaches_the_transport() -> None:
+    """An empty list is unconstructible: the whole-account cancel never leaves the
+    transport (no native call at all, so nothing for the OS block to refuse)."""
+    from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+
+    class _Never:
+        async def post(self, *_a: Any, **_k: Any) -> Any:
+            raise AssertionError("an empty-slug cancel-all must never reach the client")
+
+    transport = PolymarketUSWriteTransport(client=_Never())
+    with pytest.raises(ValueError, match="non-empty"):
+        await transport.post_cancel_all("https://api.example.invalid", headers={}, slugs=[])
