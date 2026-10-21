@@ -105,7 +105,8 @@ def test_resting_two_echo_matches_stay_contradiction() -> None:
 def test_resting_echo_match_that_is_not_a_clean_gtd_rest_stays_contradiction(
     overrides: dict[str, str],
 ) -> None:
-    v = verdict((rest_order(**overrides),))
+    order: Any = rest_order(**overrides)  # type: ignore[arg-type]
+    v = verdict((order,))
     assert v.kind == "CONTRADICTION"
 
 

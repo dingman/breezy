@@ -19,6 +19,8 @@ from typing import Any, Final
 
 import pandas as pd
 import pytest
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.model.enums import OrderSide, TimeInForce
@@ -26,8 +28,10 @@ from nautilus_trader.model.objects import Quantity
 
 from tests.unit.ambig_latch_rig import (
     AmbiguousResolverContext,
+    RaisingSender,
     RetirementReason,
     build_client,
+    caps,
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
     read_context,
@@ -42,6 +46,7 @@ from tests.unit.test_current_rung_hold_pre_arm_race import (
     STRATEGY_ID,
     TRADER_ID,
 )
+from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 
 
 def _context(**overrides: object) -> AmbiguousResolverContext:
@@ -113,19 +118,23 @@ def _create_body(order_id: str = VENUE_ID) -> bytes:
 
 
 def _expire_ns(client: Any, *, seconds: int = 1_800) -> int:
-    now = client._clock.timestamp_ns()
+    now = int(client._clock.timestamp_ns())
     day_end = (now // (86_400 * NS_PER_S) + 1) * 86_400 * NS_PER_S
     return min(now + seconds * NS_PER_S, day_end - 1)
+
+
+#: ONE factory for the module: its counter de-dupes client order ids when a test
+#: submits several orders.
+_FACTORY: Final[OrderFactory] = OrderFactory(
+    trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock()
+)
 
 
 def _rest_command(client: Any, *, price: str = "0.40", tif: TimeInForce = TimeInForce.GTD) -> Any:
     """A BUY 1 GTD on the NO leg of the shared (daily-HIGH) market, cached the
     way the engine does before the client runs."""
-    from nautilus_trader.common.component import LiveClock
-    from nautilus_trader.common.factories import OrderFactory
-
     no = build_no_leg_instrument()
-    factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
+    factory = _FACTORY
     expire = (
         pd.Timestamp(_expire_ns(client), unit="ns", tz="UTC") if tif is TimeInForce.GTD else None
     )
@@ -434,26 +443,20 @@ async def test_pre_post_context_carries_resting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A crash between POST and the with-id write is adopted by the no-id path and
-    then bound by the with-id resolver: the PRE-POST context must say resting."""
+    then bound by the with-id resolver: the PRE-POST context must say resting.
+    (A POST that raises leaves exactly the pre-POST context; no alias of the
+    sender's ``post_order`` is taken here -- the B9 one-caller scan follows aliases.)"""
     rig = await _rig(tmp_path, monkeypatch)
+    rig.client._order_sender = RaisingSender()
     command = _rest_command(rig.client)
-    client = rig.client
-    captured: list[Any] = []
-    real_post = rig.sender.post_order
-
-    async def capturing_post(base_url: str, *, headers: Any, body: bytes) -> Any:
-        intent = client._latch.current()
-        captured.append(read_context(client, intent.intent_id))
-        return await real_post(base_url, headers=headers, body=body)
-
-    rig.sender.post_order = capturing_post
-    rig.set_get(_venue_order(command))
-    await client._submit_order(command)
-    context = captured[0]
+    await rig.client._submit_order(command)
+    intent = rig.intent()
+    assert intent is not None
+    context = read_context(rig.client, intent.intent_id)
     assert context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID
     assert context.resting is True
     assert context.resting_expire_ns == command.order.expire_time_ns
-    await client._disconnect()
+    await rig.client._disconnect()
 
 
 @pytest.mark.asyncio
@@ -705,3 +708,131 @@ async def test_ioc_submit_path_still_posts_the_ten_key_ioc_body(
         assert set(body) == set(submit_chain.ORDER_BODY_KEYS)
         assert body["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
         await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Many orders under K=1, headroom, taker-on-create
+# ---------------------------------------------------------------------------
+
+
+def _id_n(n: int) -> str:
+    return f"ABCDEF12345{n}"
+
+
+async def _submit_rest(rig: _Rig, n: int) -> Any:
+    """Submit one more rest with venue id ``_id_n(n)`` (the K=1 latch is free)."""
+    rig.sender.response = response_sender(200, _create_body(_id_n(n))).response
+    command = _rest_command(rig.client)
+    rig.client._private_read._payloads[submit_chain.order_by_id_path(_id_n(n))] = _venue_order(
+        command, id=_id_n(n)
+    )
+    await rig.client._submit_order(command)
+    return command
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("write_canonical_verified")
+async def test_eight_resting_orders_coexist_with_k1_and_a_ninth_is_refused_by_the_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eight binds in a row, each releasing the single slot; the ninth is refused by
+    the permit's order count (fixture caps only), NOT by the latch, and never POSTs."""
+    enable_operator_gate(monkeypatch, order_count="8")
+    with caps():
+        rig = await _rig(tmp_path, monkeypatch)
+        for n in range(8):
+            await _submit_rest(rig, n)
+            assert rig.client._latch.open_slot_count() == 0, n
+        client = rig.client
+        assert json.loads(client._store_get(_RESTING_INDEX_KEY)) == [_id_n(n) for n in range(8)]
+        assert sorted(client._resting_bookings) == [_id_n(n) for n in range(8)]
+        assert all(
+            client._ledger.has_open_exposure(intent_id)
+            for intent_id, _booking in client._resting_bookings.values()
+        )
+        assert len(rig.sender.calls) == 8
+        assert rig.event_names().count("OrderAccepted") == 8
+        await _submit_rest(rig, 8)
+        assert len(rig.sender.calls) == 8, "the ninth never reaches the venue"
+        assert rig.event_names().count("OrderAccepted") == 8
+        assert "OrderDenied" in rig.event_names()
+        assert client._latch.open_slot_count() == 0, "denied, so the latch was never armed"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_resting_accept_does_not_double_register_exposure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm-time registration is the ONLY one: binding registers nothing more
+    (a second `register_open_exposure` for the same intent would raise)."""
+    rig = await _rig(tmp_path, monkeypatch)
+    calls: list[str] = []
+    ledger_type = type(rig.client._ledger)
+    real = ledger_type.register_open_exposure
+
+    def counting(self: Any, intent_id: str, *args: Any, **kwargs: Any) -> Any:
+        calls.append(intent_id)
+        return real(self, intent_id, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_type, "register_open_exposure", counting)
+    command = _rest_command(rig.client)
+    rig.set_get(_venue_order(command))
+    await rig.client._submit_order(command)
+    assert len(calls) == 1
+    assert rig.client._resolver_error_count == 0
+    await rig.client._disconnect()
+
+
+def _crossed_create_body(command: Any) -> bytes:
+    """A create response that already carries the fill (the rest crossed)."""
+    import time
+
+    from tests.unit.polymarket_us_exec_shapes import build_execution, build_order
+    from tests.unit.test_polymarket_us_submit_order_chain import _rfc3339_nanos_utc
+
+    posted = submit_chain.build_resting_order_body(command.order, build_no_leg_instrument())
+    order = build_order(posted["marketSlug"])
+    order.update(
+        {
+            "id": VENUE_ID,
+            "side": "ORDER_SIDE_SELL",
+            "intent": "ORDER_INTENT_BUY_SHORT",
+            "tif": "TIME_IN_FORCE_GOOD_TILL_DATE",
+            "quantity": 1,
+            "cumQuantity": 1,
+            "leavesQuantity": 0,
+            "state": "ORDER_STATE_FILLED",
+            "price": posted["price"],
+            "avgPx": posted["price"],
+        }
+    )
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = posted["price"]
+    execution["commissionNotionalCollected"] = {"value": "0.03", "currency": "USD"}
+    execution["transactTime"] = _rfc3339_nanos_utc(time.time_ns())
+    return json.dumps({"id": VENUE_ID, "executions": [execution]}).encode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_create_fill_on_resting_shape_is_taker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rest that crossed at create time is booked as today, as a TAKER fill (spec
+    section 3: counted separately), with a WARN naming `resting_order_crossed`; it is
+    never bound and never retired ACCEPTED_RESTING."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = _rest_command(rig.client)
+    rig.sender.response = response_sender(200, _crossed_create_body(command)).response
+    await rig.client._submit_order(command)
+    fills = [e for e in rig.events if type(e).__name__ == "OrderFilled"]
+    assert len(fills) == 1
+    assert fills[0].liquidity_side.name == "TAKER"
+    assert rig.client.log_lines("warning", "resting_order_crossed")
+    assert "OrderAccepted" not in rig.event_names()
+    assert rig.client._store_get(_RESTING_INDEX_KEY) is None
+    assert rig.client._latch.open_slot_count() == 0
+    await rig.client._disconnect()

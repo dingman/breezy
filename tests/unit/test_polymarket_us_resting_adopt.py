@@ -149,7 +149,9 @@ async def test_resting_single_echo_match_open_order_is_adopted_then_bound(
     await run_passes(client, 1)
     assert read_context(client, current.intent_id).venue_order_id == VENUE_ID
     assert client._latch.open_slot_count() == 0
-    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == [VENUE_ID]
+    index = client._store_get(client_module.RESTING_INDEX_KEY)
+    assert index is not None
+    assert json.loads(index) == [VENUE_ID]
     assert VENUE_ID in client._resting_bookings
     assert client._trading_refusals == []
     await client._disconnect()

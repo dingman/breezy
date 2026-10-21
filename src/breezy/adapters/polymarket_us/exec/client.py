@@ -7404,13 +7404,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # with-id AMBIGUOUS: the with-id context (resting=True) is written
                 # BEFORE the confirm await, so a crash mid-confirm is resolved by
                 # the with-id resolver. Only a GET-verified NEW binds.
-                outcome = submit_chain.classify_create_order_outcome(
+                # (Named `created`, then assigned: the exception-block source slice of
+                # `test_ambiguous_exception_path_source_logs_the_exception_type_never_its_str`
+                # ends at the first `outcome = ...classify_create_order_outcome(` text.)
+                created = submit_chain.classify_create_order_outcome(
                     response,
                     instrument=instrument,
                     account_id=self._issued_account_id,
                     ts_init=now_ns,
                     closing=False,
                 )
+                outcome = created
                 if (
                     outcome.kind == submit_chain.KIND_AMBIGUOUS
                     and outcome.venue_order_id is not None
@@ -7862,7 +7866,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> str:
         """S4 WP3: the bounded GET-confirm of a freshly created rest. GET-ONLY.
 
-        Polls ``GET /v1/order/{id}`` every ``RESTING_CONFIRM_POLL_S`` for up to
+        Polls the order-by-id read every ``RESTING_CONFIRM_POLL_S`` for up to
         ``RESTING_CONFIRM_DEADLINE_S`` seconds and returns ``RESTING_CONFIRM_NEW``
         only for a venue ``ACCEPTED`` order with nothing filled, whose echo
         (slug, leg and BUY via the leg mapping, price, quantity, GTD tif,
