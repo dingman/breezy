@@ -1860,6 +1860,8 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # S4 WP4 (ARM B5, pin row P4b): the RETRY-WHEN-OPEN cancel loop; scanned by
         # EXEC_CANCEL_SEND_PERMITTED_CALLEES (row N2): one send callee, post_cancel_order.
         "_cancel_resting_order",
+        # S4 WP4 (ARM B5, pin row P4a): the GET-only cancel confirm (row N1).
+        "_confirm_cancel_terminal",
         # The injected read protocol's own call signature.
         "__call__",
     }
