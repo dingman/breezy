@@ -202,6 +202,51 @@ BOOT_SWEEP_DEADLINE_S: Final[float] = 120.0
 #: booked. Flipped only by a reviewed commit citing the WP6 probe artifact (the first own
 #: passive fill); pinned in the cage rule table, never an operator control.
 MAKER_COMMISSION_SIGN_VERIFIED: Final[bool] = False
+#: The marker a POLL-booked maker fill carries in ``DurableFillRecord.trade_id`` (the record
+#: gains no key, r4 K1): ``POLL-<venue_order_id>``. The create path stores the venue's own
+#: trade id and the resolver stores ``GET-<venue_order_id>``, so this prefix alone says "booked
+#: by the resting-order poll, as MAKER". The ARM D1 harm-stop selector freezes on it.
+MAKER_POLL_TRADE_ID_PREFIX: Final[str] = "POLL-"
+#: Nautilus ``TradeId`` is at most 36 characters.
+_TRADE_ID_MAX_LEN: Final[int] = 36
+
+
+def maker_poll_trade_id(venue_order_id: str) -> str:
+    """The deterministic, visibly synthetic trade id of a poll-booked maker fill.
+
+    ``POLL-<venue_order_id>`` while that fits a native ``TradeId``; a longer venue id is
+    replaced by a digest of itself (same input, same output; no clock, no counter).
+    """
+    text = f"{MAKER_POLL_TRADE_ID_PREFIX}{venue_order_id}"
+    if len(text) <= _TRADE_ID_MAX_LEN:
+        return text
+    digest = hashlib.sha256(venue_order_id.encode("utf-8")).hexdigest()
+    keep = _TRADE_ID_MAX_LEN - len(MAKER_POLL_TRADE_ID_PREFIX)
+    return f"{MAKER_POLL_TRADE_ID_PREFIX}{digest[:keep]}"
+
+
+def is_maker_poll_fill(trade_id: str | None) -> bool:
+    """True iff a durable fill record's ``trade_id`` marks a poll-booked MAKER fill."""
+    return isinstance(trade_id, str) and trade_id.startswith(MAKER_POLL_TRADE_ID_PREFIX)
+
+
+def commission_sign_class(raw_text: str | None) -> str:
+    """``"-"`` / ``"0"`` / ``"+"`` / ``"?"`` for a venue commission string: the ONLY thing of
+    ``venue_fee_raw`` that may be logged. The sign is the string's first character; a zero
+    (any spelling, signed or not) is ``"0"``; an absent or non-numeric string is ``"?"``."""
+    if raw_text is None:
+        return "?"
+    try:
+        value = Decimal(raw_text)
+    except (InvalidOperation, ValueError):
+        return "?"
+    if not value.is_finite():
+        return "?"
+    if value == 0:
+        return "0"
+    return "-" if value < 0 else "+"
+
+
 #: Three consecutive failed polls of one bound id latch ``resting_query_unreadable``.
 RESTING_POLL_FAILURE_LATCH_COUNT: Final[int] = 3
 #: The two S4 CRITICAL latches. Both refuse NEW rests only (cancels continue); the
@@ -213,6 +258,17 @@ RESTING_CANCEL_UNCONFIRMED_REASON: Final[str] = (
 RESTING_QUERY_UNREADABLE_REASON: Final[str] = (
     "resting_query_unreadable: a bound resting order could not be read three times running; "
     "new rests are refused (cancels continue)"
+)
+#: S4 WP5: the two commission latches. Both refuse NEW rests only; a fill is ALWAYS still booked
+#: (L-48). Clearing path: both live in the client's in-memory refusal list, so a node restart
+#: after the operator reviewed the venue's fee behaviour clears them; there is no auto-clear.
+RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON: Final[str] = (
+    "resting_commission_out_of_envelope: a resting fill's commission exceeded the modelled taker "
+    "fee; the fill is booked, new rests are refused (cancels continue)"
+)
+COMMISSION_BPS_DRIFT_REASON: Final[str] = (
+    "commission_bps_drift: a resting order's commission bps fields left the observed inert "
+    "value; the fill is booked, new rests are refused (cancels continue)"
 )
 
 #: Verdicts of :func:`cancel_read_verdict` (what a GET of a cancelled order proves).

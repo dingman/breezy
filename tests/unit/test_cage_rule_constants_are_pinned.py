@@ -749,18 +749,16 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="firewall",
         attr="EXEC_DECLARED_UNIMPLEMENTED_COROUTINES",
-        expected=frozenset({"_query_order"}),
-        widened=frozenset({"_query_order", "_query_account"}),
-        narrowed=frozenset(),
+        expected=frozenset(),
+        widened=frozenset({"_query_order"}),
+        narrowed=set(),
         why="the escape hatch that lets the coroutine INVENTORY be an equality "
-        "rather than a subset. The widened neighbour parks `_query_account` in "
-        "it -- the method `live/execution_client.py:332` calls with nothing "
-        "defining it in the base -- which is how a deletion would pass. "
-        "`_query_order` (the only member actually pinned) is a DIFFERENT "
-        "fate from `_query_account`: the base defines a real method that "
-        "runs unmodified and can call `_send_order_status_report` on a "
-        "non-None report -- 'unimplemented' here means the native default "
-        "runs, never that the coroutine raises AttributeError",
+        "rather than a subset. ARM B6 (S4 r4 row P3) EMPTIED it: `_query_order` is now a "
+        "defined, scanned GET-only coroutine (EXEC_QUERY_PERMITTED_CALLEES), so parking "
+        "it here again -- the widened neighbour -- would hide a deleted poll behind the "
+        "native default (which can call `_send_order_status_report`). The narrowed "
+        "neighbour is a plain `set()`: equal to the empty frozenset by value, refused "
+        "by type identity",
     ),
     RulePin(
         module="readonly",

@@ -817,3 +817,156 @@ def test_planting_a_sender_call_beside_the_is_none_guard_in_the_sweep_is_flagged
     assert "self._order_sender is None" in ast.unparse(_function(source, _SWEEP))
     planted = _plant_into(source, _SWEEP, "x = self._order_sender")
     assert _sweep_violations(planted) != []
+
+
+# ---------------------------------------------------------------------------
+# Row P3 (ARM B6): `_query_order` is a defined, scanned, GET-only coroutine
+# ---------------------------------------------------------------------------
+
+_QUERY: Final[str] = "_query_order"
+#: Everything ``_query_order`` may call. ONE read (``self._private_read``), the id path
+#: builder, the sync ledger lookup, the poll counter, and the sync ``_apply_resting_poll``
+#: that does the booking. NO sender, signer, store write, status-report seam or ledger call
+#: of its own. (Tighter than the r4 sketch: the booking callees live in the sync helpers
+#: below, which the helper pins keep egress-free.)
+EXEC_QUERY_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        "self._apply_resting_poll",
+        "self._log.debug",
+        "self._log.warning",
+        "self._note_resting_poll",
+        "self._private_read",
+        "self._resting_poll_target",
+        "submit_chain.order_by_id_path",
+    }
+)
+_QUERY_AWAITS: Final[frozenset[str]] = frozenset({"self._private_read"})
+_QUERY_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
+    "send",
+    "post",
+    "request",
+    "status_report",
+    "create_task",
+    "_order_sender",
+    "_write_signer",
+)
+
+
+def _query_violations(source: str) -> list[str]:
+    fn = _function(source, _QUERY)
+    callees = _callees(fn)
+    found = sorted(callees - EXEC_QUERY_PERMITTED_CALLEES)
+    # the banned-word loop of the order allowlist, minus "read" (``self._private_read`` IS the
+    # GET), plus the report-injection seam and the sender/signer attributes
+    found += [
+        f"forbidden token in {c}"
+        for c in sorted(callees)
+        if any(t in c for t in _QUERY_FORBIDDEN_TOKENS)
+    ]
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            value = node.value
+            target = firewall._dotted_callee(value.func) if isinstance(value, ast.Call) else None
+            if target not in _QUERY_AWAITS:
+                found.append(f"await {target}")
+        if isinstance(node, ast.Attribute) and node.attr in (
+            *_EGRESS_NAMES,
+            "_send_order_status_report",
+        ):
+            found.append(f"attribute {node.attr}")
+    return found
+
+
+def test_the_query_coroutine_callee_set_is_exact_and_egress_free() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _query_violations(source) == []
+    assert _callees(_function(source, _QUERY)) == EXEC_QUERY_PERMITTED_CALLEES
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "await self._order_sender.post_order(None)",
+        "await self._order_sender.post_cancel_order(None)",
+        "self._write_signer.sign_headers('POST', '/x')",
+        "self._store_set('k', b'v')",
+        "self._send_order_status_report(None)",
+        "await self.generate_order_status_report(None)",
+        "self.create_task(self._apply_resting_poll(None, None))",
+        "await self._cancel_resting_order(['x'])",
+        "self.generate_order_filled()",
+        "self._ledger.settle('k')",
+    ],
+)
+def test_planting_a_send_write_or_seam_into_the_query_coroutine_is_flagged(
+    statement: str,
+) -> None:
+    planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _QUERY, statement)
+    assert _query_violations(planted) != []
+
+
+def test_the_query_coroutine_is_defined_and_no_longer_declared_unimplemented() -> None:
+    assert firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES == frozenset()
+    assert _QUERY in firewall.EXEC_PERMITTED_COROUTINE_NAMES
+    _function(CLIENT_PATH.read_text(encoding="utf-8"), _QUERY)  # raises if absent
+
+
+#: The sync helpers the poll reaches. They are not coroutines, so the inventory never sees
+#: them; this pin keeps each egress-free (the class-wide sender-reference scope already
+#: forbids ``_order_sender`` outside its named rows, this adds the rest).
+POLL_HELPERS: Final[frozenset[str]] = frozenset(
+    {
+        "_resting_poll_target",
+        "_resting_instrument",
+        "_parse_resting_read",
+        "_apply_resting_poll",
+        "_watch_commission_bps",
+        "_note_commission_alert",
+        "_book_resting_fill",
+        "_emit_resting_fill_event",
+        "_settle_resting_fill",
+        "_check_commission_envelope",
+    }
+)
+_HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
+    "_order_sender",
+    "_write_signer",
+    "post_order",
+    "post_cancel",
+    "create_task",
+    "_send_order_status_report",
+    "asyncio",
+    "threading",
+)
+
+
+def _any_function(source: str, name: str) -> ast.FunctionDef:
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not defined as a plain function")
+
+
+def _helper_violations(source: str, name: str) -> list[str]:
+    fn = _any_function(source, name)
+    text = ast.unparse(fn)
+    found = [f"token {t}" for t in _HELPER_FORBIDDEN_TOKENS if t in text]
+    found += [f"await in {name}" for n in ast.walk(fn) if isinstance(n, ast.Await)]
+    return found
+
+
+@pytest.mark.parametrize("name", sorted(POLL_HELPERS))
+def test_each_poll_helper_is_synchronous_and_egress_free(name: str) -> None:
+    assert _helper_violations(CLIENT_PATH.read_text(encoding="utf-8"), name) == []
+
+
+@pytest.mark.parametrize("name", sorted(POLL_HELPERS))
+def test_planting_a_send_or_seam_into_a_poll_helper_is_flagged(name: str) -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    for statement in (
+        "self._order_sender.post_cancel_order(None)",
+        "self._send_order_status_report(None)",
+        "asyncio.ensure_future(None)",
+    ):
+        planted = _plant_any(source, name, statement)
+        assert _helper_violations(planted, name) != [], (name, statement)

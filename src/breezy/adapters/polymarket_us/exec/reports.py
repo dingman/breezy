@@ -1288,6 +1288,16 @@ def resting_commission_total(order: Mapping[str, Any]) -> Decimal:
     return _amount_field(order, "commissionNotionalTotalCollected", context="resting order")
 
 
+def resting_commission_text(order: Mapping[str, Any]) -> str:
+    """The venue's OWN string for the amount :func:`resting_commission_total` reads (exact,
+    never re-formatted: it is what ``DurableFillRecord.venue_fee_raw`` stores, and the
+    sign of the figure is that string's first character). Call it only after
+    :func:`resting_commission_total` accepted the same ``order``."""
+    amount = _require(order, "commissionNotionalTotalCollected", context="resting order")
+    value = amount.get("value") if isinstance(amount, Mapping) else amount
+    return value if isinstance(value, str) else str(value)
+
+
 def assert_commission_bps_inert(order: Mapping[str, Any]) -> BpsDrift | None:
     """``None`` while both bps fields are exactly the string ``"0"``, else a drift.
 

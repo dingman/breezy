@@ -301,6 +301,7 @@ from breezy.adapters.polymarket_us.exec.refusals import (
 from breezy.adapters.polymarket_us.exec.reports import (
     NON_FILL_TERMINAL_STATUSES,
     OpenOrderRecord,
+    assert_commission_bps_inert,
     build_execution_mass_status,
     derive_position_cost_basis,
     parse_account_balances,
@@ -308,6 +309,9 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_order_status_report,
     parse_position_status_report,
     position_leg,
+    recognised_commission,
+    resting_commission_text,
+    resting_commission_total,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import (
@@ -373,6 +377,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         GeneratePositionStatusReports,
         ModifyOrder,
         QueryAccount,
+        QueryOrder,
         SubmitOrder,
         SubmitOrderList,
     )
@@ -2092,6 +2097,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `resting_query_unreadable` (the WP5 poll reports through `_note_resting_poll`).
         self._resting_poll_failures: dict[str, int] = {}
         self._unreadable_resting_ids: frozenset[str] = frozenset()
+        # S4 WP5: the non-latching CRITICAL alert surface of the two commission latches
+        # (`resting_commission_alerts`); value-free by construction. Replaced, never mutated.
+        self._resting_commission_alert_details: dict[str, Mapping[str, str]] = {}
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
         # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
@@ -8908,6 +8916,338 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         :attr:`stale_ambiguous_intent_alerts`: this module cannot import the alert
         sink)."""
         return tuple(self._resting_cancel_alert_details.values())
+
+    @property
+    def resting_commission_alerts(self) -> tuple[Mapping[str, str], ...]:
+        """The CRITICAL commission alerts (`commission_bps_drift`,
+        `resting_commission_out_of_envelope`) for the health surface. Value-free: an alert
+        names the event, the order id prefix and the slug, never a commission figure."""
+        return tuple(self._resting_commission_alert_details.values())
+
+    # -- S4 WP5: the poll (`_query_order`) and the ONE fill booking -------------
+
+    def _resting_poll_target(self, command: Any) -> RestingTarget | None:
+        """The BOUND ledger target a ``QueryOrder`` names (SYNC), else ``None``: an order
+        the ledger does not bind (or only holds as a resolver context) is not polled."""
+        for target in self._resting_cancel_target(command):
+            if target.bound:
+                return target
+        return None
+
+    async def _query_order(self, command: QueryOrder) -> None:
+        """S4 WP5: the maker strategy's poll of ONE bound rest. GET-ONLY.
+
+        Reads the order-by-id endpoint and hands the body to the synchronous
+        ``_apply_resting_poll``: a fill is booked (durable record first, then the native
+        ``OrderFilled`` as MAKER, then the ledger settle), a venue terminal retires the
+        row like a cancel, a failed or mismatched read counts toward the
+        ``resting_query_unreadable`` latch. An order the ledger does not bind is a quiet
+        no-op. Never sends, never calls the native ``_send_order_status_report`` (the
+        report-injection seam stays closed).
+        """
+        target = self._resting_poll_target(command)
+        if target is None:
+            self._log.debug("resting poll: not a bound resting order; nothing to read")
+            return
+        try:
+            payload = await self._private_read(
+                submit_chain.order_by_id_path(target.venue_order_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed GET is one strike, never fatal
+            self._log.warning(f"resting poll: the GET failed ({exc.__class__.__name__})")
+            self._note_resting_poll(target.venue_order_id, readable=False)
+            return
+        self._apply_resting_poll(target, payload)
+
+    def _resting_instrument(self, target: RestingTarget) -> Any:
+        """The loaded instrument of a bound rest (provider first, then the cache), or
+        ``None``. SYNC; never refuses (a ``_find_instrument`` refusal is a producer)."""
+        if target.instrument_id is None:
+            return None
+        instrument_id = InstrumentId.from_str(target.instrument_id)
+        found = self._instrument_provider.find(instrument_id)
+        return found if found is not None else self._cache.instrument(instrument_id)
+
+    def _parse_resting_read(self, target: RestingTarget, body: Mapping[str, Any]) -> Any:
+        """The native status report of one read of a bound rest; RAISES when the body does
+        not map (an unknown key, a mismatched slug, no loaded instrument)."""
+        instrument = self._resting_instrument(target)
+        if instrument is None:
+            raise ExecutionReportMappingError("no loaded instrument for the bound rest")
+        return parse_order_status_report(
+            body,
+            instrument=instrument,
+            account_id=self._issued_account_id,
+            report_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+            closing=False,
+        )
+
+    def _apply_resting_poll(self, target: RestingTarget, payload: Any) -> None:
+        """One read of a bound rest, acted on (SYNC; never raises).
+
+        The read must ECHO the requested id and market (``cancel_read_verdict``); a live or
+        filled order must also map to a native report (``parse_order_status_report``); else
+        it is one failed poll. A readable read clears the poll counter and runs the
+        commission bps watch, then: still open -> nothing; filled ->
+        :meth:`_book_resting_fill`; a zero-fill terminal -> the single-winner retirement
+        (as the cancel path, 4c).
+        """
+        venue_id = target.venue_order_id
+        report = None
+        try:
+            nested = payload.get("order") if isinstance(payload, Mapping) else None
+            body = nested if isinstance(nested, Mapping) else payload
+            verdict = submit_chain.cancel_read_verdict(
+                body, expected_id=venue_id, expected_slug=target.slug
+            )
+            if verdict == submit_chain.CANCEL_READ_UNREADABLE:
+                raise ExecutionReportMappingError("the read does not answer for this order")
+            if verdict in (submit_chain.CANCEL_READ_OPEN, submit_chain.CANCEL_READ_FILLED):
+                # A live or filled order must also MAP (a new key or a mismatched market
+                # is drift, fail-closed). A zero-fill terminal is decided by the verdict
+                # alone, as the cancel path does: its leaves are the venue's to define.
+                report = self._parse_resting_read(target, body)
+        except Exception as exc:  # noqa: BLE001 - one failed poll, never raised
+            self._log.warning(f"resting poll: the read did not map ({exc.__class__.__name__})")
+            self._note_resting_poll(venue_id, readable=False)
+            return
+        self._note_resting_poll(venue_id, readable=True)
+        try:
+            self._watch_commission_bps(target, body)
+            if verdict == submit_chain.CANCEL_READ_OPEN:
+                return
+            if verdict == submit_chain.CANCEL_READ_FILLED:
+                if self._book_resting_fill(target, body, report):
+                    self._clear_resting_cancel_latch(venue_id)
+                return
+            self._settle_resting_terminal(target, verdict)
+            self._clear_resting_cancel_latch(venue_id)
+        except Exception as exc:  # noqa: BLE001 - the poll never raises; the next one retries
+            self._log.error(f"resting poll: acting on a read failed ({exc.__class__.__name__})")
+
+    def _book_filled_read(self, venue_order_id: str, body: Mapping[str, Any]) -> None:
+        """A FILLED terminal read made by the CANCEL path books the fill through the same
+        single winner as the poll (SYNC; never raises). Not a bound rest: nothing to do."""
+        try:
+            target = self._resting_target_of(venue_order_id)
+            if target is None or not target.bound:
+                return
+            report = self._parse_resting_read(target, body)
+            self._book_resting_fill(target, body, report)
+        except Exception as exc:  # noqa: BLE001 - the cancel loop goes on; the poll retries
+            self._log.error(
+                f"resting cancel: booking the filled read failed ({exc.__class__.__name__})"
+            )
+
+    def _note_commission_alert(
+        self, event: str, target: RestingTarget, extra: Mapping[str, str]
+    ) -> None:
+        """Record one value-free CRITICAL commission alert (once per event and order)."""
+        key = f"{event}:{target.venue_order_id}"
+        if key in self._resting_commission_alert_details:
+            return
+        self._resting_commission_alert_details = {
+            **self._resting_commission_alert_details,
+            key: {
+                "severity": "CRITICAL",
+                "event": event,
+                "venue_order_id": _loggable_order_id(target.venue_order_id),
+                "slug": _loggable_slug(target.slug),
+                **extra,
+                "next": "new_rests_refused_cancels_continue_restart_after_review_clears",
+            },
+        }
+
+    def _watch_commission_bps(self, target: RestingTarget, body: Mapping[str, Any]) -> None:
+        """Every poll GET: both bps fields must still read the string ``"0"``. A drift is
+        value-free (field NAMES only); it latches ``commission_bps_drift`` (NEW rests only)
+        and never changes what a fill is booked at."""
+        drift = assert_commission_bps_inert(body)
+        if drift is None:
+            return
+        fields = ",".join(drift.fields)
+        self._note_commission_alert("commission_bps_drift", target, {"fields": fields})
+        self._latch_resting_order(
+            submit_chain.COMMISSION_BPS_DRIFT_REASON, target.venue_order_id, f"fields {fields}"
+        )
+
+    def _book_resting_fill(
+        self, target: RestingTarget, body: Mapping[str, Any], report: Any
+    ) -> bool:
+        """The ONE booking of a bound rest's fill (SYNC; the poll AND the cancel/sweep
+        FILLED read call it). Returns ``True`` iff THIS call booked it.
+
+        Single winner: the rest must still be in the ``resting:`` index (a loser returns
+        ``False`` and writes nothing). Then, with no ``await`` between: (1) the durable
+        ``DurableFillRecord`` (``trade_id`` = the ``POLL-`` maker marker, ``cumulative_fee`` =
+        the RECOGNISED commission, ``venue_fee_raw`` = the venue's own string,
+        ``fee_reconciled = recognised == raw``); (2) the index row retired; (3) the native
+        ``OrderFilled`` as MAKER at the venue's commission (guarded: an order this run's
+        cache does not know gets no event); (4) the ledger settle at the realised cost. A
+        fill is NEVER refused for its commission (L-48): an absent commission is booked
+        unreconciled at zero (the resolver's precedent), an out-of-envelope one still books
+        and latches.
+        """
+        venue_id = target.venue_order_id
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None or venue_id not in indexed:
+            return False
+        instrument = self._resting_instrument(target)
+        avg_px = report.avg_px
+        if instrument is None or target.instrument_id is None or avg_px is None or avg_px <= 0:
+            self._log.error(
+                "resting fill: no usable instrument or average price; the fill is not booked "
+                "and the next poll retries"
+            )
+            return False
+        raw: Decimal | None
+        raw_text: str | None
+        try:
+            raw = resting_commission_total(body)
+            raw_text = resting_commission_text(body)
+        except ExecutionReportMappingError:
+            raw, raw_text = None, None
+            self._log.warning("resting fill: no readable commission on the order; unreconciled")
+        recognised = (
+            Decimal(0)
+            if raw is None
+            else recognised_commission(
+                raw, sign_verified=submit_chain.MAKER_COMMISSION_SIGN_VERIFIED
+            )
+        )
+        quantity = report.filled_qty.as_decimal()
+        cost = quantity * avg_px
+        stamp_ns = self._clock.timestamp_ns()
+        record = DurableFillRecord(
+            venue_order_id=venue_id,
+            client_order_id=target.client_order_id,
+            instrument_id=target.instrument_id,
+            order_side=LONG_ONLY_SIDE,
+            cumulative_qty=quantity,
+            cumulative_cost=cost,
+            cumulative_fee=recognised,
+            fee_reconciled=raw is not None and recognised == raw,
+            ts_event=stamp_ns,
+            venue_fee_raw=raw_text,
+            trade_id=submit_chain.maker_poll_trade_id(venue_id),
+            order_qty=report.quantity.as_decimal(),
+        )
+        try:
+            self.record_fill(record, fill_time_instrument=instrument)
+        except Exception as exc:  # noqa: BLE001 - never raised; the row stays for the next read
+            self._log.error(f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}")
+            self._latch_resting_order(_FILL_WRITE_FAILED, venue_id, "fill record not written")
+            return False
+        self._retire_resting_row(venue_id)
+        held = self._resting_bookings.get(venue_id)
+        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
+        self._log.info(
+            f"resting fill: booked the fill of {_redact_order_id(venue_id)} "
+            f"(commission sign {submit_chain.commission_sign_class(raw_text)})"
+        )
+        self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
+        self._settle_resting_fill(target, held, cost, stamp_ns)
+        self._check_commission_envelope(target, raw, instrument, avg_px, quantity, stamp_ns)
+        return True
+
+    def _emit_resting_fill_event(
+        self, target: RestingTarget, report: Any, instrument: Any, recognised: Decimal, ts_ns: int
+    ) -> None:
+        """The native ``OrderFilled`` of a poll-booked rest: ``liquidity_side=MAKER``,
+        commission = the RECOGNISED venue figure. Only for an order this run's cache knows
+        and has not closed; a failing emit is logged, never raised (the durable record and
+        the settle already stand)."""
+        cached = self._cache.order(ClientOrderId(target.client_order_id))
+        if cached is None or cached.is_closed or not target.strategy_id:
+            self._log.warning("resting fill: the order is not open in this run's cache; no event")
+            return
+        try:
+            self.generate_order_filled(
+                strategy_id=StrategyId(target.strategy_id),
+                instrument_id=InstrumentId.from_str(target.instrument_id or ""),
+                client_order_id=ClientOrderId(target.client_order_id),
+                venue_order_id=VenueOrderId(target.venue_order_id),
+                venue_position_id=None,
+                trade_id=TradeId(submit_chain.maker_poll_trade_id(target.venue_order_id)),
+                order_side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                last_qty=report.filled_qty,
+                last_px=instrument.make_price(report.avg_px),
+                quote_currency=USD,
+                commission=Money(recognised, USD),
+                liquidity_side=LiquiditySide.MAKER,
+                ts_event=ts_ns,
+            )
+        except Exception as exc:  # noqa: BLE001 - the durable record already stands
+            self._log.error(f"resting fill: the native event failed ({exc.__class__.__name__})")
+
+    def _settle_resting_fill(
+        self, target: RestingTarget, held: tuple[str, Any] | None, cost: Decimal, ts_ns: int
+    ) -> None:
+        """Settle the fill's exposure at its realised cost (a fill gives the permit slot
+        nothing back). A same-process booking is trued up; a prior process's (``None``) adds
+        the cost once; after the boot spend seed a fill with no registered exposure latches
+        the resolver's unbudgeted refusal (AC6b)."""
+        if self._ledger is None:
+            return
+        registered = False
+        try:
+            registered = self._ledger.settle(
+                target.intent_id,
+                booking=None if held is None else held[1],
+                realized_usd=cost,
+                fill_ts_ns=ts_ns,
+                now_ns=ts_ns,
+            )
+        except Exception as exc:  # noqa: BLE001 - abandon, count, go on
+            self._note_resolver_error(target.intent_id, exc)
+            self._ledger.abandon_open_exposure(target.intent_id)
+        if not registered and (held is None or held[1] is None) and self._spend_seeded:
+            self._latch_resting_order(
+                _RESOLVER_FILL_UNBUDGETED, target.venue_order_id, "the fill had no exposure"
+            )
+
+    def _check_commission_envelope(
+        self,
+        target: RestingTarget,
+        raw: Decimal | None,
+        instrument: Any,
+        price: Decimal,
+        quantity: Decimal,
+        ts_ns: int,
+    ) -> None:
+        """``abs(raw)`` must not exceed the modelled TAKER fee for the fill. Outside it the
+        fill is STILL booked; this latches ``resting_commission_out_of_envelope`` (NEW rests
+        only) and raises a value-free CRITICAL alert. An unpinned fee schedule skips with a
+        WARN. Never raises."""
+        if raw is None:
+            return
+        try:
+            modelled = taker_fee_at_fill(
+                quantity=quantity,
+                price=price,
+                ts_event_ns=ts_ns,
+                fee_coefficient_at_fill=taker_fee_coefficient_of(instrument),
+            )
+            if modelled is None:
+                self._log.warning("resting fill: the fee schedule is unpinned; envelope skipped")
+                return
+            if abs(raw) <= modelled.as_decimal():
+                return
+        except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
+            self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
+            return
+        self._note_commission_alert(
+            "resting_commission_out_of_envelope",
+            target,
+            {"sign": submit_chain.commission_sign_class(str(raw))},
+        )
+        self._latch_resting_order(
+            submit_chain.RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON,
+            target.venue_order_id,
+            "commission above the modelled taker fee",
+        )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """S4 WP4: cancel ONE resting order of ours (bound, or a with-id HOLD context).

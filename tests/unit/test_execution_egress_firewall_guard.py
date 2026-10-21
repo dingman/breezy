@@ -2126,24 +2126,20 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
 #: A subset check (``defined <= permitted``) passes just as happily when a
 #: coroutine is DELETED, which is how ``_query_account`` -- the method
 #: ``live/execution_client.py:332`` calls with nothing defining it in the base
-#: -- could disappear without a failure. ``_query_order`` is declared here
-#: because the base DOES define it and this client does not override it.
+#: -- could disappear without a failure.
 #:
-#: "Declared unimplemented" means two DIFFERENT fates, and this set only ever
-#: holds the second one. ``_query_account`` is genuinely absent -- the base
-#: has nothing defining it, so the ``QueryAccount`` path would raise
-#: ``AttributeError`` were it ever left undeclared. ``_query_order`` is NOT
-#: absent: the base defines a real method (``live/execution_client.py:516-532``)
-#: that calls ``generate_order_status_report`` and, if the result is
-#: non-``None``, ``_send_order_status_report`` -- a report-injection seam that
-#: bypasses ``_submit_order``'s refusal latch. For this entry, "unimplemented"
-#: means the NATIVE default RUNS, unmodified, every time; the seam stays
-#: closed only because this client's own ``generate_order_status_report``
-#: always returns ``None`` (pinned in
-#: ``tests/unit/test_polymarket_us_exec_client.py`` by
-#: ``test_native_query_order_never_reaches_the_send_seam``), never because
-#: the coroutine is missing or raises.
-EXEC_DECLARED_UNIMPLEMENTED_COROUTINES = frozenset({"_query_order"})
+#: ARM maker-sharp B6 (S4 r4 pin row P3, RESTORED to its r3 form): the set is now EMPTY.
+#: ``_query_order`` used to be declared here because the base defines a real method
+#: (``live/execution_client.py:516-532``) that calls ``generate_order_status_report``
+#: and, if the result is non-``None``, ``_send_order_status_report`` -- a
+#: report-injection seam that bypasses ``_submit_order``'s refusal latch -- and this
+#: client did not override it. The client now DEFINES ``_query_order`` (the resting-order
+#: poll: GET-only, never ``_send_order_status_report``), so the name moved out of this
+#: escape hatch and into the scanned GET-only set ``EXEC_QUERY_PERMITTED_CALLEES``
+#: (``test_resting_path_firewall_delta.py``, row P3). ``_query_account`` is still
+#: genuinely absent from the base and must never be parked here: the cage rule table
+#: pins that widened neighbour.
+EXEC_DECLARED_UNIMPLEMENTED_COROUTINES: frozenset[str] = frozenset()
 
 #: Resolution A (plan rev 6.1), SAFETY M3 pin 2: the hole `find_exec_send_
 #: path_violations` left. That scanner only inspects a function whose NAME
