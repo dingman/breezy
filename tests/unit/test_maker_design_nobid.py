@@ -166,6 +166,9 @@ def test_arm_table_pins_the_card_parameters_and_the_shipped_control() -> None:
         "spike_bid",
         "sharp",
         "sharp_cap84",
+        "sharp_dp600",
+        "sharp_dm600",
+        "sharp_k1",
     }
 
 
@@ -407,3 +410,18 @@ def test_config_refuses_an_arm_whose_cap_could_bid_no_090_or_more(
     monkeypatch.setitem(cfgm.ARMS, "sharp", replace(cfgm.ARMS["sharp"], b_cap=0.90))
     with pytest.raises(cfgm.DesignRefused, match="0.90"):
         cfgm.parse_config(_raw(arms=["sharp"]))
+
+
+def test_robustness_arms_are_sharp_with_a_bounded_clock_offset_or_one_rung() -> None:
+    base = cfgm.ARMS["sharp"]
+    assert base.delta_ns == 0
+    for name, delta in (("sharp_dp600", 600 * 10**9), ("sharp_dm600", -600 * 10**9)):
+        arm = cfgm.ARMS[name]
+        assert arm.delta_ns == delta
+        assert (arm.p_min, arm.e_min, arm.b_floor, arm.b_cap, arm.max_rungs) == (
+            base.p_min, base.e_min, base.b_floor, base.b_cap, base.max_rungs,
+        )  # fmt: skip
+    k1 = cfgm.ARMS["sharp_k1"]
+    assert k1.max_rungs == 1
+    assert (k1.p_min, k1.e_min, k1.b_floor, k1.b_cap) == (0.97, 0.04, 0.75, 0.89)
+    assert all(abs(a.delta_ns) <= 600 * 10**9 for a in cfgm.ARMS.values())  # S-7 bound

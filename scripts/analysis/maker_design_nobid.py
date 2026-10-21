@@ -274,14 +274,15 @@ def _replay_arm(
         selector = build_spike_selector(prep.edges, ask_trails(data.events))
         vectors = (flat_vector(query_window_ns(station, day)[0]),)
     else:
-        selector, vectors = _selector_for(prep, job.key, "none", 0, tracker), prep.vectors["none"]
+        selector = _selector_for(prep, job.key, "none", arm.delta_ns, tracker)
+        vectors = prep.vectors["none"]
     clock = clock_events(_cut_specs(primary_schedule(day), station, day), vectors)
     with rule_override(
         arm.b_cap, arm.max_rungs, p_min=arm.p_min, e_min=arm.e_min, b_floor=arm.b_floor
     ):
         replay = replay_station_day(
             data, clock, selector=selector, tracker=tracker, station=station, day=day,
-            unit_hypothesis=unit, live_from_ns=live_from_ns, delta_ns=0,
+            unit_hypothesis=unit, live_from_ns=live_from_ns, delta_ns=arm.delta_ns,
         )  # fmt: skip
     fold = PositionFold(station, day, unit)
     for episode in replay.result.episodes:

@@ -70,6 +70,7 @@ class Arm:
     p_min: float | None = None  # None: the shipped rule value
     e_min: float | None = None
     b_floor: float | None = None
+    delta_ns: int = 0  # recorder clock offset handed to the simulator (it applies |delta|)
 
 
 ARMS: Final[Mapping[str, Arm]] = {
@@ -81,6 +82,27 @@ ARMS: Final[Mapping[str, Arm]] = {
         Arm("spike_bid", rule.B_CAP, rule.MAX_RUNGS, False, spike=True),
         Arm("sharp", 0.89, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
         Arm("sharp_cap84", 0.84, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
+        Arm(
+            "sharp_dp600",
+            0.89,
+            2,
+            False,
+            p_min=0.97,
+            e_min=0.04,
+            b_floor=0.75,
+            delta_ns=600 * 10**9,
+        ),
+        Arm(
+            "sharp_dm600",
+            0.89,
+            2,
+            False,
+            p_min=0.97,
+            e_min=0.04,
+            b_floor=0.75,
+            delta_ns=-600 * 10**9,
+        ),
+        Arm("sharp_k1", 0.89, 1, False, p_min=0.97, e_min=0.04, b_floor=0.75),
     )
 }
 
