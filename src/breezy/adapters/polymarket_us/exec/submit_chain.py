@@ -196,6 +196,12 @@ RETRY_LATCH_FLOOR_S: Final[int] = 60
 #: A timeout latches ``resting_cancel_unconfirmed``. A provisional RulePin, not an operator
 #: control.
 BOOT_SWEEP_DEADLINE_S: Final[float] = 120.0
+#: S4 WP5 / WP6: whether the venue's MAKER commission sign is VERIFIED (a rebate is negative).
+#: Nothing has observed an own passive fill yet, so the sign is unknown and the recognised
+#: commission (``reports.recognised_commission``) clamps a negative to zero everywhere it is
+#: booked. Flipped only by a reviewed commit citing the WP6 probe artifact (the first own
+#: passive fill); pinned in the cage rule table, never an operator control.
+MAKER_COMMISSION_SIGN_VERIFIED: Final[bool] = False
 #: Three consecutive failed polls of one bound id latch ``resting_query_unreadable``.
 RESTING_POLL_FAILURE_LATCH_COUNT: Final[int] = 3
 #: The two S4 CRITICAL latches. Both refuse NEW rests only (cancels continue); the

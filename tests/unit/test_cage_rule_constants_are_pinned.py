@@ -1061,6 +1061,22 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             "to False by value, refused by type identity"
         ),
     ),
+    # ARM maker-sharp B6 / S4 r4 P16 (one reviewed row, one commit): the maker commission
+    # sign is UNVERIFIED until WP6 observes a first own passive fill. While False the
+    # recognised commission clamps a negative (rebate) to zero everywhere it is booked. The
+    # flip is a reviewed commit citing the probe artifact; narrowed neighbour is an int 0
+    RulePin(
+        module="submit_chain",
+        attr="MAKER_COMMISSION_SIGN_VERIFIED",
+        expected=False,
+        widened=True,
+        narrowed=0,
+        why=(
+            "S4 P16 (B6): the maker commission sign is unverified until WP6 observes a first "
+            "own passive fill; while False a negative commission is never booked as a rebate. "
+            "Narrowed neighbour is an int 0: equal to False by value, refused by type identity"
+        ),
+    ),
     # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the in-coroutine backoff
     # after each full pass of the RETRY-WHEN-OPEN cancel loop (last value repeats). Widening
     # slows a refused cancel's retry; narrowing hammers a halted market
@@ -1244,6 +1260,8 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "submit_chain.RETRY_ALERT_AGE_S",
         "submit_chain.CANCEL_RETRY_BACKOFF_S",
         "submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED",
+        # ARM maker-sharp B6 / S4 r4 P16: the maker commission sign gate.
+        "submit_chain.MAKER_COMMISSION_SIGN_VERIFIED",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
