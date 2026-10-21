@@ -1034,34 +1034,53 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "proven by the positive control. Narrowed neighbour is an int 0: equal to "
         "False by value, refused by type identity",
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the slug-scoped cancel-all stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal to False by value, refused by type identity
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the slug-scoped cancel-all
+    # stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed
+    # neighbour is an int 0: equal to False by value, refused by type identity
     RulePin(
         module="submit_chain",
         attr="SLUG_SCOPED_CANCEL_ALL_VERIFIED",
         expected=False,
         widened=True,
         narrowed=0,
-        why="S4 P16 (B5): the slug-scoped cancel-all stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal to False by value, refused by type identity",
+        why=(
+            "S4 P16 (B5): the slug-scoped cancel-all stays disabled until a reviewed commit "
+            "cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal "
+            "to False by value, refused by type identity"
+        ),
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the in-coroutine backoff after each full pass of the RETRY-WHEN-OPEN cancel loop (last value repeats). Widening slows a refused cancel's retry; narrowing hammers a halted market
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the in-coroutine backoff
+    # after each full pass of the RETRY-WHEN-OPEN cancel loop (last value repeats). Widening
+    # slows a refused cancel's retry; narrowing hammers a halted market
     RulePin(
         module="submit_chain",
         attr="CANCEL_RETRY_BACKOFF_S",
         expected=(5, 10, 20, 40, 60),
         widened=(5, 10, 20, 40, 61),
         narrowed=(5, 10, 20, 40),
-        why="S4 P16 (B5): the in-coroutine backoff after each full pass of the RETRY-WHEN-OPEN cancel loop (last value repeats). Widening slows a refused cancel's retry; narrowing hammers a halted market",
+        why=(
+            "S4 P16 (B5): the in-coroutine backoff after each full pass of the RETRY-WHEN-OPEN "
+            "cancel loop (last value repeats). Widening slows a refused cancel's retry; "
+            "narrowing hammers a halted market"
+        ),
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): age from the FIRST refused cancel at which the non-latching CRITICAL alert fires. Widening delays the operator signal; narrowing alerts on routine venue lag
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): age from the FIRST refused
+    # cancel at which the non-latching CRITICAL alert fires. Widening delays the operator
+    # signal; narrowing alerts on routine venue lag
     RulePin(
         module="submit_chain",
         attr="RETRY_ALERT_AGE_S",
         expected=600,
         widened=601,
         narrowed=599,
-        why="S4 P16 (B5): age from the FIRST refused cancel at which the non-latching CRITICAL alert fires. Widening delays the operator signal; narrowing alerts on routine venue lag",
+        why=(
+            "S4 P16 (B5): age from the FIRST refused cancel at which the non-latching CRITICAL "
+            "alert fires. Widening delays the operator signal; narrowing alerts on routine "
+            "venue lag"
+        ),
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): re-alert cadence of an unconfirmed cancel after the first alert
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): re-alert cadence of an
+    # unconfirmed cancel after the first alert
     RulePin(
         module="submit_chain",
         attr="RETRY_REALERT_S",
@@ -1070,23 +1089,32 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         narrowed=1799,
         why="S4 P16 (B5): re-alert cadence of an unconfirmed cancel after the first alert",
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): grace after the order's expiry before an unconfirmed cancel latches resting_cancel_unconfirmed
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): grace after the order's
+    # expiry before an unconfirmed cancel latches resting_cancel_unconfirmed
     RulePin(
         module="submit_chain",
         attr="RETRY_LATCH_GRACE_S",
         expected=120,
         widened=121,
         narrowed=119,
-        why="S4 P16 (B5): grace after the order's expiry before an unconfirmed cancel latches resting_cancel_unconfirmed",
+        why=(
+            "S4 P16 (B5): grace after the order's expiry before an unconfirmed cancel latches "
+            "resting_cancel_unconfirmed"
+        ),
     ),
-    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): minimum gap between the alert age and the latch; it is what makes the alert strictly precede the latch for every input
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): minimum gap between the
+    # alert age and the latch; it is what makes the alert strictly precede the latch for every
+    # input
     RulePin(
         module="submit_chain",
         attr="RETRY_LATCH_FLOOR_S",
         expected=60,
         widened=61,
         narrowed=59,
-        why="S4 P16 (B5): minimum gap between the alert age and the latch; it is what makes the alert strictly precede the latch for every input",
+        why=(
+            "S4 P16 (B5): minimum gap between the alert age and the latch; it is what makes "
+            "the alert strictly precede the latch for every input"
+        ),
     ),
 )
 
