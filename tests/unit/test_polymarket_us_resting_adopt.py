@@ -216,6 +216,32 @@ async def test_contradiction_is_re_evaluated_per_tick_not_latched(
     await client._disconnect()
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("indicator", ["MANUAL_ORDER_INDICATOR_MANUAL", None])
+async def test_a_manual_or_unmarked_open_order_is_never_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, indicator: str | None
+) -> None:
+    """B4 review F2 (adopt path): an operator's own order that happens to echo-match
+    the rest is a CONTRADICTION, never the bot's order."""
+    client, current, command = await _no_id_rest(tmp_path, monkeypatch)
+    context = read_context(client, current.intent_id)
+    row = _open_rest_row(context.created_ns, command)
+    if indicator is None:
+        del row["manualOrderIndicator"]
+    else:
+        row["manualOrderIndicator"] = indicator
+    _negative(client, open_orders=[row])
+    client.advance(305)
+    await run_passes(client, 2)
+    detail = client._resolver_contradiction_details[current.intent_id]
+    assert detail["reason"] == "in_window_open_order"
+    assert read_context(client, current.intent_id).venue_order_id == submit_chain.NO_VENUE_ORDER_ID
+    assert client._store_get(client_module.RESTING_INDEX_KEY) is None
+    assert client._latch.current_open() is not None
+    await client._disconnect()
+
+
 def test_open_orders_path_constant_is_the_stubbed_one() -> None:
     """Non-vacuity of the stub wiring used above."""
     assert OPEN_ORDERS_PATH.startswith("/v1/")
