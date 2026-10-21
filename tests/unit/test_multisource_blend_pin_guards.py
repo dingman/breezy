@@ -20,6 +20,7 @@ from scripts.analysis import blend_veto_descriptive as veto
 from scripts.analysis import multisource_blend_lag_arm as lag_arm
 from scripts.analysis import multisource_blend_pin_guards as guards
 from scripts.analysis import multisource_blend_skill as skill
+from scripts.analysis.multisource_blend_inputs_pins import LAG_FLOORS_NS
 from scripts.analysis.multisource_blend_sidecar import draft_scratch_digest
 from tests.unit.test_multisource_blend_skill import (
     _LAG_CAPS,
@@ -27,6 +28,7 @@ from tests.unit.test_multisource_blend_skill import (
     _PINNED_LAGS,
     _PREREG_SRC,
     DROP,
+    REPO_ROOT,
     _design,
     _freeze,
     _git,
@@ -211,6 +213,22 @@ def _evidence_raw(samples: dict[str, Any]) -> str:
 def _evidence(**overrides: Any) -> str:
     renamed = {k.replace("_", "-"): v for k, v in overrides.items()}
     return _evidence_raw({**c1_lag_samples(), **renamed})
+
+
+#: the freeze-time C1 evidence: the unmodified ``c1_lag_evidence.py`` output of 2026-10-21
+_C1_FREEZE_EVIDENCE = REPO_ROOT / "docs" / "evidence" / "f13" / "c1_lag_evidence_2026-10-21.json"
+
+
+def test_each_frozen_lag_is_exactly_the_larger_of_the_r29_floor_and_the_c1_p99() -> None:
+    pinned = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))["pins"]["source_lags_ns"]
+    evidence = json.loads(_C1_FREEZE_EVIDENCE.read_text(encoding="utf-8"))
+    samples = evidence["lag_samples_ns"]
+
+    assert evidence["ready"] is True
+    assert set(pinned) == set(LAG_FLOORS_NS)
+    for source, floor in LAG_FLOORS_NS.items():
+        assert pinned[source] == max(floor, guards.observed_p99_ns(samples[source])), source
+    guards.check_pinned_lags_cover_c1(pinned, samples)  # PIN-R6 as the runner enforces it
 
 
 # ------------------------------------------------------------------ PIN-R7: source breaks

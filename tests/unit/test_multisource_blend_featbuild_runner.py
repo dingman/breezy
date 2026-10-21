@@ -51,8 +51,8 @@ def test_prereg_skeleton_carries_the_builder_pins_and_is_unfrozen() -> None:
     for key in _NEW_PINS:
         assert key in draft["pins"], key
         assert key in draft["pin_units"], key
-    # PIN-R2: only the two blocked pins stay null until the freeze derives them by rule
-    assert {k for k, v in draft["pins"].items() if v is None} == {"source_lags_ns", "source_breaks"}
+    # PIN-R2: the freeze derived the two blocked pins by rule (PIN-R6/R7); no pin is null now
+    assert {k for k, v in draft["pins"].items() if v is None} == set()
 
 
 # ------------------------------------------------------------------ FB-R2 key intersection
