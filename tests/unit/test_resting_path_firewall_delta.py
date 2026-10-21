@@ -560,6 +560,8 @@ def test_the_cancel_loop_callee_set_is_exact_with_exactly_one_send_name() -> Non
         "await self._read_open_orders()",
         # B5 review G2 pin row: the permission is the ONE release helper, by name
         "self._release_cancel_in_flight_all([], [])",
+        # B5 review G16 pin row: the sweep's `asyncio.timeout` is not the loop's
+        "asyncio.timeout(1)",
     ],
 )
 def test_planting_any_other_send_or_read_into_the_cancel_loop_is_flagged(statement: str) -> None:
@@ -729,6 +731,7 @@ EXEC_BOOT_SWEEP_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
     {
         "ExecutionReportMappingError",
         "_redact_order_id",
+        "asyncio.timeout",
         "frozenset",
         "len",
         "parse_open_orders",
@@ -786,6 +789,9 @@ def test_the_boot_sweep_callee_set_is_exact_and_never_names_the_sender() -> None
         "self._write_signer.sign_headers('POST', '/x')",
         "self._store_set('k', b'v')",
         "await self._read_open_orders()",
+        # B5 review G16 pin row: only `asyncio.timeout` is added; a neighbouring wait is not
+        "asyncio.wait_for(None, 1)",
+        "asyncio.shield(None)",
     ],
 )
 def test_planting_a_send_or_write_into_the_boot_sweep_is_flagged(statement: str) -> None:

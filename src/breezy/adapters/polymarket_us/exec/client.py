@@ -8294,30 +8294,33 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ledger_ids = {t.venue_order_id for t in ledger}
         ledger_slugs = {t.slug for t in ledger if t.slug}
         try:
-            if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True:
-                # Pin True (r4 5.4): read the UNFILTERED book first so every unbound order
-                # on a ledger slug is named (id prefix only) before the slug cancel-all
-                # removes it (spec 9.18: a manual order on a family slug is cancelled).
-                before = parse_open_orders(await self._private_read(OPEN_ORDERS_PATH))
-                for record in before:
-                    foreign_here = record.venue_order_id not in ledger_ids
-                    if foreign_here and record.market_slug in ledger_slugs:
-                        self._log.warning(
-                            "resting sweep: unbound open order "
-                            f"{_redact_order_id(record.venue_order_id)} on {record.market_slug} "
-                            "will be cancelled by the slug cancel-all"
-                        )
-                for slug in ledger_slugs:
-                    await self._cancel_slug_orders(slug)
-            unresolved = await self._cancel_resting_order(
-                [t.venue_order_id for t in ledger], max_passes=1
-            )
-            for venue_id in unresolved:
-                self._latch_resting_cancel_unconfirmed(venue_id, "boot_sweep_unresolved")
-            payload = await self._private_read(OPEN_ORDERS_PATH)
-            if not submit_chain.open_orders_envelope_is_known(payload):
-                raise ExecutionReportMappingError("open-orders envelope has an undeclared key")
-            records = parse_open_orders(payload)
+            # B5 review G16: the WHOLE sweep (every id's POST + GET, both reads) is bounded,
+            # so a hung venue cannot hang `_connect`; the timeout latches via the handler below.
+            async with asyncio.timeout(submit_chain.BOOT_SWEEP_DEADLINE_S):
+                if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True:
+                    # Pin True (r4 5.4): read the UNFILTERED book first so every unbound order
+                    # on a ledger slug is named (id prefix only) before the slug cancel-all
+                    # removes it (spec 9.18: a manual order on a family slug is cancelled).
+                    before = parse_open_orders(await self._private_read(OPEN_ORDERS_PATH))
+                    for record in before:
+                        foreign_here = record.venue_order_id not in ledger_ids
+                        if foreign_here and record.market_slug in ledger_slugs:
+                            self._log.warning(
+                                "resting sweep: unbound open order "
+                                f"{_redact_order_id(record.venue_order_id)} on "
+                                f"{record.market_slug} will be cancelled by the slug cancel-all"
+                            )
+                    for slug in ledger_slugs:
+                        await self._cancel_slug_orders(slug)
+                unresolved = await self._cancel_resting_order(
+                    [t.venue_order_id for t in ledger], max_passes=1
+                )
+                for venue_id in unresolved:
+                    self._latch_resting_cancel_unconfirmed(venue_id, "boot_sweep_unresolved")
+                payload = await self._private_read(OPEN_ORDERS_PATH)
+                if not submit_chain.open_orders_envelope_is_known(payload):
+                    raise ExecutionReportMappingError("open-orders envelope has an undeclared key")
+                records = parse_open_orders(payload)
         except Exception as exc:  # noqa: BLE001 - never raise out of `_connect`
             self._latch_resting_cancel_unconfirmed(
                 _BOOT_SWEEP_LATCH_ID, f"boot_sweep_reread_failed:{exc.__class__.__name__}"

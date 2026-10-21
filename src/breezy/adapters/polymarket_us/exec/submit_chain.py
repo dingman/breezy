@@ -191,6 +191,11 @@ RETRY_ALERT_AGE_S: Final[int] = 600
 RETRY_REALERT_S: Final[int] = 1800
 RETRY_LATCH_GRACE_S: Final[int] = 120
 RETRY_LATCH_FLOOR_S: Final[int] = 60
+#: B5 review G16: the wall-clock bound, in seconds, on the WHOLE boot sweep (every id's cancel
+#: POST + confirm GET and both open-orders reads), so a hung venue cannot hang ``_connect``.
+#: A timeout latches ``resting_cancel_unconfirmed``. A provisional RulePin, not an operator
+#: control.
+BOOT_SWEEP_DEADLINE_S: Final[float] = 120.0
 #: Three consecutive failed polls of one bound id latch ``resting_query_unreadable``.
 RESTING_POLL_FAILURE_LATCH_COUNT: Final[int] = 3
 #: The two S4 CRITICAL latches. Both refuse NEW rests only (cancels continue); the

@@ -12,6 +12,7 @@ No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig`
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Final
@@ -117,4 +118,28 @@ async def test_a_ledger_id_still_listed_open_after_the_per_id_pass_latches(
     assert _latched(second) is still_listed
     if still_listed:
         assert second.log_lines("error", "boot_sweep_ledger_id_still_listed")
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_hung_sweep_is_bounded_latches_and_connect_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G16: the per-order bound does not bound the SWEEP (many ids, each with a venue
+    round trip). An overall wall-clock deadline latches and lets ``_connect`` finish."""
+    monkeypatch.setattr(submit_chain, "BOOT_SWEEP_DEADLINE_S", 0.2)
+    rig = await _rig(tmp_path, monkeypatch)
+    await _submit_rest(rig, 0)
+    sender = CancelSender()
+    sender.gate = asyncio.Event()  # never set: the first cancel POST hangs forever
+    second = await _second_process(
+        tmp_path, monkeypatch, rig.client, rig.client.latch_cm, sender=sender
+    )
+    await asyncio.wait_for(second._connect(), 5.0)
+    assert _latched(second)
+    assert second.log_lines("error", "boot_sweep_reread_failed:TimeoutError")
+    assert second._cancel_in_flight == frozenset(), "the hung loop released its guard"
+    assert second._store_get(_EVIDENCE_KEY), "the evidence write still ran"
+    assert second._swept_resting_intent_ids == frozenset()
     await second._disconnect()
