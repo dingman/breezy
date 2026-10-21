@@ -236,8 +236,9 @@ def _build_world(
     )
     design = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
     design["pins"] = {**design["pins"], **(pins if pins is not None else _pins())}
-    if frozen:  # the builder only reads the stamp; the runner verifies the blob against git
-        design["frozen_sha"] = "a" * 40
+    # the committed prereg is frozen; a scratch world states its own freeze state explicitly. The
+    # builder only reads the stamp; the runner verifies the blob against git.
+    design["frozen_sha"] = "a" * 40 if frozen else skill.UNFROZEN
     prereg = root / "prereg.json"
     prereg.write_text(json.dumps(design, indent=2), encoding="utf-8")
     return _World(root, prereg, nbp, us, mos, asos, truth, metar, draft=not frozen)

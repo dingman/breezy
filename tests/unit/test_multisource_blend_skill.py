@@ -228,9 +228,9 @@ class _Scenario:
 # ------------------------------------------------------------------ prereg skeleton
 
 
-def test_prereg_skeleton_is_an_unfrozen_draft_with_the_fixed_pins_filled() -> None:
+def test_prereg_is_the_frozen_prereg_with_the_fixed_pins_filled() -> None:
     draft = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
-    assert draft["frozen_sha"] == "UNFROZEN"
+    assert draft["frozen_sha"] == "205fd542b8d601524893b5855ad49736f01436ad"
     pins = draft["pins"]
     assert (pins["floor_multiple"], pins["m0_prime_tolerance_crps_f"]) == (0.25, 0.03)
     assert pins["station_tolerance_crps_f"] == 0.05

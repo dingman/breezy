@@ -294,7 +294,7 @@ def test_the_rung_edges_are_the_71_even_integers_written_out() -> None:
     assert all(type(e) is int for e in edges)
 
 
-def test_the_build_pins_are_filled_and_only_the_two_blocked_pins_stay_null() -> None:
+def test_the_build_pins_are_filled_and_the_two_derived_pins_are_exact_literals() -> None:
     design = _skeleton()
     pins = design["pins"]
 
@@ -325,8 +325,28 @@ def test_the_build_pins_are_filled_and_only_the_two_blocked_pins_stay_null() -> 
         "method": "NORMAL",
         "spread_prob": 0.02,
     }
-    assert {k for k, v in pins.items() if v is None} == {"source_lags_ns", "source_breaks"}
-    assert design["frozen_sha"] == "UNFROZEN"
+    assert {k for k, v in pins.items() if v is None} == set()
+    # PIN-R6: max(R29 floor, nearest-rank C1 p99) as exact integer ns (freeze evidence 2026-10-21)
+    assert pins["source_lags_ns"] == {
+        "lamp-mdl": 3600000000000,
+        "lav-iem": 5400000000000,
+        "pfm": 5953353629263,
+        "mos-gfs": 18913081701834,
+        "obs": 1923961500685,
+    }
+    # PIN-R7: provenance-derived breaks; 2022-08-11 is the manual ILZ104 (LOT PFM layout) break
+    assert pins["source_breaks"] == [
+        "2022-08-11",
+        "2023-01-18",
+        "2024-05-15",
+        "2024-05-16",
+        "2025-05-28",
+        "2026-03-29",
+        "2026-03-30",
+        "2026-03-31",
+        "2026-05-06",
+    ]
+    assert design["frozen_sha"] == "205fd542b8d601524893b5855ad49736f01436ad"
 
 
 def test_the_skeleton_pins_pass_the_runner_and_builder_validators_once_the_blocked_two_are_set(

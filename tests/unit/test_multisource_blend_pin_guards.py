@@ -20,13 +20,16 @@ from scripts.analysis import blend_veto_descriptive as veto
 from scripts.analysis import multisource_blend_lag_arm as lag_arm
 from scripts.analysis import multisource_blend_pin_guards as guards
 from scripts.analysis import multisource_blend_skill as skill
+from scripts.analysis.multisource_blend_inputs_pins import LAG_FLOORS_NS
 from scripts.analysis.multisource_blend_sidecar import draft_scratch_digest
+from scripts.analysis.prereg_precommit_check import check_frozen_blob
 from tests.unit.test_multisource_blend_skill import (
     _LAG_CAPS,
     _NO_BREAKS,
     _PINNED_LAGS,
     _PREREG_SRC,
     DROP,
+    REPO_ROOT,
     _design,
     _freeze,
     _git,
@@ -211,6 +214,22 @@ def _evidence_raw(samples: dict[str, Any]) -> str:
 def _evidence(**overrides: Any) -> str:
     renamed = {k.replace("_", "-"): v for k, v in overrides.items()}
     return _evidence_raw({**c1_lag_samples(), **renamed})
+
+
+#: the freeze-time C1 evidence: the unmodified ``c1_lag_evidence.py`` output of 2026-10-21
+_C1_FREEZE_EVIDENCE = REPO_ROOT / "docs" / "evidence" / "f13" / "c1_lag_evidence_2026-10-21.json"
+
+
+def test_each_frozen_lag_is_exactly_the_larger_of_the_r29_floor_and_the_c1_p99() -> None:
+    pinned = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))["pins"]["source_lags_ns"]
+    evidence = json.loads(_C1_FREEZE_EVIDENCE.read_text(encoding="utf-8"))
+    samples = evidence["lag_samples_ns"]
+
+    assert evidence["ready"] is True
+    assert set(pinned) == set(LAG_FLOORS_NS)
+    for source, floor in LAG_FLOORS_NS.items():
+        assert pinned[source] == max(floor, guards.observed_p99_ns(samples[source])), source
+    guards.check_pinned_lags_cover_c1(pinned, samples)  # PIN-R6 as the runner enforces it
 
 
 # ------------------------------------------------------------------ PIN-R7: source breaks
@@ -634,8 +653,11 @@ def test_a_prereg_outside_git_is_refused_by_the_guard(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ PIN-R8c: frozen digest pin
 
 #: Set to the skeleton's ``skill.content_digest`` in the SAME commit that stamps the freeze. While
-#: the skeleton is UNFROZEN the test below skips; from the freeze on it is binding.
-FROZEN_CONTENT_SHA256: str | None = None
+#: the skeleton is UNFROZEN the test below skips; from the freeze on it is binding. The digest
+#: excludes ``frozen_sha``, so it is the digest of the content commit A as well as of the stamp B.
+FROZEN_CONTENT_SHA256: str | None = (
+    "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7"
+)
 
 
 def test_the_frozen_skeleton_content_digest_is_pinned_to_a_constant() -> None:
@@ -646,6 +668,14 @@ def test_the_frozen_skeleton_content_digest_is_pinned_to_a_constant() -> None:
         "the prereg is frozen: set FROZEN_CONTENT_SHA256 to skill.content_digest(prereg)"
     )
     assert skill.content_digest(design) == FROZEN_CONTENT_SHA256
+
+
+def test_the_committed_prereg_equals_the_blob_at_its_frozen_commit() -> None:
+    design = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
+
+    assert design["frozen_sha"] != skill.UNFROZEN
+    # frozen_sha is an ancestor of HEAD and the file body equals the blob committed there
+    assert check_frozen_blob(_PREREG_SRC, design) == []
 
 
 # ------------------------------------------------------------------ PIN-R9: required pins

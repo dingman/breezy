@@ -1,7 +1,7 @@
 {
   "schema": "f13_prereg_blend_v1",
-  "frozen_sha": "UNFROZEN",
-  "status": "DRAFT skeleton (F13 Phase A pins r3, PIN-R2). Every fixed pin and the veto reference are written as exact literals; only `source_lags_ns` and `source_breaks` stay null until the one gated freeze derives them by their rules (PIN-R6/R7). Then it is frozen once (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, if the committed blob differs, or if the file was re-frozen.",
+  "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
+  "status": "DRAFT skeleton (F13 Phase A pins r3, PIN-R2). Every fixed pin and the veto reference are written as exact literals; `source_lags_ns` and `source_breaks` were filled on 2026-10-21 from the freeze-time C1 evidence (docs/evidence/f13/c1_lag_evidence_2026-10-21.json) by their rules (PIN-R6/R7) and are frozen by the stamp commit. Then it is frozen once (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, if the committed blob differs, or if the file was re-frozen.",
   "pin_note": "coordinator pins before any M1-M3 scoring",
   "plan": {
     "document": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md",
@@ -72,7 +72,10 @@
       "commit": "ad76d2f24415b2c4256289f74e5ad12d02dcba0f"
     },
     "m0_bootstrap_draws": 200,
-    "source_breaks": null,
+    "source_breaks": [
+      "2022-08-11", "2023-01-18", "2024-05-15", "2024-05-16", "2025-05-28",
+      "2026-03-29", "2026-03-30", "2026-03-31", "2026-05-06"
+    ],
     "rung_edges_f": [
       -20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2,
       4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26,
@@ -89,7 +92,13 @@
       "D0_sensitivity": {"kind": "lst", "hour": 12},
       "offset_rule": "fixed_standard_time_never_dst"
     },
-    "source_lags_ns": null,
+    "source_lags_ns": {
+      "lamp-mdl": 3600000000000,
+      "lav-iem": 5400000000000,
+      "pfm": 5953353629263,
+      "mos-gfs": 18913081701834,
+      "obs": 1923961500685
+    },
     "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
     "obs_cadence_seconds": 3600,
     "obs_routine_minute_by_station": {"KLAX": 53, "KMDW": 53, "KMIA": 53, "KNYC": 51, "KSFO": 56},
@@ -106,7 +115,7 @@
     "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses",
     "embargo_days": "integer days (>= 2, FB-R6): every day within this many days of a held block is dropped from the training of M0, the pooled-M0 sensitivity AND every blend arm",
     "anchors": "FB-R1, read by multisource_blend_features_build.py: object {\"D-1\": {\"kind\": \"utc\", \"hour\": 18}, \"D0\": {\"kind\": \"lst\", \"hour\": 10}, \"D0_sensitivity\": {\"kind\": \"lst\", \"hour\": 12}, \"offset_rule\": \"fixed_standard_time_never_dst\"}. A utc anchor is that UTC hour on the day before the climate day; an lst anchor is that local-STANDARD hour on the climate day (EST 15Z, CST 16Z, PST 18Z for hour 10). D0_sensitivity builds a separate file pair, never mixed into the primary pair.",
-    "source_lags_ns": "FB-R4, integer nanoseconds per source key lamp-mdl, lav-iem, pfm, mos-gfs, obs: availability = nominal time + lag. Provisional basis: lamp-mdl max(60 min, C1 max); lav-iem the same + 30 min; pfm WMO issuance + 60 min; mos-gfs runtime + 5 h; obs report time + 15 min. The builder refuses any value below the R29 floor (lamp-mdl 60 min, lav-iem 90 min, pfm 60 min, mos-gfs 5 h, obs 15 min). Frozen only after >= 14 days of C1 measurement (R29); every value's basis is flagged in the build report.",
+    "source_lags_ns": "FB-R4/PIN-R6, integer nanoseconds per source key lamp-mdl, lav-iem, pfm, mos-gfs, obs: availability = nominal time + lag. Each value = max(R29 floor, nearest-rank p99 of the C1 uncensored lag samples in the freeze-time evidence file docs/evidence/f13/c1_lag_evidence_2026-10-21.json), written as an exact integer ns and never rounded down. The builder refuses any value below the R29 floor (lamp-mdl 60 min, lav-iem 90 min, pfm 60 min, mos-gfs 5 h, obs 15 min); the runner refuses any value below that source's C1 observed p99 (PIN-R6). Frozen only after >= 14 days of C1 measurement (R29); every value's basis is flagged in the build report.",
     "obs_source": "FB-R3/FB-R15, a string label for the obs_so_far path; the builder accepts only iem_routine_metar_tgroup_round_half_up_f (the routine-METAR store, T group quantised through round_half_up_f). The 1-min archive is no longer a source; its raw running max and 5-min arm are descriptive, non-METAR arms only.",
     "obs_cadence_seconds": "FB-R13, integer seconds between routine METAR readings; the builder refuses any value other than 3600 (obs_so_far is the running max of routine hourly METAR values only; interval rows and specials are excluded).",
     "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report; FB-R15: a VALIDATION FILTER over the routine-METAR store (rows at another minute are excluded and counted). Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied).",
