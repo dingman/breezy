@@ -311,3 +311,50 @@ def test_planting_a_sender_reference_into_any_other_helper_is_still_flagged(name
     after = {v.detail for v in firewall.find_order_sender_reference_violations(CLIENT_REL, planted)}
     assert [d for d in after - before if "_retire_resting_row" in d], after
     assert name != "_retire_resting_row"
+
+
+# ---------------------------------------------------------------------------
+# Row P2: the order-coroutine await ban, exempting exactly two cancel coroutines
+# ---------------------------------------------------------------------------
+
+
+def _send_path_violations(source: str) -> list[str]:
+    return [v.detail for v in firewall.find_exec_send_path_violations(CLIENT_REL, source)]
+
+
+def test_the_shipped_cancel_coroutines_await_only_the_pinned_callee() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert [d for d in _send_path_violations(source) if "awaits" in d] == []
+    for name in sorted(firewall.EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES):
+        awaited = {
+            firewall._dotted_callee(n.value.func)
+            for n in ast.walk(_function(source, name))
+            if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
+        }
+        assert awaited == set(firewall.EXEC_CANCEL_QUERY_AWAITED_CALLEES), (name, awaited)
+
+
+def test_the_exempt_set_and_the_awaited_set_are_exact() -> None:
+    assert firewall.EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES == {"_cancel_order", "_cancel_all_orders"}
+    assert firewall.EXEC_CANCEL_QUERY_AWAITED_CALLEES == {"self._cancel_resting_order"}
+
+
+@pytest.mark.parametrize(
+    ("function", "statement"),
+    [
+        ("_cancel_order", "await self._private_read('/x')"),
+        ("_cancel_order", "await self._order_sender.post_order(None)"),
+        ("_cancel_all_orders", "await self._cancel_slug_orders('x')"),
+        # the pinned callee awaited by an order coroutine that is NOT exempt
+        ("_modify_order", "await self._cancel_resting_order(['x'])"),
+        ("_submit_order_list", "await self._cancel_resting_order(['x'])"),
+    ],
+)
+def test_planting_any_other_await_into_an_order_coroutine_is_flagged(
+    function: str, statement: str
+) -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    before = set(_send_path_violations(source))
+    planted = _plant_any(source, function, statement)
+    new = [d for d in set(_send_path_violations(planted)) - before if "awaits" in d]
+    assert any(function in d for d in new), new

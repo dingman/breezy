@@ -2479,6 +2479,24 @@ def _dotted_callee(node: ast.expr) -> str | None:
     return None
 
 
+#: S4 WP4 (ARM B5, pin row P2): the ONLY awaits a cancel-path order coroutine may make,
+#: and the two coroutines that may make them. Everything else an order coroutine awaits
+#: is still a violation (`_submit_order` keeps its own exemption above). The awaited
+#: coroutine is itself scanned (`EXEC_CANCEL_SEND_PERMITTED_CALLEES`, row N2, in
+#: `test_resting_path_firewall_delta.py`).
+EXEC_CANCEL_QUERY_AWAITED_CALLEES = frozenset({"self._cancel_resting_order"})
+EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES = frozenset({"_cancel_order", "_cancel_all_orders"})
+
+
+def _is_pinned_cancel_await(function: str, node: ast.Await) -> bool:
+    """True iff ``node`` is the one pinned await of an exempt cancel coroutine."""
+    return (
+        function in EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES
+        and isinstance(node.value, ast.Call)
+        and _dotted_callee(node.value.func) in EXEC_CANCEL_QUERY_AWAITED_CALLEES
+    )
+
+
 def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
     """E0-NOSEND: what an order-lifecycle coroutine under ``exec/`` may DO.
 
@@ -2505,7 +2523,9 @@ def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
             continue
         for inner in ast.walk(node):
             if isinstance(inner, ast.AsyncFor | ast.AsyncWith) or (
-                isinstance(inner, ast.Await) and node.name != "_submit_order"
+                isinstance(inner, ast.Await)
+                and node.name != "_submit_order"
+                and not _is_pinned_cancel_await(node.name, inner)
             ):
                 violations.append(
                     Violation(
