@@ -746,7 +746,9 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     holding whose NO instrument is not loaded. Widened AGAIN old(34) ->
     new(35) by EDGE-2 plan r3 (AC6b): `_resolve_accept_fill` gained a
     third `self._refuse(_RESOLVER_FILL_UNBUDGETED)` site, the cross-process
-    unbudgeted-fill latch. Never relaxed, only widened (L-12).
+    unbudgeted-fill latch. Widened AGAIN old(35) -> new(36) by ARM maker-sharp
+    B5 (S4 WP4): `_latch_resting_order`, the one producer of the two resting-order
+    latches. Never relaxed, only widened (L-12).
 
     The authoritative, triaged inventory is
     `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
@@ -764,7 +766,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 35
+    assert count == 36
 
 
 @pytest.mark.asyncio
