@@ -305,6 +305,8 @@ PRE_ORDER_CALLEES = frozenset(
         "self._resting_cancel_target",
         # S4 WP4 (ARM B5, pin row P1b): NAMED row added to the baseline, never relaxed.
         "self._cancel_resting_order",
+        # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row added to the baseline, never relaxed.
+        "self._reject_cancel_of",
         "submit_chain.venue_order_id",
         "submit_chain.wire_fingerprint_bytes",
     }
