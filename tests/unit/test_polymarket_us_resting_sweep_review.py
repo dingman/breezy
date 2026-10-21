@@ -13,6 +13,7 @@ No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig`
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Final
@@ -143,3 +144,34 @@ async def test_a_hung_sweep_is_bounded_latches_and_connect_completes(
     assert second._store_get(_EVIDENCE_KEY), "the evidence write still ran"
     assert second._swept_resting_intent_ids == frozenset()
     await second._disconnect()
+
+
+_NEVER_CANCELLED_CLAIM: Final[str] = (
+    "Unbound orders are NEVER cancelled only while SLUG_SCOPED_CANCEL_ALL_VERIFIED is False"
+)
+
+
+def test_the_unbound_never_cancelled_claim_is_scoped_to_the_slug_pin_being_false() -> None:
+    """G13: "unbound orders are never cancelled" is a property of the pin being False. With
+    the pin True the slug cancel-all removes an unbound order on a ledger slug (spec 9.18),
+    so the sweep's docstring must say the claim is conditional."""
+    doc = " ".join(
+        (
+            inspect.getdoc(client_module.PolymarketUSExecutionClient._sweep_resting_orders_at_boot)
+            or ""
+        ).split()
+    )
+    assert _NEVER_CANCELLED_CLAIM in doc
+
+
+def test_flipping_the_slug_pin_requires_reconciling_the_never_cancelled_claim() -> None:
+    """The reconciliation tripwire. Flipping ``SLUG_SCOPED_CANCEL_ALL_VERIFIED`` to ``True``
+    must be done in the same reviewed change that (a) rewrites the sweep docstring, r4 5.4
+    and spec 9.18 so no one still reads "unbound orders are never cancelled", and (b) edits
+    this test. It fails loudly until then. (The pin-True behaviour itself -- a WARN naming
+    each unbound order, then the slug cancel-all -- is pinned in
+    ``test_polymarket_us_resting_sweep.py``.)"""
+    assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is False, (
+        "the slug pin was flipped: reconcile the sweep docstring, r4 5.4 and spec 9.18 "
+        "('unbound orders are never cancelled') before editing this test"
+    )

@@ -8261,17 +8261,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     async def _sweep_resting_orders_at_boot(self) -> None:
         """S4 WP4 (4e): the boot sweep over the durable resting ledger.
 
-        Cancels every ledger-bound id (per order, ONE bounded pass so ``_connect``
-        cannot hang), then re-reads the UNFILTERED open orders and certifies the
-        ledger's slugs. Unbound orders are NEVER cancelled (they may be the
-        operator's): WARN-logged by id and ONE CRITICAL alert, and the arm gate keeps
-        refusing them. A ledger id still open, an unreadable or uncertifiable re-read,
-        or a no-id context's slug that is not empty latches
+        Cancels every ledger-bound id (per order, ONE bounded pass; the WHOLE sweep is
+        bounded by ``BOOT_SWEEP_DEADLINE_S`` so ``_connect`` cannot hang), then re-reads
+        the UNFILTERED open orders and certifies the ledger's slugs. Unbound orders are
+        NEVER cancelled only while SLUG_SCOPED_CANCEL_ALL_VERIFIED is False (they may be
+        the operator's): WARN-logged by id and ONE CRITICAL alert, and the arm gate keeps
+        refusing them. With that pin True the slug cancel-all removes an unbound order on
+        a ledger slug (spec 9.18) after a WARN naming it; flipping the pin must reconcile
+        this paragraph. A ledger id still open or still listed, a sweep that does not run,
+        overruns, or whose re-read is unreadable or uncertifiable, or a no-id context's
+        slug that is not empty latches
         ``resting_cancel_unconfirmed`` and marks no intent swept. A no-id resting
         intent is added to ``_swept_resting_intent_ids`` ONLY when its slug reads
-        empty on a certified re-read (WP5 alone retires it). Does not run without an
-        injected sender and a verified canonical string; an empty ledger posts and
-        reads nothing; an unreadable index posts nothing and keeps its refusal.
+        empty on a certified re-read (WP5 alone retires it). Does not run (and latches)
+        without an injected sender and a verified canonical string; an empty ledger
+        posts and reads nothing; an unreadable index posts nothing and keeps its refusal.
         """
         ledger = self._resting_ledger()
         if ledger is None:
