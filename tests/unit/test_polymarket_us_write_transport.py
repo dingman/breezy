@@ -337,28 +337,51 @@ def test_the_write_callable_has_no_method_query_or_body_parameter() -> None:
 
 @pytest.mark.asyncio
 async def test_it_issues_exactly_one_post_to_the_one_pinned_path() -> None:
-    """Equality to the one path, never membership in a widened allowlist."""
+    """Equality to the one path per verb, never membership in a widened allowlist.
+
+    ARM B1 (S4 r4 T2): the call keys widen from ``{url, headers, keys}`` to
+    ``{url, headers, body, keys}`` -- the cancel verbs now REQUIRE a body.
+    """
     from breezy.adapters.polymarket_us.write_transport import (
         CANCEL_ALL_PATH,
         PolymarketUSWriteTransport,
     )
 
+    slug = "tc-temp-nychigh-2026-10-13-lt71f"
+    order_id = "ABCDEF123456"
     client = _RecordingWriteClient()
     transport = PolymarketUSWriteTransport(client=client)
     response = await transport.post_cancel_all(
         "https://api.example.invalid",
         headers={ACCESS_KEY_HEADER: "k"},
+        slugs=[slug],
+    )
+    await transport.post_cancel_order(
+        "https://api.example.invalid",
+        headers={ACCESS_KEY_HEADER: "k"},
+        order_id=order_id,
+        market_slug=slug,
     )
 
-    assert len(client.calls) == 1
-    call = client.calls[0]
-    assert set(call) == {"url", "headers", "keys"}
-    assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
-    assert call["headers"] == {ACCESS_KEY_HEADER: "k"}
-    path = call["url"].removeprefix("https://api.example.invalid")
-    assert {path} == {CANCEL_ALL_PATH} == {_CANCEL_ALL_PATH}
+    assert len(client.calls) == 2
+    expected_paths = [CANCEL_ALL_PATH, f"/v1/order/{order_id}/cancel"]
+    for call, expected_path in zip(client.calls, expected_paths, strict=True):
+        assert set(call) == {"url", "headers", "body", "keys"}
+        assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
+        assert call["headers"] == {ACCESS_KEY_HEADER: "k"}
+        path = call["url"].removeprefix("https://api.example.invalid")
+        assert {path} == {expected_path}
+    assert expected_paths[0] == _CANCEL_ALL_PATH
     assert isinstance(response, VenueResponse)
     assert response.status == 200
+
+    # Non-vacuity plant: a bodiless cancel-all (the pre-B1 shape, an account-wide
+    # cancel) cannot be issued and records no call.
+    with pytest.raises(TypeError):
+        await transport.post_cancel_all(  # type: ignore[call-arg]
+            "https://api.example.invalid", headers={ACCESS_KEY_HEADER: "k"}
+        )
+    assert len(client.calls) == 2
 
 
 # --------------------------------------------------------------------------

@@ -207,11 +207,14 @@ _ORDER_PATH_RE = re.compile(r"/v\d+/orders?\b", re.IGNORECASE)
 #: accepted, in EXACTLY one module, matched by EXACT string equality (never
 #: a prefix, never a regex): the open-orders list path and the singular
 #: order-by-id PREFIX the ``endpoints.order_by_id_path`` builder completes.
-#: Both are GETs on the SDK's own ``Orders.list``/``Orders.retrieve``
+#: ARM B1 (S4 r4 P7) adds a THIRD, WRITE-verb literal: the per-order cancel
+#: template ``/v1/order/{order_id}/cancel`` -- the single named exception to
+#: "no write path here", an exact literal in this one module, never spliced
+#: from the read prefix. The first two are GETs on the SDK's own ``Orders.list``/``Orders.retrieve``
 #: (``sdk_snapshot/.../resources/orders.py:32-42``) and were the plan's
 #: named prerequisite for any resting order ("nothing may rest that cannot
 #: be enumerated"). Every WRITE order path -- the create path, the
-#: per-order cancel/modify suffixes, ``orders/open/cancel``, the batched
+#: per-order modify suffix and every other cancel spelling, ``orders/open/cancel``, the batched
 #: paths -- is NOT here and stays refused: an allowlisted literal with any
 #: suffix appended is a different string and trips V2 as before. Compensating
 #: strengthening: ``test_v2_allowlist_*`` below prove (a) the entry is
@@ -221,7 +224,7 @@ _ORDER_PATH_RE = re.compile(r"/v\d+/orders?\b", re.IGNORECASE)
 #: trips, and (d) the write paths trip even inside ``endpoints.py``.
 V2_ORDER_READ_PATH_ALLOWLIST: Mapping[str, frozenset[str]] = {
     "src/breezy/adapters/polymarket_us/exec/endpoints.py": frozenset(
-        {"/v1/orders/open", "/v1/order/"}
+        {"/v1/orders/open", "/v1/order/", "/v1/order/{order_id}/cancel"}
     ),
 }
 #: C3 (Kalshi widening, S1'): old -- Polymarket's two origins only. New --
@@ -2507,10 +2510,13 @@ def test_kalshi_sdk_import_trips_b5_at_every_consumption_site() -> None:
 _ENDPOINTS_PATH = "src/breezy/adapters/polymarket_us/exec/endpoints.py"
 
 
-def test_v2_allowlist_is_exactly_two_read_literals_in_exactly_endpoints() -> None:
-    """Enumerated, not described: one module, two exact strings."""
+def test_v2_allowlist_is_exactly_three_literals_in_exactly_endpoints() -> None:
+    """Enumerated, not described: one module, three exact strings (two reads and
+    the one named per-order cancel write literal, ARM B1 / S4 r4 P7)."""
     assert dict(V2_ORDER_READ_PATH_ALLOWLIST) == {
-        _ENDPOINTS_PATH: frozenset({"/v1/orders/open", "/v1/order/"}),
+        _ENDPOINTS_PATH: frozenset(
+            {"/v1/orders/open", "/v1/order/", "/v1/order/{order_id}/cancel"}
+        ),
     }
 
 
@@ -2527,15 +2533,19 @@ def test_v2_allowlist_non_vacuity_the_real_endpoints_source_trips_under_any_othe
     source = (REPO_ROOT / _ENDPOINTS_PATH).read_text(encoding="utf-8")
     copycat = "src/breezy/adapters/polymarket_us/exec/endpoints_copy.py"
     v2 = [v for v in find_write_egress_violations(copycat, source) if v.rule == "V2"]
-    assert len(v2) >= 2, "endpoints.py must actually carry both allowlisted literals"
+    assert len(v2) >= 3, "endpoints.py must actually carry all three allowlisted literals"
     literals = {v.detail for v in v2}
     assert any("/v1/orders/open" in d for d in literals)
     assert any("/v1/order/" in d for d in literals)
+    assert any("/v1/order/{order_id}/cancel" in d for d in literals)
 
 
 def test_v2_allowlist_non_vacuity_a_second_module_with_the_same_literals_trips() -> None:
     """Direction 2: the exemption is an EXACT path, not a shared shape."""
-    source = 'OPEN = "/v1/orders/open"\nPREFIX = "/v1/order/"\n'
+    source = (
+        'OPEN = "/v1/orders/open"\nPREFIX = "/v1/order/"\n'
+        'CANCEL = "/v1/order/{order_id}/cancel"\n'
+    )
     for path in (
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/submit_chain.py",
@@ -2543,7 +2553,7 @@ def test_v2_allowlist_non_vacuity_a_second_module_with_the_same_literals_trips()
         "scripts/venue/endpoints.py",
     ):
         rules = [v.rule for v in find_write_egress_violations(path, source)]
-        assert rules.count("V2") == 2, path
+        assert rules.count("V2") == 3, path
 
 
 def test_v2_allowlist_a_new_order_literal_inside_endpoints_is_still_refused() -> None:
@@ -2552,6 +2562,7 @@ def test_v2_allowlist_a_new_order_literal_inside_endpoints_is_still_refused() ->
     source = (
         'OPEN = "/v1/orders/open"\n'
         'PREFIX = "/v1/order/"\n'
+        'CANCEL = "/v1/order/{order_id}/cancel"\n'
         'HISTORY = "/v1/orders/history"\n'
     )
     v2 = [v for v in find_write_egress_violations(_ENDPOINTS_PATH, source) if v.rule == "V2"]
@@ -2566,6 +2577,14 @@ def test_v2_allowlist_a_new_order_literal_inside_endpoints_is_still_refused() ->
         "/v1/orders/open/cancel",
         "/v1/order/{id}/cancel",
         "/v1/order/{id}/modify",
+        "/v1/order/{id}",
+        "/v1/order/{order_id}",
+        "/v1/order/{order_id}/modify",
+        "/v1/order/{order_id}/cancel/x",
+        "/v1/order/{order_id}/cancel?x",
+        "/v1/order/{order_id}/Cancel",
+        "/v1/order/{order_id}//cancel",
+        "/v1/order/{order_id}/cancel ",
         "/v1/orders/batched",
         "/v1/orders/batched/cancel",
         "/v1/order/preview",

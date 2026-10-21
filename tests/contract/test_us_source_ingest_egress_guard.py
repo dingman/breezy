@@ -54,7 +54,7 @@ COLLECT_DIR = SCRIPTS / "collect"
 BANNED_MODULES: dict[str, tuple[str, int, str]] = {
     "breezy.adapters.polymarket_us.write_transport": (
         "src/breezy/adapters/polymarket_us/write_transport.py",
-        147,
+        170,
         "class PolymarketUSWriteTransport",
     ),
     "breezy.adapters.polymarket_us.exec": (
