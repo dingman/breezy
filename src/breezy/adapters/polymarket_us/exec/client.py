@@ -9080,9 +9080,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.debug("resting poll: not a bound resting order; nothing to read")
             return
         try:
-            payload = await self._private_read(
-                submit_chain.order_by_id_path(target.venue_order_id)
-            )
+            payload = await self._private_read(submit_chain.order_by_id_path(target.venue_order_id))
         except Exception as exc:  # noqa: BLE001 - a failed GET is one strike, never fatal
             self._log.warning(f"resting poll: the GET failed ({exc.__class__.__name__})")
             self._note_resting_poll(target.venue_order_id, readable=False)
