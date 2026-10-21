@@ -3952,6 +3952,13 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # `SOCKET_RESTORING_MARKERS`, builds no client, and only touches the
         # in-process submit-intent latch and the supervisor decode marker file.
         "tests/unit/test_resting_retirement_reasons.py",
+        # ARM maker-sharp B3 / S4 r3 P16: `test_cage_rule_constants_are_pinned.py`
+        # now imports `exec.submit_chain` to pin `RESTING_PRICE_CAP` beside the
+        # other cage rule constants. WIDENED, not relaxed (L-6/L-12): the
+        # comparison is still `==`; the module carries no
+        # `SOCKET_RESTORING_MARKERS`, constructs no client, and only compares
+        # module-level constants (a `Decimal`) to their pins.
+        "tests/unit/test_cage_rule_constants_are_pinned.py",
     }
 
 

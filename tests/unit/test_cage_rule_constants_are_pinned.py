@@ -72,6 +72,7 @@ import ast
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
@@ -79,6 +80,7 @@ import pytest
 
 import tests.unit.test_execution_egress_firewall_guard as firewall
 import tests.unit.test_polymarket_us_readonly_guard as readonly
+from breezy.adapters.polymarket_us.exec import submit_chain
 from tests.unit.test_polymarket_us_readonly_guard import Violation, iter_python_sources
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -954,9 +956,21 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "body and no longer banned; BUY_SHORT (SDK-snapshot-only) and SELL_ "
         "(naked short) are banned instead",
     ),
+    # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): the highest
+    # NO price a resting order may be posted at. Widening it posts dearer bids;
+    # narrowing it silently disarms the family's whole price band.
+    RulePin(
+        module="submit_chain",
+        attr="RESTING_PRICE_CAP",
+        expected=Decimal("0.80"),
+        widened=Decimal("0.81"),
+        narrowed=Decimal("0.79"),
+        why="S4 P16: the resting shape's price cap (submit_chain.RESTING_PRICE_CAP). "
+        "A value change is a re-valuing and needs a ruling-cited commit",
+    ),
 )
 
-_MODULES = {"readonly": readonly, "firewall": firewall}
+_MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
 
 #: Every exemption the cage grants, as an EXACT path. Counter 1: a directory
 #: prefix would be a blanket allowance, and an entry naming a file that does
@@ -1058,6 +1072,8 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # R-6.5b-0 review: B3-M, no module-level HttpClient holder.
         "readonly.B3M_SCAN_ROOTS",
         "readonly.B3M_HTTP_CLIENT_CTOR_NAMES",
+        # ARM maker-sharp B3 / S4 r3 P16: the resting price cap.
+        "submit_chain.RESTING_PRICE_CAP",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
