@@ -59,6 +59,11 @@ KIND_AMBIGUOUS: Final[str] = "ambiguous"
 RETIRE_ACCEPT_FILL: Final[str] = "ACCEPTED_WITH_DURABLE_FILL"
 RETIRE_ZERO_FILL: Final[str] = "ACCEPTED_ZERO_FILL_TERMINAL"
 RETIRE_REJECT: Final[str] = "DEFINITIVE_REJECT"
+#: Resting-order reasons (S4 WP2, r3 P12). A node writes either only after the
+#: supervisor advertises it (``supervisor_admits_retirement_reason``); each is a
+#: ``RetirementReason`` member (``test_retirement_reason_superset.py``).
+RETIRE_ACCEPTED_RESTING: Final[str] = "ACCEPTED_RESTING"
+RETIRE_BOOT_SWEEP_RESTING_NO_FILL: Final[str] = "BOOT_SWEEP_RESTING_NO_FILL"
 
 SENDER_ABSENT_REASON: Final[str] = "order sender is not injected; this client refuses to submit"
 CANONICAL_UNVERIFIED_REASON: Final[str] = (

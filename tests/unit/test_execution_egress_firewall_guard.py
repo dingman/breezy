@@ -3943,6 +3943,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # comparison is still `==`; the module carries no `SOCKET_RESTORING_MARKERS`,
         # builds no client and no sender -- every function under test is pure.
         "tests/unit/test_polymarket_us_resting_order_shape.py",
+        # ARM maker-sharp B3 / S4 WP2 (plan S4 r3 WP2, P12): `test_resting_
+        # retirement_reasons.py` imports `exec.submit_chain` to pin the two
+        # `RETIRE_*` names it emits (`RETIRE_ACCEPTED_RESTING`, `RETIRE_BOOT_
+        # SWEEP_RESTING_NO_FILL`) and `retirement_member`, and the AST collector
+        # from `test_retirement_reason_superset.py`. WIDENED, not relaxed
+        # (L-6/L-12): the comparison is still `==`; the module carries no
+        # `SOCKET_RESTORING_MARKERS`, builds no client, and only touches the
+        # in-process submit-intent latch and the supervisor decode marker file.
+        "tests/unit/test_resting_retirement_reasons.py",
     }
 
 
