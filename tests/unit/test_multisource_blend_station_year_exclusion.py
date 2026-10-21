@@ -346,7 +346,7 @@ def test_the_build_pins_are_filled_and_the_two_derived_pins_are_exact_literals()
         "2026-03-31",
         "2026-05-06",
     ]
-    assert design["frozen_sha"] == "UNFROZEN"
+    assert design["frozen_sha"] == "205fd542b8d601524893b5855ad49736f01436ad"
 
 
 def test_the_skeleton_pins_pass_the_runner_and_builder_validators_once_the_blocked_two_are_set(

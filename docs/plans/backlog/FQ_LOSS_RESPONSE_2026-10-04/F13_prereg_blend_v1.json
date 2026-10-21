@@ -1,6 +1,6 @@
 {
   "schema": "f13_prereg_blend_v1",
-  "frozen_sha": "UNFROZEN",
+  "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
   "status": "DRAFT skeleton (F13 Phase A pins r3, PIN-R2). Every fixed pin and the veto reference are written as exact literals; `source_lags_ns` and `source_breaks` were filled on 2026-10-21 from the freeze-time C1 evidence (docs/evidence/f13/c1_lag_evidence_2026-10-21.json) by their rules (PIN-R6/R7) and are frozen by the stamp commit. Then it is frozen once (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, if the committed blob differs, or if the file was re-frozen.",
   "pin_note": "coordinator pins before any M1-M3 scoring",
   "plan": {
