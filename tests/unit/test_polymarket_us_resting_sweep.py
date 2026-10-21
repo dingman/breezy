@@ -411,3 +411,66 @@ def test_admission_forbids_two_open_intents_on_one_slug_at_k_greater_than_one() 
     assert admit(open_one, "tc-temp-a", False, 4, False, 0) == Wait("slug_open")
     assert admit(open_one, "tc-temp-b", False, 4, False, 0) == Admit()
     assert admit(open_one, "tc-temp-b", False, 1, False, 0) == Wait("slot_open")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_boot_sweep_with_the_pin_true_cancel_alls_each_ledger_slug_once_and_logs_foreign_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 5.4: with the slug pin True the sweep reads the UNFILTERED book, WARN-logs
+    every unbound order on a ledger slug (it will be cancelled by the slug cancel-all,
+    spec 9.18), cancel-alls each ledger slug exactly once, and re-reads."""
+    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    command = await _submit_rest(rig, 0)
+    src = wire_payloads(rig.client)
+    sender = CancelSender()
+    book: dict[str, Any] = {"orders": [_open_row(command, 7)]}  # a foreign rest, same slug
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): src[submit_chain.order_by_id_path(_id_n(0))],
+            OPEN_ORDERS_PATH: book,
+        },
+    )
+    sender.on_cancel = lambda oid: _set_state_on(second, 0, "ORDER_STATE_CANCELED")
+    sender.on_cancel_all = lambda slugs: book["orders"].clear()
+    await second._connect()
+    slug = submit_chain.build_resting_order_body(command.order, build_no_leg_instrument())[
+        "marketSlug"
+    ]
+    assert sender.cancel_alls == [[slug]]
+    assert _cancel_posts(sender) == [_id_n(0)]
+    assert second.log_lines("warning", "unbound open order")
+    assert second._trading_refusals == []
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_boot_sweep_never_cancel_alls_a_slug_that_is_only_a_no_id_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 5.3: a pre-POST no-id context is not in the cancellable ledger, so even with the
+    pin True its slug is never cancel-all'd; a busy slug latches instead."""
+    monkeypatch.setattr(submit_chain, "SLUG_SCOPED_CANCEL_ALL_VERIFIED", True)
+    client, _current, command = await _no_id_rest(tmp_path, monkeypatch)
+    sender = CancelSender()
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        client,
+        client.latch_cm,
+        sender=sender,
+        payloads={OPEN_ORDERS_PATH: {"orders": [_open_row(command, 0)]}},
+    )
+    await second._connect()
+    assert sender.cancel_alls == [] and sender.cancels == []
+    assert [r.reason for r in second._trading_refusals][:1] == [
+        submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+    ]
+    await second._disconnect()

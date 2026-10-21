@@ -8156,12 +8156,27 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "no intent is swept and the arm gate keeps refusing"
             )
             return
+        ledger_ids = {t.venue_order_id for t in ledger}
+        ledger_slugs = {t.slug for t in ledger if t.slug}
         try:
+            if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True:
+                # Pin True (r4 5.4): read the UNFILTERED book first so every unbound order
+                # on a ledger slug is named (id prefix only) before the slug cancel-all
+                # removes it (spec 9.18: a manual order on a family slug is cancelled).
+                before = parse_open_orders(await self._private_read(OPEN_ORDERS_PATH))
+                for record in before:
+                    foreign_here = record.venue_order_id not in ledger_ids
+                    if foreign_here and record.market_slug in ledger_slugs:
+                        self._log.warning(
+                            "resting sweep: unbound open order "
+                            f"{_redact_order_id(record.venue_order_id)} on {record.market_slug} "
+                            "will be cancelled by the slug cancel-all"
+                        )
+                for slug in ledger_slugs:
+                    await self._cancel_slug_orders(slug)
             unresolved = await self._cancel_resting_order(
                 [t.venue_order_id for t in ledger], max_passes=1
             )
-            for slug in {c.wire_market_slug for c in noid if c.wire_market_slug}:
-                await self._cancel_slug_orders(slug)
             for venue_id in unresolved:
                 self._latch_resting_cancel_unconfirmed(venue_id, "boot_sweep_unresolved")
             payload = await self._private_read(OPEN_ORDERS_PATH)
@@ -8173,8 +8188,6 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "boot-sweep", f"boot_sweep_reread_failed:{exc.__class__.__name__}"
             )
             return
-        ledger_ids = {t.venue_order_id for t in ledger}
-        ledger_slugs = {t.slug for t in ledger if t.slug}
         noid_slugs = {c.wire_market_slug for c in noid}
         foreign = [
             r
@@ -8337,7 +8350,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
         now_ns = self._clock.timestamp_ns()
         cached = self._cache.order(ClientOrderId(target.client_order_id))
-        if cached is not None and target.instrument_id is not None and target.strategy_id:
+        if (
+            cached is not None
+            and not cached.is_closed
+            and target.instrument_id is not None
+            and target.strategy_id
+        ):
             events = {
                 "strategy_id": StrategyId(target.strategy_id),
                 "instrument_id": InstrumentId.from_str(target.instrument_id),

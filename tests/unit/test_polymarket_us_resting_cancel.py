@@ -62,6 +62,7 @@ class CancelSender(_SlowSender):
         self.cancels: list[dict[str, Any]] = []
         self.cancel_alls: list[list[str]] = []
         self.on_cancel: Any = None
+        self.on_cancel_all: Any = None
         self.cancel_raises: BaseException | None = None
         self.gate: asyncio.Event | None = None
 
@@ -81,6 +82,8 @@ class CancelSender(_SlowSender):
     async def post_cancel_all(self, api_base_url: str, *, headers: Any, slugs: list[str]) -> Any:
         await asyncio.sleep(0)
         self.cancel_alls.append(list(slugs))
+        if self.on_cancel_all is not None:
+            self.on_cancel_all(list(slugs))
         return VenueResponse(status=200, headers={}, body=b"{}")
 
 
