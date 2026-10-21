@@ -30,6 +30,7 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     _auto_cancel,
     _names,
     _rig,
+    _set_state,
 )
 from tests.unit.test_polymarket_us_resting_submit import _id_n, _submit_rest
 from tests.unit.test_polymarket_us_resting_sweep import _open_row, _second_process
@@ -218,6 +219,54 @@ async def test_a_mid_batch_exception_latches_that_id_and_still_cancels_the_rest(
     assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == [_id_n(0)]
     assert _LATCH in [r.reason for r in client._trading_refusals]
     assert client._cancel_in_flight == frozenset()
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_settle_runs_before_the_native_event_and_a_raising_emit_is_contained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G8: the exposure is settled and the row retired BEFORE the event is emitted, and
+    an exception out of the emit neither escapes nor undoes the settle."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    seen: list[bool] = []
+
+    def boom(**kwargs: Any) -> None:
+        seen.append(client._ledger.has_open_exposure(intent_id))
+        raise RuntimeError("emit exploded")
+
+    monkeypatch.setattr(client, "generate_order_canceled", boom)
+    _set_state(rig, 0, "ORDER_STATE_CANCELED")
+    target = client._resting_target_of(_id_n(0))
+    assert target is not None
+    assert client._settle_resting_terminal(target, submit_chain.CANCEL_READ_CANCELED) is True
+    assert seen == [False], "settled before the emit"
+    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == []
+    assert client.log_lines("error", "RuntimeError") or client.log_lines("warning", "RuntimeError")
+    del command
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_raising_expired_emit_is_contained_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+
+    def boom(**kwargs: Any) -> None:
+        raise RuntimeError("emit exploded")
+
+    monkeypatch.setattr(client, "generate_order_expired", boom)
+    target = client._resting_target_of(_id_n(0))
+    assert target is not None
+    assert client._settle_resting_terminal(target, submit_chain.CANCEL_READ_EXPIRED) is True
     await client._disconnect()
 
 

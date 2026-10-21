@@ -8490,11 +8490,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """Retire a BOUND rest the venue shows terminal with nothing filled, once.
 
         Wins ``_retire_resting_row`` (a loser returns ``False`` and does nothing),
-        emits the native ``OrderCanceled`` / ``OrderExpired`` (only for an order this
-        run's cache knows), settles the exposure via ``settle`` (never
-        ``release_booking``) and restores the permit slot ONLY for an id this process
-        armed, idempotently per venue id. A permit that cannot restore (expired) is
-        logged and skipped: a cancel never needs the permit.
+        settles the exposure via ``settle`` (never ``release_booking``), restores the
+        permit slot ONLY for an id this process armed (idempotently per venue id), and
+        only THEN emits the native ``OrderCanceled`` / ``OrderExpired`` (only for an
+        order this run's cache knows; a failing emit is logged, never raised). A permit
+        that cannot restore (expired) is logged and skipped: a cancel never needs it.
         """
         venue_id = target.venue_order_id
         held = self._resting_bookings.get(venue_id)
@@ -8502,24 +8502,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return False
         self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
         now_ns = self._clock.timestamp_ns()
-        cached = self._cache.order(ClientOrderId(target.client_order_id))
-        if (
-            cached is not None
-            and not cached.is_closed
-            and target.instrument_id is not None
-            and target.strategy_id
-        ):
-            events = {
-                "strategy_id": StrategyId(target.strategy_id),
-                "instrument_id": InstrumentId.from_str(target.instrument_id),
-                "client_order_id": ClientOrderId(target.client_order_id),
-                "venue_order_id": VenueOrderId(venue_id),
-                "ts_event": now_ns,
-            }
-            if verdict == submit_chain.CANCEL_READ_EXPIRED:
-                self.generate_order_expired(**events)
-            else:
-                self.generate_order_canceled(**events)
+        # B5 review G8: settle BEFORE the native event is emitted. The row is already
+        # retired, so an exception out of the emit must not strand the exposure or the
+        # permit slot; the emit itself is guarded below.
         if self._ledger is not None:
             try:
                 self._ledger.settle(
@@ -8534,7 +8519,39 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._ledger.abandon_open_exposure(target.intent_id)
         if venue_id in self._this_process_resting_ids:
             self._restore_resting_budget(target)
+        try:
+            self._emit_resting_terminal_event(target, verdict, now_ns)
+        except Exception as exc:  # noqa: BLE001 - the settle above already stands
+            self._log.error(
+                "resting terminal: the native event could not be emitted "
+                f"({exc.__class__.__name__})"
+            )
         return True
+
+    def _emit_resting_terminal_event(
+        self, target: RestingTarget, verdict: str, now_ns: int
+    ) -> None:
+        """The native ``OrderCanceled`` / ``OrderExpired`` for a retired bound rest -- only
+        for an order this run's cache knows and has not already closed (SYNC)."""
+        cached = self._cache.order(ClientOrderId(target.client_order_id))
+        if (
+            cached is None
+            or cached.is_closed
+            or target.instrument_id is None
+            or not target.strategy_id
+        ):
+            return
+        events = {
+            "strategy_id": StrategyId(target.strategy_id),
+            "instrument_id": InstrumentId.from_str(target.instrument_id),
+            "client_order_id": ClientOrderId(target.client_order_id),
+            "venue_order_id": VenueOrderId(target.venue_order_id),
+            "ts_event": now_ns,
+        }
+        if verdict == submit_chain.CANCEL_READ_EXPIRED:
+            self.generate_order_expired(**events)
+        else:
+            self.generate_order_canceled(**events)
 
     def _restore_resting_budget(self, target: RestingTarget) -> None:
         """Give back the permit slot of a rest THIS process armed (idempotent per id)."""
