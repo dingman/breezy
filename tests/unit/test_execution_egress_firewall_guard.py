@@ -1862,6 +1862,8 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         "_cancel_resting_order",
         # S4 WP4 (ARM B5, pin row P4a): the GET-only cancel confirm (row N1).
         "_confirm_cancel_terminal",
+        # S4 WP4 (ARM B5, pin row P4c): the slug cancel-all choke point (row N3).
+        "_cancel_slug_orders",
         # The injected read protocol's own call signature.
         "__call__",
     }

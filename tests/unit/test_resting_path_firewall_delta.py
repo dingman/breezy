@@ -366,7 +366,7 @@ def test_planting_any_other_await_into_an_order_coroutine_is_flagged(
 
 #: Coroutines ADDED to the exact inventory, one named entry per reviewed commit.
 INVENTORY_ROWS: Final[frozenset[str]] = frozenset(
-    {"_cancel_resting_order", "_confirm_cancel_terminal"}
+    {"_cancel_resting_order", "_confirm_cancel_terminal", "_cancel_slug_orders"}
 )
 
 
