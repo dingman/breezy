@@ -8664,6 +8664,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         (the resolver skips them); an id another loop already owns is left to it.
         ``max_passes=None`` loops until every id is terminal (the cancel command's own
         task); the boot sweep passes a bound so ``_connect`` cannot hang.
+
+        Each id's attempt runs inside its own ``try``: any exception LATCHES
+        ``resting_cancel_unconfirmed`` for that id and the loop goes on to the next
+        (B5 review G10). The body is deliberately ONE coroutine (longer than the usual 50
+        lines): the single ``post_cancel_order`` send name, the exact callee set and the
+        sender-reference scope are pinned to THIS function (rows N2, P1b, P2, FW), so
+        extracting a per-id coroutine is a pin migration of its own, not a refactor.
         """
         owned = [v for v in venue_ids if v not in self._cancel_in_flight]
         self._cancel_in_flight = self._cancel_in_flight | frozenset(owned)

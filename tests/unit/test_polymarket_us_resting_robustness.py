@@ -1,9 +1,11 @@
-"""S4 WP4 (ARM maker-sharp B5 review G2-G8, G10, G11): robustness of the resting ledger,
-the rehydration, the cancel loop and the terminal settle.
+"""S4 WP4 (ARM maker-sharp B5 review G2-G5, G8, G10-G12, G14, G15 and the REJECTED event):
+robustness of the resting ledger, the rehydration, the cancel loop and the terminal settle.
 
 A poisoned durable binding row (or any exception inside one id's cancel attempt) must
 never fail ``_connect``, the evidence write or the other ids' cancels: the failure LATCHES
-``resting_cancel_unconfirmed`` and the loop goes on.
+``resting_cancel_unconfirmed`` and the loop goes on. Terminal reads must echo the id and
+slug that were asked about; logs and alert details name an order by a redacted prefix and
+never echo an id or slug that fails validation.
 
 Every sender and private read is a local double: no network, no venue contact.
 No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig``.
