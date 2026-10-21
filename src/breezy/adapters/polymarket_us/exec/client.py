@@ -1434,6 +1434,11 @@ class StartupOpenOrderSnapshot:
     venue_order_id: str
     market_slug: str
     state: str
+    #: S4 WP4 (4b): True iff ``venue_order_id`` has a live ``resting:`` binding row
+    #: whose slug equals ``market_slug`` -- an order THIS client bound. The never-arm
+    #: gate then ignores it; anything else open still refuses. A record written
+    #: before this field decodes ``False`` (unrecorded is never "ours").
+    own_resting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1481,6 +1486,7 @@ class StartupPositionEvidence:
                         "venue_order_id": o.venue_order_id,
                         "market_slug": o.market_slug,
                         "state": o.state,
+                        "own_resting": o.own_resting,
                     }
                     for o in self.open_orders
                 ],
@@ -1537,6 +1543,7 @@ class StartupPositionEvidence:
                         venue_order_id=str(entry["venue_order_id"]),
                         market_slug=str(entry["market_slug"]),
                         state=str(entry["state"]),
+                        own_resting=entry.get("own_resting") is True,
                     )
                     for entry in raw_open_orders
                 )
@@ -2551,6 +2558,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # wholly before or wholly after this span. A raise propagates and
             # fails the connect closed, exactly as the seed does.
             self._register_open_intents_at_boot()
+            # S4 WP4 (B4 review item 1): the same synchronous span -- rehydrate every
+            # BOUND rest from the durable ledger so its exposure is registered (unknown
+            # notional: admission is refused) and its booking is tracked for the sweep.
+            self._rehydrate_resting_at_boot()
             # AC6b (EDGE-2 plan r3, D8): the NEXT statement, no `await`
             # between -- a fill the resolver's own immediate pass above
             # already recorded (before this line runs) was necessarily
@@ -2566,6 +2577,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # `_reconcile_submit_intent`/`record_fill`), so it lands before
             # the resolver's NEXT periodic pass, not before its first.
             self._reconcile_no_side_first_order_key()
+            # S4 WP4 (4e): the boot sweep -- cancel-on-stop enforcement and the only
+            # retirement route for a prior-process no-id rest. BEFORE the startup
+            # evidence write below, so the evidence sees the swept book. Never raises:
+            # a failure latches and the node keeps refusing NEW rests.
+            await self._sweep_resting_orders_at_boot()
             # C1 (plan rev 6.1): the strategy's never-arm gate needs FRESH
             # startup evidence, taken AFTER reconciliation -- last, not
             # first, so a position opened or closed by whatever reconcile
@@ -6480,6 +6496,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 if net_raw is not None:
                     net_position = str(net_raw)
             snapshots.append(StartupPositionSnapshot(slug=slug, net_position=net_position))
+        # S4 WP4 (4b): the (id, slug) pairs of the bound `resting:` rows. An unreadable
+        # index yields none, so every open order stays foreign (the gate refuses).
+        own_resting = {
+            (t.venue_order_id, t.slug) for t in (self._resting_ledger() or ()) if t.bound
+        }
         evidence = StartupPositionEvidence(
             ts_ns=now_ns,
             eof_complete=eof_complete,
@@ -6492,6 +6513,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     venue_order_id=o.venue_order_id,
                     market_slug=o.market_slug,
                     state=o.state,
+                    own_resting=(o.venue_order_id, o.market_slug) in own_resting,
                 )
                 for o in self._open_orders
             ),
@@ -8047,6 +8069,128 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"({submit_chain.AMBIGUOUS_REASON!r}) for intent {intent_id}"
             )
         return True
+
+    # -- S4 WP4: restart rehydration and the boot sweep ------------------------
+
+    def _rehydrate_resting_at_boot(self) -> None:
+        """B4 review item 1: after a restart a live bound rest must not be invisible.
+
+        For every BOUND ledger row (the index plus its binding row) register the
+        intent's exposure with an UNKNOWN notional -- the row does not carry one, so
+        the ledger refuses admission (``open exposure has an unknown notional``)
+        until the sweep's terminal read settles it -- and track its booking
+        (``None``: the prior process's booking died with it). Not added to
+        ``_this_process_resting_ids``: a cancel here restores nothing to this
+        process's permit. An unreadable index registers nothing (``_read_fill_index``
+        has already refused). A bad row (no intent id) is skipped; the sweep latches it.
+        """
+        if self._ledger is None or self._latch is None or not self._intent_reconciled:
+            return
+        now_ns = self._clock.timestamp_ns()
+        for target in self._resting_ledger() or ():
+            if not target.bound or not target.intent_id:
+                continue
+            if not self._ledger.has_open_exposure(target.intent_id):
+                self._ledger.register_open_exposure(
+                    target.intent_id,
+                    None,
+                    booking=None,
+                    seeded_partial_usd=Decimal(0),
+                    side="BUY",
+                    now_ns=now_ns,
+                )
+            self._resting_bookings = {
+                **self._resting_bookings,
+                target.venue_order_id: (target.intent_id, None),
+            }
+
+    def _resting_noid_contexts(self) -> list[AmbiguousResolverContext]:
+        """The OPEN no-id resting contexts (the durable pre-POST slug ledger): a rest
+        whose POST may have landed with nothing to GET. SYNC."""
+        found: list[AmbiguousResolverContext] = []
+        if self._latch is None:
+            return found
+        for intent in self._latch.open_submit_intents():
+            context = self._boot_context_of(intent.intent_id)
+            if (
+                context is not None
+                and context.resting
+                and context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID
+                and context.wire_market_slug
+            ):
+                found.append(context)
+        return found
+
+    async def _sweep_resting_orders_at_boot(self) -> None:
+        """S4 WP4 (4e): the boot sweep over the durable resting ledger.
+
+        Cancels every ledger-bound id (per order, ONE bounded pass so ``_connect``
+        cannot hang), then re-reads the UNFILTERED open orders and certifies the
+        ledger's slugs. Unbound orders are NEVER cancelled (they may be the
+        operator's): WARN-logged by id and ONE CRITICAL alert, and the arm gate keeps
+        refusing them. A ledger id still open, an unreadable or uncertifiable re-read,
+        or a no-id context's slug that is not empty latches
+        ``resting_cancel_unconfirmed`` and marks no intent swept. A no-id resting
+        intent is added to ``_swept_resting_intent_ids`` ONLY when its slug reads
+        empty on a certified re-read (WP5 alone retires it). Does not run without an
+        injected sender and a verified canonical string; an empty ledger posts and
+        reads nothing; an unreadable index posts nothing and keeps its refusal.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            self._log.error("resting sweep: the ledger index is unreadable; nothing is cancelled")
+            return
+        noid = self._resting_noid_contexts()
+        if not ledger and not noid:
+            return
+        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            self._log.error(
+                "resting sweep does not run: the sender is absent or canonical unverified; "
+                "no intent is swept and the arm gate keeps refusing"
+            )
+            return
+        try:
+            unresolved = await self._cancel_resting_order(
+                [t.venue_order_id for t in ledger], max_passes=1
+            )
+            for slug in {c.wire_market_slug for c in noid if c.wire_market_slug}:
+                await self._cancel_slug_orders(slug)
+            for venue_id in unresolved:
+                self._latch_resting_cancel_unconfirmed(venue_id, "boot_sweep_unresolved")
+            payload = await self._private_read(OPEN_ORDERS_PATH)
+            if not submit_chain.open_orders_envelope_is_known(payload):
+                raise ExecutionReportMappingError("open-orders envelope has an undeclared key")
+            records = parse_open_orders(payload)
+        except Exception as exc:  # noqa: BLE001 - never raise out of `_connect`
+            self._latch_resting_cancel_unconfirmed(
+                "boot-sweep", f"boot_sweep_reread_failed:{exc.__class__.__name__}"
+            )
+            return
+        ledger_ids = {t.venue_order_id for t in ledger}
+        ledger_slugs = {t.slug for t in ledger if t.slug}
+        noid_slugs = {c.wire_market_slug for c in noid}
+        foreign = [
+            r
+            for r in records
+            if r.venue_order_id not in ledger_ids and r.market_slug in ledger_slugs | noid_slugs
+        ]
+        for record in foreign:
+            self._log.warning(
+                f"resting sweep: unbound open order {_redact_order_id(record.venue_order_id)} "
+                f"on {record.market_slug} is NOT cancelled"
+            )
+        if foreign:
+            self._log.error(
+                f"resting sweep: {len(foreign)} unbound open order(s) on a ledger slug; "
+                "never cancelled, the never-arm gate keeps refusing"
+            )
+        busy = {r.market_slug for r in records}
+        swept = [c.intent_id for c in noid if c.wire_market_slug not in busy]
+        if len(swept) != len(noid):
+            self._latch_resting_cancel_unconfirmed(
+                "boot-sweep", "boot_sweep_slug_not_empty_for_a_no_id_rest"
+            )
+        self._swept_resting_intent_ids = self._swept_resting_intent_ids | frozenset(swept)
 
     # -- S4 WP4: the resting-order ledger, cancel loop and latches -------------
 

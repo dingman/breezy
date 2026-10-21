@@ -45,6 +45,9 @@ from tests.unit.test_polymarket_us_resting_submit import (
     _submit_rest,
     _venue_order,
 )
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_unverified,  # noqa: F401 -- used via usefixtures
+)
 
 _INDEX_KEY: Final[str] = client_module.RESTING_INDEX_KEY
 _ROW_PREFIX: Final[str] = client_module.RESTING_KEY_PREFIX
@@ -394,10 +397,12 @@ async def test_cancel_is_rejected_while_the_sender_is_missing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("write_canonical_unverified")
 async def test_cancel_is_rejected_while_the_canonical_string_is_unverified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No ``write_canonical_verified`` fixture: the module default (unverified) holds."""
+    """The submit-chain module's own fixture pins the flag False (it is the one place
+    allowed to set it); a cancel is then rejected before any POST."""
     enable_operator_gate(monkeypatch, order_count="2")
     with caps():
         rig = await _rig(tmp_path, monkeypatch)
