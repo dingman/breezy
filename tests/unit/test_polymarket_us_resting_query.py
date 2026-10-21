@@ -29,6 +29,7 @@ from tests.unit.ambig_latch_rig import (
 from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
 from tests.unit.test_current_rung_hold_pre_arm_race import STRATEGY_ID, TRADER_ID
 from tests.unit.test_polymarket_us_resting_cancel import (
+    CancelSender,
     _auto_cancel,
     _cancel_cmd,
     _names,
@@ -43,6 +44,7 @@ from tests.unit.test_polymarket_us_resting_submit import (
     _Rig,
     _submit_rest,
 )
+from tests.unit.test_polymarket_us_resting_sweep import _second_process
 
 _INDEX_KEY: Final[str] = client_module.RESTING_INDEX_KEY
 NS: Final[int] = 1_000_000_000
@@ -636,3 +638,99 @@ async def test_durable_fill_record_key_set_unchanged_no_commission_sign(
         "feeSource",
     }
     await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# One winner: poll and cancel-confirm book a fill once (N-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_and_cancel_confirm_book_one_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    settles: list[str] = []
+    ledger_type = type(client._ledger)
+    real = ledger_type.settle
+
+    def spy(self: Any, key: str, **kwargs: Any) -> Any:
+        settles.append(key)
+        return real(self, key, **kwargs)
+
+    monkeypatch.setattr(ledger_type, "settle", spy)
+    _fill(rig, 0)
+    await client._cancel_order(_cancel_cmd(rig, command))  # the cancel loop reads FILLED
+    await client._query_order(_query(rig, command))  # then the poll reads FILLED again
+    await client._query_order(_query(rig, command))
+    assert len(_filled_events(rig)) == 1
+    assert len(_records(rig)) == 1
+    assert settles == [intent_id]
+    assert "OrderCanceled" not in _names(rig)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_cancel_loop_filled_read_books_the_fill_without_restoring_the_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B5 left the row for the poll; the cancel path's FILLED read now books it
+    (durable record, then event, then settle) and a fill gives the permit slot nothing back."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    before = _remaining(rig)
+    _fill(rig, 0, commission="0.01")
+    await client._cancel_order(_cancel_cmd(rig, command))
+    assert len(_filled_events(rig)) == 1 and len(_records(rig)) == 1
+    assert json.loads(client._store_get(_INDEX_KEY)) == []
+    assert _remaining(rig) == before, "a fill spends the slot; nothing is restored"
+    assert not client._unconfirmed_cancel_ids
+    await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# A rest that filled while the node was down: the boot sweep books it (r3 4e(2))
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_boot_sweep_that_reads_a_rest_filled_books_it_and_the_next_boot_seeds_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable fill record first, then settle (no event: the new run's cache has no such
+    order), exposure closed, nothing restored to the new permit; the NEXT boot's
+    seed-from-durable-fills accounting counts the same fill once."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    first = rig.client
+    intent_id = first._resting_bookings[_id_n(0)][0]
+    _fill(rig, 0, commission="0.01")
+    path = submit_chain.order_by_id_path(_id_n(0))
+    payloads = {path: first._private_read._payloads[path]}
+    sender = CancelSender()
+    second = await _second_process(
+        tmp_path, monkeypatch, first, first.latch_cm, sender=sender, payloads=payloads
+    )
+    await second._connect()
+    records = tuple(second.fill_records_for(build_no_leg_instrument().id))
+    assert len(records) == 1 and submit_chain.is_maker_poll_fill(records[0].trade_id)
+    assert records[0].cumulative_cost == NO_PX
+    day = client_module.utc_day_for_ns(records[0].ts_event).isoformat()
+    assert _id_n(0) in (second._read_fill_index(f"{client_module.FILL_BY_DAY_KEY_PREFIX}{day}"))
+    assert not second._ledger.has_open_exposure(intent_id)
+    assert json.loads(second._store_get(_INDEX_KEY)) == []
+    assert second._trading_refusals == []
+    assert not second._budget_was_restored(_id_n(0)), "a fill gives the permit nothing back"
+    spent_now = second._ledger.spent_today_usd(now_ns=second._clock.timestamp_ns())
+    assert spent_now == NO_PX
+    third = await _second_process(
+        tmp_path, monkeypatch, second, second.latch_cm, sender=CancelSender()
+    )
+    await third._connect()
+    assert third._ledger.spent_today_usd(now_ns=third._clock.timestamp_ns()) == NO_PX
+    await third._disconnect()
+    del command

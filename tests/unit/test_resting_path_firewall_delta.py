@@ -433,6 +433,9 @@ EXEC_CANCEL_CONFIRM_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
     {
         "isinstance",
         "payload.get",
+        # ARM B6 (NAMED row, widen only): the cancel/sweep read that finds the order FILLED
+        # books the fill through the poll's single winner; used only by this confirm.
+        "self._book_filled_read",
         "self._log.warning",
         "self._private_read",
         "submit_chain.cancel_read_verdict",
@@ -478,6 +481,26 @@ def test_the_cancel_confirm_callee_set_is_exact_and_egress_free() -> None:
 def test_planting_a_send_or_write_into_the_cancel_confirm_is_flagged(statement: str) -> None:
     planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _CANCEL_CONFIRM, statement)
     assert _cancel_confirm_violations(planted) != []
+
+
+def test_the_filled_read_booker_is_named_only_by_the_cancel_confirm() -> None:
+    """ARM B6 row N1b usage side: ``_book_filled_read`` is reached from the GET-only cancel
+    confirm and nowhere else; planted into the cancel loop or the sweep it is a second
+    caller the exact sets reject."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    callers = {
+        node.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Call)
+        and firewall._dotted_callee(inner.func) == "self._book_filled_read"
+    }
+    assert callers == {_CANCEL_CONFIRM}
+    planted = _plant_into(source, _CANCEL_LOOP, "self._book_filled_read('x', {})")
+    assert _cancel_loop_violations(planted) != []
+    planted_sweep = _plant_into(source, _SWEEP, "self._book_filled_read('x', {})")
+    assert _sweep_violations(planted_sweep) != []
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +939,7 @@ def test_the_query_coroutine_is_defined_and_no_longer_declared_unimplemented() -
 #: forbids ``_order_sender`` outside its named rows, this adds the rest).
 POLL_HELPERS: Final[frozenset[str]] = frozenset(
     {
+        "_book_filled_read",
         "_resting_poll_target",
         "_resting_instrument",
         "_parse_resting_read",

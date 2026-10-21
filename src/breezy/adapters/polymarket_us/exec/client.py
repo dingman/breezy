@@ -8653,11 +8653,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.warning(f"resting cancel: confirm GET failed ({exc.__class__.__name__})")
             return submit_chain.CANCEL_READ_UNREADABLE
         nested = payload.get("order") if isinstance(payload, Mapping) else None
-        return submit_chain.cancel_read_verdict(
-            nested if isinstance(nested, Mapping) else payload,
-            expected_id=venue_order_id,
-            expected_slug=market_slug,
+        body = nested if isinstance(nested, Mapping) else payload
+        verdict = submit_chain.cancel_read_verdict(
+            body, expected_id=venue_order_id, expected_slug=market_slug
         )
+        if verdict == submit_chain.CANCEL_READ_FILLED:
+            # B6: the cancel/sweep read that finds the order FILLED books the fill through
+            # the same single winner as the poll (durable record, event, settle).
+            self._book_filled_read(venue_order_id, body)
+        return verdict
 
     async def _cancel_resting_order(
         self, venue_ids: list[str] | tuple[str, ...], *, max_passes: int | None = None
