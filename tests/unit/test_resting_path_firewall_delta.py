@@ -29,6 +29,7 @@ from tests.unit import test_execution_egress_firewall_guard as firewall
 from tests.unit.ambig_latch_rig import client_module
 
 CLIENT_PATH: Final[Path] = Path(client_module.__file__)
+CLIENT_REL: Final[str] = "src/breezy/adapters/polymarket_us/exec/client.py"
 
 #: callee -> the order coroutines allowed to reference it. Each key is a row
 #: ADDED to ``EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`` by its own commit.
@@ -164,3 +165,64 @@ def test_planting_a_send_or_write_into_the_confirm_coroutine_is_flagged(statemen
     source = CLIENT_PATH.read_text(encoding="utf-8")
     planted = _plant_into(source, _CONFIRM, statement)
     assert _confirm_violations(planted) != []
+
+
+# ---------------------------------------------------------------------------
+# Resolver-scan rows (P6a/P6b and the binder's own callees)
+# ---------------------------------------------------------------------------
+
+#: callee -> the scanned resolver bodies allowed to call it. Each key is a row
+#: ADDED to ``EXEC_RESOLVER_PERMITTED_CALLEES`` by its own commit; none is a send.
+RESOLVER_ROWS: Final[dict[str, frozenset[str]]] = {}
+#: The scanned resolver helper this item adds (row P6a): the ONE binder.
+BINDER: Final[str] = "_bind_resting_order"
+
+
+def _resolver_references(source: str, callee: str) -> set[str]:
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name not in firewall.EXEC_RESOLVER_COROUTINES:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call) and firewall._dotted_callee(inner.func) == callee:
+                found.add(node.name)
+    return found
+
+
+def _plant_any(source: str, function: str, statement: str) -> str:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == function:
+            node.body.insert(0, ast.parse(statement).body[0])
+            return ast.unparse(ast.fix_missing_locations(tree))
+    raise AssertionError(f"{function} is not defined")
+
+
+@pytest.mark.parametrize("callee", sorted(RESOLVER_ROWS))
+def test_each_resolver_row_is_in_the_firewall_set_and_used_only_where_named(callee: str) -> None:
+    assert callee in firewall.EXEC_RESOLVER_PERMITTED_CALLEES
+    used = _resolver_references(CLIENT_PATH.read_text(encoding="utf-8"), callee)
+    assert used, f"{callee} must be referenced (a row nothing uses is dead permission)"
+    assert used <= RESOLVER_ROWS[callee], (callee, used)
+
+
+@pytest.mark.parametrize("callee", sorted(RESOLVER_ROWS))
+def test_planting_a_resolver_row_into_another_scanned_body_trips_the_pin(callee: str) -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    planted = _plant_any(source, "_resolve_terminal_zero", f"{callee}(None)")
+    used = _resolver_references(planted, callee)
+    assert "_resolve_terminal_zero" in used
+    assert not used <= RESOLVER_ROWS[callee]
+
+
+def test_the_binder_is_a_scanned_resolver_helper_and_a_planted_send_is_flagged() -> None:
+    """Row P6a-1 (r3 R1): ``_bind_resting_order`` is scanned like the resolver, so a
+    ``post_order`` laundered through it would be a violation."""
+    assert BINDER in firewall.EXEC_RESOLVER_COROUTINES
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert firewall.find_exec_resolver_violations(CLIENT_REL, source) == []
+    planted = _plant_any(source, BINDER, "self._order_sender.post_order(None)")
+    violations = firewall.find_exec_resolver_violations(CLIENT_REL, planted)
+    assert any(BINDER in v.detail for v in violations), violations

@@ -160,6 +160,8 @@ PRE_RESOLVER_COROUTINES = frozenset(
         "_resolve_accept_fill",
         "_resolve_ambiguous_intents",
         "_resolve_terminal_zero",
+        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1). NAMED row added to the baseline, never relaxed.
+        "_bind_resting_order",
     }
 )
 

@@ -2155,6 +2155,8 @@ EXEC_RESOLVER_COROUTINES = frozenset(
         "_no_id_trade_activity",
         "_resolve_no_order",
         "_adopt_no_id_venue_order",
+        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1).
+        "_bind_resting_order",
     }
 )
 
