@@ -130,7 +130,7 @@ async def test_late_landing_post_after_first_read_is_caught_by_second_read(
     assert _retirement(client) is None, "never NO_FILL once the rest is visible"
     adopted = read_context(client, current.intent_id)
     assert adopted.venue_order_id == VENUE_ID
-    assert current.intent_id not in client._no_id_resting_first_nofill_ns
+    assert client._no_id_resting_first_nofill_ns.get(current.intent_id, 0) == 0
     await client._disconnect()
 
 

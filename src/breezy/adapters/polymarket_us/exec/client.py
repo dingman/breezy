@@ -1976,7 +1976,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
         # TWO consecutive NO_FILL verdicts >= `_NO_ID_RECHECK_INTERVAL_NS` apart
         # (a late-landing POST after the first read is then caught by the second).
-        # Cleared on any other verdict and at retirement.
+        # 0 = no streak (reset by any other verdict); removed at retirement.
         self._no_id_resting_first_nofill_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
         self._order_sender = order_sender
@@ -4739,10 +4739,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return
 
         if outcome_kind != "NO_FILL" and intent_id in self._no_id_resting_first_nofill_ns:
+            # A non-negative verdict resets the streak (0 = none; a dict-method call
+            # would be an unpermitted callee in this scanned coroutine).
             self._no_id_resting_first_nofill_ns = {
-                key: value
-                for key, value in self._no_id_resting_first_nofill_ns.items()
-                if key != intent_id
+                **self._no_id_resting_first_nofill_ns,
+                intent_id: 0,
             }
         if outcome_kind == "NO_FILL" and context is not None and context.resting:
             # S4 WP3: a RESTING order needs two consecutive complete negative
@@ -4750,9 +4751,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             first_nofill_ns = (
                 self._no_id_resting_first_nofill_ns[intent_id]  # noqa: SIM401
                 if intent_id in self._no_id_resting_first_nofill_ns
-                else None
+                else 0
             )
-            if first_nofill_ns is None:
+            if first_nofill_ns == 0:
                 self._no_id_resting_first_nofill_ns = {
                     **self._no_id_resting_first_nofill_ns,
                     intent_id: now_ns,
