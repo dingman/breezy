@@ -7,6 +7,7 @@ for the arm under test (`sharp`: `ARMS["sharp"]`; `control`: the shipped constan
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import itertools
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -132,6 +133,88 @@ def test_invalid_probability_and_theta_raise_like_the_original(
     _, params = arm
     _same(rule.decide_bid, s_rule.decide_bid, bad, None, None, 0.0695, extra=(params,))
     _same(rule.decide_bid, s_rule.decide_bid, 0.99, None, None, bad, extra=(params,))
+
+
+def _custom(**over: Any) -> p.MakerRuleParams:
+    return dataclasses.replace(p.SHARP_V1, **over)
+
+
+def test_b_max_none_and_lowest_cent_region_matches_original() -> None:
+    """p_min 0.0 reaches the b_max branch for every p_no; large theta pushes b_max to the floor."""
+    params = _custom(p_min=0.0)
+    seen_none = seen_floor = seen_reason = False
+    with rule_override(params.b_cap, params.max_rungs, p_min=0.0, e_min=0.04, b_floor=0.75):
+        for theta in (0.0, 0.0695, 0.5, 2.0, 10.0):
+            for k in range(1001):
+                p_no = k / 1000
+                got = rule.b_max(p_no, theta, params)
+                assert got == s_rule.b_max(p_no, theta)
+                seen_none |= got is None
+                seen_floor |= got == params.b_floor
+                dec = rule.decide_bid(p_no, None, None, theta, params)
+                want = s_rule.decide_bid(p_no, None, None, theta)
+                assert (dec.bid, dec.reason) == (want.bid, want.reason)
+                seen_reason |= dec.reason == rule.REASON_B_MAX_BELOW_FLOOR
+                GRID_SIZE.append(1)
+    assert seen_none and seen_floor and seen_reason
+
+
+def test_cents_and_desired_price_survive_every_cent() -> None:
+    """round(price * 100) must recover each integer cent (29, 57, 58 break a truncating int())."""
+    ctx = t.DecisionContext(now_ns=0, books={}, live_bids={}, held=frozenset())
+    s_ctx = s_events.DecisionContext(
+        now_ns=0, vector=None, books={}, live_bids={}, held=frozenset()
+    )
+    for cent in range(101):
+        price = cent / 100
+        assert rule._cents(price) == cent == s_rule._cents(price)
+        (ours,) = selector._desired(("r",), {"r": price}, ctx)
+        (theirs,) = s_adapter._desired(("r",), {"r": price}, s_ctx)
+        assert (ours.rung_id, ours.bid_cents) == (theirs.rung_id, theirs.bid_cents) == ("r", cent)
+        GRID_SIZE.append(1)
+
+
+def test_b_max_equality_boundary_needs_eps() -> None:
+    """p_no exactly at b + theta*b*(1-b) == p_no - e_min keeps b despite float rounding."""
+    params = _custom(p_min=0.0)
+    cases: list[tuple[float, float, float]] = []  # (theta, p_no, b) with b exactly on the boundary
+    for cent in range(75, 90):
+        b = cent / 100
+        cases.append((0.0, round(b + params.e_min, 2), b))  # decimal p_no: 0.84 - 0.04 < 0.80
+        for theta in (0.01, 0.06, 0.0695, 0.1):
+            cases.append((theta, b + theta * b * (1.0 - b) + params.e_min, b))
+    lossy = 0
+    with rule_override(params.b_cap, params.max_rungs, p_min=0.0, e_min=0.04, b_floor=0.75):
+        for theta, p_no, b in cases:
+            lossy += (p_no - params.e_min) < b + theta * b * (1.0 - b)
+            assert rule.b_max(p_no, theta, params) == s_rule.b_max(p_no, theta) == b
+            below = rule.b_max(p_no - 1e-8, theta, params)
+            assert below == s_rule.b_max(p_no - 1e-8, theta)
+            assert below is None or below < b
+            GRID_SIZE.append(1)
+    assert lossy >= 4  # the grid really contains float-lossy boundary cases
+
+
+def test_obs_cancel_eps_edge() -> None:
+    edge = 82.0
+    just_inside = edge - 2.0 - 1e-12
+    assert rule.obs_cancel(just_inside, edge) is True
+    assert rule.obs_cancel(just_inside, edge) == s_rule.obs_cancel(just_inside, edge)
+    outside = edge - 2.0 - 1e-8
+    assert rule.obs_cancel(outside, edge) is False
+    assert rule.obs_cancel(outside, edge) == s_rule.obs_cancel(outside, edge)
+    # integer-C widening applies to the upper bound
+    assert rule.obs_cancel(edge - 2.0 - 1.8, edge, True) is True
+    assert rule.obs_cancel(edge - 2.0 - 1.8 - 1e-8, edge, True) is False
+
+
+def test_params_validation_messages_echo_the_offending_values() -> None:
+    with pytest.raises(ValueError, match=r"0\.9.*0\.8"):
+        _custom(b_floor=0.9, b_cap=0.8)
+    with pytest.raises(ValueError, match=r"1\.5.*-0\.1"):
+        _custom(p_min=1.5, e_min=-0.1)
+    with pytest.raises(ValueError, match=r"0, 8, 8"):
+        _custom(max_rungs=0)
 
 
 def test_forecast_gate_grid(arm: tuple[str, p.MakerRuleParams]) -> None:
@@ -454,3 +537,33 @@ def test_rung_pricer_memoises_like_the_original(arm: tuple[str, p.MakerRuleParam
     assert len(calls) == 2
     want = s_rule.decide_bid(0.99, 0.75, 0.9, 0.0695)
     assert (first.bid, first.reason) == (want.bid, want.reason)
+
+
+@pytest.mark.parametrize("stress", ["none", "plus60"])
+def test_classify_p_no_stale_boundary_is_exactly_stale_h(
+    arm: tuple[str, p.MakerRuleParams], tmp_path: Path, stress: Any
+) -> None:
+    _, params = arm
+    ported, original = _stores(tmp_path)
+    last = pno.release_instants(ported, "SFO", DAY, stress=stress)[-1]
+    limit = last + params.stale_h * NS_H
+    for now, stale in ((limit, False), (limit + 1, True), (limit - 1, False)):
+        got = pno.classify_p_no(ported, "SFO", DAY, now, stress=stress, stale_h=params.stale_h)
+        want = s_pno.classify_p_no(original, "SFO", DAY, now, stress=stress)
+        assert type(got).__name__ == type(want).__name__
+        assert isinstance(got, pno.AbstainReason) is stale
+        if isinstance(got, pno.AbstainReason):
+            assert isinstance(want, s_pno.AbstainReason)
+            assert got.reason == want.reason == pno.FORECAST_STALE
+        GRID_SIZE.append(1)
+
+
+def test_selector_plan_memo_keeps_only_the_latest_view(arm: tuple[str, p.MakerRuleParams]) -> None:
+    _, params = arm
+    memo = selector._Memo(selector.RungPricer(0.0695, selector._quote, params))
+    first, second = {"a": 0.1, "b": 0.2}, {"a": 0.1, "b": 0.2}
+    edges = {"a": 0.0, "b": 1.0}
+    plan_a = memo.plan_for(first, edges, params)
+    assert memo.plan_for(first, edges, params) is plan_a
+    plan_b = memo.plan_for(second, edges, params)
+    assert plan_b is not plan_a and memo.plan == (second, plan_b)  # one entry, the latest

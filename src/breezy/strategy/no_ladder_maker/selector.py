@@ -187,20 +187,23 @@ def _abstain(served: AbstainReason, tracker: WantTracker | None) -> Decision:
 
 @dataclass
 class _Memo:
-    """What one selector may reuse between decisions: rung prices and per-vector ladder plans."""
+    """What one selector may reuse between decisions: rung prices and the latest ladder plan."""
 
     pricer: RungPricer
-    plans: dict[int, tuple[Mapping[str, float], rule.LadderPlan]] = field(default_factory=dict)
+    plan: tuple[Mapping[str, float], rule.LadderPlan] | None = None
 
     def plan_for(
         self, p_yes: Mapping[str, float], edges: Mapping[str, float], params: MakerRuleParams
     ) -> rule.LadderPlan:
-        """One plan per p_yes view (the store keeps one view per cycle; the ref pins its id)."""
-        hit = self.plans.get(id(p_yes))
-        if hit is not None and hit[0] is p_yes:
-            return hit[1]
+        """One plan, for the p_yes view in force (the store keeps one view per cycle).
+
+        Only the latest view is kept: forecast time moves forward, so an older view never
+        returns, and holding every view served would grow without bound in a live process.
+        """
+        if self.plan is not None and self.plan[0] is p_yes:
+            return self.plan[1]
         plan = rule.ladder_plan(p_yes, edges, params)
-        self.plans[id(p_yes)] = (p_yes, plan)
+        self.plan = (p_yes, plan)
         return plan
 
 

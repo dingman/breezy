@@ -28,9 +28,12 @@ class MakerRuleParams:
         if not 0.0 <= self.b_floor <= self.b_cap <= 1.0:
             raise ValueError(f"need 0 <= b_floor <= b_cap <= 1, got {self.b_floor}, {self.b_cap}")
         if not 0.0 <= self.p_min <= 1.0 or self.e_min < 0.0:
-            raise ValueError("p_min must be in [0, 1] and e_min >= 0")
+            raise ValueError(f"need p_min in [0, 1] and e_min >= 0, got {self.p_min}, {self.e_min}")
         if self.max_rungs < 1 or self.max_simultaneous < 1 or self.stale_h < 1:
-            raise ValueError("max_rungs, max_simultaneous and stale_h must be >= 1")
+            raise ValueError(
+                "max_rungs, max_simultaneous and stale_h must be >= 1, got "
+                f"{self.max_rungs}, {self.max_simultaneous}, {self.stale_h}"
+            )
 
 
 SHARP_V1: Final = MakerRuleParams(
