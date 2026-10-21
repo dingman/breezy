@@ -1410,6 +1410,33 @@ class StartupPositionSnapshot:
     net_position: str | None
 
 
+#: The synthetic latch id of a ledger enumeration failure (not a venue order id).
+_LEDGER_LATCH_ID: Final[str] = "ledger"
+
+
+def _binding_row_fields(row: object) -> tuple[str, str, str, int] | None:
+    """``(intent_id, client_order_id, slug, expire_time_ns)`` out of a decoded binding row,
+    or ``None`` when the row is not an object or any field has the wrong type (B5 review
+    G10/G11): ids must be printable-ASCII ``str``, the slug a daily-high market slug, the
+    expiry a non-negative ``int`` (never a ``bool``). Absent keys default to empty / ``0``;
+    an empty slug is still reported (the loop treats it as terminal-unconfirmable).
+    """
+    if not isinstance(row, dict):
+        return None
+    intent_id = row.get("intentId", "")
+    client_order_id = row.get("clientOrderId", "")
+    slug = row.get("slug", "")
+    expire = row.get("expireTimeNs", 0)
+    for text in (intent_id, client_order_id):
+        if not isinstance(text, str) or not (text.isascii() and (text == "" or text.isprintable())):
+            return None
+    if not isinstance(slug, str) or (slug != "" and not submit_chain.is_daily_high_slug(slug)):
+        return None
+    if not isinstance(expire, int) or isinstance(expire, bool) or expire < 0:
+        return None
+    return intent_id, client_order_id, slug, expire
+
+
 @dataclass(frozen=True, slots=True)
 class RestingTarget:
     """One resting order this client may cancel: a BOUND ``resting:`` row (``bound``)
@@ -8182,24 +8209,33 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         has already refused). A bad row (no intent id) is skipped; the sweep latches it.
         """
         if self._ledger is None or self._latch is None or not self._intent_reconciled:
+            self._log.warning(
+                "resting rehydration skipped: the intent ledger is not reconciled; the "
+                "boot sweep still cancels every bound rest"
+            )
             return
         now_ns = self._clock.timestamp_ns()
         for target in self._resting_ledger() or ():
             if not target.bound or not target.intent_id:
                 continue
-            if not self._ledger.has_open_exposure(target.intent_id):
-                self._ledger.register_open_exposure(
-                    target.intent_id,
-                    None,
-                    booking=None,
-                    seeded_partial_usd=Decimal(0),
-                    side="BUY",
-                    now_ns=now_ns,
+            try:
+                if not self._ledger.has_open_exposure(target.intent_id):
+                    self._ledger.register_open_exposure(
+                        target.intent_id,
+                        None,
+                        booking=None,
+                        seeded_partial_usd=Decimal(0),
+                        side="BUY",
+                        now_ns=now_ns,
+                    )
+                self._resting_bookings = {
+                    **self._resting_bookings,
+                    target.venue_order_id: (target.intent_id, None),
+                }
+            except Exception as exc:  # noqa: BLE001 - one bad row never fails `_connect`
+                self._latch_resting_cancel_unconfirmed(
+                    target.venue_order_id, f"rehydrate_failed:{type(exc).__name__}"
                 )
-            self._resting_bookings = {
-                **self._resting_bookings,
-                target.venue_order_id: (target.intent_id, None),
-            }
 
     def _resting_noid_contexts(self) -> list[AmbiguousResolverContext]:
         """The OPEN no-id resting contexts (the durable pre-POST slug ledger): a rest
@@ -8313,8 +8349,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         when the index is UNREADABLE (``_read_fill_index`` has already refused): the
         callers then treat the ledger as empty and issue zero POSTs. A row that will
         not decode yields a target with an empty slug (terminal-unconfirmable in the
-        loop), never a skipped id.
+        loop), never a skipped id. NEVER RAISES (B5 review G10): an unexpected failure
+        enumerating the ledger latches ``resting_cancel_unconfirmed`` and returns
+        ``None``, so ``_connect`` and the evidence write cannot be failed by a bad row.
         """
+        try:
+            return self._enumerate_resting_ledger()
+        except Exception as exc:  # noqa: BLE001 - never raised out of the ledger
+            self._latch_resting_cancel_unconfirmed(
+                _LEDGER_LATCH_ID, f"ledger_enumeration_failed:{type(exc).__name__}"
+            )
+            return None
+
+    def _enumerate_resting_ledger(self) -> tuple[RestingTarget, ...] | None:
         indexed = self._read_fill_index(RESTING_INDEX_KEY)
         if indexed is None:
             return None
@@ -8345,35 +8392,48 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         return tuple(found)
 
     def _bound_target_of(self, venue_order_id: str) -> RestingTarget:
-        """The target for one indexed id, decoded from its durable binding row."""
+        """The target for one indexed id, decoded DEFENSIVELY from its durable binding
+        row (B5 review G10/G11). A row that is missing, undecodable, not an object, or
+        carries a wrongly-typed field (a JSON ``null`` slug is NOT the string ``"None"``)
+        yields an UNUSABLE target -- empty slug and ids, still ``bound`` -- which the
+        cancel loop latches rather than posting; it never raises.
+        """
+        unusable = RestingTarget(venue_order_id, "", "", "", None, None, 0, True)
         raw = self._store_get(f"{RESTING_KEY_PREFIX}{venue_order_id}")
         row: Any = None
         if raw:
             try:
                 row = json.loads(raw)
-            except ValueError:
+            except ValueError:  # includes UnicodeDecodeError
                 row = None
-        if not isinstance(row, dict):
-            self._log.error("resting ledger: a bound id has no readable binding row")
-            return RestingTarget(venue_order_id, "", "", "", None, None, 0, True)
-        intent_id = str(row.get("intentId", ""))
-        client_order_id = str(row.get("clientOrderId", ""))
-        context = self._boot_context_of(intent_id) if intent_id else None
-        instrument_id = None if context is None else context.instrument_id
-        strategy_id = None if context is None else context.strategy_id
-        if instrument_id is None:
-            cached = self._cache.order(ClientOrderId(client_order_id)) if client_order_id else None
-            if cached is not None:
-                instrument_id = str(cached.instrument_id)
-                strategy_id = str(cached.strategy_id)
+        fields = _binding_row_fields(row)
+        if fields is None:
+            self._log.error("resting ledger: a bound id has no usable binding row")
+            return unusable
+        intent_id, client_order_id, slug, expire_time_ns = fields
+        instrument_id: str | None = None
+        strategy_id: str | None = None
+        try:
+            context = self._boot_context_of(intent_id) if intent_id else None
+            instrument_id = None if context is None else context.instrument_id
+            strategy_id = None if context is None else context.strategy_id
+            if instrument_id is None and client_order_id:
+                cached = self._cache.order(ClientOrderId(client_order_id))
+                if cached is not None:
+                    instrument_id = str(cached.instrument_id)
+                    strategy_id = str(cached.strategy_id)
+        except Exception as exc:  # noqa: BLE001 - a bad lookup leaves the order eventless
+            self._log.error(
+                f"resting ledger: a bound id's context lookup failed ({type(exc).__name__})"
+            )
         return RestingTarget(
             venue_order_id=venue_order_id,
-            slug=str(row.get("slug", "")),
+            slug=slug,
             client_order_id=client_order_id,
             intent_id=intent_id,
             instrument_id=instrument_id,
             strategy_id=strategy_id,
-            expire_time_ns=int(row.get("expireTimeNs", 0) or 0),
+            expire_time_ns=expire_time_ns,
             bound=True,
         )
 
@@ -8532,49 +8592,58 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         try:
             while pending:
                 for venue_id in list(pending):
-                    target = self._resting_target_of(venue_id)
-                    if not submit_chain.valid_venue_order_id(venue_id) or (
-                        target is not None and not target.slug
-                    ):
-                        self._latch_resting_cancel_unconfirmed(venue_id, "id_or_slug_unusable")
-                        pending.remove(venue_id)
-                        continue
-                    if target is None:
-                        pending.remove(venue_id)
-                        continue
                     try:
-                        headers = self._write_signer.sign_headers(
-                            write_transport._WRITE_METHOD,
-                            submit_chain.cancel_order_path(venue_id),
+                        target = self._resting_target_of(venue_id)
+                        if not submit_chain.valid_venue_order_id(venue_id) or (
+                            target is not None and not target.slug
+                        ):
+                            self._latch_resting_cancel_unconfirmed(venue_id, "id_or_slug_unusable")
+                            pending.remove(venue_id)
+                            continue
+                        if target is None:
+                            pending.remove(venue_id)
+                            continue
+                        try:
+                            headers = self._write_signer.sign_headers(
+                                write_transport._WRITE_METHOD,
+                                submit_chain.cancel_order_path(venue_id),
+                            )
+                            await self._order_sender.post_cancel_order(
+                                self._api_base_url,
+                                headers=headers,
+                                order_id=venue_id,
+                                market_slug=target.slug,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - a refused POST is retried
+                            self._log.warning(
+                                f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
+                            )
+                        verdict = await self._confirm_cancel_terminal(venue_id)
+                        if verdict in (
+                            submit_chain.CANCEL_READ_CANCELED,
+                            submit_chain.CANCEL_READ_EXPIRED,
+                        ):
+                            if target.bound:
+                                self._settle_resting_terminal(target, verdict)
+                            self._clear_resting_cancel_latch(venue_id)
+                            pending.remove(venue_id)
+                        elif verdict == submit_chain.CANCEL_READ_FILLED:
+                            self._log.warning(
+                                "resting cancel: the order filled; the fill path owns it"
+                            )
+                            pending.remove(venue_id)
+                        else:
+                            now_ns = self._clock.timestamp_ns()
+                            if venue_id not in first_refused:
+                                first_refused[venue_id] = now_ns
+                            if self._note_cancel_refused(target, first_refused[venue_id], now_ns):
+                                await self._cancel_slug_orders(target.slug)
+                    except Exception as exc:  # noqa: BLE001 - B5 review G10: latch, go on
+                        self._latch_resting_cancel_unconfirmed(
+                            venue_id, f"cancel_attempt_failed:{exc.__class__.__name__}"
                         )
-                        await self._order_sender.post_cancel_order(
-                            self._api_base_url,
-                            headers=headers,
-                            order_id=venue_id,
-                            market_slug=target.slug,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - a refused POST is retried
-                        self._log.warning(
-                            f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
-                        )
-                    verdict = await self._confirm_cancel_terminal(venue_id)
-                    if verdict in (
-                        submit_chain.CANCEL_READ_CANCELED,
-                        submit_chain.CANCEL_READ_EXPIRED,
-                    ):
-                        if target.bound:
-                            self._settle_resting_terminal(target, verdict)
-                        self._clear_resting_cancel_latch(venue_id)
-                        pending.remove(venue_id)
-                    elif verdict == submit_chain.CANCEL_READ_FILLED:
-                        self._log.warning("resting cancel: the order filled; the fill path owns it")
-                        pending.remove(venue_id)
-                    else:
-                        now_ns = self._clock.timestamp_ns()
-                        if venue_id not in first_refused:
-                            first_refused[venue_id] = now_ns
-                        if self._note_cancel_refused(target, first_refused[venue_id], now_ns):
-                            await self._cancel_slug_orders(target.slug)
+                        if venue_id in pending:
+                            pending.remove(venue_id)
                 pass_no += 1
                 if not pending or (max_passes is not None and pass_no >= max_passes):
                     break
