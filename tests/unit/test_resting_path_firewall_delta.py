@@ -382,3 +382,59 @@ def test_each_inventory_row_is_declared_and_defined_and_the_equality_is_sensitiv
     # non-vacuity: without the row the inventory EQUALITY would fail on this name
     assert defined | firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES == declared
     assert defined | firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES != declared - {name}
+
+
+# ---------------------------------------------------------------------------
+# Row N1b: the GET-only cancel confirm (exact callee set, scanned)
+# ---------------------------------------------------------------------------
+
+#: Everything ``_confirm_cancel_terminal`` may call: reads and a verdict only. No sender,
+#: no signer, no store write. (The banned-word loop is not copied: ``self._private_read``
+#: contains "read" -- the point of a GET-only helper.)
+EXEC_CANCEL_CONFIRM_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        "isinstance",
+        "payload.get",
+        "self._log.warning",
+        "self._private_read",
+        "submit_chain.cancel_read_verdict",
+        "submit_chain.order_by_id_path",
+        "submit_chain.valid_venue_order_id",
+    }
+)
+_CANCEL_CONFIRM: Final[str] = "_confirm_cancel_terminal"
+
+
+def _cancel_confirm_violations(source: str) -> list[str]:
+    fn = _function(source, _CANCEL_CONFIRM)
+    found = sorted(_callees(fn) - EXEC_CANCEL_CONFIRM_PERMITTED_CALLEES)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            value = node.value
+            target = firewall._dotted_callee(value.func) if isinstance(value, ast.Call) else None
+            if target != "self._private_read":
+                found.append(f"await {target}")
+        if isinstance(node, ast.Attribute) and node.attr in _EGRESS_NAMES:
+            found.append(f"attribute {node.attr}")
+    return found
+
+
+def test_the_cancel_confirm_callee_set_is_exact_and_egress_free() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _cancel_confirm_violations(source) == []
+    assert _callees(_function(source, _CANCEL_CONFIRM)) == EXEC_CANCEL_CONFIRM_PERMITTED_CALLEES
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "self._order_sender.post_cancel_order(None)",
+        "await self._order_sender.post_cancel_all(None)",
+        "self._write_signer.sign_headers('POST', '/v1/orders')",
+        "self._store_set('k', b'v')",
+        "await self._cancel_slug_orders('x')",
+    ],
+)
+def test_planting_a_send_or_write_into_the_cancel_confirm_is_flagged(statement: str) -> None:
+    planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _CANCEL_CONFIRM, statement)
+    assert _cancel_confirm_violations(planted) != []
