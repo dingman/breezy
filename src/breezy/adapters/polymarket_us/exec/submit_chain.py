@@ -30,10 +30,10 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.endpoints import (
-    order_by_id_path as endpoints_order_by_id_path,
+    cancel_order_path as cancel_order_path,  # noqa: PLC0414
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
-    cancel_order_path as cancel_order_path,  # noqa: PLC0414
+    order_by_id_path as endpoints_order_by_id_path,
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
     valid_venue_order_id as valid_venue_order_id,  # noqa: PLC0414
