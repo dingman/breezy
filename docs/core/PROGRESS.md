@@ -83,7 +83,6 @@ restart + `live_orders_ruling`); no auto-arm path is built by this programme.
 ### Calendar obligations (pre-registered; never moved after seeing data)
 | When | What |
 |---|---|
-| ≥ 2026-10-21 | F13 `source_lags_ns` freeze (T3 input) |
 | ≥ 2026-12-07 | M1-v3 single read-once (`no_longshot_pooled_test.py`, default `--out`); T1 route |
 | 2026-12-31 | Drop-in allowlist row expiry (`health_dropins.py:55`) → CRITICAL `allowlist_mismatch` unless renewed by a reviewed row; decide in December, never edit the drop-in |
 | ≤ 2027-01-24 | RA-13 R4 record (ledger REGISTERED + shell) or N/A per RULING_BLOCKERS_R4_scope_and_E5_2026-10-19.md §B4 (B4=NO) |
