@@ -318,8 +318,15 @@ FROZEN_SOURCE_SHA256: Final[dict[str, str]] = {
 #: Re-pinned by EXEC-PAR r5 §5 WP4 + r5.1 E14 (with the exec client's own pin):
 #: the per-slug admission, the open-exposure pre-check, the two body pins, the
 #: `arm_slot` call and the registration all sit INSIDE this prefix by design.
+#: S4 WP3 (ARM B4, pin row P22): RE-PINNED ONCE, 4183d5f4... -> 3b31ef5a.... The
+#: prefix gains exactly (1) `is_resting_order = False`, (2) the `elif
+#: order.time_in_force == TimeInForce.GTD` shape-dispatch arm (supervisor
+#: admission denial, `unmappable_resting_order_reason`), (3) the `elif
+#: is_resting_order` body arm, and (4) `resting=`/`resting_expire_ns=` on the
+#: pre-POST `_note_ambiguous_open`. Every IOC and exit statement is unchanged
+#: (the IOC `else` arms and all the denials around them are byte-identical).
 SUBMIT_PREFIX_SHA256: Final[str] = (
-    "4183d5f475c62f6f7ccdea387cc7bce051063935400a83492d21441e52aec6eb"
+    "3b31ef5a07ac254a0997fbc0045b818ab1de1eb48f7cf9018ccfe53996ff0223"
 )
 
 

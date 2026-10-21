@@ -234,3 +234,33 @@ def test_the_binder_is_a_scanned_resolver_helper_and_a_planted_send_is_flagged()
     planted = _plant_any(source, BINDER, "self._order_sender.post_order(None)")
     violations = firewall.find_exec_resolver_violations(CLIENT_REL, planted)
     assert any(BINDER in v.detail for v in violations), violations
+
+
+# ---------------------------------------------------------------------------
+# Row P22: the _submit_order prefix pin is sensitive (non-vacuity of the re-pin)
+# ---------------------------------------------------------------------------
+
+
+def _prefix_digest(source: str) -> str:
+    import hashlib
+
+    fn = ast.parse(source).body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+    index = next(
+        i
+        for i, st in enumerate(fn.body)
+        if isinstance(st, ast.Try) and "self._latch.arm" in ast.unparse(st)
+    )
+    prefix = "\n".join(ast.dump(s) for s in fn.body[: index + 1])
+    return hashlib.sha256(prefix.encode()).hexdigest()
+
+
+def test_the_submit_prefix_pin_moves_when_a_statement_is_planted_into_the_prefix() -> None:
+    import inspect
+    import textwrap
+
+    real = textwrap.dedent(
+        inspect.getsource(client_module.PolymarketUSExecutionClient._submit_order)
+    )
+    planted = _plant_into(real, "_submit_order", "self._log.warning('planted')")
+    assert _prefix_digest(real) != _prefix_digest(planted)
