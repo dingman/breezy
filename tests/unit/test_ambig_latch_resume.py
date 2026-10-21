@@ -572,7 +572,10 @@ def test_ambiguous_refusal_producers_are_only_in_submit_order_and_the_count_is_u
 
     _V().visit(tree)
     assert owners and set(owners) == {"_submit_order"}
-    assert total == 35, "r4/r6 adds no _refuse call site anywhere (the 25-producer pin)"
+    # ARM maker-sharp B6 (pin row, widen only): 35 -> 36 for the ONE producer B5 added,
+    # `_latch_resting_order` (the single `_refuse` site of the S4 resting latches, whose
+    # reason is never AMBIGUOUS_REASON); B6's own latches reuse it and add no site.
+    assert total == 36, "r4/r6 adds no _refuse call site anywhere (the 25-producer pin)"
 
 
 @pytest.mark.asyncio
