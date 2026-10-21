@@ -10,10 +10,12 @@ No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig`
 RENAME / DEFERRAL MAP for the r4 section 9 WP4 named tests (B5 review G1)
 ------------------------------------------------------------------------
 Status: PRESENT = the r4 name exists as written; RENAMED = the behaviour is pinned under
-the listed existing name(s); ADDED = written by the B5 review fixes under the r4 name;
-SPLIT = one r4 name, two halves; DEFERRED = cannot be written yet (owner and reason given).
-Target aliases: cancel / pure / sweep / adopt = tests/unit/test_polymarket_us_resting_
-<alias>.py (pure = ..._cancel_pure.py); transport = test_polymarket_us_cancel_transport.py.
+the listed existing name(s); ADDED = written by the B5 review fixes (or by B6, for the two
+rows that were DEFERRED to WP5) under the r4 name; SPLIT = one r4 name, two halves;
+DEFERRED = cannot be written yet (owner and reason given). B6 closed both DEFERRED rows.
+Target aliases: cancel / pure / sweep / adopt / query / reconcile = tests/unit/test_polymarket_
+us_resting_<alias>.py (pure = ..._cancel_pure.py); transport = test_polymarket_us_cancel_
+transport.py.
 ``test_the_rename_map_targets_exist`` checks every target below is a real test function.
 
 - test_cancel_body_is_exactly_market_slug_of_the_bound_row [RENAMED]
@@ -44,10 +46,10 @@ Target aliases: cancel / pure / sweep / adopt = tests/unit/test_polymarket_us_re
     adopt::test_adopted_order_becomes_cancellable_ledger_id
 - test_empty_ledger_sweep_issues_zero_posts [RENAMED]
     sweep::test_empty_ledger_sweep_issues_zero_posts_and_reads_nothing
-- test_unavailable_index_issues_zero_posts_and_carve_out_off [SPLIT]
+- test_unavailable_index_issues_zero_posts_and_carve_out_off [RENAMED]
     sweep::test_restart_with_an_unreadable_index_issues_zero_posts_and_keeps_the_refusal
-    note: zero-POST half RENAMED to the target above.
-    note: carve-out half DEFERRED to WP5: the maker-fill carve-out does not exist yet.
+    reconcile::test_unavailable_index_carve_out_is_off
+    note: B6 (WP5/CC-1) wrote the carve-out half; the zero-POST half is the sweep target.
 - test_ledger_enumeration_excludes_no_venue_order_id_contexts [ADDED]
     adopt::test_ledger_enumeration_excludes_no_venue_order_id_contexts
 - test_allowlist_failure_in_loop_latches_without_raise_or_retry [PRESENT]
@@ -64,8 +66,9 @@ Target aliases: cancel / pure / sweep / adopt = tests/unit/test_polymarket_us_re
     sweep::test_sweep_ignores_canceled_order_ids_echo
 - test_refused_cancel_loops_in_the_cancel_coroutine_with_backoff [RENAMED]
     cancel::test_bare_200_does_not_emit_order_canceled
-- test_query_order_poll_never_sends [DEFERRED]
-    note: B6 owns _query_order; add this test with it.
+- test_query_order_poll_never_sends [ADDED]
+    query::test_query_order_poll_never_sends
+    note: B6 (WP5) wrote it with the _query_order override.
 - test_retry_when_open_holds_budget_and_emits_no_event [ADDED]
     cancel::test_retry_when_open_holds_budget_and_emits_no_event
 - test_alert_age_measured_from_first_refused_cancel_and_precedes_latch [RENAMED]
@@ -896,6 +899,8 @@ _ALIAS_FILE: Final[dict[str, str]] = {
     "pure": "test_polymarket_us_resting_cancel_pure.py",
     "sweep": "test_polymarket_us_resting_sweep.py",
     "adopt": "test_polymarket_us_resting_adopt.py",
+    "query": "test_polymarket_us_resting_query.py",
+    "reconcile": "test_polymarket_us_resting_reconciliation.py",
     "transport": "test_polymarket_us_cancel_transport.py",
 }
 _ROW: Final[re.Pattern[str]] = re.compile(r"^- (?P<name>\S+) \[(?P<status>[A-Z]+)\]$")
@@ -915,8 +920,9 @@ def test_the_rename_map_targets_exist() -> None:
     assert len(rows) == 27, "one row per r4 section 9 WP4 name"
     statuses = {name: status for name, status, _ in rows}
     assert set(statuses.values()) <= {"PRESENT", "RENAMED", "ADDED", "SPLIT", "DEFERRED"}
-    assert statuses["test_query_order_poll_never_sends"] == "DEFERRED"
-    assert statuses["test_unavailable_index_issues_zero_posts_and_carve_out_off"] == "SPLIT"
+    assert statuses["test_query_order_poll_never_sends"] == "ADDED"
+    assert statuses["test_unavailable_index_issues_zero_posts_and_carve_out_off"] == "RENAMED"
+    assert [n for n, st, _ in rows if st == "DEFERRED"] == [], "B6 closed every deferral"
     for name, status, targets in rows:
         assert targets or status == "DEFERRED", name
         for alias, test_name in targets:
