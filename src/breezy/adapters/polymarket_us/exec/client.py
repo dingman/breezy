@@ -8147,7 +8147,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         noid = self._resting_noid_contexts()
         if not ledger and not noid:
             return
-        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+        if (
+            self._order_sender is None
+            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
+        ):
             self._log.error(
                 "resting sweep does not run: the sender is absent or canonical unverified; "
                 "no intent is swept and the arm gate keeps refusing"
@@ -8444,7 +8447,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                             f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
                         )
                     verdict = await self._confirm_cancel_terminal(venue_id)
-                    if verdict in (submit_chain.CANCEL_READ_CANCELED, submit_chain.CANCEL_READ_EXPIRED):
+                    if verdict in (
+                        submit_chain.CANCEL_READ_CANCELED,
+                        submit_chain.CANCEL_READ_EXPIRED,
+                    ):
                         if target.bound:
                             self._settle_resting_terminal(target, verdict)
                         self._clear_resting_cancel_latch(venue_id)
@@ -8480,7 +8486,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ledger = self._resting_ledger() or ()
         if slug not in {t.slug for t in ledger if t.slug}:
             return "REFUSED_OFF_LEDGER"
-        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+        if (
+            self._order_sender is None
+            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
+        ):
             return "REFUSED_NO_SENDER"
         try:
             headers = self._write_signer.sign_headers(
@@ -8494,7 +8503,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return "POST_FAILED"
         return "POSTED"
 
-    def _note_cancel_refused(self, target: RestingTarget, first_refused_ns: int, now_ns: int) -> bool:
+    def _note_cancel_refused(
+        self, target: RestingTarget, first_refused_ns: int, now_ns: int
+    ) -> bool:
         """Alert-before-latch bookkeeping for one still-open cancel (SYNC).
 
         The non-latching CRITICAL alert fires once the age from the FIRST refused
@@ -8538,7 +8549,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         terminal read of every latched id (``_clear_resting_cancel_latch``), else the
         next boot's sweep."""
         self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids | {venue_order_id}
-        self._latch_resting_order(submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON, venue_order_id, cause)
+        self._latch_resting_order(
+            submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON, venue_order_id, cause
+        )
 
     def _latch_resting_order(self, reason: str, venue_order_id: str, cause: str) -> None:
         """The ONE producer of the S4 resting-order latches (``resting_cancel_unconfirmed``,
@@ -8581,7 +8594,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ):
             self._unreadable_resting_ids = self._unreadable_resting_ids | {venue_order_id}
             self._latch_resting_order(
-                submit_chain.RESTING_QUERY_UNREADABLE_REASON, venue_order_id, f"{failures} failed polls"
+                submit_chain.RESTING_QUERY_UNREADABLE_REASON,
+                venue_order_id,
+                f"{failures} failed polls",
             )
 
     def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
@@ -8657,7 +8672,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         issued from this strategy path. Nothing to cancel is success.
         """
         targets = self._resting_cancel_target(command)
-        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+        if (
+            self._order_sender is None
+            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
+        ):
             self._log.error("Refusing cancel-all: the sender is absent or canonical unverified")
             return
         if not targets:
