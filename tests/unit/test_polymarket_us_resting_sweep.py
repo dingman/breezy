@@ -378,13 +378,16 @@ def _legacy_evidence(open_orders: list[dict[str, Any]]) -> dict[str, Any]:
 def test_unbound_open_order_still_refuses_arm_and_a_mixed_book_refuses() -> None:
     own = {"venue_order_id": "A", "market_slug": "s", "state": "N", "own_resting": True}
     foreign = {"venue_order_id": "B", "market_slug": "s", "state": "N", "own_resting": False}
-    assert startup_evidence_permits_arm(_legacy_evidence([own]))
+    clear = {"resting_cancel_unconfirmed": False}  # B5 review G9: an own order needs this key
+    assert startup_evidence_permits_arm({**_legacy_evidence([own]), **clear})
     assert startup_evidence_permits_arm(_legacy_evidence([]))
-    assert not startup_evidence_permits_arm(_legacy_evidence([foreign]))
-    assert not startup_evidence_permits_arm(_legacy_evidence([own, foreign]))
+    assert not startup_evidence_permits_arm({**_legacy_evidence([foreign]), **clear})
+    assert not startup_evidence_permits_arm({**_legacy_evidence([own, foreign]), **clear})
     # anything but the boolean True is not "own" (a string, 1, None, a missing key)
     for value in ("true", 1, None):
-        assert not startup_evidence_permits_arm(_legacy_evidence([{**own, "own_resting": value}]))
+        assert not startup_evidence_permits_arm(
+            {**_legacy_evidence([{**own, "own_resting": value}]), **clear}
+        )
 
 
 def test_pre_s4_evidence_bytes_decode_own_resting_false() -> None:
@@ -396,6 +399,138 @@ def test_pre_s4_evidence_bytes_decode_own_resting_false() -> None:
     assert not startup_evidence_permits_arm(payload)
     again = json.loads(decoded.to_bytes())
     assert again["open_orders"][0]["own_resting"] is False
+
+
+# -- B5 review G9: the stricter own-order rule and the latch-aware gate ----------
+
+
+async def _own_flags_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate: Any
+) -> tuple[list[bool], dict[str, Any]]:
+    """Submit one rest, let ``mutate(client, intent_id)`` change the client, then write
+    fresh evidence over a venue book that lists the order. Returns the ``own_resting``
+    flags and the evidence dict."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    client._private_read._payloads[OPEN_ORDERS_PATH] = {"orders": [_open_row(command, 0)]}
+    mutate(client, intent_id)
+    await client._refresh_startup_position_evidence()
+    evidence: dict[str, Any] = json.loads(client._store_get(_EVIDENCE_KEY))
+    await client._disconnect()
+    return [o["own_resting"] for o in evidence["open_orders"]], evidence
+
+
+def _rewrite_row(client: Any, **changes: Any) -> None:
+    key = f"{client_module.RESTING_KEY_PREFIX}{_id_n(0)}"
+    row = json.loads(client._store_get(key))
+    row.update(changes)
+    client._store_set(key, json.dumps(row).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_own_resting_requires_open_exposure_for_the_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G9: a bound row whose intent the ledger no longer carries as open exposure is not
+    ours to exempt -- the order is still on the venue's book, so the gate refuses."""
+    flags, evidence = await _own_flags_after(
+        tmp_path,
+        monkeypatch,
+        lambda client, intent_id: client._ledger.abandon_open_exposure(intent_id),
+    )
+    assert flags == [False]
+    assert startup_evidence_refusal_reason(evidence) == "startup_open_orders_present"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("field", ["intentId", "clientOrderId", "slug"])
+async def test_own_resting_requires_a_nonempty_intent_client_order_id_and_slug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    flags, evidence = await _own_flags_after(
+        tmp_path, monkeypatch, lambda client, _intent: _rewrite_row(client, **{field: ""})
+    )
+    assert flags == [False], field
+    assert not startup_evidence_permits_arm(evidence)
+
+
+def _own_evidence(**extra: Any) -> dict[str, Any]:
+    own = {"venue_order_id": "A", "market_slug": "s", "state": "N", "own_resting": True}
+    return {**_legacy_evidence([own]), **extra}
+
+
+def test_gate_refuses_an_own_order_while_resting_cancel_unconfirmed_is_latched() -> None:
+    latched = _own_evidence(resting_cancel_unconfirmed=True)
+    assert startup_evidence_refusal_reason(latched) == "resting_cancel_unconfirmed"
+    assert not startup_evidence_permits_arm(latched)
+    assert startup_evidence_permits_arm(_own_evidence(resting_cancel_unconfirmed=False))
+
+
+def _empty_with_latch(value: Any) -> dict[str, Any]:
+    return {**_legacy_evidence([]), "resting_cancel_unconfirmed": value}
+
+
+def test_gate_refuses_a_latched_record_even_with_no_open_order() -> None:
+    assert startup_evidence_refusal_reason(_empty_with_latch(True)) == "resting_cancel_unconfirmed"
+    assert startup_evidence_permits_arm(_empty_with_latch(False))
+
+
+def test_a_record_without_the_latch_key_fails_closed_for_own_orders_only() -> None:
+    """An old record (no key): an own order is refused (the latch state is UNKNOWN); a
+    record with no open orders stays unaffected."""
+    assert startup_evidence_refusal_reason(_own_evidence()) == "resting_cancel_unconfirmed"
+    assert startup_evidence_refusal_reason(_legacy_evidence([])) is None
+
+
+@pytest.mark.parametrize("value", ["false", 0, None, "", [], {}])
+def test_a_non_boolean_latch_key_is_never_taken_as_clear(value: Any) -> None:
+    assert startup_evidence_refusal_reason(_own_evidence(resting_cancel_unconfirmed=value)) == (
+        "resting_cancel_unconfirmed"
+    )
+    assert startup_evidence_refusal_reason(_empty_with_latch(value)) == "resting_cancel_unconfirmed"
+
+
+def test_a_foreign_order_keeps_its_own_reason_ahead_of_the_latch() -> None:
+    foreign = {"venue_order_id": "B", "market_slug": "s", "state": "N", "own_resting": False}
+    record = {**_legacy_evidence([foreign]), "resting_cancel_unconfirmed": True}
+    assert startup_evidence_refusal_reason(record) == "startup_open_orders_present"
+
+
+def test_the_latch_key_round_trips_and_a_legacy_record_decodes_unrecorded() -> None:
+    legacy = client_module.StartupPositionEvidence.from_bytes(
+        json.dumps(_legacy_evidence([])).encode()
+    )
+    assert legacy.resting_cancel_unconfirmed is None
+    assert "resting_cancel_unconfirmed" not in json.loads(legacy.to_bytes())
+    for flag in (True, False):
+        raw = json.dumps({**_legacy_evidence([]), "resting_cancel_unconfirmed": flag}).encode()
+        again = client_module.StartupPositionEvidence.from_bytes(raw)
+        assert again.resting_cancel_unconfirmed is flag
+        assert json.loads(again.to_bytes())["resting_cancel_unconfirmed"] is flag
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("latched", [False, True])
+async def test_the_client_writes_the_latch_state_into_the_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, latched: bool
+) -> None:
+    flags, evidence = await _own_flags_after(
+        tmp_path,
+        monkeypatch,
+        (lambda client, _i: client._latch_resting_cancel_unconfirmed(_id_n(0), "test"))
+        if latched
+        else (lambda _c, _i: None),
+    )
+    assert flags == [True]
+    assert evidence["resting_cancel_unconfirmed"] is latched
+    assert startup_evidence_refusal_reason(evidence) == (
+        "resting_cancel_unconfirmed" if latched else None
+    )
 
 
 # -- B4 review item 3: one open intent per slug ----------------------------------

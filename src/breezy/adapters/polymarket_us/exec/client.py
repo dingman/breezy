@@ -394,6 +394,7 @@ __all__ = [
     "RESOLVER_CONTEXT_KEY_PREFIX",
     "STARTUP_EVIDENCE_KEY",
     "STARTUP_OPEN_ORDERS_PRESENT_REASON",
+    "STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY",
     "VENUE_ORDER_ID_KEY_PREFIX",
     "AmbiguousResolverContext",
     "DurableFillRecord",
@@ -482,6 +483,11 @@ STARTUP_EVIDENCE_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}startup_evidence"
 #: open-order enumeration came back NON-EMPTY. Defined here (the producer,
 #: lowest layer) so both sides spell one string.
 STARTUP_OPEN_ORDERS_PRESENT_REASON: Final[str] = "startup_open_orders_present"
+
+#: S4 WP4 (B5 review G9): the evidence key AND the never-arm refusal token for a
+#: latched ``resting_cancel_unconfirmed`` (an own order whose cancel could not be
+#: confirmed terminal must not let the strategy arm). One spelling for both sides.
+STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY: Final[str] = "resting_cancel_unconfirmed"
 
 #: How many leading characters of a venue order id an ERROR line may carry.
 _ORDER_ID_REDACT_PREFIX: Final[int] = 4
@@ -1468,10 +1474,21 @@ class StartupPositionEvidence:
     #: UNKNOWN, never "none open".
     open_orders_read_refused: bool = True
     open_orders: tuple[StartupOpenOrderSnapshot, ...] = ()
+    #: B5 review G9: whether ``resting_cancel_unconfirmed`` was latched when this row
+    #: was written. ``None`` = UNRECORDED (a row written before the key existed): the
+    #: gate then refuses any OWN open order, and a row with no open orders is
+    #: unaffected. Omitted from the bytes while ``None`` so an old row round-trips.
+    resting_cancel_unconfirmed: bool | None = None
 
     def to_bytes(self) -> bytes:
+        latch: dict[str, bool] = (
+            {}
+            if self.resting_cancel_unconfirmed is None
+            else {STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY: self.resting_cancel_unconfirmed}
+        )
         return json.dumps(
             {
+                **latch,
                 "v": 1,
                 "ts_ns": self.ts_ns,
                 "eof_complete": self.eof_complete,
@@ -1562,6 +1579,14 @@ class StartupPositionEvidence:
                 positions=snapshots,
                 open_orders_read_refused=open_orders_read_refused,
                 open_orders=open_orders,
+                resting_cancel_unconfirmed=(
+                    _require_bool(
+                        payload[STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY],
+                        field=STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY,
+                    )
+                    if STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY in payload
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ExecutionReportMappingError(
@@ -6483,6 +6508,37 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return False
         return True
 
+    def _own_resting_pairs(self) -> frozenset[tuple[str, str]]:
+        """The ``(venue_order_id, slug)`` pairs the never-arm gate may call OURS (S4 WP4 4b,
+        tightened by B5 review G9): a BOUND ``resting:`` row with a non-empty intent id,
+        client order id and slug AND an open exposure for its intent in the ledger. An
+        unreadable index, a poisoned row or any failure here yields NONE, so every open
+        order stays foreign (the gate refuses) and the evidence write never raises.
+        """
+        try:
+            ledger = self._ledger
+            if ledger is None:
+                return frozenset()
+            return frozenset(
+                (t.venue_order_id, t.slug)
+                for t in (self._resting_ledger() or ())
+                if t.bound
+                and t.intent_id
+                and t.client_order_id
+                and t.slug
+                and ledger.has_open_exposure(t.intent_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed: no order is ours
+            self._log.error(f"startup evidence: own-order derivation failed ({type(exc).__name__})")
+            return frozenset()
+
+    def _resting_cancel_latched(self) -> bool:
+        """Whether ``resting_cancel_unconfirmed`` is latched now (the evidence key)."""
+        return bool(self._unconfirmed_cancel_ids) or any(
+            r.reason == submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+            for r in self._trading_refusals
+        )
+
     def _write_startup_position_evidence(
         self,
         *,
@@ -6510,11 +6566,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 if net_raw is not None:
                     net_position = str(net_raw)
             snapshots.append(StartupPositionSnapshot(slug=slug, net_position=net_position))
-        # S4 WP4 (4b): the (id, slug) pairs of the bound `resting:` rows. An unreadable
-        # index yields none, so every open order stays foreign (the gate refuses).
-        own_resting = {
-            (t.venue_order_id, t.slug) for t in (self._resting_ledger() or ()) if t.bound
-        }
+        own_resting = self._own_resting_pairs()
         evidence = StartupPositionEvidence(
             ts_ns=now_ns,
             eof_complete=eof_complete,
@@ -6531,6 +6583,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 for o in self._open_orders
             ),
+            resting_cancel_unconfirmed=self._resting_cancel_latched(),
         )
         self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
         # R-9a (HF-4 rev2): the single writer of the watermark the resolver's
