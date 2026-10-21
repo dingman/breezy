@@ -39,8 +39,11 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     _rig,
     _set_state,
 )
-from tests.unit.test_polymarket_us_resting_submit import _id_n, _submit_rest
+from tests.unit.test_polymarket_us_resting_submit import _id_n, _rest_command, _submit_rest
 from tests.unit.test_polymarket_us_resting_sweep import _open_row, _second_process
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_unverified,  # noqa: F401 -- used via usefixtures
+)
 
 _ROW_PREFIX: Final[str] = client_module.RESTING_KEY_PREFIX
 _EVIDENCE_KEY: Final[str] = client_module.STARTUP_EVIDENCE_KEY
@@ -420,11 +423,33 @@ async def test_a_terminal_read_that_echoes_another_order_never_settles_ours(
     await client._disconnect()
 
 
+def hand_bind(client: Any, command: Any, n: int) -> str:
+    """Bind ``command``'s cached order as ledger id ``_id_n(n)`` by writing the durable
+    index and binding row directly (no submit, so no canonical string is needed); returns
+    the slug. The test then has a real cancellable ledger target."""
+    body = submit_chain.build_resting_order_body(command.order, build_no_leg_instrument())
+    venue_id = _id_n(n)
+    indexed = json.loads(client._store_get(client_module.RESTING_INDEX_KEY) or b"[]")
+    client._store_set(
+        f"{_ROW_PREFIX}{venue_id}",
+        submit_chain.resting_binding_bytes(
+            intent_id=f"intent-{n}",
+            slug=body["marketSlug"],
+            client_order_id=command.order.client_order_id.value,
+            expire_time_ns=int(command.order.expire_time_ns),
+        ),
+    )
+    client._store_set(
+        client_module.RESTING_INDEX_KEY, submit_chain.resting_index_bytes([*indexed, venue_id])
+    )
+    slug: str = body["marketSlug"]
+    return slug
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-@pytest.mark.parametrize("cause", ["no_sender", "canonical_unverified"])
-async def test_cancel_all_that_cannot_send_rejects_every_target_and_never_looks_like_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+async def test_cancel_all_without_a_sender_rejects_every_target_and_never_looks_like_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """G12: a cancel-all the client cannot send must tell the strategy -- one
     ``OrderCancelRejected`` per ledger target -- and shout in the log, never return quietly."""
@@ -432,15 +457,29 @@ async def test_cancel_all_that_cannot_send_rejects_every_target_and_never_looks_
     client = rig.client
     await _submit_rest(rig, 0)
     await _submit_rest(rig, 1)
-    if cause == "no_sender":
-        client._order_sender = None
-    else:
-        monkeypatch.setattr(client_module.write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
+    client._order_sender = None
     await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
     assert _names(rig).count("OrderCancelRejected") == 2
     assert rig.sender.cancels == []
     assert client.log_lines("error", "Refusing cancel-all")
     assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == [_id_n(0), _id_n(1)]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env", "write_canonical_unverified")
+async def test_cancel_all_with_the_canonical_string_unverified_rejects_every_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same, for an unverified canonical string. The ledger is bound by hand because a
+    submit cannot run while the canonical string is unverified."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    hand_bind(client, _rest_command(client), 0)
+    await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
+    assert _names(rig).count("OrderCancelRejected") == 1
+    assert rig.sender.cancels == []
+    assert client.log_lines("error", "canonical string is unverified")
     await client._disconnect()
 
 

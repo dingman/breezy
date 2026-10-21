@@ -29,12 +29,16 @@ from tests.unit.ambig_latch_rig import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender, _rig
-from tests.unit.test_polymarket_us_resting_submit import _id_n, _submit_rest
+from tests.unit.test_polymarket_us_resting_robustness import hand_bind
+from tests.unit.test_polymarket_us_resting_submit import _id_n, _rest_command, _submit_rest
 from tests.unit.test_polymarket_us_resting_sweep import (
     _EVIDENCE_KEY,
     _open_row,
     _second_process,
     _set_state_on,
+)
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_unverified,  # noqa: F401 -- used via usefixtures
 )
 
 _LATCH: Final[str] = submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
@@ -46,9 +50,8 @@ def _latched(client: Any) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-@pytest.mark.parametrize("cause", ["no_sender", "canonical_unverified"])
 async def test_a_sweep_that_does_not_run_latches_and_the_gate_refuses_the_own_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """G6: the rest could not be cancelled and the gate exempts own orders, so the
     refusal must be the latch (and the evidence must say so), not just a log line."""
@@ -59,11 +62,9 @@ async def test_a_sweep_that_does_not_run_latches_and_the_gate_refuses_the_own_or
         monkeypatch,
         rig.client,
         rig.client.latch_cm,
-        sender=None if cause == "no_sender" else CancelSender(),
+        sender=None,
         payloads={OPEN_ORDERS_PATH: {"orders": [_open_row(command, 0)]}},
     )
-    if cause == "canonical_unverified":
-        monkeypatch.setattr(client_module.write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
     await second._connect()
     assert _latched(second)
     evidence = json.loads(second._store_get(_EVIDENCE_KEY))
@@ -72,6 +73,23 @@ async def test_a_sweep_that_does_not_run_latches_and_the_gate_refuses_the_own_or
     assert startup_evidence_refusal_reason(evidence) == "resting_cancel_unconfirmed"
     assert not second.log_lines("error", "arm gate keeps refusing")
     await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env", "write_canonical_unverified")
+async def test_a_sweep_with_the_canonical_string_unverified_latches_and_posts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same latch for an unverified canonical string (the ledger is bound by hand: a
+    submit cannot run while the canonical string is unverified)."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    hand_bind(client, _rest_command(client), 0)
+    await client._sweep_resting_orders_at_boot()
+    assert _latched(client)
+    assert client.log_lines("error", "sweep does not run")
+    assert rig.sender.cancels == [] and rig.sender.cancel_alls == []
+    await client._disconnect()
 
 
 @pytest.mark.asyncio
