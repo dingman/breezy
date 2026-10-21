@@ -1071,6 +1071,15 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         narrowed=119,
         why="S4 P16 (B5): grace after the order's expiry before an unconfirmed cancel latches resting_cancel_unconfirmed",
     ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): minimum gap between the alert age and the latch; it is what makes the alert strictly precede the latch for every input
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_LATCH_FLOOR_S",
+        expected=60,
+        widened=61,
+        narrowed=59,
+        why="S4 P16 (B5): minimum gap between the alert age and the latch; it is what makes the alert strictly precede the latch for every input",
+    ),
 )
 
 _MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
@@ -1181,6 +1190,7 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # ARM maker-sharp B4 / S4 r4 P16: the GET-confirm deadline.
         "submit_chain.RESTING_CONFIRM_DEADLINE_S",
         "submit_chain.RESTING_CONFIRM_POLL_S",
+        "submit_chain.RETRY_LATCH_FLOOR_S",
         "submit_chain.RETRY_LATCH_GRACE_S",
         "submit_chain.RETRY_REALERT_S",
         "submit_chain.RETRY_ALERT_AGE_S",
