@@ -259,6 +259,8 @@ PRE_ORDER_CALLEES = frozenset(
         "submit_chain.retirement_member",
         "submit_chain.unmappable_exit_order_reason",
         "submit_chain.unmappable_order_reason",
+        # S4 WP3 (ARM B4, pin row P1c): NAMED row added to the baseline, never relaxed.
+        "self._bind_resting_order",
         # S4 WP3 (ARM B4, pin row P1a): NAMED row added to the baseline, never relaxed.
         "self._confirm_resting_order",
         # S4 WP3 (ARM B4, pin row P1d-2): NAMED row added to the baseline, never relaxed.
