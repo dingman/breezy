@@ -292,3 +292,29 @@ async def test_a_poisoned_row_is_not_an_open_order_passthrough_in_a_sweep(
     evidence = json.loads(second._store_get(_EVIDENCE_KEY))
     assert [o["own_resting"] for o in evidence["open_orders"]] == [False]
     await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_id_that_leaves_pending_is_released_from_in_flight_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G2: the in-flight guard drops an id the moment it is terminal, not when the whole
+    loop (which may retry another id for hours) finally exits."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    await _submit_rest(rig, 1)
+    rig.sender.on_cancel = lambda oid: (
+        _set_state(rig, 0, "ORDER_STATE_CANCELED") if oid == _id_n(0) else None
+    )
+    task = asyncio.ensure_future(client._cancel_resting_order([_id_n(0), _id_n(1)]))
+    await asyncio.sleep(0.1)
+    assert not task.done(), "id 1 stays open, so the loop keeps retrying"
+    assert _id_n(0) not in client._cancel_in_flight, "terminal id released immediately"
+    assert _id_n(1) in client._cancel_in_flight
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client._cancel_in_flight == frozenset()
+    await client._disconnect()

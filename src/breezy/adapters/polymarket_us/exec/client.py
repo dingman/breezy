@@ -8609,6 +8609,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         try:
             while pending:
                 for venue_id in list(pending):
+                    # B5 review G2: an id that left `pending` is released NOW, so the
+                    # with-id resolver is not locked out for the rest of a long loop.
+                    self._release_cancel_in_flight(owned, pending)
                     try:
                         target = self._resting_target_of(venue_id)
                         if not submit_chain.valid_venue_order_id(venue_id) or (
@@ -8661,6 +8664,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         )
                         if venue_id in pending:
                             pending.remove(venue_id)
+                self._release_cancel_in_flight(owned, pending)
                 pass_no += 1
                 if not pending or (max_passes is not None and pass_no >= max_passes):
                     break
@@ -8668,6 +8672,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         finally:
             self._cancel_in_flight = self._cancel_in_flight - frozenset(owned)
         return frozenset(pending)
+
+    def _release_cancel_in_flight(self, owned: list[str], pending: list[str]) -> None:
+        """Drop from ``_cancel_in_flight`` every id this loop owned that is no longer
+        pending (SYNC). Ids another loop owns were never in ``owned`` and are untouched."""
+        self._cancel_in_flight = self._cancel_in_flight - (frozenset(owned) - frozenset(pending))
 
     async def _cancel_slug_orders(self, slug: Any) -> str:
         """The ONE choke point of the slug-scoped venue cancel-all (escalation only).

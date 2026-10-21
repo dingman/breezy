@@ -470,6 +470,8 @@ def test_the_cancel_confirm_callee_set_is_exact_and_egress_free() -> None:
         "self._write_signer.sign_headers('POST', '/v1/orders')",
         "self._store_set('k', b'v')",
         "await self._cancel_slug_orders('x')",
+        # B5 review G2 pin row: the loop's release helper is not the confirm's to call
+        "self._release_cancel_in_flight([], [])",
     ],
 )
 def test_planting_a_send_or_write_into_the_cancel_confirm_is_flagged(statement: str) -> None:
@@ -498,6 +500,7 @@ EXEC_CANCEL_SEND_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
         "self._latch_resting_cancel_unconfirmed",
         "self._log.warning",
         "self._note_cancel_refused",
+        "self._release_cancel_in_flight",
         "self._resting_target_of",
         "self._settle_resting_terminal",
         "self._write_signer.sign_headers",
@@ -555,6 +558,8 @@ def test_the_cancel_loop_callee_set_is_exact_with_exactly_one_send_name() -> Non
         "self.create_task(self._cancel_slug_orders('x'))",
         "self._store_set('k', b'v')",
         "await self._read_open_orders()",
+        # B5 review G2 pin row: the permission is the ONE release helper, by name
+        "self._release_cancel_in_flight_all([], [])",
     ],
 )
 def test_planting_any_other_send_or_read_into_the_cancel_loop_is_flagged(statement: str) -> None:
