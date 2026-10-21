@@ -1831,6 +1831,12 @@ _NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
 _RESTING_NO_ID_OPERATOR_CLEAR_NEXT: Final[str] = (
     "operator_clears_via_breezy_clear_submit_intent_after_venue_reconcile"
 )
+#: S4 WP5: the CRITICAL reason of a swept prior-process resting no-id intent whose slug shows a
+#: fill while the node was down (the holding moved unexplained, or a non-manual TRADE row
+#: sits on the slug since the intent was created). Stays AMBIGUOUS; the clearing path is the
+#: operator runbook above. And the default retirement reason of every other no-id intent.
+_RESTING_FILL_WHILE_DOWN_TOKEN: Final[str] = "resting_no_id_fill_while_down"
+_NO_ID_NO_FILL_RETIRE_REASON: Final[str] = "RESOLVER_NO_ID_NO_FILL"
 #: A manual trade this close to the baseline snapshot may or may not be in it
 #: (the venue's 30 s timestamp tolerance), so it cannot be reconciled.
 _NO_ID_MANUAL_STRADDLE_NS: Final[int] = 30 * 1_000_000_000
@@ -4574,6 +4580,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if intent_id in self._post_in_flight_intent_ids:
             self._log.debug(f"resolver: no-id intent {intent_id} POST in flight; skipping")
             return
+        # S4 WP5 (r3 "prior process"): a RESTING no-id intent THIS process did not arm (its
+        # booking died with the old process) is never classified by the attribution join: the
+        # order is gone. Only the boot sweep's "swept" marker lets it be evaluated at all.
+        resting_prior = (
+            context is not None
+            and context.resting
+            and intent_id not in self._ambiguous_bookings
+        )
+        swept_mode = resting_prior and intent_id in self._swept_resting_intent_ids
+        if resting_prior and not swept_mode:
+            self._log.debug(
+                f"resolver: prior-process resting no-id intent {intent_id} is not swept; "
+                "stays AMBIGUOUS"
+            )
+            return
         now_ns = self._clock.timestamp_ns()
         age_ns = now_ns - created_ns
         if age_ns < _RESOLVER_NO_ID_MIN_AGE_NS:
@@ -4761,26 +4782,56 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             for order in open_orders
             if self.client_order_id_for(VenueOrderId(order.venue_order_id)) is not None
         }
-        verdict = classify_no_id_evidence(
-            legs=join.legs,
-            passive_manual=join.passive_manual,
-            legs_complete=join.complete,
-            out_of_order=join.out_of_order,
-            open_orders=open_orders,
-            open_orders_ok=open_orders_ok,
-            known_order_ids=known,
-            echo=echo,
-            window_start_ns=window_start_ns,
-            window_end_ns=window_end_ns,
-        )
-        outcome_kind: str = verdict.kind
-        outcome_token = f"{verdict.token}"
+        adopt_id = ""
+        outcome_kind: str
+        if swept_mode:
+            # Prior-process swept rest: no attribution join. (b) any non-manual TRADE row on
+            # the slug at or after the intent's creation is a fill while down (the order was
+            # cancelled and read-confirmed gone); unreadable activities retry. Plain loop and
+            # comparisons only: no new callee in this scanned body.
+            outcome_kind = "NO_FILL"
+            outcome_token = "None"
+            if echo is None:
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "holding_unreadable"
+            elif join.out_of_order or not join.complete:
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "activities_incomplete"
+            else:
+                row_index = 0
+                for leg in join.legs:
+                    passive_is_manual = join.passive_manual[row_index]
+                    row_index += 1  # noqa: SIM113 - enumerate() would be a new scanned callee
+                    if (
+                        not leg.manual
+                        and not passive_is_manual
+                        and leg.market_slug == echo.slug
+                        and leg.trade_create_ns >= created_ns
+                    ):
+                        outcome_kind = "CONTRADICTION"
+                        outcome_token = "unattributed_automated_trade_in_window"
+        else:
+            verdict = classify_no_id_evidence(
+                legs=join.legs,
+                passive_manual=join.passive_manual,
+                legs_complete=join.complete,
+                out_of_order=join.out_of_order,
+                open_orders=open_orders,
+                open_orders_ok=open_orders_ok,
+                known_order_ids=known,
+                echo=echo,
+                window_start_ns=window_start_ns,
+                window_end_ns=window_end_ns,
+            )
+            outcome_kind = verdict.kind
+            outcome_token = f"{verdict.token}"
+            adopt_id = f"{verdict.order_id}"
         manual_reason = ""
         if (
             outcome_kind == "ADOPT"
             and context is not None
             and context.resting
-            and not submit_chain.valid_venue_order_id(f"{verdict.order_id}")
+            and not submit_chain.valid_venue_order_id(adopt_id)
         ):
             # A resting id is written into the durable resolver context and later
             # spliced into GET and cancel paths: it must pass the allowlist HERE.
@@ -4864,11 +4915,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                                         "resolver: no-id holding delta reconciled by "
                                         f"{manual.count} manual leg(s)"
                                     )
+                        elif swept_mode:
+                            # (a) needs the baseline: without it the holding is not evaluable
+                            outcome_kind = "INCOMPLETE"
+                            outcome_token = "holding_unreadable"
                         elif (
                             echo.action == "ORDER_ACTION_BUY" and venue_leg_qty > durable_qty
                         ) or (echo.action != "ORDER_ACTION_BUY" and venue_leg_qty < durable_qty):
                             outcome_kind = "CONTRADICTION"
                             outcome_token = "unexplained_holding"
+                    elif swept_mode:
+                        # the instrument is not listed today: (a) is not evaluable
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "holding_unreadable"
                 elif echo is None:
                     listed_instruments = 0
                     for candidate in self._instrument_provider.list_all():
@@ -4930,6 +4989,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     self._holding_contradiction_intent_ids | {intent_id}
                 )
                 self._contradiction_events_total += 1
+            if swept_mode:
+                # every contradiction of a swept prior-process rest is a fill while down
+                outcome_token = _RESTING_FILL_WHILE_DOWN_TOKEN
             details = {
                 "severity": "CRITICAL",
                 "event": "resolver_evidence_contradiction",
@@ -4974,7 +5036,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return
             self._no_id_next_check_ns[intent_id] = recheck_ns
             try:
-                self._adopt_no_id_venue_order(context, f"{verdict.order_id}")
+                self._adopt_no_id_venue_order(context, adopt_id)
                 cached = self._cache.order(ClientOrderId(context.client_order_id))
                 if cached is not None and cached.status is OrderStatus.INITIALIZED:
                     self._generate_submitted(cached, now_ns)
@@ -4983,7 +5045,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return
             self._log.warning(
                 f"resolver: no-id intent {intent_id} adopted venue order "
-                f"{_redact_order_id(f'{verdict.order_id}')}; resolving on the with-id path"
+                f"{_redact_order_id(adopt_id)}; resolving on the with-id path"
             )
             return
         # NO_FILL with the baseline passing: the H2 analogue, set only by a
@@ -4993,7 +5055,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # the interval, never on every 5 s poll.
         self._no_id_next_check_ns[intent_id] = recheck_ns
         try:
-            self._resolve_no_order(intent_id, context, now_ns, positions, slug=intent_slug)
+            self._resolve_no_order(
+                intent_id,
+                context,
+                now_ns,
+                positions,
+                slug=intent_slug,
+                reason=(
+                    submit_chain.RETIRE_BOOT_SWEEP_RESTING_NO_FILL
+                    if swept_mode
+                    else _NO_ID_NO_FILL_RETIRE_REASON
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
             self._note_resolver_error(intent_id, exc)
 
