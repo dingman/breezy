@@ -23,7 +23,10 @@ from nautilus_trader.model.enums import LiquiditySide
 from tests.unit.ambig_latch_rig import (
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
+    response_sender,
+    run_passes,
     submit_chain,
+    wire_payloads,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
@@ -39,10 +42,12 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     _set_state,
 )
 from tests.unit.test_polymarket_us_resting_submit import (
+    _create_body,
     _id_n,
     _rest_command,
     _Rig,
     _submit_rest,
+    _venue_order,
 )
 from tests.unit.test_polymarket_us_resting_sweep import _second_process
 
@@ -734,3 +739,77 @@ async def test_boot_sweep_that_reads_a_rest_filled_books_it_and_the_next_boot_se
     assert third._ledger.spent_today_usd(now_ns=third._clock.timestamp_ns()) == NO_PX
     await third._disconnect()
     del command
+
+
+# ---------------------------------------------------------------------------
+# The resolver paths are UNCHANGED: a HOLD-resolved resting fill is a TAKER fill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_hold_resolved_resting_fill_reports_taker_fee_unreconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 WP5: the resolver cannot tell a create-cross from a later maker fill, so a fill it
+    resolves from a HELD rest is booked exactly as before -- TAKER, ``Money(0)``,
+    ``fee_reconciled=False``, the visibly synthetic ``GET-`` trade id, NEVER the maker
+    ``POLL-`` marker -- and nothing reads the raw commission."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = _rest_command(client)
+    # the GET shows the order already FILLED when the confirm reads it: HOLD, not booked inline
+    held = _venue_order(command, id=_id_n(0))
+    wire_payloads(client)[submit_chain.order_by_id_path(_id_n(0))] = held
+    rig.sender.response = response_sender(200, _create_body(_id_n(0))).response
+    order = held["order"]
+    order.update(
+        {
+            "state": "ORDER_STATE_FILLED",
+            "cumQuantity": 1,
+            "leavesQuantity": 0,
+            "avgPx": _amount(WIRE_PX),
+            "commissionNotionalTotalCollected": _amount("0.01"),
+        }
+    )
+    await client._submit_order(command)
+    assert _filled_events(rig) == [], "not booked inline"
+    wire_payloads(client)["/v1/portfolio/positions"] = {
+        "positions": {order["marketSlug"]: {"netPosition": "-1"}},
+        "eof": True,
+    }
+    await run_passes(client, 3)
+    (event,) = _filled_events(rig)
+    assert event.liquidity_side == LiquiditySide.TAKER
+    assert event.commission.as_decimal() == Decimal(0)
+    (record,) = _records(rig)
+    assert record.fee_reconciled is False
+    assert record.venue_fee_raw is None
+    assert record.trade_id == f"GET-{_id_n(0)}"
+    assert not submit_chain.is_maker_poll_fill(record.trade_id)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_cancels_proceed_while_an_ambiguous_intent_is_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancels and polls never consult the K=1 latch or the AMBIGUOUS refusal: with a later
+    rest HELD (an OPEN ambiguous intent), the bound one still cancels and still polls."""
+    rig, (first,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    held = _rest_command(client)
+    rig.sender.response = response_sender(200, _create_body(_id_n(1))).response
+    wire_payloads(client)[submit_chain.order_by_id_path(_id_n(1))] = _venue_order(
+        held, id=_id_n(1), state="ORDER_STATE_PENDING_RISK"
+    )
+    await client._submit_order(held)
+    assert client._latch.open_slot_count() == 1, "the second rest is HELD (OPEN, ambiguous)"
+    assert submit_chain.AMBIGUOUS_REASON in _reasons(rig)
+    await client._query_order(_query(rig, first))  # the poll proceeds
+    _auto_cancel(rig)
+    await client._cancel_order(_cancel_cmd(rig, first))
+    assert _names(rig).count("OrderCanceled") == 1
+    assert json.loads(client._store_get(_INDEX_KEY)) == []
+    await client._disconnect()
