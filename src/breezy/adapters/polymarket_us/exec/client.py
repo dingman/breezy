@@ -7945,8 +7945,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``goodTillTime``) matches ``wire_echo``. EVERYTHING else is
         ``RESTING_CONFIRM_HOLD`` (the with-id resolver decides): an id that fails
         the allowlist, a filled/partial/terminal/rejected read, an echo mismatch,
-        a non-GTD tif, a GET that never mapped before the deadline, a body that
-        is not an object. Never books a fill, never retires, never sends; a
+        a non-GTD tif, a GET that never mapped before the deadline, a GET that
+        timed out (each read is bounded by the time left to the deadline), a
+        body that is not an object. Never books a fill, never retires, never sends; a
         cancellation propagates (the pre-confirm context keeps the intent
         resolvable).
         """
@@ -7955,8 +7956,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return submit_chain.RESTING_CONFIRM_HOLD
         deadline_ns = self._clock.timestamp_ns() + submit_chain.RESTING_CONFIRM_DEADLINE_NS
         while True:
+            # Each read is bounded by the time left to the deadline (never less than one
+            # poll interval), so a GET that never answers cannot outlive the confirm.
+            # Plain arithmetic and a comparison: no `max()` callee in this scanned body.
+            read_budget_s = (deadline_ns - self._clock.timestamp_ns()) / _NANOS_PER_SECOND
+            if read_budget_s < submit_chain.RESTING_CONFIRM_POLL_S:  # noqa: PLR1730
+                read_budget_s = submit_chain.RESTING_CONFIRM_POLL_S
             try:
-                payload = await self._private_read(submit_chain.order_by_id_path(venue_order_id))
+                async with asyncio.timeout(read_budget_s):
+                    payload = await self._private_read(
+                        submit_chain.order_by_id_path(venue_order_id)
+                    )
                 nested = payload.get("order") if isinstance(payload, Mapping) else None
                 order_body = nested if isinstance(nested, Mapping) else payload
                 report = parse_order_status_report(
@@ -7967,6 +7977,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     ts_init=self._clock.timestamp_ns(),
                     closing=False,
                 )
+            except TimeoutError:
+                self._log.warning("resting confirm: the GET timed out; holding")
+                return submit_chain.RESTING_CONFIRM_HOLD
             except Exception as exc:  # noqa: BLE001 - an unreadable GET is retried to the deadline
                 self._log.warning(
                     f"resting confirm: GET did not map ({exc.__class__.__name__}); retrying"

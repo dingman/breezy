@@ -99,6 +99,9 @@ def test_planting_an_order_row_into_another_order_coroutine_trips_the_pin(callee
 EXEC_RESTING_CONFIRM_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
     {
         "asyncio.sleep",
+        # B4 review F3 (NAMED row, widen only): bounds each confirm GET by the time
+        # left to the deadline; used only in this coroutine.
+        "asyncio.timeout",
         "UUID4",
         "isinstance",
         "parse_order_status_report",
@@ -151,6 +154,15 @@ def test_the_confirm_coroutine_callee_set_is_exact_and_egress_free() -> None:
     assert _confirm_violations(source) == []
     # Set EQUALITY (not membership): a permitted name nothing uses is dead permission.
     assert _callees(_function(source, _CONFIRM)) == EXEC_RESTING_CONFIRM_PERMITTED_CALLEES
+
+
+def test_the_confirm_get_timeout_row_is_used_and_a_neighbouring_wait_is_flagged() -> None:
+    """B4 review F3: ``asyncio.timeout`` is the ONE widened row; a neighbouring wait
+    primitive planted into the coroutine is still a violation."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert "asyncio.timeout" in _callees(_function(source, _CONFIRM))
+    planted = _plant_into(source, _CONFIRM, "asyncio.wait_for(None, 1)")
+    assert _confirm_violations(planted) == ["asyncio.wait_for"]
 
 
 def test_the_confirm_coroutine_is_a_declared_inventory_member() -> None:

@@ -547,6 +547,39 @@ async def test_stop_during_confirm_leaves_context_intact(
     await client._disconnect()
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_hung_confirm_get_is_bounded_by_the_deadline_and_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F3: a GET that never answers must not hold the coroutine past the
+    confirm deadline. HOLD semantics: slot and budget kept, nothing bound."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = _rest_command(rig.client)
+    client = rig.client
+    hang = asyncio.Event()
+
+    async def hung_read(path: str, query: Any = None) -> Any:
+        del query
+        if path.startswith("/v1/order/"):
+            await hang.wait()
+        return {}
+
+    hung_read._payloads = {}  # type: ignore[attr-defined]
+    hung_read.paths = []  # type: ignore[attr-defined]
+    client._private_read = hung_read
+    await asyncio.wait_for(client._submit_order(command), timeout=2.0)
+    intent = rig.intent()
+    assert intent is not None and intent.state.name == "OPEN"
+    assert client._latch.open_slot_count() == 1
+    assert client._ledger.has_open_exposure(intent.intent_id)
+    assert intent.intent_id in client._ambiguous_bookings
+    assert "OrderAccepted" not in rig.event_names()
+    assert client._store_get(_RESTING_INDEX_KEY) is None
+    assert client._post_in_flight_intent_ids == frozenset()
+    await client._disconnect()
+
+
 def test_hold_writes_follow_the_finally_without_an_await() -> None:
     """N-8: every ``await`` in ``_submit_order`` sits inside the one POST/confirm
     ``try`` -- so nothing suspends between its ``finally`` and the HOLD writes."""
