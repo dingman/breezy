@@ -968,6 +968,19 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         why="S4 P16: the resting shape's price cap (submit_chain.RESTING_PRICE_CAP). "
         "A value change is a re-valuing and needs a ruling-cited commit",
     ),
+    # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): fail-closed
+    # until the positive control proves the venue expires a GTD order at
+    # goodTillTime (S-6). The flip is a reviewed commit citing that artifact.
+    RulePin(
+        module="submit_chain",
+        attr="GTD_EXPIRY_VERIFIED",
+        expected=False,
+        widened=True,
+        narrowed=0,
+        why="S4 P16: the resting shape refuses every order until GTD expiry is "
+        "proven by the positive control. Narrowed neighbour is an int 0: equal to "
+        "False by value, refused by type identity",
+    ),
 )
 
 _MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
@@ -1074,6 +1087,7 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "readonly.B3M_HTTP_CLIENT_CTOR_NAMES",
         # ARM maker-sharp B3 / S4 r3 P16: the resting price cap.
         "submit_chain.RESTING_PRICE_CAP",
+        "submit_chain.GTD_EXPIRY_VERIFIED",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
