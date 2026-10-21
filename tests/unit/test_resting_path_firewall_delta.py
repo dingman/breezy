@@ -272,7 +272,9 @@ def test_the_submit_prefix_pin_moves_when_a_statement_is_planted_into_the_prefix
 
 #: Functions ADDED to ``ORDER_SENDER_REFERENCE_PERMITTED_SCOPES`` (rows FW-1, FW-2),
 #: one named term per reviewed commit.
-SENDER_SCOPE_ROWS: Final[frozenset[str]] = frozenset({"_cancel_resting_order"})
+SENDER_SCOPE_ROWS: Final[frozenset[str]] = frozenset(
+    {"_cancel_resting_order", "_cancel_slug_orders"}
+)
 #: Functions ADDED to ``ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD`` (rows FW-3, FW-4).
 SENDER_HEAD_ROWS: Final[frozenset[str]] = frozenset({"_cancel_resting_order"})
 
