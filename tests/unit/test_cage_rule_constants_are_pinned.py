@@ -579,6 +579,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1c): NAMED row, see the definition site.
+                "self._bind_resting_order",
                 # S4 WP3 (ARM B4, pin row P1a): NAMED row, see the definition site.
                 "self._confirm_resting_order",
                 # S4 WP3 (ARM B4, pin row P1d-2): NAMED row, see the definition site.
@@ -681,6 +683,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1c): NAMED row, see the definition site.
+                "self._bind_resting_order",
                 # S4 WP3 (ARM B4, pin row P1a): NAMED row, see the definition site.
                 "self._confirm_resting_order",
                 # S4 WP3 (ARM B4, pin row P1d-2): NAMED row, see the definition site.
