@@ -33,6 +33,7 @@ CLIENT_PATH: Final[Path] = Path(client_module.__file__)
 #: callee -> the order coroutines allowed to reference it. Each key is a row
 #: ADDED to ``EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`` by its own commit.
 ORDER_ROWS: Final[dict[str, frozenset[str]]] = {
+    "self._confirm_resting_order": frozenset({"_submit_order"}),
     "submit_chain.build_resting_order_body": frozenset({"_submit_order"}),
     "submit_chain.unmappable_resting_order_reason": frozenset({"_submit_order"}),
 }
