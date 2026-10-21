@@ -351,6 +351,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # `EXEC_RESOLVER_COROUTINES`/`EXEC_RESOLVER_PERMITTED_CALLEES`.
                 "_resolve_no_id_intent",
                 "_no_id_trade_activity",
+                # S4 WP3 (ARM B4, pin row P4a): the bounded GET-confirm of a fresh
+                # rest; GET-only, scanned by row N1 (`test_resting_path_firewall_delta.py`).
+                "_confirm_resting_order",
                 "__call__",
             }
         ),
@@ -576,6 +579,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
+                "submit_chain.unmappable_resting_order_reason",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
@@ -672,6 +677,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
+                "submit_chain.unmappable_resting_order_reason",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
