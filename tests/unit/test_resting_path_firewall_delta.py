@@ -37,6 +37,7 @@ CLIENT_REL: Final[str] = "src/breezy/adapters/polymarket_us/exec/client.py"
 ORDER_ROWS: Final[dict[str, frozenset[str]]] = {
     "self._resting_cancel_target": frozenset({"_cancel_order", "_cancel_all_orders"}),
     "self._cancel_resting_order": frozenset({"_cancel_order", "_cancel_all_orders"}),
+    "self._reject_cancel_of": frozenset({"_cancel_all_orders"}),
     "self._bind_resting_order": frozenset({"_submit_order"}),
     "self._confirm_resting_order": frozenset({"_submit_order"}),
     "submit_chain.build_resting_order_body": frozenset({"_submit_order"}),

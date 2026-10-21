@@ -2061,6 +2061,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders
         # (`test_resting_path_firewall_delta.py`).
         "self._cancel_resting_order",
+        # S4 WP4 (ARM B5 review G12, pin row P1g): the per-target `OrderCancelRejected` of a
+        # cancel-all that cannot send; referenced only from _cancel_all_orders
+        # (`test_resting_path_firewall_delta.py`).
+        "self._reject_cancel_of",
         "submit_chain.build_order_body",
         "submit_chain.encode_order_body",
         "submit_chain.order_price_decimal",
@@ -3421,6 +3425,9 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders
             # (`test_resting_path_firewall_delta.py`).
             "self._cancel_resting_order",
+            # S4 WP4 (ARM B5 review G12, pin row P1g): referenced only from _cancel_all_orders
+            # (`test_resting_path_firewall_delta.py`).
+            "self._reject_cancel_of",
             "submit_chain.build_order_body",
             "submit_chain.encode_order_body",
             "submit_chain.order_price_decimal",

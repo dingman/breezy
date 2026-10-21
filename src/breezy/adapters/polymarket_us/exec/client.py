@@ -8913,16 +8913,37 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         issued from this strategy path. Nothing to cancel is success.
         """
         targets = self._resting_cancel_target(command)
-        if (
-            self._order_sender is None
-            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
-        ):
-            self._log.error("Refusing cancel-all: the sender is absent or canonical unverified")
+        reason = ""
+        if self._order_sender is None:
+            reason = submit_chain.SENDER_ABSENT_REASON
+        elif write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            reason = submit_chain.CANONICAL_UNVERIFIED_REASON
+        if reason:
+            # B5 review G12: never a silent success -- tell the strategy, per target.
+            self._log.error(f"Refusing cancel-all: {reason}")
+            for target in targets:
+                self._reject_cancel_of(command, target, reason)
             return
         if not targets:
             self._log.warning("cancel-all: no ledger-bound resting order on this instrument")
             return
         await self._cancel_resting_order([t.venue_order_id for t in targets])
+
+    def _reject_cancel_of(self, command: Any, target: RestingTarget, reason: str) -> None:
+        """``OrderCancelRejected`` for one ledger target of a refused cancel-all (SYNC)."""
+        try:
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=ClientOrderId(target.client_order_id),
+                venue_order_id=VenueOrderId(target.venue_order_id),
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the error line above already told the operator
+            self._log.error(
+                f"cancel-all: the rejection could not be emitted ({exc.__class__.__name__})"
+            )
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         raise NotImplementedError(self._unsupported("batch cancel"))

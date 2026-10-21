@@ -25,9 +25,11 @@ from tests.unit.ambig_latch_rig import (
     submit_chain,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
 from tests.unit.test_polymarket_us_resting_cancel import (
     CancelSender,
     _auto_cancel,
+    _cancel_all_cmd,
     _names,
     _payload,
     _rig,
@@ -411,4 +413,42 @@ async def test_a_terminal_read_that_echoes_another_order_never_settles_ours(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("cause", ["no_sender", "canonical_unverified"])
+async def test_cancel_all_that_cannot_send_rejects_every_target_and_never_looks_like_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """G12: a cancel-all the client cannot send must tell the strategy -- one
+    ``OrderCancelRejected`` per ledger target -- and shout in the log, never return quietly."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    await _submit_rest(rig, 1)
+    if cause == "no_sender":
+        client._order_sender = None
+    else:
+        monkeypatch.setattr(client_module.write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
+    await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
+    assert _names(rig).count("OrderCancelRejected") == 2
+    assert rig.sender.cancels == []
+    assert client.log_lines("error", "Refusing cancel-all")
+    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == [_id_n(0), _id_n(1)]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_cancel_all_that_cannot_send_with_no_target_still_logs_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    client._order_sender = None
+    await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
+    assert "OrderCancelRejected" not in _names(rig)
+    assert client.log_lines("error", "Refusing cancel-all")
     await client._disconnect()

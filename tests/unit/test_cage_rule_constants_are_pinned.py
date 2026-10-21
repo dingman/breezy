@@ -599,6 +599,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "self._resting_cancel_target",
                 # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
                 "self._cancel_resting_order",
+                # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row, see the definition site.
+                "self._reject_cancel_of",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
@@ -707,6 +709,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "self._resting_cancel_target",
                 # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
                 "self._cancel_resting_order",
+                # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row, see the definition site.
+                "self._reject_cancel_of",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
