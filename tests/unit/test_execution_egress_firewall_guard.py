@@ -3927,6 +3927,14 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # carries no `SOCKET_RESTORING_MARKERS`, constructs no client, and
         # only reads plain string constants and a pure hashing function.
         "tests/unit/autonomy/test_exec_intent_parity.py",
+        # ARM maker-sharp B1 (slice 3b5744eb, caught at B3): `test_polymarket_us_
+        # cancel_transport.py` imports `exec.endpoints` (`cancel_order_path`,
+        # `valid_venue_order_id`) to pin the per-order cancel path and the venue
+        # id allowlist. WIDENED, not relaxed (L-6/L-12): the comparison is still
+        # `==`; the module carries no `SOCKET_RESTORING_MARKERS` and drives the
+        # `write_transport` verbs against an injected recording `_Client` double --
+        # no real HttpClient, no socket.
+        "tests/unit/test_polymarket_us_cancel_transport.py",
     }
 
 
