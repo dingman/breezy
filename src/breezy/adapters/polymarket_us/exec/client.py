@@ -8054,7 +8054,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             or slug is None
             or expire_ns is None
         ):
-            self._log.error("resting bind: refused (invalid id or an incomplete context)")
+            self._log.error(
+                "resting bind: refused (invalid id or an incomplete context) "
+                f"client_order_id={_redact_order_id(context.client_order_id)}"
+            )
             return False
         indexed = self._read_fill_index(RESTING_INDEX_KEY)
         if indexed is None:

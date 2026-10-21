@@ -615,6 +615,53 @@ async def test_a_binder_failure_holds_and_logs_the_exception_type_only(
     await client._disconnect()
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_binder_retires_and_releases_the_slot_when_the_order_is_not_in_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F7 [CHAR]: a context whose order is absent from this run's cache
+    (a restart) still binds, retires ACCEPTED_RESTING and releases K=1, emitting
+    no event."""
+    import dataclasses
+
+    rig, _command, intent_id = await _held_rest(tmp_path, monkeypatch)
+    client = rig.client
+    context = read_context(client, intent_id)
+    assert context is not None
+    missing = dataclasses.replace(context, client_order_id="O-NOT-IN-CACHE")
+    events_before = rig.event_names()
+    assert client._bind_resting_order(missing, VENUE_ID, client._clock.timestamp_ns()) is True
+    assert rig.event_names() == events_before
+    assert client._latch.open_slot_count() == 0
+    assert json.loads(client._store_get(_RESTING_INDEX_KEY)) == [VENUE_ID]
+    assert VENUE_ID in client._resting_bookings
+    assert client.log_lines("warning", "not in this run's cache")
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_binder_allowlist_refusal_logs_the_redacted_client_order_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F7: the allowlist-fail line names the client order id (redacted
+    like every other id) and never the offending venue id."""
+    import dataclasses
+
+    rig, _command, intent_id = await _held_rest(tmp_path, monkeypatch)
+    client = rig.client
+    context = read_context(client, intent_id)
+    assert context is not None
+    unique = dataclasses.replace(context, client_order_id="O-ABCDEFGHIJKLMNOP")
+    assert client._bind_resting_order(unique, "bad id\n", client._clock.timestamp_ns()) is False
+    (line,) = client.log_lines("error", "resting bind: refused")
+    assert client_module._redact_order_id("O-ABCDEFGHIJKLMNOP") in line
+    assert "O-ABCDEFGHIJKLMNOP" not in line
+    assert "bad id" not in line
+    await client._disconnect()
+
+
 def test_hold_writes_follow_the_finally_without_an_await() -> None:
     """N-8: every ``await`` in ``_submit_order`` sits inside the one POST/confirm
     ``try`` -- so nothing suspends between its ``finally`` and the HOLD writes."""
