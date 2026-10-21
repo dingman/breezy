@@ -33,6 +33,9 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     order_by_id_path as endpoints_order_by_id_path,
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
+    cancel_order_path as cancel_order_path,  # noqa: PLC0414
+)
+from breezy.adapters.polymarket_us.exec.endpoints import (
     valid_venue_order_id as valid_venue_order_id,  # noqa: PLC0414
 )
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
@@ -167,6 +170,53 @@ RESTING_CONFIRM_HOLD: Final[str] = "HOLD"
 RESTING_NOT_ADMITTED_REASON: Final[str] = (
     "the running supervisor does not list the ACCEPTED_RESTING retirement reason; "
     "this client refuses to rest an order"
+)
+
+#: S4 WP4: the slug-scoped cancel-all stays DISABLED until a reviewed commit cites
+#: the positive-control artifact proving the venue honours the slug filter (S-2).
+#: While ``False`` the client's slug helper returns :data:`UNSCOPED_UNVERIFIED`
+#: without sending and every cancel is per-order. Pinned in the cage rule table.
+SLUG_SCOPED_CANCEL_ALL_VERIFIED: Final[bool] = False
+UNSCOPED_UNVERIFIED: Final[str] = "UNSCOPED_UNVERIFIED"
+
+#: RETRY-WHEN-OPEN cancel loop pacing (provisional RulePins, not operator controls):
+#: the sleep after each full pass over the pending ids (the last value repeats),
+#: the age from the FIRST refused cancel at which a non-latching CRITICAL alert
+#: fires (re-alerting every ``RETRY_REALERT_S``), and the two terms of the latch
+#: deadline (:func:`cancel_latch_deadline_ns`).
+CANCEL_RETRY_BACKOFF_S: Final[tuple[float, ...]] = (5, 10, 20, 40, 60)
+RETRY_ALERT_AGE_S: Final[int] = 600
+RETRY_REALERT_S: Final[int] = 1800
+RETRY_LATCH_GRACE_S: Final[int] = 120
+RETRY_LATCH_FLOOR_S: Final[int] = 60
+#: Three consecutive failed polls of one bound id latch ``resting_query_unreadable``.
+RESTING_POLL_FAILURE_LATCH_COUNT: Final[int] = 3
+#: The two S4 CRITICAL latches. Both refuse NEW rests only (cancels continue); the
+#: clearing path is the terminal read of the subject id, else the next boot's sweep.
+RESTING_CANCEL_UNCONFIRMED_REASON: Final[str] = (
+    "resting_cancel_unconfirmed: a resting order's cancel could not be confirmed terminal; "
+    "new rests are refused (cancels continue)"
+)
+RESTING_QUERY_UNREADABLE_REASON: Final[str] = (
+    "resting_query_unreadable: a bound resting order could not be read three times running; "
+    "new rests are refused (cancels continue)"
+)
+
+#: Verdicts of :func:`cancel_read_verdict` (what a GET of a cancelled order proves).
+CANCEL_READ_CANCELED: Final[str] = "CANCELED"
+CANCEL_READ_EXPIRED: Final[str] = "EXPIRED"
+CANCEL_READ_FILLED: Final[str] = "FILLED"
+CANCEL_READ_OPEN: Final[str] = "OPEN"
+CANCEL_READ_UNREADABLE: Final[str] = "UNREADABLE"
+_OPEN_ORDERS_KNOWN_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({"orders", "eof"})
+_CANCEL_OPEN_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "ORDER_STATE_NEW",
+        "ORDER_STATE_PENDING_NEW",
+        "ORDER_STATE_PENDING_RISK",
+        "ORDER_STATE_PENDING_CANCEL",
+        "ORDER_STATE_PARTIALLY_FILLED",
+    }
 )
 
 #: The venue's GTD time-in-force token (public: the client's resting echo reuses it).
@@ -671,6 +721,59 @@ def resting_echo_matches(
         ValueError,
     ):
         return False
+
+
+def cancel_read_verdict(order: object) -> str:
+    """What one GET of an order proves about its cancel (pure, never raises).
+
+    ``FILLED`` for ANY cumulative fill (even on an order the venue then cancelled:
+    the fill path owns it, a cancel never settles it); ``CANCELED`` / ``EXPIRED``
+    only for a zero-fill terminal state with ``cumQuantity`` PRESENT and zero;
+    ``OPEN`` for a live state; everything else (not an object, a missing or
+    non-numeric or negative ``cumQuantity``, an unknown state, a FILLED state
+    with nothing filled) is ``UNREADABLE``. A bare 200 on the cancel POST is
+    never an input here: only a read of the order is.
+    """
+    if not isinstance(order, Mapping):
+        return CANCEL_READ_UNREADABLE
+    state = order.get("state")
+    raw_cum = order.get("cumQuantity")
+    if not isinstance(state, str) or raw_cum is None or isinstance(raw_cum, bool):
+        return CANCEL_READ_UNREADABLE
+    try:
+        cum = Decimal(str(raw_cum))
+    except (InvalidOperation, ValueError):
+        return CANCEL_READ_UNREADABLE
+    if not cum.is_finite() or cum < 0:
+        return CANCEL_READ_UNREADABLE
+    if cum > 0:
+        return CANCEL_READ_FILLED
+    if state in ("ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED"):
+        return CANCEL_READ_CANCELED
+    if state == "ORDER_STATE_EXPIRED":
+        return CANCEL_READ_EXPIRED
+    if state in _CANCEL_OPEN_STATES:
+        return CANCEL_READ_OPEN
+    return CANCEL_READ_UNREADABLE
+
+
+def cancel_latch_deadline_ns(first_refused_ns: int, expire_time_ns: int) -> int:
+    """When an unconfirmed cancel latches: the LATER of the order's expiry plus
+    :data:`RETRY_LATCH_GRACE_S` and the first refusal plus the alert age plus
+    :data:`RETRY_LATCH_FLOOR_S`. Since the floor is positive the non-latching alert
+    (first refusal + :data:`RETRY_ALERT_AGE_S`) is STRICTLY earlier for every input.
+    """
+    return max(
+        expire_time_ns + RETRY_LATCH_GRACE_S * _NANOS_PER_SECOND,
+        first_refused_ns + (RETRY_ALERT_AGE_S + RETRY_LATCH_FLOOR_S) * _NANOS_PER_SECOND,
+    )
+
+
+def open_orders_envelope_is_known(payload: object) -> bool:
+    """True iff an open-orders response carries only the declared envelope keys
+    (``orders``, ``eof``). A future ``nextCursor`` is NOT known: a sweep certifying
+    "nothing open" must refuse a page it cannot prove is the whole book."""
+    return isinstance(payload, Mapping) and set(payload) <= _OPEN_ORDERS_KNOWN_ENVELOPE_KEYS
 
 
 def resting_binding_bytes(
