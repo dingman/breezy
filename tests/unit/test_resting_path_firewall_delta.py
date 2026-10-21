@@ -276,7 +276,9 @@ SENDER_SCOPE_ROWS: Final[frozenset[str]] = frozenset(
     {"_cancel_resting_order", "_cancel_slug_orders"}
 )
 #: Functions ADDED to ``ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD`` (rows FW-3, FW-4).
-SENDER_HEAD_ROWS: Final[frozenset[str]] = frozenset({"_cancel_resting_order"})
+SENDER_HEAD_ROWS: Final[frozenset[str]] = frozenset(
+    {"_cancel_resting_order", "_cancel_slug_orders"}
+)
 
 
 @pytest.mark.parametrize("name", sorted(SENDER_SCOPE_ROWS))
