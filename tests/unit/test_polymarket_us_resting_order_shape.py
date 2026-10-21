@@ -299,6 +299,29 @@ def test_resting_shape_refuses_price_above_cap(
     assert _reason(_order(no, price=above), no) is not None
 
 
+@pytest.mark.parametrize("price", ["0.855", "0.405", "0.401"])
+def test_resting_shape_refuses_a_price_that_is_not_a_whole_cent(
+    legs: tuple[BinaryOption, BinaryOption], price: str
+) -> None:
+    """B3 review MEDIUM: ``f"{wire:.2f}"`` must never post a different price."""
+    _yes, no = legs
+    reason = _reason(_order(no, price=price), no)
+    assert reason is not None
+    assert "cent" in reason
+    with pytest.raises(ValueError, match="cent"):
+        submit_chain.build_resting_order_body(_order(no, price=price), no)
+
+
+def test_ioc_shape_refuses_a_price_that_is_not_a_whole_cent(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    _yes, no = legs
+    order = _order(no, price="0.855", tif=TimeInForce.IOC)
+    reason = submit_chain.unmappable_order_reason(order, no)
+    assert reason is not None
+    assert "cent" in reason
+
+
 def test_resting_shape_refuses_the_yes_leg(legs: tuple[BinaryOption, BinaryOption]) -> None:
     yes, _no = legs
     assert _reason(_order(yes), yes) is not None

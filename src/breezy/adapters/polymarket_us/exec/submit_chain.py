@@ -363,6 +363,18 @@ def _outcome_token(instrument: object) -> str | None:
     return _OUTCOME_SIDE_NO if id_leg == LEG_NO else _OUTCOME_SIDE_YES
 
 
+_WHOLE_CENT: Final[Decimal] = Decimal("0.01")
+NOT_WHOLE_CENT_REASON: Final[str] = (
+    "order price is not a whole cent; the wire renders two decimals and would "
+    "post a different price; refusing"
+)
+
+
+def _is_whole_cent(price: Decimal) -> bool:
+    """True iff ``price`` has no sub-cent part (``f"{p:.2f}"`` is lossless)."""
+    return price == price.quantize(_WHOLE_CENT)
+
+
 def unmappable_order_reason(order: object, instrument: object) -> str | None:
     """Return a denial reason when the order cannot be mapped, else None."""
     if instrument is None or not isinstance(instrument, BinaryOption):
@@ -385,6 +397,8 @@ def unmappable_order_reason(order: object, instrument: object) -> str | None:
         return "only a 1-contract order is mappable; refusing"
     if price <= OPEN_PRICE_EXCLUSIVE_LOW or price >= OPEN_PRICE_EXCLUSIVE_HIGH:
         return "price must be strictly inside (0.00, 1.00); refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
     if getattr(order, "is_post_only", False):
         return "post-only is not mappable; refusing"
     if getattr(order, "is_reduce_only", False):
@@ -496,6 +510,8 @@ def _resting_shape_reason(order: object, instrument: object) -> str | None:
         return "only a 1-contract order is mappable; refusing"
     if price <= OPEN_PRICE_EXCLUSIVE_LOW or price > RESTING_PRICE_CAP:
         return "resting price must be inside (0.00, RESTING_PRICE_CAP]; refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
     if getattr(order, "is_post_only", False):
         return "post-only is not mappable; refusing"
     if getattr(order, "is_reduce_only", False):
