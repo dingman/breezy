@@ -687,3 +687,19 @@ async def test_unreadable_index_issues_zero_posts_and_keeps_the_refusal(
     assert rig.sender.cancels == [] and rig.sender.cancel_alls == []
     assert client._trading_refusals, "the unreadable index refusal is kept (fail closed)"
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_cancel_all_with_nothing_to_cancel_is_a_no_op_not_a_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P9: ``_cancel_all_orders`` moved here from the raises-unsupported test. It used to
+    raise ``NotImplementedError``; now an instrument with no ledger-bound rest is simply
+    nothing to do (no POST, no event, no raise)."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await client._cancel_all_orders(_cancel_all_cmd(rig, build_no_leg_instrument().id))
+    assert rig.sender.cancels == [] and rig.sender.cancel_alls == []
+    assert _names(rig) == []
+    await client._disconnect()

@@ -1652,8 +1652,12 @@ async def test_cancel_order_is_refused(tmp_path: Path) -> None:
 async def test_the_other_four_lifecycle_coroutines_raise_unsupported(
     tmp_path: Path,
 ) -> None:
-    """Only `_submit_order` and `_cancel_order` get denial bodies. The rest are
-    not silently no-ops: a no-op would look like acceptance."""
+    """`_submit_order`, `_cancel_order` and (S4 WP4, ARM B5) `_cancel_all_orders` have
+    bodies; cancel-all moved to the positive tests in
+    ``test_polymarket_us_resting_cancel.py``. The other three still raise (the test
+    name is kept so the plan's P9 citation resolves). Not silently no-ops: a no-op
+    would look like acceptance. Never deleted, only narrowed by the one coroutine
+    that gained a real body (L-12)."""
     rig = _build_rig(tmp_path)
     await rig.client._connect()
     order = rig.submit_command().order
@@ -1679,17 +1683,6 @@ async def test_the_other_four_lifecycle_coroutines_raise_unsupported(
                 quantity=None,
                 price=None,
                 trigger_price=None,
-                command_id=UUID4(),
-                ts_init=TS_INIT,
-            ),
-        )
-    with pytest.raises(NotImplementedError):
-        await rig.client._cancel_all_orders(
-            CancelAllOrders(
-                trader_id=TRADER_ID,
-                strategy_id=STRATEGY_ID,
-                instrument_id=rig.instrument.id,
-                order_side=OrderSide.NO_ORDER_SIDE,
                 command_id=UUID4(),
                 ts_init=TS_INIT,
             ),
