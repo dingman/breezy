@@ -390,3 +390,25 @@ async def test_a_live_partial_fill_keeps_the_cancel_loop_retrying_until_terminal
     assert "OrderCanceled" not in _names(rig), "a fill is never settled by the cancel path"
     assert client._ledger.has_open_exposure(intent_id)
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("field", ["id", "marketSlug"])
+async def test_a_terminal_read_that_echoes_another_order_never_settles_ours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """G15 at the client: a CANCELED body for a different id or market is not our proof."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    _payload(rig, 0).update({"state": "ORDER_STATE_CANCELED", field: "tc-temp-other-x"})
+    task = asyncio.ensure_future(client._cancel_resting_order([_id_n(0)]))
+    await asyncio.sleep(0.1)
+    assert not task.done(), "an echo mismatch keeps the cancel pending"
+    assert "OrderCanceled" not in _names(rig)
+    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY)) == [_id_n(0)]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await client._disconnect()

@@ -8579,11 +8579,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if applied:
             self._mark_budget_restored(venue_id)
 
-    async def _confirm_cancel_terminal(self, venue_order_id: str) -> str:
+    async def _confirm_cancel_terminal(self, venue_order_id: str, market_slug: str) -> str:
         """One GET of a cancelled order, classified by ``cancel_read_verdict``. GET-ONLY.
 
         The authoritative answer after a cancel POST: a bare 200 proves nothing. An
-        unreadable GET (or an id failing the allowlist) is ``UNREADABLE``.
+        unreadable GET (an id failing the allowlist, or an order whose echoed id or
+        ``marketSlug`` is not the one requested -- B5 review G15) is ``UNREADABLE``.
         """
         if not submit_chain.valid_venue_order_id(venue_order_id):
             return submit_chain.CANCEL_READ_UNREADABLE
@@ -8593,7 +8594,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.warning(f"resting cancel: confirm GET failed ({exc.__class__.__name__})")
             return submit_chain.CANCEL_READ_UNREADABLE
         nested = payload.get("order") if isinstance(payload, Mapping) else None
-        return submit_chain.cancel_read_verdict(nested if isinstance(nested, Mapping) else payload)
+        return submit_chain.cancel_read_verdict(
+            nested if isinstance(nested, Mapping) else payload,
+            expected_id=venue_order_id,
+            expected_slug=market_slug,
+        )
 
     async def _cancel_resting_order(
         self, venue_ids: list[str] | tuple[str, ...], *, max_passes: int | None = None
@@ -8646,7 +8651,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                             self._log.warning(
                                 f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
                             )
-                        verdict = await self._confirm_cancel_terminal(venue_id)
+                        verdict = await self._confirm_cancel_terminal(venue_id, target.slug)
                         if verdict in (
                             submit_chain.CANCEL_READ_CANCELED,
                             submit_chain.CANCEL_READ_EXPIRED,

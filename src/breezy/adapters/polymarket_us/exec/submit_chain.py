@@ -753,8 +753,14 @@ def _cum_reaches_quantity(cum: Decimal, raw_quantity: object) -> bool:
     return quantity.is_finite() and quantity > 0 and cum >= quantity
 
 
-def cancel_read_verdict(order: object) -> str:
+def cancel_read_verdict(
+    order: object, *, expected_id: str | None = None, expected_slug: str | None = None
+) -> str:
     """What one GET of an order proves about its cancel (pure, never raises).
+
+    When ``expected_id`` / ``expected_slug`` are given the body must ECHO them exactly (an
+    absent or different ``id`` / ``marketSlug`` is ``UNREADABLE``, B5 review G15): the read
+    answers for the order that was asked about, or it proves nothing.
 
     ``FILLED`` for a cumulative fill on an order that is DONE -- a terminal state (even
     one the venue cancelled: the fill path owns it, a cancel never settles it) or a
@@ -768,6 +774,10 @@ def cancel_read_verdict(order: object) -> str:
     never an input here: only a read of the order is.
     """
     if not isinstance(order, Mapping):
+        return CANCEL_READ_UNREADABLE
+    if (expected_id is not None and order.get("id") != expected_id) or (
+        expected_slug is not None and order.get("marketSlug") != expected_slug
+    ):
         return CANCEL_READ_UNREADABLE
     state = order.get("state")
     raw_cum = order.get("cumQuantity")

@@ -153,3 +153,41 @@ def test_cancel_backoff_follows_the_table_and_repeats_the_last_value(
 def test_cancel_backoff_never_returns_zero_or_raises_for_a_nonpositive_pass() -> None:
     assert submit_chain.cancel_backoff_s(0) == 5
     assert submit_chain.cancel_backoff_s(-3) == 5
+
+
+_SLUG: Final[str] = "tc-temp-nychigh-2026-08-25-lt79f"
+
+
+def _echo(**overrides: Any) -> dict[str, Any]:
+    return {**_order(state="ORDER_STATE_CANCELED", marketSlug=_SLUG), **overrides}
+
+
+def test_the_verdict_accepts_an_echo_of_the_requested_id_and_slug() -> None:
+    verdict = submit_chain.cancel_read_verdict(
+        _echo(), expected_id="ABCDEF123456", expected_slug=_SLUG
+    )
+    assert verdict == "CANCELED"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _echo(id="ZZZZZZZZZZZZ"),  # another order's terminal state must not settle ours
+        _echo(marketSlug="tc-temp-nychigh-2026-08-26-lt79f"),
+        _echo(id=None),
+        _echo(id=123456),
+        _echo(marketSlug=None),
+        {k: v for k, v in _echo().items() if k != "id"},
+        {k: v for k, v in _echo().items() if k != "marketSlug"},
+    ],
+)
+def test_a_mismatched_or_missing_echo_is_unreadable_never_a_verdict(body: dict[str, Any]) -> None:
+    """B5 review G15: the GET answers for the order we ASKED about, or it proves nothing."""
+    verdict = submit_chain.cancel_read_verdict(
+        body, expected_id="ABCDEF123456", expected_slug=_SLUG
+    )
+    assert verdict == "UNREADABLE"
+
+
+def test_without_expectations_the_echo_is_not_checked() -> None:
+    assert submit_chain.cancel_read_verdict(_echo(id="OTHER")) == "CANCELED"
