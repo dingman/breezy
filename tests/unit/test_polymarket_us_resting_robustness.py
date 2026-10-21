@@ -318,3 +318,25 @@ async def test_an_id_that_leaves_pending_is_released_from_in_flight_at_once(
         await task
     assert client._cancel_in_flight == frozenset()
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_filled_read_clears_the_cancel_latch_and_alert_for_that_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G3: a terminal read of any kind (here a fill, which the fill path owns) ends the
+    cancel problem for that id: it must not leave the latch or the alert behind."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    client._latch_resting_cancel_unconfirmed(_id_n(0), "earlier_refusals")
+    client._resting_cancel_alert_details = {_id_n(0): {"severity": "CRITICAL"}}
+    client._resting_cancel_alert_ns = {_id_n(0): 1}
+    _set_state(rig, 0, "ORDER_STATE_FILLED", cum=1)
+    unresolved = await asyncio.wait_for(client._cancel_resting_order([_id_n(0)]), 2.0)
+    assert unresolved == frozenset()
+    assert _LATCH not in [r.reason for r in client._trading_refusals]
+    assert client.resting_cancel_alerts == ()
+    assert client._unconfirmed_cancel_ids == frozenset()
+    await client._disconnect()

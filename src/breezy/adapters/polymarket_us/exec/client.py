@@ -8651,6 +8651,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                             self._log.warning(
                                 "resting cancel: the order filled; the fill path owns it"
                             )
+                            # B5 review G3: a terminal read ends this id's cancel problem
+                            self._clear_resting_cancel_latch(venue_id)
                             pending.remove(venue_id)
                         else:
                             now_ns = self._clock.timestamp_ns()
