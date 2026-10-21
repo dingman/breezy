@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
-from typing import Any, Final, Protocol, cast
+from typing import Any, Final, Literal, Protocol, cast
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
@@ -164,8 +164,10 @@ RESTING_CONFIRM_DEADLINE_NS: Final[int] = RESTING_CONFIRM_DEADLINE_S * 1_000_000
 #: The two verdicts of the confirm. ``NEW_VERIFIED`` is the ONLY value that
 #: binds a rest; every other observation is a ``HOLD`` (the with-id resolver
 #: decides).
-RESTING_CONFIRM_NEW: Final[str] = "NEW_VERIFIED"
-RESTING_CONFIRM_HOLD: Final[str] = "HOLD"
+RESTING_CONFIRM_NEW: Final = "NEW_VERIFIED"
+RESTING_CONFIRM_HOLD: Final = "HOLD"
+#: The closed verdict vocabulary of the GET-confirm (a typo is a type error).
+RestingConfirmVerdict = Literal["NEW_VERIFIED", "HOLD"]
 #: The denial when the running supervisor cannot decode ``ACCEPTED_RESTING``.
 RESTING_NOT_ADMITTED_REASON: Final[str] = (
     "the running supervisor does not list the ACCEPTED_RESTING retirement reason; "

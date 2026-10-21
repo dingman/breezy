@@ -7472,7 +7472,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._post_in_flight_intent_ids = self._post_in_flight_intent_ids | {intent.intent_id}
         outcome: submit_chain.CreateOrderOutcome | None = None
         resting_context: AmbiguousResolverContext | None = None
-        resting_verdict = submit_chain.RESTING_CONFIRM_HOLD
+        resting_verdict: submit_chain.RestingConfirmVerdict = submit_chain.RESTING_CONFIRM_HOLD
         try:
             response = await self._order_sender.post_order(
                 self._api_base_url,
@@ -7959,7 +7959,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
     async def _confirm_resting_order(
         self, venue_order_id: str, wire_echo: Mapping[str, Any], instrument: Any
-    ) -> str:
+    ) -> submit_chain.RestingConfirmVerdict:
         """S4 WP3: the bounded GET-confirm of a freshly created rest. GET-ONLY.
 
         Polls the order-by-id read every ``RESTING_CONFIRM_POLL_S`` for up to
