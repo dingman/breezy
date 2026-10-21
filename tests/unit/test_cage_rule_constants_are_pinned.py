@@ -1026,6 +1026,15 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "proven by the positive control. Narrowed neighbour is an int 0: equal to "
         "False by value, refused by type identity",
     ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the slug-scoped cancel-all stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal to False by value, refused by type identity
+    RulePin(
+        module="submit_chain",
+        attr="SLUG_SCOPED_CANCEL_ALL_VERIFIED",
+        expected=False,
+        widened=True,
+        narrowed=0,
+        why="S4 P16 (B5): the slug-scoped cancel-all stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal to False by value, refused by type identity",
+    ),
 )
 
 _MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
@@ -1136,6 +1145,7 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # ARM maker-sharp B4 / S4 r4 P16: the GET-confirm deadline.
         "submit_chain.RESTING_CONFIRM_DEADLINE_S",
         "submit_chain.RESTING_CONFIRM_POLL_S",
+        "submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
