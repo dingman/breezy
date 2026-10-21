@@ -2171,6 +2171,8 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
     {
         "asyncio.sleep",
         "self._resolver_poll_interval_secs",
+        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        "self._read_fill_index",
         # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
         "submit_chain.valid_venue_order_id",
         # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`).
