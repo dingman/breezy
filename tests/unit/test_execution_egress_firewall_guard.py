@@ -4463,7 +4463,12 @@ ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
 #: referencing it -- including a new helper the create-path accept-fill
 #: branch calls, such as R-7-IMPL's `_match_position_lag` -- is exactly what
 #: `find_order_sender_reference_violations` below refuses.
-ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"})
+ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"}) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-3): a NAMED member per reviewed row.
+        "_cancel_resting_order",
+    }
+)
 
 
 def _functions_referencing_order_sender(path: str, source: str) -> set[str]:
