@@ -2034,11 +2034,14 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # a second exemption from a ban that means "no I/O verb here").
         "submit_chain.wire_fingerprint_bytes",
         "submit_chain.unmappable_order_reason",
-        # S4 WP3 (ARM B4, pin row P1c): referenced only from `_submit_order` (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P1c): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
         "self._bind_resting_order",
-        # S4 WP3 (ARM B4, pin row P1a): referenced only from `_submit_order` (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P1a): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
         "self._confirm_resting_order",
-        # S4 WP3 (ARM B4, pin row P1d-2): referenced only from `_submit_order` (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P1d-2): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
         "submit_chain.build_resting_order_body",
         # S4 WP3 (ARM B4, pin row P1d-1): the pure resting-shape classifier. Referenced
         # only from `_submit_order` (`test_resting_path_firewall_delta.py`).
@@ -2171,19 +2174,26 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
     {
         "asyncio.sleep",
         "self._resolver_poll_interval_secs",
-        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
         "submit_chain.resting_index_bytes",
-        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
         "submit_chain.resting_binding_bytes",
-        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
         "self._read_fill_index",
-        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
         "submit_chain.valid_venue_order_id",
-        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`).
         "submit_chain.resting_echo_matches",
-        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
         "self.generate_order_accepted",
-        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`).
+        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`).
         "self._bind_resting_order",
         # Layers-contract review: `current()` + a bare `SubmitIntentState`
         # comparison would need `breezy.runtime.submit_intent` imported --

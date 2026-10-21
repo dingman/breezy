@@ -69,19 +69,26 @@ PRE_RESOLVER_CALLEES = frozenset(
         # WP-DR (2026-10-10): a pure date function, no I/O, no egress. ONE
         # named row added to the baseline; the delta stays pinned by `==`.
         "utc_day_for_ns",
-        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "submit_chain.resting_index_bytes",
-        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "submit_chain.resting_binding_bytes",
-        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "self._read_fill_index",
-        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "submit_chain.valid_venue_order_id",
-        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "submit_chain.resting_echo_matches",
-        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "self.generate_order_accepted",
-        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
         "self._bind_resting_order",
         # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2): NAMED rows added to the baseline,
         # never relaxed (L-12) -- local-state calls only (the slot table, the
@@ -174,7 +181,8 @@ PRE_RESOLVER_COROUTINES = frozenset(
         "_resolve_accept_fill",
         "_resolve_ambiguous_intents",
         "_resolve_terminal_zero",
-        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1). NAMED row added to the baseline, never relaxed.
+        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1). NAMED row added to the
+        # baseline, never relaxed.
         "_bind_resting_order",
     }
 )
