@@ -7892,7 +7892,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
             except Exception as exc:  # noqa: BLE001 - an unreadable GET is retried to the deadline
                 self._log.warning(
-                    f"resting confirm: GET did not map ({type(exc).__name__}); retrying"
+                    f"resting confirm: GET did not map ({exc.__class__.__name__}); retrying"
                 )
             else:
                 if report.order_status is OrderStatus.ACCEPTED:

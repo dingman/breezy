@@ -80,3 +80,87 @@ def test_planting_an_order_row_into_another_order_coroutine_trips_the_pin(callee
     used = _order_references(planted, callee)
     assert "_cancel_order" in used
     assert not used <= ORDER_ROWS[callee]
+
+
+# ---------------------------------------------------------------------------
+# Row N1: the GET-confirm coroutine's exact callee set (new, scanned)
+# ---------------------------------------------------------------------------
+
+#: Everything ``_confirm_resting_order`` may call. NO ``self._order_sender.*``, no
+#: signer, no store write. (The banned-word loop of the order allowlist is NOT
+#: copied here: ``self._private_read`` contains "read" -- the whole point of a
+#: GET-only helper.)
+EXEC_RESTING_CONFIRM_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        "asyncio.sleep",
+        "UUID4",
+        "isinstance",
+        "parse_order_status_report",
+        "payload.get",
+        "self._clock.timestamp_ns",
+        "self._log.debug",
+        "self._log.error",
+        "self._log.warning",
+        "self._private_read",
+        "submit_chain.order_by_id_path",
+        "submit_chain.resting_echo_matches",
+        "submit_chain.valid_venue_order_id",
+    }
+)
+_CONFIRM: Final[str] = "_confirm_resting_order"
+_EGRESS_NAMES: Final[tuple[str, ...]] = ("_order_sender", "_write_signer", "post_order")
+
+
+def _function(source: str, name: str) -> ast.AsyncFunctionDef:
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not defined as a coroutine")
+
+
+def _callees(fn: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            out.add(firewall._dotted_callee(node.func) or ast.dump(node.func)[:40])
+    return out
+
+
+def _confirm_violations(source: str) -> list[str]:
+    fn = _function(source, _CONFIRM)
+    found = sorted(_callees(fn) - EXEC_RESTING_CONFIRM_PERMITTED_CALLEES)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            value = node.value
+            target = firewall._dotted_callee(value.func) if isinstance(value, ast.Call) else None
+            if target not in {"self._private_read", "asyncio.sleep"}:
+                found.append(f"await {target}")
+        if isinstance(node, ast.Attribute) and node.attr in _EGRESS_NAMES:
+            found.append(f"attribute {node.attr}")
+    return found
+
+
+def test_the_confirm_coroutine_callee_set_is_exact_and_egress_free() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _confirm_violations(source) == []
+    # Set EQUALITY (not membership): a permitted name nothing uses is dead permission.
+    assert _callees(_function(source, _CONFIRM)) == EXEC_RESTING_CONFIRM_PERMITTED_CALLEES
+
+
+def test_the_confirm_coroutine_is_a_declared_inventory_member() -> None:
+    assert _CONFIRM in firewall.EXEC_PERMITTED_COROUTINE_NAMES
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "self._order_sender.post_order(None)",
+        "await self._order_sender.post_order(None)",
+        "self._write_signer.sign_headers('POST', '/v1/orders')",
+        "self._store_set('k', b'v')",
+    ],
+)
+def test_planting_a_send_or_write_into_the_confirm_coroutine_is_flagged(statement: str) -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    planted = _plant_into(source, _CONFIRM, statement)
+    assert _confirm_violations(planted) != []
