@@ -27,6 +27,7 @@ from tests.unit.ambig_latch_rig import (
     gate_env,  # noqa: F401 -- used via usefixtures
     reboot_client,
     submit_chain,
+    wire_payloads,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.polymarket_us_exec_shapes import build_instrument, build_no_leg_instrument
@@ -63,8 +64,8 @@ async def _second_process(
     client.latch_cm = latch_cm  # keeps the flock held (dropping it GCs the generator)
     client._order_sender = sender
     client._resting_accept_admitted = True
-    client._private_read._payloads.setdefault(OPEN_ORDERS_PATH, {"orders": []})
-    client._private_read._payloads.update(payloads or {})
+    wired = wire_payloads(client)  # also makes sure the open-orders path answers
+    wired.update(payloads or {})
     return client
 
 

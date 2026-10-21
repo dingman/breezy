@@ -651,12 +651,8 @@ def _real_spy_transport() -> tuple[Any, _RawExceptionSpy, str]:
     it, and a TEST-NET base URL. The firewall attestation is REQUIRED: this FAILS, not
     skips, without it -- a skip would read green on a host with no block."""
     from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
-    from tests.conftest import _ORIGINAL_PYO3_NETWORK_CLIENTS
-    from tests.unit.test_execution_egress_firewall_guard import (
-        CANARY_HOST,
-        CANARY_PORT,
-        os_egress_block_attested,
-    )
+    from tests.conftest import _ORIGINAL_PYO3_NETWORK_CLIENTS, CANARY_HOST, CANARY_PORT
+    from tests.unit.test_execution_egress_firewall_guard import os_egress_block_attested
 
     assert os_egress_block_attested(), (
         "the cancel-verb OS-block proof needs BREEZY_TEST_OS_EGRESS_BLOCK=1 "
