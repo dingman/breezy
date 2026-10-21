@@ -580,6 +580,41 @@ async def test_a_hung_confirm_get_is_bounded_by_the_deadline_and_holds(
     await client._disconnect()
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_binder_failure_holds_and_logs_the_exception_type_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F4: the binder runs outside the POST/confirm ``try``; an exception
+    from it (a failing store write) must HOLD, not escape ``_submit_order``, and the
+    log carries the exception TYPE only, never its message."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = _rest_command(rig.client)
+    client = rig.client
+    real_store_set = client._store_set
+
+    def faulty_store_set(key: str, value: bytes) -> None:
+        if key.startswith(_RESTING_KEY_PREFIX):
+            raise RuntimeError("SECRET-STORE-DETAIL")
+        real_store_set(key, value)
+
+    monkeypatch.setattr(client, "_store_set", faulty_store_set)
+    rig.set_get(_venue_order(command))
+    await client._submit_order(command)
+    intent = rig.intent()
+    assert intent is not None and intent.state.name == "OPEN"
+    assert client._latch.open_slot_count() == 1
+    assert client._ledger.has_open_exposure(intent.intent_id)
+    assert intent.intent_id in client._ambiguous_bookings
+    assert "OrderAccepted" not in rig.event_names()
+    assert client._store_get(_RESTING_INDEX_KEY) is None
+    assert client._post_in_flight_intent_ids == frozenset()
+    lines = [m for _lv, m in client.log_records]
+    assert any("RuntimeError" in m for m in lines)
+    assert not any("SECRET-STORE-DETAIL" in m for m in lines)
+    await client._disconnect()
+
+
 def test_hold_writes_follow_the_finally_without_an_await() -> None:
     """N-8: every ``await`` in ``_submit_order`` sits inside the one POST/confirm
     ``try`` -- so nothing suspends between its ``finally`` and the HOLD writes."""

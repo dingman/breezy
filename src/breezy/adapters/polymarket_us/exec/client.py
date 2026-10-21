@@ -7582,12 +7582,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # ACCEPTED_RESTING, emits OrderSubmitted/OrderAccepted and releases K=1. If
         # it cannot bind (an unreadable index) this falls through to the HOLD
         # below: the with-id resolver decides.
+        resting_bound = False
         if (
             resting_verdict == submit_chain.RESTING_CONFIRM_NEW
             and resting_context is not None
             and outcome.venue_order_id is not None
-            and self._bind_resting_order(resting_context, outcome.venue_order_id, now_ns)
         ):
+            try:
+                resting_bound = self._bind_resting_order(
+                    resting_context, outcome.venue_order_id, now_ns
+                )
+            except Exception as exc:  # noqa: BLE001 - HOLD; the with-id resolver decides
+                # Exception TYPE only, never its message (it may embed a store path or
+                # key). The binder's writes are idempotent, so a partial bind is re-run
+                # by the with-id resolver.
+                self._log.error(
+                    "resting bind raised; holding "
+                    f"exc_type={exc.__class__.__name__} "
+                    f"client_order_id={order.client_order_id.value}"
+                )
+        if resting_bound:
             return
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
