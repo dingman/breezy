@@ -2046,6 +2046,8 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # S4 WP3 (ARM B4, pin row P1d-1): the pure resting-shape classifier. Referenced
         # only from `_submit_order` (`test_resting_path_firewall_delta.py`).
         "submit_chain.unmappable_resting_order_reason",
+        # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders (`test_resting_path_firewall_delta.py`).
+        "self._cancel_resting_order",
         "submit_chain.build_order_body",
         "submit_chain.encode_order_body",
         "submit_chain.order_price_decimal",
@@ -3380,6 +3382,8 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "submit_chain.build_resting_order_body",
             # S4 WP3 (ARM B4, pin row P1d-1): see the definition site's comment.
             "submit_chain.unmappable_resting_order_reason",
+            # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders (`test_resting_path_firewall_delta.py`).
+            "self._cancel_resting_order",
             "submit_chain.build_order_body",
             "submit_chain.encode_order_body",
             "submit_chain.order_price_decimal",

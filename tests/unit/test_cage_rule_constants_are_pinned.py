@@ -587,6 +587,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.build_resting_order_body",
                 # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
                 "submit_chain.unmappable_resting_order_reason",
+                # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
+                "self._cancel_resting_order",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
@@ -691,6 +693,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.build_resting_order_body",
                 # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
                 "submit_chain.unmappable_resting_order_reason",
+                # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
+                "self._cancel_resting_order",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
