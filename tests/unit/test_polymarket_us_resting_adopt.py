@@ -47,6 +47,7 @@ from tests.unit.ambig_latch_rig import (
 )
 from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
 from tests.unit.test_ambig_no_id_resolver import _negative, _retirement
+from tests.unit.test_polymarket_us_resting_cancel import CancelSender
 from tests.unit.test_polymarket_us_resting_submit import (
     VENUE_ID,
     _rest_command,
@@ -265,3 +266,51 @@ async def test_an_adopted_resting_id_failing_the_allowlist_is_a_contradiction(
 def test_open_orders_path_constant_is_the_stubbed_one() -> None:
     """Non-vacuity of the stub wiring used above."""
     assert OPEN_ORDERS_PATH.startswith("/v1/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_adopted_order_becomes_cancellable_ledger_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 section 9 (WP4): the no-id resolver's ADOPT is the one sanctioned claim path, so
+    the adopted-then-bound id must be a ledger target the cancel loop can cancel, with the
+    bound row's slug on the wire."""
+    client, current, command = await _no_id_rest(tmp_path, monkeypatch)
+    context = read_context(client, current.intent_id)
+    _negative(client, open_orders=[_open_rest_row(context.created_ns, command)])
+    order_path = submit_chain.order_by_id_path(VENUE_ID)
+    wire_payloads(client)[order_path] = _venue_order(command)
+    client.advance(305)
+    await run_passes(client, 1)
+    ledger = client._resting_ledger()
+    assert ledger is not None
+    assert [(t.venue_order_id, t.bound) for t in ledger] == [(VENUE_ID, True)]
+    target = ledger[0]
+    assert target.slug and target.intent_id and target.client_order_id
+    sender = CancelSender()
+    client._order_sender = sender
+    sender.on_cancel = lambda _oid: wire_payloads(client)[order_path]["order"].update(
+        {"state": "ORDER_STATE_CANCELED", "cumQuantity": 0}
+    )
+    unresolved = await client._cancel_resting_order([VENUE_ID], max_passes=1)
+    assert unresolved == frozenset()
+    assert sender.cancels == [{"order_id": VENUE_ID, "market_slug": target.slug}]
+    assert json.loads(client._store_get(client_module.RESTING_INDEX_KEY) or b"[]") == []
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_ledger_enumeration_excludes_no_venue_order_id_contexts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 section 5 (WP4 enumeration): a pre-POST no-id context has no venue id to cancel,
+    so it is NOT a ledger target (the sweep sees it only through ``_resting_noid_contexts``),
+    and a cancel-all by instrument never names it."""
+    client, current, _command = await _no_id_rest(tmp_path, monkeypatch)
+    assert client._resting_ledger() == ()
+    noid = client._resting_noid_contexts()
+    assert [c.intent_id for c in noid] == [current.intent_id]
+    assert noid[0].venue_order_id == submit_chain.NO_VENUE_ORDER_ID
+    await client._disconnect()

@@ -16,6 +16,7 @@ from typing import Any, Final
 
 import pytest
 
+from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.domain.exec_slots import Admit, SlotRecord, SlotTableView, Wait, admit
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     startup_evidence_permits_arm,
@@ -608,4 +609,80 @@ async def test_boot_sweep_never_cancel_alls_a_slug_that_is_only_a_no_id_context(
     assert [r.reason for r in second._trading_refusals][:1] == [
         submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
     ]
+    await second._disconnect()
+
+
+class _EchoingCancelSender(CancelSender):
+    """A cancel POST whose 200 body ECHOES ``canceledOrderIds`` -- while the order itself
+    is left untouched (the venue's GET still says it is open)."""
+
+    async def post_cancel_order(
+        self, api_base_url: str, *, headers: Any, order_id: str, market_slug: str
+    ) -> Any:
+        await super().post_cancel_order(
+            api_base_url, headers=headers, order_id=order_id, market_slug=market_slug
+        )
+        body = json.dumps({"canceledOrderIds": [order_id]}).encode()
+        return VenueResponse(status=200, headers={}, body=body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_sweep_ignores_canceled_order_ids_echo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 section 5.5: a cancel POST's ``canceledOrderIds`` is logged at most, never believed.
+    The GET still reads the order open, so nothing retires and the sweep latches."""
+    rig = await _rig(tmp_path, monkeypatch)
+    await _submit_rest(rig, 0)
+    src: dict[str, Any] = rig.client._private_read._payloads
+    sender = _EchoingCancelSender()
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): src[submit_chain.order_by_id_path(_id_n(0))]
+        },
+    )
+    await second._connect()
+    assert _cancel_posts(sender) == [_id_n(0)]
+    assert json.loads(second._store_get(_INDEX_KEY)) == [_id_n(0)], "no row retired on an echo"
+    assert second._swept_resting_intent_ids == frozenset()
+    assert [r.reason for r in second._trading_refusals] == [
+        submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+    ]
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("eof", [None, True])
+async def test_sweep_missing_eof_counts_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, eof: bool | None
+) -> None:
+    """[CHAR] r4 section 5.5: an open-orders reply without ``eof`` counts as complete (only an
+    UNKNOWN envelope key refuses), so a certified-empty book needs no ``eof`` key."""
+    rig = await _rig(tmp_path, monkeypatch)
+    await _submit_rest(rig, 0)
+    src: dict[str, Any] = rig.client._private_read._payloads
+    sender = CancelSender()
+    book: dict[str, Any] = {"orders": []} if eof is None else {"orders": [], "eof": eof}
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): src[submit_chain.order_by_id_path(_id_n(0))],
+            OPEN_ORDERS_PATH: book,
+        },
+    )
+    sender.on_cancel = lambda oid: _set_state_on(second, 0, "ORDER_STATE_CANCELED")
+    await second._connect()
+    assert second._trading_refusals == [], "a certified re-read with no eof key is complete"
+    assert json.loads(second._store_get(_INDEX_KEY)) == []
     await second._disconnect()

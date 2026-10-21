@@ -6,12 +6,94 @@ sections 2 WP4, 5, 6 and 9; ARM plan r2 delta D2 (instrument filter, in-flight s
 
 Every sender and private read is a local double: no network, no venue contact.
 No ``exec`` import here (barrier X1): everything goes through ``ambig_latch_rig``.
+
+RENAME / DEFERRAL MAP for the r4 section 9 WP4 named tests (B5 review G1)
+------------------------------------------------------------------------
+Status: PRESENT = the r4 name exists as written; RENAMED = the behaviour is pinned under
+the listed existing name(s); ADDED = written by the B5 review fixes under the r4 name;
+SPLIT = one r4 name, two halves; DEFERRED = cannot be written yet (owner and reason given).
+Target aliases: cancel / pure / sweep / adopt = tests/unit/test_polymarket_us_resting_
+<alias>.py (pure = ..._cancel_pure.py); transport = test_polymarket_us_cancel_transport.py.
+``test_the_rename_map_targets_exist`` checks every target below is a real test function.
+
+- test_cancel_body_is_exactly_market_slug_of_the_bound_row [RENAMED]
+    cancel::test_cancel_body_is_the_bound_rows_market_slug_and_the_signature_covers_the_path
+- test_cancel_order_path_signed_equals_dispatched [RENAMED]
+    cancel::test_cancel_body_is_the_bound_rows_market_slug_and_the_signature_covers_the_path
+    pure::test_cancel_order_path_is_re_exported_and_signs_the_exact_path
+- test_cancel_order_id_allowlist_refuses_everything_outside_the_regex [RENAMED]
+    transport::test_post_cancel_order_refuses_bad_order_id_without_sending
+    transport::test_cancel_order_path_refuses_invalid_ids
+- test_post_cancel_order_refuses_non_daily_market_slug [RENAMED]
+    transport::test_post_cancel_order_refuses_bad_slug_without_sending
+- test_post_cancel_all_refuses_empty_non_daily_duplicate_slugs [RENAMED]
+    transport::test_post_cancel_all_refuses_unsafe_slugs_without_sending
+    transport::test_post_cancel_all_refuses_each_bad_slug_in_a_valid_list
+- test_post_cancel_all_body_built_in_transport_and_reparsed [RENAMED]
+    transport::test_post_cancel_all_builds_and_sends_the_slugs_body
+    transport::test_post_cancel_all_cannot_be_called_bodiless
+- test_slug_helper_returns_unscoped_unverified_while_pin_false [PRESENT]
+    cancel::test_slug_helper_returns_unscoped_unverified_while_pin_false
+- test_slug_helper_refuses_empty_and_off_ledger_slug [RENAMED]
+    cancel::test_slug_helper_refuses_empty_and_off_ledger_slug_and_posts_the_ledger_slug
+- test_boot_sweep_while_pin_false_cancels_per_id_ledger_only [RENAMED]
+    sweep::test_boot_sweep_cancels_every_ledger_id_and_confirms_by_read
+- unbound_unattributed_order_never_cancelled_by_sweep [RENAMED]
+    sweep::test_unbound_open_order_is_never_cancelled_by_the_sweep_and_still_refuses_arm
+- test_adopted_order_becomes_cancellable_ledger_id [ADDED]
+    adopt::test_adopted_order_becomes_cancellable_ledger_id
+- test_empty_ledger_sweep_issues_zero_posts [RENAMED]
+    sweep::test_empty_ledger_sweep_issues_zero_posts_and_reads_nothing
+- test_unavailable_index_issues_zero_posts_and_carve_out_off [SPLIT]
+    sweep::test_restart_with_an_unreadable_index_issues_zero_posts_and_keeps_the_refusal
+    note: zero-POST half RENAMED to the target above.
+    note: carve-out half DEFERRED to WP5: the maker-fill carve-out does not exist yet.
+- test_ledger_enumeration_excludes_no_venue_order_id_contexts [ADDED]
+    adopt::test_ledger_enumeration_excludes_no_venue_order_id_contexts
+- test_allowlist_failure_in_loop_latches_without_raise_or_retry [PRESENT]
+    cancel::test_allowlist_failure_in_loop_latches_without_raise_or_retry
+- test_cancel_all_attempts_every_id_before_backoff [PRESENT]
+    cancel::test_cancel_all_attempts_every_id_before_backoff
+- test_sweep_exit_requires_empty_unfiltered_reread_with_no_unknown_envelope_keys [RENAMED]
+    sweep::test_boot_sweep_reread_failure_latches_and_marks_no_intent_swept
+    pure::test_envelope_is_known_only_for_orders_and_eof
+- test_sweep_next_cursor_key_is_unreadable [RENAMED]
+    sweep::test_boot_sweep_reread_failure_latches_and_marks_no_intent_swept
+    note: its re-read payload carries nextCursor.
+- test_sweep_ignores_canceled_order_ids_echo [ADDED]
+    sweep::test_sweep_ignores_canceled_order_ids_echo
+- test_refused_cancel_loops_in_the_cancel_coroutine_with_backoff [RENAMED]
+    cancel::test_bare_200_does_not_emit_order_canceled
+- test_query_order_poll_never_sends [DEFERRED]
+    note: B6 owns _query_order; add this test with it.
+- test_retry_when_open_holds_budget_and_emits_no_event [ADDED]
+    cancel::test_retry_when_open_holds_budget_and_emits_no_event
+- test_alert_age_measured_from_first_refused_cancel_and_precedes_latch [RENAMED]
+    pure::test_alert_is_strictly_before_the_latch_for_every_input
+    cancel::test_refused_cancel_alerts_before_the_latch_then_escalates_and_latches
+- test_latch_only_after_computed_deadline [RENAMED]
+    cancel::test_no_latch_before_the_computed_deadline
+    pure::test_cancel_latch_deadline_is_the_later_of_expiry_grace_and_alert_plus_floor
+- test_venue_initiated_terminal_settles_once_restores_this_process_only [RENAMED]
+    cancel::test_venue_initiated_expiry_settles_once_with_an_expired_event
+    cancel::test_restore_only_for_this_process_ids_and_idempotent_per_venue_id
+- test_unsolicited_cancel_reason_absent_on_get_is_not_required [ADDED]
+    cancel::test_unsolicited_cancel_reason_absent_on_get_is_not_required
+- test_sweep_missing_eof_counts_complete [ADDED]
+    sweep::test_sweep_missing_eof_counts_complete
+    note: [CHAR] in r4 section 9.
+
+Other names changed by the B5 review fixes (G4): the pure file's
+``test_any_cumulative_fill_routes_to_the_fill_path`` is split by state into
+``test_any_cumulative_fill_on_a_terminal_order_routes_to_the_fill_path`` and
+``test_a_live_partial_fill_keeps_the_cancel_retrying`` (its NEW row moved).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Final
 
@@ -754,3 +836,90 @@ async def test_a_readable_poll_between_failures_resets_the_count(
         client._note_resting_poll(vid, readable=False)
     assert client._trading_refusals == []
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_retry_when_open_holds_budget_and_emits_no_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r4 section 6 (RETRY-WHEN-OPEN): while the GET still reads the order open, the loop keeps
+    POSTing and changes NOTHING: no event, no settle, no restore, exposure and booking held."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    events_before = list(_names(rig))
+    budget_before = _remaining(rig)
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    booking_before = client._resting_bookings[_id_n(0)]
+    task = asyncio.ensure_future(client._cancel_order(_cancel_cmd(rig, command)))
+    await asyncio.sleep(0.15)
+    assert not task.done()
+    assert len(rig.sender.cancels) >= 3, "re-POSTed on every pass"
+    assert _names(rig) == events_before, "no event of any kind while the order stays open"
+    assert _remaining(rig) == budget_before
+    assert client._ledger.has_open_exposure(intent_id)
+    assert client._resting_bookings[_id_n(0)] == booking_before
+    assert json.loads(client._store_get(_INDEX_KEY)) == [_id_n(0)]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_unsolicited_cancel_reason_absent_on_get_is_not_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[CHAR] ``unsolicitedCancelReason`` is an Execution field the venue sends empty or not
+    at all: a CANCELED GET WITHOUT it is a clean cancel, and a present empty one is no
+    different."""
+    for n, with_reason in ((0, False), (1, True)):
+        (tmp_path / f"r{n}").mkdir()
+        rig = await _rig(tmp_path / f"r{n}", monkeypatch)
+        client = rig.client
+        command = await _submit_rest(rig, 0)
+        payload = _payload(rig, 0)
+        assert "unsolicitedCancelReason" not in payload
+        if with_reason:
+            payload["unsolicitedCancelReason"] = ""
+        _auto_cancel(rig)
+        await asyncio.wait_for(client._cancel_order(_cancel_cmd(rig, command)), 2.0)
+        assert _names(rig).count("OrderCanceled") == 1
+        assert json.loads(client._store_get(_INDEX_KEY)) == []
+        await client._disconnect()
+
+
+_ALIAS_FILE: Final[dict[str, str]] = {
+    "cancel": "test_polymarket_us_resting_cancel.py",
+    "pure": "test_polymarket_us_resting_cancel_pure.py",
+    "sweep": "test_polymarket_us_resting_sweep.py",
+    "adopt": "test_polymarket_us_resting_adopt.py",
+    "transport": "test_polymarket_us_cancel_transport.py",
+}
+_ROW: Final[re.Pattern[str]] = re.compile(r"^- (?P<name>\S+) \[(?P<status>[A-Z]+)\]$")
+_TARGET: Final[re.Pattern[str]] = re.compile(r"^    (?P<alias>[a-z]+)::(?P<test>test_\w+)$")
+
+
+def test_the_rename_map_targets_exist() -> None:
+    """Every mapped target is a real test function, every row has a known status, and the
+    SPLIT and DEFERRED entries stay visible."""
+    unit_dir = Path(__file__).parent
+    rows: list[tuple[str, str, list[tuple[str, str]]]] = []
+    for line in (__doc__ or "").splitlines():
+        if row := _ROW.match(line):
+            rows.append((row["name"], row["status"], []))
+        elif (target := _TARGET.match(line)) and rows:
+            rows[-1][2].append((target["alias"], target["test"]))
+    assert len(rows) == 27, "one row per r4 section 9 WP4 name"
+    statuses = {name: status for name, status, _ in rows}
+    assert set(statuses.values()) <= {"PRESENT", "RENAMED", "ADDED", "SPLIT", "DEFERRED"}
+    assert statuses["test_query_order_poll_never_sends"] == "DEFERRED"
+    assert statuses["test_unavailable_index_issues_zero_posts_and_carve_out_off"] == "SPLIT"
+    for name, status, targets in rows:
+        assert targets or status == "DEFERRED", name
+        for alias, test_name in targets:
+            source = (unit_dir / _ALIAS_FILE[alias]).read_text(encoding="utf-8")
+            pattern = rf"^(async )?def {test_name}\b"
+            assert re.search(pattern, source, re.MULTILINE), (alias, test_name)
