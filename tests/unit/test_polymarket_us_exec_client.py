@@ -58,7 +58,6 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
-    CancelAllOrders,
     CancelOrder,
     GenerateFillReports,
     GenerateOrderStatusReports,

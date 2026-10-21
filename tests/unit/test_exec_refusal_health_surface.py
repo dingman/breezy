@@ -95,10 +95,10 @@ _resolve_accept_fill#3              EXCEPTIONAL   AC6b (EDGE-2 r3): a cross-proc
                                                    a respawn reseeds from today's fill index
 _resolve_terminal_zero#1            EXCEPTIONAL   fail-closed: the venue-id map write raised on a
                                                    GET-confirmed terminal zero; the retire proceeds
-_latch_resting_order#1              EXCEPTIONAL   ARM B5 (S4 WP4): a resting order's cancel could not be
-                                                   confirmed terminal, or a bound rest could not be
-                                                   read three times; NEW rests are refused, cancels
-                                                   continue (the single producer of both latches)
+_latch_resting_order#1              EXCEPTIONAL   ARM B5 (S4 WP4): a rest's cancel is unconfirmed
+                                                   (terminal read never came), or a bound rest could
+                                                   not be read three times; NEW rests are refused,
+                                                   cancels continue (one producer, both latches)
 ==================================  ============  ================================================
 
 Seven ROUTINE, twenty-nine EXCEPTIONAL (ARM maker-sharp B5, S4 WP4: old total
