@@ -1759,6 +1759,10 @@ _OPEN_ORDER_REQUIRED_KEYS: Final[tuple[str, ...]] = (
 )
 
 
+_MANUAL_ORDER_INDICATOR_MANUAL: Final[str] = "MANUAL_ORDER_INDICATOR_MANUAL"
+_MANUAL_ORDER_INDICATOR_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
+
+
 class OpenOrderRecord(NamedTuple):
     """One open order as the venue enumerates it -- instrument-FREE.
 
@@ -1787,6 +1791,20 @@ class OpenOrderRecord(NamedTuple):
     #: the live drift allowlist declares -- on the order row AND the response
     #: envelope -- sorted, capped at :data:`OPEN_ORDER_UNKNOWN_KEYS_MAX`.
     unknown_keys: tuple[str, ...]
+    #: ``manualOrderIndicator`` read as a tri-state: ``True`` for the declared
+    #: MANUAL value, ``False`` for the declared AUTOMATIC value, ``None`` for
+    #: anything else (absent, null, unrecognised). ``None`` is NOT own: an
+    #: attribution join may only claim an order the venue marks AUTOMATIC.
+    manual: bool | None = None
+
+
+def _manual_indicator_flag(payload: Mapping[str, Any]) -> bool | None:
+    indicator = payload.get("manualOrderIndicator")
+    if indicator == _MANUAL_ORDER_INDICATOR_MANUAL:
+        return True
+    if indicator == _MANUAL_ORDER_INDICATOR_AUTOMATIC:
+        return False
+    return None
 
 
 def _unknown_key_names(payload: Mapping[str, Any], *, known: frozenset[str]) -> list[str]:
@@ -1855,6 +1873,7 @@ def _open_order_record(
         tif=tif,
         create_time=create_time,
         unknown_keys=tuple(unknown[:OPEN_ORDER_UNKNOWN_KEYS_MAX]),
+        manual=_manual_indicator_flag(payload),
     )
 
 

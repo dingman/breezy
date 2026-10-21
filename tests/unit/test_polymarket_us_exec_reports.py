@@ -1784,6 +1784,39 @@ def test_parse_open_orders_maps_one_resting_order() -> None:
     assert record.unknown_keys == ()
 
 
+@pytest.mark.parametrize(
+    ("indicator", "expected"),
+    [
+        ("MANUAL_ORDER_INDICATOR_MANUAL", True),
+        ("MANUAL_ORDER_INDICATOR_AUTOMATIC", False),
+        ("MANUAL_ORDER_INDICATOR_UNSPECIFIED", None),
+        (None, None),
+    ],
+    ids=["manual", "automatic", "unspecified", "null"],
+)
+def test_parse_open_orders_records_the_manual_indicator_tristate(
+    indicator: str | None, expected: bool | None
+) -> None:
+    """B4 review F2: ``manual`` is True/False only for the two declared values;
+    anything else (absent, null, unrecognised) is None and treated as not-own."""
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    (record,) = parse_open_orders(
+        {"orders": [_resting_order(manualOrderIndicator=indicator)]},
+    )
+    assert record.manual is expected
+
+
+def test_parse_open_orders_manual_is_none_when_the_key_is_absent() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    order = _resting_order()
+    order.pop("manualOrderIndicator", None)
+    (record,) = parse_open_orders({"orders": [order]})
+    assert record.manual is None
+    assert record.unknown_keys == ()
+
+
 def test_parse_open_orders_records_a_drift_key_bounded_and_never_refuses_on_it() -> None:
     """Drift-TOLERANT by design: the boot gate must still be able to ENUMERATE
     an order whose shape moved, so a new key is recorded, never fatal."""

@@ -175,6 +175,7 @@ def _venue_order(command: Any, **overrides: Any) -> dict[str, Any]:
         "leavesQuantity": posted["quantity"],
         "createTime": "2026-08-25T00:00:14.120237895Z",
         "goodTillTime": posted["goodTillTime"],
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
     }
     order.update(overrides)
     return {"order": order}
@@ -387,6 +388,48 @@ async def test_confirm_echo_mismatch_or_non_gtd_tif_holds(
     assert "OrderAccepted" not in rig.event_names()
     assert rig.client._latch.open_slot_count() == 1
     await rig.client._disconnect()
+
+
+@pytest.mark.parametrize("indicator", ["MANUAL_ORDER_INDICATOR_MANUAL", None])
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_confirm_never_binds_a_manual_or_unmarked_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, indicator: str | None
+) -> None:
+    """B4 review F2 (inline bind path): an order the venue marks MANUAL, or does not
+    mark at all, is HELD for the resolver, never bound as the bot's own rest."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = _rest_command(rig.client)
+    payload = _venue_order(command)
+    if indicator is None:
+        del payload["order"]["manualOrderIndicator"]
+    else:
+        payload["order"]["manualOrderIndicator"] = indicator
+    rig.set_get(payload)
+    await rig.client._submit_order(command)
+    client = rig.client
+    assert "OrderAccepted" not in rig.event_names()
+    assert client._store_get(_RESTING_INDEX_KEY) is None
+    assert client._latch.open_slot_count() == 1
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_resolver_never_binds_a_manual_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 review F2 (resolver bind path)."""
+    rig, command, _intent_id = await _held_rest(tmp_path, monkeypatch)
+    client = rig.client
+    payload = _venue_order(command)
+    payload["order"]["manualOrderIndicator"] = "MANUAL_ORDER_INDICATOR_MANUAL"
+    rig.set_get(payload)
+    await run_passes(client, 2)
+    assert "OrderAccepted" not in rig.event_names()
+    assert client._store_get(_RESTING_INDEX_KEY) is None
+    assert client._latch.open_slot_count() == 1
+    await client._disconnect()
 
 
 @pytest.mark.asyncio

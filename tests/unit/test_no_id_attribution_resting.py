@@ -47,8 +47,10 @@ def rest_order(
     quantity: str = "1",
     price: str = "0.60",
     slug: str = SLUG,
+    manual: bool | None = False,
 ) -> Any:
     return SimpleNamespace(
+        manual=manual,
         venue_order_id=order_id,
         market_slug=slug,
         price=Decimal(price),
@@ -79,6 +81,18 @@ def test_resting_single_echo_match_open_order_is_adopt() -> None:
     v = verdict((rest_order(),))
     assert v.kind == "ADOPT"
     assert v.order_id == "REST-1"
+
+
+@pytest.mark.parametrize("manual", [True, None], ids=["manual", "unmarked"])
+def test_resting_echo_match_that_is_manual_or_unmarked_is_a_contradiction(
+    manual: bool | None,
+) -> None:
+    """B4 review F2: a manual operator order is never an ADOPT candidate. An
+    unmarked order (the venue omitted the indicator) is fail-closed the same way."""
+    v = verdict((rest_order(manual=manual),))
+    assert v.kind == "CONTRADICTION"
+    assert v.token == "in_window_open_order"
+    assert v.order_id is None
 
 
 def test_ioc_echo_match_open_order_stays_contradiction() -> None:

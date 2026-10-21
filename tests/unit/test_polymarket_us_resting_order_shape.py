@@ -502,6 +502,7 @@ def _venue_order(body: dict[str, Any], *, state: str = "ORDER_STATE_NEW") -> dic
         "leavesQuantity": body["quantity"],
         "createTime": "2026-08-25T00:00:14.120237895Z",
         "goodTillTime": body["goodTillTime"],
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
     }
 
 
@@ -532,6 +533,30 @@ def test_resting_echo_matches_the_order_we_posted(
     report, order = _report_and_order(no, body)
     assert report.order_status is OrderStatus.ACCEPTED
     assert submit_chain.resting_echo_matches(report, body, order) is True
+
+
+@pytest.mark.parametrize(
+    "indicator",
+    ["MANUAL_ORDER_INDICATOR_MANUAL", "MANUAL_ORDER_INDICATOR_UNSPECIFIED", None, 7],
+    ids=["manual", "unspecified", "null", "non-string"],
+)
+def test_resting_echo_matches_requires_the_automatic_indicator(
+    posted: tuple[BinaryOption, dict[str, Any]], indicator: Any
+) -> None:
+    """B4 review F2: a manual operator order must never pass as the bot's own rest.
+    Fail-closed: anything but the AUTOMATIC indicator is a mismatch."""
+    no, body = posted
+    report, order = _report_and_order(no, body, manualOrderIndicator=indicator)
+    assert submit_chain.resting_echo_matches(report, body, order) is False
+
+
+def test_resting_echo_matches_is_false_when_the_venue_omits_the_indicator(
+    posted: tuple[BinaryOption, dict[str, Any]],
+) -> None:
+    no, body = posted
+    report, order = _report_and_order(no, body)
+    del order["manualOrderIndicator"]
+    assert submit_chain.resting_echo_matches(report, body, order) is False
 
 
 def test_resting_echo_matches_price_mismatch_is_false(

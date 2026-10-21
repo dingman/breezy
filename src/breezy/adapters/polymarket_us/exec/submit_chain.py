@@ -683,6 +683,11 @@ def resting_echo_matches(
     price), quantity, TIF GTD, and ``goodTillTime`` within one second. Anything
     unreadable is ``False``; this never raises. It decides nothing about the
     order STATE: the caller still requires ``ACCEPTED`` and ``filled_qty == 0``.
+
+    ``venue_order["manualOrderIndicator"]`` must equal the AUTOMATIC value the
+    body carried; a MANUAL, absent or unrecognised value is ``False`` (fail-closed:
+    the WP0 discovery, ``MAKER_S4_WP0_VENUE_DISCOVERY_2026-10-13.md`` S-3, saw the
+    key on the wire of every observed ``Order``).
     """
     try:
         leg = leg_of(getattr(report, "instrument_id"))  # noqa: B009
@@ -696,6 +701,10 @@ def resting_echo_matches(
             or base_slug_of(getattr(report, "instrument_id")) != slug  # noqa: B009
             or wire_echo["tif"] != _TIF_GTD
             or getattr(report, "time_in_force", None) is not TimeInForce.GTD
+            # Fail-closed (B4 review F2): only an order the venue marks AUTOMATIC is
+            # ours. MANUAL, absent or unrecognised is a mismatch; a KeyError on an
+            # absent key is caught below and is also False.
+            or venue_order["manualOrderIndicator"] != _MANUAL_AUTOMATIC
         ):
             return False
         wire_price = Decimal(str(wire_echo["price"]["value"]))

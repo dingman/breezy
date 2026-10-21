@@ -287,9 +287,13 @@ _VENUE_SIDE_FOR_ECHO: Final[Mapping[tuple[str, str], str]] = {
 
 
 def _is_resting_candidate(order: Any, echo: NoIdEcho) -> bool:
-    """A GTD order of quantity 1 whose venue side is the echoed leg's opening side."""
+    """A GTD order of quantity 1 whose venue side is the echoed leg's opening side,
+    that the venue marks AUTOMATIC. A MANUAL or unmarked order (``manual`` is not
+    ``False``) is never a candidate: it falls through to the in-window-open-order
+    contradiction, so an operator's own order is never adopted as the bot's rest."""
     return (
         echo.resting
+        and getattr(order, "manual", None) is False
         and order.tif == GTD_TIF
         and order.quantity == _ONE
         and order.side == _VENUE_SIDE_FOR_ECHO.get((echo.outcome_side, echo.action))
