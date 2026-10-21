@@ -962,10 +962,14 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="submit_chain",
         attr="RESTING_PRICE_CAP",
-        expected=Decimal("0.80"),
-        widened=Decimal("0.81"),
-        narrowed=Decimal("0.79"),
-        why="S4 P16: the resting shape's price cap (submit_chain.RESTING_PRICE_CAP). "
+        # Old -> new: 0.80 (S4 r3 B_CAP) -> 0.89 (family pm_us_no_maker_sharp_v1 B_CAP),
+        # ruling RULING_MAKER_sharp_v1_live_small_2026-10-21. Neighbours re-chosen so they
+        # stay distinct from `expected` in both directions.
+        expected=Decimal("0.89"),
+        widened=Decimal("0.90"),
+        narrowed=Decimal("0.88"),
+        why="S4 P16: the resting shape's price cap (submit_chain.RESTING_PRICE_CAP), "
+        "re-valued to 0.89 by RULING_MAKER_sharp_v1_live_small_2026-10-21. "
         "A value change is a re-valuing and needs a ruling-cited commit",
     ),
     # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): fail-closed

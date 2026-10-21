@@ -140,9 +140,10 @@ RESTING_ORDER_BODY_KEYS: Final[frozenset[str]] = (
     ORDER_BODY_KEYS - frozenset({"synchronousExecution", "maxBlockTime"})
 ) | frozenset({"goodTillTime"})
 
-#: The highest NO price a resting order may be posted at (the spec B_CAP). A
-#: re-valued, ruling-cited constant: see ``tests/unit/test_cage_rule_constants_are_pinned.py``.
-RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.80")
+#: The highest NO price a resting order may be posted at. Re-valued 0.80 -> 0.89
+#: (the family's B_CAP) by ``RULING_MAKER_sharp_v1_live_small_2026-10-21``; pinned in
+#: ``tests/unit/test_cage_rule_constants_are_pinned.py``.
+RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.89")
 
 #: Flipped to ``True`` only by a reviewed commit citing the positive-control
 #: artifact that proves the venue expires a GTD order at ``goodTillTime`` (S-6).

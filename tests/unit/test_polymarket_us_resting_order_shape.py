@@ -210,6 +210,23 @@ def test_resting_shape_admits_gtd_buy_no_qty1_at_the_cap(
     assert _reason(_order(no, price=format(CAP, ".2f")), no) is None
 
 
+def test_resting_price_cap_is_the_sharp_v1_b_cap() -> None:
+    """P16: re-valued 0.80 -> 0.89 by ``RULING_MAKER_sharp_v1_live_small_2026-10-21``.
+
+    The equality to the family's ``B_CAP`` (``MakerRuleParams.b_cap``, the ported
+    Stage 0 rule) lands with that port; until then this literal is the assertion.
+    """
+    assert Decimal("0.89") == CAP
+
+
+def test_resting_shape_admits_089_and_refuses_090(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    _yes, no = legs
+    assert _reason(_order(no, price="0.89"), no) is None
+    assert _reason(_order(no, price="0.90"), no) is not None
+
+
 def test_resting_shape_admits_gtd_buy_no_qty1_at_a_low_price(
     legs: tuple[BinaryOption, BinaryOption],
 ) -> None:
