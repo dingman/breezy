@@ -27,11 +27,12 @@ from tests.unit.ambig_latch_rig import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender, _rig
-from tests.unit.test_polymarket_us_resting_submit import _submit_rest
+from tests.unit.test_polymarket_us_resting_submit import _id_n, _submit_rest
 from tests.unit.test_polymarket_us_resting_sweep import (
     _EVIDENCE_KEY,
     _open_row,
     _second_process,
+    _set_state_on,
 )
 
 _LATCH: Final[str] = submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
@@ -82,4 +83,38 @@ async def test_a_sweep_with_nothing_to_cancel_does_not_latch(
     )
     await second._connect()
     assert not _latched(second)
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("still_listed", [True, False])
+async def test_a_ledger_id_still_listed_open_after_the_per_id_pass_latches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, still_listed: bool
+) -> None:
+    """G7: the per-id GET read the order terminal, but the unfiltered re-read still LISTS
+    it -- the two disagree, so nothing may be certified: latch."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = await _submit_rest(rig, 0)
+    payloads: dict[str, Any] = rig.client._private_read._payloads
+    sender = CancelSender()
+    listed = [_open_row(command, 0)] if still_listed else []
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): payloads[
+                submit_chain.order_by_id_path(_id_n(0))
+            ],
+            OPEN_ORDERS_PATH: {"orders": listed},
+        },
+    )
+    sender.on_cancel = lambda oid: _set_state_on(second, 0, "ORDER_STATE_CANCELED")
+    await second._connect()
+    assert _latched(second) is still_listed
+    if still_listed:
+        assert second.log_lines("error", "boot_sweep_ledger_id_still_listed")
     await second._disconnect()

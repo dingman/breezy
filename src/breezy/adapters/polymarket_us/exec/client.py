@@ -8339,6 +8339,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"resting sweep: {len(foreign)} unbound open order(s) on a ledger slug; "
                 "never cancelled, the never-arm gate keeps refusing"
             )
+        # B5 review G7: a ledger id the re-read still LISTS contradicts its terminal per-id
+        # read; nothing is certified, so latch it (the per-id pass alone is not proof).
+        for record in records:
+            if record.venue_order_id in ledger_ids:
+                self._latch_resting_cancel_unconfirmed(
+                    record.venue_order_id, "boot_sweep_ledger_id_still_listed"
+                )
         busy = {r.market_slug for r in records}
         swept = [c.intent_id for c in noid if c.wire_market_slug not in busy]
         if len(swept) != len(noid):
