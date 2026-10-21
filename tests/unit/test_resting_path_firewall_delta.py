@@ -20,6 +20,7 @@ It imports the firewall module read-only and edits nothing in it.
 from __future__ import annotations
 
 import ast
+import hashlib
 from pathlib import Path
 from typing import Final
 
@@ -602,3 +603,74 @@ def test_the_slug_helper_refuses_to_send_before_the_pin_is_verified() -> None:
     assert isinstance(first, ast.If)
     assert "SLUG_SCOPED_CANCEL_ALL_VERIFIED" in ast.unparse(first.test)
     assert "UNSCOPED_UNVERIFIED" in ast.unparse(first.body[0])
+
+
+# ---------------------------------------------------------------------------
+# Row N5: the tree scan for the cancel-all path (src AND scripts)
+# ---------------------------------------------------------------------------
+
+_REPO: Final[Path] = CLIENT_PATH.parents[5]
+_CANCEL_ALL_SUBSTRINGS: Final[tuple[str, ...]] = (
+    "post_cancel_all",
+    "CANCEL_ALL_PATH",
+    "/v1/orders/open/cancel",
+)
+_OWNER_REL: Final[str] = "src/breezy/adapters/polymarket_us/write_transport.py"
+_PROBE_REL: Final[str] = "scripts/venue/polymarket_us_write_signing_probe.py"
+
+
+def _tree_hits(extra: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """(file, token) for every src/scripts file naming a cancel-all token, except the
+    owner, the client (checked by AST below) and the sha-pinned legacy probe."""
+    hits: list[tuple[str, str]] = []
+    files = {
+        p.relative_to(_REPO).as_posix(): p.read_text(encoding="utf-8")
+        for root in ("src", "scripts")
+        for p in sorted((_REPO / root).rglob("*.py"))
+    }
+    files.update(extra or {})
+    for rel, text in files.items():
+        if rel in {_OWNER_REL, CLIENT_REL, _PROBE_REL}:
+            continue
+        hits.extend((rel, tok) for tok in _CANCEL_ALL_SUBSTRINGS if tok in text)
+    return hits
+
+
+def test_no_other_src_or_scripts_file_names_the_cancel_all_path() -> None:
+    assert _tree_hits() == []
+
+
+@pytest.mark.parametrize("token", _CANCEL_ALL_SUBSTRINGS)
+def test_the_tree_scan_sees_a_planted_script_naming_the_path(token: str) -> None:
+    hits = _tree_hits({"scripts/venue/_planted.py": f"x = '{token}'\n"})
+    assert ("scripts/venue/_planted.py", token) in hits
+
+
+def test_the_legacy_probe_exemption_is_the_one_sha_pinned_constant() -> None:
+    from tests.unit import test_polymarket_us_cancel_transport as b1
+
+    assert b1._LEGACY_PROBE == _PROBE_REL
+    assert hashlib.sha256((_REPO / _PROBE_REL).read_bytes()).hexdigest() == b1._LEGACY_PROBE_SHA256
+
+
+def test_the_cancel_all_tokens_appear_only_in_the_choke_point() -> None:
+    """Inside the client the tokens live in ``_cancel_slug_orders`` alone."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    for token in _CANCEL_ALL_SUBSTRINGS:
+        assert _functions_containing(source, token) <= {_SLUG_HELPER}, token
+    planted = _plant_any(source, "_cancel_resting_order", "x = write_transport.CANCEL_ALL_PATH")
+    assert "_cancel_resting_order" in _functions_containing(planted, "CANCEL_ALL_PATH")
+
+
+def _functions_containing(source: str, token: str) -> set[str]:
+    """Functions whose unparsed body text contains ``token`` (docstrings excluded)."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        if any(token in ast.unparse(stmt) for stmt in body):
+            found.add(node.name)
+    return found

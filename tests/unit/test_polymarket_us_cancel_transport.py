@@ -218,6 +218,10 @@ async def test_post_cancel_all_refuses_each_bad_slug_in_a_valid_list(bad: str) -
 
 _CANCEL_ALL_TOKENS = ("CANCEL_ALL_PATH", "_signed_post_cancel_all", "/v1/orders/open/cancel")
 _OWNER = "src/breezy/adapters/polymarket_us/write_transport.py"
+#: Row N5 (ARM B5): the exec client is the ONE extra file that may name the path, and only
+#: inside the single choke point ``_cancel_slug_orders`` (pinned by AST in
+#: ``test_resting_path_firewall_delta.py``, row N5).
+_CLIENT = "src/breezy/adapters/polymarket_us/exec/client.py"
 
 
 def _scan(tokens: tuple[str, ...], allowed: frozenset[str]) -> list[tuple[str, str]]:
@@ -238,7 +242,7 @@ def test_legacy_probe_exemption_is_sha_pinned() -> None:
 
 
 def test_no_module_but_the_owner_and_the_pinned_probe_names_the_cancel_all_path() -> None:
-    assert _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE})) == []
+    assert _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT})) == []
 
 
 def test_scan_sees_a_planted_reference(tmp_path: Path) -> None:
