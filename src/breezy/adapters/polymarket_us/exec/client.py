@@ -8390,11 +8390,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         terminal read of every latched id (``_clear_resting_cancel_latch``), else the
         next boot's sweep."""
         self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids | {venue_order_id}
+        self._latch_resting_order(submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON, venue_order_id, cause)
+
+    def _latch_resting_order(self, reason: str, venue_order_id: str, cause: str) -> None:
+        """The ONE producer of the S4 resting-order latches (``resting_cancel_unconfirmed``,
+        ``resting_query_unreadable``): a CRITICAL log naming the latch token, then the
+        global durable refusal (deduped by reason) that refuses NEW rests only."""
         self._log.error(
-            f"resting_cancel_unconfirmed: venue order {venue_order_id} ({cause}); "
+            f"{reason.split(':', 1)[0]}: venue order {venue_order_id} ({cause}); "
             "new rests are refused, cancels continue"
         )
-        self._refuse(submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON)
+        self._refuse(reason)
 
     def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
         """A terminal read of ``venue_order_id`` drops its alert and, when it was the
@@ -8473,7 +8479,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.error("Refusing cancel-all: the sender is absent or canonical unverified")
             return
         if not targets:
-            self._log.info("cancel-all: no ledger-bound resting order on this instrument")
+            self._log.warning("cancel-all: no ledger-bound resting order on this instrument")
             return
         await self._cancel_resting_order([t.venue_order_id for t in targets])
 
