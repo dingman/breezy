@@ -169,7 +169,9 @@ RESTING_NOT_ADMITTED_REASON: Final[str] = (
     "this client refuses to rest an order"
 )
 
-_TIF_GTD: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+#: The venue's GTD time-in-force token (public: the client's resting echo reuses it).
+TIF_GTD: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+_TIF_GTD: Final[str] = TIF_GTD
 _NANOS_PER_SECOND: Final[int] = 1_000_000_000
 _NANOS_PER_DAY: Final[int] = 86_400 * _NANOS_PER_SECOND
 #: ``goodTillTime`` is sent in whole seconds and the venue echoes whole seconds;

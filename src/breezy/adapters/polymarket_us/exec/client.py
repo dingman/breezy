@@ -317,7 +317,6 @@ from breezy.adapters.polymarket_us.fees import (
     taker_fee_coefficient_of,
 )
 from breezy.adapters.polymarket_us.no_id_attribution import (
-    GTD_TIF,
     NoIdEcho,
     NoIdLeg,
     classify_no_id_evidence,
@@ -1210,7 +1209,7 @@ class AmbiguousResolverContext:
             "marketSlug": self.wire_market_slug,
             "price": {"value": self.wire_price, "currency": "USD"},
             "quantity": self.wire_quantity,
-            "tif": GTD_TIF,
+            "tif": submit_chain.TIF_GTD,
             "outcomeSide": self.wire_outcome_side,
             "action": self.wire_action,
             "goodTillTime": good_till,

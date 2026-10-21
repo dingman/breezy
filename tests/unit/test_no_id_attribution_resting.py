@@ -168,3 +168,11 @@ def test_resting_fill_leg_never_matches_echo() -> None:
     v = verdict((), rows=[maker_filled, older_row()])
     assert v.kind == "CONTRADICTION"
     assert v.token == "unattributed_automated_trade_in_window"
+
+
+def test_the_pure_module_and_the_submit_chain_agree_on_the_gtd_token() -> None:
+    """The pure module cannot import ``submit_chain`` (its import set is pinned), so
+    the GTD token is spelled in both; they must stay equal."""
+    from tests.unit.ambig_latch_rig import submit_chain
+
+    assert na().GTD_TIF == submit_chain.TIF_GTD == GTD
