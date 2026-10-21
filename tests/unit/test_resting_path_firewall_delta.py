@@ -277,7 +277,7 @@ SENDER_SCOPE_ROWS: Final[frozenset[str]] = frozenset(
 )
 #: Functions ADDED to ``ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD`` (rows FW-3, FW-4).
 SENDER_HEAD_ROWS: Final[frozenset[str]] = frozenset(
-    {"_cancel_resting_order", "_cancel_slug_orders"}
+    {"_cancel_order", "_cancel_resting_order", "_cancel_slug_orders"}
 )
 
 
