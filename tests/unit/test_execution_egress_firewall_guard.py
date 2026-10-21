@@ -4497,6 +4497,8 @@ ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
     | frozenset({"_cancel_slug_orders"})
     # S4 WP4 (ARM B5, pin row FW-1): a NAMED term per reviewed row, never relaxed.
     | frozenset({"_cancel_resting_order"})
+    # S4 WP4 (ARM B5, pin row FW-8): a NAMED term per reviewed row, never relaxed.
+    | frozenset({"_sweep_resting_orders_at_boot"})
 )
 
 #: Pinned at HEAD (2026-09-26, before R-7-IMPL): the exact set of functions in
