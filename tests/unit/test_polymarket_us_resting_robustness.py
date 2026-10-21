@@ -340,3 +340,28 @@ async def test_a_filled_read_clears_the_cancel_latch_and_alert_for_that_id(
     assert client.resting_cancel_alerts == ()
     assert client._unconfirmed_cancel_ids == frozenset()
     await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_unreadable_ledger_mid_loop_latches_instead_of_dropping_the_id_as_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G5: ``None`` from the ledger means UNREADABLE, which is not "retired"."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _submit_rest(rig, 0)
+    real = client._read_fill_index
+
+    def unreadable(key: str) -> list[str] | None:
+        if key == client_module.RESTING_INDEX_KEY:
+            return None
+        return real(key)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(client, "_read_fill_index", unreadable)
+    unresolved = await asyncio.wait_for(client._cancel_resting_order([_id_n(0)]), 2.0)
+    assert unresolved == frozenset()
+    assert rig.sender.cancels == [], "nothing to post against an unreadable ledger"
+    assert _LATCH in [r.reason for r in client._trading_refusals]
+    assert client.log_lines("error", "resting_cancel_unconfirmed")
+    await client._disconnect()

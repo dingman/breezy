@@ -8438,8 +8438,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
 
     def _resting_target_of(self, venue_order_id: str) -> RestingTarget | None:
-        """The ledger target for one venue id, or ``None`` (retired or unknown)."""
-        for target in self._resting_ledger() or ():
+        """The ledger target for one venue id, or ``None`` (retired or unknown).
+
+        An UNREADABLE ledger is not "retired" (B5 review G5): it yields an unusable target
+        (empty slug, not bound) so the cancel loop LATCHES instead of treating the id as
+        done and dropping it silently.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            return RestingTarget(venue_order_id, "", "", "", None, None, 0, False)
+        for target in ledger:
             if target.venue_order_id == venue_order_id:
                 return target
         return None
