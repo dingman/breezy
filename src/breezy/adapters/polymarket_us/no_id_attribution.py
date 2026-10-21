@@ -80,6 +80,11 @@ class NoIdEcho:
     outcome_side: str
     action: str
     price: str
+    #: S4 WP3 (r3 WP5, ARM r2 D2): True for a RESTING (GTD) submit. Then a single
+    #: echo-matching, in-window, unknown, non-IOC open order is an ADOPT
+    #: candidate instead of a contradiction. Default ``False`` is byte-equivalent
+    #: to every pre-S4 caller.
+    resting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,16 +278,42 @@ def _matches_echo(leg: NoIdLeg, echo: NoIdEcho) -> bool:
     )
 
 
+#: The venue ``side`` of an opening BUY, by the echoed ``(outcomeSide, action)``:
+#: the venue nets a NO buy as a SELL of the YES contract (``leg_prices``).
+_VENUE_SIDE_FOR_ECHO: Final[Mapping[tuple[str, str], str]] = {
+    ("OUTCOME_SIDE_YES", "ORDER_ACTION_BUY"): "ORDER_SIDE_BUY",
+    ("OUTCOME_SIDE_NO", "ORDER_ACTION_BUY"): "ORDER_SIDE_SELL",
+}
+
+
+def _is_resting_candidate(order: Any, echo: NoIdEcho) -> bool:
+    """A GTD order of quantity 1 whose venue side is the echoed leg's opening side."""
+    return (
+        echo.resting
+        and order.tif == GTD_TIF
+        and order.quantity == _ONE
+        and order.side == _VENUE_SIDE_FOR_ECHO.get((echo.outcome_side, echo.action))
+    )
+
+
 def _open_order_verdict(
     open_orders: Sequence[Any],
     known_order_ids: AbstractSet[str],
     echo: NoIdEcho | None,
     window_start_ns: int,
     window_end_ns: int,
-) -> tuple[bool, bool]:
-    """``(contradiction, unreadable)`` over the open orders."""
+) -> tuple[bool, bool, str | None]:
+    """``(contradiction, unreadable, resting_candidate)`` over the open orders.
+
+    ``resting_candidate`` is the venue order id of the ONE in-window, unknown,
+    echo-matching GTD order of a RESTING echo (``echo.resting``); two or more
+    such orders are a contradiction (none is adopted), and an IOC-tif open order
+    is a contradiction exactly as before. With ``echo.resting`` False the third
+    element is always ``None`` and the first two are unchanged.
+    """
     contradiction = False
     unreadable = False
+    candidates: list[str] = []
     price = _echo_price(echo) if echo is not None else None
     for order in open_orders:
         if order.venue_order_id in known_order_ids:
@@ -301,9 +332,13 @@ def _open_order_verdict(
             and order.price is not None
             and order.price == price
         )
-        if order.tif == IOC_TIF or echo_match:
+        if echo_match and echo is not None and _is_resting_candidate(order, echo):
+            candidates.append(order.venue_order_id)
+        elif order.tif == IOC_TIF or echo_match:
             contradiction = True
-    return contradiction, unreadable
+    if len(candidates) > 1:
+        return True, unreadable, None
+    return contradiction, unreadable, candidates[0] if candidates else None
 
 
 def classify_no_id_evidence(
@@ -344,9 +379,11 @@ def classify_no_id_evidence(
     open_contradiction = False
     open_unreadable = False
     if open_orders_ok:
-        open_contradiction, open_unreadable = _open_order_verdict(
+        open_contradiction, open_unreadable, resting_candidate = _open_order_verdict(
             open_orders, known_order_ids, echo, window_start_ns, window_end_ns
         )
+        if resting_candidate is not None and resting_candidate not in candidates:
+            candidates.append(resting_candidate)
     if unattributed:
         return NoIdVerdict(CONTRADICTION, TOKEN_UNATTRIBUTED)
     if late:

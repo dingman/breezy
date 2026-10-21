@@ -1246,6 +1246,7 @@ class AmbiguousResolverContext:
             outcome_side=self.wire_outcome_side,
             action=self.wire_action,
             price=self.wire_price,
+            resting=self.resting,
         )
 
     def to_bytes(self) -> bytes:
@@ -1709,6 +1710,16 @@ _NO_ID_NO_FILL_REASON: Final[str] = (
 #: After a CONTRADICTION or INCOMPLETE verdict the no-id branch makes no
 #: further reads for that intent until this long has passed.
 _NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
+
+#: S4 WP3 (ARM r2 D2 RED b): the `next` of a CONTRADICTION on a RESTING no-id
+#: intent -- a maker fill that happened before the order could be adopted has
+#: no automated resolution (fail closed). Runbook: stop the node, `breezy-clear-
+#: submit-intent --list`, then clear that intent with the venue evidence
+#: (positions + activities show the held NO leg) and `--ack`; see
+#: `src/breezy/runtime/clear_submit_intent_cli.py`.
+_RESTING_NO_ID_OPERATOR_CLEAR_NEXT: Final[str] = (
+    "operator_clears_via_breezy_clear_submit_intent_after_venue_reconcile"
+)
 #: A manual trade this close to the baseline snapshot may or may not be in it
 #: (the venue's 30 s timestamp tolerance), so it cannot be reconciled.
 _NO_ID_MANUAL_STRADDLE_NS: Final[int] = 30 * 1_000_000_000
@@ -1962,6 +1973,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._cancel_in_flight: frozenset[str] = frozenset()
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
+        # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
+        # TWO consecutive NO_FILL verdicts >= `_NO_ID_RECHECK_INTERVAL_NS` apart
+        # (a late-landing POST after the first read is then caught by the second).
+        # Cleared on any other verdict and at retirement.
+        self._no_id_resting_first_nofill_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
         self._order_sender = order_sender
         self._write_signer = write_signer
@@ -4722,6 +4738,34 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._note_resolver_error(intent_id, exc)
                 return
 
+        if outcome_kind != "NO_FILL" and intent_id in self._no_id_resting_first_nofill_ns:
+            self._no_id_resting_first_nofill_ns = {
+                key: value
+                for key, value in self._no_id_resting_first_nofill_ns.items()
+                if key != intent_id
+            }
+        if outcome_kind == "NO_FILL" and context is not None and context.resting:
+            # S4 WP3: a RESTING order needs two consecutive complete negative
+            # passes, >= the recheck interval apart, before it is called NO_FILL.
+            first_nofill_ns = (
+                self._no_id_resting_first_nofill_ns[intent_id]  # noqa: SIM401
+                if intent_id in self._no_id_resting_first_nofill_ns
+                else None
+            )
+            if first_nofill_ns is None:
+                self._no_id_resting_first_nofill_ns = {
+                    **self._no_id_resting_first_nofill_ns,
+                    intent_id: now_ns,
+                }
+                self._no_id_next_check_ns[intent_id] = recheck_ns
+                self._log.info(
+                    f"resolver: resting no-id intent {intent_id} first negative pass; "
+                    "a second consecutive one is required before NO_FILL"
+                )
+                return
+            if now_ns - first_nofill_ns < _NO_ID_RECHECK_INTERVAL_NS:
+                self._no_id_next_check_ns[intent_id] = recheck_ns
+                return
         if outcome_kind == "CONTRADICTION":
             holding = outcome_token in {"unexplained_holding", "unexplained_holding_delta"}
             if holding and intent_id not in self._holding_contradiction_intent_ids:
@@ -4740,9 +4784,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "no_id": "true",
                 "reason": outcome_token,
                 "next": (
-                    "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution"
-                    if holding
-                    else "no_id_recheck_60s"
+                    _RESTING_NO_ID_OPERATOR_CLEAR_NEXT
+                    if context is not None and context.resting
+                    else (
+                        "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution"
+                        if holding
+                        else "no_id_recheck_60s"
+                    )
                 ),
             }
             if manual_reason:
@@ -6794,6 +6842,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         }
         self._create_fill_recorded_intent_ids = self._create_fill_recorded_intent_ids - {
             intent_id
+        }
+        self._no_id_resting_first_nofill_ns = {
+            key: value
+            for key, value in self._no_id_resting_first_nofill_ns.items()
+            if key != intent_id
         }
         # EXEC-PAR E1 leak backstop: every handler settles BEFORE calling here,
         # so an entry still open now is a registry leak. Never settle from here
