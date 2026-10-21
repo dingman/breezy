@@ -51,6 +51,8 @@ _REQUIRED: Final[frozenset[str]] = frozenset(
 )  # fmt: skip
 _KEYS: Final[frozenset[str]] = _REQUIRED | {"reference", "plan_cache", "workers"}
 MAX_WORKERS: Final[int] = 4
+#: no bid may reach NO >= 0.90: that population is the frozen M1-v3 read-once
+NO_BID_CEILING: Final[float] = 0.90
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -65,6 +67,9 @@ class Arm:
     max_rungs: int
     abstain: bool
     spike: bool = False
+    p_min: float | None = None  # None: the shipped rule value
+    e_min: float | None = None
+    b_floor: float | None = None
 
 
 ARMS: Final[Mapping[str, Arm]] = {
@@ -74,6 +79,8 @@ ARMS: Final[Mapping[str, Arm]] = {
         Arm("control_noabst", rule.B_CAP, rule.MAX_RUNGS, False),
         Arm("nbp_deep", 0.84, 3, False),
         Arm("spike_bid", rule.B_CAP, rule.MAX_RUNGS, False, spike=True),
+        Arm("sharp", 0.89, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
+        Arm("sharp_cap84", 0.84, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
     )
 }
 
@@ -162,6 +169,9 @@ def parse_config(raw: Mapping[str, object]) -> DesignConfig:
     workers = raw.get("workers", 1)
     if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= MAX_WORKERS:
         raise DesignRefused(f"workers must be an integer in 1..{MAX_WORKERS}: {workers!r}")
+    arms = _names(raw, "arms", tuple(ARMS), "arms")
+    if any(ARMS[a].b_cap >= NO_BID_CEILING for a in arms):
+        raise DesignRefused(f"an arm's B_CAP can reach NO >= {NO_BID_CEILING:.2f} (M1-v3 cell)")
     reference, cache = raw.get("reference"), raw.get("plan_cache")
     if cache is not None and not _under(_path(raw, "plan_cache"), Path.home() / WORK_BASE_REL):
         raise DesignRefused(f"plan_cache {cache} must be a file under ~/{WORK_BASE_REL}")
@@ -169,7 +179,7 @@ def parse_config(raw: Mapping[str, object]) -> DesignConfig:
         day_from=day_from,
         day_to=day_to,
         stations=_names(raw, "stations", MAKER_STATIONS, "stations (maker stations only)"),
-        arms=_names(raw, "arms", tuple(ARMS), "arms"),
+        arms=arms,
         theta=_floats(raw, "theta"),
         slip=_floats(raw, "slip"),
         catalog_root=_path(raw, "catalog_root"),

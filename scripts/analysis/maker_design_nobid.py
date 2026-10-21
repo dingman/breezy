@@ -131,13 +131,25 @@ SD_COLUMNS: Final[tuple[str, ...]] = ("arm", "station", "climate_day", "late_lis
 
 
 @contextmanager
-def rule_override(b_cap: float, max_rungs: int) -> Iterator[None]:
-    """Rebind B_CAP / MAX_RUNGS everywhere they are held, for one replay; always restored."""
+def rule_override(
+    b_cap: float,
+    max_rungs: int,
+    *,
+    p_min: float | None = None,
+    e_min: float | None = None,
+    b_floor: float | None = None,
+) -> Iterator[None]:
+    """Rebind the rule constants everywhere they are held, for one replay; always restored.
+
+    P_MIN / E_MIN / B_FLOOR are read at call time inside ``maker_stage0_rule``; None leaves them.
+    """
+    extra = (("P_MIN", p_min), ("E_MIN", e_min), ("B_FLOOR", b_floor))
     patches = (
         (rule, "B_CAP", b_cap),
         (rule, "MAX_RUNGS", max_rungs),
         (adapter, "MAX_RUNGS_PASSED", max_rungs),
         (events_build, "MAX_RUNGS_PASSED", max_rungs),
+        *((rule, name, value) for name, value in extra if value is not None),
     )
     saved = [(module, name, vars(module)[name]) for module, name, _ in patches]
     for module, name, value in patches:
@@ -264,7 +276,9 @@ def _replay_arm(
     else:
         selector, vectors = _selector_for(prep, job.key, "none", 0, tracker), prep.vectors["none"]
     clock = clock_events(_cut_specs(primary_schedule(day), station, day), vectors)
-    with rule_override(arm.b_cap, arm.max_rungs):
+    with rule_override(
+        arm.b_cap, arm.max_rungs, p_min=arm.p_min, e_min=arm.e_min, b_floor=arm.b_floor
+    ):
         replay = replay_station_day(
             data, clock, selector=selector, tracker=tracker, station=station, day=day,
             unit_hypothesis=unit, live_from_ns=live_from_ns, delta_ns=0,

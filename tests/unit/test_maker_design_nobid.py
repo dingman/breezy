@@ -159,7 +159,14 @@ def test_arm_table_pins_the_card_parameters_and_the_shipped_control() -> None:
     assert (deep.b_cap, deep.max_rungs, deep.abstain, deep.spike) == (0.84, 3, False, False)
     spike = cfgm.ARMS["spike_bid"]
     assert (spike.max_rungs, spike.abstain, spike.spike) == (rule.MAX_RUNGS, False, True)
-    assert set(cfgm.ARMS) == {"control", "control_noabst", "nbp_deep", "spike_bid"}
+    assert set(cfgm.ARMS) == {
+        "control",
+        "control_noabst",
+        "nbp_deep",
+        "spike_bid",
+        "sharp",
+        "sharp_cap84",
+    }
 
 
 def _bound() -> tuple[float, int, int, int]:
@@ -365,3 +372,38 @@ def test_plan_cache_refuses_a_file_it_did_not_write(tmp_path: Path) -> None:
 
 def test_workers_is_a_small_positive_integer_when_given() -> None:
     assert cfgm.parse_config(_raw(workers=2)).workers == 2
+
+
+def test_sharp_arms_pin_the_card_parameters_and_never_bid_to_no_090() -> None:
+    sharp, capped = cfgm.ARMS["sharp"], cfgm.ARMS["sharp_cap84"]
+    assert (sharp.p_min, sharp.e_min, sharp.b_floor) == (0.97, 0.04, 0.75)
+    assert (sharp.b_cap, sharp.max_rungs, sharp.abstain, sharp.spike) == (0.89, 2, False, False)
+    assert (capped.p_min, capped.e_min, capped.b_floor) == (0.97, 0.04, 0.75)
+    assert (capped.b_cap, capped.max_rungs, capped.abstain) == (0.84, 2, False)
+    assert all(arm.b_cap < 0.90 for arm in cfgm.ARMS.values())
+
+
+def test_config_accepts_the_sharp_arms() -> None:
+    cfg = cfgm.parse_config(_raw(arms=["sharp", "sharp_cap84"]))
+    assert cfg.arms == ("sharp", "sharp_cap84")
+
+
+def test_override_rebinds_p_min_e_min_and_b_floor_and_restores_them() -> None:
+    shipped = (rule.P_MIN, rule.E_MIN, rule.B_FLOOR)
+    with nb.rule_override(0.89, 2, p_min=0.97, e_min=0.04, b_floor=0.75):
+        assert (rule.P_MIN, rule.E_MIN, rule.B_FLOOR) == (0.97, 0.04, 0.75)
+        assert rule.decide_bid(0.96, None, None, 0.0695).bid is None  # below the new P_MIN
+        assert rule.decide_bid(0.999, None, None, 0.0695).bid == 0.89
+        assert rule.decide_bid(0.999, 0.70, None, 0.0695).bid is None  # 0.71 < the new floor
+    assert (rule.P_MIN, rule.E_MIN, rule.B_FLOOR) == shipped
+    assert rule.decide_bid(0.96, None, None, 0.0695).bid is not None
+
+
+def test_config_refuses_an_arm_whose_cap_could_bid_no_090_or_more(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.setitem(cfgm.ARMS, "sharp", replace(cfgm.ARMS["sharp"], b_cap=0.90))
+    with pytest.raises(cfgm.DesignRefused, match="0.90"):
+        cfgm.parse_config(_raw(arms=["sharp"]))
