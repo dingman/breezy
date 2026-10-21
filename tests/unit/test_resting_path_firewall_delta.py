@@ -588,9 +588,12 @@ def test_post_cancel_all_is_named_only_in_the_slug_helper() -> None:
         assert _functions_naming(planted, "post_cancel_all") == {_SLUG_HELPER, host}, host
 
 
-def test_the_slug_helper_is_reached_only_from_the_cancel_loop_and_never_from_submit() -> None:
+def test_the_slug_helper_is_reached_only_from_the_cancel_loop_the_sweep_and_never_submit() -> None:
     source = CLIENT_PATH.read_text(encoding="utf-8")
-    assert _functions_naming(source, _SLUG_HELPER) == {"_cancel_resting_order"}
+    assert _functions_naming(source, _SLUG_HELPER) == {
+        "_cancel_resting_order",
+        "_sweep_resting_orders_at_boot",
+    }
     assert _order_references(source, f"self.{_SLUG_HELPER}") == set()
     planted = _plant_into(source, "_submit_order", f"self.{_SLUG_HELPER}('x')")
     assert "_submit_order" in _order_references(planted, f"self.{_SLUG_HELPER}")
@@ -679,3 +682,95 @@ def _functions_containing(source: str, token: str) -> set[str]:
         if any(token in ast.unparse(stmt) for stmt in body):
             found.add(node.name)
     return found
+
+
+# ---------------------------------------------------------------------------
+# Row N4: the boot sweep's exact callee set -- reads and the two cancel helpers only
+# ---------------------------------------------------------------------------
+
+_SWEEP: Final[str] = "_sweep_resting_orders_at_boot"
+EXEC_BOOT_SWEEP_PERMITTED_CALLEES: Final[frozenset[str]] = frozenset(
+    {
+        "ExecutionReportMappingError",
+        "_redact_order_id",
+        "frozenset",
+        "len",
+        "parse_open_orders",
+        "self._cancel_resting_order",
+        "self._cancel_slug_orders",
+        "self._latch_resting_cancel_unconfirmed",
+        "self._log.error",
+        "self._log.warning",
+        "self._private_read",
+        "self._resting_ledger",
+        "self._resting_noid_contexts",
+        "submit_chain.open_orders_envelope_is_known",
+    }
+)
+_SWEEP_AWAITS: Final[frozenset[str]] = frozenset(
+    {"self._cancel_resting_order", "self._cancel_slug_orders", "self._private_read"}
+)
+
+
+def _sweep_violations(source: str) -> list[str]:
+    fn = _function(source, _SWEEP)
+    found = sorted(_callees(fn) - EXEC_BOOT_SWEEP_PERMITTED_CALLEES)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            value = node.value
+            target = firewall._dotted_callee(value.func) if isinstance(value, ast.Call) else None
+            if target not in _SWEEP_AWAITS:
+                found.append(f"await {target}")
+        if isinstance(node, ast.Attribute) and node.attr == "_write_signer":
+            found.append(f"attribute {node.attr}")
+    # the ONLY mention of the sender is the `is None` guard (row FW-7/FW-8); every other
+    # reference (a call through it, a bare alias) is a violation
+    if "_order_sender" in ast.unparse(fn).replace("self._order_sender is None", ""):
+        found.append("attribute _order_sender beyond the is-None guard")
+    return found
+
+
+def test_the_boot_sweep_callee_set_is_exact_and_never_names_the_sender() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert _sweep_violations(source) == []
+    assert _callees(_function(source, _SWEEP)) == EXEC_BOOT_SWEEP_PERMITTED_CALLEES
+    # it reaches the venue only through the two cancel helpers (rows N2/N3) and reads;
+    # it never names post_order, post_cancel_order or post_cancel_all itself
+    text = ast.unparse(_function(source, _SWEEP))
+    for banned in ("post_order", "post_cancel_order", "post_cancel_all"):
+        assert banned not in text
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "await self._order_sender.post_order(None)",
+        "await self._order_sender.post_cancel_order(None)",
+        "await self._order_sender.post_cancel_all(None)",
+        "self._write_signer.sign_headers('POST', '/x')",
+        "self._store_set('k', b'v')",
+        "await self._read_open_orders()",
+    ],
+)
+def test_planting_a_send_or_write_into_the_boot_sweep_is_flagged(statement: str) -> None:
+    planted = _plant_into(CLIENT_PATH.read_text(encoding="utf-8"), _SWEEP, statement)
+    assert _sweep_violations(planted) != []
+
+
+def test_the_sweep_is_called_from_connect_before_the_startup_evidence_refresh() -> None:
+    fn = _function(CLIENT_PATH.read_text(encoding="utf-8"), "_connect")
+    awaited = [
+        firewall._dotted_callee(n.value.func)
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
+    ]
+    assert awaited.index(f"self.{_SWEEP}") < awaited.index(
+        "self._refresh_startup_position_evidence"
+    )
+
+
+def test_planting_a_sender_call_beside_the_is_none_guard_in_the_sweep_is_flagged() -> None:
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    assert "self._order_sender is None" in ast.unparse(_function(source, _SWEEP))
+    planted = _plant_into(source, _SWEEP, "x = self._order_sender")
+    assert _sweep_violations(planted) != []
