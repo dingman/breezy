@@ -757,6 +757,13 @@ def cancel_read_verdict(order: object) -> str:
     return CANCEL_READ_UNREADABLE
 
 
+def cancel_backoff_s(pass_no: int) -> float:
+    """The sleep after the ``pass_no``-th full pass of the cancel loop (1-based):
+    the table in :data:`CANCEL_RETRY_BACKOFF_S`, its last value repeating."""
+    table = CANCEL_RETRY_BACKOFF_S
+    return table[min(max(pass_no, 1), len(table)) - 1]
+
+
 def cancel_latch_deadline_ns(first_refused_ns: int, expire_time_ns: int) -> int:
     """When an unconfirmed cancel latches: the LATER of the order's expiry plus
     :data:`RETRY_LATCH_GRACE_S` and the first refusal plus the alert age plus

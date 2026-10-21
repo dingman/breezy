@@ -100,3 +100,17 @@ def test_unscoped_token_and_latch_reasons_are_stable_tokens() -> None:
     assert submit_chain.RESTING_QUERY_UNREADABLE_REASON.startswith("resting_query_unreadable")
     assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is False
     assert submit_chain.RESTING_POLL_FAILURE_LATCH_COUNT == 3
+
+
+@pytest.mark.parametrize(
+    ("pass_no", "seconds"), [(1, 5), (2, 10), (3, 20), (4, 40), (5, 60), (6, 60), (50, 60)]
+)
+def test_cancel_backoff_follows_the_table_and_repeats_the_last_value(
+    pass_no: int, seconds: float
+) -> None:
+    assert submit_chain.cancel_backoff_s(pass_no) == seconds
+
+
+def test_cancel_backoff_never_returns_zero_or_raises_for_a_nonpositive_pass() -> None:
+    assert submit_chain.cancel_backoff_s(0) == 5
+    assert submit_chain.cancel_backoff_s(-3) == 5

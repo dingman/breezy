@@ -1405,6 +1405,27 @@ class StartupPositionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RestingTarget:
+    """One resting order this client may cancel: a BOUND ``resting:`` row (``bound``)
+    or the HOLD context of a with-id rest the resolver has not yet decided.
+
+    ``slug`` is empty when the durable row was unreadable (the cancel loop treats
+    that as terminal-unconfirmable); ``instrument_id`` / ``strategy_id`` come from
+    the durable resolver context, else the run's cache (``None`` when neither
+    knows the order, in which case no native event is generated for it).
+    """
+
+    venue_order_id: str
+    slug: str
+    client_order_id: str
+    intent_id: str
+    instrument_id: str | None
+    strategy_id: str | None
+    expire_time_ns: int
+    bound: bool
+
+
+@dataclass(frozen=True, slots=True)
 class StartupOpenOrderSnapshot:
     """One enumerated open order, as the never-arm gate needs it: enough to
     name the order in a refusal (id, market, state) and nothing that would
@@ -1687,6 +1708,8 @@ _RESOLVER_ZERO_FILL_MIN_AGE_NS: Final[int] = 120 * 1_000_000_000
 #: 65 s``; the rest is eventual-consistency margin for the activities and
 #: positions feeds (about 2x the with-id 120 s floor that gates the same read).
 _RESOLVER_NO_ID_MIN_AGE_NS: Final[int] = 300 * 1_000_000_000
+#: One second in nanoseconds (the S4 cancel loop's alert/latch arithmetic).
+_NANOS_PER_SECOND: Final[int] = 1_000_000_000
 #: P-c: 30 s venue timestamp tolerance + 30 s clock offset + 5 s maxBlockTime.
 _NO_ID_FATE_FIXED_NS: Final[int] = 65 * 1_000_000_000
 #: A CHOICE, not a derivation: chosen only so the forward bound equals the
@@ -1971,6 +1994,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._resting_bookings: dict[str, tuple[str, Any]] = {}
         self._this_process_resting_ids: frozenset[str] = frozenset()
         self._cancel_in_flight: frozenset[str] = frozenset()
+        # S4 WP4: the cancel loop's bookkeeping. `_unconfirmed_cancel_ids` are the venue
+        # ids whose cancel latched `resting_cancel_unconfirmed` (the latch clears when
+        # the last of them reads terminal); `_resting_cancel_alert_*` are the
+        # non-latching CRITICAL alert surface (`resting_cancel_alerts`). Replaced,
+        # never mutated.
+        self._unconfirmed_cancel_ids: frozenset[str] = frozenset()
+        self._resting_cancel_alert_details: dict[str, Mapping[str, str]] = {}
+        self._resting_cancel_alert_ns: dict[str, int] = {}
+        # Intents whose slug the boot sweep confirmed empty (process-local; WP5 reads it).
+        self._swept_resting_intent_ids: frozenset[str] = frozenset()
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
         # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
@@ -8015,21 +8048,412 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
         return True
 
+    # -- S4 WP4: the resting-order ledger, cancel loop and latches -------------
+
+    def _resting_ledger(self) -> tuple[RestingTarget, ...] | None:
+        """Every order this client may cancel: the ``resting:`` index ids (with their
+        durable binding rows) UNION the open with-id resting HOLD contexts. ``None``
+        when the index is UNREADABLE (``_read_fill_index`` has already refused): the
+        callers then treat the ledger as empty and issue zero POSTs. A row that will
+        not decode yields a target with an empty slug (terminal-unconfirmable in the
+        loop), never a skipped id.
+        """
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None:
+            return None
+        found: list[RestingTarget] = []
+        for venue_order_id in indexed:
+            found.append(self._bound_target_of(venue_order_id))
+        if self._latch is not None:
+            for intent in self._latch.open_submit_intents():
+                context = self._boot_context_of(intent.intent_id)
+                if (
+                    context is not None
+                    and context.resting
+                    and context.venue_order_id != submit_chain.NO_VENUE_ORDER_ID
+                    and context.venue_order_id not in indexed
+                ):
+                    found.append(
+                        RestingTarget(
+                            venue_order_id=context.venue_order_id,
+                            slug=context.wire_market_slug or "",
+                            client_order_id=context.client_order_id,
+                            intent_id=context.intent_id,
+                            instrument_id=context.instrument_id,
+                            strategy_id=context.strategy_id,
+                            expire_time_ns=context.resting_expire_ns or 0,
+                            bound=False,
+                        )
+                    )
+        return tuple(found)
+
+    def _bound_target_of(self, venue_order_id: str) -> RestingTarget:
+        """The target for one indexed id, decoded from its durable binding row."""
+        raw = self._store_get(f"{RESTING_KEY_PREFIX}{venue_order_id}")
+        row: Any = None
+        if raw:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                row = None
+        if not isinstance(row, dict):
+            self._log.error("resting ledger: a bound id has no readable binding row")
+            return RestingTarget(venue_order_id, "", "", "", None, None, 0, True)
+        intent_id = str(row.get("intentId", ""))
+        client_order_id = str(row.get("clientOrderId", ""))
+        context = self._boot_context_of(intent_id) if intent_id else None
+        instrument_id = None if context is None else context.instrument_id
+        strategy_id = None if context is None else context.strategy_id
+        if instrument_id is None:
+            cached = self._cache.order(ClientOrderId(client_order_id)) if client_order_id else None
+            if cached is not None:
+                instrument_id = str(cached.instrument_id)
+                strategy_id = str(cached.strategy_id)
+        return RestingTarget(
+            venue_order_id=venue_order_id,
+            slug=str(row.get("slug", "")),
+            client_order_id=client_order_id,
+            intent_id=intent_id,
+            instrument_id=instrument_id,
+            strategy_id=strategy_id,
+            expire_time_ns=int(row.get("expireTimeNs", 0) or 0),
+            bound=True,
+        )
+
+    def _resting_target_of(self, venue_order_id: str) -> RestingTarget | None:
+        """The ledger target for one venue id, or ``None`` (retired or unknown)."""
+        for target in self._resting_ledger() or ():
+            if target.venue_order_id == venue_order_id:
+                return target
+        return None
+
+    def _resting_cancel_target(self, command: Any) -> tuple[RestingTarget, ...]:
+        """The ledger targets a cancel command names (SYNC; empty = none).
+
+        A ``CancelOrder`` matches by client order id; a ``CancelAllOrders`` matches
+        by instrument (and side) so cancel-all only ever touches ledger-bound
+        orders of THAT instrument -- never an unbound or operator order.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            return ()
+        client_order_id = getattr(command, "client_order_id", None)
+        if client_order_id is not None:
+            return tuple(t for t in ledger if t.client_order_id == client_order_id.value)
+        wanted = str(command.instrument_id)
+        side = command.order_side
+        matched: list[RestingTarget] = []
+        for target in ledger:
+            if target.instrument_id != wanted:
+                continue
+            cached = self._cache.order(ClientOrderId(target.client_order_id))
+            if side != OrderSide.NO_ORDER_SIDE and cached is not None and cached.side != side:
+                continue
+            matched.append(target)
+        return tuple(matched)
+
+    def _retire_resting_row(self, venue_order_id: str) -> bool:
+        """The ONE winner of a bound rest's retirement. SYNC, no ``await``: read the
+        index three-way; an absent id (or an unreadable index) returns ``False`` and
+        does nothing; otherwise rewrite the index without it, tombstone the binding
+        row and drop the process-local booking. Every terminal path (cancel confirm,
+        venue-initiated terminal, the poll) goes through here, so exactly one settles.
+        """
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None or venue_order_id not in indexed:
+            return False
+        self._store_set(
+            RESTING_INDEX_KEY,
+            submit_chain.resting_index_bytes([v for v in indexed if v != venue_order_id]),
+        )
+        self._store_set(f"{RESTING_KEY_PREFIX}{venue_order_id}", b"")
+        return True
+
+    def _settle_resting_terminal(self, target: RestingTarget, verdict: str) -> bool:
+        """Retire a BOUND rest the venue shows terminal with nothing filled, once.
+
+        Wins ``_retire_resting_row`` (a loser returns ``False`` and does nothing),
+        emits the native ``OrderCanceled`` / ``OrderExpired`` (only for an order this
+        run's cache knows), settles the exposure via ``settle`` (never
+        ``release_booking``) and restores the permit slot ONLY for an id this process
+        armed, idempotently per venue id. A permit that cannot restore (expired) is
+        logged and skipped: a cancel never needs the permit.
+        """
+        venue_id = target.venue_order_id
+        held = self._resting_bookings.get(venue_id)
+        if not self._retire_resting_row(venue_id):
+            return False
+        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
+        now_ns = self._clock.timestamp_ns()
+        cached = self._cache.order(ClientOrderId(target.client_order_id))
+        if cached is not None and target.instrument_id is not None and target.strategy_id:
+            events = {
+                "strategy_id": StrategyId(target.strategy_id),
+                "instrument_id": InstrumentId.from_str(target.instrument_id),
+                "client_order_id": ClientOrderId(target.client_order_id),
+                "venue_order_id": VenueOrderId(venue_id),
+                "ts_event": now_ns,
+            }
+            if verdict == submit_chain.CANCEL_READ_EXPIRED:
+                self.generate_order_expired(**events)
+            else:
+                self.generate_order_canceled(**events)
+        if self._ledger is not None:
+            try:
+                self._ledger.settle(
+                    target.intent_id,
+                    booking=None if held is None else held[1],
+                    realized_usd=None,
+                    fill_ts_ns=None,
+                    now_ns=now_ns,
+                )
+            except Exception as exc:  # noqa: BLE001 - never stick: abandon, count, go on
+                self._note_resolver_error(target.intent_id, exc)
+                self._ledger.abandon_open_exposure(target.intent_id)
+        if venue_id in self._this_process_resting_ids:
+            self._restore_resting_budget(target)
+        return True
+
+    def _restore_resting_budget(self, target: RestingTarget) -> None:
+        """Give back the permit slot of a rest THIS process armed (idempotent per id)."""
+        venue_id = target.venue_order_id
+        context = self._boot_context_of(target.intent_id) if target.intent_id else None
+        if self._permit is None or context is None or self._budget_was_restored(venue_id):
+            return
+        try:
+            applied = restore_live_trading_budget(
+                permit=self._permit,
+                venue_order_id=venue_id,
+                order_notional_usd=context.notional_usd,
+            )
+        except LiveTradingPermissionError:
+            self._log.warning("resting cancel: the permit slot could not be restored; skipped")
+            return
+        if applied:
+            self._mark_budget_restored(venue_id)
+
+    async def _confirm_cancel_terminal(self, venue_order_id: str) -> str:
+        """One GET of a cancelled order, classified by ``cancel_read_verdict``. GET-ONLY.
+
+        The authoritative answer after a cancel POST: a bare 200 proves nothing. An
+        unreadable GET (or an id failing the allowlist) is ``UNREADABLE``.
+        """
+        if not submit_chain.valid_venue_order_id(venue_order_id):
+            return submit_chain.CANCEL_READ_UNREADABLE
+        try:
+            payload = await self._private_read(submit_chain.order_by_id_path(venue_order_id))
+        except Exception as exc:  # noqa: BLE001 - an unreadable GET keeps the cancel pending
+            self._log.warning(f"resting cancel: confirm GET failed ({exc.__class__.__name__})")
+            return submit_chain.CANCEL_READ_UNREADABLE
+        nested = payload.get("order") if isinstance(payload, Mapping) else None
+        return submit_chain.cancel_read_verdict(nested if isinstance(nested, Mapping) else payload)
+
+    async def _cancel_resting_order(
+        self, venue_ids: list[str] | tuple[str, ...], *, max_passes: int | None = None
+    ) -> frozenset[str]:
+        """The RETRY-WHEN-OPEN cancel loop; returns the ids still unconfirmed.
+
+        Each pass makes ONE POST + confirm-GET attempt per pending id before any
+        backoff sleep, so no id head-of-line-blocks another. A terminal zero-fill read
+        retires a BOUND row once (``_settle_resting_terminal``); a HOLD context is
+        never retired here (the with-id resolver owns that); a fill read leaves the
+        row to the fill path. ``_cancel_in_flight`` carries the ids this loop owns
+        (the resolver skips them); an id another loop already owns is left to it.
+        ``max_passes=None`` loops until every id is terminal (the cancel command's own
+        task); the boot sweep passes a bound so ``_connect`` cannot hang.
+        """
+        owned = [v for v in venue_ids if v not in self._cancel_in_flight]
+        self._cancel_in_flight = self._cancel_in_flight | frozenset(owned)
+        pending = list(owned)
+        first_refused: dict[str, int] = {}
+        pass_no = 0
+        try:
+            while pending:
+                for venue_id in list(pending):
+                    target = self._resting_target_of(venue_id)
+                    if not submit_chain.valid_venue_order_id(venue_id) or (
+                        target is not None and not target.slug
+                    ):
+                        self._latch_resting_cancel_unconfirmed(venue_id, "id_or_slug_unusable")
+                        pending.remove(venue_id)
+                        continue
+                    if target is None:
+                        pending.remove(venue_id)
+                        continue
+                    try:
+                        headers = self._write_signer.sign_headers(
+                            write_transport._WRITE_METHOD,
+                            submit_chain.cancel_order_path(venue_id),
+                        )
+                        await self._order_sender.post_cancel_order(
+                            self._api_base_url,
+                            headers=headers,
+                            order_id=venue_id,
+                            market_slug=target.slug,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - a refused POST is retried
+                        self._log.warning(
+                            f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
+                        )
+                    verdict = await self._confirm_cancel_terminal(venue_id)
+                    if verdict in (submit_chain.CANCEL_READ_CANCELED, submit_chain.CANCEL_READ_EXPIRED):
+                        if target.bound:
+                            self._settle_resting_terminal(target, verdict)
+                        self._clear_resting_cancel_latch(venue_id)
+                        pending.remove(venue_id)
+                    elif verdict == submit_chain.CANCEL_READ_FILLED:
+                        self._log.warning("resting cancel: the order filled; the fill path owns it")
+                        pending.remove(venue_id)
+                    else:
+                        now_ns = self._clock.timestamp_ns()
+                        if venue_id not in first_refused:
+                            first_refused[venue_id] = now_ns
+                        if self._note_cancel_refused(target, first_refused[venue_id], now_ns):
+                            await self._cancel_slug_orders(target.slug)
+                pass_no += 1
+                if not pending or (max_passes is not None and pass_no >= max_passes):
+                    break
+                await asyncio.sleep(submit_chain.cancel_backoff_s(pass_no))
+        finally:
+            self._cancel_in_flight = self._cancel_in_flight - frozenset(owned)
+        return frozenset(pending)
+
+    async def _cancel_slug_orders(self, slug: Any) -> str:
+        """The ONE choke point of the slug-scoped venue cancel-all (escalation only).
+
+        Disabled (``UNSCOPED_UNVERIFIED``, nothing sent) until
+        ``SLUG_SCOPED_CANCEL_ALL_VERIFIED`` is flipped by a reviewed commit citing the
+        two-slug positive control. ``slug`` must be one of the LEDGER's slugs: an
+        empty, off-ledger or unreadable-index call posts nothing. The body is built
+        and re-validated inside the transport.
+        """
+        if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is not True:
+            return submit_chain.UNSCOPED_UNVERIFIED
+        ledger = self._resting_ledger() or ()
+        if slug not in {t.slug for t in ledger if t.slug}:
+            return "REFUSED_OFF_LEDGER"
+        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            return "REFUSED_NO_SENDER"
+        try:
+            headers = self._write_signer.sign_headers(
+                write_transport._WRITE_METHOD, write_transport.CANCEL_ALL_PATH
+            )
+            await self._order_sender.post_cancel_all(
+                self._api_base_url, headers=headers, slugs=[slug]
+            )
+        except Exception as exc:  # noqa: BLE001 - the per-order loop continues
+            self._log.warning(f"resting cancel: slug cancel-all failed ({exc.__class__.__name__})")
+            return "POST_FAILED"
+        return "POSTED"
+
+    def _note_cancel_refused(self, target: RestingTarget, first_refused_ns: int, now_ns: int) -> bool:
+        """Alert-before-latch bookkeeping for one still-open cancel (SYNC).
+
+        The non-latching CRITICAL alert fires once the age from the FIRST refused
+        cancel reaches ``RETRY_ALERT_AGE_S`` (re-alerting every ``RETRY_REALERT_S``);
+        the latch only at ``cancel_latch_deadline_ns`` -- strictly later by
+        construction. Returns ``True`` iff it latched NOW (the caller then escalates
+        to the slug cancel-all, which is a no-op while that pin is False).
+        """
+        venue_id = target.venue_order_id
+        age_ns = now_ns - first_refused_ns
+        last_alert = self._resting_cancel_alert_ns.get(venue_id)
+        if age_ns >= submit_chain.RETRY_ALERT_AGE_S * _NANOS_PER_SECOND and (
+            last_alert is None
+            or now_ns - last_alert >= submit_chain.RETRY_REALERT_S * _NANOS_PER_SECOND
+        ):
+            self._resting_cancel_alert_ns = {**self._resting_cancel_alert_ns, venue_id: now_ns}
+            self._resting_cancel_alert_details = {
+                **self._resting_cancel_alert_details,
+                venue_id: {
+                    "severity": "CRITICAL",
+                    "event": "resting_cancel_alert",
+                    "venue_order_id": venue_id,
+                    "slug": target.slug,
+                    "age_s": str(age_ns // _NANOS_PER_SECOND),
+                    "next": "cancel_loop_retrying_then_latch_resting_cancel_unconfirmed",
+                },
+            }
+            self._log.error(
+                f"resting_cancel_alert: venue order {venue_id} on {target.slug} is still open "
+                f"{age_ns // _NANOS_PER_SECOND} s after its first refused cancel"
+            )
+        deadline_ns = submit_chain.cancel_latch_deadline_ns(first_refused_ns, target.expire_time_ns)
+        if now_ns >= deadline_ns and venue_id not in self._unconfirmed_cancel_ids:
+            self._latch_resting_cancel_unconfirmed(venue_id, "cancel_not_confirmed")
+            return True
+        return False
+
+    def _latch_resting_cancel_unconfirmed(self, venue_order_id: str, cause: str) -> None:
+        """Latch ``resting_cancel_unconfirmed``: NEW rests are refused (a global
+        durable refusal; cancels never consult it and continue). Clearing path: the
+        terminal read of every latched id (``_clear_resting_cancel_latch``), else the
+        next boot's sweep."""
+        self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids | {venue_order_id}
+        self._log.error(
+            f"resting_cancel_unconfirmed: venue order {venue_order_id} ({cause}); "
+            "new rests are refused, cancels continue"
+        )
+        self._refuse(submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON)
+
+    def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
+        """A terminal read of ``venue_order_id`` drops its alert and, when it was the
+        last latched id, the ``resting_cancel_unconfirmed`` refusal."""
+        self._resting_cancel_alert_details = {
+            k: v for k, v in self._resting_cancel_alert_details.items() if k != venue_order_id
+        }
+        self._resting_cancel_alert_ns = {
+            k: v for k, v in self._resting_cancel_alert_ns.items() if k != venue_order_id
+        }
+        if venue_order_id not in self._unconfirmed_cancel_ids:
+            return
+        self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids - {venue_order_id}
+        if self._unconfirmed_cancel_ids:
+            return
+        self._trading_refusals = [
+            r
+            for r in self._trading_refusals
+            if r.reason != submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+        ]
+        self._log.info("resting cancel: every latched cancel read terminal; latch cleared")
+
+    @property
+    def resting_cancel_alerts(self) -> tuple[Mapping[str, str], ...]:
+        """The non-latching CRITICAL cancel alerts, for the health surface (read like
+        :attr:`stale_ambiguous_intent_alerts`: this module cannot import the alert
+        sink)."""
+        return tuple(self._resting_cancel_alert_details.values())
+
     async def _cancel_order(self, command: CancelOrder) -> None:
-        """Refuse. There is nothing to cancel: nothing can be sent."""
-        reason = (
-            "EXEC_SPINE R-4 has no order path, so no order of ours can be "
-            "resting at the venue to cancel"
-        )
-        self._log.error(f"Refusing to cancel {command.client_order_id!r}: {reason}")
-        self.generate_order_cancel_rejected(
-            strategy_id=command.strategy_id,
-            instrument_id=command.instrument_id,
-            client_order_id=command.client_order_id,
-            venue_order_id=command.venue_order_id,
-            reason=reason,
-            ts_event=self._clock.timestamp_ns(),
-        )
+        """S4 WP4: cancel ONE resting order of ours (bound, or a with-id HOLD context).
+
+        Refuses via ``generate_order_cancel_rejected`` unless the sender is
+        injected, the canonical string is verified, and the order maps to a venue
+        id in the ledger (a SUBMITTED order with no id yet is cancelled by its
+        venue ``goodTillTime``). Never arms the intent, never asserts the permit
+        (a cancel only reduces risk). The confirm-by-read loop is
+        ``_cancel_resting_order``; a bare 200 never emits ``OrderCanceled``.
+        """
+        targets = self._resting_cancel_target(command)
+        reason = ""
+        if self._order_sender is None:
+            reason = submit_chain.SENDER_ABSENT_REASON
+        elif write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            reason = submit_chain.CANONICAL_UNVERIFIED_REASON
+        elif not targets:
+            reason = "no bound or held resting order carries this client order id"
+        if reason:
+            self._log.error(f"Refusing to cancel {command.client_order_id!r}: {reason}")
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=command.venue_order_id,
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+        await self._cancel_resting_order((targets[0].venue_order_id,))
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         raise NotImplementedError(self._unsupported("order lists"))
@@ -8038,7 +8462,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         raise NotImplementedError(self._unsupported("order modification"))
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        raise NotImplementedError(self._unsupported("cancel-all"))
+        """S4 WP4: cancel every LEDGER-BOUND rest on ``command.instrument_id``.
+
+        One per-order cancel for each bound order of that instrument (and side);
+        an unbound or operator order is never touched and no venue cancel-all is
+        issued from this strategy path. Nothing to cancel is success.
+        """
+        targets = self._resting_cancel_target(command)
+        if self._order_sender is None or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            self._log.error("Refusing cancel-all: the sender is absent or canonical unverified")
+            return
+        if not targets:
+            self._log.info("cancel-all: no ledger-bound resting order on this instrument")
+            return
+        await self._cancel_resting_order([t.venue_order_id for t in targets])
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         raise NotImplementedError(self._unsupported("batch cancel"))
