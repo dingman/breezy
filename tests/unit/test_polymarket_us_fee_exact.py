@@ -43,14 +43,18 @@ def test_the_exact_fee_is_theta_q_p_one_minus_p_unrounded(
 
 @pytest.mark.parametrize("price", ["0.03", "0.40", "0.75", "0.89", "0.97"])
 def test_the_cent_fee_is_the_exact_fee_rounded_bankers(price: str) -> None:
-    kwargs = {
-        "quantity": Decimal(1),
-        "price": Decimal(price),
-        "ts_event_ns": AMBIGUOUS_START_NS,
-        "fee_coefficient_at_fill": THETA,
-    }
-    exact = taker_fee_exact_at_fill(**kwargs)
-    cents = taker_fee_at_fill(**kwargs)
+    exact = taker_fee_exact_at_fill(
+        quantity=Decimal(1),
+        price=Decimal(price),
+        ts_event_ns=AMBIGUOUS_START_NS,
+        fee_coefficient_at_fill=THETA,
+    )
+    cents = taker_fee_at_fill(
+        quantity=Decimal(1),
+        price=Decimal(price),
+        ts_event_ns=AMBIGUOUS_START_NS,
+        fee_coefficient_at_fill=THETA,
+    )
     assert exact is not None and cents is not None
     assert cents.as_decimal() == exact.quantize(Decimal("0.01"))
 
