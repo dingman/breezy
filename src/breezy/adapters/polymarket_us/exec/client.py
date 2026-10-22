@@ -9254,9 +9254,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``False`` and writes nothing). Then, with no ``await`` between: (1) the durable
         ``DurableFillRecord`` (``trade_id`` = the ``POLL-`` maker marker, ``cumulative_fee`` =
         the RECOGNISED commission, ``venue_fee_raw`` = the venue's own string,
-        ``fee_reconciled = recognised == raw``); (2) the index row retired; (3) the native
+        ``fee_reconciled = recognised == raw`` and in the envelope); (2) the native
         ``OrderFilled`` as MAKER at the venue's commission (guarded: an order this run's
-        cache does not know gets no event); (4) the ledger settle at the realised cost. A
+        cache does not know gets no event); (3) the index row retired (guarded); (4) the
+        ledger settle at the realised cost. The event precedes the retire (B6 review S6; a
+        deviation from the r4 record-then-retire wording: the crash window is then a bound
+        row the next read re-books, never a stuck open order). A
         fill is NEVER refused for its commission (L-48): an absent commission is booked
         unreconciled at zero (the resolver's precedent), an out-of-envelope one still books
         and latches.
@@ -9321,14 +9324,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.error(f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}")
             self._latch_resting_order(_FILL_WRITE_FAILED, venue_id, "fill record not written")
             return False
-        self._retire_resting_row(venue_id)
         held = self._resting_bookings.get(venue_id)
-        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
         self._log.info(
             f"resting fill: booked the fill of {_redact_order_id(venue_id)} "
             f"(commission sign {submit_chain.commission_sign_class(raw_text)})"
         )
+        # B6 review S6: the native event goes BEFORE the retire, so a crash between the two
+        # leaves the row bound (the next read re-books it, see S3) instead of an order stuck
+        # open with its record already written; a failing retire is guarded (it may have
+        # raised after the index write) and never strands the settle below.
         self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
+        try:
+            self._retire_resting_row(venue_id)
+        except Exception as exc:  # noqa: BLE001 - the booking completes; the next read retries
+            self._log.error(
+                f"resting fill: retiring the booked rest failed ({exc.__class__.__name__})"
+            )
+        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
         self._settle_resting_fill(target, held, Decimal(0) if replayed else cost, stamp_ns)
         if raw is None:
             self._flag_unreadable_commission(target.venue_order_id, target.slug)

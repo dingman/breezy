@@ -163,3 +163,53 @@ async def test_s1_an_unreadable_open_orders_read_blocks_the_no_fill_retirement(
     await _swept_two_passes(second)
     assert _retirement(second) is None, "an unread open-orders book is not a clear slug"
     await second._disconnect()
+
+
+# -- S6: emit before retire; a failing retire never strands the booking ---------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s6_a_failing_retire_after_the_record_still_emits_the_fill_and_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native ``OrderFilled`` is emitted BEFORE the row is retired and the retire is guarded:
+    a retire that raises (after the index write, or before) must not leave the Nautilus order
+    open with the durable record already written, nor skip the settle."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    _fill(rig, 0, commission="0.01")
+
+    def boom(_venue_id: str) -> bool:
+        raise OSError("tombstone write failed")
+
+    monkeypatch.setattr(client, "_retire_resting_row", boom)
+    await client._query_order(_query(rig, command))
+    assert len(_records(rig)) == 1
+    assert len(_filled_events(rig)) == 1, "the order is not left open in the cache"
+    assert not client._ledger.has_open_exposure(intent_id), "the exposure is settled"
+    assert client.log_lines("error", "retiring the booked rest failed")
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s6_the_fill_event_is_emitted_while_the_row_is_still_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    _fill(rig, 0)
+    seen: list[bool] = []
+    real = client._emit_resting_fill_event
+
+    def spy(*args: Any, **kwargs: Any) -> None:
+        seen.append(client._rest_still_bound(_id_n(0)))
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(client, "_emit_resting_fill_event", spy)
+    await client._query_order(_query(rig, command))
+    assert seen == [True]
+    assert not client._rest_still_bound(_id_n(0)), "and retired right after"
+    await client._disconnect()
