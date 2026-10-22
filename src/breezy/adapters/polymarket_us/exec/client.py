@@ -7097,6 +7097,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         in the ``resting:`` index). Default OFF and NEVER RAISES: an unreadable or unavailable
         ledger (store closed, a bad row, any enumeration error), an unknown order or a
         mismatch is ``False``, so the caller refuses exactly as before.
+
+        Residue (B6 review S5, accepted): ``calculate_commission`` carries no order side, so
+        the side of the fill is not checked; a MAKER fill that matches an unretired rest on
+        instrument, quantity and limit price is taken to be that rest's. The carve-out only
+        skips a refusal; the fill is still priced at the taker figure.
         """
         try:
             if last_qty.as_decimal() != 1:
@@ -7108,7 +7113,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             for target in ledger:
                 if not target.bound or target.slug != slug:
                     continue
-                if target.instrument_id is not None and target.instrument_id != str(instrument.id):
+                # B6 review S5: explicit equality. A row that does not name its leg
+                # instrument (None) never matches, so the refusal stands (fail closed).
+                if target.instrument_id != str(instrument.id):
                     continue
                 cached = self._cache.order(ClientOrderId(target.client_order_id))
                 if cached is None or cached.price is None:

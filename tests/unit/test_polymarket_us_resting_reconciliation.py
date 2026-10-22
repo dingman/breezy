@@ -15,6 +15,7 @@ Every sender and private read is a local double: no network, no venue contact.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -195,4 +196,25 @@ async def test_taker_and_sideless_reconciliation_fills_are_unchanged_by_the_carv
         assert priced is not None
     assert _refusals(rig) == []
     assert submit_chain.MAKER_COMMISSION_SIGN_VERIFIED is False
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_bound_rest_with_no_recorded_instrument_does_not_carve_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 review S5: the instrument equality is explicit. A bound row that does not name its
+    leg instrument (``instrument_id`` None) can never match a fill's instrument, so the
+    refusal stands (fail closed), instead of the missing instrument skipping the check."""
+    rig = await _rig(tmp_path, monkeypatch)
+    await _submit_rest(rig, 0)
+    client = rig.client
+    real = client._enumerate_resting_ledger()
+    assert real, "the fixture has one bound rest"
+    unnamed = tuple(dataclasses.replace(t, instrument_id=None) for t in real)
+    monkeypatch.setattr(client, "_enumerate_resting_ledger", lambda: unnamed)
+    assert _maker_commission(rig) is not None
+    assert len(_refusals(rig)) == 1, "no carve-out without a named instrument"
+    assert rig.client.log_lines("warning", "carve-out") == []
     await rig.client._disconnect()
