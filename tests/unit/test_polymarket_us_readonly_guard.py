@@ -1833,11 +1833,33 @@ def test_b8_no_retry_manager_or_com_adapter() -> None:
 def test_b9_post_order_and_clear_submit_intent_have_exactly_one_caller_each() -> None:
     """B9: own one-caller pin, never BARRED_CALLEES."""
     assert named_call_sites("post_order") == {
-        ("src/breezy/adapters/polymarket_us/exec/client.py", "_submit_order")
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "_submit_order"),
+        # ARM B2 (plan_r2_delta D3): the maker positive-control script rests its OWN probe orders
+        # through the shipped transport; the body comes only from build_resting_order_body and
+        # the call sits behind the create budget and the GTD ceiling. One named row.
+        ("scripts/venue/polymarket_us_maker_positive_control.py", "rest"),
     }
     assert named_call_sites("clear_submit_intent") == {
         ("src/breezy/runtime/clear_submit_intent_cli.py", "main")
     }
+
+
+def test_b9_b2_control_row_is_one_call_site_and_a_second_one_would_trip() -> None:
+    """ARM B2 row plant: the script has exactly ONE ``post_order`` site (``rest``); a second
+    function calling it in the same script would add a tuple and break the exact-set pin."""
+    script = "scripts/venue/polymarket_us_maker_positive_control.py"
+    source = (REPO_ROOT / script).read_text(encoding="utf-8")
+    planted = source + "\n\nasync def rogue(sender):\n    return await sender.post_order()\n"
+    sites = {
+        (script, fn.name)
+        for fn in ast.walk(ast.parse(planted))
+        if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "post_order"
+    }
+    assert sites == {(script, "rest"), (script, "rogue")}
 
 
 def test_b9_named_call_sites_is_not_vacuous_against_a_planted_second_caller(
