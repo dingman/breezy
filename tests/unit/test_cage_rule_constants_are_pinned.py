@@ -1142,6 +1142,20 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             "the alert strictly precede the latch for every input"
         ),
     ),
+    # ARM maker-sharp B6 review H1 (one reviewed row, one commit): the half-cent slack on the
+    # resting commission envelope.
+    RulePin(
+        module="submit_chain",
+        attr="COMMISSION_ENVELOPE_SLACK_USD",
+        expected=Decimal("0.005"),
+        widened=Decimal("0.006"),
+        narrowed=Decimal("0.004"),
+        why=(
+            "S4 P16 (B6 review H1): the slack added to the resting commission envelope bound. "
+            "Widening lets a larger over-charge pass unlatched; narrowing re-opens the false "
+            "latch on an ordinary fill"
+        ),
+    ),
 )
 
 _MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
@@ -1260,6 +1274,8 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED",
         # ARM maker-sharp B6 / S4 r4 P16: the maker commission sign gate.
         "submit_chain.MAKER_COMMISSION_SIGN_VERIFIED",
+        # ARM maker-sharp B6 review H1: the commission envelope slack.
+        "submit_chain.COMMISSION_ENVELOPE_SLACK_USD",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason

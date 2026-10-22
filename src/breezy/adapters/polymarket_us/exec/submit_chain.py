@@ -19,7 +19,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, Literal, Protocol, cast
 
 from nautilus_trader.core.uuid import UUID4
@@ -266,6 +266,26 @@ RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON: Final[str] = (
     "resting_commission_out_of_envelope: a resting fill's commission exceeded the modelled taker "
     "fee; the fill is booked, new rests are refused (cancels continue)"
 )
+#: B6 review H1: half a cent of slack on the commission envelope. A provisional RulePin, not an
+#: operator control (pinned in the cage rule table); widening lets a larger over-charge pass
+#: unlatched, narrowing re-opens the false latch on an ordinary fill.
+COMMISSION_ENVELOPE_SLACK_USD: Final[Decimal] = Decimal("0.005")
+_ONE_CENT: Final[Decimal] = Decimal("0.01")
+
+
+def commission_envelope_bound(*, modelled: Decimal, exact: Decimal) -> Decimal:
+    """The largest commission, in USD, a resting fill may carry without latching
+    ``resting_commission_out_of_envelope``.
+
+    ``max(modelled cent fee, exact unrounded theta*q*p*(1-p), that exact fee rounded UP to
+    the next cent) + COMMISSION_ENVELOPE_SLACK_USD``. The modelled (banker's-rounded) fee alone
+    is 0.01 across the whole 0.75-0.89 band and 0.00 below ~0.07 / above ~0.93, so a venue that
+    charges the unrounded fee, or rounds up, would otherwise latch on an ordinary fill.
+    """
+    rounded_up = exact.quantize(_ONE_CENT, rounding=ROUND_CEILING)
+    return max(modelled, exact, rounded_up) + COMMISSION_ENVELOPE_SLACK_USD
+
+
 COMMISSION_BPS_DRIFT_REASON: Final[str] = (
     "commission_bps_drift: a resting order's commission bps fields left the observed inert "
     "value; the fill is booked, new rests are refused (cancels continue)"

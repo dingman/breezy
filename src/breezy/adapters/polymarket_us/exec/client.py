@@ -318,6 +318,7 @@ from breezy.adapters.polymarket_us.fees import (
     fee_schedule_bucket,
     polymarket_us_fee,
     taker_fee_at_fill,
+    taker_fee_coefficient_as_of,
     taker_fee_coefficient_of,
 )
 from breezy.adapters.polymarket_us.no_id_attribution import (
@@ -9356,23 +9357,30 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         quantity: Decimal,
         ts_ns: int,
     ) -> None:
-        """``abs(raw)`` must not exceed the modelled TAKER fee for the fill. Outside it the
+        """``abs(raw)`` must not exceed the modelled TAKER fee envelope for the fill
+        (``submit_chain.commission_envelope_bound``). Outside it the
         fill is STILL booked; this latches ``resting_commission_out_of_envelope`` (NEW rests
         only) and raises a value-free CRITICAL alert. An unpinned fee schedule skips with a
         WARN. Never raises."""
         if raw is None:
             return
         try:
+            theta = taker_fee_coefficient_of(instrument)
+            if theta is None:
+                theta = taker_fee_coefficient_as_of(ts_ns)
             modelled = taker_fee_at_fill(
                 quantity=quantity,
                 price=price,
                 ts_event_ns=ts_ns,
-                fee_coefficient_at_fill=taker_fee_coefficient_of(instrument),
+                fee_coefficient_at_fill=theta,
             )
-            if modelled is None:
+            if modelled is None or theta is None:
                 self._log.warning("resting fill: the fee schedule is unpinned; envelope skipped")
                 return
-            if abs(raw) <= modelled.as_decimal():
+            bound = submit_chain.commission_envelope_bound(
+                modelled=modelled.as_decimal(), exact=theta * quantity * price * (1 - price)
+            )
+            if abs(raw) <= bound:
                 return
         except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
             self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
