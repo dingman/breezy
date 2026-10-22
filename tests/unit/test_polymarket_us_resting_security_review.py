@@ -320,3 +320,23 @@ async def test_s8_the_poll_path_still_writes_its_own_poll_trade_id(
     (record,) = _records(rig)
     assert record.trade_id == submit_chain.maker_poll_trade_id(_id_n(0))
     await rig.client._disconnect()
+
+
+# -- the startup-evidence value of the cancel latch (kills an always-None mutant) -----------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_resting_cancel_evidence_is_true_when_latched_false_when_an_order_is_open_else_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, _commands = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    assert client._resting_cancel_evidence() is None, "flat book, latch clear: key omitted"
+    monkeypatch.setattr(client, "_open_orders", (object(),))
+    assert client._resting_cancel_evidence() is False, "an open order needs the explicit False"
+    client._latch_resting_cancel_unconfirmed(_id_n(0), "test")
+    assert client._resting_cancel_evidence() is True, "latched wins over an open order"
+    monkeypatch.setattr(client, "_open_orders", ())
+    assert client._resting_cancel_evidence() is True, "latched with a flat book is still True"
+    await client._disconnect()
