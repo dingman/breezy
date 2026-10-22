@@ -105,7 +105,7 @@ _EXPIRED: Final[str] = "ORDER_STATE_EXPIRED"
 # ---------------------------------------------------------------------------
 
 
-class _LifecycleStrategy(Strategy):
+class _LifecycleStrategy(Strategy):  # type: ignore[misc]
     """Test-only: does exactly what the scenario tells it to (no logic of its own)."""
 
 

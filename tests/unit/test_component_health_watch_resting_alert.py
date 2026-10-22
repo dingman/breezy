@@ -22,7 +22,7 @@ from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.identifiers import ClientId, TraderId
 
-from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
+from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.runtime import trade_cli
 from breezy.runtime.component_health_watch import (
     RESTING_ALERT_SEVERITY,
@@ -31,6 +31,7 @@ from breezy.runtime.component_health_watch import (
     install_resting_alert,
 )
 from breezy.runtime.health import AlertPayload
+from tests.unit.ambig_latch_rig import PolymarketUSExecutionClient
 
 TRADER_ID = TraderId("BREEZY-RESTING-001")
 RESTING_EVENTS = (
@@ -217,9 +218,9 @@ def test_the_trade_cli_reader_joins_both_client_surfaces_at_poll_time() -> None:
     read = trade_cli._exec_client_resting_alert_reader(node)
 
     assert read() == ()
-    clients[ClientId(trade_cli.POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
+    clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
     assert read() == ()
-    clients[ClientId(trade_cli.POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace(
+    clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace(
         resting_cancel_alerts=(cancel,), resting_commission_alerts=(commission,)
     )
     assert read() == (cancel, commission)
