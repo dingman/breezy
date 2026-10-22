@@ -253,6 +253,8 @@ class _Snapshot:
     anchor: datetime | None = None
     settled_at: datetime | None = None
     alert_delivered: bool = False
+    #: the probe's ``strict_staleness``, carried in the snapshot so the veto still reads ONE field
+    strict: bool = False
 
 
 class LossStopProbe:
@@ -267,7 +269,12 @@ class LossStopProbe:
         alert_sink: AlertSink,
         alert_every_probe: Callable[[], bool],
         expected_uid: int,
+        strict_staleness: bool = False,
     ) -> None:
+        # ``strict_staleness`` (default False: FQ's behaviour is unchanged) makes an artefact older
+        # than ``MAX_AGE_H`` veto unconditionally, with or without a delivered alert. The maker
+        # family's wiring passes True (ARM D1 review K2).
+        self._strict_staleness = strict_staleness
         self._path = path
         self._clock = clock
         self._set_family_halted = set_family_halted
@@ -372,7 +379,9 @@ class LossStopProbe:
         """Publish ONE snapshot, then run side effects; nothing after can undo it."""
         if self._state.verdict is Verdict.FAIL:
             return Verdict.FAIL  # the latch: no settle ever leaves FAIL
-        self._state = _Snapshot(verdict, anchor=anchor, settled_at=now)
+        self._state = _Snapshot(
+            verdict, anchor=anchor, settled_at=now, strict=self._strict_staleness
+        )
         self.counters[verdict.value.lower()] += 1
         try:
             self._side_effects(verdict, detail)
@@ -428,7 +437,9 @@ class LossStopProbe:
 
 
 def _derive_veto(state: _Snapshot, now: datetime) -> str | None:
-    """PASS / UNKNOWN_STALE, re-derived at veto time from the cached anchor and deadman."""
+    """PASS / UNKNOWN_STALE, re-derived at veto time from the cached anchor and deadman.
+
+    ``state.strict``: past ``MAX_AGE_H`` the veto is unconditional (no delivered-alert window)."""
     if state.settled_at is None or state.anchor is None:
         return REASON_UNKNOWN
     if now - state.settled_at > _deadman_window():
@@ -437,6 +448,8 @@ def _derive_veto(state: _Snapshot, now: datetime) -> str | None:
     if age_h > STALE_VETO_H:
         return REASON_STALE
     if age_h > MAX_AGE_H:
+        if state.strict:
+            return REASON_STALE
         # entries only while THIS probe's CRITICAL alert actually left the box
         if state.verdict is Verdict.UNKNOWN_STALE and state.alert_delivered:
             return None

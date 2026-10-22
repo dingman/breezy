@@ -91,6 +91,7 @@ def _probe(
     halts: Callable[[str, str], None] | None = None,
     live_unhalted: bool = False,
     uid: int | None = None,
+    strict: bool | None = None,
 ) -> tuple[LossStopProbe, Path, _Sink, list[datetime]]:
     path = tmp_path / "derived" / "fq-loss-stop" / "latest.json"
     sink = sink if sink is not None else _Sink()
@@ -102,6 +103,7 @@ def _probe(
         alert_sink=sink,
         alert_every_probe=lambda: live_unhalted,
         expected_uid=os.getuid() if uid is None else uid,
+        **({} if strict is None else {"strict_staleness": strict}),
     )
     return probe, path, sink, clock
 
@@ -878,8 +880,10 @@ def test_item3_state_is_published_before_any_side_effect_so_readers_never_see_a_
 # -- item 4: stale window needs a delivered alert ------------------------------
 
 
-def _stale_window_probe(tmp_path: Path, sink: object) -> LossStopProbe:
-    probe, path, _s, _ = _probe(tmp_path, sink=sink)  # type: ignore[arg-type]
+def _stale_window_probe(
+    tmp_path: Path, sink: object, *, strict: bool | None = None
+) -> LossStopProbe:
+    probe, path, _s, _ = _probe(tmp_path, sink=sink, strict=strict)  # type: ignore[arg-type]
     _write_artefact(path, as_of=_NOW - timedelta(hours=lsp.MAX_AGE_H + 2))
     assert lsp.MAX_AGE_H + 2 < STALE_VETO_H
     probe.probe_once()
@@ -922,6 +926,32 @@ def test_item4_stale_window_allows_when_alert_really_delivered(
     tmp_path: Path, sink: object
 ) -> None:
     assert _stale_window_probe(tmp_path, sink).veto_reason() is None
+
+
+# -- review K2: strict staleness (the maker wiring) --------------------------------------------
+
+
+def test_k2_strict_staleness_vetoes_past_max_age_even_with_the_alert_delivered(
+    tmp_path: Path,
+) -> None:
+    # the artefact is MAX_AGE_H + 2 h old (27 h < STALE_VETO_H) and the CRITICAL alert LEFT the box
+    strict = _stale_window_probe(tmp_path / "strict", _OkSink(), strict=True)
+    assert strict.veto_reason() == lsp.REASON_STALE
+    default = _stale_window_probe(tmp_path / "default", _OkSink())
+    assert default.veto_reason() is None, "FQ's default path is unchanged"
+    explicit = _stale_window_probe(tmp_path / "explicit", _OkSink(), strict=False)
+    assert explicit.veto_reason() is None
+
+
+def test_k2_strict_staleness_still_passes_a_fresh_artefact_and_vetoes_one_that_ages_out(
+    tmp_path: Path,
+) -> None:
+    probe, path, _sink, clock = _probe(tmp_path, sink=_OkSink(), strict=True)  # type: ignore[arg-type]
+    _write_artefact(path, as_of=_NOW - timedelta(hours=lsp.MAX_AGE_H) + timedelta(minutes=5))
+    probe.probe_once()
+    assert probe.veto_reason() is None
+    clock[0] = _NOW + timedelta(minutes=10)  # inside the deadman, past MAX_AGE_H
+    assert probe.veto_reason() == lsp.REASON_STALE
 
 
 def test_item4_delivery_failure_then_recovery_reopens_the_window(tmp_path: Path) -> None:
