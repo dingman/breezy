@@ -856,3 +856,27 @@ async def test_a_fill_with_no_readable_commission_is_booked_unreconciled_at_zero
     assert record.cumulative_fee == Decimal(0) and event.commission.as_decimal() == Decimal(0)
     assert record.fee_source == client_module.FEE_SOURCE_MODELLED_AT_FILL_TIME
     await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_commission_alerts_carry_no_commission_figure_or_sign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both CRITICAL commission alerts are value-free: event, id prefix, slug, bps field NAMES."""
+    rig, (command, second) = await _rested(tmp_path, monkeypatch, n=2)
+    _fill(rig, 0, commission="-0.5123")
+    await rig.client._query_order(_query(rig, command))
+    _payload(rig, 1)["makerCommissionsBasisPoints"] = "17"
+    await rig.client._query_order(_query(rig, second))
+    alerts = [dict(a) for a in rig.client.resting_commission_alerts]
+    assert {a["event"] for a in alerts} == {
+        "commission_bps_drift",
+        "resting_commission_out_of_envelope",
+    }
+    assert all(a["severity"] == "CRITICAL" for a in alerts)
+    blob = json.dumps(alerts)
+    assert "5123" not in blob and "-0." not in blob and ":17" not in blob and '"17"' not in blob
+    drift = next(a for a in alerts if a["event"] == "commission_bps_drift")
+    assert drift["fields"] == "makerCommissionsBasisPoints"
+    await rig.client._disconnect()

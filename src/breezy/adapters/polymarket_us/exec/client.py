@@ -9377,11 +9377,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
             self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
             return
-        self._note_commission_alert(
-            "resting_commission_out_of_envelope",
-            target,
-            {"sign": submit_chain.commission_sign_class(str(raw))},
-        )
+        self._note_commission_alert("resting_commission_out_of_envelope", target, {})
         self._latch_resting_order(
             submit_chain.RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON,
             target.venue_order_id,
