@@ -9122,7 +9122,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         self._apply_resting_poll(target, payload)
 
-    def _resting_instrument(self, target: RestingTarget) -> Any:
+    def _resting_instrument(self, target: RestingTarget) -> Instrument | None:
         """The loaded instrument of a bound rest (provider first, then the cache), or
         ``None``. SYNC; never refuses (a ``_find_instrument`` refusal is a producer)."""
         if target.instrument_id is None:
@@ -9131,7 +9131,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         found = self._instrument_provider.find(instrument_id)
         return found if found is not None else self._cache.instrument(instrument_id)
 
-    def _parse_resting_read(self, target: RestingTarget, body: Mapping[str, Any]) -> Any:
+    def _parse_resting_read(
+        self, target: RestingTarget, body: Mapping[str, Any]
+    ) -> OrderStatusReport:
         """The native status report of one read of a bound rest; RAISES when the body does
         not map (an unknown key, a mismatched slug, no loaded instrument)."""
         instrument = self._resting_instrument(target)
@@ -9179,7 +9181,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         try:
             self._watch_commission_bps(target, body)
             if verdict == submit_chain.CANCEL_READ_FILLED:
-                if self._book_resting_fill(target, body, report):
+                if report is not None and self._book_resting_fill(target, body, report):
                     self._clear_resting_cancel_latch(venue_id)
                 else:
                     # not booked: either another path won (the row is gone), or this fill
@@ -9256,7 +9258,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
 
     def _book_resting_fill(
-        self, target: RestingTarget, body: Mapping[str, Any], report: Any
+        self, target: RestingTarget, body: Mapping[str, Any], report: OrderStatusReport
     ) -> bool:
         """The ONE booking of a bound rest's fill (SYNC; the poll AND the cancel/sweep
         FILLED read call it). Returns ``True`` iff THIS call booked it.
@@ -9359,7 +9361,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._check_commission_envelope(target, within)
         return True
 
-    def _watch_fill_against_order(self, target: RestingTarget, report: Any) -> None:
+    def _watch_fill_against_order(self, target: RestingTarget, report: OrderStatusReport) -> None:
         """B6 review S7: a venue fill that is not the order we rested (a filled quantity other
         than the cached order's, or a BUY average price above its limit) raises a value-free
         CRITICAL ``resting_fill_mismatch`` alert. The fill is still booked at the venue's own
@@ -9398,14 +9400,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         except Exception:  # noqa: BLE001 - counting twice is the conservative direction
             return False
 
-    def _taker_theta(self, instrument: Any, ts_ns: int) -> Decimal | None:
+    def _taker_theta(self, instrument: Instrument, ts_ns: int) -> Decimal | None:
         """The taker theta for a resting fill: the instrument's, else the dated schedule's
         at ``ts_ns``; ``None`` when neither pins one. SYNC, never raises."""
         theta = taker_fee_coefficient_of(instrument)
         return theta if theta is not None else taker_fee_coefficient_as_of(ts_ns)
 
     def _modelled_taker_fee(
-        self, instrument: Any, price: Decimal, quantity: Decimal, ts_ns: int
+        self, instrument: Instrument, price: Decimal, quantity: Decimal, ts_ns: int
     ) -> Decimal | None:
         """The modelled TAKER cent fee of a fill (USD), or ``None`` when the schedule is
         unpinned or the price is out of range. SYNC, never raises."""
@@ -9476,7 +9478,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         return "ok" if within else "out"
 
     def _emit_resting_fill_event(
-        self, target: RestingTarget, report: Any, instrument: Any, recognised: Decimal, ts_ns: int
+        self,
+        target: RestingTarget,
+        report: OrderStatusReport,
+        instrument: Instrument,
+        recognised: Decimal,
+        ts_ns: int,
     ) -> None:
         """The native ``OrderFilled`` of a poll-booked rest: ``liquidity_side=MAKER``,
         commission = the RECOGNISED venue figure. Only for an order this run's cache knows
