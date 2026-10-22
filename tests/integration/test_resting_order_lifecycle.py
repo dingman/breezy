@@ -12,10 +12,12 @@ objects, no socket) and the execution engine, which is replaced by :class:`_Benc
 strategy's commands to the client and feeds the client's events back to the cache and strategy,
 exactly the two jobs the engine does in a node).
 
-Constants flipped in the tests, and why: the rig's ``_rig`` patches ``GTD_EXPIRY_VERIFIED`` to
-``True`` (a resting submit is refused while it is ``False``). ``MAKER_COMMISSION_SIGN_VERIFIED``
-and ``SLUG_SCOPED_CANCEL_ALL_VERIFIED`` stay ``False`` (the module values; the recognised
-commission is therefore the clamp and the sweep cancels per id). B2 flips them from venue evidence.
+Constants set in the tests, and why: the rig's ``_rig`` patches ``GTD_EXPIRY_VERIFIED`` to
+``True`` and ``SLUG_SCOPED_CANCEL_ALL_VERIFIED`` to ``False`` explicitly (the module values are
+both ``True`` since the ARM post-B2 flip on S-6 / S-2 PASS; the lifecycle here is proven on the
+per-id cancel path, and the pin-True sweep is covered in ``test_polymarket_us_resting_sweep.py``).
+``MAKER_COMMISSION_SIGN_VERIFIED`` stays ``False`` (the module value; the recognised commission
+is therefore the clamp)
 
 The ``exec`` package is never imported here (barrier X1 pins its importers by set equality);
 every symbol comes through ``tests/unit/ambig_latch_rig.py`` or the sibling suites.

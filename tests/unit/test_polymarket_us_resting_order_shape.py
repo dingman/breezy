@@ -287,8 +287,20 @@ def test_resting_shape_refuses_while_gtd_unverified(
     assert _reason(_order(no), no, gtd_expiry_verified=False) is not None
 
 
-def test_gtd_expiry_verified_constant_is_false_until_the_positive_control_flips_it() -> None:
-    assert submit_chain.GTD_EXPIRY_VERIFIED is False
+def test_gtd_expiry_verified_constant_is_true_after_the_s6_positive_control() -> None:
+    """Flipped at ARM post-B2 on S-6 PASS (docs/evidence/b2/maker_positive_control_
+    20261022T075159Z.json, sha256 ffbed58e...c36938). Both flag values stay covered: True
+    admits the resting shape, False (parameter, as the client passes the module constant)
+    refuses it -- see ``test_resting_shape_refuses_while_gtd_unverified``."""
+    assert submit_chain.GTD_EXPIRY_VERIFIED is True
+
+
+def test_resting_shape_gate_follows_the_flag_both_ways(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    _yes, no = legs
+    assert _reason(_order(no), no, gtd_expiry_verified=submit_chain.GTD_EXPIRY_VERIFIED) is None
+    assert _reason(_order(no), no, gtd_expiry_verified=False) is not None
 
 
 def test_resting_shape_refuses_price_above_cap(

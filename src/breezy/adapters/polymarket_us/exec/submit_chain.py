@@ -150,8 +150,12 @@ RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.89")
 
 #: Flipped to ``True`` only by a reviewed commit citing the positive-control
 #: artifact that proves the venue expires a GTD order at ``goodTillTime`` (S-6).
-#: Until then the resting shape refuses every order (fail closed).
-GTD_EXPIRY_VERIFIED: Final[bool] = False
+#: While ``False`` the resting shape refuses every order (fail closed).
+#: ``True`` since ARM post-B2: S-6 PASS in
+#: ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json`` (sha256
+#: ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938): B echoed GTD within 1 s
+#: and the first EXPIRED was not early.
+GTD_EXPIRY_VERIFIED: Final[bool] = True
 
 #: The bounded GET-confirm that turns a 200+id async create into a bound rest:
 #: poll ``GET /v1/order/{id}`` every ``RESTING_CONFIRM_POLL_S`` for up to
@@ -178,7 +182,10 @@ RESTING_NOT_ADMITTED_REASON: Final[str] = (
 #: the positive-control artifact proving the venue honours the slug filter (S-2).
 #: While ``False`` the client's slug helper returns :data:`UNSCOPED_UNVERIFIED`
 #: without sending and every cancel is per-order. Pinned in the cage rule table.
-SLUG_SCOPED_CANCEL_ALL_VERIFIED: Final[bool] = False
+#: ``True`` since ARM post-B2: S-2 PASS over sibling slugs (``slugs_share_event`` true) in
+#: ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json`` (sha256
+#: ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938).
+SLUG_SCOPED_CANCEL_ALL_VERIFIED: Final[bool] = True
 UNSCOPED_UNVERIFIED: Final[str] = "UNSCOPED_UNVERIFIED"
 
 #: RETRY-WHEN-OPEN cancel loop pacing (provisional RulePins, not operator controls):

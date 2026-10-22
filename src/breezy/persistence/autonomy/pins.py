@@ -26,11 +26,15 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin on arm/integration (ARM exec resting-order B-chain: exec/client.py, submit_chain,
         # reports, endpoints, account_activity, fees, write_transport, ... in the label closure);
         # was db374704...7b2c
-        "aut2.label": "4f857b29d67bd07819e6d750fd911c278dacc15131e7ccc47a80957c0abf7052",
+        # re-pin at ARM post-B2 (GTD_EXPIRY_VERIFIED / SLUG_SCOPED_CANCEL_ALL_VERIFIED flipped
+        # True in exec/submit_chain.py on S-2/S-6 PASS; exec/client.py sweep docstring);
+        # was 4f857b29...7052
+        "aut2.label": "63c8031f6237c1a6b94af83f1d8162c164aa6db2e8f425f6e9af9779865c6d73",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
-        "aut6.health": "72f6d236e34c2e3205262c0ff7f906e8a5aae4f6414139019571a862bfaa1a17",
+        # re-pin at ARM post-B2 (same submit_chain.py + client.py change); was 72f6d236...1a17
+        "aut6.health": "caa4d1142be1ff4a922e42130b2d7a64a6bdc92989f082ca67894e3b7cf8c832",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()

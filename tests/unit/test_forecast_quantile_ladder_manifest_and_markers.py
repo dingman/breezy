@@ -39,10 +39,14 @@ _EXEC_CLIENT_PATH = (
 # re-pinned 2026-10-10: WP-DR day-roll settle (3 resolver sites skip prior-day true-up; fill-on-new-day latches UNBUDGETED), reviewer-approved (python-reviewer + prediction-market-reviewer)  # noqa: E501
 # re-pinned 2026-10-10: EXEC-PAR WP4 parallel-slot wiring (r5 §5 WP4 + r5.1 E1-E14); python-reviewer + prediction-market-reviewer APPROVE, silent-failure-hunter READY 88  # noqa: E501
 # S4 WP6 (ARM B7) re-pin once after WP3-WP5; prior a4cbd8cbbf29524a6de3c18dc4e2b565ce25e1f1b91ca54f0c2483f671b64410; reviewed in f507e5c0 (B1, B3-B6 client edits + review fixes; B7 itself edits no client byte)  # noqa: E501
+# ARM post-B2 flip: re-pinned once; prior 7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e. The only client byte change is the _sweep_resting_orders_at_boot docstring reconciled for SLUG_SCOPED_CANCEL_ALL_VERIFIED=True (S-2 PASS, docs/evidence/b2/maker_positive_control_20261022T075159Z.json); no code line changes  # noqa: E501
 # ONE constant is the home of this pin for three tests: this file's byte-identity test,
 # test_autonomy_envelope::test_exec_client_never_edited (reads it by AST) and the
 # positive control of test_aut1_wp0_closure_premises::test_submit_chain_is_not_byte_pinned_in_tests.
-_EXEC_CLIENT_SHA256 = "7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e"
+_EXEC_CLIENT_SHA256 = "f44830077501040a76a1823345e24aca2eefcc3f090d718c6d7db03ff03af17d"
+_EXEC_CLIENT_SHA256_BEFORE_POSTB2_REPIN = (
+    "7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e"
+)
 _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN = (
     "a4cbd8cbbf29524a6de3c18dc4e2b565ce25e1f1b91ca54f0c2483f671b64410"
 )
@@ -179,6 +183,8 @@ def test_b7_repin_is_sensitive_to_the_old_digest_and_to_a_single_flipped_byte() 
     original = _EXEC_CLIENT_PATH.read_bytes()
     assert hashlib.sha256(original).hexdigest() == _EXEC_CLIENT_SHA256
     assert _EXEC_CLIENT_SHA256 != _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN
+    assert _EXEC_CLIENT_SHA256 != _EXEC_CLIENT_SHA256_BEFORE_POSTB2_REPIN
+    assert hashlib.sha256(original).hexdigest() != _EXEC_CLIENT_SHA256_BEFORE_POSTB2_REPIN
     assert hashlib.sha256(original).hexdigest() != _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN
     flipped = bytes([original[0] ^ 0x01]) + original[1:]
     assert hashlib.sha256(flipped).hexdigest() != _EXEC_CLIENT_SHA256

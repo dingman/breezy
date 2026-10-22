@@ -1037,12 +1037,14 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="submit_chain",
         attr="GTD_EXPIRY_VERIFIED",
-        expected=False,
-        widened=True,
-        narrowed=0,
-        why="S4 P16: the resting shape refuses every order until GTD expiry is "
-        "proven by the positive control. Narrowed neighbour is an int 0: equal to "
-        "False by value, refused by type identity",
+        expected=True,
+        widened=False,
+        narrowed=1,
+        why="S4 P16: flipped True at ARM post-B2 on S-6 PASS (evidence "
+        "docs/evidence/b2/maker_positive_control_20261022T075159Z.json, sha256 "
+        "ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938). The plant is the "
+        "opposite value False (the resting shape would refuse every order); the narrowed "
+        "neighbour is an int 1: equal to True by value, refused by type identity",
     ),
     # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the slug-scoped cancel-all
     # stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed
@@ -1050,13 +1052,16 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="submit_chain",
         attr="SLUG_SCOPED_CANCEL_ALL_VERIFIED",
-        expected=False,
-        widened=True,
-        narrowed=0,
+        expected=True,
+        widened=False,
+        narrowed=1,
         why=(
-            "S4 P16 (B5): the slug-scoped cancel-all stays disabled until a reviewed commit "
-            "cites the positive-control artifact (S-2). Narrowed neighbour is an int 0: equal "
-            "to False by value, refused by type identity"
+            "S4 P16 (B5): flipped True at ARM post-B2 on S-2 PASS over sibling slugs "
+            "(slugs_share_event true; evidence "
+            "docs/evidence/b2/maker_positive_control_20261022T075159Z.json, sha256 "
+            "ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938). The plant is "
+            "the opposite value False (every cancel back to per-order); the narrowed neighbour "
+            "is an int 1: equal to True by value, refused by type identity"
         ),
     ),
     # ARM maker-sharp B6 / S4 r4 P16 (one reviewed row, one commit): the maker commission

@@ -139,7 +139,10 @@ def test_unscoped_token_and_latch_reasons_are_stable_tokens() -> None:
     assert submit_chain.UNSCOPED_UNVERIFIED == "UNSCOPED_UNVERIFIED"
     assert submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON.startswith("resting_cancel_unconfirmed")
     assert submit_chain.RESTING_QUERY_UNREADABLE_REASON.startswith("resting_query_unreadable")
-    assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is False
+    # S-2 PASS over sibling slugs (ARM post-B2 evidence): the slug cancel-all is verified. The
+    # False behaviour (UNSCOPED_UNVERIFIED, nothing sent) is pinned by monkeypatch in
+    # test_polymarket_us_resting_cancel.py / _sweep.py.
+    assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True
     assert submit_chain.RESTING_POLL_FAILURE_LATCH_COUNT == 3
 
 

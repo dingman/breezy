@@ -190,10 +190,23 @@ def test_flipping_the_slug_pin_requires_reconciling_the_never_cancelled_claim() 
     this test. It fails loudly until then. (The pin-True behaviour itself -- a WARN naming
     each unbound order, then the slug cancel-all -- is pinned in
     ``test_polymarket_us_resting_sweep.py``.)"""
-    assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is False, (
-        "the slug pin was flipped: reconcile the sweep docstring, r4 5.4 and spec 9.18 "
-        "('unbound orders are never cancelled') before editing this test"
+    # Reconciled at the post-B2 flip (S-2 PASS, docs/evidence/b2/maker_positive_control_
+    # 20261022T075159Z.json): (a) the sweep docstring says the pin is True and the claim holds
+    # only for False, (b) r4 delta 5.4 carries the erratum, (c) this test now asserts True.
+    assert submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True
+    doc = " ".join(
+        (
+            inspect.getdoc(client_module.PolymarketUSExecutionClient._sweep_resting_orders_at_boot)
+            or ""
+        ).split()
     )
+    assert "The pin is now True (S-2 PASS" in doc
+    assert "holds only for the False case" in doc
+    r4 = (
+        Path(__file__).resolve().parents[2]
+        / "docs/plans/backlog/MAKER_2026-10-12/S4_exec_resting_order_path_plan_r4_delta.md"
+    ).read_text(encoding="utf-8")
+    assert "ERRATUM (ARM post-B2, S-2 PASS)" in r4
 
 
 def _evidence_bytes(client: Any, open_orders: tuple[Any, ...] = ()) -> dict[str, Any]:

@@ -8457,9 +8457,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         the UNFILTERED open orders and certifies the ledger's slugs. Unbound orders are
         NEVER cancelled only while SLUG_SCOPED_CANCEL_ALL_VERIFIED is False (they may be
         the operator's): WARN-logged by id and ONE CRITICAL alert, and the arm gate keeps
-        refusing them. With that pin True the slug cancel-all removes an unbound order on
-        a ledger slug (spec 9.18) after a WARN naming it; flipping the pin must reconcile
-        this paragraph. A ledger id still open or still listed, a sweep that does not run,
+        refusing them. The pin is now True (S-2 PASS over sibling slugs, ARM post-B2
+        evidence ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json``): the
+        slug cancel-all removes an unbound order on a ledger slug (spec 9.18) after a WARN
+        naming it, so the "never cancelled" claim holds only for the False case. A ledger id
+        still open or still listed, a sweep that does not run,
         overruns, or whose re-read is unreadable or uncertifiable, or a no-id context's
         slug that is not empty latches
         ``resting_cancel_unconfirmed`` and marks no intent swept. A no-id resting
