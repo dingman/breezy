@@ -15,9 +15,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 import breezy.persistence.family_manifest as family_manifest_module
 import breezy.runtime.trade_supervisor_core as trade_supervisor_core_module
-from breezy.persistence.family_manifest import load_family_manifest
+from breezy.persistence.family_manifest import FamilyManifestValidationError, load_family_manifest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_fq_v1.json"
@@ -63,7 +65,21 @@ def test_composition_kind_exact_set_is_widened_by_exactly_one_row() -> None:
         },
     )
     assert family_manifest_module._COMPOSITION_KINDS == pinned
-    assert family_manifest_module._COMPOSITION_KINDS != pinned - {"no_ladder_maker"}  # plant
+
+
+def test_the_no_ladder_maker_kind_is_load_bearing_for_the_shipped_maker_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plant: with the row removed the shipped maker manifest no longer loads."""
+    path = _REPO_ROOT / "deploy" / "families" / "pm_us_no_maker_sharp_v1.json"
+    assert load_family_manifest(path).composition_kind == "no_ladder_maker"
+    monkeypatch.setattr(
+        family_manifest_module,
+        "_COMPOSITION_KINDS",
+        family_manifest_module._COMPOSITION_KINDS - {"no_ladder_maker"},
+    )
+    with pytest.raises(FamilyManifestValidationError, match="no_ladder_maker"):
+        load_family_manifest(path)
 
 
 def test_forecast_quantile_ladder_is_accepted_as_a_composition_kind(tmp_path: Path) -> None:
@@ -93,7 +109,21 @@ def test_marker_map_is_widened_by_exactly_one_row() -> None:
         # ARM C2: one further named row.
         "no_ladder_maker": "NoLadderMakerStrategy subscribed",
     }
-    assert markers != {k: v for k, v in markers.items() if k != "no_ladder_maker"}  # plant
+
+
+def test_the_no_ladder_maker_marker_row_is_load_bearing_for_the_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plant: with the row removed the supervisor no longer recognises the maker's boot line."""
+    line = "NoLadderMakerStrategy subscribed n=6"
+    assert trade_supervisor_core_module.strategy_subscribed_in(line)
+    kept = tuple(
+        marker
+        for kind, marker in trade_supervisor_core_module.COMPOSITION_KIND_SUBSCRIBED_MARKERS.items()
+        if kind != "no_ladder_maker"
+    )
+    monkeypatch.setattr(trade_supervisor_core_module, "STRATEGY_SUBSCRIBED_MARKERS", kept)
+    assert not trade_supervisor_core_module.strategy_subscribed_in(line)
 
 
 def test_strategy_subscribed_in_recognises_the_new_marker() -> None:

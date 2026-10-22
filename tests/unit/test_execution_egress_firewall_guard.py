@@ -227,6 +227,7 @@ _EGRESS_FUNCTION_NAMES = frozenset(
 )
 
 
+
 #: X1 -- roots scanned for the exec-test marker ban.
 TEST_SCAN_ROOTS = ("tests",)
 
@@ -1135,6 +1136,7 @@ def test_n5_the_same_probe_is_not_blocked_without_the_sandbox() -> None:
         probe_socket.close()
 
 
+
 # ==========================================================================
 # X1-X3 -- the detectors (single implementations; the proofs above run these)
 # ==========================================================================
@@ -1154,7 +1156,9 @@ def _marker_names(tree: ast.AST) -> set[str]:
             continue
         receiver = node.value
         receiver_name = (
-            receiver.attr if isinstance(receiver, ast.Attribute) else getattr(receiver, "id", "")
+            receiver.attr
+            if isinstance(receiver, ast.Attribute)
+            else getattr(receiver, "id", "")
         )
         if receiver_name == "mark":
             names.add(node.attr)
@@ -1222,7 +1226,9 @@ def find_banned_native_constructs(path: str, source: str) -> list[Violation]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if BANNED_NATIVE_MODULE_SUBSTRING in alias.name:
-                    found.append(Violation(path, node.lineno, "X2", f"imports {alias.name}"))
+                    found.append(
+                        Violation(path, node.lineno, "X2", f"imports {alias.name}")
+                    )
         elif isinstance(node, ast.ImportFrom):
             if node.module and BANNED_NATIVE_MODULE_SUBSTRING in node.module:
                 found.append(Violation(path, node.lineno, "X2", f"imports {node.module}"))
@@ -1326,7 +1332,9 @@ def find_exec_direction_violations(path: str, source: str) -> list[Violation]:
     found: list[Violation] = []
     for token in sorted(BANNED_EXEC_DIRECTION_TOKENS):
         if token in source or any(token in value for value in constants):
-            found.append(Violation(path, 0, "X3", f"carries the banned direction token {token!r}"))
+            found.append(
+                Violation(path, 0, "X3", f"carries the banned direction token {token!r}")
+            )
     for node in ast.walk(tree):
         is_complement_sub = (
             isinstance(node, ast.BinOp)
@@ -1353,7 +1361,6 @@ def scan_exec_direction_vocabulary(
         for path, src in iter_python_sources(roots)
         for v in find_exec_direction_violations(path, src)
     ]
-
 
 # ==========================================================================
 # X1 -- no exec test may carry a marker that restores the real pyo3 clients
@@ -1394,7 +1401,12 @@ _PLANTED_EXEC_TEST_WITHOUT_MARKER = (
 #: A marked test that does NOT touch the exec package -- the shipped suite has
 #: these (the ``live`` weather tests), and X1 must not touch them.
 _PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE = (
-    "import pytest\n\n\n@pytest.mark.live\ndef test_weather():\n    assert True\n"
+    "import pytest\n"
+    "\n"
+    "\n"
+    "@pytest.mark.live\n"
+    "def test_weather():\n"
+    "    assert True\n"
 )
 
 
@@ -3194,7 +3206,8 @@ def test_submit_veto_sits_after_is_latched_and_before_the_permit_spend_no_await_
         and _dotted_callee(n.func) == "assert_live_order_submission_permitted"
     ]
     assert is_latched_lines and veto_lines and permit_spend_lines, (
-        "all three must be present in the shipped _submit_order for this pin to prove anything"
+        "all three must be present in the shipped _submit_order for this pin "
+        "to prove anything"
     )
     assert max(is_latched_lines) < min(veto_lines) < min(permit_spend_lines)
 
@@ -3381,10 +3394,10 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "authorization.consume",
             # Item 4 (slice 4 review): the family-halt chokepoint veto.
             "self._submit_veto",
-            # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
-            # context. Inert sync callee -- writes only to the already-open
-            # local store and a process-local dict; reaches no network.
-            "self._note_ambiguous_open",
+        # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
+        # context. Inert sync callee -- writes only to the already-open
+        # local store and a process-local dict; reaches no network.
+        "self._note_ambiguous_open",
             "self._write_signer.sign_headers",
             "self._order_sender.post_order",
             "submit_chain.latched_refusal_reason",
@@ -4517,9 +4530,7 @@ def test_the_correct_shape_is_accepted_by_the_shape_check() -> None:
 #: `self._order_sender.post_order` by construction) rather than by this ban
 #: silently widening around it.
 ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
-    frozenset({"__init__"})
-    | ORDER_LIFECYCLE_COROUTINES
-    | EXEC_RESOLVER_COROUTINES
+    frozenset({"__init__"}) | ORDER_LIFECYCLE_COROUTINES | EXEC_RESOLVER_COROUTINES
     # S4 WP4 (ARM B5, pin row FW-2): a NAMED term per reviewed row, never relaxed.
     | frozenset({"_cancel_slug_orders"})
     # S4 WP4 (ARM B5, pin row FW-1): a NAMED term per reviewed row, never relaxed.
@@ -4535,38 +4546,31 @@ ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
 #: referencing it -- including a new helper the create-path accept-fill
 #: branch calls, such as R-7-IMPL's `_match_position_lag` -- is exactly what
 #: `find_order_sender_reference_violations` below refuses.
-ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = (
-    frozenset({"__init__", "_submit_order"})
-    | frozenset(
-        {
-            # S4 WP4 (ARM B5, pin row FW-7): a NAMED member per reviewed row.
-            "_sweep_resting_orders_at_boot",
-        }
-    )
-    | frozenset(
-        {
-            # S4 WP4 (ARM B5, pin row FW-6): a NAMED member per reviewed row.
-            "_cancel_all_orders",
-        }
-    )
-    | frozenset(
-        {
-            # S4 WP4 (ARM B5, pin row FW-5): a NAMED member per reviewed row.
-            "_cancel_order",
-        }
-    )
-    | frozenset(
-        {
-            # S4 WP4 (ARM B5, pin row FW-4): a NAMED member per reviewed row.
-            "_cancel_slug_orders",
-        }
-    )
-    | frozenset(
-        {
-            # S4 WP4 (ARM B5, pin row FW-3): a NAMED member per reviewed row.
-            "_cancel_resting_order",
-        }
-    )
+ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"}) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-7): a NAMED member per reviewed row.
+        "_sweep_resting_orders_at_boot",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-6): a NAMED member per reviewed row.
+        "_cancel_all_orders",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-5): a NAMED member per reviewed row.
+        "_cancel_order",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-4): a NAMED member per reviewed row.
+        "_cancel_slug_orders",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-3): a NAMED member per reviewed row.
+        "_cancel_resting_order",
+    }
 )
 
 

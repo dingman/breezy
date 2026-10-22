@@ -22,11 +22,14 @@ import pytest
 from breezy.runtime.exec_state_db_path import EXEC_STATE_DB_ENV_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.strategy.current_rung_hold import family_id_arg as family_id_arg_module
 from breezy.strategy.current_rung_hold.clear_family_halt_cli import main as clear_main
 from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
 from breezy.strategy.current_rung_hold.family_id_arg import (
     HALTABLE_COMPOSITION_KINDS,
     KINDS_WITH_EXIT_PATH,
+    FamilyIdArgError,
+    resolve_haltable_family_arg,
 )
 from breezy.strategy.current_rung_hold.set_family_halt_cli import main as set_main
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -189,7 +192,23 @@ def test_the_accepted_composition_kinds_are_pinned_exactly() -> None:
     # ARM C2: widened by exactly ONE named row, `no_ladder_maker` (buys only: no exit path).
     pinned = frozenset({"continuous_rung_hold", "forecast_quantile_ladder", "no_ladder_maker"})
     assert HALTABLE_COMPOSITION_KINDS == pinned
-    assert HALTABLE_COMPOSITION_KINDS != pinned - {"no_ladder_maker"}  # plant: the row is load-bearing
+
+
+def test_the_no_ladder_maker_row_is_load_bearing_for_the_halt_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plant: with the row removed the shipped maker manifest is refused; with it, accepted."""
+    families = Path("deploy/families")
+    assert resolve_haltable_family_arg("pm_us_no_maker_sharp_v1", families).composition_kind == (
+        "no_ladder_maker"
+    )
+    monkeypatch.setattr(
+        family_id_arg_module,
+        "HALTABLE_COMPOSITION_KINDS",
+        HALTABLE_COMPOSITION_KINDS - {"no_ladder_maker"},
+    )
+    with pytest.raises(FamilyIdArgError, match="no_ladder_maker"):
+        resolve_haltable_family_arg("pm_us_no_maker_sharp_v1", families)
 
 
 CONTINUOUS_FAMILY_ID = "pm_us_crh_v4"
