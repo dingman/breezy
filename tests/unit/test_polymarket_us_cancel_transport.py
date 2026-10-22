@@ -37,6 +37,12 @@ _LEGACY_PROBE = "scripts/venue/polymarket_us_write_signing_probe.py"
 #: unconditionally (prior fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f).
 #: Pinned together with the AST tests at the end of this file and the M6 baseline entry.
 _LEGACY_PROBE_SHA256 = "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3"
+#: ARM B2 (plan_r2_delta D3): the maker positive-control script is the ONE other script that may
+#: name the cancel-all verb -- it calls ``PolymarketUSWriteTransport.post_cancel_all`` from a
+#: single guarded site (``ControlSession.cancel_slugs``: non-empty, de-duplicated, daily-HIGH
+#: slugs only) and never the legacy helper. sha-pinned: any edit re-reviews this row.
+_B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
+_B2_CONTROL_SHA256 = "ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66"
 
 
 class _Resp:
@@ -245,7 +251,17 @@ def test_legacy_probe_exemption_is_sha_pinned() -> None:
 
 
 def test_no_module_but_the_owner_and_the_pinned_probe_names_the_cancel_all_path() -> None:
-    assert _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT})) == []
+    exempt = frozenset({_OWNER, _LEGACY_PROBE, _CLIENT, _B2_CONTROL})
+    assert _scan(_CANCEL_ALL_TOKENS, exempt) == []
+
+
+def test_b2_control_exemption_is_sha_pinned_and_load_bearing() -> None:
+    """ARM B2 row plant: the digest is pinned, the exemption is exercised (the script really
+    names the verb), and without it the scan flags the script."""
+    digest = hashlib.sha256((REPO_ROOT / _B2_CONTROL).read_bytes()).hexdigest()
+    assert digest == _B2_CONTROL_SHA256
+    unexempted = _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT}))
+    assert {path for path, _ in unexempted} == {_B2_CONTROL}
 
 
 def test_scan_sees_a_planted_reference(tmp_path: Path) -> None:
