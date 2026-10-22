@@ -4050,7 +4050,25 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # `SOCKET_RESTORING_MARKERS`, constructs no client, and only compares
         # module-level constants (a `Decimal`) to their pins.
         "tests/unit/test_cage_rule_constants_are_pinned.py",
+        # ARM D1 harm stop (review follow-up, 2026-10-22): the producer's fixture suite imports
+        # `DurableFillRecord` and `FILL_KEY_PREFIX` from `exec.client` to build and key the
+        # durable fill records it feeds the harm-stop evaluator, exactly like the fill-tally
+        # siblings above. WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+        # module carries no `SOCKET_RESTORING_MARKERS`, constructs no client and no sender, and
+        # opens no socket (a throwaway sqlite file, an injected CLI reader, a local JSON file);
+        # `test_d1_producer_suite_is_inside_x1_and_carries_no_marker` plants the marker.
+        "tests/strategy/no_ladder_maker/test_harm_stop_producer.py",
     }
+
+
+def test_d1_producer_suite_is_inside_x1_and_carries_no_marker() -> None:
+    path = "tests/strategy/no_ladder_maker/test_harm_stop_producer.py"
+    source = (REPO_ROOT / path).read_text()
+    assert _imports_exec_package(ast.parse(source))
+    assert find_exec_test_marker_violations(path, source) == []
+    # plant: the same module with a socket-restoring marker added is an X1 violation
+    planted = source + "\n" + _PLANTED_EXEC_TEST_WITH_MARKER
+    assert [v.rule for v in find_exec_test_marker_violations(path, planted)] == ["X1"]
 
 
 def test_x1_the_reach_detector_is_the_same_predicate_the_rule_uses() -> None:

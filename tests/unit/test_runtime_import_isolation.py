@@ -144,6 +144,10 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.maker_stage0_catalog_read",  # MAKER-S2 WP6 capture reader
     # MAKER-S2 second look C4: the parked trigger unit's `-m` entry (WIDENED by this one row).
     "scripts.analysis.maker_stage0_trigger",
+    # ARM D1: the maker harm-stop producer (ExecStartPost of the truth-dataset unit) imports
+    # `breezy.runtime.submit_intent`'s read-only slot decoder, so source (c) picks it up
+    # (WIDENED by this one row; the meta-test below is the plant: deleting it names this entry).
+    "scripts.analysis.maker_loss_stop_producer",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

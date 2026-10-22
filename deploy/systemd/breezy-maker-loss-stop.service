@@ -1,0 +1,68 @@
+[Unit]
+# ARM D1 (docs/plans/backlog/ARM_MAKER_SHARP_2026-10-21/plan_r2_delta.md D5): the harm stop of the
+# maker family pm_us_no_maker_sharp_v1. Daily, after the 11:40Z truth fetch and the 12:40Z truth
+# dataset, it (1) collects the venue's own YES resolutions from the account activity feed
+# (ExecStartPre, the ONLY step that touches the network, read-only signed GETs), then (2) runs the
+# producer, which reads the exec-state SQLite and the station catalog read-only, makes NO network
+# contact, and writes only <catalog-root parent>/derived/maker-loss-stop/latest.json for the node's
+# LossStopProbe (strict staleness). Exit 0 PASS, 2 FAIL (or a sticky FAIL / unreadable file
+# standing), 3 HOLD, 1 error: every non-zero exit fires OnFailure= below, the alert path.
+#
+# A collector failure (a venue 5xx, a missing credential) fails the unit BEFORE the producer runs:
+# the previous artefact then ages past MAX_AGE_H and the strict probe vetoes. That is the intended
+# fail-closed behaviour, and no exit status is masked anywhere in this file.
+#
+# PARKED: committed but NOT installed, enabled or daemon-reloaded. The coordinator installs it.
+Description=Breezy maker-family harm stop (collect venue settlements, then evaluate D5)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py
+Documentation=file:///home/jon/breezy/scripts/venue/maker_settlement_collect.py
+
+# AUD-15a: alert on failure (timeout, OOM-kill or ANY non-zero exit, including FAIL and HOLD).
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Slice=breezy-studies.slice
+UMask=0077
+
+# Hardening (review D1-F5). The whole file hierarchy is read-only to this unit except the ONE
+# directory both steps write: <catalog-root parent>/derived/maker-loss-stop/ (latest.json written by
+# the producer, venue_settlements.json by the collector). The state SQLite and the station catalog
+# are only READ. systemd refuses to start a unit whose ReadWritePaths= entry does not exist
+# (status 226/NAMESPACE, which fires OnFailure=), so the installer must first run
+#   mkdir -p -m 0755 /mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+# (tests/unit/test_maker_loss_stop_scheduling.py pins this path to the --catalog-root below).
+ProtectSystem=strict
+ReadWritePaths=/mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+NoNewPrivileges=yes
+
+MemoryHigh=1G
+MemoryMax=1536M
+
+# The collector's credential: polymarket.env carries the Ed25519 signing key; breezy.env is the
+# shared non-credential host config (the venue User-Agent contact). alerts.env feeds the notifier.
+# Never breezy-trade.env or operator.env: this unit must never see an operator-reserved control.
+EnvironmentFile=-%h/.config/breezy/breezy.env
+EnvironmentFile=-%h/.config/breezy/polymarket.env
+EnvironmentFile=-%h/.config/breezy/alerts.env
+Environment=POLYMARKET_US_EXEC_STATE_DB=%h/.local/share/breezy/state/exec_polymarket_us.sqlite
+
+# --catalog-root MUST equal the node's BREEZY_TRADE_CATALOG_ROOT (~/.config/breezy/breezy-trade.env):
+# the artefact lands at <that root's parent>/derived/maker-loss-stop/latest.json, the exact path the
+# probe reads (tests/strategy/no_ladder_maker pins the producer path == the probe path). Explicit
+# paths, no defaults. The station list is plan r3 R10's four; the family manifest replaces it when
+# C2 lands.
+ExecStartPre=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/venue/maker_settlement_collect.py --catalog-root /mnt/storage/breezy/catalog/quote_tape/polymarket_us --data-root %h/.local/share/breezy --catalog-base %h/.local/share/breezy/catalog --station lax --station sfo --station mdw --station mia
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py --catalog-root /mnt/storage/breezy/catalog/quote_tape/polymarket_us --data-root %h/.local/share/breezy --catalog-base %h/.local/share/breezy/catalog --station lax --station sfo --station mdw --station mia
+
+# <=20 paced pages plus a catalog read: bounded. Type=oneshot ignores RuntimeMaxSec=; TimeoutStartSec=
+# bounds the whole run, ExecStartPre included.
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-maker-loss-stop
+
+# NOTE: no [Install] section. Started BY the timer; enable only the timer.

@@ -2333,6 +2333,14 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # touches no operator control (its `operator_controls` import is the pre-existing
         # `utc_day_for_ns` date helper).
         "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
+        # WIDENED (ARM D1 harm stop, 2026-10-22), not relaxed (L-6/L-12): the comparison
+        # is still `==`; old -> new added exactly this one path. The maker harm-stop
+        # producer imports `CURRENT_INTENT_KEY`, `SubmitIntentCorrupt` and `decode_slot_table`
+        # ONLY, to read the singleton's OPEN slots from a READ-ONLY (`mode=ro`) sqlite
+        # connection of its own. It opens no latch, takes no flock, opens no writable store
+        # and touches no operator control; `test_d1_maker_producer_reads_the_intent_...`
+        # below pins that import set and plants the violation.
+        "scripts/analysis/maker_loss_stop_producer.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",
@@ -2380,6 +2388,30 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # `utc_day_for_ns` rows above.
         "scripts/analysis/portfolio_roi_report.py",
     }
+
+
+_D1_PRODUCER = REPO_ROOT / "scripts" / "analysis" / "maker_loss_stop_producer.py"
+_D1_READ_ONLY_INTENT_NAMES = frozenset(
+    {"CURRENT_INTENT_KEY", "SubmitIntentCorrupt", "decode_slot_table"}
+)
+
+
+def _submit_intent_names_imported(source: str) -> frozenset[str]:
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("submit_intent"):
+            names.update(alias.name for alias in node.names)
+    return frozenset(names)
+
+
+def test_d1_maker_producer_reads_the_intent_with_the_read_only_decoder_names_only() -> None:
+    imported = _submit_intent_names_imported(_D1_PRODUCER.read_text())
+    assert imported == _D1_READ_ONLY_INTENT_NAMES
+    # plant: the same module importing the latch opener would no longer match the pin
+    planted = _D1_PRODUCER.read_text() + (
+        "\nfrom breezy.runtime.submit_intent import open_submit_intent_latch\n"
+    )
+    assert _submit_intent_names_imported(planted) != _D1_READ_ONLY_INTENT_NAMES
 
 
 # ==========================================================================
