@@ -4058,7 +4058,24 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # opens no socket (a throwaway sqlite file, an injected CLI reader, a local JSON file);
         # `test_d1_producer_suite_is_inside_x1_and_carries_no_marker` plants the marker.
         "tests/strategy/no_ladder_maker/test_harm_stop_producer.py",
+        # ARM C2 (D4, MAX_RUNGS 2): `test_no_ladder_maker_max_rungs.py` imports `exec.reports`
+        # (`parse_position_status_report`) and drives the shipped resting-submit rig to prove the
+        # real exec client admits and books two NO-leg rests on one ladder and maps each rung's
+        # position to its own NO leg. WIDENED, not relaxed (L-6/L-12): the comparison is still
+        # `==`; the module carries no `SOCKET_RESTORING_MARKERS`, reuses the injected fake senders
+        # of its sibling exec suites and opens no socket;
+        # `test_c2_max_rungs_suite_is_inside_x1_and_carries_no_marker` plants the marker.
+        "tests/unit/test_no_ladder_maker_max_rungs.py",
     }
+
+
+def test_c2_max_rungs_suite_is_inside_x1_and_carries_no_marker() -> None:
+    path = "tests/unit/test_no_ladder_maker_max_rungs.py"
+    source = (REPO_ROOT / path).read_text()
+    assert _imports_exec_package(ast.parse(source))
+    assert find_exec_test_marker_violations(path, source) == []
+    planted = source + "\n" + _PLANTED_EXEC_TEST_WITH_MARKER
+    assert [v.rule for v in find_exec_test_marker_violations(path, planted)] == ["X1"]
 
 
 def test_d1_producer_suite_is_inside_x1_and_carries_no_marker() -> None:

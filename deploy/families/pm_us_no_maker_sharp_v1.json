@@ -1,0 +1,19 @@
+{
+  "family_id": "pm_us_no_maker_sharp_v1",
+  "venue": "polymarket_us",
+  "trial_id_prefix": "no_ladder_maker/trial/pm_us_no_maker_sharp_v1/",
+  "d0_climate_day": "2026-10-28",
+  "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
+  "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
+  "composition_kind": "no_ladder_maker",
+  "density_artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+  "density_artefact_sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
+  "stations": [
+    "LAX",
+    "MDW",
+    "MIA",
+    "SFO"
+  ],
+  "taker_fee_coefficient": "0.0695",
+  "status": "REGISTERED"
+}

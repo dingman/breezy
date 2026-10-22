@@ -1,6 +1,6 @@
 """The offline-side C6 plug-in registry (ARCH-0 AC 26; AUT-2 FQ-R41).
 
-Exactly the four composition kinds (``family_manifest._COMPOSITION_KINDS``). Three of them carry a
+Exactly the five composition kinds (``family_manifest._COMPOSITION_KINDS``). Three of them carry a
 real C6 ``Scorer`` (ARCH C6, AUTONOMY_ARCHITECTURE.md:756-760: the CRH kinds keep a real Scorer even
 when retired): ``forecast_quantile_ladder`` the FQ scorer (``FqEvaluator``, which lives in
 ``evaluators/forecast_quantile_ladder.py``) and the two CRH kinds the legacy CRH
@@ -56,5 +56,6 @@ OFFLINE_PLUGINS: Final[MappingProxyType[str, RefusingPlugin]] = MappingProxyType
         "continuous_rung_hold": ContinuousRungHoldOfflinePlugin(),
         "forecast_ladder": RefusingPlugin(),
         "forecast_quantile_ladder": FqEvaluator(),
+        "no_ladder_maker": RefusingPlugin(),
     }
 )

@@ -114,10 +114,20 @@ ManifestStatus = Literal["DRAFT_NOT_REGISTERED", "REGISTERED"]
 #: names the composition, matching the manifest's own cardinality-1
 #: ``family_id``.
 CompositionKind = Literal[
-    "current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"
+    "current_rung_hold",
+    "continuous_rung_hold",
+    "forecast_ladder",
+    "forecast_quantile_ladder",
+    "no_ladder_maker",
 ]
 _COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
-    {"current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"}
+    {
+        "current_rung_hold",
+        "continuous_rung_hold",
+        "forecast_ladder",
+        "forecast_quantile_ladder",
+        "no_ladder_maker",
+    }
 )
 
 _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(

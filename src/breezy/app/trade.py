@@ -122,11 +122,21 @@ from breezy.strategy.forecast_quantile_ladder.decision_funnel import (
     FqDecisionCounts,
     FqDecisionFunnelActor,
 )
+from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import LossStopProbeActor
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
 )
 from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
+from breezy.strategy.no_ladder_maker.composition import (
+    TRIAL_KEY_PREFIX as MAKER_TRIAL_KEY_PREFIX,
+)
+from breezy.strategy.no_ladder_maker.composition import (
+    PlaceholderD0Error,
+    build_harm_stop_wiring,
+    build_no_ladder_maker_strategy,
+    refuse_placeholder_d0,
+)
 
 _VENUE = "polymarket_us"
 
@@ -926,6 +936,128 @@ def _compose_forecast_quantile_ladder(
     )
 
 
+def _compose_no_ladder_maker(
+    *,
+    manifest: FamilyManifest,
+    catalog_root: Path,
+    today_by_station: dict[str, dt.date],
+    latch: SubmitIntentLatch,
+    sending_permit: OrderSubmissionPermit | None,
+    settings: BreezyTradeSettings,
+) -> _FamilyComposition:
+    """Boot-time composition for ``no_ladder_maker`` (ARM C2, maker-sharp v1).
+
+    ONE ``NoLadderMakerStrategy`` serves every manifest station. Sending is shadow-only unless the
+    two-key live-orders gate (code-committed allowlist triple + verified ruling + a permit) answers
+    ``enabled``: the manifest ships WITHOUT a ``live_orders_ruling`` and the family is in no
+    allowlist, so the gate reads ``no_ruling`` and ``shadow_only`` stays True. The entry veto is the
+    family halt, then the STRICT maker harm stop (``derived/maker-loss-stop/latest.json``); a FAIL
+    sets the family halt, and the strategy answers any veto by cancelling every live order, per
+    order (open and in flight). The same veto object reaches the strategy and the exec client.
+    """
+    extra_actors: list[Any] = []
+    halt_latch, halt_veto = _open_halt_latch_preamble(
+        latch,
+        family_id=manifest.family_id,
+        key_prefix=MAKER_TRIAL_KEY_PREFIX,
+        alert_on_unattributable_legacy=False,
+    )
+    registry = default_registry()
+    station_icaos = tuple(
+        registry.settlement_site(_VENUE, station).icao for station in today_by_station
+    )
+    extra_actors.append(NbmQuantileActor(NbmQuantileActorConfig(station_icaos=station_icaos)))
+    fee_verified_holder = _FeeVerifiedHolder()
+    repo_root = Path.cwd()
+    try:
+        live_orders = live_orders_authorized(
+            manifest,
+            repo_root,
+            permit_present=sending_permit is not None,
+        )
+    except LiveOrdersGateRefusedError as exc:
+        _boot_logger.info(
+            "maker_live_orders enabled=False family_id=%s ruling=%s reason=%s ruling_sha256=none",
+            manifest.family_id,
+            manifest.live_orders_ruling,
+            exc.reason,
+        )
+        raise SettingsError(
+            f"maker live-orders gate refused for {manifest.family_id}: {exc}"
+        ) from exc
+    _boot_logger.info(
+        "maker_live_orders enabled=%s family_id=%s ruling=%s reason=%s "
+        "ruling_sha256=%s calibration_sha256=%s",
+        live_orders.enabled,
+        manifest.family_id,
+        manifest.live_orders_ruling or "none",
+        live_orders.reason,
+        live_orders.ruling_sha256 or "none",
+        manifest.density_artefact_sha256,
+    )
+
+    try:
+        refuse_placeholder_d0(manifest, shadow_only=not live_orders.enabled)
+    except PlaceholderD0Error as exc:
+        raise SettingsError(str(exc)) from exc
+
+    def _maker_now() -> dt.datetime:
+        return dt.datetime.now(tz=dt.UTC)
+
+    def _maker_set_halt(reason: str, evidence_sha256: str) -> None:
+        halt_latch.record_policy_halt(
+            reason=reason, evidence_sha256=evidence_sha256, ts_ns=time.time_ns()
+        )
+
+    harm = build_harm_stop_wiring(
+        catalog_root=catalog_root,
+        halt_veto=halt_veto,
+        set_family_halted=_maker_set_halt,
+        clock=_maker_now,
+        alert_sink=resolve_alert_sink(),
+        alert_every_probe=lambda: live_orders.enabled and not halt_latch.is_family_halted(),
+        expected_uid=os.getuid(),
+    )
+    harm.probe.probe_once()
+    extra_actors.append(LossStopProbeActor(harm.probe))
+    try:
+        maker = build_no_ladder_maker_strategy(
+            stations=tuple(today_by_station),
+            calibration_artefact_path=str(manifest.density_artefact_path),
+            calibration_artefact_sha256=manifest.density_artefact_sha256,
+            theta=float(manifest.taker_fee_coefficient),
+            order_submission_permit=sending_permit,
+            submit_veto=harm.veto,
+            fee_verified=fee_verified_holder.is_fee_verified,
+            shadow_only=not live_orders.enabled,
+        )
+    except (CalibrationArtefactPinMismatchError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SettingsError(
+            f"no_ladder_maker composition failed for {settings.sending_family_id}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    fee_drift_actor: FeeDriftProbeActor | None = None
+    fee_drift_resolve_client: Callable[[Any], None] | None = None
+    built_probe = _build_fee_drift_probe(
+        strategies=(maker,),
+        family_halt_latch=halt_latch,
+        registered_fee_coefficient=manifest.taker_fee_coefficient,
+        slug_fn=maker.current_yes_instrument_slug,
+    )
+    if built_probe is not None:
+        fee_drift_actor, fee_drift_resolve_client = built_probe
+        fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
+    return _FamilyComposition(
+        strategies=[maker],
+        submit_veto=harm.veto,
+        exit_manifest=manifest,
+        fee_drift_actor=fee_drift_actor,
+        fee_drift_resolve_client=fee_drift_resolve_client,
+        extra_actors=tuple(extra_actors),
+    )
+
+
 def _compose_family(
     manifest: FamilyManifest,
     *,
@@ -955,6 +1087,15 @@ def _compose_family(
         )
     if manifest.composition_kind == "forecast_quantile_ladder":
         return _compose_forecast_quantile_ladder(
+            manifest=manifest,
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            latch=latch,
+            sending_permit=sending_permit,
+            settings=settings,
+        )
+    if manifest.composition_kind == "no_ladder_maker":
+        return _compose_no_ladder_maker(
             manifest=manifest,
             catalog_root=catalog_root,
             today_by_station=today_by_station,

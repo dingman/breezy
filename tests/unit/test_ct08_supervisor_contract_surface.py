@@ -211,8 +211,11 @@ def test_subscribe_marker_class_names() -> None:
         "continuous_rung_hold": "ContinuousRungHoldStrategy subscribed",
         "forecast_ladder": "ForecastLadderStrategy subscribed",
         "forecast_quantile_ladder": "ForecastQuantileLadderStrategy subscribed",
+        # ARM C2: one named row; the maker logs `NoLadderMakerStrategy subscribed n=<count>`.
+        "no_ladder_maker": "NoLadderMakerStrategy subscribed",
     }
     assert strategy_subscribed_in("ForecastQuantileLadderStrategy subscribed") is True
+    assert strategy_subscribed_in("NoLadderMakerStrategy subscribed n=24") is True
     assert strategy_subscribed_in("not a subscribe line") is False
 
 

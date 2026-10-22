@@ -18,7 +18,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_ID_PATTERN
 #: family id, never the composition kind), so a kind is listed here only when
 #: its strategy honours that row through ``family_halt_submit_veto``.
 HALTABLE_COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
-    {"continuous_rung_hold", "forecast_quantile_ladder"}
+    {"continuous_rung_hold", "forecast_quantile_ladder", "no_ladder_maker"}
 )
 
 #: The haltable kinds whose strategy has an automated EXIT path
