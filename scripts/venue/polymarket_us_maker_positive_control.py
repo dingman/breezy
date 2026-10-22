@@ -47,8 +47,9 @@ first, middle rungs first; a slug failing a guard is excluded, and with fewer th
 run refuses before any write.
 
 **Bodies** are built ONLY by ``submit_chain.build_resting_order_body`` (BUY NO, qty 1, price
-0.01, GTD at most ten minutes ahead, re-checked at send time). Every write goes through the
-shipped :class:`PolymarketUSWriteTransport` methods; this file builds no write request by hand.
+0.01, GTD at most ten minutes ahead, re-checked at send time, unless ``--horizon``). Every
+write goes through the shipped :class:`PolymarketUSWriteTransport` methods; this file builds
+no write request by hand.
 The slug-scoped cancel-all is reachable only through :meth:`ControlSession.cancel_slugs`, which
 refuses an empty, duplicated or malformed slug list before anything is signed or sent: the venue
 reads an empty list as "cancel the whole account", so that body is unconstructible here.
@@ -62,6 +63,11 @@ quote reads, writes the evidence (``mode`` ``select_only``, every verdict ``NOT_
 and prints one summary line. It reads the activities feed not at all and builds no write
 request: a read-only way to see which two slugs a full run would pick, and why others were
 dropped (``selection.excluded_by_reason``: counts per reason, no slug and no venue value).
+
+**``--horizon``** is the P3 probe, not the 600 s control: one BUY NO, GTD of
+``HORIZON_GTD_SECS`` (4 h), budget 1 create and 3 cancels, no activities read. Slug selection
+requires an event date after today (UTC) and ``market_exclusion`` clear at now + that horizon.
+Evidence stamp ``horizon_<UTC>``. Every licence stays false. The unflagged path is unchanged.
 
 Exit codes: 0 all steps ran and the account is clean; 1 a step failed (own orders were cancelled
 by id first) or the account was not clean at the end; 2 a precondition refused.
@@ -106,10 +112,13 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     FILL_STATES,
     GTD_CEILING_SECS,
     GTD_ECHO_TOLERANCE_NS,
+    GTD_REJECTION_SUBSTRINGS,
+    HORIZON_GTD_SECS,
     MAX_LIST_PAGES,
     NS_PER_S,
     PROBE_PRICE,
     PROBE_QUANTITY,
+    QUOTE_HALTED,
     QUOTE_OK,
     QUOTE_SCAN_CAP,
     QUOTE_UNREADABLE,
@@ -144,6 +153,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     StepFailed,
     assert_gtd_within_ceiling,
     assert_no_trade_node,
+    cancel_reason_enum,
     capture_activity_pages,
     eligible_probe_slugs,
     enum_token,
@@ -151,6 +161,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     has_position_resolution_row,
     install_termination_handlers,
     is_own_probe_shape,
+    iso_utc,
     key_paths,
     list_units_via_systemctl,
     load_env_file,
@@ -166,6 +177,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     quote_verdict,
     rank_probe_slugs,
     require_run_date,
+    slug_event_day,
     write_evidence,
 )
 from _maker_control_core import (
@@ -219,6 +231,13 @@ _FILL_NOTICE: Final[str] = (
     "order {order_id} FILLED or PARTIALLY_FILLED; a position may exist; flatten by hand"
 )
 _LEFTOVER_NOTICE: Final[str] = "order {order_id} may rest; cancel by hand"
+_HORIZON_CONFIRM_POLLS: Final[int] = 10
+_HORIZON_READ_RETRIES: Final[int] = 2
+_HORIZON_RETRY_S: Final[float] = 5.0
+_PASS_WINDOW_BEFORE_S: Final[int] = 55
+_PASS_WINDOW_AFTER_S: Final[int] = 65
+_G_MINUS_30_S: Final[int] = 30
+_G_PLUS_60_S: Final[int] = 60
 
 
 def _candidates(
@@ -331,6 +350,8 @@ class ControlSession:
         discovery: PolymarketUSMarketDiscoveryConfig,
         now_ns: Callable[[], int],
         budget: Budget,
+        ceiling_secs: int = GTD_CEILING_SECS,
+        horizon: bool = False,
     ) -> None:
         self._read = read_client
         self._tap = tap
@@ -341,6 +362,11 @@ class ControlSession:
         self._discovery = discovery
         self._now_ns = now_ns
         self.budget = budget
+        self.ceiling_secs = ceiling_secs
+        self.horizon = horizon
+        #: The goodTillTime of the create about to be sent, stored before post_order so a
+        #: create left in doubt can be matched exactly. None until a body passes the ceiling.
+        self.persisted_gtd_ns: int | None = None
         #: True from the moment a create is sent until the answer proves the venue booked nothing
         #: or told us the id: a 5xx, an exception or an id-less 200 leaves it set (R2).
         self.create_in_doubt = False
@@ -494,8 +520,8 @@ class ControlSession:
         return merged
 
     def _build_resting_body(self, slug: str, gtd_secs: int) -> dict[str, Any]:
-        if not 0 < gtd_secs <= GTD_CEILING_SECS:
-            raise ValueError(f"GTD must be within (0, {GTD_CEILING_SECS}] seconds")
+        if not 0 < gtd_secs <= self.ceiling_secs:
+            raise ValueError(f"GTD must be within (0, {self.ceiling_secs}] seconds")
         market = self._markets.get(slug)
         if market is None:
             raise ValueError("slug is not in the listed markets")
@@ -516,7 +542,9 @@ class ControlSession:
     async def rest(self, label: str, slug: str, gtd_secs: int) -> PostResult:
         """Rest one probe order. The body is ``build_resting_order_body``'s, nothing else."""
         body = self._build_resting_body(slug, gtd_secs)
-        assert_gtd_within_ceiling(body, now_ns=self._now_ns())
+        assert_gtd_within_ceiling(body, now_ns=self._now_ns(), ceiling_secs=self.ceiling_secs)
+        sent_gtd_ns = parse_utc_ns(body["goodTillTime"])
+        self.persisted_gtd_ns = sent_gtd_ns
         encoded = submit_chain.encode_order_body(body)
         self.create_in_doubt = False
         self.budget.spend_create()
@@ -538,7 +566,6 @@ class ControlSession:
             self.create_in_doubt = (
                 False  # a definite answer: refused outright, or booked with an id
             )
-        sent_gtd_ns = parse_utc_ns(body["goodTillTime"])
         return PostResult(status, payload, order_id, sent_gtd_ns)
 
     async def retract_order(self, order_id: str, slug: str, op: str = "cancel_order") -> PostResult:
@@ -658,6 +685,11 @@ async def _rest(
         if session.create_in_doubt:
             state.unknown_create = True
     if result.status != 200:
+        if session.horizon and 400 <= result.status < 500:
+            blob = json.dumps(result.payload, default=str)
+            if any(token in blob for token in GTD_REJECTION_SUBSTRINGS):
+                raise StepFailed("GTD_REJECTED")
+            raise StepFailed("CREATE_4XX")
         raise StepFailed("CREATE_REFUSED")
     if result.order_id is None:
         raise StepFailed("CREATE_NO_VALID_ID")
@@ -774,6 +806,314 @@ async def _choose_pair(
         pair = pick_pair(ranked, qualified)
     selection["chosen"] = list(pair.slugs) if pair is not None else []
     return pair
+
+
+# -------------------------------------------------------------------------- horizon (P3)
+
+
+def _warn_resting(state: RunState, order_id: str, until: str) -> None:
+    """Name a horizon order that may still rest, once. The unflagged notice is unchanged."""
+    if order_id in state.rest_warned:
+        return
+    state.rest_warned.add(order_id)
+    print(f"order {order_id} may rest until {until}; cancel by hand", file=sys.stderr)
+
+
+def _until_text(ns: int | None) -> str:
+    return iso_utc(ns) if ns is not None else "unknown"
+
+
+def _order_body(reading: Reading) -> Mapping[str, Any] | None:
+    payload = reading.payload
+    order = payload.get("order") if isinstance(payload, Mapping) else None
+    return order if isinstance(order, Mapping) else None
+
+
+def _note_cancel_reason(state: RunState, order: Mapping[str, Any] | None) -> None:
+    reason = cancel_reason_enum(order)
+    if reason is not None:
+        state.details["cancel_reason"] = reason
+
+
+def _stamp_obs(session: ControlSession, reading: Reading) -> Observation:
+    return dataclasses.replace(_observe(reading), observed_ns=session.now_ns())
+
+
+def _listing_match(session: ControlSession, state: RunState, order: Mapping[str, Any]) -> bool:
+    """Horizon listing cleanup matches only the stored G. No stored G matches nothing."""
+    if session.horizon:
+        exact = session.persisted_gtd_ns
+        if exact is None:
+            return False
+        return is_own_probe_shape(
+            order, slugs=state.slugs, now_ns=session.now_ns(), exact_gtd_ns=exact
+        )
+    return is_own_probe_shape(order, slugs=state.slugs, now_ns=session.now_ns())
+
+
+async def _sleep_until(
+    session: ControlSession,
+    sleep: Callable[[float], Awaitable[None]],
+    target_ns: int,
+) -> None:
+    delta = target_ns - session.now_ns()
+    if delta > 0:
+        await sleep(delta / NS_PER_S)
+
+
+def _judge_echo(state: RunState, own: OwnOrder, obs: Observation, created_ns: int) -> None:
+    """|echo − G| within 1 s passes. A larger gap is CLAMPED; anything else is not a FAIL."""
+    sent = own.sent_gtd_ns
+    echo_gap = None if obs.gtd_ns is None or sent is None else abs(obs.gtd_ns - sent)
+    if echo_gap is not None and echo_gap > GTD_ECHO_TOLERANCE_NS:
+        state.details["echo_minus_tc_ns"] = obs.gtd_ns - created_ns
+        state.verdicts["P3"] = VERDICT_FAIL
+        raise StepFailed("CLAMPED")
+    if not gtd_echoed(obs, own):
+        raise StepFailed("ECHO_NOT_CONFIRMED")
+    if obs.gtd_ns is not None:
+        state.details["echo_minus_tc_ns"] = obs.gtd_ns - created_ns
+
+
+async def _horizon_raise_terminal(
+    session: ControlSession,
+    state: RunState,
+    own: OwnOrder,
+    obs: Observation,
+    *,
+    bracket: str,
+) -> None:
+    """A terminal read at or before G−30 s. A halted market makes the cancel non-binding."""
+    own.terminal = True
+    if obs.state in FILL_STATES:
+        own.filled = True
+        raise StepFailed("ORDER_FILLED")
+    state.details["early_bracket"] = bracket
+    state.verdicts["P3"] = VERDICT_FAIL
+    if obs.state == STATE_CANCELED:
+        verdict = await session.read_quote(own.slug)
+        if verdict == QUOTE_HALTED:
+            raise StepFailed("EARLY_MARKET_NOT_OPEN")
+    raise StepFailed("EARLY")
+
+
+async def _horizon_confirm(
+    session: ControlSession,
+    state: RunState,
+    own: OwnOrder,
+    sleep: Callable[[float], Awaitable[None]],
+    *,
+    created_ns: int,
+) -> Observation:
+    """Sleep 1 s, then up to 10 polls × 1 s. A 404 is tolerated; NEW is required."""
+    await sleep(1.0)
+    seen: Observation | None = None
+    for attempt in range(1, _HORIZON_CONFIRM_POLLS + 1):
+        if attempt > 1:
+            await sleep(1.0)
+        reading = await session.get_order(own.order_id or "", f"get_B_confirm_{attempt}")
+        _note_cancel_reason(state, _order_body(reading))
+        obs = _stamp_obs(session, reading)
+        if obs.state is None:
+            continue
+        if obs.state in FILL_STATES or obs.state in TERMINAL_STATES:
+            await _horizon_raise_terminal(session, state, own, obs, bracket="confirm")
+        if obs.state == STATE_NEW:
+            seen = obs
+            break
+    if seen is None:
+        raise StepFailed("NEW_NOT_CONFIRMED")
+    _judge_echo(state, own, seen, created_ns)
+    return seen
+
+
+async def _horizon_read_at(
+    session: ControlSession,
+    state: RunState,
+    own: OwnOrder,
+    sleep: Callable[[float], Awaitable[None]],
+    *,
+    target_ns: int,
+    tag: str,
+    retries: int,
+    bracket: str,
+) -> Observation:
+    """Sleep to ``target_ns``, then read. A terminal state at or before G−30 s is EARLY."""
+    for attempt in range(1, retries + 2):
+        if attempt == 1:
+            await _sleep_until(session, sleep, target_ns)
+        else:
+            await sleep(_HORIZON_RETRY_S)
+        reading = await session.get_order(own.order_id or "", f"get_{tag}_{attempt}")
+        _note_cancel_reason(state, _order_body(reading))
+        obs = _stamp_obs(session, reading)
+        if obs.state is None:
+            continue
+        if obs.state in FILL_STATES or obs.state in TERMINAL_STATES:
+            await _horizon_raise_terminal(session, state, own, obs, bracket=bracket)
+        return obs
+    raise StepFailed(f"{tag.upper()}_UNREADABLE")
+
+
+async def _horizon_expiry_read(
+    session: ControlSession,
+    state: RunState,
+    own: OwnOrder,
+    sleep: Callable[[float], Awaitable[None]],
+) -> Observation:
+    """The PASS read, issued only inside [G+55 s, G+65 s]. Outside that window it does not count."""
+    gtd_ns = own.sent_gtd_ns
+    if gtd_ns is None:
+        raise StepFailed("GTD_NOT_STORED")
+    target = gtd_ns + _G_PLUS_60_S * NS_PER_S
+    window_lo = gtd_ns + _PASS_WINDOW_BEFORE_S * NS_PER_S
+    window_hi = gtd_ns + _PASS_WINDOW_AFTER_S * NS_PER_S
+    for attempt in range(1, _HORIZON_READ_RETRIES + 2):
+        if attempt == 1:
+            await _sleep_until(session, sleep, target)
+        else:
+            await sleep(_HORIZON_RETRY_S)
+        now = session.now_ns()
+        if now < window_lo or now > window_hi:
+            continue
+        reading = await session.get_order(own.order_id or "", f"get_g_plus_60_{attempt}")
+        _note_cancel_reason(state, _order_body(reading))
+        obs = _stamp_obs(session, reading)
+        if obs.state is None:
+            continue
+        if obs.state in FILL_STATES:
+            own.terminal = True
+            own.filled = True
+            raise StepFailed("ORDER_FILLED")
+        return obs
+    raise StepFailed("G_PLUS_60_UNREADABLE")
+
+
+async def _horizon_cancel_late(
+    session: ControlSession,
+    state: RunState,
+    own: OwnOrder,
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """One cancel by id. A failure is recorded; it must not raise, or cleanup would cancel again."""
+    try:
+        result = await session.retract_order(own.order_id or "", own.slug, "cancel_B_late")
+        if result.status != 200:
+            state.cleanup["errors"].append(f"HTTP_{result.status}")
+            return
+        await _await_state(
+            session,
+            own,
+            tag="B_late_cancel",
+            want=frozenset({STATE_CANCELED}),
+            polls=CONFIRM_POLLS,
+            interval_s=CONFIRM_INTERVAL_S,
+            sleep=sleep,
+        )
+    except BudgetExhausted as exc:
+        state.cleanup["errors"].append(type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 - LATE must survive a failed confirm
+        state.cleanup["errors"].append(type(exc).__name__)
+
+
+async def _choose_horizon_slug(
+    session: ControlSession, state: RunState, markets_payload: object
+) -> str | None:
+    """One slug whose event date is after today (real now) and that is open across the horizon.
+
+    ``market_exclusion`` keeps its own ceiling. Passing now + H only moves the instant it judges.
+    Ranking's internal today is that same shifted instant, so the date filter below uses real now.
+    """
+    selection = state.selection
+    selection["pages"] = session.list_pages
+    selection["markets_seen"] = session.markets_seen
+    selection["listing_complete"] = session.list_complete
+    by_reason: dict[str, int] = selection["excluded_by_reason"]
+    if not isinstance(markets_payload, Mapping):
+        _count(by_reason, REASON_LISTING_UNREADABLE)
+        return None
+    now_ns = session.now_ns()
+    ranked, market_excluded = _rank_with_counts(
+        markets_payload,
+        city_codes=session.discovery.city_codes,
+        now_ns=now_ns + HORIZON_GTD_SECS * NS_PER_S,
+        reasons=by_reason,
+    )
+    state.quote_guard["market_excluded"] = dict(sorted(market_excluded.items()))
+    today = iso_utc(now_ns)[:10]
+    future: list[str] = []
+    for slug in ranked:
+        day = slug_event_day(slug)
+        if day is not None and day > today:
+            future.append(slug)
+        else:
+            _count(by_reason, "EVENT_NOT_AFTER_TODAY")
+    selection["eligible"] = len(future)
+    chosen: str | None = None
+    for slug in future[:QUOTE_SCAN_CAP]:
+        verdict = await session.read_quote(slug)
+        state.quote_guard["scanned"] += 1
+        selection["scanned"] += 1
+        if verdict == QUOTE_OK:
+            chosen = slug
+            break
+        excluded = state.quote_guard["excluded"]
+        excluded[verdict] = excluded.get(verdict, 0) + 1
+        _count(by_reason, f"QUOTE_{verdict}")
+    selection["chosen"] = [chosen] if chosen is not None else []
+    return chosen
+
+
+async def _horizon_sequence(
+    session: ControlSession,
+    state: RunState,
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """One BUY NO at H. No activities read. LATE cancels once here and does not raise."""
+    state.horizon = True
+    state.phase = "P3"
+    state.verdicts = {"P3": VERDICT_NOT_RUN}
+    markets = await session.list_markets()
+    slug = await _choose_horizon_slug(session, state, markets.payload)
+    if slug is None:
+        raise StepFailed("NO_ELIGIBLE_SLUG")
+    state.slugs = (slug,)
+    state.share_event = False
+    own = await _rest(session, state, "B", slug, HORIZON_GTD_SECS)
+    created_ns = session.now_ns()
+    await _horizon_confirm(session, state, own, sleep, created_ns=created_ns)
+    gtd_ns = own.sent_gtd_ns
+    if gtd_ns is None:
+        raise StepFailed("GTD_NOT_STORED")
+    mid_target = created_ns + (HORIZON_GTD_SECS // 2) * NS_PER_S
+    mid = await _horizon_read_at(
+        session, state, own, sleep, target_ns=mid_target, tag="mid", retries=0, bracket="mid"
+    )
+    if mid.state != STATE_NEW:
+        raise StepFailed("MID_NOT_NEW")
+    pre = await _horizon_read_at(
+        session,
+        state,
+        own,
+        sleep,
+        target_ns=gtd_ns - _G_MINUS_30_S * NS_PER_S,
+        tag="g_minus_30",
+        retries=_HORIZON_READ_RETRIES,
+        bracket="G-30",
+    )
+    if pre.state != STATE_NEW:
+        raise StepFailed("G_MINUS_30_NOT_NEW")
+    expiry = await _horizon_expiry_read(session, state, own, sleep)
+    if expiry.state == STATE_NEW:
+        state.verdicts["P3"] = VERDICT_FAIL
+        state.failure = "LATE"
+        await _horizon_cancel_late(session, state, own, sleep)
+    elif expiry.state == STATE_EXPIRED:
+        own.terminal = True
+        state.verdicts["P3"] = VERDICT_PASS
+    else:
+        raise StepFailed("G_PLUS_60_NOT_EXPIRED")
+    await _final_clean_check(session, state)
 
 
 # -------------------------------------------------------------------------- sequence
@@ -970,6 +1310,12 @@ async def _cleanup(
         await _cleanup_by_listing(session, state)
     for own in left:
         state.cleanup["left_to_gtd"].append(own.label)
+        if session.horizon:
+            state.cleanup["errors"].append("LEFT_ORDER_NOT_LAPSED")
+            until_ns = own.sent_gtd_ns if own.sent_gtd_ns is not None else session.persisted_gtd_ns
+            if own.order_id:
+                _warn_resting(state, own.order_id, _until_text(until_ns))
+            continue
         try:
             lapsed = await _await_state(
                 session,
@@ -1005,9 +1351,7 @@ async def _cleanup_by_listing(session: ControlSession, state: RunState) -> None:
         if not isinstance(order, Mapping):
             continue
         order_id, slug = order.get("id"), order.get("marketSlug")
-        if valid_venue_order_id(order_id) and is_own_probe_shape(
-            order, slugs=state.slugs, now_ns=session.now_ns()
-        ):
+        if valid_venue_order_id(order_id) and _listing_match(session, state, order):
             try:
                 await session.retract_order(str(order_id), str(slug), "cleanup_by_listing")
             except Exception as exc:  # noqa: BLE001
@@ -1023,12 +1367,15 @@ async def run_control(
     run_date: str,
     state: RunState | None = None,
 ) -> ControlResult:
-    """Run S-1, S-2, S-6 in order. Any failure cancels own orders by id and exits non-zero."""
+    """Run S-1, S-2, S-6, or the P3 horizon probe when ``session.horizon`` is set."""
     active = (
         state if state is not None else RunState(run_date=run_date, started_ns=session.now_ns())
     )
     try:
-        await _sequence(session, active, sleep)
+        if session.horizon:
+            await _horizon_sequence(session, active, sleep)
+        else:
+            await _sequence(session, active, sleep)
     except BaseException as exc:
         if isinstance(exc, StepFailed):
             active.failure = str(exc.args[0])
@@ -1036,7 +1383,9 @@ async def run_control(
             active.failure = (
                 "BUDGET_EXHAUSTED" if isinstance(exc, BudgetExhausted) else type(exc).__name__
             )
-        if active.phase == "S-1" and active.verdicts["S-1"] == VERDICT_NOT_RUN:
+        if active.phase == "P3" and active.verdicts.get("P3") == VERDICT_NOT_RUN:
+            active.verdicts["P3"] = VERDICT_FAIL
+        elif active.phase == "S-1" and active.verdicts["S-1"] == VERDICT_NOT_RUN:
             active.verdicts["S-1"] = VERDICT_FAIL
         elif active.phase == "S-6" and active.verdicts["S-6"] == VERDICT_NOT_RUN:
             active.verdicts["S-6"] = VERDICT_FAIL
@@ -1071,12 +1420,23 @@ def _announce_orders(state: RunState) -> None:
         if own.order_id:
             print(_FILL_NOTICE.format(order_id=own.order_id), file=sys.stderr)
     for order_id in state.cleanup["leftover"]:
-        print(_LEFTOVER_NOTICE.format(order_id=order_id), file=sys.stderr)
+        if state.horizon:
+            match = next((own for own in state.orders.values() if own.order_id == order_id), None)
+            until_ns = None if match is None else match.sent_gtd_ns
+            _warn_resting(state, order_id, _until_text(until_ns))
+        else:
+            print(_LEFTOVER_NOTICE.format(order_id=order_id), file=sys.stderr)
 
 
 async def _select_only_sequence(session: ControlSession, state: RunState) -> None:
     """Listing and quote reads only: no activities feed, no order, no cancel, no POST."""
     markets = await session.list_markets()
+    if session.horizon:
+        slug = await _choose_horizon_slug(session, state, markets.payload)
+        if slug is not None:
+            state.slugs = (slug,)
+            state.share_event = False
+        return
     chosen = await _choose_pair(session, state, markets.payload)
     if chosen is not None:
         state.slugs = chosen.slugs
@@ -1115,11 +1475,14 @@ async def _run_select_only(session: ControlSession, state: RunState, deps: Deps)
     return 0 if state.slugs else 1
 
 
-async def run(run_date: str, deps: Deps, *, select_only: bool = False) -> int:
+async def run(
+    run_date: str, deps: Deps, *, select_only: bool = False, horizon: bool = False
+) -> int:
     """Preconditions, then the control, then the evidence file. Returns the exit code.
 
     ``select_only`` stops after the preconditions (run date, no trade node, node probe, clean
     open-orders) and the read-only slug selection: it never builds or sends a POST.
+    ``horizon`` rests one order at ``HORIZON_GTD_SECS`` (budget 1 create / 3 cancels).
     """
     try:
         require_run_date(run_date, deps.today_utc())
@@ -1127,6 +1490,10 @@ async def run(run_date: str, deps: Deps, *, select_only: bool = False) -> int:
         assert_no_trade_node(deps.list_units())
         deps.probe_node()
         session = deps.build_session(env)
+        if horizon:
+            session.horizon = True
+            session.ceiling_secs = HORIZON_GTD_SECS
+            session.budget = Budget(max_creates=1, max_cancels=3)
         await _require_clean_account(session)
     except Refusal as exc:
         print(f"B2_CONTROL REFUSED code={exc.code}", file=sys.stderr)
@@ -1135,15 +1502,17 @@ async def run(run_date: str, deps: Deps, *, select_only: bool = False) -> int:
         print("B2_CONTROL REFUSED code=BUDGET_EXHAUSTED", file=sys.stderr)
         return 2
     state = RunState(run_date=run_date, started_ns=session.now_ns(), select_only=select_only)
+    state.horizon = horizon
     if select_only:
         return await _run_select_only(session, state, deps)
+    stamp = f"horizon_{deps.stamp()}" if horizon else deps.stamp()
     try:
         result = await run_control(session, sleep=deps.sleep, run_date=run_date, state=state)
     except BaseException:
-        write_evidence(state.document(session), deps.evidence_dir, stamp=deps.stamp())
+        write_evidence(state.document(session), deps.evidence_dir, stamp=stamp)
         _announce_orders(state)
         raise
-    path = write_evidence(result.document, deps.evidence_dir, stamp=deps.stamp())
+    path = write_evidence(result.document, deps.evidence_dir, stamp=stamp)
     _announce_orders(state)
     verdicts = " ".join(f"{k}={v}" for k, v in result.document["verdicts"].items())
     print(f"B2_CONTROL outcome={result.document['outcome']} {verdicts} evidence={path}")
@@ -1206,7 +1575,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     install_termination_handlers()
     try:
-        return asyncio.run(run(args.run_date, _production_deps(), select_only=args.select_only))
+        return asyncio.run(
+            run(
+                args.run_date,
+                _production_deps(),
+                select_only=args.select_only,
+                horizon=args.horizon,
+            )
+        )
     except KeyboardInterrupt:
         print("B2_CONTROL INTERRUPTED cleanup and evidence were attempted", file=sys.stderr)
         return 1

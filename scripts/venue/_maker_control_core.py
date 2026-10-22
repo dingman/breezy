@@ -47,6 +47,8 @@ PROBE_QUANTITY: Final[int] = 1
 
 #: R13: every probe order is GTD and expires no later than now + this many seconds.
 GTD_CEILING_SECS: Final[int] = 600
+#: P3 horizon probe only. The unflagged path keeps ``GTD_CEILING_SECS``.
+HORIZON_GTD_SECS: Final[int] = 14_400
 #: A and A' rest this long (well inside the ceiling); B's lapse is what S-6 observes.
 REST_GTD_SECS: Final[int] = 540
 SHORT_GTD_SECS: Final[int] = 120
@@ -146,6 +148,20 @@ MODE_FULL: Final[str] = "full"
 MODE_SELECT_ONLY: Final[str] = "select_only"
 OUTCOME_SELECT_PAIR: Final[str] = "SELECT_ONLY_PAIR_FOUND"
 OUTCOME_SELECT_NO_PAIR: Final[str] = "SELECT_ONLY_NO_PAIR"
+OUTCOME_INVALID: Final[str] = "INVALID"
+#: P3 FAIL classes. Anything else that stops a horizon run is INVALID, not FAIL.
+P3_FAIL_CODES: Final[frozenset[str]] = frozenset({"CLAMPED", "EARLY", "LATE", "GTD_REJECTED"})
+#: A create 4xx is GTD_REJECTED only when the body contains one of these documented
+#: names. OrdRejectReason has no GTD member
+#: (docs_snapshots/api-reference_orders_overview_2026-08-25.md:254-267).
+#: ``goodTillTime`` is the request field
+#: (docs_snapshots/api-reference_orders_create-order_2026-08-25.md:87-89);
+#: ``TIME_IN_FORCE_GOOD_TILL_DATE`` is the same snapshot at lines 165-172.
+#: Any other 4xx is INVALID.
+GTD_REJECTION_SUBSTRINGS: Final[tuple[str, ...]] = (
+    "goodTillTime",
+    "TIME_IN_FORCE_GOOD_TILL_DATE",
+)
 _MARKET_OPEN_STATE: Final[str] = "MARKET_STATE_OPEN"
 _MARKET_OPEN_STATUS: Final[str] = "MARKET_STATUS_OPEN"
 _MARKET_OPEN_EP3: Final[str] = "OPEN"
@@ -398,16 +414,21 @@ def parse_utc_ns(value: object) -> int:
     return seconds * NS_PER_S + int((match.group(7) or "").ljust(9, "0"))
 
 
-def assert_gtd_within_ceiling(body: Mapping[str, Any], *, now_ns: int) -> None:
-    """R13: refuse a body whose ``goodTillTime`` is not in (now, now + GTD_CEILING_SECS]."""
+def assert_gtd_within_ceiling(
+    body: Mapping[str, Any], *, now_ns: int, ceiling_secs: int = GTD_CEILING_SECS
+) -> None:
+    """R13: refuse a body whose ``goodTillTime`` is not in (now, now + ceiling].
+
+    ``ceiling_secs`` is :data:`GTD_CEILING_SECS` unless the caller is the horizon probe.
+    """
     try:
         expire_ns = parse_utc_ns(body.get("goodTillTime"))
     except ValueError:
         raise ValueError("GTD missing or unreadable; refusing to send") from None
     if expire_ns <= now_ns:
         raise ValueError("GTD is not in the future; refusing to send")
-    if expire_ns > now_ns + GTD_CEILING_SECS * NS_PER_S:
-        raise ValueError(f"GTD is more than {GTD_CEILING_SECS}s ahead; refusing to send")
+    if expire_ns > now_ns + ceiling_secs * NS_PER_S:
+        raise ValueError(f"GTD is more than {ceiling_secs}s ahead; refusing to send")
 
 
 def assert_no_trade_node(listing: str) -> None:
@@ -701,6 +722,9 @@ class RunState:
         }
     )
     select_only: bool = False
+    horizon: bool = False
+    #: Order ids already named on stderr, so a second announcer does not repeat them.
+    rest_warned: set[str] = field(default_factory=set)
     final_open_ids: frozenset[str] = frozenset()
     final_account_clean: bool | None = None
     failure: str | None = None
@@ -734,25 +758,78 @@ class RunState:
     def document(self, session: Any) -> dict[str, Any]:
         """Build the evidence document. ``session`` supplies ``budget``, ``trace``, ``now_ns()``."""
         budget = session.budget
-        verdicts_ok = (
-            self.verdicts["S-1"] == VERDICT_PASS
-            and self.verdicts["S-6"] == VERDICT_PASS
-            and self.verdicts["S-2"] in _S2_ACCEPTED
-        )
-        passed = (
-            self.failure is None
-            and verdicts_ok
-            and self.final_account_clean is True
-            and not self.filled_orders
-            and not self.cleanup["leftover"]
-            and not self.select_only
-        )
-        outcome = VERDICT_PASS if passed else VERDICT_FAIL
-        failure = self.failure if self.failure is not None else self._unmet(passed)
-        if self.select_only:
-            found = bool(self.slugs) and self.failure is None
-            outcome = OUTCOME_SELECT_PAIR if found else OUTCOME_SELECT_NO_PAIR
-            failure = None if found else (self.failure or "NO_ELIGIBLE_SLUGS")
+        horizon = bool(getattr(session, "horizon", False) or self.horizon)
+        if horizon and not self.select_only:
+            passed = (
+                self.failure is None
+                and self.verdicts.get("P3") == VERDICT_PASS
+                and self.final_account_clean is True
+                and not self.filled_orders
+                and not self.cleanup["leftover"]
+            )
+            if self.filled_orders:
+                outcome = OUTCOME_INVALID
+                failure: str | None = "ORDER_FILLED"
+            elif passed:
+                outcome = VERDICT_PASS
+                failure = None
+            elif not self.unknown_create and self.failure in P3_FAIL_CODES:
+                outcome = VERDICT_FAIL
+                failure = self.failure
+            else:
+                outcome = OUTCOME_INVALID
+                failure = self.failure if self.failure is not None else self._unmet(False)
+            licenses = {
+                "GTD_EXPIRY": False,
+                "SLUG_SCOPED_CANCEL_ALL": False,
+                "MAKER_COMMISSION_SIGN": False,
+            }
+        else:
+            verdicts_ok = (
+                self.verdicts["S-1"] == VERDICT_PASS
+                and self.verdicts["S-6"] == VERDICT_PASS
+                and self.verdicts["S-2"] in _S2_ACCEPTED
+            )
+            passed = (
+                self.failure is None
+                and verdicts_ok
+                and self.final_account_clean is True
+                and not self.filled_orders
+                and not self.cleanup["leftover"]
+                and not self.select_only
+            )
+            outcome = VERDICT_PASS if passed else VERDICT_FAIL
+            failure = self.failure if self.failure is not None else self._unmet(passed)
+            if self.select_only:
+                found = bool(self.slugs) and self.failure is None
+                outcome = OUTCOME_SELECT_PAIR if found else OUTCOME_SELECT_NO_PAIR
+                failure = None if found else (self.failure or "NO_ELIGIBLE_SLUGS")
+            licenses = {
+                "GTD_EXPIRY": passed and self.verdicts["S-6"] == VERDICT_PASS,
+                "SLUG_SCOPED_CANCEL_ALL": passed and self.verdicts["S-2"] == VERDICT_PASS,
+                "MAKER_COMMISSION_SIGN": False,
+            }
+        constants: dict[str, Any] = {
+            "max_creates": MAX_CREATES,
+            "max_cancels": MAX_CANCELS,
+            "max_gets": MAX_GETS,
+            "max_aux_gets": MAX_AUX_GETS,
+            "quote_price_ceiling": str(QUOTE_PRICE_CEILING),
+            "close_margin_secs": CLOSE_MARGIN_SECS,
+            "side": "BUY_NO",
+            "price": str(PROBE_PRICE),
+            "quantity": PROBE_QUANTITY,
+            "gtd_ceiling_secs": GTD_CEILING_SECS,
+            "rest_gtd_secs": REST_GTD_SECS,
+            "short_gtd_secs": SHORT_GTD_SECS,
+            "confirm_polls": CONFIRM_POLLS,
+            "expiry_polls": EXPIRY_POLLS,
+            "expiry_interval_s": EXPIRY_INTERVAL_S,
+        }
+        if horizon and not self.select_only:
+            constants["max_creates"] = budget.max_creates
+            constants["max_cancels"] = budget.max_cancels
+            constants["horizon_gtd_secs"] = HORIZON_GTD_SECS
         return {
             "mode": MODE_SELECT_ONLY if self.select_only else MODE_FULL,
             "selection": json.loads(json.dumps(self.selection)),
@@ -760,23 +837,7 @@ class RunState:
             "run_date": self.run_date,
             "started_at": iso_utc(self.started_ns),
             "finished_at": iso_utc(session.now_ns()),
-            "constants": {
-                "max_creates": MAX_CREATES,
-                "max_cancels": MAX_CANCELS,
-                "max_gets": MAX_GETS,
-                "max_aux_gets": MAX_AUX_GETS,
-                "quote_price_ceiling": str(QUOTE_PRICE_CEILING),
-                "close_margin_secs": CLOSE_MARGIN_SECS,
-                "side": "BUY_NO",
-                "price": str(PROBE_PRICE),
-                "quantity": PROBE_QUANTITY,
-                "gtd_ceiling_secs": GTD_CEILING_SECS,
-                "rest_gtd_secs": REST_GTD_SECS,
-                "short_gtd_secs": SHORT_GTD_SECS,
-                "confirm_polls": CONFIRM_POLLS,
-                "expiry_polls": EXPIRY_POLLS,
-                "expiry_interval_s": EXPIRY_INTERVAL_S,
-            },
+            "constants": constants,
             "counts": {
                 "creates": budget.creates,
                 "cancels": budget.cancels,
@@ -788,11 +849,7 @@ class RunState:
             "order_ids": {o.label: o.order_id for o in self.orders.values() if o.order_id},
             "steps": [dict(step) for step in session.trace],
             "quote_guard": json.loads(json.dumps(self.quote_guard)),
-            "licenses": {
-                "GTD_EXPIRY": passed and self.verdicts["S-6"] == VERDICT_PASS,
-                "SLUG_SCOPED_CANCEL_ALL": passed and self.verdicts["S-2"] == VERDICT_PASS,
-                "MAKER_COMMISSION_SIGN": False,
-            },
+            "licenses": licenses,
             "fill_detected": bool(self.filled_orders),
             "verdicts": dict(self.verdicts),
             "details": dict(self.details),
@@ -902,6 +959,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--select-only",
         action="store_true",
         help="preflight, list markets and read quotes, write the selection; sends no POST",
+    )
+    parser.add_argument(
+        "--horizon",
+        action="store_true",
+        help="P3: one BUY NO at HORIZON_GTD_SECS (4 h) instead of the 600 s control",
     )
     return parser.parse_args(argv)
 
@@ -1179,12 +1241,20 @@ def quote_verdict(payload: object, *, slug: str) -> str:
     return QUOTE_OK
 
 
-def is_own_probe_shape(order: object, *, slugs: Collection[str], now_ns: int) -> bool:
+def is_own_probe_shape(
+    order: object,
+    *,
+    slugs: Collection[str],
+    now_ns: int,
+    exact_gtd_ns: int | None = None,
+) -> bool:
     """R5: an open order that looks exactly like one of this control's probes.
 
-    On a probe slug, quantity one, GTD, a ``goodTillTime`` inside the ceiling window, and the
-    one-cent price in either spelling (the BUY NO as sent, or the SELL YES complement the venue
-    shows). Anything else on those slugs is somebody else's and is never cancelled.
+    On a probe slug, quantity one, GTD, and the one-cent price in either spelling (the BUY NO
+    as sent, or the SELL YES complement the venue shows). The unflagged path also requires
+    ``goodTillTime`` inside the ceiling window. Horizon cleanup passes ``exact_gtd_ns`` (the G
+    stored before the create) and then only a time within :data:`GTD_ECHO_TOLERANCE_NS` matches
+    — not the ceiling window, and not a freshly computed now + horizon.
     """
     if not isinstance(order, Mapping) or order.get("marketSlug") not in slugs:
         return False
@@ -1196,8 +1266,39 @@ def is_own_probe_shape(order: object, *, slugs: Collection[str], now_ns: int) ->
         gtd_ns = parse_utc_ns(order.get("goodTillTime"))
     except ValueError:
         return False
+    if exact_gtd_ns is not None:
+        return abs(gtd_ns - exact_gtd_ns) <= GTD_ECHO_TOLERANCE_NS
     slack = 60 * NS_PER_S
     return now_ns - slack <= gtd_ns <= now_ns + GTD_CEILING_SECS * NS_PER_S + slack
+
+
+def slug_event_day(slug: str) -> str | None:
+    """The ``YYYY-MM-DD`` event date in a daily-HIGH slug, or ``None``."""
+    match = _EVENT_SPLIT_RE.fullmatch(slug)
+    if match is None:
+        return None
+    return match.group(2)
+
+
+_CANCEL_REASON_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:UNSOLICITED_CXL_REASON|ORD_REJECT_REASON)_[A-Z0-9_]+"
+)
+_CANCEL_REASON_FIELDS: Final[tuple[str, ...]] = ("unsolicitedCancelReason", "orderRejectReason")
+
+
+def cancel_reason_enum(order: object) -> str | None:
+    """A documented cancel/reject enum on an order object, or ``None`` if the field is absent.
+
+    ``unsolicitedCancelReason`` is an Execution field and may be absent on Order
+    (polymarket-us-integration SKILL.md, the 2026-10-13 unresolved row). Free text is not kept.
+    """
+    if not isinstance(order, Mapping):
+        return None
+    for name in _CANCEL_REASON_FIELDS:
+        value = order.get(name)
+        if isinstance(value, str) and _CANCEL_REASON_RE.fullmatch(value) is not None:
+            return value
+    return None
 
 
 @dataclass

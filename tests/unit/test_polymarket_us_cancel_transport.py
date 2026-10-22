@@ -53,7 +53,10 @@ _B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
 #: Re-digested once at the B2 slug-selection fix (production-parity candidates, paged listing,
 #: value-free selection diagnostics, --select-only). Prior digest:
 #: ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f
-_B2_CONTROL_SHA256 = "c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc"
+#: Re-digested once at P3 (horizon probe: --horizon, one 4 h order, exact stored-G cleanup).
+#: Prior digest:
+#: c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc
+_B2_CONTROL_SHA256 = "61a7b6a9f1e9e65fd266c0bddff02620a7bfa94bf11a61a7de8d7fe73d268192"
 
 
 class _Resp:
