@@ -71,6 +71,7 @@ class Arm:
     e_min: float | None = None
     b_floor: float | None = None
     delta_ns: int = 0  # recorder clock offset handed to the simulator (it applies |delta|)
+    latency_ns: int = 0  # placement latency; 0 leaves Pass._on_print untouched
 
 
 ARMS: Final[Mapping[str, Arm]] = {
@@ -81,6 +82,26 @@ ARMS: Final[Mapping[str, Arm]] = {
         Arm("nbp_deep", 0.84, 3, False),
         Arm("spike_bid", rule.B_CAP, rule.MAX_RUNGS, False, spike=True),
         Arm("sharp", 0.89, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
+        Arm(
+            "sharp_l1",
+            0.89,
+            2,
+            False,
+            p_min=0.97,
+            e_min=0.04,
+            b_floor=0.75,
+            latency_ns=10**9,  # 1 s
+        ),
+        Arm(
+            "sharp_l5",
+            0.89,
+            2,
+            False,
+            p_min=0.97,
+            e_min=0.04,
+            b_floor=0.75,
+            latency_ns=5 * 10**9,  # 5 s
+        ),
         Arm("sharp_cap84", 0.84, 2, False, p_min=0.97, e_min=0.04, b_floor=0.75),
         Arm(
             "sharp_dp600",

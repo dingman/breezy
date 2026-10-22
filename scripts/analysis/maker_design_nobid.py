@@ -44,7 +44,7 @@ import sys
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Final
@@ -54,6 +54,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_l
 from scripts.analysis import maker_design_score as score
 from scripts.analysis import maker_stage0_adapter as adapter
 from scripts.analysis import maker_stage0_events_build as events_build
+from scripts.analysis import maker_stage0_fill_pass as fill_pass
 from scripts.analysis import maker_stage0_rule as rule
 from scripts.analysis.maker_design_config import (
     ARMS,
@@ -112,6 +113,7 @@ __all__ = [
     "abstains",
     "compare_with_reference",
     "flat_vector",
+    "latency_override",
     "main",
     "plan_only",
     "rule_override",
@@ -159,6 +161,29 @@ def rule_override(
     finally:
         for module, name, value in saved:
             vars(module)[name] = value
+
+
+@contextmanager
+def latency_override(latency_ns: int) -> Iterator[None]:
+    """Wrap ``Pass._on_print`` for one replay; always restored.
+
+    A print on a live episode at ``ts <= t0 + latency_ns`` updates ``instance`` only.
+    It does not move ``r`` or ``g``. Zero matches the simulator.
+    """
+    original = fill_pass.Pass._on_print
+
+    def _on_print(self: fill_pass.Pass, pr: fill_pass.Print, ts: int) -> None:
+        episode = self.live.get(pr.rung_id)
+        if episode is not None and ts <= episode.t0_ns + latency_ns:
+            self.instance = pr.instance_id or self.instance
+            return
+        original(self, pr, ts)
+
+    fill_pass.Pass._on_print = _on_print
+    try:
+        yield
+    finally:
+        fill_pass.Pass._on_print = original
 
 
 def flat_vector(at_ns: int) -> ForecastVector:
@@ -277,9 +302,10 @@ def _replay_arm(
         selector = _selector_for(prep, job.key, "none", arm.delta_ns, tracker)
         vectors = prep.vectors["none"]
     clock = clock_events(_cut_specs(primary_schedule(day), station, day), vectors)
+    delayed = latency_override(arm.latency_ns) if arm.latency_ns > 0 else nullcontext()
     with rule_override(
         arm.b_cap, arm.max_rungs, p_min=arm.p_min, e_min=arm.e_min, b_floor=arm.b_floor
-    ):
+    ), delayed:
         replay = replay_station_day(
             data, clock, selector=selector, tracker=tracker, station=station, day=day,
             unit_hypothesis=unit, live_from_ns=live_from_ns, delta_ns=arm.delta_ns,

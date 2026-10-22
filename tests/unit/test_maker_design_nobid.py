@@ -15,8 +15,10 @@ from scripts.analysis import maker_design_config as cfgm
 from scripts.analysis import maker_design_nobid as nb
 from scripts.analysis import maker_stage0_adapter as adapter
 from scripts.analysis import maker_stage0_events_build as events_build
+from scripts.analysis import maker_stage0_fill_pass as fill_pass
 from scripts.analysis import maker_stage0_rule as rule
 from scripts.analysis.maker_stage0_catalog_read import StationDayPlan
+from scripts.analysis.maker_stage0_fill_events import BUYER, ForecastVector, Print
 
 DAY = dt.date(2026, 10, 2)
 
@@ -169,6 +171,8 @@ def test_arm_table_pins_the_card_parameters_and_the_shipped_control() -> None:
         "sharp_dp600",
         "sharp_dm600",
         "sharp_k1",
+        "sharp_l1",
+        "sharp_l5",
     }
 
 
@@ -425,3 +429,104 @@ def test_robustness_arms_are_sharp_with_a_bounded_clock_offset_or_one_rung() -> 
     assert k1.max_rungs == 1
     assert (k1.p_min, k1.e_min, k1.b_floor, k1.b_cap) == (0.97, 0.04, 0.75, 0.89)
     assert all(abs(a.delta_ns) <= 600 * 10**9 for a in cfgm.ARMS.values())  # S-7 bound
+
+
+# --- placement latency -----------------------------------------------------------------------
+
+
+_NS = 10**9
+_T0 = _NS
+_QUEUE_AHEAD = 9
+_RUNG = "gte80f"
+
+
+def _no_decide(_ctx: object) -> None:
+    raise AssertionError("synthetic pass does not decide")
+
+
+def _latency_pass() -> fill_pass.Pass:
+    """One live episode, r=5. The print's NO price equals the bid, so the whole size leaves r."""
+    sim = fill_pass.Pass(_no_decide, False, 0, 0, 2)  # type: ignore[arg-type]
+    sim.live[_RUNG] = fill_pass.Live(
+        rung_id=_RUNG,
+        t0_ns=_T0,
+        bid_cents=20,
+        a_gt=0,
+        a_eq=4,
+        r=5,
+        g=_QUEUE_AHEAD,
+        depth_ts_used_ns=_T0,
+        placed_vector=ForecastVector(0, {}, {}, 0, "", "none"),
+    )
+    return sim
+
+
+def _buyer(sim: fill_pass.Pass, ts: int, size: int, instance: str = "") -> None:
+    sim._on_print(Print(_RUNG, 80, size, BUYER, instance), ts)
+
+
+def test_a_print_inside_latency_leaves_the_queue_and_a_later_print_fills() -> None:
+    sim = _latency_pass()
+    episode = sim.live[_RUNG]
+    with nb.latency_override(_NS):
+        _buyer(sim, _T0 + _NS, 10, "inst-during-L")  # ts == t0 + L is still inside
+        assert (episode.r, episode.g) == (5, _QUEUE_AHEAD)
+        assert sim.instance == "inst-during-L"
+        assert sim.rests == []
+        _buyer(sim, _T0 + _NS + 1, 3)
+        assert episode.r == 2
+        assert _RUNG in sim.live
+        assert sim.rests == []
+        _buyer(sim, _T0 + _NS + 2, 2)
+    assert _RUNG not in sim.live
+    assert [(rest.end_reason, rest.filled_ns) for rest in sim.rests] == [("FILLED", _T0 + _NS + 2)]
+
+
+def test_zero_latency_matches_the_unwrapped_simulator() -> None:
+    def consume(sim: fill_pass.Pass) -> None:
+        episode = sim.live[_RUNG]
+        _buyer(sim, _T0, 10, "at-t0")  # the simulator already ignores ts <= t0
+        assert (episode.r, episode.g) == (5, _QUEUE_AHEAD)
+        assert sim.instance == "at-t0"
+        assert sim.rests == []
+        _buyer(sim, _T0 + 1, 10)
+
+    bare, wrapped = _latency_pass(), _latency_pass()
+    consume(bare)
+    with nb.latency_override(0):
+        consume(wrapped)
+    filled = [("FILLED", _T0 + 1)]
+    assert [(rest.end_reason, rest.filled_ns) for rest in bare.rests] == filled
+    assert [(rest.end_reason, rest.filled_ns) for rest in wrapped.rests] == filled
+    assert bare.live == {} and wrapped.live == {}
+
+
+def test_latency_override_restores_on_print_after_an_exception() -> None:
+    original = fill_pass.Pass._on_print
+    with pytest.raises(RuntimeError, match="boom"), nb.latency_override(_NS):
+        assert fill_pass.Pass._on_print is not original
+        raise RuntimeError("boom")
+    assert fill_pass.Pass._on_print is original
+    sim = _latency_pass()
+    _buyer(sim, _T0 + 1, 10)
+    assert [(rest.end_reason, rest.filled_ns) for rest in sim.rests] == [("FILLED", _T0 + 1)]
+
+
+def test_latency_arms_match_sharp_except_latency_and_stay_under_the_no_ceiling() -> None:
+    from dataclasses import replace
+
+    base = cfgm.ARMS["sharp"]
+    assert base.latency_ns == 0
+    one, five = cfgm.ARMS["sharp_l1"], cfgm.ARMS["sharp_l5"]
+    assert (one.latency_ns, five.latency_ns) == (_NS, 5 * _NS)
+    assert replace(one, name="sharp", latency_ns=0) == base
+    assert replace(five, name="sharp", latency_ns=0) == base
+    assert all(
+        arm.latency_ns == 0
+        for name, arm in cfgm.ARMS.items()
+        if name not in {"sharp_l1", "sharp_l5"}
+    )
+    assert cfgm.NO_BID_CEILING == 0.90
+    assert all(arm.b_cap < cfgm.NO_BID_CEILING for arm in cfgm.ARMS.values())
+    cfg = cfgm.parse_config(_raw(arms=["sharp", "sharp_l1", "sharp_l5"]))
+    assert cfg.arms == ("sharp", "sharp_l1", "sharp_l5")
