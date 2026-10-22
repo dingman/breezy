@@ -528,21 +528,24 @@ async def test_query_account_republishes_the_account_state(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# `_query_order` -- NOT absent from the base, a report-injection seam CLOSED
-# by this client's own `generate_order_status_report` always returning `None`
+# `_query_order` -- the base method IS a report-injection seam (it hands whatever
+# `generate_order_status_report` returns to `_send_order_status_report`); the B6
+# override of `_query_order` is what keeps it closed
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_native_query_order_never_reaches_the_send_seam(tmp_path: Path) -> None:
-    """`_query_order` (`live/execution_client.py:516-532`) is genuinely
-    inherited, not absent: it calls `generate_order_status_report` and, if the
-    result is non-`None`, `_send_order_status_report` -- a report-injection
-    seam that bypasses `_submit_order`'s refusal latch entirely. This client's
-    override always returns `None` (see its own docstring), so the seam is
-    closed BEHAVIOURALLY -- but that closure was never pinned. If a future
-    change to `generate_order_status_report` ever returned a real report, this
-    is the test that would catch the seam opening.
+    """The BASE `_query_order` (`live/execution_client.py:516-532`) calls
+    `generate_order_status_report` and, if the result is non-`None`,
+    `_send_order_status_report` -- a report-injection seam that bypasses
+    `_submit_order`'s refusal latch entirely. This client's
+    `generate_order_status_report` DOES return real reports (the by-id read), so
+    the base path would reach the seam. What keeps it closed is the B6 OVERRIDE
+    of `_query_order` (the resting-order poll): it never calls the base and
+    never calls `generate_order_status_report`. Pinned here with a generator
+    that returns a real report, so a change that routed the override back
+    through the base would fail this test.
     """
     rig = _build_rig(tmp_path)
     await rig.client._connect()
@@ -550,6 +553,24 @@ async def test_native_query_order_never_reaches_the_send_seam(tmp_path: Path) ->
     def _fail_if_reached(report: Any) -> None:
         pytest.fail(f"_send_order_status_report was reached with {report!r}")
 
+    async def _real_report(command: Any) -> OrderStatusReport:
+        return OrderStatusReport(
+            account_id=rig.client._issued_account_id,
+            instrument_id=rig.instrument.id,
+            venue_order_id=VenueOrderId("V-1"),
+            order_side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.IOC,
+            order_status=OrderStatus.FILLED,
+            quantity=Quantity(1, rig.instrument.size_precision),
+            filled_qty=Quantity(1, rig.instrument.size_precision),
+            report_id=UUID4(),
+            ts_accepted=TS_INIT,
+            ts_last=TS_INIT,
+            ts_init=TS_INIT,
+        )
+
+    rig.client.generate_order_status_report = _real_report  # type: ignore[method-assign]
     rig.client._send_order_status_report = _fail_if_reached
 
     await rig.client._query_order(
