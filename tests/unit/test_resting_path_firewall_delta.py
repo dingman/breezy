@@ -963,6 +963,23 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         "_rederived_commission_state",
         # B6 review S3 (NAMED row, widen only): the crash-replay probe of the fill booking.
         "_poll_record_exists",
+        # B6 review S4 (NAMED rows, widen only): the rest of the poll path's call graph, so the
+        # set is closed under it (see the closure test below).
+        "_settle_resting_terminal",
+        "_retire_resting_row",
+        "_latch_resting_order",
+        "_latch_resting_cancel_unconfirmed",
+        "_note_resting_poll",
+        "_clear_resting_cancel_latch",
+        "_resting_target_of",
+        "_resting_ledger",
+        "_enumerate_resting_ledger",
+        "_bound_target_of",
+        "_boot_context_of",
+        "_emit_resting_terminal_event",
+        "_restore_resting_budget",
+        "_mark_budget_restored",
+        "_budget_was_restored",
     }
 )
 _HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
@@ -990,6 +1007,69 @@ def _helper_violations(source: str, name: str) -> list[str]:
     found = [f"token {t}" for t in _HELPER_FORBIDDEN_TOKENS if t in text]
     found += [f"await in {name}" for n in ast.walk(fn) if isinstance(n, ast.Await)]
     return found
+
+
+#: B6 review S4: the sync entry points of the poll/booking path whose call graph must be closed.
+POLL_ROOTS: Final[tuple[str, ...]] = ("_apply_resting_poll", "_book_filled_read")
+#: The generic, audited primitives the helpers may reach without being poll helpers
+#: themselves: the inert durable-store reads/writes, the refusal list, the resolver-error
+#: counter and the one fill-record writer. None of them can reach the sender (the class-wide
+#: sender-reference scope pins that).
+POLL_CLOSURE_EXEMPT: Final[frozenset[str]] = frozenset(
+    {
+        "record_fill",
+        "_note_resolver_error",
+        "_read_fill_index",
+        "_refuse",
+        "_require_store",
+        "_store_get",
+        "_store_set",
+    }
+)
+
+
+def _self_callees(fn: ast.AST) -> set[str]:
+    return {
+        node.func.attr
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
+
+
+def _poll_call_graph(source: str) -> set[str]:
+    """Every ``self.<method>`` reachable from the poll roots through methods the class defines."""
+    defined: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            defined.setdefault(node.name, []).append(node)
+    seen: set[str] = set()
+    stack = list(POLL_ROOTS)
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in defined:
+            continue
+        seen.add(name)
+        for fn in defined[name]:
+            stack.extend(_self_callees(fn))
+    return seen
+
+
+def test_the_poll_helper_set_is_closed_under_the_call_graph() -> None:
+    """A helper the poll reaches but this module does not pin would escape the egress scan."""
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    reached = _poll_call_graph(source)
+    assert reached - POLL_HELPERS - POLL_CLOSURE_EXEMPT == set()
+
+
+def test_dropping_a_reached_helper_from_the_set_is_seen_by_the_closure_check() -> None:
+    """Non-vacuity: the closure check is not trivially empty."""
+    reached = _poll_call_graph(CLIENT_PATH.read_text(encoding="utf-8"))
+    assert {"_settle_resting_terminal", "_retire_resting_row", "_latch_resting_order"} <= reached
+    for name in ("_settle_resting_terminal", "_retire_resting_row", "_latch_resting_order"):
+        assert reached - (POLL_HELPERS - {name}) - POLL_CLOSURE_EXEMPT == {name}
 
 
 @pytest.mark.parametrize("name", sorted(POLL_HELPERS))
