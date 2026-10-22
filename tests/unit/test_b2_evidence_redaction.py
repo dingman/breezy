@@ -115,6 +115,7 @@ def test_a_document_the_real_script_produced_passes_the_scan(
     deps = ctl.Deps(
         today_utc=lambda: "2026-10-22",
         list_units=lambda: "breezy-trade-supervisor.service loaded active running x\n",
+        probe_node=lambda: None,
         load_env=dict,
         build_session=lambda _env: rig.session,
         sleep=rig.venue.sleep,

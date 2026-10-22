@@ -52,6 +52,9 @@ def _deps(
         log.append("list_units")
         return units
 
+    def probe_node() -> None:
+        log.append("probe_node")
+
     def load_env() -> dict[str, str]:
         log.append("load_env")
         return {"POLYMARKET_US_USER_AGENT": "ua"}
@@ -63,6 +66,7 @@ def _deps(
     return ctl.Deps(
         today_utc=lambda: today,
         list_units=list_units,
+        probe_node=probe_node,
         load_env=load_env,
         build_session=build_session,
         sleep=rig.venue.sleep,
@@ -146,7 +150,8 @@ def test_a_run_with_a_tiny_get_budget_stops_calling_and_exits_nonzero(ctl: Any) 
     rig = fk.Rig(ctl, budget=ctl.Budget(max_gets=6))
     result = rig.run()
     assert result.exit_code != 0
-    assert sum(1 for m, _ in rig.venue.requests if m == "GET") <= 6
+    assert rig.budget.gets <= 6
+    assert sum(1 for m, _ in rig.venue.requests if m == "GET") <= 6 + rig.budget.aux_gets
     assert rig.venue.alive_own() == []  # best-effort cleanup still cancelled by id
 
 
@@ -198,7 +203,12 @@ def test_the_full_sequence_passes_s1_s2_s6_and_leaves_the_account_clean(ctl: Any
     assert doc["verdicts"] == {"S-1": "PASS", "S-2": "PASS", "S-6": "PASS"}
     assert doc["final_account_clean"] is True
     assert rig.venue.alive_all() == []
-    assert doc["counts"] == {"creates": 3, "cancels": 2, "gets": rig.budget.gets}
+    assert doc["counts"] == {
+        "creates": 3,
+        "cancels": 2,
+        "gets": rig.budget.gets,
+        "aux_gets": rig.budget.aux_gets,
+    }
     assert rig.budget.gets <= ctl.MAX_GETS
     assert set(doc["order_ids"]) == {"A", "A_prime", "B"}
     assert len(set(doc["order_ids"].values())) == 3
@@ -296,7 +306,7 @@ def test_select_probe_slugs_excludes_low_closed_and_non_daily_markets(ctl: Any) 
     payload = fk.markets_page(
         fk.SLUG_LOW, fk.SLUG_CLOSED, fk.SLUG_X, fk.SLUG_Z, closed=frozenset({fk.SLUG_CLOSED})
     )
-    chosen = ctl.select_probe_slugs(payload, city_codes=("nyc", "mia", "lax"))
+    chosen = ctl.select_probe_slugs(payload, city_codes=("nyc", "mia", "lax"), now_ns=fk.START_NS)
     assert chosen is not None
     assert set(chosen.slugs) == {fk.SLUG_X, fk.SLUG_Z}
     assert chosen.share_event is False
@@ -304,9 +314,10 @@ def test_select_probe_slugs_excludes_low_closed_and_non_daily_markets(ctl: Any) 
 
 def test_select_probe_slugs_returns_none_with_fewer_than_two_eligible(ctl: Any) -> None:
     payload = fk.markets_page(fk.SLUG_X, fk.SLUG_LOW)
-    assert ctl.select_probe_slugs(payload, city_codes=("nyc",)) is None
-    assert ctl.select_probe_slugs({"markets": "nope"}, city_codes=("nyc",)) is None
-    assert ctl.select_probe_slugs({}, city_codes=("nyc",)) is None
+    now = fk.START_NS
+    assert ctl.select_probe_slugs(payload, city_codes=("nyc",), now_ns=now) is None
+    assert ctl.select_probe_slugs({"markets": "nope"}, city_codes=("nyc",), now_ns=now) is None
+    assert ctl.select_probe_slugs({}, city_codes=("nyc",), now_ns=now) is None
 
 
 def test_no_eligible_slugs_means_no_write_and_a_nonzero_exit(ctl: Any) -> None:
@@ -607,7 +618,15 @@ def test_a_non_empty_open_orders_list_refuses_before_any_write(ctl: Any, tmp_pat
 
 @pytest.mark.parametrize(
     ("status", "body"),
-    [(500, b"{}"), (200, b"not json"), (200, b'{"orders": "x"}'), (200, b"{}"), (401, b"{}")],
+    [
+        (500, b"{}"),
+        (200, b"not json"),
+        (200, b'{"orders": "x"}'),
+        (200, b"{}"),
+        (401, b"{}"),
+        (200, b'{"orders": []}'),  # R5: a listing without eof is not a complete listing
+        (200, b'{"orders": [], "eof": false}'),
+    ],
 )
 def test_an_unreadable_or_failed_preflight_refuses(
     ctl: Any, tmp_path: Path, status: int, body: bytes
@@ -723,6 +742,9 @@ _EVIDENCE_TOP_KEYS = {
     "slugs_share_event",
     "order_ids",
     "steps",
+    "quote_guard",
+    "licenses",
+    "fill_detected",
     "verdicts",
     "details",
     "activities",

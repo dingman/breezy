@@ -42,7 +42,10 @@ _LEGACY_PROBE_SHA256 = "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c
 #: single guarded site (``ControlSession.cancel_slugs``: non-empty, de-duplicated, daily-HIGH
 #: slugs only) and never the legacy helper. sha-pinned: any edit re-reviews this row.
 _B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
-_B2_CONTROL_SHA256 = "ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66"
+#: Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
+#: handlers, activities paging). Prior digest:
+#: ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
+_B2_CONTROL_SHA256 = "1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50"
 
 
 class _Resp:

@@ -39,6 +39,7 @@ SIGNATURE_SENTINEL: Final[str] = ("SIGNATURESENTINEL" + "AbCdEfGhIjKlMnOpQrStUvW
 ] + "=="
 NS: Final[int] = 1_000_000_000
 START_NS: Final[int] = 1_792_000_000 * NS  # a fixed instant in 2026-10
+START_NS_RUN_DAY: Final[int] = 1792627200 * NS  # 2026-10-22T00:00:00Z, the run date of the tests
 
 SLUG_X: Final[str] = "tc-temp-nychigh-2026-10-22-lt56f"
 SLUG_Y: Final[str] = "tc-temp-nychigh-2026-10-22-gte56lt57f"
@@ -77,6 +78,7 @@ def market_payload(slug: str, *, closed: bool = False) -> dict[str, Any]:
         side["identifier"] = slug
     market.update(
         {
+            "endDate": f"{_next_day(date.group(0))}T05:00:00Z",
             "closed": closed,
             "archived": False,
             "active": not closed,
@@ -87,6 +89,13 @@ def market_payload(slug: str, *, closed: bool = False) -> dict[str, Any]:
         }
     )
     return market
+
+
+def _next_day(day: str) -> str:
+    from datetime import date as _date
+    from datetime import timedelta
+
+    return (_date.fromisoformat(day) + timedelta(days=1)).isoformat()
 
 
 def markets_page(*slugs: str, closed: frozenset[str] = frozenset()) -> dict[str, Any]:
@@ -125,6 +134,23 @@ class FakeVenue:
         self.open_orders_status = 200
         self.open_orders_body_override: bytes | None = None
         self.creates = 0
+        # quote (public bbo) behaviour: per-slug payload overrides, scripted sequences, status
+        self.quote_overrides: dict[str, Any] = {}
+        self.quote_script: dict[str, list[Any]] = {}
+        self.quote_status = 200
+        self.quote_reads: list[str] = []
+        # create behaviour: the venue books the order, then the client sees a failure
+        self.create_then_500_nth: int | None = None
+        self.create_then_raise_nth: int | None = None
+        self.fail_cancel_one = False
+        # order-echo behaviour
+        self.echo_tif: str | None = None
+        self.echo_gtd_skew_s = 0
+        self.expire_early_s = 0
+        self.fill_on_get: dict[int, tuple[int, str]] = {}  # create ordinal -> (nth GET, state)
+        # activities paging
+        self.activities_pages: list[Any] | None = None
+        self.activity_urls: list[str] = []
 
     # ------------------------------------------------------------------ helpers
     def clock(self) -> int:
@@ -162,7 +188,7 @@ class FakeVenue:
         for row in self.orders.values():
             gtd = row.get("goodTillTime")
             if row["state"] == "ORDER_STATE_NEW" and gtd and row.get("_own"):
-                expiry = _parse_utc(gtd) + self.expiry_lag_s * NS
+                expiry = _parse_utc(gtd) + (self.expiry_lag_s - self.expire_early_s) * NS
                 if self.now_ns >= expiry:
                     row["state"] = "ORDER_STATE_EXPIRED"
 
@@ -200,12 +226,49 @@ class FakeVenue:
             if row is None:
                 return _json(404, {"code": 5, "message": "not found"})
             self._expire()
-            return _json(200, {"order": self._public(row)})
+            return _json(200, {"order": self._echoed(row)})
+        quote = re.fullmatch(r"/v1/markets/([^/]+)/bbo", path)
+        if quote:
+            return self._quote(quote.group(1))
         if path == "/v1/portfolio/activities":
+            self.activity_urls.append(url)
+            if self.activities_pages is not None:
+                index = min(len(self.activity_urls) - 1, len(self.activities_pages) - 1)
+                return _json(self.activities_status, self.activities_pages[index])
             return _json(self.activities_status, self.activities_page)
         if path == "/v1/markets":
             return _json(200, self.markets)
         return _json(404, {})
+
+    def _echoed(self, row: dict[str, Any]) -> dict[str, Any]:
+        """The order as the GET shows it, with the configured echo skew and fill flips."""
+        row["_gets"] = row.get("_gets", 0) + 1
+        flip = self.fill_on_get.get(row.get("_create_n", -1))
+        if flip is not None and row["_gets"] >= flip[0]:
+            row["state"] = flip[1]
+        shown = self._public(row)
+        if self.echo_tif is not None:
+            shown["tif"] = self.echo_tif
+        if self.echo_gtd_skew_s and shown.get("goodTillTime"):
+            shown["goodTillTime"] = _format_utc(
+                _parse_utc(shown["goodTillTime"]) + self.echo_gtd_skew_s * NS
+            )
+        return shown
+
+    def _quote(self, slug: str) -> VenueResponse:
+        self.quote_reads.append(slug)
+        if self.quote_status != 200:
+            return _json(self.quote_status, {})
+        scripted = self.quote_script.get(slug)
+        if scripted:
+            payload = scripted.pop(0) if len(scripted) > 1 else scripted[0]
+        elif slug in self.quote_overrides:
+            payload = self.quote_overrides[slug]
+        else:
+            payload = quote_payload(slug)
+        if isinstance(payload, bytes):
+            return _resp(200, payload)
+        return _json(200, payload)
 
     # --------------------------------------------------------------------- POST
     def handle_post(self, url: str, body: bytes) -> VenueResponse:
@@ -230,9 +293,14 @@ class FakeVenue:
         row = self._order_row(order_id, payload["marketSlug"], own=True)
         row["goodTillTime"] = payload["goodTillTime"]
         row["tif"] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+        row["_create_n"] = self.creates
         self.orders[order_id] = row
         if self.foreign_after_creates is not None and self.creates == self.foreign_after_creates:
             self.add_foreign_order()
+        if self.create_then_500_nth == self.creates:
+            return _json(500, {"code": 13, "message": "internal"})
+        if self.create_then_raise_nth == self.creates:
+            raise ConnectionError("connection reset")
         return _json(200, {"id": order_id})
 
     def _cancel_one(self, order_id: str, payload: Mapping[str, Any]) -> VenueResponse:
@@ -243,6 +311,8 @@ class FakeVenue:
             or payload["marketSlug"] != row["marketSlug"]
         ):
             return _json(400, {"code": 3, "message": "bad cancel"})
+        if self.fail_cancel_one:
+            return _json(500, {"code": 13})
         if row["state"] == "ORDER_STATE_NEW":
             row["state"] = "ORDER_STATE_CANCELED"
         return _json(200, {})
@@ -272,6 +342,39 @@ def _parse_utc(text: str) -> int:
     from datetime import UTC, datetime
 
     return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()) * NS
+
+
+def _format_utc(ns: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ns // NS, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def quote_payload(
+    slug: str,
+    *,
+    bid: str = "0.4000",
+    last: str = "0.4000",
+    current: str = "0.4000",
+    settlement: str = "0.4000",
+    state: str = "MARKET_STATE_OPEN",
+) -> dict[str, Any]:
+    """A public ``bbo`` body (the recorded ``marketData`` envelope shape), values overridable."""
+
+    def px(value: str) -> dict[str, str]:
+        return {"value": value, "currency": "USD"}
+
+    return {
+        "marketData": {
+            "marketSlug": slug,
+            "currentPx": px(current),
+            "lastTradePx": px(last),
+            "settlementPx": px(settlement),
+            "bestBid": px(bid),
+            "bestAsk": px("0.4200"),
+            "state": state,
+        }
+    }
 
 
 def _resp(status: int, body: bytes) -> VenueResponse:

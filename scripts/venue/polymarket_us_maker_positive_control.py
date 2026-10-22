@@ -11,7 +11,21 @@ slug X and leaves the order on slug Y alive, and (S-6) a short ``goodTillTime`` 
 GET, and the shape (key names and enum values only) of the activities feed for the D1 work.
 
 **It does NOT flip any ``*_VERIFIED`` constant.** A separate reviewed commit does that from the
-evidence file this run writes under ``docs/evidence/b2/``.
+evidence file this run writes under ``docs/evidence/b2/``. The evidence says plainly what each
+verdict licenses (``licenses``): the GTD expiry flip needs S-6 PASS (B's pre-expiry GET echoes
+GTD and a ``goodTillTime`` within 1 s of what was sent, and the first EXPIRED observation is not
+before that time minus 1 s); the slug-scoped cancel-all flip needs S-2 PASS, which needs the two
+slugs to be siblings of one event (otherwise ``PASS_NONSIBLING``, which licenses nothing);
+the maker commission sign is never licensed by this run.
+
+**Run it under a user scope** so a hangup or a stop cannot orphan resting orders::
+
+    systemd-run --user --scope --unit=breezy-b2-control \\
+        .venv/bin/python scripts/venue/polymarket_us_maker_positive_control.py --run-date YYYY-MM-DD
+
+SIGTERM and SIGHUP are turned into ``KeyboardInterrupt`` so cleanup by id and the evidence file
+still happen. Any order that may still rest is named on stderr ("order <id> may rest; cancel by
+hand") and the exit code is non-zero; a detected fill is reported, never flattened.
 
 **One-shot.** ``--run-date YYYY-MM-DD`` must equal today (UTC); there is no timer. Every
 precondition below refuses (exit 2) before any write:
@@ -19,9 +33,18 @@ precondition below refuses (exit 2) before any write:
 1. the run date equals today (UTC);
 2. credentials come ONLY from ``~/.config/breezy`` (the env file, mode 0600, and the secret key
    file it names must both live there; the process environment is never consulted for them);
-3. no ``breezy-trade-*`` unit other than the supervisor is active (R13);
+3. no trade node exists (R13): no ``breezy-trade-*`` or ``breezy-node-*`` unit or scope but the
+   supervisor is live, no ``breezy-trade`` process in ``/proc`` (the node is a ``Popen`` child of
+   the supervisor, invisible to a unit listing), and nobody holds the node's intent flock; any
+   probe error refuses;
 4. an unfiltered open-orders GET is 200 and shows zero orders;
 5. the budget constants are enforced in code (:class:`Budget`).
+
+**Guards before every rest** (read-only, public): the market is plainly open and closes at least
+the GTD ceiling plus 15 minutes away; its quote is readable, not halted, and its YES bid, last,
+current and settlement prices are all under 0.97. Slugs are chosen siblings first, next-day
+first, middle rungs first; a slug failing a guard is excluded, and with fewer than two left the
+run refuses before any write.
 
 **Bodies** are built ONLY by ``submit_chain.build_resting_order_body`` (BUY NO, qty 1, price
 0.01, GTD at most ten minutes ahead, re-checked at send time). Every write goes through the
@@ -41,6 +64,8 @@ by id first) or the account was not clean at the end; 2 a precondition refused.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import re
 import resource
 import sys
 import time
@@ -63,6 +88,7 @@ for _entry in (REPO_ROOT / "src", _SCRIPT_DIRECTORY):  # pragma: no cover - boot
         sys.path.insert(0, str(_entry))
 
 from _maker_control_core import (  # type: ignore[import-not-found]
+    ACTIVITIES_MAX_PAGES,
     CONFIG_DIR,
     CONFIRM_INTERVAL_S,
     CONFIRM_POLLS,
@@ -72,9 +98,13 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     EXPIRY_POLLS,
     FILL_STATES,
     GTD_CEILING_SECS,
+    GTD_ECHO_TOLERANCE_NS,
     NS_PER_S,
     PROBE_PRICE,
     PROBE_QUANTITY,
+    QUOTE_OK,
+    QUOTE_SCAN_CAP,
+    QUOTE_UNREADABLE,
     REST_GTD_SECS,
     SHORT_GTD_SECS,
     STATE_CANCELED,
@@ -84,6 +114,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     VERDICT_FAIL,
     VERDICT_NOT_RUN,
     VERDICT_PASS,
+    VERDICT_PASS_NONSIBLING,
     VERDICT_SKIPPED,
     Budget,
     BudgetExhausted,
@@ -101,17 +132,26 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     StepFailed,
     assert_gtd_within_ceiling,
     assert_no_trade_node,
-    capture_activity_shape,
+    capture_activity_pages,
+    eligible_probe_slugs,
     enum_token,
     gtd_echoed,
+    has_position_resolution_row,
+    install_termination_handlers,
+    is_own_probe_shape,
     key_paths,
     list_units_via_systemctl,
     load_env_file,
+    market_exclusion,
     markets_by_slug,
     open_order_ids,
     parse_args,
     parse_json,
     parse_utc_ns,
+    pick_pair,
+    probe_production_node,
+    quote_verdict,
+    rank_probe_slugs,
     require_run_date,
     write_evidence,
 )
@@ -143,6 +183,7 @@ from breezy.adapters.polymarket_us.provider import discovery_candidate_slugs
 from breezy.adapters.polymarket_us.redaction import redact_url
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
 from breezy.adapters.polymarket_us.transport import (
+    QUOTA_KEY_BOOK,
     QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_PORTFOLIO,
     NautilusHttpTransport,
@@ -160,21 +201,61 @@ from breezy.adapters.polymarket_us.write_transport import (
 
 _WRITE_METHOD: Final[str] = next(iter(PERMITTED_WRITE_METHODS))
 ACTIVITIES_PAGE_LIMIT: Final[int] = 100
+_QUOTE_PATH: Final[str] = "/v1/markets/{slug}/bbo"
+_CURSOR_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.=+/-]{1,512}", re.ASCII)
+_FILL_NOTICE: Final[str] = (
+    "order {order_id} FILLED or PARTIALLY_FILLED; a position may exist; flatten by hand"
+)
+_LEFTOVER_NOTICE: Final[str] = "order {order_id} may rest; cancel by hand"
+
+
+def _candidates(payload: Mapping[str, Any], city_codes: tuple[str, ...]) -> list[str] | None:
+    try:
+        return list(discovery_candidate_slugs(payload, city_codes=city_codes))
+    except (PolymarketUSError, TypeError, ValueError):
+        return None
+
+
+def _is_resolved(market: Mapping[str, Any]) -> bool:
+    return _provider._resolved_reason(market) is not None
+
+
+def _rank_with_counts(
+    payload: Mapping[str, Any], *, city_codes: tuple[str, ...], now_ns: int
+) -> tuple[list[str], dict[str, int]]:
+    candidates = _candidates(payload, city_codes)
+    if candidates is None:
+        return [], {}
+    eligible, excluded = eligible_probe_slugs(
+        payload,
+        candidates=candidates,
+        is_daily_high=submit_chain.is_daily_high_slug,
+        is_resolved=_is_resolved,
+        now_ns=now_ns,
+    )
+    return rank_probe_slugs(eligible, now_ns=now_ns), excluded
+
+
+def ranked_probe_slugs(
+    payload: Mapping[str, Any], *, city_codes: tuple[str, ...], now_ns: int
+) -> list[str]:
+    """Eligible daily-HIGH slugs in preference order (siblings, next day, middle rungs first)."""
+    return _rank_with_counts(payload, city_codes=city_codes, now_ns=now_ns)[0]
 
 
 def select_probe_slugs(
-    payload: Mapping[str, Any], *, city_codes: tuple[str, ...]
+    payload: Mapping[str, Any], *, city_codes: tuple[str, ...], now_ns: int
 ) -> ProbeSlugs | None:
-    """Two distinct, open daily-HIGH slugs (see :func:`_maker_control_core.select_probe_slugs`)."""
-    try:
-        candidates = discovery_candidate_slugs(payload, city_codes=city_codes)
-    except (PolymarketUSError, TypeError, ValueError):
+    """Two distinct, eligible slugs before any quote read (the core's ``select_probe_slugs``)."""
+    candidates = _candidates(payload, city_codes)
+    if candidates is None:
         return None
     return select_slugs(
         payload,
         candidates=candidates,
         is_daily_high=submit_chain.is_daily_high_slug,
-        is_resolved=lambda market: _provider._resolved_reason(market) is not None,
+        is_resolved=_is_resolved,
+        now_ns=now_ns,
     )
 
 
@@ -211,6 +292,9 @@ class ControlSession:
         self._discovery = discovery
         self._now_ns = now_ns
         self.budget = budget
+        #: True from the moment a create is sent until the answer proves the venue booked nothing
+        #: or told us the id: a 5xx, an exception or an id-less 200 leaves it set (R2).
+        self.create_in_doubt = False
         self.trace: list[dict[str, Any]] = []
         self._markets: dict[str, Mapping[str, Any]] = {}
         self._factory = OrderFactory(
@@ -245,8 +329,12 @@ class ControlSession:
         public: bool = False,
         query: Mapping[str, object] | None = None,
         quota_key: str = QUOTA_KEY_PORTFOLIO,
+        aux: bool = False,
     ) -> Reading:
-        self.budget.spend_get()
+        if aux:
+            self.budget.spend_aux_get()
+        else:
+            self.budget.spend_get()
         self._tap.last_status = None
         payload: Any = None
         try:
@@ -263,15 +351,40 @@ class ControlSession:
     async def get_open_orders(self, op: str = "get_open_orders") -> Reading:
         return await self._get(op, OPEN_ORDERS_PATH)
 
-    async def get_order(self, order_id: str, op: str = "get_order") -> Reading:
-        return await self._get(op, order_by_id_path(order_id))
+    async def get_order(
+        self, order_id: str, op: str = "get_order", *, aux: bool = False
+    ) -> Reading:
+        return await self._get(op, order_by_id_path(order_id), aux=aux)
 
-    async def get_activities(self) -> Reading:
-        return await self._get(
-            "get_activities",
-            PORTFOLIO_ACTIVITIES_PATH,
-            query={"limit": ACTIVITIES_PAGE_LIMIT},
+    async def get_activities(self, cursor: str | None = None, *, aux: bool = False) -> Reading:
+        query: dict[str, object] = {"limit": ACTIVITIES_PAGE_LIMIT}
+        if cursor is not None:
+            query["cursor"] = cursor
+        return await self._get("get_activities", PORTFOLIO_ACTIVITIES_PATH, query=query, aux=aux)
+
+    async def read_quote(self, slug: str) -> str:
+        """Q1: the public best-bid/offer for ``slug`` classified by :func:`quote_verdict`."""
+        if not submit_chain.is_daily_high_slug(slug):
+            raise ValueError("every slug must be a daily HIGH market slug")
+        reading = await self._get(
+            "get_quote",
+            _QUOTE_PATH.format(slug=slug),
+            public=True,
+            quota_key=QUOTA_KEY_BOOK,
+            aux=True,
         )
+        verdict: str = QUOTE_UNREADABLE
+        if reading.status == 200:
+            verdict = quote_verdict(reading.payload, slug=slug)
+        return verdict
+
+    def market_exclusion(self, slug: str) -> str | None:
+        """Q2: why ``slug`` is no longer fit to rest on, judged now; ``None`` if it still is."""
+        market = self._markets.get(slug)
+        reason: str | None = "NOT_LISTED"
+        if market is not None:
+            reason = market_exclusion(market, now_ns=self._now_ns())
+        return reason
 
     async def list_markets(self) -> Reading:
         reading = await self._get(
@@ -310,21 +423,28 @@ class ControlSession:
         body = self._build_resting_body(slug, gtd_secs)
         assert_gtd_within_ceiling(body, now_ns=self._now_ns())
         encoded = submit_chain.encode_order_body(body)
+        self.create_in_doubt = False
         self.budget.spend_create()
         headers = self._signer.sign_headers(_WRITE_METHOD, ORDERS_PATH)
         op = f"rest_{label}"
         url = f"{self._api_base}{ORDERS_PATH}"
+        self.create_in_doubt = True
         try:
             response = await self._write.post_order(self._api_base, headers=headers, body=encoded)
-        except PolymarketUSError:
+        except BaseException:
             self._record(op, url, None, None)
             raise
         payload = parse_json(response.body)
-        self._record(op, url, int(response.status), payload)
+        status = int(response.status)
+        self._record(op, url, status, payload)
         raw_id = payload.get("id") if isinstance(payload, Mapping) else None
         order_id = raw_id if valid_venue_order_id(raw_id) else None
+        if status < 500 and not (status == 200 and order_id is None):
+            self.create_in_doubt = (
+                False  # a definite answer: refused outright, or booked with an id
+            )
         sent_gtd_ns = parse_utc_ns(body["goodTillTime"])
-        return PostResult(int(response.status), payload, order_id, sent_gtd_ns)
+        return PostResult(status, payload, order_id, sent_gtd_ns)
 
     async def retract_order(self, order_id: str, slug: str, op: str = "cancel_order") -> PostResult:
         path = cancel_order_path(order_id)  # ValueError on an invalid id
@@ -409,8 +529,10 @@ async def _await_state(
         if attempt > 1:
             await sleep(interval_s)
         last = _observe(await session.get_order(own.order_id, f"get_{tag}_{attempt}"))
+        last = dataclasses.replace(last, observed_ns=session.now_ns())
         if last.state in FILL_STATES:
             own.terminal = True
+            own.filled = True
             raise StepFailed("ORDER_FILLED")
         if last.state in want:
             if last.state in TERMINAL_STATES:
@@ -425,13 +547,24 @@ async def _await_state(
 async def _rest(
     session: ControlSession, state: RunState, label: str, slug: str, gtd: int
 ) -> OwnOrder:
+    """Guard (close time, then a fresh quote), then rest. Nothing is sent if a guard fails."""
     own = OwnOrder(label=label, slug=slug, gtd_secs=gtd)
     state.orders[label] = own
-    result = await session.rest(label, slug, gtd)
+    reason = session.market_exclusion(slug)
+    if reason is not None:
+        raise StepFailed(reason)
+    verdict = await session.read_quote(slug)
+    state.quote_guard["rechecks"][label] = verdict
+    if verdict != QUOTE_OK:
+        raise StepFailed(f"QUOTE_GUARD_{verdict}")
+    try:
+        result = await session.rest(label, slug, gtd)
+    finally:
+        if session.create_in_doubt:
+            state.unknown_create = True
     if result.status != 200:
         raise StepFailed("CREATE_REFUSED")
     if result.order_id is None:
-        state.unknown_create = True
         raise StepFailed("CREATE_NO_VALID_ID")
     own.order_id = result.order_id
     own.sent_gtd_ns = result.sent_gtd_ns
@@ -459,6 +592,79 @@ async def _confirm_new(
     return obs
 
 
+async def _collect_activities(session: ControlSession) -> dict[str, Any]:
+    """Q5: page the activities feed until a position-resolution row, the end, or a cap.
+
+    Page one is a ``MAX_GETS`` read; every further page is an auxiliary read, so the feed can
+    never starve the order sequence. The cursor lives in memory only; it is never recorded.
+    """
+    pages: list[Any] = []
+    first_status: int | None = None
+    requested = 0
+    cursor: str | None = None
+    reason = "PAGE_CAP"
+    for index in range(ACTIVITIES_MAX_PAGES):
+        try:
+            reading = await session.get_activities(cursor, aux=index > 0)
+        except BudgetExhausted:
+            reason = "BUDGET"
+            break
+        requested += 1
+        first_status = reading.status if index == 0 else first_status
+        payload = reading.payload
+        if reading.status != 200 or not isinstance(payload, Mapping):
+            reason = "UNREADABLE"
+            break
+        pages.append(payload)
+        if has_position_resolution_row(payload):
+            reason = "FOUND_POSITION_RESOLUTION"
+            break
+        if payload.get("eof") is True:
+            reason = "EOF"
+            break
+        next_cursor = payload.get("nextCursor")
+        if not isinstance(next_cursor, str) or _CURSOR_RE.fullmatch(next_cursor) is None:
+            reason = "NO_USABLE_CURSOR"
+            break
+        cursor = next_cursor
+    return {
+        "http_status": first_status,
+        "pages": requested,
+        "stop_reason": reason,
+        **capture_activity_pages(pages),
+    }
+
+
+async def _choose_pair(
+    session: ControlSession, state: RunState, markets_payload: object
+) -> ProbeSlugs | None:
+    """Q1/Q2: rank the eligible slugs, read quotes in that order, stop at the best pair.
+
+    At most ``QUOTE_SCAN_CAP`` reads. A slug whose quote is unreadable, halted or near-resolved
+    is excluded. Fewer than two qualifying slugs returns ``None`` (the caller refuses; nothing
+    has been written).
+    """
+    if not isinstance(markets_payload, Mapping):
+        return None
+    ranked, market_excluded = _rank_with_counts(
+        markets_payload, city_codes=session.discovery.city_codes, now_ns=session.now_ns()
+    )
+    state.quote_guard["market_excluded"] = dict(sorted(market_excluded.items()))
+    qualified: set[str] = set()
+    for slug in ranked[:QUOTE_SCAN_CAP]:
+        verdict = await session.read_quote(slug)
+        state.quote_guard["scanned"] += 1
+        if verdict == QUOTE_OK:
+            qualified.add(slug)
+        else:
+            excluded = state.quote_guard["excluded"]
+            excluded[verdict] = excluded.get(verdict, 0) + 1
+        pair = pick_pair(ranked, qualified)
+        if pair is not None and pair.share_event:
+            return pair
+    return pick_pair(ranked, qualified)
+
+
 # -------------------------------------------------------------------------- sequence
 
 
@@ -467,16 +673,11 @@ async def _sequence(
     state: RunState,
     sleep: Callable[[float], Awaitable[None]],
 ) -> None:
-    # D1: one activities page, key names only. Informational: never gates the run.
-    reading = await session.get_activities()
-    state.activities = {"http_status": reading.status, **capture_activity_shape(reading.payload)}
+    # D1: the activities feed shape, names only. Informational: never gates the run.
+    state.activities = await _collect_activities(session)
 
     markets = await session.list_markets()
-    chosen = (
-        select_probe_slugs(markets.payload, city_codes=session.discovery.city_codes)
-        if isinstance(markets.payload, Mapping)
-        else None
-    )
+    chosen = await _choose_pair(session, state, markets.payload)
     if chosen is None:
         raise StepFailed("NO_ELIGIBLE_SLUGS")
     slug_x, slug_y = chosen.slugs
@@ -510,7 +711,8 @@ async def _sequence(
     order_ap = await _rest(session, state, "A_prime", slug_x, REST_GTD_SECS)
     await _confirm_new(session, order_ap, sleep, tag="A_prime")
     order_b = await _rest(session, state, "B", slug_y, SHORT_GTD_SECS)
-    await _confirm_new(session, order_b, sleep, tag="B")
+    b_new = await _confirm_new(session, order_b, sleep, tag="B")
+    state.details["s6_b_gtd_echoed"] = gtd_echoed(b_new, order_b)
 
     # --- S-2: only if the account holds nothing but our own two orders -------------------
     state.phase = "S-2"
@@ -558,7 +760,8 @@ async def _sequence(
         if a_obs is None or b_obs.state != STATE_NEW:
             state.verdicts["S-2"] = VERDICT_FAIL
             raise StepFailed("S2_SCOPE_MISMATCH")
-        state.verdicts["S-2"] = VERDICT_PASS
+        # Only siblings of one event test that the scope really is the slug.
+        state.verdicts["S-2"] = VERDICT_PASS if state.share_event else VERDICT_PASS_NONSIBLING
 
     # --- S-6: B's short GTD lapses ---------------------------------------------------------
     state.phase = "S-6"
@@ -574,12 +777,22 @@ async def _sequence(
     state.details["s6_final_state"] = None if expired is None else expired.state
     if expired is None:
         raise StepFailed("S6_NOT_EXPIRED")
+    sent_ns, seen_ns = order_b.sent_gtd_ns, expired.observed_ns
+    not_early = (
+        sent_ns is not None and seen_ns is not None and seen_ns >= sent_ns - GTD_ECHO_TOLERANCE_NS
+    )
+    state.details["s6_expiry_not_early"] = not_early
+    if state.details["s6_b_gtd_echoed"] is not True:
+        raise StepFailed("S6_GTD_ECHO_MISMATCH")
+    if not not_early:
+        raise StepFailed("S6_EXPIRED_EARLY")
     state.verdicts["S-6"] = VERDICT_PASS
 
     await _final_clean_check(session, state)
 
 
 async def _final_clean_check(session: ControlSession, state: RunState) -> None:
+    """The account is empty, AND no own order filled (an empty open list does not prove that)."""
     try:
         reading = await session.get_open_orders("final_clean_check")
     except BudgetExhausted:
@@ -587,6 +800,27 @@ async def _final_clean_check(session: ControlSession, state: RunState) -> None:
         return
     ids = open_order_ids(reading.payload) if reading.status == 200 else None
     state.final_account_clean = None if ids is None else len(ids) == 0
+    state.final_open_ids = ids if ids is not None else frozenset()
+    if not await _own_orders_unfilled(session, state) and state.final_account_clean is True:
+        state.final_account_clean = None
+
+
+async def _own_orders_unfilled(session: ControlSession, state: RunState) -> bool:
+    """GET each own order; flag a fill. ``False`` if any order could not be read."""
+    readable = True
+    for own in list(state.orders.values()):
+        if own.order_id is None:
+            continue
+        try:
+            reading = await session.get_order(own.order_id, f"final_get_{own.label}", aux=True)
+        except BudgetExhausted:
+            return False
+        seen = _observe(reading)
+        if seen.state in FILL_STATES:
+            own.filled = True
+        elif seen.state is None:
+            readable = False
+    return readable
 
 
 async def _cleanup(
@@ -644,7 +878,10 @@ async def _cleanup(
 
 
 async def _cleanup_by_listing(session: ControlSession, state: RunState) -> None:
-    """A create answered 200 without a usable id: cancel what rests on our probe slugs."""
+    """A create left in doubt (5xx, exception, id-less 200): cancel own-shape orders on our slugs.
+
+    Only orders that look exactly like a probe (:func:`is_own_probe_shape`) are touched.
+    """
     try:
         listing = await session.get_open_orders("cleanup_listing")
     except BudgetExhausted:
@@ -657,7 +894,9 @@ async def _cleanup_by_listing(session: ControlSession, state: RunState) -> None:
         if not isinstance(order, Mapping):
             continue
         order_id, slug = order.get("id"), order.get("marketSlug")
-        if valid_venue_order_id(order_id) and slug in state.slugs:
+        if valid_venue_order_id(order_id) and is_own_probe_shape(
+            order, slugs=state.slugs, now_ns=session.now_ns()
+        ):
             try:
                 await session.retract_order(str(order_id), str(slug), "cleanup_by_listing")
             except Exception as exc:  # noqa: BLE001
@@ -694,7 +933,9 @@ async def run_control(
             active.verdicts["S-2"] = VERDICT_FAIL
         await _cleanup(session, active, sleep)
         if not isinstance(exc, Exception):
+            active.collect_leftover()
             raise
+    active.collect_leftover()
     document = active.document(session)
     return ControlResult(document, 0 if document["outcome"] == VERDICT_PASS else 1)
 
@@ -713,12 +954,22 @@ async def _require_clean_account(session: ControlSession) -> None:
         raise Refusal("PREFLIGHT_ACCOUNT_NOT_EMPTY")
 
 
+def _announce_orders(state: RunState) -> None:
+    """R4: loud, per order, on stderr -- an order that may rest, or one that filled."""
+    for own in state.filled_orders:
+        if own.order_id:
+            print(_FILL_NOTICE.format(order_id=own.order_id), file=sys.stderr)
+    for order_id in state.cleanup["leftover"]:
+        print(_LEFTOVER_NOTICE.format(order_id=order_id), file=sys.stderr)
+
+
 async def run(run_date: str, deps: Deps) -> int:
     """Preconditions, then the control, then the evidence file. Returns the exit code."""
     try:
         require_run_date(run_date, deps.today_utc())
         env = deps.load_env()
         assert_no_trade_node(deps.list_units())
+        deps.probe_node()
         session = deps.build_session(env)
         await _require_clean_account(session)
     except Refusal as exc:
@@ -732,8 +983,10 @@ async def run(run_date: str, deps: Deps) -> int:
         result = await run_control(session, sleep=deps.sleep, run_date=run_date, state=state)
     except BaseException:
         write_evidence(state.document(session), deps.evidence_dir, stamp=deps.stamp())
+        _announce_orders(state)
         raise
     path = write_evidence(result.document, deps.evidence_dir, stamp=deps.stamp())
+    _announce_orders(state)
     verdicts = " ".join(f"{k}={v}" for k, v in result.document["verdicts"].items())
     print(f"B2_CONTROL outcome={result.document['outcome']} {verdicts} evidence={path}")
     exit_code: int = result.exit_code
@@ -781,6 +1034,7 @@ def _production_deps() -> Deps:
     return Deps(
         today_utc=lambda: datetime.now(UTC).date().isoformat(),
         list_units=list_units_via_systemctl,
+        probe_node=probe_production_node,
         load_env=lambda: load_env_file(CONFIG_DIR / ENV_FILE_NAME),
         build_session=_build_production_session,
         sleep=asyncio.sleep,
@@ -792,8 +1046,12 @@ def _production_deps() -> Deps:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    install_termination_handlers()
     try:
         return asyncio.run(run(args.run_date, _production_deps()))
+    except KeyboardInterrupt:
+        print("B2_CONTROL INTERRUPTED cleanup and evidence were attempted", file=sys.stderr)
+        return 1
     except Exception as exc:  # noqa: BLE001 - the class name is the whole message
         print(f"B2_CONTROL ERROR error={type(exc).__name__}", file=sys.stderr)
         return 1

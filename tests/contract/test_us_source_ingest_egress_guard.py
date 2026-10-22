@@ -167,7 +167,10 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # write-transport methods). One named row, exempt only while its sha256 equals this digest;
     # any edit re-scans it like a new file. Its pure sibling `_maker_control_core.py` imports
     # nothing banned and needs no row.
-    "scripts/venue/polymarket_us_maker_positive_control.py": "ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66",  # noqa: E501
+    # Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
+    # handlers, activities paging). Prior digest:
+    # ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
+    "scripts/venue/polymarket_us_maker_positive_control.py": "1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501
