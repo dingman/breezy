@@ -106,6 +106,7 @@ from breezy.runtime.component_health_watch import (
     install_reconciliation_refusal_alert,
     install_refusal_repoll_timer,
     install_resolver_contradiction_alert,
+    install_resting_alert,
     install_stale_intent_alert,
 )
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -505,6 +506,29 @@ def _exec_client_resolver_contradiction_reader(
     return _read
 
 
+def _exec_client_resting_alert_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``alerts`` reader ARM B7's resting-order alert watch requires.
+
+    Same lookup and lazy resolution as :func:`_exec_client_stale_intent_reader`: the client
+    is looked up at poll time, and a missing client or one without either surface yields
+    ``()`` rather than raising inside a message-bus handler. Joins the cancel and commission
+    surfaces (the no-id fill-while-down entry rides the contradiction surface instead).
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return (
+            *getattr(client, "resting_cancel_alerts", ()),
+            *getattr(client, "resting_commission_alerts", ()),
+        )
+
+    return _read
+
+
 def _exec_client_ambiguous_clears_reader(node: Node) -> Callable[[], int]:
     """Build the ``ambiguous_clears`` reader the degraded alert's F6 episode
     counter requires (AMBIG-LATCH-RESUME).
@@ -690,6 +714,10 @@ def _run_node(
             node.kernel.msgbus,
             contradictions=_exec_client_resolver_contradiction_reader(node),
         )
+        resting_h = install_resting_alert(
+            node.kernel.msgbus,
+            alerts=_exec_client_resting_alert_reader(node),
+        )
         try:
             cancel_repoll = install_refusal_repoll_timer(
                 node.kernel.clock,
@@ -699,6 +727,7 @@ def _run_node(
                     stale_h,
                     contradiction_h,
                     degraded_h,
+                    resting_h,
                     _exec_client_resume_handler(node),
                 ),
             )

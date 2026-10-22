@@ -425,7 +425,9 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
         for topic, handler in node.kernel.msgbus.subscriptions
         if topic == COMPONENT_STATE_TOPIC
     ]
-    assert len(component_state_subscribers) == 4, node.kernel.msgbus.subscriptions
+    # ARM B7 (S4 r4 WP6) widens this count by ONE named row: `install_resting_alert`, the fifth
+    # watch, delivering `resting_cancel_alerts` + `resting_commission_alerts`.
+    assert len(component_state_subscribers) == 5, node.kernel.msgbus.subscriptions
 
 
 def test_the_reconciliation_refusal_reader_reads_the_exec_client_surface() -> None:
@@ -1633,7 +1635,8 @@ def test_degraded_alert_and_resume_handler_are_wired_into_the_repoll_tuple(
 
     assert code == EXIT_OK
     handlers = captured["handlers"]
-    assert len(handlers) == 5
+    # ARM B7 (S4 r4 WP6): ONE named row added, `resting_h`, ahead of `_resume`.
+    assert len(handlers) == 6
     assert handlers[3] is degraded_handler
     assert handlers[-1].__name__ == "_resume"
     kwargs = captured["degraded_kwargs"]

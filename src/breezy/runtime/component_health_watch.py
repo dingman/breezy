@@ -72,6 +72,7 @@ credential and no ``user_agent_contact``.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
@@ -375,6 +376,116 @@ def install_resolver_contradiction_alert(
                     event=RESOLVER_CONTRADICTION_ALERT_EVENT,
                     site=RESOLVER_CONTRADICTION_ALERT_SITE,
                     detail=_resolver_contradiction_detail(alert),
+                ),
+            )
+
+    msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
+    return _on_component_state
+
+
+#: ARM B7 (S4 r4 WP6): the resting-order alert surfaces of the venue execution client
+#: (``resting_cancel_alerts`` and ``resting_commission_alerts``). Same shape as the
+#: contradiction watch above: the client only RECORDS (barrier E0-TRANSPORT), this is where it
+#: is delivered. ``resting_no_id_fill_while_down`` is NOT here: it is carried by the
+#: resolver-contradiction surface (its ``reason`` token) and delivered by that watch.
+RESTING_ALERT_SEVERITY: Final[str] = "CRITICAL"
+RESTING_ALERT_SITE: Final[str] = "global"
+RESTING_ALERT_UNKNOWN_EVENT: Final[str] = "resting_alert_unknown"
+
+#: The closed event set the client records; anything else is sent under the generic name.
+_RESTING_ALERT_EVENTS: Final[frozenset[str]] = frozenset(
+    {
+        "resting_cancel_alert",
+        "commission_bps_drift",
+        "resting_commission_out_of_envelope",
+        "commission_unreadable",
+        "resting_fill_mismatch",
+    }
+)
+
+#: The only entry keys that travel (value-free by construction: the client writes redacted
+#: ids, a slug, an age in seconds, bps FIELD NAMES and a closed ``next`` token).
+_RESTING_ALERT_DETAIL_KEYS: Final[tuple[str, ...]] = (
+    "venue_order_id",
+    "slug",
+    "age_s",
+    "fields",
+    "next",
+)
+
+#: A plain token: no whitespace, so no free-text sentence (and no figure embedded in one)
+#: can ride along. Anything else is replaced, never forwarded.
+_RESTING_ALERT_TOKEN: Final = re.compile(r"[A-Za-z0-9_.,:/-]{1,96}")
+
+
+def _resting_alert_token(value: str) -> str:
+    return value if _RESTING_ALERT_TOKEN.fullmatch(value) else "<redacted>"
+
+
+def _resting_alert_event(alert: Mapping[str, str]) -> str:
+    event = alert.get("event", "")
+    return event if event in _RESTING_ALERT_EVENTS else RESTING_ALERT_UNKNOWN_EVENT
+
+
+def _resting_alert_key(alert: Mapping[str, str]) -> tuple[str, str, str]:
+    """Dedupe key. ``age_s`` is part of it: the client re-alerts a still-open cancel with a
+    new age, and that re-alert must reach the operator."""
+    return (
+        _resting_alert_event(alert),
+        alert.get("venue_order_id", ""),
+        alert.get("age_s", ""),
+    )
+
+
+def _resting_alert_detail(alert: Mapping[str, str]) -> str:
+    parts = [
+        f"{key}={_resting_alert_token(alert[key])}"
+        for key in _RESTING_ALERT_DETAIL_KEYS
+        if key in alert
+    ]
+    return "resting order alert: " + (" ".join(parts) if parts else "no detail recorded")
+
+
+def install_resting_alert(
+    msgbus: MessageBus,
+    *,
+    alerts: Callable[[], Sequence[Mapping[str, str]]],
+    sink: AlertSink | None = None,
+) -> Callable[[object], None]:
+    """Deliver the execution client's resting-order alert entries, once each.
+
+    Mirrors :func:`install_resolver_contradiction_alert`: the shared
+    ``COMPONENT_STATE_TOPIC`` heartbeat is the first trigger and
+    :func:`install_refusal_repoll_timer` the second (pass the returned handler to it). Dedupe
+    is by :func:`_resting_alert_key`; a key that leaves the surface is forgotten, so a later
+    recurrence alerts again. Nothing but the closed ``_RESTING_ALERT_DETAIL_KEYS`` tokens is
+    ever sent: no commission figure, no raw order id.
+    """
+    active_sink = resolve_alert_sink() if sink is None else sink
+    alerted: set[tuple[str, str, str]] = set()
+
+    def _on_component_state(event: object) -> None:
+        del event
+        try:
+            current = tuple(alerts())
+        # Broad, deliberately: a broken reader must not crash the component
+        # publishing the triggering event (CONTAINMENT, module docstring).
+        except Exception:
+            logger.exception("failed to read the resting alert surfaces")
+            return
+        alerted.intersection_update({_resting_alert_key(alert) for alert in current})
+        for alert in current:
+            key = _resting_alert_key(alert)
+            if key in alerted:
+                continue
+            alerted.add(key)
+            emit_alert(
+                active_sink,
+                AlertPayload(
+                    severity=RESTING_ALERT_SEVERITY,
+                    event=key[0],
+                    site=RESTING_ALERT_SITE,
+                    detail=_resting_alert_detail(alert),
                 ),
             )
 
