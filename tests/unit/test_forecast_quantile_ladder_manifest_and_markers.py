@@ -52,9 +52,18 @@ _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN = (
 
 
 def test_composition_kind_exact_set_is_widened_by_exactly_one_row() -> None:
-    assert family_manifest_module._COMPOSITION_KINDS == frozenset(
-        {"current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"},
+    # ARM C2: widened by exactly ONE further named row, `no_ladder_maker`.
+    pinned = frozenset(
+        {
+            "current_rung_hold",
+            "continuous_rung_hold",
+            "forecast_ladder",
+            "forecast_quantile_ladder",
+            "no_ladder_maker",
+        },
     )
+    assert family_manifest_module._COMPOSITION_KINDS == pinned
+    assert family_manifest_module._COMPOSITION_KINDS != pinned - {"no_ladder_maker"}  # plant
 
 
 def test_forecast_quantile_ladder_is_accepted_as_a_composition_kind(tmp_path: Path) -> None:
@@ -81,7 +90,10 @@ def test_marker_map_is_widened_by_exactly_one_row() -> None:
         "continuous_rung_hold": "ContinuousRungHoldStrategy subscribed",
         "forecast_ladder": "ForecastLadderStrategy subscribed",
         "forecast_quantile_ladder": "ForecastQuantileLadderStrategy subscribed",
+        # ARM C2: one further named row.
+        "no_ladder_maker": "NoLadderMakerStrategy subscribed",
     }
+    assert markers != {k: v for k, v in markers.items() if k != "no_ladder_maker"}  # plant
 
 
 def test_strategy_subscribed_in_recognises_the_new_marker() -> None:

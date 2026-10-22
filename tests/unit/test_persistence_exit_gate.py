@@ -49,6 +49,10 @@ _COMMITTED_MANIFEST_NAMES: tuple[str, ...] = (
     # `exit_rule` nor `no_leg_exit` -- it satisfies both invariants below
     # exactly like every other committed manifest.
     "pm_us_crh_fq_v1.json",
+    # ARM C2 (2026-10-22): the no_ladder_maker family. It declares neither `exit_rule` nor
+    # `no_leg_exit` and no `live_orders_ruling`, so it satisfies both invariants below exactly
+    # like every sibling above (one named row, L-12).
+    "pm_us_no_maker_sharp_v1.json",
 )
 
 

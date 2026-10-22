@@ -186,9 +186,10 @@ def test_an_unknown_composition_kind_is_still_refused_by_set_and_clear(tmp_path:
 
 
 def test_the_accepted_composition_kinds_are_pinned_exactly() -> None:
-    assert HALTABLE_COMPOSITION_KINDS == frozenset(
-        {"continuous_rung_hold", "forecast_quantile_ladder"}
-    )
+    # ARM C2: widened by exactly ONE named row, `no_ladder_maker` (buys only: no exit path).
+    pinned = frozenset({"continuous_rung_hold", "forecast_quantile_ladder", "no_ladder_maker"})
+    assert HALTABLE_COMPOSITION_KINDS == pinned
+    assert HALTABLE_COMPOSITION_KINDS != pinned - {"no_ladder_maker"}  # plant: the row is load-bearing
 
 
 CONTINUOUS_FAMILY_ID = "pm_us_crh_v4"

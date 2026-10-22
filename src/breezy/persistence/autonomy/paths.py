@@ -27,7 +27,8 @@ VENUE_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9_]{1,32}\Z", re.ASCII)
 FAMILY_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9_]{1,64}\Z", re.ASCII)
 #: Kept equal to ``family_manifest._COMPOSITION_KINDS`` (test-asserted; not imported: layering).
 MODEL_CLASS_RE: Final[re.Pattern[str]] = re.compile(
-    r"\A(?:current_rung_hold|continuous_rung_hold|forecast_ladder|forecast_quantile_ladder)"
+    r"\A(?:current_rung_hold|continuous_rung_hold|forecast_ladder|forecast_quantile_ladder"
+    r"|no_ladder_maker)"
     r":[a-z_]{1,48}\Z",
     re.ASCII,
 )
