@@ -56,7 +56,10 @@ _B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
 #: Re-digested once at P3 (horizon probe: --horizon, one 4 h order, exact stored-G cleanup).
 #: Prior digest:
 #: c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc
-_B2_CONTROL_SHA256 = "61a7b6a9f1e9e65fd266c0bddff02620a7bfa94bf11a61a7de8d7fe73d268192"
+#: Re-digested once at the P3 4xx classification fix (error code or message field only).
+#: Prior digest:
+#: 61a7b6a9f1e9e65fd266c0bddff02620a7bfa94bf11a61a7de8d7fe73d268192
+_B2_CONTROL_SHA256 = "ce8f3dd1cd0b1be56ed678853ff63b008f944e460bf20e7d8dee38986a115807"
 
 
 class _Resp:

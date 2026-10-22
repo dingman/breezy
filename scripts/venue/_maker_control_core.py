@@ -151,17 +151,38 @@ OUTCOME_SELECT_NO_PAIR: Final[str] = "SELECT_ONLY_NO_PAIR"
 OUTCOME_INVALID: Final[str] = "INVALID"
 #: P3 FAIL classes. Anything else that stops a horizon run is INVALID, not FAIL.
 P3_FAIL_CODES: Final[frozenset[str]] = frozenset({"CLAMPED", "EARLY", "LATE", "GTD_REJECTED"})
-#: A create 4xx is GTD_REJECTED only when the body contains one of these documented
-#: names. OrdRejectReason has no GTD member
-#: (docs_snapshots/api-reference_orders_overview_2026-08-25.md:254-267).
-#: ``goodTillTime`` is the request field
-#: (docs_snapshots/api-reference_orders_create-order_2026-08-25.md:87-89);
-#: ``TIME_IN_FORCE_GOOD_TILL_DATE`` is the same snapshot at lines 165-172.
-#: Any other 4xx is INVALID.
-GTD_REJECTION_SUBSTRINGS: Final[tuple[str, ...]] = (
-    "goodTillTime",
-    "TIME_IN_FORCE_GOOD_TILL_DATE",
-)
+#: Documented GTD or expiry rejection codes and messages. Both sets are empty.
+#: OrdRejectReason has no GTD member
+#: (docs_snapshots/api-reference_orders_create-order_2026-08-25.md:375-386;
+#: docs_snapshots/api-reference_orders_overview_2026-08-25.md:254-267).
+#: Create-order HTTP 400 (create-order snapshot lines 51-52) has no body.
+#: The retail error envelope message is generic, not a GTD rejection
+#: (polymarket-us-integration SKILL.md, 2026-09-02 error-taxonomy row).
+#: ``goodTillTime`` is a request field (create-order snapshot lines 87-89),
+#: not an error. Every create 4xx is therefore not GTD_REJECTED.
+DOCUMENTED_GTD_REJECTION_CODES: Final[frozenset[str]] = frozenset()
+DOCUMENTED_GTD_REJECTION_MESSAGES: Final[frozenset[str]] = frozenset()
+
+
+def is_explicit_gtd_rejection(payload: object) -> bool:
+    """True when a create 4xx names a documented GTD or expiry rejection.
+
+    Only the venue error ``code`` and ``message`` fields count. ``details`` and
+    every other field are ignored, so an echoed request cannot decide this.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    code = payload.get("code")
+    if isinstance(code, str) and code in DOCUMENTED_GTD_REJECTION_CODES:
+        return True
+    if (
+        isinstance(code, int)
+        and not isinstance(code, bool)
+        and str(code) in DOCUMENTED_GTD_REJECTION_CODES
+    ):
+        return True
+    message = payload.get("message")
+    return isinstance(message, str) and message in DOCUMENTED_GTD_REJECTION_MESSAGES
 _MARKET_OPEN_STATE: Final[str] = "MARKET_STATE_OPEN"
 _MARKET_OPEN_STATUS: Final[str] = "MARKET_STATUS_OPEN"
 _MARKET_OPEN_EP3: Final[str] = "OPEN"

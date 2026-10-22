@@ -112,7 +112,6 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     FILL_STATES,
     GTD_CEILING_SECS,
     GTD_ECHO_TOLERANCE_NS,
-    GTD_REJECTION_SUBSTRINGS,
     HORIZON_GTD_SECS,
     MAX_LIST_PAGES,
     NS_PER_S,
@@ -160,6 +159,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     gtd_echoed,
     has_position_resolution_row,
     install_termination_handlers,
+    is_explicit_gtd_rejection,
     is_own_probe_shape,
     iso_utc,
     key_paths,
@@ -686,8 +686,7 @@ async def _rest(
             state.unknown_create = True
     if result.status != 200:
         if session.horizon and 400 <= result.status < 500:
-            blob = json.dumps(result.payload, default=str)
-            if any(token in blob for token in GTD_REJECTION_SUBSTRINGS):
+            if is_explicit_gtd_rejection(result.payload):
                 raise StepFailed("GTD_REJECTED")
             raise StepFailed("CREATE_4XX")
         raise StepFailed("CREATE_REFUSED")

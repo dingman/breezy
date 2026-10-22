@@ -179,7 +179,10 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # Re-digested once at P3 (horizon probe: --horizon, one 4 h order, exact stored-G cleanup).
     # Prior digest:
     # c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc
-    "scripts/venue/polymarket_us_maker_positive_control.py": "61a7b6a9f1e9e65fd266c0bddff02620a7bfa94bf11a61a7de8d7fe73d268192",  # noqa: E501
+    # Re-digested once at the P3 4xx classification fix (error code or message field only).
+    # Prior digest:
+    # 61a7b6a9f1e9e65fd266c0bddff02620a7bfa94bf11a61a7de8d7fe73d268192
+    "scripts/venue/polymarket_us_maker_positive_control.py": "ce8f3dd1cd0b1be56ed678853ff63b008f944e460bf20e7d8dee38986a115807",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501
