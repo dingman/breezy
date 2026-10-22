@@ -223,7 +223,7 @@ def test_client_order_id_embeds_utc_date() -> None:
         record = SimpleNamespace(
             instrument_id="i",
             venue_order_id="V",
-            trade_id=None,  # ARM B6 S8: record_fill reads the POLL- namespace marker; a taker record carries none
+            trade_id=None,  # ARM B6 S8: record_fill reads the POLL- marker; a taker has none
             ts_event=created_ns + 2 * NS,
             to_bytes=lambda: b"{}",
         )
