@@ -146,7 +146,7 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # signs GETs through the shared production client (same imports as the capital-flow puller
     # below, which also needs this exemption) and reconciles through `reconcile_settlement`; it
     # is digest-pinned, so any edit re-scans it (test_m6_maker_collector_row_is_digest_bound).
-    "scripts/venue/maker_settlement_collect.py": "3b9764f7c9838221bcfe7dee586915df7e3ec4e72b7241a6aa18b690831dc5de",  # noqa: E501
+    "scripts/venue/maker_settlement_collect.py": "d61ebce0df9453e0484c0f45923c18ef7866eabbeb261d3b0a35372b3ed727bd",  # noqa: E501
     "scripts/venue/_write_sequence.py": "d49c238293f0cf7aa64ce1d295960fa4eb4eeb03c6d82d7223d2feb304d9a2e8",  # noqa: E501
     "scripts/venue/fee_drift_evidence_pull.py": "bbaa9c098e61dae7c3dc32d9addfa3920132c4249d3a4c725bdff79d6a3b2950",  # noqa: E501
     "scripts/venue/iem_afos_forecast_pil_probe.py": "121af2d1945acec194d1bb2b5dab9bca795d88f6657f847908354f6c4aafb040",  # noqa: E501

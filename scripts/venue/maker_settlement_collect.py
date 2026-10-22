@@ -17,7 +17,9 @@ harm-stop artefact. The producer (``maker_loss_stop_producer.py``, no network) r
   counts and a path -- never a header, a credential, a body, an id or an amount.
 * A venue failure raises before anything is written (a failed run leaves the old file).
 
-Exit status: 0 completed (even when some rows were omitted: see the summary counts), 1 error.
+Exit status: 0 complete (``eof`` reached; some rows may still be omitted: see the summary counts),
+1 error, 4 INCOMPLETE (``MAX_PAGES`` hit or no cursor before ``eof``; the file is still written
+with ``complete: false`` and the producer then HOLDs). Non-zero fires ``OnFailure=``.
 """
 
 from __future__ import annotations
@@ -60,12 +62,13 @@ from breezy.strategy.no_ladder_maker.venue_settlement import (
     write_venue_settlement,
 )
 
-__all__ = ["MAX_PAGES", "PAGE_LIMIT", "SUMMARY_PREFIX", "collect", "main"]
+__all__ = ["EXIT_INCOMPLETE", "MAX_PAGES", "PAGE_LIMIT", "SUMMARY_PREFIX", "collect", "main"]
 
 #: 2,000 activities per run at the shared portfolio quota; past it the run is INCOMPLETE
 MAX_PAGES: Final[int] = 20
 PAGE_LIMIT: Final[int] = 100
 SUMMARY_PREFIX: Final[str] = "MAKER_SETTLEMENT"
+EXIT_INCOMPLETE: Final[int] = 4
 CATALOG_ROOT_ENV: Final[str] = "BREEZY_TRADE_CATALOG_ROOT"
 DEFAULT_DATA_ROOT: Final[Path] = Path.home() / ".local/share/breezy"
 
@@ -106,9 +109,11 @@ async def _pull_resolutions(
                 conflicts.add(resolution.slug)
         raw_cursor = page.get("nextCursor")
         cursor = raw_cursor if isinstance(raw_cursor, str) and raw_cursor else None
-        if page.get("eof") or not cursor:
+        if page.get("eof") is True:
             complete = True
             break
+        if not cursor:
+            break  # not at eof and nowhere to go: the traversal is incomplete, never "done"
     return yes, conflicts, unreadable, pages, complete
 
 
@@ -194,7 +199,7 @@ def main(
         f"written={result.written} unchecked={result.unchecked} mismatched={result.mismatched} "
         f"unreadable={result.unreadable} conflicts={result.conflicts} path={path}"
     )
-    return 0
+    return 0 if result.complete else EXIT_INCOMPLETE
 
 
 if __name__ == "__main__":  # pragma: no cover - operator entrypoint

@@ -28,6 +28,7 @@ from breezy.runtime.submit_intent import (
 from breezy.strategy.forecast_quantile_ladder import loss_stop_probe as lsp
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import LossStopProbe
 from breezy.strategy.no_ladder_maker import harm_stop as hsm
+from breezy.strategy.no_ladder_maker import venue_settlement
 from breezy.strategy.no_ladder_maker.cli_final import registry_std_offset_hours
 from breezy.strategy.no_ladder_maker.harm_stop import maker_loss_stop_artefact_path
 from breezy.strategy.no_ladder_maker.venue_settlement import VENUE_SCHEMA
@@ -81,7 +82,7 @@ class _World:
         self.venue_path = tmp / "venue_settlements.json"
         self.venue: dict[str, bool] = {}
         self.cli: dict[tuple[str, str], int] = {}
-        self.offset: float = -5.0
+        self.offset: float | None = -5.0
 
     def fill(self, record: DurableFillRecord) -> None:
         self.store.set(f"{FILL_KEY_PREFIX}{record.venue_order_id}", record.to_bytes())
@@ -102,8 +103,28 @@ class _World:
     def cli_reader(self, facts: WeatherBucketFacts) -> int | None:
         return self.cli.get((facts.settlement_station, facts.climate_day.isoformat()))
 
-    def run(self, *, now: datetime = NOW, stations: frozenset[str] = STATIONS) -> producer.Outcome:
-        self.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": self.venue}))
+    def write_venue(self, fetched_at: datetime, *, complete: bool = True) -> None:
+        """The collector's file: by default complete and fetched ``fetched_at``."""
+        body = {
+            "schema": VENUE_SCHEMA,
+            "source": "activities",
+            "fetched_at": fetched_at.isoformat().replace("+00:00", "Z"),
+            "complete": complete,
+            "yes_resolved": self.venue,
+        }
+        self.venue_path.write_text(json.dumps(body))
+
+    def run(
+        self,
+        *,
+        now: datetime = NOW,
+        stations: frozenset[str] = STATIONS,
+        fetched_at: datetime | None = None,
+        complete: bool = True,
+        write_file: bool = True,
+    ) -> producer.Outcome:
+        if write_file:
+            self.write_venue(fetched_at or now, complete=complete)
         return producer.produce(
             state_db=self.db,
             derived_dir=self.derived,
@@ -443,7 +464,7 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
 ) -> None:
     monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
     world.win(1)
-    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
+    world.write_venue(datetime.now(tz=UTC))
     argv = [
         "--station", "nyc",
         "--state-db", str(world.db),
@@ -457,7 +478,7 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
     assert producer.main(argv) == producer.EXIT_HOLD
     for d in (3, 4, 5):
         world.lose(d)
-    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
+    world.write_venue(datetime.now(tz=UTC))
     assert producer.main(argv) == producer.EXIT_FAIL
 
 
@@ -612,7 +633,7 @@ def test_j4_a_standing_fail_exits_fail_even_when_the_new_verdict_is_pass(
     world.run()  # the FAIL is on disk
     for d in (1, 2, 3):
         world.settle(d, yes=False, tmax=HIGH_TMAX)  # the losses are later 'resolved' as wins
-    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
+    world.write_venue(datetime.now(tz=UTC))
     assert producer.main(argv) == producer.EXIT_FAIL
 
 
@@ -667,7 +688,7 @@ def test_j6_main_writes_where_the_probe_reads(
         "--catalog-base", str(world.derived.parents[1]),
         "--venue-settlements", str(world.venue_path),
     ]  # fmt: skip
-    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
+    world.write_venue(datetime.now(tz=UTC))
     assert producer.main(argv) == producer.EXIT_PASS
     probe = _probe(maker_loss_stop_artefact_path(catalog_root), datetime.now(tz=UTC))
     probe.probe_once()
@@ -720,3 +741,132 @@ def test_j7_a_new_derived_directory_is_0755_whatever_the_umask(world: _World) ->
     finally:
         os.umask(old)
     assert stat.S_IMODE(world.derived.stat().st_mode) == 0o755
+
+
+# -- review D1-F3: the settlement file must be present, complete and fresh ------------------------
+
+
+def _three_unresolved_past_deadline(world: _World) -> datetime:
+    """Three family fills that NO file resolves, long past their settlement deadline."""
+    for d in (1, 2, 3):
+        world.fill(_record(d))
+    return NOW
+
+
+def test_f3_a_trusted_file_leaves_unresolved_past_deadline_a_loss_and_fails(world: _World) -> None:
+    _three_unresolved_past_deadline(world)
+    outcome = world.run()
+    assert outcome.result.verdict.value == "FAIL" and "T1" in outcome.result.triggers
+
+
+def test_f3_an_incomplete_file_holds_and_a_partial_page_cannot_latch_a_sticky_fail(
+    world: _World,
+) -> None:
+    _three_unresolved_past_deadline(world)
+    outcome = world.run(complete=False)
+    assert outcome.result.verdict.value == "HOLD"
+    assert "venue_settlement_incomplete" in outcome.result.hold_reasons
+    assert outcome.result.unresolved == 0 and outcome.result.losses == 0
+    assert outcome.result.pending == 3
+    assert not (world.derived / "latest.json").exists(), "no FAIL file, so nothing is sticky"
+    # the next COMPLETE run is judged on its own merits: the partial run left nothing behind
+    assert world.run().result.verdict.value == "FAIL"
+
+
+def test_f3_an_incomplete_file_still_scores_the_slugs_it_resolves(world: _World) -> None:
+    for d in (1, 2, 3):
+        world.lose(d)  # resolved venue YES, CLI agrees: three REAL losses
+    outcome = world.run(complete=False)
+    assert outcome.result.verdict.value == "FAIL" and outcome.result.losses == 3
+
+
+def test_f3_a_missing_file_holds_and_a_partial_page_cannot_latch_a_sticky_fail(
+    world: _World,
+) -> None:
+    _three_unresolved_past_deadline(world)
+    outcome = world.run(write_file=False)
+    assert outcome.result.verdict.value == "HOLD"
+    assert "venue_settlement_missing" in outcome.result.hold_reasons
+    assert not (world.derived / "latest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"garbage",
+        b"[]",
+        json.dumps({"schema": "other/v1", "complete": True, "yes_resolved": {}}).encode(),
+        json.dumps({"schema": VENUE_SCHEMA, "complete": True, "yes_resolved": {}}).encode(),
+        json.dumps(
+            {"schema": VENUE_SCHEMA, "complete": True, "fetched_at": "nope", "yes_resolved": {}}
+        ).encode(),
+        json.dumps(
+            {
+                "schema": VENUE_SCHEMA,
+                "complete": True,
+                "fetched_at": "2026-10-25T12:40:00",  # naive: not a usable instant
+                "yes_resolved": {},
+            }
+        ).encode(),
+    ],
+    ids=["garbage", "not_a_mapping", "foreign_schema", "no_fetched_at", "bad_fetched_at", "naive"],
+)
+def test_f3_an_unusable_file_holds_as_missing(world: _World, body: bytes) -> None:
+    _three_unresolved_past_deadline(world)
+    world.venue_path.write_bytes(body)
+    outcome = world.run(write_file=False)
+    assert outcome.result.verdict.value == "HOLD"
+    assert "venue_settlement_missing" in outcome.result.hold_reasons
+
+
+def test_f3_complete_must_be_exactly_true(world: _World) -> None:
+    world.win(1)
+    world.write_venue(NOW)
+    body = json.loads(world.venue_path.read_text())
+    body["complete"] = "true"
+    world.venue_path.write_text(json.dumps(body))
+    outcome = world.run(write_file=False)
+    assert "venue_settlement_incomplete" in outcome.result.hold_reasons
+
+
+def test_f3_the_staleness_boundary_is_24_hours(world: _World) -> None:
+    assert venue_settlement.SETTLEMENT_MAX_AGE == timedelta(hours=24)
+    world.win(1)
+    fresh = world.run(fetched_at=NOW - venue_settlement.SETTLEMENT_MAX_AGE)
+    assert fresh.result.verdict.value == "PASS", "exactly 24 h old is still usable"
+    stale = world.run(fetched_at=NOW - venue_settlement.SETTLEMENT_MAX_AGE - timedelta(seconds=1))
+    assert stale.result.verdict.value == "HOLD"
+    assert "venue_settlement_stale" in stale.result.hold_reasons
+    assert not (world.derived / "latest.json").exists(), "HOLD removes the standing PASS"
+
+
+def test_f3_a_stale_file_cannot_latch_a_sticky_fail_from_unresolved_fills(world: _World) -> None:
+    _three_unresolved_past_deadline(world)
+    outcome = world.run(fetched_at=NOW - timedelta(days=3))
+    assert outcome.result.verdict.value == "HOLD" and outcome.result.pending == 3
+    assert not (world.derived / "latest.json").exists()
+
+
+def test_f3_a_trusted_file_adds_no_settlement_hold_reason(world: _World) -> None:
+    world.win(1)
+    outcome = world.run()
+    assert outcome.result.hold_reasons == ()
+
+
+# -- review D1-F4: an unknown station offset is a HOLD, not an immediate LOSS ---------------------
+
+
+def test_f4_an_unknown_station_offset_holds_instead_of_losing(world: _World) -> None:
+    world.offset = None
+    for d in (1, 2, 3):
+        world.fill(_record(d))  # unresolved; with no offset the deadline is unknowable
+    outcome = world.run()
+    assert outcome.result.verdict.value == "HOLD"
+    assert "station_offset_unknown" in outcome.result.hold_reasons
+    assert (outcome.result.pending, outcome.result.losses, outcome.result.unresolved) == (3, 0, 0)
+    assert not (world.derived / "latest.json").exists()
+
+
+def test_f4_a_known_offset_adds_no_offset_hold_reason(world: _World) -> None:
+    world.win(1)
+    assert "station_offset_unknown" not in world.run().result.hold_reasons

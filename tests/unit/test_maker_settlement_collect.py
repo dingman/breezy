@@ -126,12 +126,19 @@ def test_only_the_family_stations_are_kept(collector: ModuleType, tmp_path: Path
     assert read_venue_yes(_paths(tmp_path)[1]) == {SFO: False}
 
 
+def _synthetic_long_winner(row: dict[str, Any]) -> None:
+    """SYNTHETIC: the market pays YES and the long holder's recorded PnL is a win."""
+    resolution = row["positionResolution"]
+    for side in resolution["market"]["marketSides"]:
+        side["price"] = "1" if side["long"] else "0"
+    resolution["afterPosition"]["realized"]["value"] = "0.8100"
+
+
 def test_a_synthetic_yes_paid_out_market_is_written_true_when_the_cli_agrees(
     collector: ModuleType, tmp_path: Path
 ) -> None:
     page = _only_resolutions(copy.deepcopy(_page()))
-    for side in page["activities"][0]["positionResolution"]["market"]["marketSides"]:
-        side["price"] = "1" if side["long"] else "0"
+    _synthetic_long_winner(page["activities"][0])
     client, _ = _client_for(page)
     assert _run(collector, tmp_path, client, reader=_reader(94)) == 0
     # NYC: venue YES, CLI 94 inside gte94lt95 -> agreed; SFO: venue NO, CLI 94 outside -> agreed
@@ -184,16 +191,46 @@ def test_pagination_follows_the_cursor_to_eof(collector: ModuleType, tmp_path: P
     )
 
 
-def test_hitting_the_page_cap_is_incomplete_but_still_writes(
+def test_hitting_the_page_cap_is_incomplete_exits_non_zero_but_still_writes(
     collector: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     page = _only_resolutions(_page())
     page.update(eof=False, nextCursor="again")
     client, transport = _client_for(page)
-    assert _run(collector, tmp_path, client) == 0
+    assert _run(collector, tmp_path, client) == collector.EXIT_INCOMPLETE != 0
     assert len(transport.calls) == collector.MAX_PAGES
     assert "status=INCOMPLETE" in capsys.readouterr().out
     assert json.loads(_paths(tmp_path)[1].read_text())["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        {"eof": False, "nextCursor": ""},
+        {"nextCursor": ""},
+        {"eof": "true", "nextCursor": ""},
+        {"eof": 1, "nextCursor": ""},
+        {"eof": None},
+    ],
+    ids=["eof_false_no_cursor", "eof_absent", "eof_string", "eof_int", "eof_null"],
+)
+def test_complete_is_set_only_when_eof_is_exactly_true(
+    collector: ModuleType, tmp_path: Path, tail: dict[str, Any]
+) -> None:
+    page = _only_resolutions(_page())
+    page.pop("eof")
+    page.update(tail)
+    client, _ = _client_for(page)
+    assert _run(collector, tmp_path, client) == collector.EXIT_INCOMPLETE
+    assert json.loads(_paths(tmp_path)[1].read_text())["complete"] is False
+
+
+def test_a_complete_run_exits_zero_and_writes_complete_true(
+    collector: ModuleType, tmp_path: Path
+) -> None:
+    client, _ = _client_for(_page())
+    assert _run(collector, tmp_path, client) == 0
+    assert json.loads(_paths(tmp_path)[1].read_text())["complete"] is True
 
 
 def test_a_5xx_writes_nothing_and_leaves_the_previous_file(
@@ -236,8 +273,7 @@ def test_a_resolution_that_flips_against_the_previous_file_is_dropped(
     client, _ = _client_for(_page())
     assert _run(collector, tmp_path, client) == 0
     flipped = _only_resolutions(copy.deepcopy(_page()))
-    for side in flipped["activities"][0]["positionResolution"]["market"]["marketSides"]:
-        side["price"] = "1" if side["long"] else "0"
+    _synthetic_long_winner(flipped["activities"][0])
     client2, _ = _client_for(flipped)
     capsys.readouterr()
     assert _run(collector, tmp_path, client2, reader=_reader(None)) == 0

@@ -10,8 +10,9 @@ writes nothing but that artefact.
 * PASS / FAIL write the file atomically. FAIL is sticky (a restart needs a new dated ruling), and
   so is a standing file this producer cannot read back.
 * HOLD (GET- family fills, an open AMBIGUOUS family intent, an unreadable state DB or any
-  undecodable fill record) removes a standing PASS so the probe vetoes at once, and never touches
-  a FAIL.
+  undecodable fill record, a missing / incomplete / stale venue-settlement file, or a family
+  station with no known UTC offset) removes a standing PASS so the probe vetoes at once, and never
+  touches a FAIL.
 * Zero fills is a PASS. A fill whose settlement is not yet knowable is PENDING until 48 h after the
   end of its local station-day (in no count); after that it is a LOSS.
 
@@ -29,8 +30,16 @@ unreadable file standing on disk), 3 HOLD, 1 error.
 The venue-settlement input (``--venue-settlements``, default beside the artefact) is a JSON object
 ``{"schema": "maker_venue_settlement/v1", "yes_resolved": {"<base slug>": true|false}, ...}``
 written by ``scripts/venue/maker_settlement_collect.py``; extra keys are ignored. An absent or
-unreadable file leaves every fill unresolved (PENDING, then a LOSS past the deadline). The CLI
-final alone never resolves a fill (it is the cross-check).
+unreadable file leaves every fill unresolved. The CLI final alone never resolves a fill (it is the
+cross-check).
+
+The file must be PRESENT, ``complete: true`` and fetched at most
+:data:`breezy.strategy.no_ladder_maker.venue_settlement.SETTLEMENT_MAX_AGE` (24 h) before the
+producer's ``now``; otherwise the verdict HOLDs (``venue_settlement_missing`` / ``_incomplete`` /
+``_stale``) and every fill the file does not resolve stays PENDING instead of turning into a LOSS
+(so a partial page cannot latch a sticky FAIL; slugs it DOES resolve are still scored). With a
+trusted file, an unresolved fill past its deadline is a LOSS. A family station with no registry
+UTC offset likewise HOLDs (``station_offset_unknown``) with its unresolved fills PENDING.
 """
 
 from __future__ import annotations
@@ -77,7 +86,8 @@ from breezy.strategy.no_ladder_maker.harm_stop import (
 from breezy.strategy.no_ladder_maker.harm_stop_artefact import ACTION_STICKY, Action, publish
 from breezy.strategy.no_ladder_maker.venue_settlement import (
     VENUE_SETTLEMENTS_NAME,
-    read_venue_yes,
+    read_venue_settlement,
+    untrusted_reason,
 )
 
 EXIT_PASS: Final[int] = 0
@@ -166,6 +176,7 @@ def _settle_record(
     *,
     now: datetime,
     std_offset_hours: StdOffset,
+    settlement_trusted: bool,
 ) -> SettledFill:
     symbol = symbol_of_instrument_id(record.instrument_id)
     facts = bucket_facts_from_instrument_id(record.instrument_id)
@@ -186,15 +197,17 @@ def _settle_record(
         quantity=record.cumulative_qty,
         venue_yes_resolved=venue_yes.get(base_symbol_of(symbol)),
         cli_yes=None if reading is None else facts.contains(reading),
-        pending=_before_deadline(station, facts.climate_day, now, std_offset_hours),
+        pending=not settlement_trusted
+        or _before_deadline(station, facts.climate_day, now, std_offset_hours),
     )
 
 
 def _before_deadline(station: str, climate_day: date, now: datetime, offset: StdOffset) -> bool:
-    """Review J2: still inside the settlement window. An unknown station offset is NOT pending."""
+    """Review J2: still inside the settlement window. An unknown station offset leaves the fill
+    PENDING (the caller HOLDs ``station_offset_unknown``); it is never turned into a LOSS."""
     hours = offset(station)
     if hours is None:
-        return False
+        return True
     return now < settlement_deadline(climate_day, std_utc_offset_hours=hours)
 
 
@@ -226,11 +239,28 @@ def produce(
         reasons.append("get_fill")
     if classification.open_ambiguous_family_intent:
         reasons.append("open_ambiguous_family_intent")
-    venue_yes = read_venue_yes(venue_settlements)
+    settlement = read_venue_settlement(venue_settlements)
+    distrust = untrusted_reason(settlement, now=now)
+    if distrust is not None:
+        reasons.append(distrust)
+    unknown_offset = {
+        station_of_slug(symbol_of_instrument_id(r.instrument_id))
+        for r in classification.maker_fills
+        if std_offset_hours(station_of_slug(symbol_of_instrument_id(r.instrument_id))) is None
+    }
+    if unknown_offset:
+        reasons.append("station_offset_unknown")
     settled = [
         (
             base_symbol_of(symbol_of_instrument_id(r.instrument_id)),
-            _settle_record(r, venue_yes, cli_reading, now=now, std_offset_hours=std_offset_hours),
+            _settle_record(
+                r,
+                settlement.yes_resolved,
+                cli_reading,
+                now=now,
+                std_offset_hours=std_offset_hours,
+                settlement_trusted=distrust is None,
+            ),
         )
         for r in classification.maker_fills
     ]

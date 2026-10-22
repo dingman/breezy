@@ -690,19 +690,19 @@ def _yes_resolved_of(slug: str, market: object) -> bool | None:
     for a market whose YES long position realised its whole cost as a loss). It does NOT read
     ``outcomePrices`` (its label order contradicts ``marketSides`` in that capture) nor the row's
     ``side`` (it is the same ``SHORT`` for a long holder that lost). Anything short of a RESOLVED,
-    closed market with exactly one long and one short side priced exactly {0, 1} is ``None``."""
+    closed market whose ``slug`` and both sides' ``identifier`` are PRESENT and equal to the row
+    slug, with exactly one long and one short side priced exactly {0, 1}, is ``None`` (no
+    defaulting: an absent slug or identifier is unreadable, never assumed to match)."""
     if not isinstance(market, Mapping):
         return None
     if market.get("status") != _MARKET_RESOLVED_STATUS or market.get("closed") is not True:
         return None
-    if market.get("slug", slug) != slug:
+    if market.get("slug") != slug:
         return None
     sides = market.get("marketSides")
     if not isinstance(sides, list) or len(sides) != 2:
         return None
-    if not all(
-        isinstance(side, Mapping) and side.get("identifier", slug) == slug for side in sides
-    ):
+    if not all(isinstance(side, Mapping) and side.get("identifier") == slug for side in sides):
         return None
     longs = [side for side in sides if side.get("long") is True]
     shorts = [side for side in sides if side.get("long") is False]
@@ -716,6 +716,50 @@ def _yes_resolved_of(slug: str, market: object) -> bool | None:
     if (long_price, short_price) == (Decimal(0), Decimal(1)):
         return False
     return None
+
+
+def _decimal_field(holder: object, key: str, *, nested: bool) -> Decimal | None:
+    """``holder[key]`` (``{"value": "<decimal>"}`` when ``nested``) as a finite Decimal."""
+    if not isinstance(holder, Mapping):
+        return None
+    raw = holder.get(key)
+    if nested:
+        raw = raw.get("value") if isinstance(raw, Mapping) else None
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _yes_resolved_by_holder(resolution: Mapping[str, Any]) -> bool | None:
+    """The YES outcome implied by what the HOLDER's own position did at resolution.
+
+    ``beforePosition.netPosition`` > 0 is a long (YES) holder, < 0 a NO holder (the venue nets a NO
+    holding as short YES). The holder won iff the realised PnL change
+    (``afterPosition.realized`` - ``beforePosition.realized``) is positive, lost iff negative; a
+    loss larger than ``beforePosition.cost`` is impossible, so such a row is unreadable. A long
+    winner means YES paid out, a long loser NO; a NO winner means YES did not, a NO loser YES did.
+    Zero net position, zero PnL change or any missing field is ``None``. A winner who bought at
+    (or above) par realises <= 0 and so reads as a loser: it then DISAGREES with ``marketSides``
+    and the row is unreadable (conservative, never trusted)."""
+    before, after = resolution.get("beforePosition"), resolution.get("afterPosition")
+    net = _decimal_field(before, "netPosition", nested=False)
+    cost = _decimal_field(before, "cost", nested=True)
+    realized_before = _decimal_field(before, "realized", nested=True)
+    realized_after = _decimal_field(after, "realized", nested=True)
+    if net is None or cost is None or realized_before is None or realized_after is None:
+        return None
+    if net == 0 or cost <= 0:
+        return None
+    change = realized_after - realized_before
+    if change == 0 or change < -cost:
+        return None
+    holder_won = change > 0
+    holder_long = net > 0
+    return holder_won if holder_long else not holder_won
 
 
 def parse_position_resolutions(page: Mapping[str, Any]) -> ResolutionScan:
@@ -739,7 +783,12 @@ def parse_position_resolutions(page: Mapping[str, Any]) -> ResolutionScan:
             if isinstance(slug, str) and slug and isinstance(resolution, Mapping)
             else None
         )
-        if not isinstance(slug, str) or yes is None:
+        # the holder's own PnL and side must CORROBORATE the market-side reading; a disagreement
+        # (or an unreadable holder) means neither is trusted
+        holder_yes = (
+            _yes_resolved_by_holder(resolution) if isinstance(resolution, Mapping) else None
+        )
+        if not isinstance(slug, str) or yes is None or holder_yes != yes:
             unreadable += 1
             continue
         found.append(MarketResolution(slug=slug, yes_resolved=yes))
