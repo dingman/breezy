@@ -320,6 +320,7 @@ from breezy.adapters.polymarket_us.fees import (
     taker_fee_at_fill,
     taker_fee_coefficient_as_of,
     taker_fee_coefficient_of,
+    taker_fee_exact_at_fill,
 )
 from breezy.adapters.polymarket_us.no_id_attribution import (
     NoIdEcho,
@@ -9570,11 +9571,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             modelled = taker_fee_at_fill(
                 quantity=quantity, price=price, ts_event_ns=ts_ns, fee_coefficient_at_fill=theta
             )
-            if modelled is None or theta is None:
+            exact = taker_fee_exact_at_fill(
+                quantity=quantity, price=price, ts_event_ns=ts_ns, fee_coefficient_at_fill=theta
+            )
+            if modelled is None or exact is None:
                 self._log.warning("resting fill: the fee schedule is unpinned; envelope skipped")
                 return True
             bound = submit_chain.commission_envelope_bound(
-                modelled=modelled.as_decimal(), exact=theta * quantity * price * (1 - price)
+                modelled=modelled.as_decimal(), exact=exact
             )
         except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
             self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
