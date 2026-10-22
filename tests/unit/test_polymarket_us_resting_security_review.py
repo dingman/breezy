@@ -213,3 +213,49 @@ async def test_s6_the_fill_event_is_emitted_while_the_row_is_still_bound(
     assert seen == [True]
     assert not client._rest_still_bound(_id_n(0)), "and retired right after"
     await client._disconnect()
+
+
+# -- S7: the venue's fill is compared with the order we rested ----------------------------
+
+
+def _mismatch_alerts(client: Any) -> list[dict[str, str]]:
+    return [
+        dict(a) for a in client.resting_commission_alerts if a["event"] == "resting_fill_mismatch"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize(
+    ("extra", "booked_cost"),
+    [
+        # a BUY of the NO leg limited at 0.40 filled at 0.50 (wire 0.50 is NO 0.50)
+        ({"avgPx": {"value": "0.50", "currency": "USD"}}, Decimal("0.50")),
+        # a quantity that is not the one contract that was rested
+        ({"quantity": 2, "cumQuantity": 2, "leavesQuantity": 0}, Decimal("0.80")),
+    ],
+)
+async def test_s7_a_fill_that_differs_from_the_rested_order_alerts_and_still_books_the_venue_figure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any], booked_cost: Decimal
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0, **extra)
+    await rig.client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    assert record.cumulative_cost == booked_cost, "the venue's figures are what is booked"
+    (alert,) = _mismatch_alerts(rig.client)
+    assert alert["severity"] == "CRITICAL"
+    assert "0.50" not in str(alert) and "0.40" not in str(alert), "value-free"
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s7_a_fill_at_the_limit_for_one_contract_raises_no_mismatch_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0)
+    await rig.client._query_order(_query(rig, command))
+    assert _mismatch_alerts(rig.client) == []
+    await rig.client._disconnect()

@@ -9073,9 +9073,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     @property
     def resting_commission_alerts(self) -> tuple[Mapping[str, str], ...]:
         """The CRITICAL commission alerts (`commission_bps_drift`,
-        `resting_commission_out_of_envelope`, `commission_unreadable`) for the health
-        surface. Value-free: an alert names the event, the order id prefix and the slug,
-        never a commission figure."""
+        `resting_commission_out_of_envelope`, `commission_unreadable`, and the non-latching
+        `resting_fill_mismatch`) for the health surface. Value-free: an alert names the
+        event, the order id prefix and the slug, never a commission figure."""
         return tuple(self._resting_commission_alert_details.values())
 
     # -- S4 WP5: the poll (`_query_order`) and the ONE fill booking -------------
@@ -9224,8 +9224,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "event": event,
                 "venue_order_id": _loggable_order_id(venue_order_id),
                 "slug": _loggable_slug(slug),
-                **extra,
                 "next": "new_rests_refused_cancels_continue_restart_after_review_clears",
+                **extra,
             },
         }
 
@@ -9342,10 +9342,39 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
         self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
         self._settle_resting_fill(target, held, Decimal(0) if replayed else cost, stamp_ns)
+        self._watch_fill_against_order(target, report)
         if raw is None:
             self._flag_unreadable_commission(target.venue_order_id, target.slug)
         self._check_commission_envelope(target, within)
         return True
+
+    def _watch_fill_against_order(self, target: RestingTarget, report: Any) -> None:
+        """B6 review S7: a venue fill that is not the order we rested (a filled quantity other
+        than the cached order's, or a BUY average price above its limit) raises a value-free
+        CRITICAL ``resting_fill_mismatch`` alert. The fill is still booked at the venue's own
+        figures (never adjusted to the order); no latch. SYNC, never raises."""
+        try:
+            cached = self._cache.order(ClientOrderId(target.client_order_id))
+            if cached is None or cached.price is None:
+                return
+            differs = (
+                report.filled_qty.as_decimal() != cached.quantity.as_decimal()
+                or report.avg_px > cached.price.as_decimal()
+            )
+        except Exception as exc:  # noqa: BLE001 - a watch, never a refusal
+            self._log.warning(f"resting fill: order comparison failed ({exc.__class__.__name__})")
+            return
+        if differs:
+            self._note_commission_alert(
+                "resting_fill_mismatch",
+                target.venue_order_id,
+                target.slug,
+                {"next": "booked_at_venue_figures_operator_review"},
+            )
+            self._log.error(
+                f"resting fill: {_redact_order_id(target.venue_order_id)} differs from the "
+                "order that was rested (quantity or price); booked at the venue's figures"
+            )
 
     def _poll_record_exists(self, venue_order_id: str) -> bool:
         """Does a durable ``POLL-`` fill record already stand for ``venue_order_id``? (SYNC;

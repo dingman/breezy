@@ -963,6 +963,8 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         "_rederived_commission_state",
         # B6 review S3 (NAMED row, widen only): the crash-replay probe of the fill booking.
         "_poll_record_exists",
+        # B6 review S7 (NAMED row, widen only): the fill-vs-rested-order watch.
+        "_watch_fill_against_order",
         # B6 review S4 (NAMED rows, widen only): the rest of the poll path's call graph, so the
         # set is closed under it (see the closure test below).
         "_settle_resting_terminal",
