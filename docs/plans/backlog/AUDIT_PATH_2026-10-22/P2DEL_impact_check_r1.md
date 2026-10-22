@@ -2,6 +2,161 @@
 
 Author: Grok Build (read-only), coordinator-accepted. Trigger: P2 FAIL (`docs/evidence/P2_NBP_VS_ASK_MURPHY_2026-10-22.md`); r2.1 item 3 requires a FAIL to get its own reviewed impact check. This is that check.
 
+## Recommendation
+
+Do not delete `pm_us_crh_fq_v1`. Leave the taker dormant behind the orders-off drop-in that is already installed. Deletion is the larger change and it breaks the supervisor's stop and self-check. The pre-registered FAIL already owes a reviewed impact check, and this check is that change: no source edit, no manifest edit, no pin edit, no restart.
+
+P2 failed on its own rule and deleted nothing. YES taker P&L was 150 takes, sum −7.92 USD, mean −0.0528 per take, wider 95% interval [−0.09066, −0.00768] (`docs/evidence/P2_NBP_VS_ASK_MURPHY_2026-10-22.md:66–94`). The live audit falsified the same taker: 34 fills, 4 wins, −2.63 (`docs/evidence/AUDIT_independent_2026-10-22.md:16–17`). r2.1 dropped the candidate delete list and said a FAIL is its own reviewed change (`docs/plans/backlog/AUDIT_PATH_2026-10-22/P2_plan_r2.md:117–120`). `docs/core/PROGRESS.md:54` records that debt. The binding floor is the simplest change (`PROGRESS.md:46–49`).
+
+## GOAL STATE
+
+The live node still boots family `pm_us_crh_fq_v1`, still subscribes, still holds the intent lock, and still cannot send, because `fq-v1-halt-orders-off.conf` forces `BREEZY_ORDERS_ENABLED=0`. Maker keepers, the calibration JSON, the FQ manifest, Nautilus, `allow_short`, the operator caps, the permit, and the enablement allowlist are unchanged.
+
+## WALK
+
+Checked against HEAD `b1d4ea02` on `feat/data-capture-and-risk`. `arm/integration` `c614fb0b` is not an ancestor of HEAD (`PROGRESS.md:36` says the same).
+
+1. The unit requests orders and names this one family: `BREEZY_ORDERS_ENABLED=1` and `BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1` (`deploy/systemd/breezy-trade-supervisor.service:121`, `:128`). Cardinality is one. There is no second configured family to fall back to.
+2. The installed drop-in overrides only the orders bit. On disk it is comments plus `[Service]` / `Environment=BREEZY_ORDERS_ENABLED=0` (`~/.config/systemd/user/breezy-trade-supervisor.service.d/fq-v1-halt-orders-off.conf:6–7`). It does not clear the family id. Its allowlist row permits exactly those two directives (`src/breezy/runtime/health_dropins.py:46–57`). A blank `Environment=BREEZY_SENDING_FAMILY_ID=` is not an unset: a blank value is `SettingsError` (`src/breezy/runtime/settings.py:348–350`). `UnsetEnvironment=` would be a new directive and would fail that allowlist.
+3. With the family still set, boot loads `deploy/families/pm_us_crh_fq_v1.json` (status `REGISTERED`, `terminal_climate_day` `2026-10-05`, density artefact sha `9c0b6d6e…`, `:6–19`) and dispatches `forecast_quantile_ladder` (`src/breezy/app/trade.py:956–963`). That path opens the submit-intent latch (`trade.py:1134–1136` → `_open_exec_latch` `:981–994` → `open_submit_intent_latch`). The lock file is `<store>.intent.lock` (`src/breezy/runtime/trade_supervisor.py:351–354`, `src/breezy/runtime/submit_intent.py:1339–1341`).
+4. Because orders are not requested, `main` logs `order submission permit not minted: orders not requested` and does not mint (`trade.py:1391–1397`). That string is `PERMIT_NOT_REQUESTED_MARKER` (`trade_supervisor_core.py:155`). `derive_self_check_facts` latches it (`:2097`, `:2110–2111`, `:2141`). `self_check` returns `PASS_ORDERS_NOT_REQUESTED` only after the child is alive, the tracked pid holds the flock, and the strategy subscribed (`:752–761`, then `:780–781` via `orders_expected_off` `:785–791`). The subscribe marker is `ForecastQuantileLadderStrategy subscribed` (`:164–168`).
+5. At 16:40Z `decide_stop_prior_action` SIGTERMs only when the discovered pid equals the lock holder (`trade_supervisor_core.py:37`, `:569–583`). The current node can be that holder. Launch is 16:50Z, self-check 17:05Z, launch window ends 17:00Z (`:38–44`).
+6. Quote tape, NWS ingest, quote-tape ingest, and `us-source-collector@` do not name this family (no match in those four unit files). Tape `ExecStart` is `breezy-quote-tape` (`deploy/systemd/breezy-quote-tape.service:114`). NWS `ExecStart` is `breezy` (`breezy-nws-ingest.service:14`). `settings.py:105` says the tape recorder never reads `BREEZY_SENDING_FAMILY_ID`. Removing the trade family would not stop them. It is the trade node that breaks, which is why this walk does not remove it.
+7. P4's imports keep resolving. No file in this walk is deleted. No restart. The 16:40Z stop and 16:50Z launch are left on the schedule they already have.
+
+### Why the three deletion-shaped alternatives lose
+
+**Unset the family and leave the code.** Unset (not blank) is a legal no-family boot: `settings.py:345–347` returns `None`, and `trade.py:1075–1087` logs `boot_family id=none …` and calls `trade_cli.run` with no strategies and no latch. The latch open at `:1136` is not reached, so this node does not hold `.intent.lock`. `decide_stop_prior_action` then cannot SIGTERM a discovered pid that is not the lock holder (`:579–583`): 16:40Z becomes `REFUSE_ALERT` or `NOOP`, not a stop. `self_check` returns `FAIL_NODE_NOT_READY` at `:756–757` (flock) or `:760–761` (no subscribe marker) and never reaches `PASS_ORDERS_NOT_REQUESTED`. The none-family log line is not the FQ subscribe marker (`:164–168`). Quote tape and the collectors keep running. The node is the thing that becomes unstoppable by the supervisor and red at 17:05Z.
+
+**Delete the manifest and leave the unit's family id.** Settings load fails closed (`settings.py:366–388`). With the drop-in, `BREEZY_ORDERS_ENABLED` is not `1`, so `main` logs the "not minted" line and falls through (`trade.py:1361–1364`); `run` hits the same `SettingsError` and returns `EXIT_CONFIG_ERROR` (`:1071–1073`). A dead child is `FAIL_CHILD_EXITED` (`trade_supervisor_core.py:752–753`). If the drop-in were absent, the unit's `ORDERS=1` makes that failure exit 1 with `order submission permit not issued` (`trade.py:1342–1356`), which `classify_exit1_cause` treats as `DETERMINISTIC` (`trade_supervisor_core.py:647–648`). Either way the node is down, reconciliation of an open position stops, and `scripts/analysis/maker_stage0_model.py:33` plus `load_model` `:98–120` can no longer open the manifest. FQ has no exit seam (`KINDS_WITH_EXIT_PATH` is only `continuous_rung_hold`; the halt pin is cited below), so the venue still settles, but this is a daily boot failure rather than a deletion.
+
+**Delete the r2 module list.** r2.1 withdrew that list (`P2_plan_r2.md:117–120`). Checked anyway, it is unsafe: `loss_stop_probe.py` and the manifest are maker inputs, and `forecast_quantile_ladder/__init__.py:10–33` imports the taker modules at package import, so deleting them breaks `from breezy.strategy.forecast_quantile_ladder.calibration_artefact import …` even if that file stays. The exact-set pins below would all have to move in a separately reviewed re-pin. Orders are already off, so the deletion removes no live send.
+
+## Acceptance criteria
+
+- No diff under `src/`, `tests/`, `deploy/families/`, or `deploy/systemd/`.
+- The unit still has `Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1` (`breezy-trade-supervisor.service:128`) and `BREEZY_ORDERS_ENABLED=1` (`:121`).
+- The drop-in file is still the two directives above, and `DROPIN_ALLOWLIST` is still the one row at `health_dropins.py:46–55` (sha `5ff0d6a1…`, ruling `RULING_FQ-v2-NO-TRADE_2026-10-08`, expiry `2026-12-31`). The sha of the live file was not recomputed in this pass.
+- `operator.env` is not read or written. Caps stay the two operator controls (`PROGRESS.md:19–24`).
+- The next 16:40Z stop still has a lock-holding node to SIGTERM, and the next 17:05Z self-check still has a subscribe marker to read. This plan does not itself restart anything, so those are properties of the running node, not of a new deploy.
+- `arm/integration` (`c614fb0b`) still imports `calibration_artefact`, `loss_stop_probe`, and `persistent_latch`, because those files are untouched.
+
+## File-by-file
+
+Recommended change: none.
+
+The r2 list (`P2_plan_r2.md:75–79`) was re-checked with codegraph on `projectPath=/home/jon/breezy`, grep over `src/`, `scripts/`, `tests/`, and `deploy/`, and `git grep` of `c614fb0b` plus maker-design `8de5ebd4`. Do not treat it as a delete set.
+
+| Path | Verdict | Why it is not safe to delete |
+|---|---|---|
+| `src/breezy/strategy/forecast_quantile_ladder/calibration_artefact.py` | KEEP | HEAD `no_ladder_maker/pno_store.py:29–32`. On `c614fb0b`: `no_ladder_maker/composition.py:30`, `live_feed.py:30`, `pno_store.py:29`, `strategy.py:96`. Maker-design scripts `maker_design_nobid.py:53`, `maker_stage0_driver.py:44`, `maker_stage0_modes.py:26`, `maker_stage0_pno_store.py:34`, `maker_stage0_report.py:20`, `maker_stage0_station_loop.py:22`. |
+| `persistent_latch.py` | KEEP | `analysis/labeling/attribution.py:44–46` on HEAD, on `c614fb0b`, and on maker-design. Constant `FORECAST_QUANTILE_TRIAL_KEY_PREFIX`, not the class. |
+| `loss_stop_probe.py` | KEEP | r2 listed it. HEAD production importer is only `trade.py:791`. `c614fb0b` maker imports it: `no_ladder_maker/composition.py:31` (`FqComposedVeto`, `LossStopProbe`) and `harm_stop_artefact.py:20`. P4 is that branch (`PROGRESS.md:36`, `:56`). |
+| `deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json` | KEEP | Manifest `:10–11` pins it. `c614fb0b:deploy/families/pm_us_no_maker_sharp_v1.json:9` points at the same file. Stage-0 and parity tests read it (`tests/strategy/no_ladder_maker/test_parity_vs_design_driver.py:79`). |
+| `deploy/families/pm_us_crh_fq_v1.json` | KEEP | r2 listed it. `maker_stage0_model.py:33` and `load_model` `:98–120` open it and check the sha. The live unit names this id (`service:128`). Deleting it is the boot failure above. |
+| `deploy/families/artefacts/not_applicable_boundary.json` | KEEP | Manifest `:7`. Not taker-only. |
+| `__init__.py` | KEEP as-is | `:10–33` imports bounds, calibration, config, decision, latch, margin, strategy. Any later taker deletion has to rewrite this first or the keeper import dies at package init. |
+| `decision.py`, `strategy.py`, `composition.py`, `plugin.py`, `capture_adapter.py`, `decision_funnel.py`, `latch.py`, `margin.py`, `config.py`, `bounds.py`, `artefact_bounds.py` | Dormant, not deleted | No `no_ladder_maker` import of these on `c614fb0b`. They are still imported by `trade.py:114–129`, by the package `__init__`, by each other, and by analysis scripts on maker-design (`fq_mc_livedata.py`, `fq_mc_type1.py`, `fq_resume_n_mc.py`, `fq_evaluate_shim.py`, `fq_loss_taxonomy_reconstruct.py`, `blend_veto_descriptive.py`, `nbp_shadow_parity.py`, `nbp_shadow_parity_pure.py`). `strategy.py:308` lazily imports `composition`. Deleting them is a script break plus the pin rewrite below, for no send reduction. |
+| `src/breezy/app/trade.py` FQ wiring (`:114–129`, `:791`, `:956–963`) | KEEP | This is the live composition branch. The arm maker does not depend on it; the running node does. |
+| `~/.config/systemd/user/.../fq-v1-halt-orders-off.conf` | DO NOT TOUCH | Removing it restores `BREEZY_ORDERS_ENABLED=1` from the unit (`service:121`). `PROGRESS.md:62` forbids hand-editing it. |
+| `operator.env`, Nautilus, `allow_short`, permit mint, `live_orders_gate` allowlist | DO NOT TOUCH | Operator caps and enablement (`PROGRESS.md:19–24`, `:46–48`). |
+
+`not_yet_calibrated_forecast_density.json` is a leftover sentinel. No py/json/sh filename citation turned up in the import pass. Leave it. It is not the density pin.
+
+## Pins and contract tests
+
+Recommended plan: no re-pin. Every row stays an equality.
+
+If a later reviewed change deletes taker modules anyway, re-pin by replacing the exact set with the exact set minus the FQ element, in its own reviewed commit. Never turn `==` into `<=`, never skip a missing file, never delete the test to go green. Regen `closure_manifest.py` with `scripts/ci/regen_closure_manifest`; do not hand-edit it. Lines below are from the tests/ enumeration pass over each deleted-module path and the family id.
+
+| Pin | Where | Re-pin only if deletion is forced |
+|---|---|---|
+| `_COMPOSITION_KINDS` | `test_composition_kind_exact_set_is_widened_by_exactly_one_row` `:47` | Drop `forecast_quantile_ladder` only. |
+| `COMPOSITION_KIND_SUBSCRIBED_MARKERS` | `test_marker_map_is_widened_by_exactly_one_row` `:70`; `test_the_family_line_is_not_a_supervisor_readiness_marker` `:217`; `test_subscribe_marker_class_names` `:209` | Drop the one FQ key. `test_subscribe_marker_is_parsed_from_the_real_fq_strategy_log_line` `:219` imports `strategy.py` and fails collection; do not weaken the other three markers to avoid it. |
+| `HALTABLE_COMPOSITION_KINDS` | `test_the_accepted_composition_kinds_are_pinned_exactly` `:188` | Drop FQ. Remainder `{continuous_rung_hold}`. |
+| `KINDS_WITH_EXIT_PATH` | `test_kinds_with_exit_path_is_pinned_exactly_and_within_the_haltable_kinds` `:239` | Do not touch. It is `{continuous_rung_hold}` and does not name FQ. |
+| `MODEL_CLASS_RE` | `test_model_class_kind_set_equals_composition_kinds` `:138` | Drop the FQ alternative in the same commit as `_COMPOSITION_KINDS`. The test only checks acceptance, so a leftover alternative stays green. Do not widen it. |
+| `NODE_PLUGINS` / `OFFLINE_PLUGINS` | `test_family_plugin_exact_set` `:196` | Drop the FQ key on both. Do not delete `evaluators/forecast_quantile_ladder.py` (not in the r2 set; it is the offline evaluator). Do not swap `FqEvaluator` for `RefusingPlugin` as a shortcut. |
+| `LIVE_GATE_ROUTED_KINDS` | `test_literal_identity_pins` `:119`; `test_every_live_kind_covers_required_detector_classes` `:85` | Would become empty. That is a registry edit, not a side effect of deleting `strategy.py`. Leave it under dormancy. |
+| `BOOTSTRAP_SEED` | `test_literal_identity_pins` `:122`; `test_bootstrap_seed_is_one_champion_and_unique_ids` `:146` | The seed is `(pm_us_crh_fq_v1, CHAMPION)` plus three retired ids. Removing the pair with no new champion fails the one-champion test. Do not rewrite it as part of a code deletion. |
+| `CLOSURE_MODULES["breezy.analysis.labeling.label_run"]` | `test_closure_manifest_equals_grimp_closure` `:689`; regen round-trip `:747` | Includes the package plus `artefact_bounds`, `bounds`, `calibration_artefact`, `composition`, `config`, `decision`, `decision_funnel`, `latch`, `margin`, `persistent_latch`, `strategy` (`closure_manifest.py:224–235`). Not `plugin`, `capture_adapter`, or `loss_stop_probe`. Rewrite `__init__.py` first, regen, drop only deleted names, keep the two keepers. |
+| `PRODUCER_SOURCE_SHA256` | `test_code_identity_pins_cover_import_closure` `:599`; `test_aut2_label_is_pinned_to_its_own_closure` `:15` | Re-pin both hashes after a real regen. `closure_manifest.py` sits in the health closure too, so the health hash moves even though that tuple has no FQ module. |
+| Closure component keys | `test_manifest_holds_only_the_reviewed_components_and_refuses_the_rest` `:90` | Do not touch. Keys are the health CLI and `label_run`. |
+| `SEAM_ALLOWLIST` | `test_every_exemption_and_allowlist_row_is_reasoned_literal_and_live` `:66` / `:369` | One row is `forecast_quantile_ladder/composition.py` `_resolve`. Remove that row only when the file is gone. Keep the `promotion_criteria.py` row. `POLICY_BAN_EXEMPTIONS == ()` stays empty. |
+| Loss-stop writer allowlist | `test_loss_stop_artefact_path_callers_in_closed_allowlist` `:48` / `:251` | Grandfathers `loss_stop_probe.py` and `app/trade.py`. Do not widen `_NEW_CALLERS` or `_WRITERS`. The arm maker adds callers; that is a P4 pin, not a deletion shortcut. |
+| Autonomy unit carve-outs | `test_every_carve_out_is_live_and_documented` `:67` / `:245` | Two rows match `composition_kind=forecast_quantile_ladder` in `replay-daily-run.sh` and `score-live-trials-run.sh`. Leave the shell lines and the rows. |
+| Replay / score / tally skip tests | `test_replay_daily_wrapper.py:148`; `test_score_live_trials_deploy.py:795`; `test_family_tally_v2_deploy.py:340` | Assert the FQ skip text for this family id. They fail if the manifest or the shell branch goes. |
+| `_FQ_S5_NEW_MODULES` | `test_fq_live_orders_gate_touches_no_operator_control` `:800` | Four paths must have zero operator-control assignments, including `composition.py`. The same module imports `persistent_latch` (`:99`). Do not drop `trade.py` from the scan. |
+| `_LIVE_ORDERS_ALLOWLIST` | `live_orders_gate.py` one tuple for `pm_us_crh_fq_v1` / `RULING_operator_fq_live_real_orders_2026-10-01`; sha pin test `:80` | Enablement. Strategy deletion does not fail it. Do not empty it under this plan. |
+| Manifest registration tests | `test_fq_s8_registration_artefacts.py:81`; `test_pm_us_crh_fq_v1_is_registered_with_the_operator_ruling` / `test_pm_us_crh_fq_v1_loads_and_names_the_right_composition_kind` (`test_forecast_quantile_ladder_manifest_and_markers.py:95`, `:104`); `test_the_installed_unit_names_a_REGISTERED_family` (`test_trade_supervisor_phase1_unit.py:49`, `:68`); `test_v1_manifest_terminal_day_parses` (`test_set_family_halt_cli.py:1424`) | All require the json to exist and be `REGISTERED`. The artefact sha equality in the s8 file (`:48`) stays with the JSON. |
+| Exec-client byte pin in that same manifest file | `test_exec_client_is_byte_identical_to_its_pre_sl13_sha256` `:117` | Global NO-SEND pin. Do not delete it with an FQ test. |
+| `DROPIN_ALLOWLIST` | `test_the_shipped_row_is_pinned_to_the_ruling_and_its_expiry` `:116`. `test_unit_health.py:1464–1497` is a fixture copy. | Do not remove the row. Cardinality is one. |
+| Exec import pin | `test_exec_import_pin_x1_is_superset_of_recorded_baseline` (`tests/contract/test_us_source_ingest_egress_guard.py:627`) and `BANNED_EXEC_TRANSPORT_MODULES` (`test_cage_rule_constants_are_pinned.py:386`) | Enumeration found no FQ module in that set. Do not touch. The difference assertion stays `==`. |
+| `allow_short` | FQ-local `tests/strategy/forecast_quantile_ladder/test_config.py:43`. Global copies do not name this family. | Deleting the FQ test with `config.py` must not be paired with editing the global short ban. `allow_short` stays `False` (`PROGRESS.md:46`). |
+| No-exit scan | `test_fq_has_no_exit_order_path` (`test_fq_loss_stop_probe.py:395`) | `offenders == []`. Do not weaken. It imports `loss_stop_probe`, which stays. |
+| Forbidden-import scan | `test_forbidden_imports.py:27` | Scans every module in the package. It is the import pin on the keepers. Do not delete it with the taker suite. |
+| `_EXIT_RULE_REGISTERED_FAMILIES` | exit-gate equality, `frozenset({"pm_us_crh_exit_v4"})` | Does not include this family. Do not add it and do not relax it. |
+| `test_r2_2_citation_map.py` | `:34` | No FQ row. Nothing to re-pin. Import-linter contracts do not name this package. |
+| `test_shadow_only_false_is_only_the_gate_output.py:201` | Incidental | Permitted path is `src/breezy/app/trade.py`. Does not fail if FQ `config.py` is deleted. Do not weaken the guard. |
+
+`_REQUIRED_KINDS` in `src/breezy/analysis/labeling/unit_factory_default.py:135` includes `forecast_quantile_ladder` and has no equality test, so a stale element would stay green. Under this plan it stays, which is correct: labeling still attributes this family.
+
+Keeper tests that must not be swept up with `tests/strategy/forecast_quantile_ladder/`: `test_calibration_artefact.py`, `test_persistent_latch.py`, `test_forbidden_imports.py`, `test_parity_vs_design_driver.py:48`, `test_aut2_attribution.py:46`, `test_te1_label_wiring.py:87`, `tests/support/te1_fixtures.py:37`, `test_family_halt_cli_fq.py:36`, `test_set_family_halt_cli.py:1436`, `test_operator_caps_through_the_live_composition.py:99`. `test_ct12_fq_halt_through_run.py:37` also imports `decision` and `strategy`; it is a halt-through-`run` test, not an exact-set pin, and it stays while those modules stay.
+
+## Deployment and activation
+
+No restart. No `daemon-reload`. No drop-in edit. The node that is up keeps running. The supervisor's next 16:40Z `STOP_PRIOR` and 16:50Z `LAUNCH` are unchanged (`trade_supervisor_core.py:37–38`).
+
+The 10 minutes between 16:40Z and 16:50Z are not a safe supervisor-restart window. The documented window is [01:00Z, 16:40Z), at or after 01:00:00Z and strictly before 16:40:00Z (`deploy/systemd/README.md:1389–1395`). `KillMode=process` (`breezy-trade-supervisor.service:163`) means a supervisor restart does not SIGTERM the node. An `ExecStopPost` reaper was rejected for that reason (`README.md:1379–1385`). Scheduler state is in memory, so a restart at or after 16:40Z can re-fire launch while a node still holds the lock.
+
+If someone later lands a real code change despite this recommendation: restart the supervisor only inside [01:00Z, 16:40Z), leave the current node up through that restart, let 16:40Z SIGTERM the lock holder, and let 16:50Z spawn the new code. Do not remove the drop-in in that same window. Collector timers are their own calendars and are not stopped by a trade-family edit.
+
+`deploy/systemd/README.md:1404–1409` still says the 17:05Z check reports `FAIL_SHADOW_MODE_NO_PERMIT` because `derive_self_check_facts` ignores `orders_not_requested_seen`, and it calls that expected. The source on this tree does latch the marker and can return `PASS_ORDERS_NOT_REQUESTED` (`trade_supervisor_core.py:2097–2141`, `:780–781`). The README paragraph is stale relative to that source. This plan does not "fix" the README, because no doc edit was asked and a doc-only correction would still be a commit. A live journal was not read, so this plan does not claim what the running process printed at the last 17:05Z.
+
+## Test strategy
+
+This plan has no diff, so `scripts/ci/run_tests_no_egress.sh` is not run and is not evidence for the no-change decision. The evidence is the import graph and the boot/stop lines above.
+
+If a later change deletes or re-pins anything, the evidence is that script on the primary tree, not a worktree, and it is necessary but not sufficient. Also required before that commit:
+
+- The re-pin is a separate reviewed commit from the deletion, equalities preserved as in the table.
+- Collection of the keeper tests listed above still passes. A deleted `tests/strategy/forecast_quantile_ladder/` tree must not take `test_calibration_artefact.py`, `test_persistent_latch.py`, or `test_forbidden_imports.py` with it.
+- No test is weakened to green. A red exact-set pin means the re-pin commit has not landed, not that the assertion should become a subset.
+- Nautilus, `allow_short`, `operator.env`, the drop-in bytes, and the exec-client sha pin are absent from the diff.
+
+## Risk register
+
+| Risk | What happens | Why dormancy is the control |
+|---|---|---|
+| 16:40Z cannot stop the node | Zero-family boot never takes `.intent.lock` (`trade.py:1075–1087` returns before `:1136`). Stop requires pid equality (`trade_supervisor_core.py:569–583`). | The live FQ node still takes the lock. |
+| 17:05Z pages `FAIL_NODE_NOT_READY` | No flock or no subscribe marker fails before the orders-off pass (`:756–761` vs `:780`). | Subscribed + orders off can reach `PASS_ORDERS_NOT_REQUESTED`. |
+| Orders come back on | Deleting or hand-editing the drop-in restores unit `ORDERS=1` (`service:121`). Allowlist expiry `2026-12-31` is already a calendar item (`PROGRESS.md:62`, `health_dropins.py:53`). | Drop-in bytes stay. Renewal stays a separate reviewed row. |
+| P4 cannot import calibration or the loss-stop probe | `__init__.py:10–33` plus `c614fb0b` `composition.py:30–31`. | Those files stay. |
+| Stage-0 model refuses | `maker_stage0_model.py:98–120` needs the manifest and the sha. | Both stay. |
+| Blank family id looks like "no family" | `Environment=VAR=` is empty, and empty is `SettingsError` (`settings.py:348–350`), and it is not an allowlisted directive (`health_dropins.py:57`). | The variable stays set to `pm_us_crh_fq_v1`. |
+| Settings failure while orders are really 1 | Exit 1, deterministic, no relaunch that day (`trade.py:1342–1356`, `trade_supervisor_core.py:647–648`). | The drop-in keeps the process environment at 0, so this branch is not taken. |
+| Open position stops being reconciled | A manifest deletion exits the node (`trade.py:1071–1073`). FQ has no exit path, so the process was never the settlement engine. | The node stays up. |
+| Quote tape or collectors stop | They would not. No family id in those units. Called out so a later plan does not add a fake dependency. | Untouched. |
+| README and code disagree on 17:05Z | Stale paragraph at `README.md:1404–1409`. | No operational change. Do not "repair" self-check behavior while orders are off. |
+
+## Confidence
+
+High that dormancy is the simplest correct close of P2-DEL. The send is already off, the stop contract needs the subscribed lock-holding node, and the maker branch imports files the r2 list would delete. That is enough to refuse the deletion without a remaining product choice.
+
+Explicit unknowns:
+
+- The running process was not inspected. HEAD is `b1d4ea02`; whether the live interpreter is that commit was not checked. The drop-in file was read this turn; its sha was not recomputed against `health_dropins.py:51`.
+- No live journal line was read. Source can return `PASS_ORDERS_NOT_REQUESTED`. `README.md:1404–1409` says the opposite. Which string the last 17:05Z printed is unverified.
+- `terminal_climate_day` `2026-10-05` (`pm_us_crh_fq_v1.json:6`) was not traced through strategy subscribe. Do not treat it as a send-stop. The drop-in is the send-stop.
+- How the supervisor fills `discovered_node_pid` for a child that never took the lock was not re-read. The stop function itself cannot SIGTERM unless that pid equals the lock holder (`:569–583`). The zero-family path never becomes the lock holder.
+- Supervisor handling of a child exit 2, beyond `FAIL_CHILD_EXITED` when the child is dead (`:752–753`), was not re-traced. The deterministic no-relaunch claim is for exit 1 plus `PERMIT_NOT_ISSUED_MARKER` (`:647–648`).
+- `trade_cli.run`'s empty-strategy default was not re-read this turn. The cited fact is only the early return at `trade.py:1075–1087`, which passes no strategies and does not open the latch.
+- The pin table's test line numbers come from one enumeration pass over `tests/`. The runtime lines in the walk were re-read. A line number inside a test file that this turn did not open can be off by a few lines; the test names and the exact sets are the part to trust.
+- Maker-design codegraph could not be queried (readonly database). Its import list is `git grep` at `8de5ebd4`, not a graph. The arm result is `git grep` of commit `c614fb0b`, not a dirty worktree.
+- `not_yet_calibrated_forecast_density.json` had no filename consumer in the searches that were run. A dynamic path build could still open it. Nothing in this plan removes it.
+
+No files were written, no commit was made, and no service was restarted.
+
 
 ---
 
@@ -497,4 +652,4 @@ r2 candidate delete set (r2.1 dropped the list as a mandate, not a replacement):
 | `tests/unit/test_shadow_only_false_is_only_the_gate_output.py` | `test_a_changed_config_default_is_flagged` | 201 | INCIDENTAL | path string `.../config.py` is a synthetic argument, not a live file read | Permitted path is only `src/breezy/app/trade.py`. Does not fail if `config.py` is deleted. |
 | `tests/unit/test_r2_2_citation_map.py` | `test_r2_2_citation_map_symbols_resolve` | 34 | INCIDENTAL | map has no `forecast_quantile_ladder` / `pm_us_crh_fq_v1` / `fq-v1` row | Will not fail. |
 
-
+Unclassified: `_REQUIRED_KINDS` has no equality test, so a stale FQ element stays green. `MODEL_CLASS_RE` is only checked in the accepting direction, so a leftover alternative stays green.
