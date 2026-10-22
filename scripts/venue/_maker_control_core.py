@@ -34,6 +34,9 @@ MAX_GETS: Final[int] = 40
 MAX_AUX_GETS: Final[int] = 20
 #: At most this many public quote reads while choosing the two probe slugs.
 QUOTE_SCAN_CAP: Final[int] = 6
+#: Listing pages read while choosing slugs (the first is a MAX_GETS read, the rest auxiliary).
+#: The data client pages until a short page; this bounds the same walk for a one-shot control.
+MAX_LIST_PAGES: Final[int] = 4
 #: Activities pages read while looking for a position-resolution row (the first is a MAX_GETS read).
 ACTIVITIES_MAX_PAGES: Final[int] = 4
 
@@ -126,6 +129,23 @@ QUOTE_OK: Final[str] = "OK"
 QUOTE_HIGH_PRICE: Final[str] = "HIGH_PRICE"
 QUOTE_UNREADABLE: Final[str] = "UNREADABLE"
 QUOTE_HALTED: Final[str] = "HALTED"
+
+#: Value-free reasons a listed market is not a probe candidate (counted, never named).
+REASON_PAYLOAD_REJECTED: Final[str] = "PAYLOAD_REJECTED"
+REASON_NOT_WEATHER: Final[str] = "NOT_WEATHER"
+REASON_UNREGISTERED_CITY: Final[str] = "UNREGISTERED_CITY"
+REASON_LISTING_UNREADABLE: Final[str] = "LISTING_UNREADABLE"
+REASON_NOT_LISTED: Final[str] = "NOT_LISTED"
+REASON_NOT_DAILY_HIGH: Final[str] = "NOT_DAILY_HIGH"
+REASON_RESOLVED: Final[str] = "RESOLVED"
+REASON_INACTIVE: Final[str] = "INACTIVE"
+REASON_HIDDEN: Final[str] = "HIDDEN"
+REASON_TICK: Final[str] = "TICK_NOT_ONE_CENT"
+REASON_MIN_QTY: Final[str] = "MIN_QTY_ABOVE_ONE_OR_UNREADABLE"
+MODE_FULL: Final[str] = "full"
+MODE_SELECT_ONLY: Final[str] = "select_only"
+OUTCOME_SELECT_PAIR: Final[str] = "SELECT_ONLY_PAIR_FOUND"
+OUTCOME_SELECT_NO_PAIR: Final[str] = "SELECT_ONLY_NO_PAIR"
 _MARKET_OPEN_STATE: Final[str] = "MARKET_STATE_OPEN"
 _MARKET_OPEN_STATUS: Final[str] = "MARKET_STATUS_OPEN"
 _MARKET_OPEN_EP3: Final[str] = "OPEN"
@@ -669,6 +689,18 @@ class RunState:
             "leftover": [],
         }
     )
+    selection: dict[str, Any] = field(
+        default_factory=lambda: {
+            "markets_seen": 0,
+            "pages": 0,
+            "listing_complete": None,
+            "eligible": 0,
+            "scanned": 0,
+            "excluded_by_reason": {},
+            "chosen": [],
+        }
+    )
+    select_only: bool = False
     final_open_ids: frozenset[str] = frozenset()
     final_account_clean: bool | None = None
     failure: str | None = None
@@ -713,8 +745,17 @@ class RunState:
             and self.final_account_clean is True
             and not self.filled_orders
             and not self.cleanup["leftover"]
+            and not self.select_only
         )
+        outcome = VERDICT_PASS if passed else VERDICT_FAIL
+        failure = self.failure if self.failure is not None else self._unmet(passed)
+        if self.select_only:
+            found = bool(self.slugs) and self.failure is None
+            outcome = OUTCOME_SELECT_PAIR if found else OUTCOME_SELECT_NO_PAIR
+            failure = None if found else (self.failure or "NO_ELIGIBLE_SLUGS")
         return {
+            "mode": MODE_SELECT_ONLY if self.select_only else MODE_FULL,
+            "selection": json.loads(json.dumps(self.selection)),
             "schema": EVIDENCE_SCHEMA,
             "run_date": self.run_date,
             "started_at": iso_utc(self.started_ns),
@@ -758,8 +799,8 @@ class RunState:
             "activities": dict(self.activities),
             "cleanup": {k: list(v) for k, v in self.cleanup.items()},
             "final_account_clean": self.final_account_clean,
-            "outcome": VERDICT_PASS if passed else VERDICT_FAIL,
-            "failure": self.failure if self.failure is not None else self._unmet(passed),
+            "outcome": outcome,
+            "failure": failure,
         }
 
 
@@ -821,6 +862,8 @@ _EVIDENCE_KEYS: Final[frozenset[str]] = frozenset(
         "final_account_clean",
         "outcome",
         "failure",
+        "mode",
+        "selection",
     }
 )
 
@@ -854,6 +897,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--run-date",
         required=True,
         help="today's UTC date, YYYY-MM-DD; any other value refuses before any I/O",
+    )
+    parser.add_argument(
+        "--select-only",
+        action="store_true",
+        help="preflight, list markets and read quotes, write the selection; sends no POST",
     )
     return parser.parse_args(argv)
 
@@ -921,6 +969,7 @@ _EVENT_SPLIT_RE: Final[re.Pattern[str]] = re.compile(
     r"(tc-temp-[a-z]{3}high-(\d{4}-\d{2}-\d{2}))-(.+)"
 )
 _RUNG_RE: Final[re.Pattern[str]] = re.compile(r"(?:gte(\d+))?(?:lt(\d+))?f", re.ASCII)
+_Q2_REASONS: Final[frozenset[str]] = frozenset({"NOT_OPEN", "CLOSE_UNREADABLE", "CLOSE_TOO_SOON"})
 _LOW_TAIL_RANK: Final[int] = -1
 _HIGH_TAIL_RANK: Final[int] = 10**6
 
@@ -945,6 +994,33 @@ def market_exclusion(market: Mapping[str, Any], *, now_ns: int) -> str | None:
     return None
 
 
+def probe_exclusion(
+    slug: str,
+    market: Mapping[str, Any] | None,
+    *,
+    is_daily_high: Callable[[str], bool],
+    is_resolved: Callable[[Mapping[str, Any]], bool],
+    now_ns: int,
+) -> str | None:
+    """The single value-free reason ``slug`` is not an eligible probe market, else ``None``."""
+    if market is None:
+        return REASON_NOT_LISTED
+    if not is_daily_high(slug):
+        return REASON_NOT_DAILY_HIGH
+    if is_resolved(market):
+        return REASON_RESOLVED
+    if market.get("active") is False:
+        return REASON_INACTIVE
+    if market.get("hidden") is True:
+        return REASON_HIDDEN
+    if _number(market.get("orderPriceMinTickSize")) != PROBE_PRICE:
+        return REASON_TICK
+    min_qty = _number(market.get("minimumTradeQty"))
+    if min_qty is None or min_qty > PROBE_QUANTITY:
+        return REASON_MIN_QTY
+    return market_exclusion(market, now_ns=now_ns)
+
+
 def eligible_probe_slugs(
     payload: Mapping[str, Any],
     *,
@@ -952,32 +1028,34 @@ def eligible_probe_slugs(
     is_daily_high: Callable[[str], bool],
     is_resolved: Callable[[Mapping[str, Any]], bool],
     now_ns: int,
+    reasons: dict[str, int] | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     """Listed, open, far-from-close daily-HIGH slugs (sorted), and counts of Q2 exclusions.
 
     Eligibility: daily HIGH, not archived/closed/resolved/inactive/hidden, tick $0.01, minimum
     quantity <= 1, plainly open, and :func:`market_exclusion` clear. The predicates are the
-    caller's (the exec package's grammar and the provider's resolved test).
+    caller's (the exec package's grammar and the provider's resolved test). ``reasons``, when
+    given, receives a count for EVERY exclusion (see :func:`probe_exclusion`); the returned
+    mapping keeps only the Q2 close and status reasons.
     """
     markets = markets_by_slug(payload)
     eligible: list[str] = []
     excluded: dict[str, int] = {}
     for slug in sorted(set(candidates)):
-        market = markets.get(slug)
-        if market is None or not is_daily_high(slug) or is_resolved(market):
+        reason = probe_exclusion(
+            slug,
+            markets.get(slug),
+            is_daily_high=is_daily_high,
+            is_resolved=is_resolved,
+            now_ns=now_ns,
+        )
+        if reason is None:
+            eligible.append(slug)
             continue
-        if market.get("active") is False or market.get("hidden") is True:
-            continue
-        if _number(market.get("orderPriceMinTickSize")) != PROBE_PRICE:
-            continue
-        min_qty = _number(market.get("minimumTradeQty"))
-        if min_qty is None or min_qty > PROBE_QUANTITY:
-            continue
-        reason = market_exclusion(market, now_ns=now_ns)
-        if reason is not None:
+        if reasons is not None:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        if reason in _Q2_REASONS:
             excluded[reason] = excluded.get(reason, 0) + 1
-            continue
-        eligible.append(slug)
     return eligible, excluded
 
 

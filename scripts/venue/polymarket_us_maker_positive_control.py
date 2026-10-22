@@ -57,6 +57,12 @@ reads an empty list as "cancel the whole account", so that body is unconstructib
 only: no headers, signatures, key id, raw bodies, amounts or other accounts' ids. URLs go
 through ``redact_url``. Files are ``0600``.
 
+**``--select-only``** runs the preconditions (1 to 4 above), the markets listing and the public
+quote reads, writes the evidence (``mode`` ``select_only``, every verdict ``NOT_RUN``, no licence)
+and prints one summary line. It reads the activities feed not at all and builds no write
+request: a read-only way to see which two slugs a full run would pick, and why others were
+dropped (``selection.excluded_by_reason``: counts per reason, no slug and no venue value).
+
 Exit codes: 0 all steps ran and the account is clean; 1 a step failed (own orders were cancelled
 by id first) or the account was not clean at the end; 2 a precondition refused.
 """
@@ -65,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import re
 import resource
 import sys
@@ -99,12 +106,17 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     FILL_STATES,
     GTD_CEILING_SECS,
     GTD_ECHO_TOLERANCE_NS,
+    MAX_LIST_PAGES,
     NS_PER_S,
     PROBE_PRICE,
     PROBE_QUANTITY,
     QUOTE_OK,
     QUOTE_SCAN_CAP,
     QUOTE_UNREADABLE,
+    REASON_LISTING_UNREADABLE,
+    REASON_NOT_WEATHER,
+    REASON_PAYLOAD_REJECTED,
+    REASON_UNREGISTERED_CITY,
     REST_GTD_SECS,
     SHORT_GTD_SECS,
     STATE_CANCELED,
@@ -180,7 +192,6 @@ from breezy.adapters.polymarket_us.exec.reports import ORDER_STATE_TO_ORDER_STAT
 from breezy.adapters.polymarket_us.factories import config_from_env
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
-from breezy.adapters.polymarket_us.provider import discovery_candidate_slugs
 from breezy.adapters.polymarket_us.redaction import redact_url
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
 from breezy.adapters.polymarket_us.transport import (
@@ -210,11 +221,43 @@ _FILL_NOTICE: Final[str] = (
 _LEFTOVER_NOTICE: Final[str] = "order {order_id} may rest; cancel by hand"
 
 
-def _candidates(payload: Mapping[str, Any], city_codes: tuple[str, ...]) -> list[str] | None:
-    try:
-        return list(discovery_candidate_slugs(payload, city_codes=city_codes))
-    except (PolymarketUSError, TypeError, ValueError):
+def _candidates(
+    payload: Mapping[str, Any],
+    city_codes: tuple[str, ...],
+    *,
+    reasons: dict[str, int] | None = None,
+) -> list[str] | None:
+    """Weather slugs the data client's own discovery accepts, one market at a time.
+
+    Production runs ``provider._weather_market_payloads`` with ``collect_unregistered=True`` so a
+    listed city outside the settlement registry is recorded, not fatal. The strict public
+    ``discovery_candidate_slugs`` raises on the first such market, which blanked the 2026-10-22
+    selection. Each market goes through the SAME production parser alone, so one rejected market
+    is counted (``reasons``) and cannot hide the others. ``None``: no readable ``markets`` list.
+    """
+    markets = payload.get("markets") if isinstance(payload, Mapping) else None
+    if not isinstance(markets, list):
+        _count(reasons, REASON_LISTING_UNREADABLE)
         return None
+    found: list[str] = []
+    for market in markets:
+        try:
+            accepted, sightings = _provider._weather_market_payloads(
+                {"markets": [market]}, city_codes, collect_unregistered=True
+            )
+        except (PolymarketUSError, TypeError, ValueError):
+            _count(reasons, REASON_PAYLOAD_REJECTED)
+            continue
+        if accepted:
+            found.append(str(accepted[0]["slug"]))
+        else:
+            _count(reasons, REASON_UNREGISTERED_CITY if sightings else REASON_NOT_WEATHER)
+    return found
+
+
+def _count(reasons: dict[str, int] | None, reason: str) -> None:
+    if reasons is not None:
+        reasons[reason] = reasons.get(reason, 0) + 1
 
 
 def _is_resolved(market: Mapping[str, Any]) -> bool:
@@ -222,9 +265,13 @@ def _is_resolved(market: Mapping[str, Any]) -> bool:
 
 
 def _rank_with_counts(
-    payload: Mapping[str, Any], *, city_codes: tuple[str, ...], now_ns: int
+    payload: Mapping[str, Any],
+    *,
+    city_codes: tuple[str, ...],
+    now_ns: int,
+    reasons: dict[str, int] | None = None,
 ) -> tuple[list[str], dict[str, int]]:
-    candidates = _candidates(payload, city_codes)
+    candidates = _candidates(payload, city_codes, reasons=reasons)
     if candidates is None:
         return [], {}
     eligible, excluded = eligible_probe_slugs(
@@ -233,6 +280,7 @@ def _rank_with_counts(
         is_daily_high=submit_chain.is_daily_high_slug,
         is_resolved=_is_resolved,
         now_ns=now_ns,
+        reasons=reasons,
     )
     return rank_probe_slugs(eligible, now_ns=now_ns), excluded
 
@@ -298,6 +346,11 @@ class ControlSession:
         self.create_in_doubt = False
         self.trace: list[dict[str, Any]] = []
         self._markets: dict[str, Mapping[str, Any]] = {}
+        #: Listing walk counters for the evidence (counts only): pages read, rows seen, and
+        #: whether the walk ended on a short page (True) or was cut off or unreadable (False).
+        self.list_pages = 0
+        self.markets_seen = 0
+        self.list_complete: bool | None = None
         self._factory = OrderFactory(
             trader_id=TraderId("BREEZY-B2-001"),
             strategy_id=StrategyId("B2CONTROL-001"),
@@ -388,16 +441,57 @@ class ControlSession:
         return reason
 
     async def list_markets(self) -> Reading:
-        reading = await self._get(
-            "list_markets",
-            "/v1/markets",
-            public=True,
-            query=market_list_query(self._discovery),
-            quota_key=QUOTA_KEY_DISCOVERY,
-        )
-        if isinstance(reading.payload, Mapping):
-            self._markets = markets_by_slug(reading.payload)
-        return reading
+        """Page the listing like the data client: offsets of ``limit`` until a short page.
+
+        Page one is a ``MAX_GETS`` read and every further page an auxiliary read, at most
+        ``MAX_LIST_PAGES`` in all. The returned payload holds every row read; ``list_pages``,
+        ``markets_seen`` and ``list_complete`` describe the walk (counts only).
+        """
+        query = market_list_query(self._discovery)
+        limit = self._discovery.limit
+        rows: list[Any] = []
+        first: Reading | None = None
+        self.list_pages, self.list_complete = 0, True
+        for page in range(MAX_LIST_PAGES):
+            label = "list_markets" if page == 0 else f"list_markets_p{page + 1}"
+            try:
+                reading = await self._get(
+                    label,
+                    "/v1/markets",
+                    public=True,
+                    query={**query, "offset": page * limit},
+                    quota_key=QUOTA_KEY_DISCOVERY,
+                    aux=page > 0,
+                )
+            except BudgetExhausted:
+                if page == 0:
+                    raise
+                self.list_complete = False
+                break
+            self.list_pages += 1
+            first = first if first is not None else reading
+            page_rows = (
+                reading.payload.get("markets")
+                if reading.status == 200 and isinstance(reading.payload, Mapping)
+                else None
+            )
+            if not isinstance(page_rows, list):
+                self.list_complete = False
+                break
+            rows.extend(page_rows)
+            if len(page_rows) < limit:
+                break
+        else:
+            self.list_complete = False
+        self.markets_seen = len(rows)
+        if first is None:  # pragma: no cover - page one either reads or raises
+            return Reading(None, None)
+        merged = first
+        if self.list_pages > 1 and isinstance(first.payload, Mapping):
+            merged = Reading(first.status, {**first.payload, "markets": rows})
+        if isinstance(merged.payload, Mapping):
+            self._markets = markets_by_slug(merged.payload)
+        return merged
 
     def _build_resting_body(self, slug: str, gtd_secs: int) -> dict[str, Any]:
         if not 0 < gtd_secs <= GTD_CEILING_SECS:
@@ -643,27 +737,43 @@ async def _choose_pair(
 
     At most ``QUOTE_SCAN_CAP`` reads. A slug whose quote is unreadable, halted or near-resolved
     is excluded. Fewer than two qualifying slugs returns ``None`` (the caller refuses; nothing
-    has been written).
+    has been written). ``state.selection`` receives the value-free counts as they are learned.
     """
+    selection = state.selection
+    selection["pages"] = session.list_pages
+    selection["markets_seen"] = session.markets_seen
+    selection["listing_complete"] = session.list_complete
+    by_reason: dict[str, int] = selection["excluded_by_reason"]
     if not isinstance(markets_payload, Mapping):
+        _count(by_reason, REASON_LISTING_UNREADABLE)
         return None
     ranked, market_excluded = _rank_with_counts(
-        markets_payload, city_codes=session.discovery.city_codes, now_ns=session.now_ns()
+        markets_payload,
+        city_codes=session.discovery.city_codes,
+        now_ns=session.now_ns(),
+        reasons=by_reason,
     )
     state.quote_guard["market_excluded"] = dict(sorted(market_excluded.items()))
+    selection["eligible"] = len(ranked)
     qualified: set[str] = set()
+    pair: ProbeSlugs | None = None
     for slug in ranked[:QUOTE_SCAN_CAP]:
         verdict = await session.read_quote(slug)
         state.quote_guard["scanned"] += 1
+        selection["scanned"] += 1
         if verdict == QUOTE_OK:
             qualified.add(slug)
         else:
             excluded = state.quote_guard["excluded"]
             excluded[verdict] = excluded.get(verdict, 0) + 1
+            _count(by_reason, f"QUOTE_{verdict}")
         pair = pick_pair(ranked, qualified)
         if pair is not None and pair.share_event:
-            return pair
-    return pick_pair(ranked, qualified)
+            break
+    else:
+        pair = pick_pair(ranked, qualified)
+    selection["chosen"] = list(pair.slugs) if pair is not None else []
+    return pair
 
 
 # -------------------------------------------------------------------------- sequence
@@ -964,8 +1074,53 @@ def _announce_orders(state: RunState) -> None:
         print(_LEFTOVER_NOTICE.format(order_id=order_id), file=sys.stderr)
 
 
-async def run(run_date: str, deps: Deps) -> int:
-    """Preconditions, then the control, then the evidence file. Returns the exit code."""
+async def _select_only_sequence(session: ControlSession, state: RunState) -> None:
+    """Listing and quote reads only: no activities feed, no order, no cancel, no POST."""
+    markets = await session.list_markets()
+    chosen = await _choose_pair(session, state, markets.payload)
+    if chosen is not None:
+        state.slugs = chosen.slugs
+        state.share_event = chosen.share_event
+
+
+def _select_only_summary(document: Mapping[str, Any], path: Path) -> str:
+    selection = document["selection"]
+    found = bool(document["slugs"])
+    reasons = json.dumps(selection["excluded_by_reason"], sort_keys=True, separators=(",", ":"))
+    return (
+        f"B2_SELECT_ONLY outcome={document['outcome']} pages={selection['pages']} "
+        f"markets_seen={selection['markets_seen']} eligible={selection['eligible']} "
+        f"scanned={selection['scanned']} pair={'found' if found else 'none'} "
+        f"share_event={str(document['slugs_share_event']).lower()} "
+        f"slugs={','.join(document['slugs']) or '-'} excluded={reasons} evidence={path}"
+    )
+
+
+async def _run_select_only(session: ControlSession, state: RunState, deps: Deps) -> int:
+    stamp = f"select_only_{deps.stamp()}"
+    try:
+        await _select_only_sequence(session, state)
+    except BaseException as exc:
+        state.failure = (
+            "BUDGET_EXHAUSTED" if isinstance(exc, BudgetExhausted) else type(exc).__name__
+        )
+        write_evidence(state.document(session), deps.evidence_dir, stamp=stamp)
+        if not isinstance(exc, Exception):
+            raise
+        print(f"B2_SELECT_ONLY FAILED code={state.failure}", file=sys.stderr)
+        return 1
+    document = state.document(session)
+    path = write_evidence(document, deps.evidence_dir, stamp=stamp)
+    print(_select_only_summary(document, path))
+    return 0 if state.slugs else 1
+
+
+async def run(run_date: str, deps: Deps, *, select_only: bool = False) -> int:
+    """Preconditions, then the control, then the evidence file. Returns the exit code.
+
+    ``select_only`` stops after the preconditions (run date, no trade node, node probe, clean
+    open-orders) and the read-only slug selection: it never builds or sends a POST.
+    """
     try:
         require_run_date(run_date, deps.today_utc())
         env = deps.load_env()
@@ -979,7 +1134,9 @@ async def run(run_date: str, deps: Deps) -> int:
     except BudgetExhausted:
         print("B2_CONTROL REFUSED code=BUDGET_EXHAUSTED", file=sys.stderr)
         return 2
-    state = RunState(run_date=run_date, started_ns=session.now_ns())
+    state = RunState(run_date=run_date, started_ns=session.now_ns(), select_only=select_only)
+    if select_only:
+        return await _run_select_only(session, state, deps)
     try:
         result = await run_control(session, sleep=deps.sleep, run_date=run_date, state=state)
     except BaseException:
@@ -1049,7 +1206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     install_termination_handlers()
     try:
-        return asyncio.run(run(args.run_date, _production_deps()))
+        return asyncio.run(run(args.run_date, _production_deps(), select_only=args.select_only))
     except KeyboardInterrupt:
         print("B2_CONTROL INTERRUPTED cleanup and evidence were attempted", file=sys.stderr)
         return 1

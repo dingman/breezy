@@ -888,5 +888,5 @@ def test_aux_budget_is_separate_and_bounded(ctl: Any) -> None:
     with pytest.raises(ctl.BudgetExhausted):
         budget.spend_aux_get()
     assert budget.gets == 0
-    plan = ctl.QUOTE_SCAN_CAP + 3 + 3 + (ctl.ACTIVITIES_MAX_PAGES - 1)
+    plan = ctl.QUOTE_SCAN_CAP + 3 + 3 + (ctl.ACTIVITIES_MAX_PAGES - 1) + (ctl.MAX_LIST_PAGES - 1)
     assert plan <= ctl.MAX_AUX_GETS

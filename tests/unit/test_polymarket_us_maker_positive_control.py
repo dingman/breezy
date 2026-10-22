@@ -752,6 +752,8 @@ _EVIDENCE_TOP_KEYS = {
     "final_account_clean",
     "outcome",
     "failure",
+    "mode",
+    "selection",
 }
 
 

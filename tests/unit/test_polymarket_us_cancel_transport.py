@@ -50,7 +50,10 @@ _B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
 #: Re-digested again at the B2 open-orders eof fix (exec rule: eof absent is complete,
 #: unknown envelope key refuses). Prior digest:
 #: 1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50
-_B2_CONTROL_SHA256 = "ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f"
+#: Re-digested once at the B2 slug-selection fix (production-parity candidates, paged listing,
+#: value-free selection diagnostics, --select-only). Prior digest:
+#: ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f
+_B2_CONTROL_SHA256 = "c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc"
 
 
 class _Resp:

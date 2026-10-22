@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Final, cast
+from urllib.parse import parse_qs, urlsplit
 
 from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
@@ -151,6 +152,9 @@ class FakeVenue:
         # activities paging
         self.activities_pages: list[Any] | None = None
         self.activity_urls: list[str] = []
+        # markets paging: offset -> page body; None serves ``markets`` for every offset
+        self.markets_pages: dict[int, Any] | None = None
+        self.markets_urls: list[str] = []
 
     # ------------------------------------------------------------------ helpers
     def clock(self) -> int:
@@ -237,6 +241,10 @@ class FakeVenue:
                 return _json(self.activities_status, self.activities_pages[index])
             return _json(self.activities_status, self.activities_page)
         if path == "/v1/markets":
+            self.markets_urls.append(url)
+            if self.markets_pages is not None:
+                offset = int(parse_qs(urlsplit(url).query).get("offset", ["0"])[0])
+                return _json(200, self.markets_pages.get(offset, {"markets": []}))
             return _json(200, self.markets)
         return _json(404, {})
 
@@ -408,8 +416,11 @@ class FakePostClient:
     def __init__(self, venue: FakeVenue) -> None:
         self._venue = venue
         self.calls: list[dict[str, Any]] = []
+        self.forbid = False  # select-only proofs: any POST is a test failure
 
     async def post(self, url: str, *, headers: Any, body: bytes, keys: list[str]) -> Any:
+        if self.forbid:
+            raise AssertionError("a POST was attempted where none is allowed")
         self.calls.append({"url": url, "headers": dict(headers), "body": body, "keys": list(keys)})
         return _PostResponse(self._venue.handle_post(url, body))
 
@@ -465,7 +476,13 @@ RUN_DATE: Final[str] = "2026-10-22"
 class Rig:
     """One fake venue plus the real client stack over it."""
 
-    def __init__(self, ctl: Any, venue: FakeVenue | None = None, budget: Any = None):
+    def __init__(
+        self,
+        ctl: Any,
+        venue: FakeVenue | None = None,
+        budget: Any = None,
+        discovery: Any = None,
+    ):
         self.ctl = ctl
         self.venue = venue or FakeVenue()
         self.post_client = FakePostClient(self.venue)
@@ -486,7 +503,7 @@ class Rig:
             write_signer=self.write_signer,
             api_base_url=API,
             gateway_base_url=GATEWAY,
-            discovery=PolymarketUSMarketDiscoveryConfig(),
+            discovery=discovery if discovery is not None else PolymarketUSMarketDiscoveryConfig(),
             now_ns=self.venue.clock,
             budget=self.budget,
         )
