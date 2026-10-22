@@ -337,28 +337,51 @@ def test_the_write_callable_has_no_method_query_or_body_parameter() -> None:
 
 @pytest.mark.asyncio
 async def test_it_issues_exactly_one_post_to_the_one_pinned_path() -> None:
-    """Equality to the one path, never membership in a widened allowlist."""
+    """Equality to the one path per verb, never membership in a widened allowlist.
+
+    ARM B1 (S4 r4 T2): the call keys widen from ``{url, headers, keys}`` to
+    ``{url, headers, body, keys}`` -- the cancel verbs now REQUIRE a body.
+    """
     from breezy.adapters.polymarket_us.write_transport import (
         CANCEL_ALL_PATH,
         PolymarketUSWriteTransport,
     )
 
+    slug = "tc-temp-nychigh-2026-10-13-lt71f"
+    order_id = "ABCDEF123456"
     client = _RecordingWriteClient()
     transport = PolymarketUSWriteTransport(client=client)
     response = await transport.post_cancel_all(
         "https://api.example.invalid",
         headers={ACCESS_KEY_HEADER: "k"},
+        slugs=[slug],
+    )
+    await transport.post_cancel_order(
+        "https://api.example.invalid",
+        headers={ACCESS_KEY_HEADER: "k"},
+        order_id=order_id,
+        market_slug=slug,
     )
 
-    assert len(client.calls) == 1
-    call = client.calls[0]
-    assert set(call) == {"url", "headers", "keys"}
-    assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
-    assert call["headers"] == {ACCESS_KEY_HEADER: "k"}
-    path = call["url"].removeprefix("https://api.example.invalid")
-    assert {path} == {CANCEL_ALL_PATH} == {_CANCEL_ALL_PATH}
+    assert len(client.calls) == 2
+    expected_paths = [CANCEL_ALL_PATH, f"/v1/order/{order_id}/cancel"]
+    for call, expected_path in zip(client.calls, expected_paths, strict=True):
+        assert set(call) == {"url", "headers", "body", "keys"}
+        assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
+        assert call["headers"] == {ACCESS_KEY_HEADER: "k"}
+        path = call["url"].removeprefix("https://api.example.invalid")
+        assert {path} == {expected_path}
+    assert expected_paths[0] == _CANCEL_ALL_PATH
     assert isinstance(response, VenueResponse)
     assert response.status == 200
+
+    # Non-vacuity plant: a bodiless cancel-all (the pre-B1 shape, an account-wide
+    # cancel) cannot be issued and records no call.
+    with pytest.raises(TypeError):
+        await transport.post_cancel_all(  # type: ignore[call-arg]
+            "https://api.example.invalid", headers={ACCESS_KEY_HEADER: "k"}
+        )
+    assert len(client.calls) == 2
 
 
 # --------------------------------------------------------------------------
@@ -598,3 +621,88 @@ def test_write_canonical_string_verified_is_true_after_op4() -> None:
     from breezy.adapters.polymarket_us.write_transport import WRITE_CANONICAL_STRING_VERIFIED
 
     assert WRITE_CANONICAL_STRING_VERIFIED is True
+
+
+# --------------------------------------------------------------------------
+# 11. S4 WP4 (ARM B5): the two cancel verbs are refused by the OS egress block
+# --------------------------------------------------------------------------
+
+_CANCEL_SLUG = "tc-temp-nychigh-2026-10-21-gte70f"
+
+
+class _RawExceptionSpy:
+    """Wraps the REAL native ``HttpClient`` and keeps the raw pyo3 exception that the
+    transport later re-raises ``from None`` as a ``VenueTransportError``."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.raw: BaseException | None = None
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await self._real.post(*args, **kwargs)
+        except BaseException as exc:
+            self.raw = exc
+            raise
+
+
+def _real_spy_transport() -> tuple[Any, _RawExceptionSpy, str]:
+    """The REAL native client (captured by conftest before its own block), a spy over
+    it, and a TEST-NET base URL. The firewall attestation is REQUIRED: this FAILS, not
+    skips, without it -- a skip would read green on a host with no block."""
+    from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+    from tests.conftest import _ORIGINAL_PYO3_NETWORK_CLIENTS, CANARY_HOST, CANARY_PORT
+    from tests.unit.test_execution_egress_firewall_guard import os_egress_block_attested
+
+    assert os_egress_block_attested(), (
+        "the cancel-verb OS-block proof needs BREEZY_TEST_OS_EGRESS_BLOCK=1 "
+        "(scripts/ci/run_tests_no_egress.sh); it must fail, not skip, without it"
+    )
+    real_cls = (_ORIGINAL_PYO3_NETWORK_CLIENTS or {}).get("HttpClient")
+    assert real_cls is not None, "the native HttpClient was not captured"
+    spy = _RawExceptionSpy(real_cls(timeout_secs=3))
+    return PolymarketUSWriteTransport(client=spy), spy, f"http://{CANARY_HOST}:{CANARY_PORT}"
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_order_is_refused_by_the_os_egress_block() -> None:
+    from breezy.adapters.polymarket_us.errors import VenueTransportError
+    from tests.unit.test_execution_egress_firewall_guard import classify_canary_failure
+
+    transport, spy, base = _real_spy_transport()
+    with pytest.raises(VenueTransportError):
+        await transport.post_cancel_order(
+            base,
+            headers={"x-dummy": "dummy"},
+            order_id="ZZZZZZZZZZZZ",  # nonexistent id
+            market_slug=_CANCEL_SLUG,
+        )
+    assert spy.raw is not None, "the request reached the native client"
+    assert classify_canary_failure(spy.raw).blocked, classify_canary_failure(spy.raw)
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_with_slugs_is_refused_by_the_os_egress_block() -> None:
+    from breezy.adapters.polymarket_us.errors import VenueTransportError
+    from tests.unit.test_execution_egress_firewall_guard import classify_canary_failure
+
+    transport, spy, base = _real_spy_transport()
+    with pytest.raises(VenueTransportError):
+        await transport.post_cancel_all(base, headers={"x-dummy": "dummy"}, slugs=[_CANCEL_SLUG])
+    assert spy.raw is not None
+    assert classify_canary_failure(spy.raw).blocked, classify_canary_failure(spy.raw)
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_with_empty_slugs_never_reaches_the_transport() -> None:
+    """An empty list is unconstructible: the whole-account cancel never leaves the
+    transport (no native call at all, so nothing for the OS block to refuse)."""
+    from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+
+    class _Never:
+        async def post(self, *_a: Any, **_k: Any) -> Any:
+            raise AssertionError("an empty-slug cancel-all must never reach the client")
+
+    transport = PolymarketUSWriteTransport(client=_Never())
+    with pytest.raises(ValueError, match="non-empty"):
+        await transport.post_cancel_all("https://api.example.invalid", headers={}, slugs=[])

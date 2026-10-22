@@ -432,6 +432,40 @@ def test_a_2_contract_order_refuses(legs: tuple[BinaryOption, BinaryOption]) -> 
         submit_chain.build_exit_order_body(order, yes, authorization)
 
 
+@pytest.mark.parametrize("leg_name", ["yes", "no"])
+def test_an_exit_price_that_is_not_a_whole_cent_refuses(
+    legs: tuple[BinaryOption, BinaryOption], leg_name: Leg
+) -> None:
+    """B4 review F1: ``f"{wire:.2f}"`` must never post a different price on a close."""
+    yes, no = legs
+    instrument = yes if leg_name == "yes" else no
+    order = _limit_sell(instrument, price="0.605", client_order_id="O-CENT-1")
+    authorization = _threat_exit_authorization(
+        leg=leg_name,
+        position_id="POS-CENT-1",
+        client_order_id="O-CENT-1",
+        limit_price=Decimal("0.605"),
+    )
+
+    reason = submit_chain.unmappable_exit_order_reason(
+        order, instrument, authorization, _registered_no_leg_manifest()
+    )
+    assert reason == submit_chain.NOT_WHOLE_CENT_REASON
+    with pytest.raises(ValueError, match="whole cent"):
+        submit_chain.build_exit_order_body(order, instrument, authorization)
+
+
+def test_an_ioc_entry_price_that_is_not_a_whole_cent_refuses(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    yes, _no = legs
+    order = _limit_buy(yes, price="0.505")
+
+    assert submit_chain.unmappable_order_reason(order, yes) == submit_chain.NOT_WHOLE_CENT_REASON
+    with pytest.raises(ValueError, match="whole cent"):
+        submit_chain.build_order_body(order, yes)
+
+
 def test_a_manifest_without_a_declared_exit_rule_refuses(
     legs: tuple[BinaryOption, BinaryOption],
 ) -> None:

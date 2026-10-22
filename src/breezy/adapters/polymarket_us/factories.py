@@ -904,6 +904,8 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             exit_manifest=config.exit_manifest,
             resolver_instrument_loader=config.resolver_instrument_loader,
             no_id_retire_admitted=config.no_id_retire_admitted,
+            resting_accept_admitted=config.resting_accept_admitted,
+            sweep_retire_admitted=config.sweep_retire_admitted,
             frozen_cost_budget_bucket=config.frozen_cost_budget_bucket,
         )
         return client

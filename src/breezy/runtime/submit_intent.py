@@ -154,6 +154,21 @@ class RetirementReason(str, Enum):
     #: raise SubmitIntentCorrupt (``_optional_enum``), read the singleton as
     #: OPEN and refuse every launch (L-48). Never reverted (plan r6 section 6).
     RESOLVER_NO_ID_NO_FILL = "RESOLVER_NO_ID_NO_FILL"
+    #: ARM maker-sharp B3 / S4 WP2 (r3 P12): a RESTING (GTD) order the venue
+    #: accepted and the client bound by a confirming GET (``ACCEPTED``,
+    #: ``filled_qty == 0``): the intent's job is done and the account-wide slot
+    #: is released (K=1 releases on accept), while the order keeps resting. Not
+    #: a fill, not a zero-fill. SUPERVISOR-FIRST: landed here so every
+    #: supervisor can decode a singleton retired with it BEFORE any node can
+    #: write it (an older supervisor would raise SubmitIntentCorrupt, read OPEN
+    #: and refuse every launch, L-48). Never reverted.
+    ACCEPTED_RESTING = "ACCEPTED_RESTING"
+    #: ARM maker-sharp B3 / S4 WP2 (r3 P12): a prior-process NO-ID resting
+    #: intent that the boot sweep retired on complete negative evidence (the
+    #: sweep cancelled/confirmed nothing resting for it and the holdings read
+    #: shows no fill). Distinct from RESOLVER_NO_ID_NO_FILL (an IOC reason that
+    #: needs no sweep). Same supervisor-first rule as ACCEPTED_RESTING.
+    BOOT_SWEEP_RESTING_NO_FILL = "BOOT_SWEEP_RESTING_NO_FILL"
 
 
 class SubmitIntentError(Exception):

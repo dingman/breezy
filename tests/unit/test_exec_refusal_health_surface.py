@@ -95,7 +95,17 @@ _resolve_accept_fill#3              EXCEPTIONAL   AC6b (EDGE-2 r3): a cross-proc
                                                    a respawn reseeds from today's fill index
 _resolve_terminal_zero#1            EXCEPTIONAL   fail-closed: the venue-id map write raised on a
                                                    GET-confirmed terminal zero; the retire proceeds
+_latch_resting_order#1              EXCEPTIONAL   ARM B5 (S4 WP4): a rest's cancel is unconfirmed
+                                                   (terminal read never came), or a bound rest could
+                                                   not be read three times; NEW rests are refused,
+                                                   cancels continue (one producer, both latches)
 ==================================  ============  ================================================
+
+Seven ROUTINE, twenty-nine EXCEPTIONAL (ARM maker-sharp B5, S4 WP4: old total
+35 -> new total 36 -- `_latch_resting_order` is the ONE producer of the
+`resting_cancel_unconfirmed` and `resting_query_unreadable` latches; it is
+EXCEPTIONAL because a rest the bot cannot cancel or read is a broken
+venue/host, and it refuses NEW rests only).
 
 Seven ROUTINE, twenty-eight EXCEPTIONAL (EDGE-2 r3 AC6b: old total 34 -> new
 total 35 -- `_resolve_accept_fill` gains a third `self._refuse(...)` site,
@@ -239,6 +249,9 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         # the existing `#1` and `#2`, so neither renumbers: old 34 -> new 35.
         "_resolve_accept_fill#3",
         "_resolve_terminal_zero#1",
+        # ARM maker-sharp B5 (S4 WP4, pin row P-refusal): the single producer of
+        # the two S4 resting-order latches. Appended last; nothing renumbers.
+        "_latch_resting_order#1",
     }
 )
 
@@ -316,7 +329,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 35  # EDGE-2 r3 AC6b: old 34 -> new 35 (position-shape: old 33 -> 34)
+    assert len(scanned) == 36  # ARM B5: old 35 -> new 36 (EDGE-2 r3 AC6b: old 34 -> new 35)
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -331,7 +344,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 36  # EDGE-2 r3 AC6b baseline 35 -> new 36 (planting breaks the pin)
+    assert len(scanned) == 37  # ARM B5 baseline 36 -> new 37 (planting breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -374,7 +387,7 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
     # A1 (AM-3): old {"EXCEPTIONAL": 23, "ROUTINE": 7} -> new {"EXCEPTIONAL": 26, "ROUTINE": 7}
     # (slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7};
     # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
-    assert counts == {"EXCEPTIONAL": 28, "ROUTINE": 7}, counts
+    assert counts == {"EXCEPTIONAL": 29, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------

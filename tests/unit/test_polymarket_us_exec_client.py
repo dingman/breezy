@@ -58,7 +58,6 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
-    CancelAllOrders,
     CancelOrder,
     GenerateFillReports,
     GenerateOrderStatusReports,
@@ -70,6 +69,7 @@ from nautilus_trader.execution.messages import (
     SubmitOrderList,
 )
 from nautilus_trader.execution.reports import ExecutionMassStatus, OrderStatusReport
+from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     LiquiditySide,
@@ -528,21 +528,24 @@ async def test_query_account_republishes_the_account_state(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# `_query_order` -- NOT absent from the base, a report-injection seam CLOSED
-# by this client's own `generate_order_status_report` always returning `None`
+# `_query_order` -- the base method IS a report-injection seam (it hands whatever
+# `generate_order_status_report` returns to `_send_order_status_report`); the B6
+# override of `_query_order` is what keeps it closed
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_native_query_order_never_reaches_the_send_seam(tmp_path: Path) -> None:
-    """`_query_order` (`live/execution_client.py:516-532`) is genuinely
-    inherited, not absent: it calls `generate_order_status_report` and, if the
-    result is non-`None`, `_send_order_status_report` -- a report-injection
-    seam that bypasses `_submit_order`'s refusal latch entirely. This client's
-    override always returns `None` (see its own docstring), so the seam is
-    closed BEHAVIOURALLY -- but that closure was never pinned. If a future
-    change to `generate_order_status_report` ever returned a real report, this
-    is the test that would catch the seam opening.
+    """The BASE `_query_order` (`live/execution_client.py:516-532`) calls
+    `generate_order_status_report` and, if the result is non-`None`,
+    `_send_order_status_report` -- a report-injection seam that bypasses
+    `_submit_order`'s refusal latch entirely. This client's
+    `generate_order_status_report` DOES return real reports (the by-id read), so
+    the base path would reach the seam. What keeps it closed is the B6 OVERRIDE
+    of `_query_order` (the resting-order poll): it never calls the base and
+    never calls `generate_order_status_report`. Pinned here with a generator
+    that returns a real report, so a change that routed the override back
+    through the base would fail this test.
     """
     rig = _build_rig(tmp_path)
     await rig.client._connect()
@@ -550,6 +553,24 @@ async def test_native_query_order_never_reaches_the_send_seam(tmp_path: Path) ->
     def _fail_if_reached(report: Any) -> None:
         pytest.fail(f"_send_order_status_report was reached with {report!r}")
 
+    async def _real_report(command: Any) -> OrderStatusReport:
+        return OrderStatusReport(
+            account_id=rig.client._issued_account_id,
+            instrument_id=rig.instrument.id,
+            venue_order_id=VenueOrderId("V-1"),
+            order_side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.IOC,
+            order_status=OrderStatus.FILLED,
+            quantity=Quantity(1, rig.instrument.size_precision),
+            filled_qty=Quantity(1, rig.instrument.size_precision),
+            report_id=UUID4(),
+            ts_accepted=TS_INIT,
+            ts_last=TS_INIT,
+            ts_init=TS_INIT,
+        )
+
+    rig.client.generate_order_status_report = _real_report  # type: ignore[method-assign]
     rig.client._send_order_status_report = _fail_if_reached
 
     await rig.client._query_order(
@@ -600,7 +621,11 @@ async def test_native_query_order_DOES_reach_the_send_seam_given_a_real_report(
     rig.client.generate_order_status_report = _fake_generate  # type: ignore[method-assign]
     rig.client._send_order_status_report = received.append
 
-    await rig.client._query_order(
+    # B6 (S4 pin row P10): the client now OVERRIDES `_query_order` (the resting-order
+    # poll), so the seam is proven on the NATIVE base method, called explicitly -- the
+    # premise of this test is the base's behaviour, which the override must never reach.
+    await LiveExecutionClient._query_order(
+        rig.client,
         QueryOrder(
             trader_id=TRADER_ID,
             strategy_id=STRATEGY_ID,
@@ -746,7 +771,9 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     holding whose NO instrument is not loaded. Widened AGAIN old(34) ->
     new(35) by EDGE-2 plan r3 (AC6b): `_resolve_accept_fill` gained a
     third `self._refuse(_RESOLVER_FILL_UNBUDGETED)` site, the cross-process
-    unbudgeted-fill latch. Never relaxed, only widened (L-12).
+    unbudgeted-fill latch. Widened AGAIN old(35) -> new(36) by ARM maker-sharp
+    B5 (S4 WP4): `_latch_resting_order`, the one producer of the two resting-order
+    latches. Never relaxed, only widened (L-12).
 
     The authoritative, triaged inventory is
     `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
@@ -764,7 +791,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 35
+    assert count == 36
 
 
 @pytest.mark.asyncio
@@ -1650,8 +1677,12 @@ async def test_cancel_order_is_refused(tmp_path: Path) -> None:
 async def test_the_other_four_lifecycle_coroutines_raise_unsupported(
     tmp_path: Path,
 ) -> None:
-    """Only `_submit_order` and `_cancel_order` get denial bodies. The rest are
-    not silently no-ops: a no-op would look like acceptance."""
+    """`_submit_order`, `_cancel_order` and (S4 WP4, ARM B5) `_cancel_all_orders` have
+    bodies; cancel-all moved to the positive tests in
+    ``test_polymarket_us_resting_cancel.py``. The other three still raise (the test
+    name is kept so the plan's P9 citation resolves). Not silently no-ops: a no-op
+    would look like acceptance. Never deleted, only narrowed by the one coroutine
+    that gained a real body (L-12)."""
     rig = _build_rig(tmp_path)
     await rig.client._connect()
     order = rig.submit_command().order
@@ -1677,17 +1708,6 @@ async def test_the_other_four_lifecycle_coroutines_raise_unsupported(
                 quantity=None,
                 price=None,
                 trigger_price=None,
-                command_id=UUID4(),
-                ts_init=TS_INIT,
-            ),
-        )
-    with pytest.raises(NotImplementedError):
-        await rig.client._cancel_all_orders(
-            CancelAllOrders(
-                trader_id=TRADER_ID,
-                strategy_id=STRATEGY_ID,
-                instrument_id=rig.instrument.id,
-                order_side=OrderSide.NO_ORDER_SIDE,
                 command_id=UUID4(),
                 ts_init=TS_INIT,
             ),

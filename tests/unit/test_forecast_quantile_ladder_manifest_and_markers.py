@@ -36,7 +36,14 @@ _EXEC_CLIENT_PATH = (
 # re-pinned 2026-10-09: AMBIG-LATCH-RESUME Phase B (resume method, accept-fill/no-id clears, pre-POST context, no-id resolver; hunks H1-H12 per plan r6 section 4)  # noqa: E501
 # re-pinned 2026-10-10: WP-DR day-roll settle (3 resolver sites skip prior-day true-up; fill-on-new-day latches UNBUDGETED), reviewer-approved (python-reviewer + prediction-market-reviewer)  # noqa: E501
 # re-pinned 2026-10-10: EXEC-PAR WP4 parallel-slot wiring (r5 §5 WP4 + r5.1 E1-E14); python-reviewer + prediction-market-reviewer APPROVE, silent-failure-hunter READY 88  # noqa: E501
-_EXEC_CLIENT_SHA256 = "a4cbd8cbbf29524a6de3c18dc4e2b565ce25e1f1b91ca54f0c2483f671b64410"
+# S4 WP6 (ARM B7) re-pin once after WP3-WP5; prior a4cbd8cbbf29524a6de3c18dc4e2b565ce25e1f1b91ca54f0c2483f671b64410; reviewed in f507e5c0 (B1, B3-B6 client edits + review fixes; B7 itself edits no client byte)  # noqa: E501
+# ONE constant is the home of this pin for three tests: this file's byte-identity test,
+# test_autonomy_envelope::test_exec_client_never_edited (reads it by AST) and the
+# positive control of test_aut1_wp0_closure_premises::test_submit_chain_is_not_byte_pinned_in_tests.
+_EXEC_CLIENT_SHA256 = "7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e"
+_EXEC_CLIENT_SHA256_BEFORE_B7_REPIN = (
+    "a4cbd8cbbf29524a6de3c18dc4e2b565ce25e1f1b91ca54f0c2483f671b64410"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,3 +129,18 @@ def test_exec_client_is_byte_identical_to_its_pre_sl13_sha256() -> None:
         "deny chain (lines 5327-5510) must stay byte-unchanged; this file "
         "must never be edited by this slice"
     )
+
+
+def test_b7_repin_is_sensitive_to_the_old_digest_and_to_a_single_flipped_byte() -> None:
+    """Sensitivity plant for the one-time WP6 re-pin: the previous digest no longer matches the
+    client, and flipping one byte of the real client fails the new pin."""
+    original = _EXEC_CLIENT_PATH.read_bytes()
+    assert hashlib.sha256(original).hexdigest() == _EXEC_CLIENT_SHA256
+    assert _EXEC_CLIENT_SHA256 != _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN
+    assert hashlib.sha256(original).hexdigest() != _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN
+    flipped = bytes([original[0] ^ 0x01]) + original[1:]
+    assert hashlib.sha256(flipped).hexdigest() != _EXEC_CLIENT_SHA256
+    # B7 review T4: a flip in the middle and at the end of the file is caught as well.
+    for index in (len(original) // 2, len(original) - 1):
+        mutated = original[:index] + bytes([original[index] ^ 0x01]) + original[index + 1 :]
+        assert hashlib.sha256(mutated).hexdigest() != _EXEC_CLIENT_SHA256, index
