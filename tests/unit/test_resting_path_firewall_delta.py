@@ -687,11 +687,15 @@ _CANCEL_ALL_SUBSTRINGS: Final[tuple[str, ...]] = (
 )
 _OWNER_REL: Final[str] = "src/breezy/adapters/polymarket_us/write_transport.py"
 _PROBE_REL: Final[str] = "scripts/venue/polymarket_us_write_signing_probe.py"
+#: ARM B2 (plan_r2_delta D3): the one other script allowed to name the verb, sha-pinned in
+#: ``test_polymarket_us_cancel_transport`` (single home for the digest).
+_B2_CONTROL_REL: Final[str] = "scripts/venue/polymarket_us_maker_positive_control.py"
 
 
 def _tree_hits(extra: dict[str, str] | None = None) -> list[tuple[str, str]]:
     """(file, token) for every src/scripts file naming a cancel-all token, except the
-    owner, the client (checked by AST below) and the sha-pinned legacy probe."""
+    owner, the client (checked by AST below), the sha-pinned legacy probe and the sha-pinned
+    ARM B2 control script."""
     hits: list[tuple[str, str]] = []
     files = {
         p.relative_to(_REPO).as_posix(): p.read_text(encoding="utf-8")
@@ -700,7 +704,7 @@ def _tree_hits(extra: dict[str, str] | None = None) -> list[tuple[str, str]]:
     }
     files.update(extra or {})
     for rel, text in files.items():
-        if rel in {_OWNER_REL, CLIENT_REL, _PROBE_REL}:
+        if rel in {_OWNER_REL, CLIENT_REL, _PROBE_REL, _B2_CONTROL_REL}:
             continue
         hits.extend((rel, tok) for tok in _CANCEL_ALL_SUBSTRINGS if tok in text)
     return hits
@@ -721,6 +725,18 @@ def test_the_legacy_probe_exemption_is_the_one_sha_pinned_constant() -> None:
 
     assert b1._LEGACY_PROBE == _PROBE_REL
     assert hashlib.sha256((_REPO / _PROBE_REL).read_bytes()).hexdigest() == b1._LEGACY_PROBE_SHA256
+
+
+def test_the_b2_control_exemption_is_the_one_sha_pinned_constant() -> None:
+    """ARM B2 row: same digest home as the cancel-transport pin; a copy elsewhere is flagged."""
+    from tests.unit import test_polymarket_us_cancel_transport as b1
+
+    assert b1._B2_CONTROL == _B2_CONTROL_REL
+    text = (_REPO / _B2_CONTROL_REL).read_text(encoding="utf-8")
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == b1._B2_CONTROL_SHA256
+    assert ("post_cancel_all" in text) and ("CANCEL_ALL_PATH" in text)  # the exemption is exercised
+    copied = _tree_hits({"scripts/venue/_copied_control.py": text})
+    assert ("scripts/venue/_copied_control.py", "post_cancel_all") in copied
 
 
 def test_the_cancel_all_tokens_appear_only_in_the_choke_point() -> None:

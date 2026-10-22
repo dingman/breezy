@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import sys
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -25,6 +26,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO
 from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+from tests.unit import b2_control_fakes as b2_fakes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _BASE = "https://api.example.invalid"
@@ -39,6 +41,21 @@ _LEGACY_PROBE = "scripts/venue/polymarket_us_write_signing_probe.py"
 #: 93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3
 #: Pinned together with the AST tests at the end of this file and the M6 baseline entry.
 _LEGACY_PROBE_SHA256 = "7dfe7f0ebe8abc398f298265b2142e80164b571ed3cd543926fab91eea0f231b"
+#: ARM B2 (plan_r2_delta D3): the maker positive-control script is the ONE other script that may
+#: name the cancel-all verb -- it calls ``PolymarketUSWriteTransport.post_cancel_all`` from a
+#: single guarded site (``ControlSession.cancel_slugs``: non-empty, de-duplicated, daily-HIGH
+#: slugs only) and never the legacy helper. sha-pinned: any edit re-reviews this row.
+_B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
+#: Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
+#: handlers, activities paging). Prior digest:
+#: ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
+#: Re-digested again at the B2 open-orders eof fix (exec rule: eof absent is complete,
+#: unknown envelope key refuses). Prior digest:
+#: 1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50
+#: Re-digested once at the B2 slug-selection fix (production-parity candidates, paged listing,
+#: value-free selection diagnostics, --select-only). Prior digest:
+#: ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f
+_B2_CONTROL_SHA256 = "c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc"
 
 
 class _Resp:
@@ -247,7 +264,17 @@ def test_legacy_probe_exemption_is_sha_pinned() -> None:
 
 
 def test_no_module_but_the_owner_and_the_pinned_probe_names_the_cancel_all_path() -> None:
-    assert _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT})) == []
+    exempt = frozenset({_OWNER, _LEGACY_PROBE, _CLIENT, _B2_CONTROL})
+    assert _scan(_CANCEL_ALL_TOKENS, exempt) == []
+
+
+def test_b2_control_exemption_is_sha_pinned_and_load_bearing() -> None:
+    """ARM B2 row plant: the digest is pinned, the exemption is exercised (the script really
+    names the verb), and without it the scan flags the script."""
+    digest = hashlib.sha256((REPO_ROOT / _B2_CONTROL).read_bytes()).hexdigest()
+    assert digest == _B2_CONTROL_SHA256
+    unexempted = _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT}))
+    assert {path for path, _ in unexempted} == {_B2_CONTROL}
 
 
 def test_scan_sees_a_planted_reference(tmp_path: Path) -> None:
@@ -394,3 +421,23 @@ async def test_the_entry_refusal_stands_down_only_for_an_installed_test_stand_in
             ),
             timeout=5,
         )
+
+
+@pytest.mark.parametrize(("payload", "complete"), b2_fakes.OPEN_ORDERS_ENVELOPES)
+def test_b2_open_orders_rule_agrees_with_the_exec_client(payload: Any, complete: bool) -> None:
+    """The script mirrors the exec client's envelope rule; both must accept the same set."""
+    from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+    from breezy.adapters.polymarket_us.exec import submit_chain
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    b2_fakes.load_control()
+    core = sys.modules["_maker_control_core"]
+
+    assert core.OPEN_ORDERS_KNOWN_ENVELOPE_KEYS == submit_chain._OPEN_ORDERS_KNOWN_ENVELOPE_KEYS
+    try:
+        exec_ok = submit_chain.open_orders_envelope_is_known(payload) and (
+            parse_open_orders(payload) == ()
+        )
+    except ExecutionReportMappingError:
+        exec_ok = False
+    assert (core.open_order_ids(payload) is not None) is exec_ok is complete

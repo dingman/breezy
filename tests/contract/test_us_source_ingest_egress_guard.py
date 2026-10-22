@@ -169,6 +169,21 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # Re-digested again at the B7 review fix T1 (the legacy flows refuse at entry). Prior:
     # 93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3
     "scripts/venue/polymarket_us_write_signing_probe.py": "7dfe7f0ebe8abc398f298265b2142e80164b571ed3cd543926fab91eea0f231b",  # noqa: E501
+    # ARM B2 (plan_r2_delta D3): the maker positive-control script is a venue script that imports
+    # the write transport and the exec submit chain on purpose (it sends only through the shipped
+    # write-transport methods). One named row, exempt only while its sha256 equals this digest;
+    # any edit re-scans it like a new file. Its pure sibling `_maker_control_core.py` imports
+    # nothing banned and needs no row.
+    # Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
+    # handlers, activities paging). Prior digest:
+    # ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
+    # Re-digested again at the B2 open-orders eof fix (exec rule: eof absent is complete,
+    # unknown envelope key refuses). Prior digest:
+    # 1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50
+    # Re-digested once at the B2 slug-selection fix (production-parity candidates, paged listing,
+    # value-free selection diagnostics, --select-only). Prior digest:
+    # ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f
+    "scripts/venue/polymarket_us_maker_positive_control.py": "c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501
@@ -469,6 +484,25 @@ def test_m6_maker_collector_row_is_digest_bound() -> None:
     assert baseline_exempts(victim, edited) is False
     assert victim in directory_scan_targets(edited)
     assert victim not in directory_scan_targets(M6_PREEXISTING_BASELINE)
+
+
+def test_m6_b2_control_row_is_exempt_only_while_its_sha_matches() -> None:
+    """ARM B2 row plant: un-exempted the script trips M6; a changed digest re-scans it."""
+    rel = "scripts/venue/polymarket_us_maker_positive_control.py"
+    path = REPO_ROOT / rel
+    assert M6_PREEXISTING_BASELINE[rel] == _sha256(path)
+    assert path not in closure_files()
+    # un-exempted, the script is scanned and DOES name banned modules (load-bearing row)
+    assert path in directory_scan_targets({})
+    assert banned_hits(import_closure([path])) != []
+    # exempt while the digest matches ...
+    assert path not in directory_scan_targets({rel: _sha256(path)})
+    # ... re-scanned the moment it differs
+    assert path in directory_scan_targets({rel: "0" * 64})
+    # the pure sibling is NOT in the baseline and is clean on its own
+    sibling = REPO_ROOT / "scripts" / "venue" / "_maker_control_core.py"
+    assert _rel(sibling) not in M6_PREEXISTING_BASELINE
+    assert banned_hits(import_closure([sibling])) == []
 
 
 def test_m6_baseline_is_well_formed_and_never_shrinks() -> None:
