@@ -253,10 +253,62 @@ def test_restore_live_trading_budget_is_called_from_exactly_the_terminal_zero_si
     # Widened by exactly one reviewed row, 2026-10-09 (AMBIG-LATCH-RESUME Phase B,
     # plan r6 line 776): `_resolve_no_order` restores the no-id slot, keyed
     # `noid:<intent_id>` and idempotent per key; T33 tests it. Exact comparison kept.
+    # Widened by exactly one more reviewed row, ARM B5 (exec resting-order chain):
+    # `_restore_resting_budget` gives back the permit slot of a rest THIS process armed, and
+    # only that (its sole caller is gated on `_this_process_resting_ids`; see the pin below).
+    # Exact comparison kept.
     assert _functions_calling_bare_name("restore_live_trading_budget", source) == {
         "_resolve_terminal_zero",
         "_resolve_no_order",
+        "_restore_resting_budget",
     }
+
+
+def _unguarded_resting_restore_callers(source: str) -> list[str]:
+    """Functions with a ``self._restore_resting_budget(...)`` call that is not nested inside an
+    ``if`` whose test mentions ``_this_process_resting_ids``."""
+    tree = ast.parse(source)
+    unguarded: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        guarded = {
+            id(call)
+            for node in ast.walk(fn)
+            if isinstance(node, ast.If) and "_this_process_resting_ids" in ast.unparse(node.test)
+            for stmt in node.body
+            for call in ast.walk(stmt)
+        }
+        for inner in ast.walk(fn):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "_restore_resting_budget"
+                and id(inner) not in guarded
+            ):
+                unguarded.append(fn.name)
+    return unguarded
+
+
+def test_resting_budget_restore_is_only_called_for_a_rest_this_process_armed() -> None:
+    source = CLIENT_SOURCE_PATH.read_text(encoding="utf-8")
+    assert "self._restore_resting_budget(target)" in source
+    assert _unguarded_resting_restore_callers(source) == []
+
+
+def test_an_unguarded_resting_budget_restore_call_breaks_the_this_process_pin() -> None:
+    """Plant (L-12): the same call outside the ``_this_process_resting_ids`` guard is reported."""
+    planted = (
+        "def _settle_resting_terminal(self, target, verdict):\n"
+        "    self._restore_resting_budget(target)\n"
+    )
+    guarded = (
+        "def _settle_resting_terminal(self, target, verdict):\n"
+        "    if target.venue_order_id in self._this_process_resting_ids:\n"
+        "        self._restore_resting_budget(target)\n"
+    )
+    assert _unguarded_resting_restore_callers(planted) == ["_settle_resting_terminal"]
+    assert _unguarded_resting_restore_callers(guarded) == []
 
 
 @pytest.mark.parametrize(
