@@ -36,7 +36,7 @@ import json
 import os
 import sqlite3
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -49,14 +49,13 @@ from breezy.domain.instrument_leg import (
     leg_of_symbol,
     symbol_of_instrument_id,
 )
-from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
-from breezy.persistence.catalog import (
-    open_station_catalog,
-    read_climate_day_including_corrections,
-    station_catalog_path,
-)
-from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntentCorrupt, decode_slot_table
+from breezy.strategy.no_ladder_maker.cli_final import (
+    CliReading,
+    StdOffset,
+    catalog_cli_reader,
+    registry_std_offset_hours,
+)
 from breezy.strategy.no_ladder_maker.harm_stop import (
     FillOutcome,
     HarmStopResult,
@@ -71,24 +70,20 @@ from breezy.strategy.no_ladder_maker.harm_stop import (
     station_of_slug,
 )
 from breezy.strategy.no_ladder_maker.harm_stop_artefact import ACTION_STICKY, Action, publish
+from breezy.strategy.no_ladder_maker.venue_settlement import (
+    VENUE_SETTLEMENTS_NAME,
+    read_venue_yes,
+)
 
-VENUE_SCHEMA: Final[str] = "maker_venue_settlement/v1"
-VENUE: Final[str] = "polymarket_us"
 EXIT_PASS: Final[int] = 0
 EXIT_ERROR: Final[int] = 1
 EXIT_FAIL: Final[int] = 2
 EXIT_HOLD: Final[int] = 3
 DEFAULT_DATA_ROOT: Final[Path] = Path.home() / ".local/share/breezy"
-#: the collector writes this beside ``latest.json``; the producer reads it
-VENUE_SETTLEMENTS_NAME: Final[str] = "venue_settlements.json"
 STATE_DB_ENV: Final[str] = "POLYMARKET_US_EXEC_STATE_DB"
 #: the node's own variable (``breezy.runtime.settings.TRADE_CATALOG_ROOT_VAR``; not imported: the
 #: producer stays free of ``breezy.runtime``)
 CATALOG_ROOT_ENV: Final[str] = "BREEZY_TRADE_CATALOG_ROOT"
-
-CliReading = Callable[[WeatherBucketFacts], int | None]
-#: station token -> the climate day's fixed standard-time UTC offset in hours (None: unknown)
-StdOffset = Callable[[str], float | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,61 +149,6 @@ def _open_slugs(raw: bytes | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if table.unreadable:
         blocked.append("open_intent_unattributable")
     return tuple(slugs), tuple(dict.fromkeys(blocked))
-
-
-def _read_venue_yes(path: Path | None) -> dict[str, bool]:
-    """``{base slug: venue resolved YES}``; absent/unreadable/malformed -> ``{}`` (unresolved)."""
-    if path is None:
-        return {}
-    try:
-        body = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(body, dict) or body.get("schema") != VENUE_SCHEMA:
-        return {}
-    raw = body.get("yes_resolved")
-    if not isinstance(raw, dict):
-        return {}
-    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, bool)}
-
-
-def registry_std_offset_hours(station: str) -> float | None:
-    """The registry's fixed standard-time UTC offset of a station token; ``None`` if unknown."""
-    registry = default_registry()
-    try:
-        city = registry.site_for_venue_city_token(VENUE, station).city
-        return registry.climate_day_window(VENUE, city).std_utc_offset_hours
-    except SiteNotFoundError:
-        return None
-
-
-def catalog_cli_reader(catalog_base: Path) -> CliReading:
-    """The CLI final from the station catalog; ``None`` when no FINAL with a value is stored.
-
-    Never creates a catalog: a station without an existing catalog directory reads ``None``. Each
-    station's catalog is opened once (the Nautilus catalog has no close; it holds no handle)."""
-    registry = default_registry()
-    city_of = {
-        registry.settlement_site(venue, city).cli_location: city
-        for venue, city in registry.pairs()
-        if venue == VENUE
-    }
-    opened: dict[str, Any] = {}
-
-    def read(facts: WeatherBucketFacts) -> int | None:
-        city = city_of.get(facts.settlement_station)
-        if city is None or not station_catalog_path(catalog_base, VENUE, city).is_dir():
-            return None
-        if city not in opened:
-            opened[city] = open_station_catalog(catalog_base, VENUE, city)
-        record = read_climate_day_including_corrections(
-            opened[city], station=facts.settlement_station, climate_day=facts.climate_day
-        )
-        if record is None or not record.is_final:
-            return None
-        return record.tmax_f if facts.measure is Measure.HIGH else record.tmin_f
-
-    return read
 
 
 # -- one fill -> one settled fill ----------------------------------------------------------------
@@ -281,7 +221,7 @@ def produce(
         reasons.append("get_fill")
     if classification.open_ambiguous_family_intent:
         reasons.append("open_ambiguous_family_intent")
-    venue_yes = _read_venue_yes(venue_settlements)
+    venue_yes = read_venue_yes(venue_settlements)
     settled = [
         (
             base_symbol_of(symbol_of_instrument_id(r.instrument_id)),

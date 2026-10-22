@@ -54,10 +54,13 @@ __all__ = [
     "PARSE_STATUS_UNPARSEABLE",
     "PORTFOLIO_ACTIVITIES_PATH",
     "UNRECOGNISED_KIND",
+    "MarketResolution",
+    "ResolutionScan",
     "TradeActivityRef",
     "TradeRowScan",
     "page_min_create_ts_ns",
     "parse_external_flows",
+    "parse_position_resolutions",
     "trade_rows_for_order",
 ]
 
@@ -637,3 +640,107 @@ def page_min_create_ts_ns(page: Mapping[str, Any]) -> int | None:
         if ts is not None:
             times.append(ts)
     return min(times) if times else None
+
+
+# --------------------------------------------------------------------------
+# ACTIVITY_TYPE_POSITION_RESOLUTION: the venue's own YES resolution of a market
+# --------------------------------------------------------------------------
+
+_RESOLUTION_ACTIVITY_TYPE: Final[str] = "ACTIVITY_TYPE_POSITION_RESOLUTION"
+_MARKET_RESOLVED_STATUS: Final[str] = "MARKET_STATUS_RESOLVED"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """One market's venue resolution: ``yes_resolved`` is whether YES paid out."""
+
+    slug: str
+    yes_resolved: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionScan:
+    """What a page of activities says about resolved markets.
+
+    ``unreadable`` counts POSITION_RESOLUTION rows whose outcome could NOT be read with certainty;
+    they contribute no resolution (never a guess)."""
+
+    resolutions: tuple[MarketResolution, ...]
+    unreadable: int
+
+
+def _price_of(side: object) -> Decimal | None:
+    if not isinstance(side, Mapping):
+        return None
+    raw = side.get("price")
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _yes_resolved_of(slug: str, market: object) -> bool | None:
+    """YES paid out iff the resolved market's ``long`` side is priced 1 and the other side 0.
+
+    Read from ``market.marketSides`` (the captured shape: ``AMBIGUOUS_ORDER_2026-09-05_SFO/
+    activities_p0.json`` rows carry ``long: true`` Yes at ``"0"`` and ``long: false`` No at ``"1"``
+    for a market whose YES long position realised its whole cost as a loss). It does NOT read
+    ``outcomePrices`` (its label order contradicts ``marketSides`` in that capture) nor the row's
+    ``side`` (it is the same ``SHORT`` for a long holder that lost). Anything short of a RESOLVED,
+    closed market with exactly one long and one short side priced exactly {0, 1} is ``None``."""
+    if not isinstance(market, Mapping):
+        return None
+    if market.get("status") != _MARKET_RESOLVED_STATUS or market.get("closed") is not True:
+        return None
+    if market.get("slug", slug) != slug:
+        return None
+    sides = market.get("marketSides")
+    if not isinstance(sides, list) or len(sides) != 2:
+        return None
+    if not all(
+        isinstance(side, Mapping) and side.get("identifier", slug) == slug for side in sides
+    ):
+        return None
+    longs = [side for side in sides if side.get("long") is True]
+    shorts = [side for side in sides if side.get("long") is False]
+    if len(longs) != 1 or len(shorts) != 1:
+        return None
+    long_price, short_price = _price_of(longs[0]), _price_of(shorts[0])
+    if long_price is None or short_price is None:
+        return None
+    if (long_price, short_price) == (Decimal(1), Decimal(0)):
+        return True
+    if (long_price, short_price) == (Decimal(0), Decimal(1)):
+        return False
+    return None
+
+
+def parse_position_resolutions(page: Mapping[str, Any]) -> ResolutionScan:
+    """The venue's YES resolution of every market a page of activities resolved.
+
+    Pure. Rows of any other type are ignored. A resolution row whose outcome cannot be read with
+    certainty counts in ``unreadable``; a page whose ``activities`` is not a list reads as one
+    unreadable row (never as "no resolutions")."""
+    activities = page.get("activities")
+    if not isinstance(activities, list):
+        return ResolutionScan((), 1)
+    found: list[MarketResolution] = []
+    unreadable = 0
+    for activity in activities:
+        if not isinstance(activity, Mapping) or activity.get("type") != _RESOLUTION_ACTIVITY_TYPE:
+            continue
+        resolution = activity.get("positionResolution")
+        slug = resolution.get("marketSlug") if isinstance(resolution, Mapping) else None
+        yes = (
+            _yes_resolved_of(slug, resolution.get("market"))
+            if isinstance(slug, str) and slug and isinstance(resolution, Mapping)
+            else None
+        )
+        if not isinstance(slug, str) or yes is None:
+            unreadable += 1
+            continue
+        found.append(MarketResolution(slug=slug, yes_resolved=yes))
+    return ResolutionScan(tuple(found), unreadable)

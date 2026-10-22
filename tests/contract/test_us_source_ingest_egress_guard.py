@@ -142,6 +142,11 @@ SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 #: Frozen at F13-C1 S4. Additive-only: a new pre-existing-file entry may be appended,
 #: nothing is ever removed or re-digested to make a scan pass (R30).
 M6_PREEXISTING_BASELINE: dict[str, str] = {
+    # ARM D1 S-COL (2026-10-22), one row: the maker harm stop's read-only settlement collector. It
+    # signs GETs through the shared production client (same imports as the capital-flow puller
+    # below, which also needs this exemption) and reconciles through `reconcile_settlement`; it
+    # is digest-pinned, so any edit re-scans it (test_m6_maker_collector_row_is_digest_bound).
+    "scripts/venue/maker_settlement_collect.py": "3b9764f7c9838221bcfe7dee586915df7e3ec4e72b7241a6aa18b690831dc5de",  # noqa: E501
     "scripts/venue/_write_sequence.py": "d49c238293f0cf7aa64ce1d295960fa4eb4eeb03c6d82d7223d2feb304d9a2e8",  # noqa: E501
     "scripts/venue/fee_drift_evidence_pull.py": "bbaa9c098e61dae7c3dc32d9addfa3920132c4249d3a4c725bdff79d6a3b2950",  # noqa: E501
     "scripts/venue/iem_afos_forecast_pil_probe.py": "121af2d1945acec194d1bb2b5dab9bca795d88f6657f847908354f6c4aafb040",  # noqa: E501
@@ -173,7 +178,7 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     "src/breezy/ingest/nws_observations.py": "8a42ea14de812f2663907198e9581181b042cd2d5f0f80e4e83e1d66291816f6",  # noqa: E501
     "src/breezy/ingest/observation_sidecar.py": "4d6830ed1472d8b93061d0fa245ec6d94a2e95ce1b645a52aa3f89816774dd79",  # noqa: E501
 }
-M6_BASELINE_FROZEN_COUNT = 28
+M6_BASELINE_FROZEN_COUNT = 29
 
 
 # --------------------------------------------------------------------------- parsing
@@ -445,6 +450,19 @@ def test_m6_modified_baseline_file_is_rescanned(tmp_path: Path) -> None:
     assert victim in directory_scan_targets(tampered)
     assert baseline_exempts(victim, honest) is True
     assert baseline_exempts(victim, tampered) is False
+
+
+def test_m6_maker_collector_row_is_digest_bound() -> None:
+    """The one D1 row: exempt only while the file is byte-identical to the recorded digest."""
+    victim = SCRIPTS / "venue" / "maker_settlement_collect.py"
+    rel = _rel(victim)
+    assert M6_PREEXISTING_BASELINE[rel] == _sha256(victim)
+    assert baseline_exempts(victim, M6_PREEXISTING_BASELINE) is True
+    # plant: any edit (a different digest) puts the file back under the full scan
+    edited = {**M6_PREEXISTING_BASELINE, rel: "0" * 64}
+    assert baseline_exempts(victim, edited) is False
+    assert victim in directory_scan_targets(edited)
+    assert victim not in directory_scan_targets(M6_PREEXISTING_BASELINE)
 
 
 def test_m6_baseline_is_well_formed_and_never_shrinks() -> None:

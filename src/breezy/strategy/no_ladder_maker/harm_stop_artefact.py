@@ -102,7 +102,7 @@ def existing_verdict(path: Path) -> str | None:
     return str(verdict)
 
 
-def _fsync_dir(directory: Path) -> None:
+def fsync_dir(directory: Path) -> None:
     dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(dir_fd)
@@ -110,7 +110,7 @@ def _fsync_dir(directory: Path) -> None:
         os.close(dir_fd)
 
 
-def _ensure_dir(directory: Path) -> None:
+def ensure_dir(directory: Path) -> None:
     """Create ``directory`` 0755 whatever the umask (the probe refuses a group-writable one)."""
     created = not directory.exists()
     directory.mkdir(parents=True, exist_ok=True)
@@ -118,8 +118,9 @@ def _ensure_dir(directory: Path) -> None:
         directory.chmod(_DIR_MODE)
 
 
-def _write_atomic(path: Path, body: dict[str, Any], *, when: datetime) -> None:
-    _ensure_dir(path.parent)
+def write_json_atomic(path: Path, body: dict[str, Any], *, when: datetime) -> None:
+    """Write ``body`` to ``path`` atomically, 0600, fsynced, with mtime ``when``."""
+    ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, _FILE_MODE)
     try:
@@ -133,7 +134,7 @@ def _write_atomic(path: Path, body: dict[str, Any], *, when: datetime) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
         raise
-    _fsync_dir(path.parent)
+    fsync_dir(path.parent)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,8 +153,8 @@ def publish(
             path.unlink()
         except FileNotFoundError:
             return PublishOutcome(ACTION_NOTHING)
-        _fsync_dir(path.parent)
+        fsync_dir(path.parent)
         return PublishOutcome(ACTION_REMOVED)
     body = render_artefact(result, as_of=as_of, c2_hwm=c2_hwm, truth_sha=truth_sha)
-    _write_atomic(path, body, when=as_of)
+    write_json_atomic(path, body, when=as_of)
     return PublishOutcome(ACTION_WRITTEN)

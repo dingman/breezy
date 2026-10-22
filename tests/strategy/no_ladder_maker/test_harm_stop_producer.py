@@ -28,7 +28,9 @@ from breezy.runtime.submit_intent import (
 from breezy.strategy.forecast_quantile_ladder import loss_stop_probe as lsp
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import LossStopProbe
 from breezy.strategy.no_ladder_maker import harm_stop as hsm
+from breezy.strategy.no_ladder_maker.cli_final import registry_std_offset_hours
 from breezy.strategy.no_ladder_maker.harm_stop import maker_loss_stop_artefact_path
+from breezy.strategy.no_ladder_maker.venue_settlement import VENUE_SCHEMA
 from scripts.analysis import maker_loss_stop_producer as producer
 
 NOW: Final = datetime(2026, 10, 25, 12, 40, tzinfo=UTC)
@@ -101,9 +103,7 @@ class _World:
         return self.cli.get((facts.settlement_station, facts.climate_day.isoformat()))
 
     def run(self, *, now: datetime = NOW, stations: frozenset[str] = STATIONS) -> producer.Outcome:
-        self.venue_path.write_text(
-            json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": self.venue})
-        )
+        self.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": self.venue}))
         return producer.produce(
             state_db=self.db,
             derived_dir=self.derived,
@@ -443,9 +443,7 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
 ) -> None:
     monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
     world.win(1)
-    world.venue_path.write_text(
-        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
-    )
+    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
     argv = [
         "--station", "nyc",
         "--state-db", str(world.db),
@@ -459,9 +457,7 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
     assert producer.main(argv) == producer.EXIT_HOLD
     for d in (3, 4, 5):
         world.lose(d)
-    world.venue_path.write_text(
-        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
-    )
+    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
     assert producer.main(argv) == producer.EXIT_FAIL
 
 
@@ -541,8 +537,8 @@ def test_j2_a_mismatch_is_pending_then_a_loss(world: _World) -> None:
 
 def test_j2_the_registry_offsets_drive_the_deadline_by_default() -> None:
     for station, offset in (("nyc", -5.0), ("lax", -8.0), ("mdw", -6.0)):
-        assert producer.registry_std_offset_hours(station) == offset
-    assert producer.registry_std_offset_hours("nowhere") is None
+        assert registry_std_offset_hours(station) == offset
+    assert registry_std_offset_hours("nowhere") is None
 
 
 # -- review K3: an unparseable rung is its own station-day --------------------------------------
@@ -616,9 +612,7 @@ def test_j4_a_standing_fail_exits_fail_even_when_the_new_verdict_is_pass(
     world.run()  # the FAIL is on disk
     for d in (1, 2, 3):
         world.settle(d, yes=False, tmax=HIGH_TMAX)  # the losses are later 'resolved' as wins
-    world.venue_path.write_text(
-        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
-    )
+    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
     assert producer.main(argv) == producer.EXIT_FAIL
 
 
@@ -673,9 +667,7 @@ def test_j6_main_writes_where_the_probe_reads(
         "--catalog-base", str(world.derived.parents[1]),
         "--venue-settlements", str(world.venue_path),
     ]  # fmt: skip
-    world.venue_path.write_text(
-        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
-    )
+    world.venue_path.write_text(json.dumps({"schema": VENUE_SCHEMA, "yes_resolved": world.venue}))
     assert producer.main(argv) == producer.EXIT_PASS
     probe = _probe(maker_loss_stop_artefact_path(catalog_root), datetime.now(tz=UTC))
     probe.probe_once()

@@ -292,16 +292,24 @@ def test_j2_the_settlement_deadline_is_48h_after_the_end_of_the_local_day() -> N
     assert nyc == datetime(2026, 9, 13, 5, 0, tzinfo=UTC)
 
 
+def _settle(*, venue: bool | None, cli: bool | None, pending: bool) -> hs.SettledFill:
+    return hs.settle_fill(
+        station_day="nyc|2026-09-10",
+        cost=Decimal("0.87"),
+        quantity=Decimal(1),
+        venue_yes_resolved=venue,
+        cli_yes=cli,
+        pending=pending,
+    )
+
+
 def test_j2_settle_fill_is_pending_only_while_unresolved_and_before_the_deadline() -> None:
-    kwargs = {"station_day": "nyc|2026-09-10", "cost": Decimal("0.87"), "quantity": Decimal(1)}
-    pending = hs.settle_fill(**kwargs, venue_yes_resolved=None, cli_yes=None, pending=True)
+    pending = _settle(venue=None, cli=None, pending=True)
     assert pending.outcome is PENDING and pending.cause == "venue_settlement_missing"
-    late = hs.settle_fill(**kwargs, venue_yes_resolved=None, cli_yes=None, pending=False)
-    assert late.outcome is FillOutcome.UNRESOLVED
+    assert _settle(venue=None, cli=None, pending=False).outcome is FillOutcome.UNRESOLVED
     # a resolved fill is scored at once, before the deadline: a known loss is never hidden
-    resolved = hs.settle_fill(**kwargs, venue_yes_resolved=True, cli_yes=True, pending=True)
-    assert resolved.outcome is FillOutcome.LOSS
-    mismatch = hs.settle_fill(**kwargs, venue_yes_resolved=False, cli_yes=True, pending=True)
+    assert _settle(venue=True, cli=True, pending=True).outcome is FillOutcome.LOSS
+    mismatch = _settle(venue=False, cli=True, pending=True)
     assert mismatch.outcome is PENDING and mismatch.cause == "settlement_mismatch"
-    missing_cli = hs.settle_fill(**kwargs, venue_yes_resolved=False, cli_yes=None, pending=True)
+    missing_cli = _settle(venue=False, cli=None, pending=True)
     assert missing_cli.outcome is PENDING and missing_cli.cause == "cli_final_missing"
