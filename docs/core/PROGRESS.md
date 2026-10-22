@@ -40,6 +40,14 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ---
 
+## BACKLOG — ARM maker-sharp v1 (operator 2026-10-21: "arm the trading bot to begin trading")
+
+Plan `docs/plans/backlog/ARM_MAKER_SHARP_2026-10-21/` (r1 + r2/r3 deltas, R10/R17 errata). Built and gate-checked on local branch `arm/integration` (feat + B1–B7 exec resting path + B2 venue control PASS 2026-10-22 + D1 harm stop + C2 strategy, shadow-only); `GTD_EXPIRY_VERIFIED`/`SLUG_SCOPED_CANCEL_ALL_VERIFIED` flipped from `docs/evidence/b2/`. Nothing merges into feat before the S2 evidence commit.
+- [HIGH] At the S2 evidence commit (≈11-10): A0′ ruling `RULING_MAKER-S2_verdict_final_pin_retired_<date>` + C7 re-baseline (one commit) → merge `arm/integration` → full gate EXIT=0 → push.
+- [HIGH] Before ARM: manifest `d0_climate_day` real value; valued activities replay through `parse_position_resolutions` (`unreadable == 0`); install `breezy-maker-loss-stop.{service,timer}` (mkdir the derived dir first); fresh harm-stop PASS; supervisor restart; shadow day per plan r1 §ARM step 5.
+- [HIGH] ARM commit: ruling `RULING_MAKER_sharp_v1_live_small_2026-10-21` FINAL (PMR + security), allowlist triple, drop-in removal, `BREEZY_SENDING_FAMILY_ID` — caps untouched.
+- [LOW] Stale sweep log text for the pin-True case (next client edit); `test_persistence_import_free` is load-flaky (60 s total), redesign separately.
+
 ## BACKLOG — MAKER programme (operator 2026-10-12: "replace the backlog with this work")
 
 Spec: `docs/strategies/SPEC_pm_us_no_ladder_maker_2026-10-12.md` (v0.3, T2
