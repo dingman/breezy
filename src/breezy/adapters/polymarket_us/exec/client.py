@@ -9294,6 +9294,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             trade_id=submit_chain.maker_poll_trade_id(venue_id),
             order_qty=report.quantity.as_decimal(),
         )
+        # B6 review S3: a durable POLL- record that already stands when this process holds no
+        # booking is a CRASH REPLAY (record_fill ran, the retire did not): the boot spend seed
+        # counted its cost, so the settle below must not add it again.
+        prior = self._resting_bookings.get(venue_id)
+        replayed = (prior is None or prior[1] is None) and self._poll_record_exists(venue_id)
         try:
             self.record_fill(record, fill_time_instrument=instrument)
         except Exception as exc:  # noqa: BLE001 - never raised; the row stays for the next read
@@ -9308,11 +9313,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             f"(commission sign {submit_chain.commission_sign_class(raw_text)})"
         )
         self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
-        self._settle_resting_fill(target, held, cost, stamp_ns)
+        self._settle_resting_fill(target, held, Decimal(0) if replayed else cost, stamp_ns)
         if raw is None:
             self._flag_unreadable_commission(target.venue_order_id, target.slug)
         self._check_commission_envelope(target, within)
         return True
+
+    def _poll_record_exists(self, venue_order_id: str) -> bool:
+        """Does a durable ``POLL-`` fill record already stand for ``venue_order_id``? (SYNC;
+        an unreadable or malformed record is ``False``: the cost is then counted, never lost.)"""
+        try:
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            return raw is not None and submit_chain.is_maker_poll_fill(
+                DurableFillRecord.from_bytes(raw).trade_id
+            )
+        except Exception:  # noqa: BLE001 - counting twice is the conservative direction
+            return False
 
     def _taker_theta(self, instrument: Any, ts_ns: int) -> Decimal | None:
         """The taker theta for a resting fill: the instrument's, else the dated schedule's

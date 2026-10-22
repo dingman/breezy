@@ -961,6 +961,8 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         # B6 review P2 (NAMED rows, widen only): the boot re-derivation of the two latches.
         "_rederive_commission_latches",
         "_rederived_commission_state",
+        # B6 review S3 (NAMED row, widen only): the crash-replay probe of the fill booking.
+        "_poll_record_exists",
     }
 )
 _HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
