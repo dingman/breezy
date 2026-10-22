@@ -2658,6 +2658,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # BOUND rest from the durable ledger so its exposure is registered (unknown
             # notional: admission is refused) and its booking is tracked for the sweep.
             self._rehydrate_resting_at_boot()
+            # B6 review P2: a restart must not silently clear the commission latches.
+            self._rederive_commission_latches()
             # AC6b (EDGE-2 plan r3, D8): the NEXT statement, no `await`
             # between -- a fill the resolver's own immediate pass above
             # already recorded (before this line runs) was necessarily
@@ -9297,7 +9299,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
         self._settle_resting_fill(target, held, cost, stamp_ns)
         if raw is None:
-            self._flag_unreadable_commission(target)
+            self._flag_unreadable_commission(target.venue_order_id, target.slug)
         self._check_commission_envelope(target, within)
         return True
 
@@ -9324,17 +9326,59 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return None
         return None if fee is None else fee.as_decimal()
 
-    def _flag_unreadable_commission(self, target: RestingTarget) -> None:
+    def _flag_unreadable_commission(self, venue_order_id: str, slug: str) -> None:
         """A FILLED rest whose commission could not be read: a value-free CRITICAL
         ``commission_unreadable`` alert and the NEW-rests latch (the fill is already booked)."""
-        self._note_commission_alert(
-            "commission_unreadable", target.venue_order_id, target.slug, {}
-        )
+        self._note_commission_alert("commission_unreadable", venue_order_id, slug, {})
         self._latch_resting_order(
             submit_chain.RESTING_COMMISSION_UNREADABLE_REASON,
-            target.venue_order_id,
+            venue_order_id,
             "commission absent or unreadable",
         )
+
+    def _rederive_commission_latches(self) -> None:
+        """B6 review P2: re-derive the two commission latches at boot from the CURRENT UTC
+        day's ``POLL-`` durable records, so a restart does not silently clear them. A record
+        with no readable ``venue_fee_raw`` re-latches ``commission_unreadable``; one above the
+        envelope (priced at the theta recorded AT FILL) re-latches
+        ``resting_commission_out_of_envelope``. SYNC and never raises: an unreadable index or
+        record is itself an unreadable commission for this purpose (fail closed)."""
+        today = utc_day_for_ns(self._clock.timestamp_ns()).isoformat()
+        indexed = self._read_fill_index(f"{FILL_BY_DAY_KEY_PREFIX}{today}")
+        for venue_id in indexed or ():
+            try:
+                raw_record = self._store_get(f"{FILL_KEY_PREFIX}{venue_id}")
+                record = None if raw_record is None else DurableFillRecord.from_bytes(raw_record)
+                if record is None or not submit_chain.is_maker_poll_fill(record.trade_id):
+                    continue
+                slug = base_slug_of(InstrumentId.from_str(record.instrument_id))
+                state = self._rederived_commission_state(record)
+                if state == "unreadable":
+                    self._flag_unreadable_commission(venue_id, slug)
+                elif state == "out":
+                    self._flag_out_of_envelope(venue_id, slug)
+            except Exception as exc:  # noqa: BLE001 - a bad record must not fail the connect
+                self._log.error(f"boot: commission re-derivation failed ({exc.__class__.__name__})")
+                self._flag_unreadable_commission(venue_id, "")
+
+    def _rederived_commission_state(self, record: DurableFillRecord) -> str:
+        """``"unreadable"`` / ``"out"`` / ``"ok"`` for one durable ``POLL-`` record. SYNC."""
+        if record.venue_fee_raw is None:
+            return "unreadable"
+        try:
+            raw = Decimal(record.venue_fee_raw)
+        except InvalidOperation:
+            return "unreadable"
+        if not raw.is_finite() or record.cumulative_qty <= 0:
+            return "unreadable"
+        theta = record.fee_coefficient_at_fill
+        if theta is None:
+            theta = taker_fee_coefficient_as_of(record.ts_event)
+        price = record.cumulative_cost / record.cumulative_qty
+        within = self._commission_in_envelope(
+            theta, raw, price, record.cumulative_qty, record.ts_event
+        )
+        return "ok" if within else "out"
 
     def _emit_resting_fill_event(
         self, target: RestingTarget, report: Any, instrument: Any, recognised: Decimal, ts_ns: int

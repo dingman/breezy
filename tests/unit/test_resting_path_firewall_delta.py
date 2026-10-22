@@ -958,6 +958,9 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         # B6 review S9 (NAMED rows, widen only): the pure envelope verdict and its alert.
         "_commission_in_envelope",
         "_flag_out_of_envelope",
+        # B6 review P2 (NAMED rows, widen only): the boot re-derivation of the two latches.
+        "_rederive_commission_latches",
+        "_rederived_commission_state",
     }
 )
 _HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
