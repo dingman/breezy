@@ -841,11 +841,12 @@ async def test_a_fill_that_cannot_be_booked_counts_toward_the_unreadable_latch_t
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-async def test_a_fill_with_no_readable_commission_is_booked_unreconciled_at_zero(
+async def test_a_fill_with_no_readable_commission_is_booked_unreconciled_at_the_taker_fee(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """L-48: never strand a real fill. An absent commission books exactly as the resolver
-    books an unknown fee: ``Money(0)``, ``venue_fee_raw`` None, ``fee_reconciled`` False."""
+    """L-48: never strand a real fill. An absent commission is booked UNRECONCILED at the
+    modelled taker cent fee (B6 review P1: conservative, not zero): ``venue_fee_raw`` None,
+    ``fee_reconciled`` False. (Alert detail: the commission_unreadable test module.)"""
     rig, (command,) = await _rested(tmp_path, monkeypatch)
     _fill(rig, 0)
     del _payload(rig, 0)["commissionNotionalTotalCollected"]
@@ -853,7 +854,8 @@ async def test_a_fill_with_no_readable_commission_is_booked_unreconciled_at_zero
     (record,) = _records(rig)
     (event,) = _filled_events(rig)
     assert record.venue_fee_raw is None and record.fee_reconciled is False
-    assert record.cumulative_fee == Decimal(0) and event.commission.as_decimal() == Decimal(0)
+    assert record.cumulative_fee == Decimal("0.01")
+    assert event.commission.as_decimal() == Decimal("0.01")
     assert record.fee_source == client_module.FEE_SOURCE_MODELLED_AT_FILL_TIME
     await rig.client._disconnect()
 

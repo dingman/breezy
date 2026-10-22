@@ -951,6 +951,10 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         "_emit_resting_fill_event",
         "_settle_resting_fill",
         "_check_commission_envelope",
+        # B6 review P1 (NAMED rows, widen only): the modelled-taker fallback, the unreadable alert.
+        "_taker_theta",
+        "_modelled_taker_fee",
+        "_flag_unreadable_commission",
     }
 )
 _HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (

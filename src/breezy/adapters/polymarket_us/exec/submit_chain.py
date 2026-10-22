@@ -286,6 +286,10 @@ def commission_envelope_bound(*, modelled: Decimal, exact: Decimal) -> Decimal:
     return max(modelled, exact, rounded_up) + COMMISSION_ENVELOPE_SLACK_USD
 
 
+RESTING_COMMISSION_UNREADABLE_REASON: Final[str] = (
+    "commission_unreadable: a resting fill's commission was absent or unreadable; the fill is "
+    "booked at the modelled taker fee (unreconciled), new rests are refused (cancels continue)"
+)
 COMMISSION_BPS_DRIFT_REASON: Final[str] = (
     "commission_bps_drift: a resting order's commission bps fields left the observed inert "
     "value; the fill is booked, new rests are refused (cancels continue)"

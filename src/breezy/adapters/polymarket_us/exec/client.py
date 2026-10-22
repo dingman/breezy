@@ -9051,8 +9051,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     @property
     def resting_commission_alerts(self) -> tuple[Mapping[str, str], ...]:
         """The CRITICAL commission alerts (`commission_bps_drift`,
-        `resting_commission_out_of_envelope`) for the health surface. Value-free: an alert
-        names the event, the order id prefix and the slug, never a commission figure."""
+        `resting_commission_out_of_envelope`, `commission_unreadable`) for the health
+        surface. Value-free: an alert names the event, the order id prefix and the slug,
+        never a commission figure."""
         return tuple(self._resting_commission_alert_details.values())
 
     # -- S4 WP5: the poll (`_query_order`) and the ONE fill booking -------------
@@ -9249,16 +9250,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         except ExecutionReportMappingError:
             raw, raw_text = None, None
             self._log.warning("resting fill: no readable commission on the order; unreconciled")
-        recognised = (
-            Decimal(0)
-            if raw is None
-            else recognised_commission(
-                raw, sign_verified=submit_chain.MAKER_COMMISSION_SIGN_VERIFIED
-            )
-        )
         quantity = report.filled_qty.as_decimal()
         cost = quantity * avg_px
         stamp_ns = self._clock.timestamp_ns()
+        if raw is None:
+            # B6 review P1 / SEC L8: an unreadable commission is booked at the MODELLED TAKER
+            # cent fee (conservative, the design cost), never at zero; 0 only if unpinned.
+            fallback = self._modelled_taker_fee(instrument, avg_px, quantity, stamp_ns)
+            recognised = Decimal(0) if fallback is None else fallback
+        else:
+            recognised = recognised_commission(
+                raw, sign_verified=submit_chain.MAKER_COMMISSION_SIGN_VERIFIED
+            )
         record = DurableFillRecord(
             venue_order_id=venue_id,
             client_order_id=target.client_order_id,
@@ -9288,8 +9291,43 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
         self._settle_resting_fill(target, held, cost, stamp_ns)
+        if raw is None:
+            self._flag_unreadable_commission(target)
         self._check_commission_envelope(target, raw, instrument, avg_px, quantity, stamp_ns)
         return True
+
+    def _taker_theta(self, instrument: Any, ts_ns: int) -> Decimal | None:
+        """The taker theta for a resting fill: the instrument's, else the dated schedule's
+        at ``ts_ns``; ``None`` when neither pins one. SYNC, never raises."""
+        theta = taker_fee_coefficient_of(instrument)
+        return theta if theta is not None else taker_fee_coefficient_as_of(ts_ns)
+
+    def _modelled_taker_fee(
+        self, instrument: Any, price: Decimal, quantity: Decimal, ts_ns: int
+    ) -> Decimal | None:
+        """The modelled TAKER cent fee of a fill (USD), or ``None`` when the schedule is
+        unpinned or the price is out of range. SYNC, never raises."""
+        try:
+            fee = taker_fee_at_fill(
+                quantity=quantity,
+                price=price,
+                ts_event_ns=ts_ns,
+                fee_coefficient_at_fill=self._taker_theta(instrument, ts_ns),
+            )
+        except Exception as exc:  # noqa: BLE001 - a fallback figure is never a refusal
+            self._log.warning(f"resting fill: no modelled taker fee ({exc.__class__.__name__})")
+            return None
+        return None if fee is None else fee.as_decimal()
+
+    def _flag_unreadable_commission(self, target: RestingTarget) -> None:
+        """A FILLED rest whose commission could not be read: a value-free CRITICAL
+        ``commission_unreadable`` alert and the NEW-rests latch (the fill is already booked)."""
+        self._note_commission_alert("commission_unreadable", target, {})
+        self._latch_resting_order(
+            submit_chain.RESTING_COMMISSION_UNREADABLE_REASON,
+            target.venue_order_id,
+            "commission absent or unreadable",
+        )
 
     def _emit_resting_fill_event(
         self, target: RestingTarget, report: Any, instrument: Any, recognised: Decimal, ts_ns: int
@@ -9365,9 +9403,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if raw is None:
             return
         try:
-            theta = taker_fee_coefficient_of(instrument)
-            if theta is None:
-                theta = taker_fee_coefficient_as_of(ts_ns)
+            theta = self._taker_theta(instrument, ts_ns)
             modelled = taker_fee_at_fill(
                 quantity=quantity,
                 price=price,
