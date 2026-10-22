@@ -12,7 +12,18 @@ on the full tape (Delta = 0, +600 s, -600 s). Two runs are made here over the sa
 Both are held to the fixture's stored driver episodes. The simulator is the Stage 0 one on both
 sides (it is not part of the port); only the decision core differs. An episode's expire is not a
 simulator field, so it is derived from the port's `gtd_expire_ns` and held to the simulator's
-clock-cut end of that episode.
+clock-cut end of that episode. That check proves clock-cut consistency (min(permit end, next UTC
+midnight)) only; hard-cancel parity is proven by `test_hard_cancel_*`, including the synthetic
+case where the window does reach D 09:00 LST.
+
+R10 asked for LAX/SFO fixtures "spanning 17:00Z". That is unsatisfiable: no posting window spans
+D 09:00 LST (17:00Z on D for LAX/SFO; the permit ends D 02:50Z), per plan_r3_delta.md
+R10-ERRATUM. The fixtures carry the CANCEL_HARD cut in their clock stream instead.
+
+P_MIN / E_MIN sensitivity is NOT exercised here (the fixture days do not discriminate them); it is
+covered by the grids in test_rule_port_equivalence.py: `test_b_max_and_decide_bid_grid`,
+`test_b_max_none_and_lowest_cent_region_matches_original`, `test_b_max_equality_boundary_needs_eps`
+and `test_ladder_plan_select_and_k1_grid`.
 """
 
 from __future__ import annotations
@@ -426,9 +437,9 @@ def test_port_posts_exactly_what_the_driver_posts(
             continue
         expire = rule.gtd_expire_ns(ep.t0_ns + shift, hard, permit_end)
         if ep.end_reason in CLOCK_ENDS:
-            assert ep.end_ns + shift == expire
+            assert ep.end_ns + shift == expire, "clock-cut consistency (not hard-cancel parity)"
         else:
-            assert ep.end_ns + shift <= expire
+            assert ep.end_ns + shift <= expire, "clock-cut consistency (not hard-cancel parity)"
 
 
 @pytest.mark.parametrize("case_id", _case_ids())
@@ -446,3 +457,43 @@ def test_the_parity_check_is_sensitive_to_the_rule_params(
         diverged[name] = _rows(case, result.episodes) != expected
     assert diverged["b_cap"] or diverged["max_rungs"]
     assert diverged["b_cap"], diverged
+
+
+@pytest.mark.parametrize("station", sorted(HARD_CANCEL_UTC_HOUR))
+def test_hard_cancel_binds_the_expire_when_the_window_reaches_it(station: str) -> None:
+    """Synthetic: no midnight or permit cut before D 09:00 LST, so the min IS the hard cancel.
+
+    The simulator is driven with `maker_stage0_rule.hard_cancel_ns` as its CANCEL_HARD cut; the
+    port's `hard_cancel_ns` and `gtd_expire_ns` must name the same instant and the rest must end
+    there with reason CANCEL_HARD.
+    """
+    day = dt.date(2026, 9, 21)
+    offset = STD_OFFSET[station]
+    sim_hard = s_rule.hard_cancel_ns(day, offset)
+    port_hard = rule.hard_cancel_ns(day, offset, SHARP)
+    assert sim_hard == port_hard
+    rung = "r"
+    first = sim_hard - 3_600 * NS
+
+    def frame(ts: int, seq: int) -> s_events.Event:
+        body = s_events.DepthFrame(
+            rung_id=rung, ts_ns=ts, yes_bids=((25, 10),), yes_asks=((30, 10),)
+        )
+        return s_events.Event(ts, s_events.Kind.DEPTH, seq, body)
+
+    def picker(ctx: s_events.DecisionContext, /) -> s_events.Decision:
+        return s_events.Decision(desired=(s_events.Desired(rung, 70),), forecast_valid=True)
+
+    vec = s_events.ForecastVector(first - 10 * NS, {rung: 0.01}, {rung: 0.02}, 0, "", "v5.0")
+    clock = clock_events([CutSpec(port_hard, "CANCEL_HARD", False)], [vec])
+    data = DataEvents((frame(first, 0), frame(first + 60 * NS, 1)), 0, frozenset({rung}))
+    result = simulate_station_day(
+        merge_events(data, clock), picker, station=station, climate_day=day.isoformat(),
+        unit_hypothesis="CONTRACTS", live_from_ns=first - 20 * NS, max_rungs=SHARP.max_rungs,
+    )  # fmt: skip
+    posted = [e for e in result.episodes if e.refused_reason is None]
+    assert posted
+    permit_end = sim_hard + 10 * 3_600 * NS  # a window long enough to reach the hard cancel
+    for ep in posted:
+        assert ep.end_reason == "CANCEL_HARD"
+        assert ep.end_ns == port_hard == rule.gtd_expire_ns(ep.t0_ns, port_hard, permit_end)

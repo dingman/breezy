@@ -295,7 +295,19 @@ def _episode_row(ep: Episode, index: Mapping[str, int]) -> list[Any]:
             ep.refused_reason, ep.filled_ns_base, ep.filled_ns_stress]  # fmt: skip
 
 
+#: arms whose rule gates a rung on the POINT p_NO only (``decide_bid``: ``p_no < p_min``)
+POINT_GATED_ARMS: Final[frozenset[str]] = frozenset({"sharp"})
+
+
 def _eligible(prep: _Prepared, episodes: Iterable[Episode], arm: Arm) -> set[str]:
+    """Rungs the rule can price: ``1 - p_yes_point >= p_min - margin`` at any release, or attempted.
+
+    This keep-rule is valid ONLY because the rule gates on the point p (``p_no < p_min`` in
+    ``decide_bid``). An arm gating on ``p_yes_upper`` (or any other bound) would need a different
+    band, so it is refused here rather than silently under-keeping rungs.
+    """
+    if arm.name not in POINT_GATED_ARMS:
+        raise ValueError(f"arm {arm.name!r} is not known to gate on the point p_NO; widen the band")
     p_min = 0.0 if arm.p_min is None else arm.p_min
     keep = {e.rung_id for e in episodes}
     for vector in prep.vectors["none"]:
