@@ -340,3 +340,25 @@ async def test_resting_cancel_evidence_is_true_when_latched_false_when_an_order_
     monkeypatch.setattr(client, "_open_orders", ())
     assert client._resting_cancel_evidence() is True, "latched with a flat book is still True"
     await client._disconnect()
+
+
+# -- LOW: ts_event is the booking time (the venue Order carries no fill time) ----------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_fill_record_is_dated_by_the_booking_clock_not_the_order_create_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rest can be created on an earlier UTC day than it fills; dating the record by the
+    order's ``createTime`` would put it in the wrong day index and spend seed."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    _fill(rig, 0, createTime="2026-01-02T03:04:05.000000000Z")
+    before = client._clock.timestamp_ns()
+    await client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    assert before <= record.ts_event <= client._clock.timestamp_ns()
+    today = client_module.utc_day_for_ns(client._clock.timestamp_ns()).isoformat()
+    assert _id_n(0) in client._read_fill_index(f"{client_module.FILL_BY_DAY_KEY_PREFIX}{today}")
+    await client._disconnect()

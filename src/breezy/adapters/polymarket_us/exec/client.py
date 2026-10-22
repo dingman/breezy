@@ -7113,6 +7113,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         the side of the fill is not checked; a MAKER fill that matches an unretired rest on
         instrument, quantity and limit price is taken to be that rest's. The carve-out only
         skips a refusal; the fill is still priced at the taker figure.
+
+        Post-retire window (B6 review, accepted): the rest must be UNRETIRED. Once the poll or
+        the cancel path has booked the fill and retired the row, a late MAKER reconciliation
+        fill of the same order no longer matches, so it refuses exactly as an unknown maker
+        fill does (an alarm, fail closed), never a silent second booking.
         """
         try:
             if last_qty.as_decimal() != 1:
@@ -9153,10 +9158,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
         The read must ECHO the requested id and market (``cancel_read_verdict``); a live or
         filled order must also map to a native report (``parse_order_status_report``); else
-        it is one failed poll. A readable read clears the poll counter and runs the
-        commission bps watch, then: still open -> nothing; filled ->
-        :meth:`_book_resting_fill`; a zero-fill terminal -> the single-winner retirement
-        (as the cancel path, 4c).
+        it is one failed poll (documented residue, B6 review: a FILLED read whose average price
+        the mapper refuses, e.g. a sub-cent ``avgPx``, stays unbooked and counts toward
+        ``resting_query_unreadable`` until a later read maps, or the operator reviews). A
+        readable read clears the poll counter and runs the commission bps watch, then: still
+        open -> nothing; filled -> :meth:`_book_resting_fill`; a zero-fill terminal -> the
+        single-winner retirement (as the cancel path, 4c).
         """
         venue_id = target.venue_order_id
         report = None
@@ -9269,7 +9276,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         the RECOGNISED commission, ``venue_fee_raw`` = the venue's own string,
         ``fee_reconciled = recognised == raw`` and in the envelope); (2) the native
         ``OrderFilled`` as MAKER at the venue's commission (guarded: an order this run's
-        cache does not know gets no event); (3) the index row retired (guarded); (4) the
+        cache does not know gets no event; ``liquidity_side`` is MAKER by construction of the
+        bound-rest path, even if the bid crossed on arrival: conservative, the commission and
+        the cost are the venue's own, and an unbound order never reaches this method, so its
+        side is never inferred here); (3) the index row retired (guarded); (4) the
         ledger settle at the realised cost. The event precedes the retire (B6 review S6; a
         deviation from the r4 record-then-retire wording: the crash window is then a bound
         row the next read re-books, never a stuck open order). A
@@ -9299,6 +9309,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._log.warning("resting fill: no readable commission on the order; unreconciled")
         quantity = report.filled_qty.as_decimal()
         cost = quantity * avg_px
+        # `ts_event` is the BOOKING (poll) time: a venue `Order` carries `createTime` only (no
+        # fill time), and a resting order can be created on an earlier UTC day than it fills,
+        # so the creation time would mis-date the fill in the day index and the spend seed.
         stamp_ns = self._clock.timestamp_ns()
         within = self._commission_in_envelope(
             self._taker_theta(instrument, stamp_ns), raw, avg_px, quantity, stamp_ns
