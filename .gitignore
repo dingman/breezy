@@ -34,3 +34,7 @@ data/evidence/discovery_set_equality/
 # live ~/.local/share/breezy/derived tree.
 /scratch/
 .venv
+
+# Per-worktree pytest scratch (--basetemp <worktree>/.pytest-tmp/<name>); keeps test temp
+# inside the repo, off tmpfs /tmp.
+.pytest-tmp/
