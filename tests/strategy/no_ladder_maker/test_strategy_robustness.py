@@ -265,32 +265,65 @@ def test_the_window_end_guard_stops_posting_and_cancels_when_the_alert_never_fir
 # --- W1: the stale-book guard ----------------------------------------------------------------
 
 
-def test_a_post_is_refused_on_a_stale_frame_whose_ask_has_since_dropped() -> None:
-    h = Harness()
+def _wanted_later(h: Harness) -> dict[str, bool]:
     wanted = {"on": False}
     rung = h.rung(BAND)
     h.install(lambda ctx: want((rung, 89)) if wanted["on"] else Decision(forecast_valid=True))
-    h.book(BAND)  # YES bid 5c -> NO ask 95c: a 89c bid is admissible against THIS frame
-    h.book("gte70lt71f")
-    h.advance(STALE_BOOK_S + 1)  # the feed went quiet; the real ask has dropped to 88c meanwhile
+    return wanted
+
+
+def test_a_quiet_rung_is_postable_while_another_rung_on_the_feed_updated_1s_ago() -> None:
+    h = Harness()
+    wanted = _wanted_later(h)
+    h.book(BAND)  # the rung's only frame
+    h.advance(60)  # the rung stays quiet for a minute...
+    h.book("gte70lt71f")  # ...but the feed is alive
+    h.advance(1)
     wanted["on"] = True
-    h.book("gte70lt71f")  # a fresh frame of ANOTHER rung re-decides the ladder
+    h.strategy._decide(h.ladder)
+    assert len(h.submits(h.drain())) == 1
+    assert h.strategy.counters["refused_stale_book"] == 0
+
+
+def test_every_feed_silent_for_more_than_the_bound_refuses_the_post() -> None:
+    h = Harness()
+    wanted = _wanted_later(h)
+    h.book(BAND)
+    h.book("gte70lt71f")
+    h.advance(STALE_BOOK_S + 1)
+    wanted["on"] = True
+    h.strategy._decide(h.ladder)  # e.g. an NBP release, a poll or an expiry re-decide
     assert h.submits(h.drain()) == []
     assert h.strategy.counters["refused_stale_book"] == 1
-    h.book(BAND, bids=(("0.05", 10),))  # a fresh frame of the rung itself
+    h.book("gte70lt71f")  # the feed speaks again
     assert len(h.submits(h.drain())) == 1
 
 
-def test_a_frame_inside_the_staleness_bound_is_still_admissible() -> None:
+def test_a_rung_with_no_frame_of_its_own_is_never_posted_even_on_a_live_feed() -> None:
     h = Harness()
-    wanted = {"on": False}
-    rung = h.rung(BAND)
-    h.install(lambda ctx: want((rung, 89)) if wanted["on"] else Decision(forecast_valid=True))
-    h.book(BAND)
+    _price_script(h)
     h.book("gte70lt71f")
+    assert h.submits(h.drain()) == []
+
+
+def test_a_post_is_refused_on_a_silent_feed_whose_ask_has_since_dropped() -> None:
+    h = Harness()
+    wanted = _wanted_later(h)
+    h.book(BAND)  # YES bid 5c -> NO ask 95c: an 89c bid is admissible against THIS frame
+    h.advance(STALE_BOOK_S + 1)  # silence: the real ask may have dropped to 88c meanwhile
+    wanted["on"] = True
+    h.strategy._decide(h.ladder)
+    assert h.submits(h.drain()) == []
+    assert h.strategy.counters["refused_stale_book"] == 1
+
+
+def test_a_feed_frame_inside_the_bound_is_still_admissible() -> None:
+    h = Harness()
+    wanted = _wanted_later(h)
+    h.book(BAND)
     h.advance(STALE_BOOK_S - 1)
     wanted["on"] = True
-    h.book("gte70lt71f")
+    h.strategy._decide(h.ladder)
     assert len(h.submits(h.drain())) == 1
 
 

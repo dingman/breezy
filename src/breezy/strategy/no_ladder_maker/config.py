@@ -31,9 +31,8 @@ DEFAULT_POLL_INTERVAL_S: Final[int] = 30
 #: (two poll intervals): a lost ack or a refused cancel can never leave a rest CANCELING forever.
 CANCEL_DEADLINE_S: Final[int] = 60
 
-#: The newest Depth10 frame a post may rely on. The order is non-post-only (venue discovery: the
-#: plan keeps ``post_only=False``), so a stale frame whose ask has since dropped would TAKE; a rung
-#: whose frame is older than this is not posted until a fresh frame arrives.
+#: Feed liveness bound: a post needs some Depth10 frame (any maker instrument) within this many
+#: seconds. The order is non-post-only, so a silent feed whose ask has since dropped would TAKE.
 STALE_BOOK_S: Final[int] = 5
 
 

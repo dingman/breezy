@@ -39,7 +39,7 @@ midnight (the instant a re-derived day would change) is later than the window at
 Restart (W2). Orders of this strategy already in the cache (open or in flight) are adopted as
 tracked rests when their rung registers, so a restart never double-posts; extras on a rung are
 cancelled. The order is non-post-only (venue discovery, plan): the stale-book guard
-(``STALE_BOOK_S``) and the truncation refusal are what keep a rest from taking.
+(feed-level, ``STALE_BOOK_S``) and the truncation refusal are what keep a rest from taking.
 
 ``obs_cancel`` is NOT ported: the sharp arm never fed observation events (the design driver has no
 call site), so the strategy cancels on forecast, price, hard-cancel and veto only -- the same
@@ -227,6 +227,8 @@ class NoLadderMakerStrategy(Strategy):
         self._nbp_pending: set[str] = set()
         self._nbp_alerts = 0
         self._shadow_alerts = 0
+        #: arrival (our clock) of the newest Depth10 frame of ANY maker instrument: the feed's pulse
+        self._last_frame_ns = 0
         self._veto_latched: str | None = None
         self._tracker = WantTracker()
         self.counters: Counter[str] = Counter()
@@ -392,7 +394,7 @@ class NoLadderMakerStrategy(Strategy):
         key, rung_id = key_rung
         ladder = self.ladders[key]
         ladder.books[rung_id] = frame_from_levels(rung_id, depth.ts_event, depth.bids, depth.asks)
-        ladder.arrivals[rung_id] = self.clock.timestamp_ns()
+        self._last_frame_ns = self.clock.timestamp_ns()
         self._decide(ladder)
 
     @_guarded
@@ -534,8 +536,11 @@ class NoLadderMakerStrategy(Strategy):
         if now_ns < ladder.backoff_until_ns.get(desired.rung_id, 0):
             self.counters["backoff"] += 1
             return
-        if now_ns - ladder.arrivals.get(desired.rung_id, 0) > self._stale_book_ns:
-            self.counters["refused_stale_book"] += 1  # post_only is False: a stale ask would take
+        # Feed-level liveness (coordinator ruling): updates on one connection arrive in order, so
+        # a quiet rung is current while the feed is alive; a silent feed is the taker risk
+        # (post_only is False). The rung's own frame exists: ``ladder.books`` is read below.
+        if now_ns - self._last_frame_ns > self._stale_book_ns:
+            self.counters["refused_stale_book"] += 1
             return
         refusal = book_refusal(ladder.books[desired.rung_id], desired.bid_cents)
         if refusal is not None:

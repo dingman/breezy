@@ -86,9 +86,6 @@ class Ladder:
     window_open_ns: int = 0
     rungs: dict[str, Rung] = field(default_factory=dict)
     books: dict[str, DepthFrame] = field(default_factory=dict)
-    #: rung -> OUR clock at the instant its newest frame arrived (the staleness guard's reference;
-    #: ``DepthFrame.ts_ns`` is the venue's ``transactTime``, a different clock)
-    arrivals: dict[str, int] = field(default_factory=dict)
     rests: dict[str, Rest] = field(default_factory=dict)
     held: set[str] = field(default_factory=set)
     #: rung -> earliest ns a re-post may be attempted (after a denial / rejection)
