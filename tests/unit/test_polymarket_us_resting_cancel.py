@@ -196,6 +196,21 @@ def _set_state(rig: _Rig, n: int, state: str, cum: int = 0) -> None:
     _payload(rig, n).update({"state": state, "cumQuantity": cum})
 
 
+def _fill_payload(rig: _Rig, n: int) -> None:
+    """The venue shows rest ``n`` FILLED in full at its limit, with a readable commission."""
+    _payload(rig, n).update(
+        {
+            "state": "ORDER_STATE_FILLED",
+            "cumQuantity": 1,
+            "leavesQuantity": 0,
+            "avgPx": {"value": "0.60", "currency": "USD"},
+            "commissionNotionalTotalCollected": {"value": "0.01", "currency": "USD"},
+            "commissionsBasisPoints": "0",
+            "makerCommissionsBasisPoints": "0",
+        }
+    )
+
+
 def _cancel_cmd(rig: _Rig, command: Any) -> CancelOrder:
     return CancelOrder(
         trader_id=TRADER_ID,
@@ -343,11 +358,14 @@ async def test_cancel_post_200_but_get_filled_routes_to_fill_and_does_not_restor
     command = await _submit_rest(rig, 0)
     before = _remaining(rig)
     intent_id = client._resting_bookings[_id_n(0)][0]
-    rig.sender.on_cancel = lambda _id: _set_state(rig, 0, "ORDER_STATE_FILLED", cum=1)
+    rig.sender.on_cancel = lambda _id: _fill_payload(rig, 0)
     await client._cancel_order(_cancel_cmd(rig, command))
     assert "OrderCanceled" not in _names(rig)
-    assert client._ledger.has_open_exposure(intent_id), "the fill path (poll) settles it"
-    assert json.loads(client._store_get(_INDEX_KEY)) == [_id_n(0)], "row kept for the poll"
+    # ARM B6: the cancel path's FILLED read books the fill through the poll's single winner
+    # (a bare FILLED payload with no price is unbookable and, since the B6 review S2, keeps
+    # the id pending instead of dropping it; see the security-review module)
+    assert not client._ledger.has_open_exposure(intent_id), "the booking settled it"
+    assert json.loads(client._store_get(_INDEX_KEY)) == [], "row retired by the booking"
     assert _remaining(rig) == before, "no restore on a fill"
     assert client._cancel_in_flight == frozenset()
     await client._disconnect()

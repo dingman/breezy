@@ -8786,10 +8786,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         verdict = submit_chain.cancel_read_verdict(
             body, expected_id=venue_order_id, expected_slug=market_slug
         )
-        if verdict == submit_chain.CANCEL_READ_FILLED:
+        if verdict == submit_chain.CANCEL_READ_FILLED and not self._book_filled_read(
+            venue_order_id, body
+        ):
             # B6: the cancel/sweep read that finds the order FILLED books the fill through
-            # the same single winner as the poll (durable record, event, settle).
-            self._book_filled_read(venue_order_id, body)
+            # the same single winner as the poll (durable record, event, settle). B6 review S2:
+            # a fill that could not be booked is NOT terminal for the loop: the id stays
+            # pending and its latch stays until a read books it.
+            return submit_chain.CANCEL_READ_UNREADABLE
         return verdict
 
     async def _cancel_resting_order(
@@ -9169,19 +9173,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         indexed = self._read_fill_index(RESTING_INDEX_KEY)
         return indexed is None or venue_order_id in indexed
 
-    def _book_filled_read(self, venue_order_id: str, body: Mapping[str, Any]) -> None:
+    def _book_filled_read(self, venue_order_id: str, body: Mapping[str, Any]) -> bool:
         """A FILLED terminal read made by the CANCEL path books the fill through the same
-        single winner as the poll (SYNC; never raises). Not a bound rest: nothing to do."""
+        single winner as the poll (SYNC; never raises).
+
+        ``True`` when there is nothing left to book: not a bound rest, booked by this call, or
+        already booked by another path. ``False`` when the fill COULD NOT be booked and the row
+        is still bound (B6 review S2): the caller must keep the id pending and its latch."""
         try:
             target = self._resting_target_of(venue_order_id)
             if target is None or not target.bound:
-                return
+                return True
             report = self._parse_resting_read(target, body)
-            self._book_resting_fill(target, body, report)
+            if self._book_resting_fill(target, body, report):
+                return True
+            return not self._rest_still_bound(venue_order_id)
         except Exception as exc:  # noqa: BLE001 - the cancel loop goes on; the poll retries
             self._log.error(
                 f"resting cancel: booking the filled read failed ({exc.__class__.__name__})"
             )
+            return False
 
     def _note_commission_alert(
         self, event: str, venue_order_id: str, slug: str, extra: Mapping[str, str]

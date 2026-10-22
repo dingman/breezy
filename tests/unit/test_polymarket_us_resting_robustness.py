@@ -34,6 +34,7 @@ from tests.unit.test_polymarket_us_resting_cancel import (
     _auto_cancel,
     _cancel_all_cmd,
     _cancel_cmd,
+    _fill_payload,
     _names,
     _payload,
     _rig,
@@ -343,7 +344,7 @@ async def test_a_filled_read_clears_the_cancel_latch_and_alert_for_that_id(
     client._latch_resting_cancel_unconfirmed(_id_n(0), "earlier_refusals")
     client._resting_cancel_alert_details = {_id_n(0): {"severity": "CRITICAL"}}
     client._resting_cancel_alert_ns = {_id_n(0): 1}
-    _set_state(rig, 0, "ORDER_STATE_FILLED", cum=1)
+    _fill_payload(rig, 0)
     unresolved = await asyncio.wait_for(client._cancel_resting_order([_id_n(0)]), 2.0)
     assert unresolved == frozenset()
     assert _LATCH not in [r.reason for r in client._trading_refusals]
@@ -383,7 +384,8 @@ async def test_a_live_partial_fill_keeps_the_cancel_loop_retrying_until_terminal
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """G4 at the client: PARTIALLY_FILLED (the rest still rests) is not a done cancel; once
-    the venue shows the order terminal WITH a fill, the fill path owns it (no event here)."""
+    the venue shows the order terminal WITH a fill the cancel path cannot book (here a partial
+    of ten), the id stays pending (B6 review S2) and the cancel path settles nothing itself."""
     rig = await _rig(tmp_path, monkeypatch)
     client = rig.client
     await _submit_rest(rig, 0)
@@ -395,9 +397,13 @@ async def test_a_live_partial_fill_keeps_the_cancel_loop_retrying_until_terminal
     assert not task.done(), "a live partial is retried, not dropped as filled"
     assert len(rig.sender.cancels) >= 2
     _set_state(rig, 0, "ORDER_STATE_CANCELED", cum=1)
-    assert await asyncio.wait_for(task, 2.0) == frozenset()
+    await asyncio.sleep(0.1)
+    assert not task.done(), "an unbookable terminal fill keeps the id pending (B6 review S2)"
     assert "OrderCanceled" not in _names(rig), "a fill is never settled by the cancel path"
     assert client._ledger.has_open_exposure(intent_id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     await client._disconnect()
 
 
@@ -608,7 +614,14 @@ async def test_a_rejected_read_with_a_fill_still_belongs_to_the_fill_path(
     command = await _submit_rest(rig, 0)
     intent_id = client._resting_bookings[_id_n(0)][0]
     rig.sender.on_cancel = lambda oid: _set_state(rig, 0, "ORDER_STATE_REJECTED", cum=1)
-    await asyncio.wait_for(client._cancel_order(_cancel_cmd(rig, command)), 2.0)
+    # B6 review S2: the unbookable REJECTED-with-a-fill read keeps the id pending in the cancel
+    # loop (it never settles or emits a terminal itself); the loop is still running here
+    task = asyncio.ensure_future(client._cancel_order(_cancel_cmd(rig, command)))
+    await asyncio.sleep(0.1)
+    assert not task.done()
     assert "OrderRejected" not in _names(rig) and "OrderCanceled" not in _names(rig)
     assert client._ledger.has_open_exposure(intent_id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     await client._disconnect()
