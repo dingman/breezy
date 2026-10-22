@@ -62,6 +62,10 @@ RAW_COMMISSION_READ_ALLOWLIST: Final[dict[tuple[str, str], str]] = {
     (_CLIENT, f"{_CLI}._submit_order"): "create-path writer (taker audit string)",
     (_CLIENT, f"{_CLI}._book_resting_fill"): "the poll booking: raw -> recognised, string stored",
     (_CLIENT, f"{_CLI}.record_fill"): "O4 fee-source stamp (the string's presence)",
+    (_CLIENT, f"{_CLI}._rederived_commission_state"): (
+        "B6 review P2: the boot re-derivation of the commission latches reads the stored string "
+        "for the envelope / unreadable verdict only; it never prices or books from it"
+    ),
     (_CLIENT, "fee_source_for"): "O4 fee-source derivation (the string's presence)",
     (f"{_EXEC}/reports.py", ""): "key NAME in the wire-order key list",
     (f"{_EXEC}/reports.py", "resting_commission_text"): "the venue's exact string (poll)",
@@ -184,3 +188,23 @@ def test_the_static_scan_sees_a_planted_raw_reader() -> None:
     assert _references(planted, VALUE_READ_ATTRIBUTES) == {("price", "cumulative_fee")}
     clean = "def price(rec):\n    return rec.cumulative_fee\n"
     assert _references(clean, RAW_COMMISSION_NAMES) == set()
+
+
+def test_the_p2_rederivation_row_names_one_scope_and_a_neighbour_is_not_covered() -> None:
+    """B6 review P2 row plant: the raw read is allowed in ``_rederived_commission_state`` ONLY;
+    the same read planted in its caller (or any sibling) is a scope the allowlist does not name."""
+    row = (_CLIENT, f"{_CLI}._rederived_commission_state")
+    assert row in RAW_COMMISSION_READ_ALLOWLIST
+    template = f"class {_CLI}:\n    def {{name}}(self, rec):\n        return rec.venue_fee_raw\n"
+    scope = f"{_CLI}.{{name}}"
+    own = _references(template.format(name="_rederived_commission_state"), RAW_COMMISSION_NAMES)
+    assert {(_CLIENT, s) for s, _n in own} == {row}
+    sibling = _references(
+        template.format(name="_rederive_commission_latches"), RAW_COMMISSION_NAMES
+    )
+    assert (_CLIENT, scope.format(name="_rederive_commission_latches")) in {
+        (_CLIENT, s) for s, _n in sibling
+    }
+    assert (_CLIENT, scope.format(name="_rederive_commission_latches")) not in (
+        RAW_COMMISSION_READ_ALLOWLIST
+    )
