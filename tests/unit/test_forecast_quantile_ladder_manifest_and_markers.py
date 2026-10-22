@@ -140,3 +140,7 @@ def test_b7_repin_is_sensitive_to_the_old_digest_and_to_a_single_flipped_byte() 
     assert hashlib.sha256(original).hexdigest() != _EXEC_CLIENT_SHA256_BEFORE_B7_REPIN
     flipped = bytes([original[0] ^ 0x01]) + original[1:]
     assert hashlib.sha256(flipped).hexdigest() != _EXEC_CLIENT_SHA256
+    # B7 review T4: a flip in the middle and at the end of the file is caught as well.
+    for index in (len(original) // 2, len(original) - 1):
+        mutated = original[:index] + bytes([original[index] ^ 0x01]) + original[index + 1 :]
+        assert hashlib.sha256(mutated).hexdigest() != _EXEC_CLIENT_SHA256, index
