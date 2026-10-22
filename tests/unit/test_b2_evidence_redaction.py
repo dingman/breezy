@@ -2,8 +2,16 @@
 
 Authority: ``plan_r2_delta.md`` D3 ("a regex test over the evidence dir"). The patterns here are
 this test's own, independent of the script's writer-side guard: a second, stricter pair of eyes.
-Every evidence file must be mode 0600, valid JSON, and free of anything shaped like a header,
-a signature, a key id, a key, a URL with a query or userinfo, or a raw order body.
+Every evidence file must be valid JSON and free of anything shaped like a header, a signature,
+a key id, a key, a URL with a query or userinfo, or a raw order body. That regex scan runs on
+EVERY file, tracked or not.
+
+The 0600 mode check is scoped to files git does NOT track. git stores only the executable bit,
+so a fresh checkout of a committed evidence file is 0644 and a mode check on it would fail for
+a reason that says nothing about secrecy. The mode protects the file the script has just written
+at runtime (an untracked file); that write is tested in the script's own write tests. A file
+that is tracked has, by construction, already passed the content scan and is public to the repo.
+An untracked file with a loose mode still fails (see the scoping tests below).
 
 The directory does not exist until the control has run; the scan is then vacuous on purpose,
 and the non-vacuity tests below prove the scanner trips on every forbidden shape and passes a
@@ -16,6 +24,7 @@ import asyncio
 import json
 import re
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Final
 
@@ -56,12 +65,31 @@ def evidence_files(directory: Path) -> list[Path]:
     return sorted(directory.glob("*.json")) if directory.is_dir() else []
 
 
-def check_directory(directory: Path) -> list[str]:
-    """Findings for every file under ``directory``: shape hits, bad mode, bad JSON."""
+def git_tracked_names(directory: Path) -> frozenset[str]:
+    """File names under ``directory`` that git tracks; empty (strict) when git is unusable."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(directory), "ls-files", "-z", "--", "."],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    return frozenset(Path(rel).name for rel in out.decode("utf-8").split("\0") if rel)
+
+
+def check_directory(directory: Path, tracked: frozenset[str] | None = None) -> list[str]:
+    """Findings per file under ``directory``: shape hits, bad JSON, bad mode (untracked only)."""
+    tracked_names = (
+        git_tracked_names(directory)
+        if tracked is None and directory.is_dir()
+        else (tracked or frozenset())
+    )
     findings: list[str] = []
     for path in evidence_files(directory):
         mode = stat.S_IMODE(path.stat().st_mode)
-        if mode != 0o600:
+        if mode != 0o600 and path.name not in tracked_names:
             findings.append(f"{path.name}: mode {oct(mode)}")
         text = path.read_text(encoding="utf-8")
         try:
@@ -105,6 +133,43 @@ def test_the_scanner_flags_a_loose_mode_and_non_json_file(tmp_path: Path) -> Non
     findings = check_directory(tmp_path)
     assert any("a.json: mode" in f for f in findings)
     assert any("b.json: not JSON" in f for f in findings)
+
+
+def test_mode_check_skips_a_tracked_file_but_still_fails_an_untracked_loose_one(
+    tmp_path: Path,
+) -> None:
+    tracked_file = tmp_path / "tracked.json"
+    tracked_file.write_text("{}", encoding="utf-8")
+    tracked_file.chmod(0o644)
+    loose = tmp_path / "loose.json"
+    loose.write_text("{}", encoding="utf-8")
+    loose.chmod(0o644)
+    findings = check_directory(tmp_path, tracked=frozenset({"tracked.json"}))
+    assert not any("tracked.json: mode" in f for f in findings)
+    assert any("loose.json: mode" in f for f in findings)
+
+
+def test_the_regex_scan_still_runs_on_a_tracked_file(tmp_path: Path) -> None:
+    leaky = tmp_path / "leaky.json"
+    leaky.write_text('{"note": "X-PM-Access-Key"}', encoding="utf-8")
+    leaky.chmod(0o644)
+    findings = check_directory(tmp_path, tracked=frozenset({"leaky.json"}))
+    assert findings == ["leaky.json: pm-header"]
+
+
+def test_tracked_status_comes_from_git_ls_files(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, timeout=30)
+    added = tmp_path / "added.json"
+    added.write_text("{}", encoding="utf-8")
+    added.chmod(0o644)
+    other = tmp_path / "other.json"
+    other.write_text("{}", encoding="utf-8")
+    other.chmod(0o644)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "added.json"], check=True, timeout=30)
+    assert git_tracked_names(tmp_path) == frozenset({"added.json"})
+    findings = check_directory(tmp_path)
+    assert not any("added.json: mode" in f for f in findings)
+    assert any("other.json: mode" in f for f in findings)
 
 
 def test_a_document_the_real_script_produced_passes_the_scan(
