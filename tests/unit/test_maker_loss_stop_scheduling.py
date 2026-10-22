@@ -130,7 +130,12 @@ def test_the_unit_is_sandboxed_to_exactly_the_artefact_directory() -> None:
     paths = writable[0].split("=", 1)[1].split()
     root = Path(_catalog_root_of(_exec("ExecStart")))
     artefact_dir = producer.artefact_path(root).parent
-    assert paths == [str(artefact_dir)], "only the dir latest.json and venue_settlements.json share"
+    # ARM D1: the artefact dir plus the alert delivery journal (the unit loads alerts.env, so the
+    # AUT-6 redeliver contract requires the journal row; removing it fails that contract).
+    assert paths == [
+        str(artefact_dir),
+        "%h/.local/share/breezy/evidence/alerts",
+    ], "only the dir latest.json and venue_settlements.json share, plus the delivery journal"
 
 
 def test_the_units_catalog_root_is_the_declared_tape_location_in_both_steps() -> None:
