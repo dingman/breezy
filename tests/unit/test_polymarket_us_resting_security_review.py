@@ -14,10 +14,14 @@ from typing import Any, Final
 import pytest
 
 from tests.unit.ambig_latch_rig import (
+    OPEN_ORDERS_PATH,
     gate_env,  # noqa: F401 -- used via usefixtures
+    run_passes,
     submit_chain,
+    wire_payloads,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+from tests.unit.test_ambig_no_id_resolver import _negative, _retirement
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender
 from tests.unit.test_polymarket_us_resting_query import (
     _fill,
@@ -26,8 +30,9 @@ from tests.unit.test_polymarket_us_resting_query import (
     _records,
     _rested,
 )
-from tests.unit.test_polymarket_us_resting_submit import _id_n
-from tests.unit.test_polymarket_us_resting_sweep import _second_process
+from tests.unit.test_polymarket_us_resting_restart import SWEEP, _prior_process
+from tests.unit.test_polymarket_us_resting_submit import _id_n, _rest_command
+from tests.unit.test_polymarket_us_resting_sweep import _open_row, _second_process
 
 NO_PX: Final[Decimal] = Decimal("0.40")
 
@@ -110,4 +115,51 @@ async def test_s3_a_crash_replay_of_record_fill_does_not_double_the_settle_cost(
     spent = second._ledger.spent_today_usd(now_ns=second._clock.timestamp_ns())
     assert spent == NO_PX, "the cost is counted once (by the seed), not again by the replay"
     assert second._trading_refusals == []
+    await second._disconnect()
+
+
+# -- S1: the swept NO_FILL retirement consults the open-orders read ------------------------
+
+
+async def _swept_two_passes(second: Any) -> None:
+    second.advance(305)
+    await run_passes(second, 1)
+    second.advance(70)
+    await run_passes(second, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s1_an_open_order_on_the_swept_slug_blocks_the_no_fill_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second, intent_id, _context = await _prior_process(tmp_path, monkeypatch, sender=CancelSender())
+    row = _open_row(_rest_command(second), 7)
+    _negative(second, open_orders=[row])
+    await _swept_two_passes(second)
+    assert _retirement(second) is None, "an order still open on the slug may yet fill"
+    assert second._latch.current_open() is not None
+    # it clears the moment the venue shows the slug clear: the retirement then proceeds
+    _negative(second)
+    second.advance(70)
+    await run_passes(second, 1)
+    second.advance(70)
+    await run_passes(second, 1)
+    assert _retirement(second) == SWEEP
+    del intent_id
+    await second._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s1_an_unreadable_open_orders_read_blocks_the_no_fill_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second, _intent_id, _context = await _prior_process(
+        tmp_path, monkeypatch, sender=CancelSender()
+    )
+    _negative(second)
+    del wire_payloads(second)[OPEN_ORDERS_PATH]
+    await _swept_two_passes(second)
+    assert _retirement(second) is None, "an unread open-orders book is not a clear slug"
     await second._disconnect()

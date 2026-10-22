@@ -4797,10 +4797,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if echo is None:
                 outcome_kind = "INCOMPLETE"
                 outcome_token = "holding_unreadable"
+            elif not open_orders_ok:
+                # B6 review S1: an unread open-orders book is not a clear slug
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "open_orders_unreadable"
             elif join.out_of_order or not join.complete:
                 outcome_kind = "INCOMPLETE"
                 outcome_token = "activities_incomplete"
             else:
+                for open_order in open_orders:
+                    if open_order.market_slug == echo.slug:
+                        # B6 review S1: an order still open on the swept slug may yet fill
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "open_order_on_swept_slug"
                 row_index = 0
                 for leg in join.legs:
                     passive_is_manual = join.passive_manual[row_index]
