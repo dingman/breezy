@@ -418,8 +418,11 @@ _RESTING_ALERT_DETAIL_KEYS: Final[tuple[str, ...]] = (
 _RESTING_ALERT_TOKEN: Final = re.compile(r"[A-Za-z0-9_.,:/-]{1,96}")
 
 
-def _resting_alert_token(value: str) -> str:
-    return value if _RESTING_ALERT_TOKEN.fullmatch(value) else "<redacted>"
+def _resting_alert_token(value: object) -> str:
+    """A non-str value is coerced first: the handler runs on the message bus and must never
+    raise on a malformed entry (B7 review T3)."""
+    text = value if isinstance(value, str) else str(value)
+    return text if _RESTING_ALERT_TOKEN.fullmatch(text) else "<redacted>"
 
 
 def _resting_alert_event(alert: Mapping[str, str]) -> str:
@@ -427,13 +430,20 @@ def _resting_alert_event(alert: Mapping[str, str]) -> str:
     return event if event in _RESTING_ALERT_EVENTS else RESTING_ALERT_UNKNOWN_EVENT
 
 
-def _resting_alert_key(alert: Mapping[str, str]) -> tuple[str, str, str]:
+#: The dedupe key: the sent event name, every forwarded detail key, and the RAW event so two
+#: different unknown events (both sent under the generic name) never collapse (B7 review P-3).
+_RestingAlertKey = tuple[str, ...]
+
+
+def _resting_alert_key(alert: Mapping[str, str]) -> _RestingAlertKey:
     """Dedupe key. ``age_s`` is part of it: the client re-alerts a still-open cancel with a
-    new age, and that re-alert must reach the operator."""
+    new age, and that re-alert must reach the operator. So are ``fields``/``next`` and the raw
+    event: an alert that changes any forwarded detail is a new alert."""
     return (
         _resting_alert_event(alert),
-        alert.get("venue_order_id", ""),
-        alert.get("age_s", ""),
+        str(alert.get("event", "")),
+        *(str(alert.get(key, "")) for key in _RESTING_ALERT_DETAIL_KEYS),
+        str(alert.get("age_s", "")),
     )
 
 
@@ -462,7 +472,7 @@ def install_resting_alert(
     ever sent: no commission figure, no raw order id.
     """
     active_sink = resolve_alert_sink() if sink is None else sink
-    alerted: set[tuple[str, str, str]] = set()
+    alerted: set[_RestingAlertKey] = set()
 
     def _on_component_state(event: object) -> None:
         del event
@@ -473,21 +483,30 @@ def install_resting_alert(
         except Exception:
             logger.exception("failed to read the resting alert surfaces")
             return
-        alerted.intersection_update({_resting_alert_key(alert) for alert in current})
+        keyed: list[tuple[_RestingAlertKey, Mapping[str, str]]] = []
         for alert in current:
-            key = _resting_alert_key(alert)
+            try:
+                keyed.append((_resting_alert_key(alert), alert))
+            # Broad, deliberately: one malformed entry must not silence the others or raise
+            # into the bus (B7 review T3).
+            except Exception:
+                logger.exception("skipped a malformed resting alert entry")
+        alerted.intersection_update({key for key, _alert in keyed})
+        for key, alert in keyed:
             if key in alerted:
                 continue
-            alerted.add(key)
-            emit_alert(
-                active_sink,
-                AlertPayload(
+            try:
+                payload = AlertPayload(
                     severity=RESTING_ALERT_SEVERITY,
                     event=key[0],
                     site=RESTING_ALERT_SITE,
                     detail=_resting_alert_detail(alert),
-                ),
-            )
+                )
+            except Exception:
+                logger.exception("failed to build a resting alert")
+                continue
+            alerted.add(key)
+            emit_alert(active_sink, payload)
 
     msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
     return _on_component_state

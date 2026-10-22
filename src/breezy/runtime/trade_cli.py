@@ -506,6 +506,14 @@ def _exec_client_resolver_contradiction_reader(
     return _read
 
 
+def _declared_surface(client: object, name: str) -> tuple[Mapping[str, str], ...]:
+    """``()`` when the client does not declare ``name``; otherwise the surface's value, with any
+    error raised INSIDE a declared property propagated (``getattr(..., ())`` would read an
+    AttributeError in the property body as "no alerts"; B7 review P-2)."""
+    declared = hasattr(type(client), name) or name in getattr(client, "__dict__", {})
+    return tuple(getattr(client, name)) if declared else ()
+
+
 def _exec_client_resting_alert_reader(
     node: Node,
 ) -> Callable[[], tuple[Mapping[str, str], ...]]:
@@ -522,8 +530,8 @@ def _exec_client_resting_alert_reader(
         if client is None:
             return ()
         return (
-            *getattr(client, "resting_cancel_alerts", ()),
-            *getattr(client, "resting_commission_alerts", ()),
+            *_declared_surface(client, "resting_cancel_alerts"),
+            *_declared_surface(client, "resting_commission_alerts"),
         )
 
     return _read

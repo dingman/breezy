@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -224,3 +225,90 @@ def test_the_trade_cli_reader_joins_both_client_surfaces_at_poll_time() -> None:
         resting_cancel_alerts=(cancel,), resting_commission_alerts=(commission,)
     )
     assert read() == (cancel, commission)
+
+
+# ------------------------------------------------------------ B7 review T3 / P-3 / P-2
+
+
+def test_a_non_string_value_never_raises_out_of_the_handler_and_other_alerts_still_go() -> None:
+    """T3: the msgbus handler must not raise on a malformed entry (non-str values, a non-mapping
+    entry); a good entry in the same poll is still delivered."""
+    bus, sink = _bus(), _RecordingSink()
+    surface: tuple[Any, ...] = (
+        _entry("resting_cancel_alert", vid="OK1"),
+        {"event": "commission_unreadable", "venue_order_id": 12345, "age_s": None, "slug": 7},
+        "not-a-mapping",
+        _entry("resting_fill_mismatch", vid="OK2"),
+    )
+    handler = install_resting_alert(bus, alerts=lambda: surface, sink=sink)
+    handler(None)  # direct call: a raise here would propagate into the publishing component
+    delivered = {p.event for p in sink.payloads}
+    assert {"resting_cancel_alert", "resting_fill_mismatch"} <= delivered, sink.payloads
+    count = len(sink.payloads)
+    handler(None)
+    assert len(sink.payloads) == count, "a second poll adds nothing"
+
+
+def test_alerts_differing_only_in_fields_or_next_are_not_collapsed() -> None:
+    """P-3: the dedupe key covers every forwarded detail key, so a changed ``fields`` or ``next``
+    on the same order is a new alert."""
+    bus, sink = _bus(), _RecordingSink()
+    surface = (
+        _entry("commission_unreadable", fields="commissionBps"),
+        _entry("commission_unreadable", fields="feeBps"),
+        _entry("resting_fill_mismatch", next="review_a"),
+        _entry("resting_fill_mismatch", next="review_b"),
+    )
+    install_resting_alert(bus, alerts=lambda: surface, sink=sink)
+    _tick(bus)
+    assert len(sink.payloads) == 4, [p.detail for p in sink.payloads]
+
+
+def test_distinct_unknown_events_are_not_collapsed_into_one_generic_alert() -> None:
+    """P-3: two different raw events that both map to the generic name stay two alerts."""
+    bus, sink = _bus(), _RecordingSink()
+    surface = (_entry("surprise_one"), _entry("surprise_two"))
+    install_resting_alert(bus, alerts=lambda: surface, sink=sink)
+    _tick(bus)
+    assert [p.event for p in sink.payloads] == ["resting_alert_unknown"] * 2
+
+
+def test_the_trade_cli_reader_does_not_hide_an_attribute_error_raised_inside_the_property() -> None:
+    """P-2: ``getattr(client, name, ())`` swallowed an AttributeError raised INSIDE the property
+    and read it as "no alerts". A declared surface that blows up must reach the caller."""
+
+    class _Client:
+        @property
+        def resting_cancel_alerts(self) -> tuple[Mapping[str, str], ...]:
+            raise AttributeError("inner bug")
+
+        resting_commission_alerts = ()
+
+    clients: dict[object, object] = {ClientId(POLYMARKET_US_CLIENT_NAME): _Client()}
+    node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
+    with pytest.raises(AttributeError, match="inner bug"):
+        trade_cli._exec_client_resting_alert_reader(node)()
+
+
+def test_a_failing_surface_reaches_logger_exception_and_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from breezy.runtime import component_health_watch as watch
+
+    logged: list[str] = []
+    monkeypatch.setattr(watch.logger, "exception", lambda msg, *a, **k: logged.append(msg))
+
+    class _Client:
+        @property
+        def resting_cancel_alerts(self) -> tuple[Mapping[str, str], ...]:
+            raise AttributeError("inner bug")
+
+        resting_commission_alerts = ()
+
+    clients: dict[object, object] = {ClientId(POLYMARKET_US_CLIENT_NAME): _Client()}
+    node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
+    bus, sink = _bus(), _RecordingSink()
+    install_resting_alert(bus, alerts=trade_cli._exec_client_resting_alert_reader(node), sink=sink)
+    _tick(bus)
+    assert sink.payloads == []
+    assert len(logged) == 1
