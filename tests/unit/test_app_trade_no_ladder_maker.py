@@ -225,6 +225,23 @@ def test_the_gate_is_closed_under_a_minted_permit_so_the_composed_strategy_canno
     assert h.drain() == [], "ZERO post_order calls under the closed gate"
 
 
+def test_a_ruling_id_alone_with_a_permit_present_enables_nothing_and_refuses_the_boot() -> None:
+    """X3 (bool level): a manifest naming a ruling, a permit present, no allowlist row -> the
+    gate REFUSES (``not_allowlisted``), so ``_compose_no_ladder_maker`` raises ``SettingsError``
+    and no strategy is built: REGISTERED / a ruling id alone is not the second key."""
+    import dataclasses
+
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
+    named = dataclasses.replace(
+        manifest, live_orders_ruling="RULING_MAKER_sharp_v1_live_small_2026-10-21"
+    )
+    with pytest.raises(live_orders_gate.LiveOrdersGateRefusedError) as refused:
+        live_orders_gate.live_orders_authorized(named, REPO, permit_present=True)
+    assert refused.value.reason == "not_allowlisted"
+
+
 def test_the_maker_compose_branch_derives_shadow_only_from_the_gate_output() -> None:
     """The +1 shadow-gate site: ``shadow_only=not live_orders.enabled`` is in BOTH composers."""
     import ast
@@ -243,3 +260,74 @@ def test_the_maker_compose_branch_derives_shadow_only_from_the_gate_output() -> 
                 homes.add(func.name)
     assert homes == {"_compose_forecast_quantile_ladder", "_compose_no_ladder_maker"}
     assert hasattr(trade_module, "_compose_no_ladder_maker")
+
+
+# --- W6: the D0 placeholder never reaches a live send ------------------------------------------
+
+PLACEHOLDER_D0: Final[str] = "2026-10-28"
+
+
+def test_the_shipped_manifest_still_carries_the_placeholder_d0_and_is_shadow() -> None:
+    """The ARM commit sets the real D0; until then the sentinel is shadow-only (a draft state)."""
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
+    assert manifest.d0_climate_day == PLACEHOLDER_D0
+    assert manifest.live_orders_ruling is None
+
+
+def test_the_placeholder_d0_is_refused_whenever_the_maker_would_send() -> None:
+    import dataclasses
+
+    from breezy.persistence.family_manifest import load_family_manifest
+    from breezy.strategy.no_ladder_maker.composition import (
+        PlaceholderD0Error,
+        refuse_placeholder_d0,
+    )
+
+    manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
+    refuse_placeholder_d0(manifest, shadow_only=True)  # shadow with the sentinel: allowed
+    with pytest.raises(PlaceholderD0Error, match="placeholder"):
+        refuse_placeholder_d0(manifest, shadow_only=False)
+    with_ruling = dataclasses.replace(manifest, live_orders_ruling="RULING_x")
+    with pytest.raises(PlaceholderD0Error, match="placeholder"):
+        refuse_placeholder_d0(with_ruling, shadow_only=True)
+    real_d0 = dataclasses.replace(manifest, d0_climate_day="2026-11-03", live_orders_ruling="R")
+    refuse_placeholder_d0(real_d0, shadow_only=False)  # a real D0 passes this guard
+
+
+def test_boot_refuses_the_placeholder_d0_when_the_gate_answers_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    """Through ``run``: a gate that (hypothetically) said enabled still cannot boot the sentinel.
+
+    The gate's output is replaced by a stand-in; nothing real is enabled (no ruling, no allowlist
+    row, no permit, no cap is read or assigned).
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        trade_module,
+        "live_orders_authorized",
+        lambda *a, **k: SimpleNamespace(enabled=True, reason="ok", ruling_sha256="0" * 64),
+    )
+    _tree(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: FAMILY,
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+    stderr = io.StringIO()
+    _Node.observed = None
+    assert run(env=env, node_factory=_Node, stderr=stderr) != EXIT_OK
+    assert _Node.observed is None, "no node was built"
+    assert "placeholder" in stderr.getvalue()

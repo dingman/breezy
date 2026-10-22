@@ -132,8 +132,10 @@ from breezy.strategy.no_ladder_maker.composition import (
     TRIAL_KEY_PREFIX as MAKER_TRIAL_KEY_PREFIX,
 )
 from breezy.strategy.no_ladder_maker.composition import (
+    PlaceholderD0Error,
     build_harm_stop_wiring,
     build_no_ladder_maker_strategy,
+    refuse_placeholder_d0,
 )
 
 _VENUE = "polymarket_us"
@@ -950,8 +952,8 @@ def _compose_no_ladder_maker(
     ``enabled``: the manifest ships WITHOUT a ``live_orders_ruling`` and the family is in no
     allowlist, so the gate reads ``no_ruling`` and ``shadow_only`` stays True. The entry veto is the
     family halt, then the STRICT maker harm stop (``derived/maker-loss-stop/latest.json``); a FAIL
-    sets the family halt, and the strategy answers any veto with ``cancel_all_orders`` on every
-    instrument. The same veto object reaches the strategy and the exec client.
+    sets the family halt, and the strategy answers any veto by cancelling every live order, per
+    order (open and in flight). The same veto object reaches the strategy and the exec client.
     """
     extra_actors: list[Any] = []
     halt_latch, halt_veto = _open_halt_latch_preamble(
@@ -993,6 +995,11 @@ def _compose_no_ladder_maker(
         live_orders.ruling_sha256 or "none",
         manifest.density_artefact_sha256,
     )
+
+    try:
+        refuse_placeholder_d0(manifest, shadow_only=not live_orders.enabled)
+    except PlaceholderD0Error as exc:
+        raise SettingsError(str(exc)) from exc
 
     def _maker_now() -> dt.datetime:
         return dt.datetime.now(tz=dt.UTC)

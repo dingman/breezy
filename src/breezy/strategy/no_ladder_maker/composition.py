@@ -7,9 +7,11 @@ Two pieces, both pure construction (no node, no I/O beyond the sha-pinned calibr
 * :func:`build_harm_stop_wiring` -- the maker's ``LossStopProbe`` (STRICT staleness, D1 review K2)
   over ``maker_loss_stop_artefact_path(catalog_root)``, and the composed entry veto (family halt
   first, then the harm stop). A harm-stop FAIL sets the family halt through the injected setter; the
-  strategy reads the same veto on every decision and on its poll timer and answers a veto with
-  ``cancel_all_orders`` on every instrument (R12). HOLD, an absent file, a stale file and a FAIL all
-  veto entries: the probe reads UNKNOWN for all but PASS.
+  strategy reads the same veto on every decision and on its poll timer and answers a veto by
+  cancelling every live order, per order from the cache (R12). HOLD, an absent file, a stale file
+  and a FAIL all veto entries: the probe reads UNKNOWN for all but PASS.
+* :func:`refuse_placeholder_d0` -- the shipped manifest's ``d0_climate_day`` is a PLACEHOLDER until
+  the ARM commit sets the first legitimately tradable ladder day; it may never reach a send.
 
 The caller (``app/trade.py``) owns the halt latch, the permit, the live-orders gate and the actors.
 """
@@ -23,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.health import AlertSink
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import FqComposedVeto, LossStopProbe
@@ -33,17 +36,37 @@ from breezy.strategy.no_ladder_maker.strategy import NoLadderMakerStrategy, Supp
 
 __all__ = [
     "COMPONENT_ID",
+    "D0_PLACEHOLDER",
     "ORDER_ID_TAG",
     "TRIAL_KEY_PREFIX",
     "HarmStopWiring",
+    "PlaceholderD0Error",
     "build_harm_stop_wiring",
     "build_no_ladder_maker_strategy",
+    "refuse_placeholder_d0",
 ]
 
 #: The family's durable namespace for the halt latch it shares with the exec client's store.
 TRIAL_KEY_PREFIX: Final[str] = "no_ladder_maker/trial/"
 COMPONENT_ID: Final[str] = "NO-LADDER-MAKER"
 ORDER_ID_TAG: Final[str] = "SHARP"
+#: The manifest's draft ``d0_climate_day``. The ARM commit replaces it with the real D0.
+D0_PLACEHOLDER: Final[str] = "2026-10-28"
+
+
+class PlaceholderD0Error(ValueError):
+    """The placeholder D0 would reach a live send (a ruling is present, or sending is enabled)."""
+
+
+def refuse_placeholder_d0(manifest: FamilyManifest, *, shadow_only: bool) -> None:
+    """W6: the placeholder D0 is allowed only for a shadow family that carries no ruling."""
+    if manifest.d0_climate_day != D0_PLACEHOLDER:
+        return
+    if not shadow_only or manifest.live_orders_ruling:
+        raise PlaceholderD0Error(
+            f"{manifest.family_id}: d0_climate_day {D0_PLACEHOLDER!r} is the draft placeholder; "
+            "set the real D0 (the first legitimately tradable ladder day) before any live send"
+        )
 
 
 @dataclass(frozen=True, slots=True)
