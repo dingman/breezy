@@ -15,12 +15,14 @@ import pytest
 
 from tests.unit.ambig_latch_rig import (
     OPEN_ORDERS_PATH,
+    client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
     run_passes,
     submit_chain,
     wire_payloads,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
 from tests.unit.test_ambig_no_id_resolver import _negative, _retirement
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender
 from tests.unit.test_polymarket_us_resting_query import (
@@ -258,4 +260,63 @@ async def test_s7_a_fill_at_the_limit_for_one_contract_raises_no_mismatch_alert(
     _fill(rig, 0)
     await rig.client._query_order(_query(rig, command))
     assert _mismatch_alerts(rig.client) == []
+    await rig.client._disconnect()
+
+
+# -- S8: D1 single-writer: only the poll path may write a POLL- trade id --------------------
+
+
+def _record_with_trade_id(trade_id: str | None) -> Any:
+    return client_module.DurableFillRecord(
+        venue_order_id="VENUE-ORDER-1",
+        client_order_id="O-1",
+        instrument_id=str(build_no_leg_instrument().id),
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.40"),
+        cumulative_fee=Decimal(0),
+        fee_reconciled=False,
+        ts_event=1_000_000_000,
+        trade_id=trade_id,
+        order_qty=Decimal(1),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("spoof", ["POLL-VENUE-ORDER-1", "POLL-anything", "POLL-"])
+async def test_s8_a_venue_trade_id_in_the_poll_namespace_is_refused_outside_the_poll_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spoof: str
+) -> None:
+    rig, _commands = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    with pytest.raises(client_module.PolymarketUSError):
+        client.record_fill(_record_with_trade_id(spoof))
+    assert client._store_get(f"{client_module.FILL_KEY_PREFIX}VENUE-ORDER-1") is None, "no write"
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("honest", [None, "GET-VENUE-ORDER-1", "venue-trade-77", "poll-lower"])
+async def test_s8_every_other_trade_id_is_still_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, honest: str | None
+) -> None:
+    rig, _commands = await _rested(tmp_path, monkeypatch)
+    client = rig.client
+    client.record_fill(_record_with_trade_id(honest))
+    assert client._store_get(f"{client_module.FILL_KEY_PREFIX}VENUE-ORDER-1") is not None
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_s8_the_poll_path_still_writes_its_own_poll_trade_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0)
+    await rig.client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    assert record.trade_id == submit_chain.maker_poll_trade_id(_id_n(0))
     await rig.client._disconnect()

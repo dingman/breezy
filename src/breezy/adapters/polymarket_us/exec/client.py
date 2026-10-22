@@ -6422,8 +6422,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         fill_time_instrument: Instrument | None = None,
         intent_fingerprint: str | None = None,
         intent_created_ns: int | None = None,
+        maker_poll: bool = False,
     ) -> None:
         """Persist one venue order's cumulative totals and index it.
+
+        B6 review S8 (the ARM D1 single-writer rule, enforced in code): the ``POLL-`` trade-id
+        namespace marks a poll-booked MAKER fill and belongs to the resting-order poll alone
+        (``maker_poll=True``); any other caller recording a ``POLL-`` trade id (a venue-chosen
+        ``Execution.tradeId``) is refused before anything is written.
 
         AUD-13b (ruling R-1 = O4 mechanism (a)): the two fill write sites pass
         ``fill_time_instrument`` -- the ``Instrument`` in hand when the fill
@@ -6458,6 +6464,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         identical ``_FILL_WRITE_FAILED`` refusal path -- an index write
         failure never leaves the fill record written without it silently.
         """
+        if not maker_poll and submit_chain.is_maker_poll_fill(record.trade_id):
+            raise PolymarketUSError(
+                "a fill record may carry a POLL- trade id only from the resting-order poll "
+                "(the D1 maker-fill marker is single-writer)"
+            )
         if fill_time_instrument is not None:
             record = dataclasses.replace(
                 record,
@@ -9319,7 +9330,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         prior = self._resting_bookings.get(venue_id)
         replayed = (prior is None or prior[1] is None) and self._poll_record_exists(venue_id)
         try:
-            self.record_fill(record, fill_time_instrument=instrument)
+            self.record_fill(record, fill_time_instrument=instrument, maker_poll=True)
         except Exception as exc:  # noqa: BLE001 - never raised; the row stays for the next read
             self._log.error(f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}")
             self._latch_resting_order(_FILL_WRITE_FAILED, venue_id, "fill record not written")
