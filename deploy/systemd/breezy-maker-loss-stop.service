@@ -33,9 +33,12 @@ UMask=0077
 # are only READ. systemd refuses to start a unit whose ReadWritePaths= entry does not exist
 # (status 226/NAMESPACE, which fires OnFailure=), so the installer must first run
 #   mkdir -p -m 0755 /mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+# and %h/.local/share/breezy/evidence/alerts must exist too (breezy-autonomy-alert-redeliver creates it).
 # (tests/unit/test_maker_loss_stop_scheduling.py pins this path to the --catalog-root below).
 ProtectSystem=strict
-ReadWritePaths=/mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+# ARM D1 (config only): the second path is the alert delivery journal, registered because this unit
+# loads alerts.env (tests/contract/test_autonomy_units_alert_redeliver.py). Still ONE line.
+ReadWritePaths=/mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop %h/.local/share/breezy/evidence/alerts
 NoNewPrivileges=yes
 
 MemoryHigh=1G
