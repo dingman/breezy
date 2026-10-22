@@ -28,17 +28,6 @@ MemoryMax=1536M
 EnvironmentFile=-%h/.config/breezy/alerts.env
 ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/archive/iem_cli_fetch.py dataset
 
-# ARM D1 (docs/plans/backlog/ARM_MAKER_SHARP_2026-10-21/plan_r2_delta.md D5): the maker family's
-# harm-stop producer runs here, daily, right after the truth fetch (11:40Z) and this dataset build,
-# instead of a unit of its own. It reads the exec-state SQLite and the station catalog read-only,
-# contacts no network, and writes only derived/maker-loss-stop/latest.json for LossStopProbe. Exit
-# 0 PASS, 2 FAIL, 3 HOLD: a non-zero exit fails this unit and fires OnFailure= above, which is the
-# alert path for a FAIL/HOLD. The station list is plan r3 R10's four (lax sfo mdw mia); the family
-# manifest replaces it when C2 lands. PARKED like the rest of this file's family: nothing here is
-# live until the coordinator's daemon-reload.
-Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
-ExecStartPost=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py --station lax --station sfo --station mdw --station mia
-
 # Five station bodies parsed once each: well under a minute. Bounded both ways.
 # Type=oneshot ignores RuntimeMaxSec=; TimeoutStartSec= bounds the whole run.
 TimeoutStartSec=900

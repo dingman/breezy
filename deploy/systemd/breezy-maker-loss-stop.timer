@@ -1,0 +1,19 @@
+[Unit]
+Description=12:50 UTC trigger for the Breezy maker-family harm stop
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py
+
+[Timer]
+Unit=breezy-maker-loss-stop.service
+
+# 12:50 UTC: after breezy-truth-fetch.timer (11:40Z) and breezy-truth-dataset.timer (12:40Z), so the
+# day's CLI revision is already in the catalog's source cache (ordering by the clock gap, never by
+# After=, which does not order units started by separate timers). Daily, so a settlement batch is
+# picked up at most ~24 h after the venue publishes it. Outside the 16:30-17:10Z window. No
+# Persistent=true (a catch-up must never replay into that window).
+OnCalendar=*-*-* 12:50:00 UTC
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
