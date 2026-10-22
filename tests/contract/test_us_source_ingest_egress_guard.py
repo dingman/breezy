@@ -162,6 +162,12 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f
     # Entry kept, digest updated, together with the cancel-transport sha pin.
     "scripts/venue/polymarket_us_write_signing_probe.py": "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3",  # noqa: E501
+    # ARM B2 (plan_r2_delta D3): the maker positive-control script is a venue script that imports
+    # the write transport and the exec submit chain on purpose (it sends only through the shipped
+    # write-transport methods). One named row, exempt only while its sha256 equals this digest;
+    # any edit re-scans it like a new file. Its pure sibling `_maker_control_core.py` imports
+    # nothing banned and needs no row.
+    "scripts/venue/polymarket_us_maker_positive_control.py": "ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501
@@ -449,6 +455,25 @@ def test_m6_modified_baseline_file_is_rescanned(tmp_path: Path) -> None:
     assert victim in directory_scan_targets(tampered)
     assert baseline_exempts(victim, honest) is True
     assert baseline_exempts(victim, tampered) is False
+
+
+def test_m6_b2_control_row_is_exempt_only_while_its_sha_matches() -> None:
+    """ARM B2 row plant: un-exempted the script trips M6; a changed digest re-scans it."""
+    rel = "scripts/venue/polymarket_us_maker_positive_control.py"
+    path = REPO_ROOT / rel
+    assert M6_PREEXISTING_BASELINE[rel] == _sha256(path)
+    assert path not in closure_files()
+    # un-exempted, the script is scanned and DOES name banned modules (load-bearing row)
+    assert path in directory_scan_targets({})
+    assert banned_hits(import_closure([path])) != []
+    # exempt while the digest matches ...
+    assert path not in directory_scan_targets({rel: _sha256(path)})
+    # ... re-scanned the moment it differs
+    assert path in directory_scan_targets({rel: "0" * 64})
+    # the pure sibling is NOT in the baseline and is clean on its own
+    sibling = REPO_ROOT / "scripts" / "venue" / "_maker_control_core.py"
+    assert _rel(sibling) not in M6_PREEXISTING_BASELINE
+    assert banned_hits(import_closure([sibling])) == []
 
 
 def test_m6_baseline_is_well_formed_and_never_shrinks() -> None:
