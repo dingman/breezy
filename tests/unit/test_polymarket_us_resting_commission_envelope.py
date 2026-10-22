@@ -25,7 +25,13 @@ from tests.unit.ambig_latch_rig import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.polymarket_us_exec_shapes import build_no_leg_instrument
-from tests.unit.test_polymarket_us_resting_query import _reasons, _rested
+from tests.unit.test_polymarket_us_resting_query import (
+    _fill,
+    _query,
+    _reasons,
+    _records,
+    _rested,
+)
 from tests.unit.test_polymarket_us_resting_submit import _id_n
 
 LATCH: Final[str] = submit_chain.RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON
@@ -52,9 +58,10 @@ async def _latched_at(
     target = client._resting_target_of(_id_n(0))
     assert target is not None
     ts_ns = client._clock.timestamp_ns()
-    client._check_commission_envelope(
-        target, raw, build_no_leg_instrument(), Decimal(price), Decimal(1), ts_ns
+    within = client._commission_in_envelope(
+        taker_fee_coefficient_of(build_no_leg_instrument()), raw, Decimal(price), Decimal(1), ts_ns
     )
+    client._check_commission_envelope(target, within)
     latched = LATCH in _reasons(rig)
     await client._disconnect()
     return latched
@@ -106,3 +113,33 @@ async def test_a_fee_well_above_the_bound_latches_at_every_price(
 ) -> None:
     raw = _round_up(_exact(price)) + Decimal("0.02")
     assert await _latched_at(tmp_path, monkeypatch, price=price, raw=raw) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_out_of_envelope_fill_books_the_venue_figure_but_never_reconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 review S9: the venue figure is kept (conservative), but a commission outside the
+    envelope is not a reconciled fee: it must stay out of the reconciled population."""
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0, commission="0.50")
+    await rig.client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    assert record.cumulative_fee == Decimal("0.50") and record.venue_fee_raw == "0.50"
+    assert record.fee_reconciled is False
+    assert LATCH in _reasons(rig)
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_an_in_envelope_fill_stays_reconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    _fill(rig, 0, commission="0.01")
+    await rig.client._query_order(_query(rig, command))
+    (record,) = _records(rig)
+    assert record.fee_reconciled is True
+    await rig.client._disconnect()

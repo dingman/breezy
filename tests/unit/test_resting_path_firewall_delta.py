@@ -955,6 +955,9 @@ POLL_HELPERS: Final[frozenset[str]] = frozenset(
         "_taker_theta",
         "_modelled_taker_fee",
         "_flag_unreadable_commission",
+        # B6 review S9 (NAMED rows, widen only): the pure envelope verdict and its alert.
+        "_commission_in_envelope",
+        "_flag_out_of_envelope",
     }
 )
 _HELPER_FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (

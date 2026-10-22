@@ -9182,10 +9182,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
 
     def _note_commission_alert(
-        self, event: str, target: RestingTarget, extra: Mapping[str, str]
+        self, event: str, venue_order_id: str, slug: str, extra: Mapping[str, str]
     ) -> None:
         """Record one value-free CRITICAL commission alert (once per event and order)."""
-        key = f"{event}:{target.venue_order_id}"
+        key = f"{event}:{venue_order_id}"
         if key in self._resting_commission_alert_details:
             return
         self._resting_commission_alert_details = {
@@ -9193,8 +9193,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             key: {
                 "severity": "CRITICAL",
                 "event": event,
-                "venue_order_id": _loggable_order_id(target.venue_order_id),
-                "slug": _loggable_slug(target.slug),
+                "venue_order_id": _loggable_order_id(venue_order_id),
+                "slug": _loggable_slug(slug),
                 **extra,
                 "next": "new_rests_refused_cancels_continue_restart_after_review_clears",
             },
@@ -9208,7 +9208,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if drift is None:
             return
         fields = ",".join(drift.fields)
-        self._note_commission_alert("commission_bps_drift", target, {"fields": fields})
+        self._note_commission_alert(
+            "commission_bps_drift", target.venue_order_id, target.slug, {"fields": fields}
+        )
         self._latch_resting_order(
             submit_chain.COMMISSION_BPS_DRIFT_REASON, target.venue_order_id, f"fields {fields}"
         )
@@ -9253,6 +9255,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         quantity = report.filled_qty.as_decimal()
         cost = quantity * avg_px
         stamp_ns = self._clock.timestamp_ns()
+        within = self._commission_in_envelope(
+            self._taker_theta(instrument, stamp_ns), raw, avg_px, quantity, stamp_ns
+        )
         if raw is None:
             # B6 review P1 / SEC L8: an unreadable commission is booked at the MODELLED TAKER
             # cent fee (conservative, the design cost), never at zero; 0 only if unpinned.
@@ -9270,7 +9275,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             cumulative_qty=quantity,
             cumulative_cost=cost,
             cumulative_fee=recognised,
-            fee_reconciled=raw is not None and recognised == raw,
+            fee_reconciled=raw is not None and recognised == raw and within,
             ts_event=stamp_ns,
             venue_fee_raw=raw_text,
             trade_id=submit_chain.maker_poll_trade_id(venue_id),
@@ -9293,7 +9298,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._settle_resting_fill(target, held, cost, stamp_ns)
         if raw is None:
             self._flag_unreadable_commission(target)
-        self._check_commission_envelope(target, raw, instrument, avg_px, quantity, stamp_ns)
+        self._check_commission_envelope(target, within)
         return True
 
     def _taker_theta(self, instrument: Any, ts_ns: int) -> Decimal | None:
@@ -9322,7 +9327,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     def _flag_unreadable_commission(self, target: RestingTarget) -> None:
         """A FILLED rest whose commission could not be read: a value-free CRITICAL
         ``commission_unreadable`` alert and the NEW-rests latch (the fill is already booked)."""
-        self._note_commission_alert("commission_unreadable", target, {})
+        self._note_commission_alert(
+            "commission_unreadable", target.venue_order_id, target.slug, {}
+        )
         self._latch_resting_order(
             submit_chain.RESTING_COMMISSION_UNREADABLE_REASON,
             target.venue_order_id,
@@ -9386,45 +9393,50 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 _RESOLVER_FILL_UNBUDGETED, target.venue_order_id, "the fill had no exposure"
             )
 
-    def _check_commission_envelope(
+    def _commission_in_envelope(
         self,
-        target: RestingTarget,
+        theta: Decimal | None,
         raw: Decimal | None,
-        instrument: Any,
         price: Decimal,
         quantity: Decimal,
         ts_ns: int,
-    ) -> None:
-        """``abs(raw)`` must not exceed the modelled TAKER fee envelope for the fill
-        (``submit_chain.commission_envelope_bound``). Outside it the
-        fill is STILL booked; this latches ``resting_commission_out_of_envelope`` (NEW rests
-        only) and raises a value-free CRITICAL alert. An unpinned fee schedule skips with a
-        WARN. Never raises."""
+    ) -> bool:
+        """Is ``abs(raw)`` within the commission envelope of the fill
+        (``submit_chain.commission_envelope_bound`` at ``theta``)? ``True`` for an absent
+        commission and for an unpinned schedule (WARN: the watch is skipped, never a
+        refusal); ``False`` only for a commission above the bound. SYNC, never raises."""
         if raw is None:
-            return
+            return True
         try:
-            theta = self._taker_theta(instrument, ts_ns)
             modelled = taker_fee_at_fill(
-                quantity=quantity,
-                price=price,
-                ts_event_ns=ts_ns,
-                fee_coefficient_at_fill=theta,
+                quantity=quantity, price=price, ts_event_ns=ts_ns, fee_coefficient_at_fill=theta
             )
             if modelled is None or theta is None:
                 self._log.warning("resting fill: the fee schedule is unpinned; envelope skipped")
-                return
+                return True
             bound = submit_chain.commission_envelope_bound(
                 modelled=modelled.as_decimal(), exact=theta * quantity * price * (1 - price)
             )
-            if abs(raw) <= bound:
-                return
         except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
             self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
+            return True
+        return abs(raw) <= bound
+
+    def _check_commission_envelope(self, target: RestingTarget, within: bool) -> None:
+        """A commission above the envelope (``within`` False): the fill is STILL booked (its
+        ``fee_reconciled`` is already False, B6 review S9); this latches
+        ``resting_commission_out_of_envelope`` (NEW rests only) and raises a value-free
+        CRITICAL alert. Never raises."""
+        if within:
             return
-        self._note_commission_alert("resting_commission_out_of_envelope", target, {})
+        self._flag_out_of_envelope(target.venue_order_id, target.slug)
+
+    def _flag_out_of_envelope(self, venue_order_id: str, slug: str) -> None:
+        """The alert and the NEW-rests latch of an out-of-envelope commission."""
+        self._note_commission_alert("resting_commission_out_of_envelope", venue_order_id, slug, {})
         self._latch_resting_order(
             submit_chain.RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON,
-            target.venue_order_id,
+            venue_order_id,
             "commission above the modelled taker fee",
         )
 
