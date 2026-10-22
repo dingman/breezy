@@ -572,14 +572,38 @@ def parse_json(body: bytes | None) -> Any:
         return None
 
 
-def open_order_ids(payload: object) -> frozenset[str] | None:
-    """Ids in an open-orders payload, or ``None`` unless it is a complete (``eof`` true) list."""
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("orders"), list):
+#: The open-orders envelope keys the exec client knows
+#: (``submit_chain._OPEN_ORDERS_KNOWN_ENVELOPE_KEYS``, S4 r4 section 5.5).
+#: Mirrored, not imported: the exec module drags the write paths into this pure core.
+#: ``nextCursor`` is deliberately NOT known, so a paginated reply refuses.
+OPEN_ORDERS_KNOWN_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({"orders", "eof"})
+
+
+def open_orders_rows(payload: object) -> list[Any] | None:
+    """The ``orders`` rows of a COMPLETE open-orders reply, else ``None`` (unreadable).
+
+    Exactly the exec client's rule (``submit_chain.open_orders_envelope_is_known`` plus
+    ``reports.parse_open_orders``): a mapping with an ``orders`` list; ``eof`` absent or ``True``
+    is complete, any other ``eof`` is incomplete; any envelope key outside
+    :data:`OPEN_ORDERS_KNOWN_ENVELOPE_KEYS` (``nextCursor`` included) refuses.
+    """
+    if not isinstance(payload, Mapping) or not set(payload) <= OPEN_ORDERS_KNOWN_ENVELOPE_KEYS:
         return None
-    if payload.get("eof") is not True:
+    orders = payload.get("orders")
+    if not isinstance(orders, list):
+        return None
+    if "eof" in payload and payload["eof"] is not True:
+        return None
+    return orders
+
+
+def open_order_ids(payload: object) -> frozenset[str] | None:
+    """Ids in a complete open-orders reply (see :func:`open_orders_rows`), else ``None``."""
+    rows = open_orders_rows(payload)
+    if rows is None:
         return None
     ids: set[str] = set()
-    for order in payload["orders"]:
+    for order in rows:
         order_id = order.get("id") if isinstance(order, Mapping) else None
         if not isinstance(order_id, str) or not order_id:
             return None

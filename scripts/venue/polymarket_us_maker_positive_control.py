@@ -145,6 +145,7 @@ from _maker_control_core import (  # type: ignore[import-not-found]
     market_exclusion,
     markets_by_slug,
     open_order_ids,
+    open_orders_rows,
     parse_args,
     parse_json,
     parse_utc_ns,
@@ -887,8 +888,8 @@ async def _cleanup_by_listing(session: ControlSession, state: RunState) -> None:
     except BudgetExhausted:
         return
     payload = listing.payload
-    orders = payload.get("orders") if isinstance(payload, Mapping) else None
-    if not isinstance(orders, list):
+    orders = open_orders_rows(payload)
+    if orders is None:
         return
     for order in orders:
         if not isinstance(order, Mapping):

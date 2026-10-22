@@ -170,7 +170,10 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
     # handlers, activities paging). Prior digest:
     # ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
-    "scripts/venue/polymarket_us_maker_positive_control.py": "1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50",  # noqa: E501
+    # Re-digested again at the B2 open-orders eof fix (exec rule: eof absent is complete,
+    # unknown envelope key refuses). Prior digest:
+    # 1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50
+    "scripts/venue/polymarket_us_maker_positive_control.py": "ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501

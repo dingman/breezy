@@ -498,3 +498,22 @@ class Rig:
         return asyncio.run(
             self.ctl.run_control(self.session, sleep=self.venue.sleep, run_date=RUN_DATE)
         )
+
+
+#: (payload, complete) open-orders replies under the exec client rule (S4 r4 section 5.5).
+OPEN_ORDERS_ENVELOPES: list[tuple[Any, bool]] = [
+    ({"orders": []}, True),  # eof absent counts complete (S4 r4 5.5)
+    ({"orders": [], "eof": True}, True),
+    ({"orders": [], "eof": False}, False),
+    ({"orders": [], "eof": "true"}, False),
+    ({"orders": [], "eof": None}, False),
+    ({"orders": [], "nextCursor": "C"}, False),
+    ({"orders": [], "eof": True, "nextCursor": "C"}, False),
+    ({"orders": [], "surprise": 1}, False),
+    ({"eof": True}, False),
+    ({"orders": "x"}, False),
+    ({"orders": [{"id": ""}]}, False),
+    ({"orders": ["x"]}, False),
+    ([], False),
+    (None, False),
+]

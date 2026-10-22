@@ -624,8 +624,8 @@ def test_a_non_empty_open_orders_list_refuses_before_any_write(ctl: Any, tmp_pat
         (200, b'{"orders": "x"}'),
         (200, b"{}"),
         (401, b"{}"),
-        (200, b'{"orders": []}'),  # R5: a listing without eof is not a complete listing
         (200, b'{"orders": [], "eof": false}'),
+        (200, b'{"orders": [], "nextCursor": "X"}'),  # unknown envelope key (exec rule)
     ],
 )
 def test_an_unreadable_or_failed_preflight_refuses(

@@ -842,34 +842,42 @@ def test_r5_id_shaped_keys_do_not_become_enum_paths(ctl: Any) -> None:
     assert "OWNORDER0001" not in json.dumps(cap)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [{"orders": []}, {"orders": [], "eof": False}, {"orders": [], "eof": "true"}],
-)
-def test_r5_an_open_orders_listing_without_eof_true_is_incomplete(
-    ctl: Any, payload: dict[str, Any]
+@pytest.mark.parametrize(("payload", "complete"), fk.OPEN_ORDERS_ENVELOPES)
+def test_open_orders_completeness_follows_the_exec_rule(
+    ctl: Any, payload: Any, complete: bool
 ) -> None:
-    assert ctl.open_order_ids(payload) is None
-    assert ctl.open_order_ids({"orders": [], "eof": True}) == frozenset()
+    assert (ctl.open_order_ids(payload) is not None) is complete
+    assert ctl.open_order_ids({"orders": [{"id": "A1"}]}) == frozenset({"A1"})
 
 
-def test_r5_the_final_check_treats_an_incomplete_listing_as_unknown(ctl: Any) -> None:
+@pytest.mark.parametrize("tail", [{"orders": [], "eof": False}, {"orders": [], "nextCursor": "C"}])
+def test_the_final_check_treats_an_incomplete_listing_as_unknown(
+    ctl: Any, tail: dict[str, Any]
+) -> None:
     venue = fk.FakeVenue()
     original = venue.handle_get
     seen = {"open": 0}
 
-    def no_eof_at_the_end(url: str) -> Any:
+    def incomplete_at_the_end(url: str) -> Any:
         if url.endswith("/v1/orders/open"):
             seen["open"] += 1
-            if seen["open"] >= 2:  # foreign check passes, the final listing lacks eof
+            if seen["open"] >= 2:  # foreign check passes, the final listing is incomplete
                 venue.requests.append(("GET", "/v1/orders/open"))
-                return fk._json(200, {"orders": []})
+                return fk._json(200, tail)
         return original(url)
 
-    venue.handle_get = no_eof_at_the_end  # type: ignore[method-assign]
+    venue.handle_get = incomplete_at_the_end  # type: ignore[method-assign]
     result = fk.Rig(ctl, venue).run()
     assert result.document["final_account_clean"] is None
     assert result.exit_code != 0
+
+
+def test_a_preflight_listing_without_eof_is_complete_and_proceeds(ctl: Any, tmp_path: Path) -> None:
+    venue = fk.FakeVenue()
+    venue.open_orders_body_override = b'{"orders": []}'
+    rig = fk.Rig(ctl, venue)
+    assert asyncio.run(ctl.run(RUN_DATE, _deps(ctl, rig, tmp_path))) != 2
+    assert rig.post_client.calls != []
 
 
 def test_aux_budget_is_separate_and_bounded(ctl: Any) -> None:
