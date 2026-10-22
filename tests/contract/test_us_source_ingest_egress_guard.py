@@ -157,7 +157,11 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     # Re-digested once at the F4 rebase: 097e768d (AUT-2 WP0, reviewed upstream) changed this
     # pre-existing venue script, which is outside the C1 closure. Entry kept, digest updated.
     "scripts/venue/polymarket_us_shape_capture.py": "4f7b2ddf78ec6ccc91ae0fb196f84aaca5ade575d6600ea8a13a7e33395e6a87",  # noqa: E501
-    "scripts/venue/polymarket_us_write_signing_probe.py": "fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f",  # noqa: E501
+    # Re-digested once at ARM B7 (S4 r4 WP6): the legacy cancel-all sender was retired (it
+    # now refuses before any I/O). Prior digest:
+    # fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f
+    # Entry kept, digest updated, together with the cancel-transport sha pin.
+    "scripts/venue/polymarket_us_write_signing_probe.py": "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",
     "src/breezy/ingest/iem_observations.py": "91cfe28c52972eece997e9375bcb4ec367d8c4bf964777f9838668ccfe355f87",  # noqa: E501

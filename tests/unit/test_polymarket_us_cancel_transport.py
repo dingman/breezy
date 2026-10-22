@@ -33,7 +33,10 @@ _SLUG = "tc-temp-nychigh-2026-10-13-lt71f"
 _SLUG_B = "tc-temp-sfohigh-2026-10-13-gte72lt73f"
 _ORDER_ID = "ABCDEF123456"
 _LEGACY_PROBE = "scripts/venue/polymarket_us_write_signing_probe.py"
-_LEGACY_PROBE_SHA256 = "fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f"
+#: ARM B7 (S4 r4 WP6) re-digest, once: the probe's empty-body cancel-all sender now refuses
+#: unconditionally (prior fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f).
+#: Pinned together with the AST tests at the end of this file and the M6 baseline entry.
+_LEGACY_PROBE_SHA256 = "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3"
 
 
 class _Resp:
@@ -258,3 +261,70 @@ def test_scan_sees_a_planted_reference(tmp_path: Path) -> None:
 
 def test_no_module_imports_the_legacy_cancel_all_helper_beyond_the_probe() -> None:
     assert _scan(("_signed_post_cancel_all",), frozenset({_LEGACY_PROBE})) == []
+
+
+# ------------------------------------------- ARM B7: the legacy empty cancel-all is retired
+#
+# B1 LOW / S4 r4 WP6: the legacy probe's ``_signed_post_cancel_all`` posts ``body={}`` to the
+# cancel-all path, which the venue reads as "cancel every open order on the account". WP6
+# forbids reusing it, so it now refuses unconditionally BEFORE any I/O and the only cancel-all
+# sender left is the exec client's ``_cancel_slug_orders``.
+
+
+def _load_legacy_probe() -> Any:
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        "breezy_b7_legacy_probe_under_test", REPO_ROOT / _LEGACY_PROBE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sender_calls_signed_post(source: str) -> bool:
+    """Does ``_signed_post_cancel_all`` in ``source`` still reach the signed-POST helper?"""
+    import ast
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_signed_post_cancel_all":
+            return any(
+                isinstance(inner, ast.Call)
+                and getattr(inner.func, "id", getattr(inner.func, "attr", "")) == "_signed_post"
+                for inner in ast.walk(node)
+            )
+    raise AssertionError("_signed_post_cancel_all not found")
+
+
+@pytest.mark.asyncio
+async def test_the_legacy_probe_cancel_all_sender_refuses_before_any_io() -> None:
+    import asyncio
+
+    probe = _load_legacy_probe()
+    client = _Client()
+    with pytest.raises(probe.ProbeRefusal):
+        await asyncio.wait_for(
+            probe._signed_post_cancel_all(client, _BASE, None, None, None), timeout=5
+        )
+    assert client.calls == []
+
+
+def test_the_legacy_probe_cancel_all_sender_never_reaches_the_signed_post_helper() -> None:
+    source = (REPO_ROOT / _LEGACY_PROBE).read_text(encoding="utf-8")
+    assert _sender_calls_signed_post(source) is False
+
+
+def test_the_sender_pin_trips_on_a_planted_signed_post_call() -> None:
+    """Non-vacuity: restoring the legacy body (a ``_signed_post`` call) is caught."""
+    source = (REPO_ROOT / _LEGACY_PROBE).read_text(encoding="utf-8")
+    planted = source.replace(
+        "async def _signed_post_cancel_all(",
+        "async def _signed_post_cancel_all_old(",
+    ) + (
+        "\nasync def _signed_post_cancel_all(*a, **k):\n"
+        "    return await _signed_post(*a, path=_CANCEL_ALL_PATH, body={})\n"
+    )
+    assert _sender_calls_signed_post(planted) is True
