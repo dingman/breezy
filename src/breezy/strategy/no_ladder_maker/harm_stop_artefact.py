@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import SCHEMA, compute_digest
 from breezy.strategy.no_ladder_maker.harm_stop import HarmStopResult, HarmVerdict
@@ -25,10 +25,15 @@ _DIR_MODE: Final[int] = 0o755
 _FILE_MODE: Final[int] = 0o600
 _MAX_READ_BYTES: Final[int] = 1 << 20
 
-ACTION_WRITTEN: Final[str] = "written"
-ACTION_REMOVED: Final[str] = "removed"
-ACTION_NOTHING: Final[str] = "nothing_to_remove"
-ACTION_STICKY: Final[str] = "sticky_fail_kept"
+Action = Literal["written", "removed", "nothing_to_remove", "sticky_fail_kept"]
+ACTION_WRITTEN: Final[Action] = "written"
+ACTION_REMOVED: Final[Action] = "removed"
+ACTION_NOTHING: Final[Action] = "nothing_to_remove"
+ACTION_STICKY: Final[Action] = "sticky_fail_kept"
+
+#: ``existing_verdict`` for a standing file that is present but not a readable ``loss_stop/v1``
+#: PASS/FAIL: treated as sticky.
+UNREADABLE: Final[str] = "UNREADABLE"
 
 
 def _stamp(when: datetime) -> str:
@@ -60,6 +65,7 @@ def render_artefact(
             "losses": result.losses,
             "n": result.n,
             "unresolved": result.unresolved,
+            "pending": result.pending,
         },
         "w_star": None if result.w_star is None else str(result.w_star),
         "cum_pnl": str(result.cum_pnl),
@@ -68,28 +74,52 @@ def render_artefact(
 
 
 def existing_verdict(path: Path) -> str | None:
-    """The verdict of the file now at ``path``, or ``None`` if absent/unreadable/not ours."""
+    """``PASS``/``FAIL`` of the file now at ``path``; ``None`` only if there is no file.
+
+    Anything else that stands there (unreadable, corrupt, foreign, an unknown verdict, a symlink or
+    other non-regular file) is :data:`UNREADABLE`: it may hide a FAIL, so the caller keeps it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        return UNREADABLE
     try:
         raw = os.read(fd, _MAX_READ_BYTES)
+    except OSError:
+        return UNREADABLE
     finally:
         os.close(fd)
     try:
         body = json.loads(raw.decode())
-    except ValueError:
-        return None
+    except ValueError:  # includes UnicodeDecodeError and JSONDecodeError
+        return UNREADABLE
     if not isinstance(body, dict) or body.get("schema") != SCHEMA:
-        return None
+        return UNREADABLE
     verdict = body.get("verdict")
-    return verdict if isinstance(verdict, str) else None
+    if verdict not in (HarmVerdict.PASS.value, HarmVerdict.FAIL.value):
+        return UNREADABLE
+    return str(verdict)
+
+
+def _fsync_dir(directory: Path) -> None:
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _ensure_dir(directory: Path) -> None:
+    """Create ``directory`` 0755 whatever the umask (the probe refuses a group-writable one)."""
+    created = not directory.exists()
+    directory.mkdir(parents=True, exist_ok=True)
+    if created or directory.stat().st_mode & 0o022:
+        directory.chmod(_DIR_MODE)
 
 
 def _write_atomic(path: Path, body: dict[str, Any], *, when: datetime) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(_DIR_MODE)  # the probe refuses a group/other-writable directory
+    _ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, _FILE_MODE)
     try:
@@ -103,29 +133,26 @@ def _write_atomic(path: Path, body: dict[str, Any], *, when: datetime) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
         raise
-    dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_dir(path.parent)
 
 
 @dataclass(frozen=True, slots=True)
 class PublishOutcome:
-    action: str
+    action: Action
 
 
 def publish(
     path: Path, result: HarmStopResult, *, as_of: datetime, c2_hwm: str, truth_sha: str
 ) -> PublishOutcome:
-    """PASS/FAIL write atomically; HOLD removes a standing PASS; a standing FAIL is never moved."""
-    if existing_verdict(path) == HarmVerdict.FAIL.value:
+    """PASS/FAIL write atomically; HOLD removes a standing PASS; FAIL or unreadable stays."""
+    if existing_verdict(path) in (HarmVerdict.FAIL.value, UNREADABLE):
         return PublishOutcome(ACTION_STICKY)
     if result.verdict is HarmVerdict.HOLD:
         try:
             path.unlink()
         except FileNotFoundError:
             return PublishOutcome(ACTION_NOTHING)
+        _fsync_dir(path.parent)
         return PublishOutcome(ACTION_REMOVED)
     body = render_artefact(result, as_of=as_of, c2_hwm=c2_hwm, truth_sha=truth_sha)
     _write_atomic(path, body, when=as_of)

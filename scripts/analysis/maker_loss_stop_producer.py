@@ -7,17 +7,25 @@ resolutions from a local file; evaluates the pre-declared D5 harm stop
 in the exact ``loss_stop/v1`` format ``LossStopProbe`` reads. It makes NO network contact and
 writes nothing but that artefact.
 
-* PASS / FAIL write the file atomically. FAIL is sticky (a restart needs a new dated ruling).
-* HOLD (GET- family fills, an open AMBIGUOUS family intent, an unreadable state DB or a corrupt
-  fill record) removes a standing PASS so the probe vetoes at once, and never touches a FAIL.
-* Zero fills is a PASS.
+* PASS / FAIL write the file atomically. FAIL is sticky (a restart needs a new dated ruling), and
+  so is a standing file this producer cannot read back.
+* HOLD (GET- family fills, an open AMBIGUOUS family intent, an unreadable state DB or any
+  undecodable fill record) removes a standing PASS so the probe vetoes at once, and never touches
+  a FAIL.
+* Zero fills is a PASS. A fill whose settlement is not yet knowable is PENDING until 48 h after the
+  end of its local station-day (in no count); after that it is a LOSS.
 
-Exit status (so ``OnFailure=`` alerts): 0 PASS, 2 FAIL, 3 HOLD, 1 error.
+The artefact lands at ``maker_loss_stop_artefact_path(--catalog-root)``, the path the node's probe
+reads (``--catalog-root`` is the node's ``BREEZY_TRADE_CATALOG_ROOT``).
 
-The venue-settlement input (``--venue-settlements``) is a JSON object
-``{"schema": "maker_venue_settlement/v1", "yes_resolved": {"<base slug>": true|false}}``. No local
-writer exists yet; an absent or unreadable file leaves every fill UNRESOLVED, which D5 counts as a
-LOSS (fail closed). The CLI final alone never resolves a fill (it is the cross-check).
+Exit status (so ``OnFailure=`` alerts): 0 PASS, 2 FAIL (a computed FAIL, or a sticky FAIL or
+unreadable file standing on disk), 3 HOLD, 1 error.
+
+The venue-settlement input (``--venue-settlements``, default beside the artefact) is a JSON object
+``{"schema": "maker_venue_settlement/v1", "yes_resolved": {"<base slug>": true|false}, ...}``
+written by ``scripts/venue/maker_settlement_collect.py``; extra keys are ignored. An absent or
+unreadable file leaves every fill unresolved (PENDING, then a LOSS past the deadline). The CLI
+final alone never resolves a fill (it is the cross-check).
 """
 
 from __future__ import annotations
@@ -30,11 +38,10 @@ import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Final
 
-from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
 from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
 from breezy.domain.instrument_leg import (
@@ -43,21 +50,27 @@ from breezy.domain.instrument_leg import (
     symbol_of_instrument_id,
 )
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
-from breezy.persistence.catalog import open_station_catalog, station_catalog_path
-from breezy.registry.sites import default_registry
+from breezy.persistence.catalog import (
+    open_station_catalog,
+    read_climate_day_including_corrections,
+    station_catalog_path,
+)
+from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntentCorrupt, decode_slot_table
 from breezy.strategy.no_ladder_maker.harm_stop import (
     FillOutcome,
     HarmStopResult,
     HarmVerdict,
     SettledFill,
-    _station_of_slug,
     classify_family_fills,
-    d1_fill_cost,
+    d1_fill_cost_conservative,
     evaluate_harm_stop,
+    maker_loss_stop_artefact_path,
     settle_fill,
+    settlement_deadline,
+    station_of_slug,
 )
-from breezy.strategy.no_ladder_maker.harm_stop_artefact import publish
+from breezy.strategy.no_ladder_maker.harm_stop_artefact import ACTION_STICKY, Action, publish
 
 VENUE_SCHEMA: Final[str] = "maker_venue_settlement/v1"
 VENUE: Final[str] = "polymarket_us"
@@ -66,15 +79,22 @@ EXIT_ERROR: Final[int] = 1
 EXIT_FAIL: Final[int] = 2
 EXIT_HOLD: Final[int] = 3
 DEFAULT_DATA_ROOT: Final[Path] = Path.home() / ".local/share/breezy"
+#: the collector writes this beside ``latest.json``; the producer reads it
+VENUE_SETTLEMENTS_NAME: Final[str] = "venue_settlements.json"
 STATE_DB_ENV: Final[str] = "POLYMARKET_US_EXEC_STATE_DB"
+#: the node's own variable (``breezy.runtime.settings.TRADE_CATALOG_ROOT_VAR``; not imported: the
+#: producer stays free of ``breezy.runtime``)
+CATALOG_ROOT_ENV: Final[str] = "BREEZY_TRADE_CATALOG_ROOT"
 
 CliReading = Callable[[WeatherBucketFacts], int | None]
+#: station token -> the climate day's fixed standard-time UTC offset in hours (None: unknown)
+StdOffset = Callable[[str], float | None]
 
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
     result: HarmStopResult
-    action: str
+    action: Action
     path: Path
 
 
@@ -93,7 +113,7 @@ def _read_state(state_db: Path) -> _StateRead:
     if not state_db.is_file():
         return _StateRead((), (), ("state_db_unreadable",))
     try:
-        conn = sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{state_db.absolute().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error:
         return _StateRead((), (), ("state_db_unreadable",))
     try:
@@ -113,7 +133,7 @@ def _read_state(state_db: Path) -> _StateRead:
         elif key.startswith(FILL_KEY_PREFIX):
             try:
                 records.append(DurableFillRecord.from_bytes(value))
-            except ExecutionReportMappingError:
+            except Exception:  # noqa: BLE001 - ANY undecodable record may hide a fill: HOLD
                 blocked.append("fill_record_corrupt")
     open_slugs, intent_blocked = _open_slugs(intent_raw)
     return _StateRead(tuple(records), open_slugs, tuple(dict.fromkeys([*blocked, *intent_blocked])))
@@ -152,26 +172,37 @@ def _read_venue_yes(path: Path | None) -> dict[str, bool]:
     return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, bool)}
 
 
+def registry_std_offset_hours(station: str) -> float | None:
+    """The registry's fixed standard-time UTC offset of a station token; ``None`` if unknown."""
+    registry = default_registry()
+    try:
+        city = registry.site_for_venue_city_token(VENUE, station).city
+        return registry.climate_day_window(VENUE, city).std_utc_offset_hours
+    except SiteNotFoundError:
+        return None
+
+
 def catalog_cli_reader(catalog_base: Path) -> CliReading:
     """The CLI final from the station catalog; ``None`` when no FINAL with a value is stored.
 
-    Never creates a catalog: a station without an existing catalog directory reads ``None``."""
+    Never creates a catalog: a station without an existing catalog directory reads ``None``. Each
+    station's catalog is opened once (the Nautilus catalog has no close; it holds no handle)."""
     registry = default_registry()
     city_of = {
         registry.settlement_site(venue, city).cli_location: city
         for venue, city in registry.pairs()
         if venue == VENUE
     }
+    opened: dict[str, Any] = {}
 
     def read(facts: WeatherBucketFacts) -> int | None:
         city = city_of.get(facts.settlement_station)
         if city is None or not station_catalog_path(catalog_base, VENUE, city).is_dir():
             return None
-        catalog = open_station_catalog(catalog_base, VENUE, city)
-        from breezy.persistence.catalog import read_climate_day_including_corrections
-
+        if city not in opened:
+            opened[city] = open_station_catalog(catalog_base, VENUE, city)
         record = read_climate_day_including_corrections(
-            catalog, station=facts.settlement_station, climate_day=facts.climate_day
+            opened[city], station=facts.settlement_station, climate_day=facts.climate_day
         )
         if record is None or not record.is_final:
             return None
@@ -184,22 +215,20 @@ def catalog_cli_reader(catalog_base: Path) -> CliReading:
 
 
 def _settle_record(
-    record: DurableFillRecord, venue_yes: dict[str, bool], cli_reading: CliReading
+    record: DurableFillRecord,
+    venue_yes: dict[str, bool],
+    cli_reading: CliReading,
+    *,
+    now: datetime,
+    std_offset_hours: StdOffset,
 ) -> SettledFill:
     symbol = symbol_of_instrument_id(record.instrument_id)
     facts = bucket_facts_from_instrument_id(record.instrument_id)
-    station = _station_of_slug(symbol)
-    day = "unknown" if facts is None else facts.climate_day.isoformat()
+    station = station_of_slug(symbol)
+    # review K3: an unparseable rung is its OWN station-day, never one shared "<station>|unknown"
+    day = f"unparseable|{record.venue_order_id}" if facts is None else facts.climate_day.isoformat()
     station_day = f"{station}|{day}"
-    try:
-        cost = d1_fill_cost(record)
-    except ValueError:
-        return SettledFill(
-            station_day=station_day,
-            cost=record.cumulative_cost,
-            outcome=FillOutcome.UNRESOLVED,
-            cause="cost_unknown",
-        )
+    cost = d1_fill_cost_conservative(record)
     if facts is None or leg_of_symbol(symbol) != "no":
         cause = "rung_unparseable" if facts is None else "not_a_no_leg"
         return SettledFill(
@@ -212,7 +241,16 @@ def _settle_record(
         quantity=record.cumulative_qty,
         venue_yes_resolved=venue_yes.get(base_symbol_of(symbol)),
         cli_yes=None if reading is None else facts.contains(reading),
+        pending=_before_deadline(station, facts.climate_day, now, std_offset_hours),
     )
+
+
+def _before_deadline(station: str, climate_day: date, now: datetime, offset: StdOffset) -> bool:
+    """Review J2: still inside the settlement window. An unknown station offset is NOT pending."""
+    hours = offset(station)
+    if hours is None:
+        return False
+    return now < settlement_deadline(climate_day, std_utc_offset_hours=hours)
 
 
 def _truth_sha(settled: Sequence[tuple[str, SettledFill]]) -> str:
@@ -230,10 +268,11 @@ def produce(
     family_stations: frozenset[str],
     cli_reading: CliReading,
     now: datetime,
+    std_offset_hours: StdOffset = registry_std_offset_hours,
 ) -> Outcome:
     """Evaluate D5 over the stores and publish. Reads only; the one write is ``latest.json``."""
     state = _read_state(state_db)
-    # a slug that is not the weather grammar is not a family slug (``_station_of_slug`` -> "")
+    # a slug that is not the weather grammar is not a family slug (``station_of_slug`` -> "")
     classification = classify_family_fills(
         state.records, family_stations=family_stations, open_ambiguous_slugs=state.open_slugs
     )
@@ -246,7 +285,7 @@ def produce(
     settled = [
         (
             base_symbol_of(symbol_of_instrument_id(r.instrument_id)),
-            _settle_record(r, venue_yes, cli_reading),
+            _settle_record(r, venue_yes, cli_reading, now=now, std_offset_hours=std_offset_hours),
         )
         for r in classification.maker_fills
     ]
@@ -264,15 +303,24 @@ def produce(
     return Outcome(result=result, action=published.action, path=derived_dir / "latest.json")
 
 
+def artefact_path(catalog_root: Path) -> Path:
+    """Where the node's probe reads this family's verdict (J6: one function, shared with the probe's
+    own path rule in ``harm_stop``)."""
+    return maker_loss_stop_artefact_path(catalog_root)
+
+
 # -- CLI -----------------------------------------------------------------------------------------
 
 
-def exit_code_for(result: HarmStopResult) -> int:
+def exit_code_for(outcome: Outcome) -> int:
+    """The verdict's code; a sticky FAIL (or unreadable file) standing on disk is always FAIL."""
+    if outcome.action == ACTION_STICKY:
+        return EXIT_FAIL
     return {
         HarmVerdict.PASS: EXIT_PASS,
         HarmVerdict.FAIL: EXIT_FAIL,
         HarmVerdict.HOLD: EXIT_HOLD,
-    }[result.verdict]
+    }[outcome.result.verdict]
 
 
 def _summary(outcome: Outcome) -> dict[str, Any]:
@@ -287,6 +335,7 @@ def _summary(outcome: Outcome) -> dict[str, Any]:
         "losses": r.losses,
         "n": r.n,
         "unresolved": r.unresolved,
+        "pending": r.pending,
         "w_star": None if r.w_star is None else str(r.w_star),
         "cum_pnl": str(r.cum_pnl),
         "cp_upper": r.cp_upper,
@@ -306,31 +355,45 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--state-db", type=Path, default=None, help=f"exec-state sqlite; default ${STATE_DB_ENV}"
     )
+    parser.add_argument(
+        "--catalog-root",
+        type=Path,
+        default=None,
+        help=f"the node's quote-tape catalog root; default ${CATALOG_ROOT_ENV}",
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--catalog-base", type=Path, default=None)
     parser.add_argument("--venue-settlements", type=Path, default=None)
     return parser.parse_args(argv)
 
 
+def _required_path(flag: Path | None, env_name: str) -> Path | None:
+    if flag is not None:
+        return flag
+    return Path(os.environ[env_name]) if os.environ.get(env_name) else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(argv)
-    state_db = args.state_db or (
-        Path(os.environ[STATE_DB_ENV]) if os.environ.get(STATE_DB_ENV) else None
-    )
+    state_db = _required_path(args.state_db, STATE_DB_ENV)
     if state_db is None:
         print(f"error: --state-db or ${STATE_DB_ENV} is required", file=sys.stderr)
         return EXIT_ERROR
-    derived_dir = args.data_root / "derived" / "maker-loss-stop"
+    catalog_root = _required_path(args.catalog_root, CATALOG_ROOT_ENV)
+    if catalog_root is None:
+        print(f"error: --catalog-root or ${CATALOG_ROOT_ENV} is required", file=sys.stderr)
+        return EXIT_ERROR
+    latest = artefact_path(catalog_root)
     outcome = produce(
         state_db=state_db,
-        derived_dir=derived_dir,
-        venue_settlements=args.venue_settlements or derived_dir / "venue_settlements.json",
+        derived_dir=latest.parent,
+        venue_settlements=args.venue_settlements or latest.parent / VENUE_SETTLEMENTS_NAME,
         family_stations=frozenset(args.stations),
         cli_reading=catalog_cli_reader(args.catalog_base or args.data_root / "catalog"),
         now=datetime.now(tz=UTC),
     )
     print(json.dumps(_summary(outcome), sort_keys=True))
-    return exit_code_for(outcome.result)
+    return exit_code_for(outcome)
 
 
 if __name__ == "__main__":

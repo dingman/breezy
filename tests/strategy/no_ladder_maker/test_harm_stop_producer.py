@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
@@ -27,6 +27,7 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.strategy.forecast_quantile_ladder import loss_stop_probe as lsp
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import LossStopProbe
+from breezy.strategy.no_ladder_maker import harm_stop as hsm
 from breezy.strategy.no_ladder_maker.harm_stop import maker_loss_stop_artefact_path
 from scripts.analysis import maker_loss_stop_producer as producer
 
@@ -78,6 +79,7 @@ class _World:
         self.venue_path = tmp / "venue_settlements.json"
         self.venue: dict[str, bool] = {}
         self.cli: dict[tuple[str, str], int] = {}
+        self.offset: float = -5.0
 
     def fill(self, record: DurableFillRecord) -> None:
         self.store.set(f"{FILL_KEY_PREFIX}{record.venue_order_id}", record.to_bytes())
@@ -109,6 +111,7 @@ class _World:
             family_stations=stations,
             cli_reading=self.cli_reader,
             now=now,
+            std_offset_hours=lambda station: self.offset,
         )
 
     def artefact(self) -> dict[str, Any]:
@@ -126,7 +129,14 @@ def test_zero_fills_writes_pass(world: _World) -> None:
     assert outcome.result.verdict.value == "PASS"
     body = world.artefact()
     assert body["schema"] == lsp.SCHEMA and body["verdict"] == "PASS"
-    assert body["counts"] == {"fills": 0, "wins": 0, "losses": 0, "n": 0, "unresolved": 0}
+    assert body["counts"] == {
+        "fills": 0,
+        "wins": 0,
+        "losses": 0,
+        "n": 0,
+        "unresolved": 0,
+        "pending": 0,
+    }
     assert body["triggers"] == []
 
 
@@ -439,7 +449,7 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
     argv = [
         "--station", "nyc",
         "--state-db", str(world.db),
-        "--data-root", str(world.derived.parents[1]),
+        "--catalog-root", str(world.derived.parents[1] / "catalog"),
         "--venue-settlements", str(world.venue_path),
     ]  # fmt: skip
     assert producer.main(argv) == producer.EXIT_PASS
@@ -461,3 +471,260 @@ def test_main_requires_a_state_db(
     monkeypatch.delenv(producer.STATE_DB_ENV, raising=False)
     assert producer.main(["--station", "nyc"]) == producer.EXIT_ERROR
     assert producer.STATE_DB_ENV in capsys.readouterr().err
+
+
+# -- review K5: the cost fallback books the modelled fee too -------------------------------------
+
+
+def test_k5_an_unusable_quantity_books_at_least_the_modelled_minimum_fee() -> None:
+    zero = _record(1, qty="0", bid="0.86")
+    object.__setattr__(zero, "cumulative_cost", Decimal("0.86"))
+    object.__setattr__(zero, "cumulative_fee", Decimal(0))
+    with pytest.raises(ValueError, match="positive quantity"):
+        hsm.d1_fill_cost(zero)
+    assert hsm.d1_fill_cost_conservative(zero) == Decimal("0.87")
+    paid = _record(1)
+    object.__setattr__(paid, "cumulative_fee", Decimal("0.05"))
+    assert hsm.d1_fill_cost_conservative(paid) == hsm.d1_fill_cost(paid) == Decimal("0.91")
+
+
+# -- review J2: PENDING settlement, end to end ---------------------------------------------------
+
+#: three DIFFERENT station-days with one common settlement deadline (same date, same offset)
+J2_STATIONS: Final = frozenset({"nyc", "lax", "sfo"})
+J2_DAY: Final = 10
+J2_OFFSET: Final = -8.0
+J2_DEADLINE: Final = hsm.settlement_deadline(date(2026, 9, J2_DAY), std_utc_offset_hours=J2_OFFSET)
+
+
+def _three_unresolved(world: _World) -> None:
+    world.offset = J2_OFFSET
+    for city in sorted(J2_STATIONS):
+        world.fill(_record(J2_DAY, city=city))  # no venue settlement, no CLI final
+
+
+def test_j2_three_unresolved_fills_before_the_deadline_are_pending_and_pass(world: _World) -> None:
+    _three_unresolved(world)
+    outcome = world.run(now=J2_DEADLINE - timedelta(seconds=1), stations=J2_STATIONS)
+    assert outcome.result.verdict.value == "PASS"
+    assert (outcome.result.pending, outcome.result.n, outcome.result.fills) == (3, 0, 0)
+    assert world.artefact()["verdict"] == "PASS"
+    assert world.artefact()["counts"]["pending"] == 3
+
+
+def test_j2_the_same_fills_one_second_past_the_deadline_fail_t1(world: _World) -> None:
+    _three_unresolved(world)
+    outcome = world.run(now=J2_DEADLINE + timedelta(seconds=1), stations=J2_STATIONS)
+    assert outcome.result.verdict.value == "FAIL" and "T1" in outcome.result.triggers
+    assert (outcome.result.pending, outcome.result.losses, outcome.result.unresolved) == (0, 3, 3)
+
+
+def test_j2_a_resolved_loss_is_scored_before_the_deadline(world: _World) -> None:
+    world.offset = J2_OFFSET
+    for city in sorted(J2_STATIONS):
+        world.fill(_record(J2_DAY, city=city))
+        world.settle(J2_DAY, yes=True, tmax=LOW_TMAX, city=city)
+    outcome = world.run(now=J2_DEADLINE - timedelta(days=1), stations=J2_STATIONS)
+    assert outcome.result.losses == 3 and outcome.result.pending == 0
+    assert "T1" in outcome.result.triggers
+
+
+def test_j2_a_mismatch_is_pending_then_a_loss(world: _World) -> None:
+    world.offset = J2_OFFSET
+    world.fill(_record(J2_DAY))
+    world.settle(J2_DAY, yes=False, tmax=LOW_TMAX)  # venue NO, CLI says the rung hit
+    early = world.run(now=J2_DEADLINE - timedelta(seconds=1))
+    assert (early.result.pending, early.result.unresolved) == (1, 0)
+    late = world.run(now=J2_DEADLINE + timedelta(seconds=1))
+    assert (late.result.pending, late.result.unresolved, late.result.losses) == (0, 1, 1)
+
+
+def test_j2_the_registry_offsets_drive_the_deadline_by_default() -> None:
+    for station, offset in (("nyc", -5.0), ("lax", -8.0), ("mdw", -6.0)):
+        assert producer.registry_std_offset_hours(station) == offset
+    assert producer.registry_std_offset_hours("nowhere") is None
+
+
+# -- review K3: an unparseable rung is its own station-day --------------------------------------
+
+
+def _unparseable(n: int) -> DurableFillRecord:
+    base = _record(n, order=f"ORD-bad-{n}")
+    return DurableFillRecord(
+        venue_order_id=base.venue_order_id,
+        client_order_id=base.client_order_id,
+        instrument_id="tc-temp-nychigh-2026-09-01-zzz^no.POLYMARKET_US",
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.86"),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=True,
+        ts_event=base.ts_event,
+        venue_fee_raw="0.01",
+        trade_id=base.trade_id,
+        order_qty=Decimal(1),
+    )
+
+
+def test_k3_unparseable_rungs_do_not_collapse_into_one_station_day(world: _World) -> None:
+    for n in (1, 2, 3):
+        world.fill(_unparseable(n))
+    outcome = world.run()
+    assert outcome.result.fills == 3
+    assert outcome.result.losses == 3, "each unparseable fill is its own loss"
+    assert "T1" in outcome.result.triggers
+
+
+# -- review K4 / J3 / J4: a standing file we cannot read is sticky; the exit code says FAIL ----
+
+
+def test_k4_a_corrupt_existing_file_is_never_overwritten_or_removed(world: _World) -> None:
+    world.win(1)
+    world.derived.mkdir(parents=True)
+    path = world.derived / "latest.json"
+    path.write_bytes(b"{not json")
+    outcome = world.run()
+    assert outcome.action == "sticky_fail_kept"
+    assert path.read_bytes() == b"{not json"
+    world.fill(_record(2, trade_id="GET-ORD-nyc-2"))  # a HOLD must not unlink it either
+    assert world.run().action == "sticky_fail_kept"
+    assert path.read_bytes() == b"{not json"
+
+
+@pytest.mark.parametrize("payload", [b"[]", b'{"schema": "other/v9", "verdict": "PASS"}', b""])
+def test_k4_a_foreign_or_empty_existing_file_is_sticky(world: _World, payload: bytes) -> None:
+    world.win(1)
+    world.derived.mkdir(parents=True)
+    (world.derived / "latest.json").write_bytes(payload)
+    assert world.run().action == "sticky_fail_kept"
+    assert (world.derived / "latest.json").read_bytes() == payload
+
+
+def test_j4_a_standing_fail_exits_fail_even_when_the_new_verdict_is_pass(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    for d in (1, 2, 3):
+        world.lose(d)
+    argv = [
+        "--station", "nyc",
+        "--state-db", str(world.db),
+        "--catalog-root", str(world.derived.parents[1] / "catalog"),
+        "--catalog-base", str(world.derived.parents[1]),
+        "--venue-settlements", str(world.venue_path),
+    ]  # fmt: skip
+    world.run()  # the FAIL is on disk
+    for d in (1, 2, 3):
+        world.settle(d, yes=False, tmax=HIGH_TMAX)  # the losses are later 'resolved' as wins
+    world.venue_path.write_text(
+        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
+    )
+    assert producer.main(argv) == producer.EXIT_FAIL
+
+
+def test_j4_a_standing_corrupt_file_exits_fail(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    world.win(1)
+    world.derived.mkdir(parents=True)
+    (world.derived / "latest.json").write_bytes(b"garbage")
+    argv = [
+        "--station", "nyc",
+        "--state-db", str(world.db),
+        "--catalog-root", str(world.derived.parents[1] / "catalog"),
+        "--catalog-base", str(world.derived.parents[1]),
+        "--venue-settlements", str(world.venue_path),
+    ]  # fmt: skip
+    assert producer.main(argv) == producer.EXIT_FAIL
+
+
+# -- review J5: any undecodable fill record is a HOLD -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload", [b"\xff\xfe", b"[]", b"{}", b'{"venue_order_id": 5}', b'{"cumulative_qty": "x"}']
+)
+def test_j5_any_undecodable_fill_record_holds(world: _World, payload: bytes) -> None:
+    world.store.set(f"{FILL_KEY_PREFIX}BAD", payload)
+    outcome = world.run()
+    assert outcome.result.verdict.value == "HOLD"
+    assert "fill_record_corrupt" in outcome.result.hold_reasons
+
+
+# -- review J6: the producer writes exactly where the probe reads --------------------------------
+
+
+def test_j6_the_producer_path_is_the_probes_path(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "catalog" / "quote_tape" / "polymarket_us"
+    assert producer.artefact_path(catalog_root) == maker_loss_stop_artefact_path(catalog_root)
+
+
+def test_j6_main_writes_where_the_probe_reads(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    world.win(1)
+    catalog_root = world.derived.parents[1] / "q" / "polymarket_us"
+    argv = [
+        "--station", "nyc",
+        "--state-db", str(world.db),
+        "--catalog-root", str(catalog_root),
+        "--catalog-base", str(world.derived.parents[1]),
+        "--venue-settlements", str(world.venue_path),
+    ]  # fmt: skip
+    world.venue_path.write_text(
+        json.dumps({"schema": producer.VENUE_SCHEMA, "yes_resolved": world.venue})
+    )
+    assert producer.main(argv) == producer.EXIT_PASS
+    probe = _probe(maker_loss_stop_artefact_path(catalog_root), datetime.now(tz=UTC))
+    probe.probe_once()
+    assert probe.veto_reason() is None
+
+
+def test_j6_main_requires_a_catalog_root(
+    world: _World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(producer.CATALOG_ROOT_ENV, raising=False)
+    argv = ["--station", "nyc", "--state-db", str(world.db)]
+    assert producer.main(argv) == producer.EXIT_ERROR
+    assert producer.CATALOG_ROOT_ENV in capsys.readouterr().err
+
+
+# -- review J7: hardening -------------------------------------------------------------------------
+
+
+def test_j7_a_state_db_path_with_uri_metacharacters_is_read(tmp_path: Path) -> None:
+    odd = tmp_path / "a b#c?d%e"
+    odd.mkdir()
+    world = _World(odd)
+    world.win(1)
+    assert world.run().result.fills == 1
+
+
+def test_j7_removing_a_pass_fsyncs_the_directory(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.win(1)
+    world.run()
+    world.fill(_record(2, trade_id="GET-ORD-nyc-2"))
+    synced: list[bool] = []
+    real = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    assert world.run().action == "removed"
+    assert synced == [True]
+
+
+def test_j7_a_new_derived_directory_is_0755_whatever_the_umask(world: _World) -> None:
+    world.win(1)
+    old = os.umask(0o077)
+    try:
+        world.run()
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(world.derived.stat().st_mode) == 0o755

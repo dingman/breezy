@@ -19,26 +19,31 @@ resolver-booked ``GET-`` family fills or an open AMBIGUOUS family intent may hid
 never saw. Nothing here reads ``fee_reconciled`` (rebate-clamped and unreadable-commission fills
 are exactly the unreconciled ones; filtering them out would hide the worst fills).
 
-Counting units (W counts winning FILLS; L counts distinct loss STATION-DAYS) follow the D5 text
-literally; the unresolved/mismatched/qty-not-1 fills are LOSSES for L, for ``w*`` and for PnL.
+Counting units (review K1, coordinator ruling): W, L and n are all counted per STATION-DAY. A
+day is a win only if EVERY fill on it won; any other fill (a loss, or unresolved, mismatched or
+qty-not-1) makes it a loss day. ``w*`` (mean cost) and the cumulative PnL stay per FILL. The T3
+n-gate is counted on station-days, so T3 can arm one fill later than a per-fill count would. A
+pending fill (review J2) is excluded from every count.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 from scipy.stats import beta
 
 from breezy.adapters.polymarket_us.exec import submit_chain
-from breezy.adapters.polymarket_us.exec.client import LONG_ONLY_SIDE
+from breezy.adapters.polymarket_us.exec.client import LONG_ONLY_SIDE, DurableFillRecord
 from breezy.domain.instrument_leg import symbol_of_instrument_id
 
 __all__ = [
+    "SETTLEMENT_PENDING_WINDOW",
     "TAKER_THETA",
     "FamilyFillClassification",
     "FillOutcome",
@@ -49,11 +54,14 @@ __all__ = [
     "cp_upper_bound",
     "d1_fail_closed",
     "d1_fill_cost",
+    "d1_fill_cost_conservative",
     "d1_verdict",
     "evaluate_harm_stop",
     "maker_loss_stop_artefact_path",
     "select_maker_fills",
     "settle_fill",
+    "settlement_deadline",
+    "station_of_slug",
 ]
 
 #: D5: the taker theta of the cost model (a pinned rule constant, NOT the record's coefficient).
@@ -63,6 +71,10 @@ MIN_MODELLED_FEE: Final[Decimal] = Decimal("0.01")
 _CENT: Final[Decimal] = Decimal("0.01")
 _ONE: Final[Decimal] = Decimal(1)
 SETTLED_QTY: Final[Decimal] = Decimal(1)
+#: review J2: a fill whose settlement is not yet knowable stays PENDING (excluded from every count)
+#: until this long after the END of its local station-day; after that an unresolved, missing or
+#: mismatched result counts as a LOSS. Pinned by ``test_j2_the_settlement_deadline_...``.
+SETTLEMENT_PENDING_WINDOW: Final[timedelta] = timedelta(hours=48)
 
 T1_MIN_LOSSES: Final[int] = 3
 T2_MIN_N: Final[int] = 3
@@ -82,7 +94,7 @@ def maker_loss_stop_artefact_path(catalog_root: Path) -> Path:
 # -- the frozen selector / classifier (B6) -------------------------------------------------------
 
 
-def _station_of_slug(slug: str) -> str:
+def station_of_slug(slug: str) -> str:
     """The station (city) segment of a daily-high slug: ``tc-temp-<city>high-...``.
 
     ``""`` for anything that is not that grammar (no family station is empty), so a foreign or
@@ -94,10 +106,12 @@ def _station_of_slug(slug: str) -> str:
 
 
 def _station_of(instrument_id: str) -> str:
-    return _station_of_slug(symbol_of_instrument_id(instrument_id))
+    return station_of_slug(symbol_of_instrument_id(instrument_id))
 
 
-def select_maker_fills(records: Iterable[Any], *, family_stations: frozenset[str]) -> list[Any]:
+def select_maker_fills(
+    records: Iterable[DurableFillRecord], *, family_stations: frozenset[str]
+) -> list[DurableFillRecord]:
     """THE FROZEN SELECTOR: ``POLL-`` marker AND BUY AND station in the family scope."""
     return [
         r
@@ -113,15 +127,15 @@ class FamilyFillClassification:
     """What D1 may know about the family's durable fills."""
 
     #: the family's POLL- maker-booked BUY fills (the frozen selector's result)
-    maker_fills: tuple[Any, ...]
+    maker_fills: tuple[DurableFillRecord, ...]
     #: the family's OWN resolver-booked fills (``GET-`` trade id, TAKER-booked) on family slugs
-    get_fills: tuple[Any, ...]
+    get_fills: tuple[DurableFillRecord, ...]
     #: any open AMBIGUOUS intent on a family slug (it may be a fill the poll never sees)
     open_ambiguous_family_intent: bool
 
 
 def classify_family_fills(
-    records: Sequence[Any],
+    records: Sequence[DurableFillRecord],
     *,
     family_stations: frozenset[str],
     open_ambiguous_slugs: Iterable[str],
@@ -139,7 +153,7 @@ def classify_family_fills(
         maker_fills=tuple(select_maker_fills(records, family_stations=family_stations)),
         get_fills=get_fills,
         open_ambiguous_family_intent=any(
-            _station_of_slug(slug) in family_stations for slug in open_ambiguous_slugs
+            station_of_slug(slug) in family_stations for slug in open_ambiguous_slugs
         ),
     )
 
@@ -167,7 +181,7 @@ def modelled_taker_fee(*, quantity: Decimal, price: Decimal) -> Decimal:
     return max(exact.quantize(_CENT, rounding=ROUND_HALF_EVEN), MIN_MODELLED_FEE)
 
 
-def d1_fill_cost(record: Any) -> Decimal:
+def d1_fill_cost(record: DurableFillRecord) -> Decimal:
     """D5: ``cost_i = posted bid + max(venue-reported fee, modelled taker fee)``, slip 0.
 
     The posted bid is the maker fill's cost (``cumulative_cost``, a maker fills AT its bid); the
@@ -183,14 +197,28 @@ def d1_fill_cost(record: Any) -> Decimal:
     return cost
 
 
+def d1_fill_cost_conservative(record: DurableFillRecord) -> Decimal:
+    """Review K5: the cost when :func:`d1_fill_cost` cannot price the fill (no positive quantity,
+    or a price outside [0, 1]). It still books the modelled taker fee, at its one-cent floor, over
+    the booked fee: an unpriceable fill is never costed cheaper than a priceable one."""
+    try:
+        return d1_fill_cost(record)
+    except ValueError:
+        fee = max(record.cumulative_fee, MIN_MODELLED_FEE)
+        cost: Decimal = record.cumulative_cost + fee
+        return cost
+
+
 # -- settlement of one fill ----------------------------------------------------------------------
 
 
 class FillOutcome(StrEnum):
     WIN = "WIN"
     LOSS = "LOSS"
-    #: unresolved, missing or mismatched settlement: counts as a LOSS until resolved
+    #: unresolved, missing or mismatched settlement PAST the deadline: counts as a LOSS
     UNRESOLVED = "UNRESOLVED"
+    #: not yet resolvable and still before the deadline (review J2): excluded from every count
+    PENDING = "PENDING"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -201,6 +229,17 @@ class SettledFill:
     cause: str
 
 
+def settlement_deadline(climate_day: date, *, std_utc_offset_hours: float) -> datetime:
+    """When an unresolved fill on ``climate_day`` stops being PENDING (review J2).
+
+    The climate day runs local-STANDARD midnight to midnight (the registry's fixed offset), so it
+    ends at ``climate_day + 1`` 00:00 local standard time; the deadline is
+    :data:`SETTLEMENT_PENDING_WINDOW` after that. UTC, timezone-aware."""
+    local_midnight = datetime.combine(climate_day + timedelta(days=1), time(0), tzinfo=UTC)
+    end_of_day = local_midnight - timedelta(hours=std_utc_offset_hours)
+    return end_of_day + SETTLEMENT_PENDING_WINDOW
+
+
 def settle_fill(
     *,
     station_day: str,
@@ -208,11 +247,15 @@ def settle_fill(
     quantity: Decimal,
     venue_yes_resolved: bool | None,
     cli_yes: bool | None,
+    pending: bool = False,
 ) -> SettledFill:
     """A BUY NO fill wins iff the venue resolved YES false AND the CLI final agrees.
 
     ``cli_yes`` is whether the CLI final lands inside the fill's rung (None: no usable final).
+    ``pending`` (the caller's "before the settlement deadline") turns an unresolved, missing or
+    mismatched result into PENDING instead of UNRESOLVED; a resolved fill is scored at once.
     """
+    unresolved = FillOutcome.PENDING if pending else FillOutcome.UNRESOLVED
 
     def _made(outcome: FillOutcome, cause: str) -> SettledFill:
         return SettledFill(station_day=station_day, cost=cost, outcome=outcome, cause=cause)
@@ -220,11 +263,11 @@ def settle_fill(
     if quantity != SETTLED_QTY:
         return _made(FillOutcome.LOSS, "qty_not_1")
     if venue_yes_resolved is None:
-        return _made(FillOutcome.UNRESOLVED, "venue_settlement_missing")
+        return _made(unresolved, "venue_settlement_missing")
     if cli_yes is None:
-        return _made(FillOutcome.UNRESOLVED, "cli_final_missing")
+        return _made(unresolved, "cli_final_missing")
     if venue_yes_resolved != cli_yes:
-        return _made(FillOutcome.UNRESOLVED, "settlement_mismatch")
+        return _made(unresolved, "settlement_mismatch")
     return _made(FillOutcome.LOSS if venue_yes_resolved else FillOutcome.WIN, "settled")
 
 
@@ -254,6 +297,9 @@ class HarmStopResult:
     losses: int
     n: int
     unresolved: int
+    #: fills still before their settlement deadline: in no other count
+    pending: int
+    #: the COUNTED fills (pending excluded); ``w_star`` and ``cum_pnl`` are over these
     fills: int
     w_star: Decimal | None
     cum_pnl: Decimal
@@ -264,14 +310,21 @@ class HarmStopResult:
 def evaluate_harm_stop(
     fills: Sequence[SettledFill], *, blocked_reasons: Sequence[str] = ()
 ) -> HarmStopResult:
-    """D5 over the settled fills. FAIL outranks HOLD; HOLD outranks PASS."""
-    loss_days = {f.station_day for f in fills if f.outcome is not FillOutcome.WIN}
-    wins = sum(1 for f in fills if f.outcome is FillOutcome.WIN)
-    losses = len(loss_days)
-    n = wins + losses
-    w_star = sum((f.cost for f in fills), Decimal(0)) / len(fills) if fills else None
+    """D5 over the settled fills. FAIL outranks HOLD; HOLD outranks PASS.
+
+    W, L and n are per station-day (a day is a win only if every fill on it won); ``w*`` and the
+    cumulative PnL are per fill. PENDING fills are in no count."""
+    counted = [f for f in fills if f.outcome is not FillOutcome.PENDING]
+    days: dict[str, bool] = {}
+    for f in counted:
+        days[f.station_day] = days.get(f.station_day, True) and f.outcome is FillOutcome.WIN
+    wins = sum(1 for won in days.values() if won)
+    losses = len(days) - wins
+    n = len(days)
+    w_star = sum((f.cost for f in counted), Decimal(0)) / len(counted) if counted else None
     cum_pnl = sum(
-        ((_ONE - f.cost) if f.outcome is FillOutcome.WIN else -f.cost for f in fills), Decimal(0)
+        ((_ONE - f.cost) if f.outcome is FillOutcome.WIN else -f.cost for f in counted),
+        Decimal(0),
     )
     cp_upper = cp_upper_bound(wins, n) if n >= T2_MIN_N else None
     triggers: list[str] = []
@@ -293,8 +346,9 @@ def evaluate_harm_stop(
         wins=wins,
         losses=losses,
         n=n,
-        unresolved=sum(1 for f in fills if f.outcome is FillOutcome.UNRESOLVED),
-        fills=len(fills),
+        unresolved=sum(1 for f in counted if f.outcome is FillOutcome.UNRESOLVED),
+        pending=len(fills) - len(counted),
+        fills=len(counted),
         w_star=w_star,
         cum_pnl=cum_pnl,
         cp_upper=cp_upper,

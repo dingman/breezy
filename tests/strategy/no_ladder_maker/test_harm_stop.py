@@ -5,6 +5,7 @@ Every case is a fixture. The evaluator takes settled fills; nothing here reads a
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 
@@ -215,3 +216,92 @@ def test_cp_upper_bound_refuses_impossible_counts(k: int, n: int) -> None:
 
 def test_theta_is_the_d5_constant_and_agrees_with_the_runtime_fee_theta() -> None:
     assert hs.TAKER_THETA == Decimal("0.0695") == FEE_THETA
+
+
+# -- review K1: W, L and n are counted per STATION-DAY ---------------------------------------------
+
+
+def test_k1_a_two_fill_win_day_is_one_win_and_t2_trips_at_w_star_875() -> None:
+    # day A: two winning fills; days B and C: one loss each. Per STATION-DAY that is W1 L2 n3
+    # (per fill it would be W2 L2 n4 and the 95% bound 0.97 would clear w*). w* is per fill.
+    fills = [
+        _fill(1, WIN, cost="0.875"),
+        _fill(1, WIN, cost="0.875"),
+        _fill(2, LOSS, cost="0.875"),
+        _fill(3, LOSS, cost="0.875"),
+    ]
+    result = _run(fills)
+    assert (result.wins, result.losses, result.n) == (1, 2, 3)
+    assert result.w_star == Decimal("0.875")
+    assert result.cp_upper == pytest.approx(0.8646496378284161, abs=1e-12)
+    assert result.triggers == ("T2",)
+    assert result.verdict is HarmVerdict.FAIL
+    assert result.fills == 4
+
+
+def test_k1_a_day_is_a_win_only_if_every_fill_on_it_won() -> None:
+    mixed = _run([_fill(1, WIN), _fill(1, LOSS)])
+    assert (mixed.wins, mixed.losses, mixed.n) == (0, 1, 1)
+    unresolved = _run([_fill(1, WIN), _fill(1, UNRES)])
+    assert (unresolved.wins, unresolved.losses) == (0, 1)
+
+
+def test_k1_pnl_stays_per_fill_and_the_t3_gate_counts_station_days() -> None:
+    # four fills on THREE station-days: n = 3 < 4, so T3 is not armed even though the per-fill
+    # cumulative PnL (2 * 0.13 - 2 * 0.87 = -1.48) is below -w*
+    fills = [
+        _fill(1, WIN, cost="0.87"),
+        _fill(1, WIN, cost="0.87"),
+        _fill(2, LOSS, cost="0.87"),
+        _fill(3, LOSS, cost="0.87"),
+    ]
+    result = _run(fills)
+    assert result.n == 3 and result.cum_pnl == Decimal("-1.48")
+    assert "T3" not in result.triggers
+    # one more distinct day arms it
+    assert "T3" in _run([*fills, _fill(4, LOSS, cost="0.87")]).triggers
+
+
+# -- review J2: PENDING settlement ---------------------------------------------------------------
+
+
+PENDING = FillOutcome.PENDING
+
+
+def test_j2_pending_fills_are_excluded_from_every_count() -> None:
+    result = _run([_fill(1, WIN), _fill(2, PENDING, cost="0.99"), _fill(3, PENDING, cost="0.99")])
+    assert (result.wins, result.losses, result.n, result.fills) == (1, 0, 1, 1)
+    assert result.pending == 2
+    assert result.w_star == Decimal("0.86")
+    assert result.cum_pnl == Decimal("0.14")
+    assert result.verdict is HarmVerdict.PASS
+
+
+def test_j2_only_pending_fills_is_a_pass_with_no_w_star() -> None:
+    result = _run([_fill(1, PENDING), _fill(1, PENDING), _fill(1, PENDING)])
+    assert result.verdict is HarmVerdict.PASS
+    assert (result.n, result.fills, result.pending, result.w_star) == (0, 0, 3, None)
+
+
+def test_j2_the_settlement_deadline_is_48h_after_the_end_of_the_local_day() -> None:
+    assert hs.SETTLEMENT_PENDING_WINDOW == timedelta(hours=48)
+    # climate day 2026-09-10 at LAX (std offset -8): the day ends 2026-09-11 08:00Z
+    deadline = hs.settlement_deadline(date(2026, 9, 10), std_utc_offset_hours=-8.0)
+    assert deadline == datetime(2026, 9, 13, 8, 0, tzinfo=UTC)
+    nyc = hs.settlement_deadline(date(2026, 9, 10), std_utc_offset_hours=-5.0)
+    assert nyc == datetime(2026, 9, 13, 5, 0, tzinfo=UTC)
+
+
+def test_j2_settle_fill_is_pending_only_while_unresolved_and_before_the_deadline() -> None:
+    kwargs = {"station_day": "nyc|2026-09-10", "cost": Decimal("0.87"), "quantity": Decimal(1)}
+    pending = hs.settle_fill(**kwargs, venue_yes_resolved=None, cli_yes=None, pending=True)
+    assert pending.outcome is PENDING and pending.cause == "venue_settlement_missing"
+    late = hs.settle_fill(**kwargs, venue_yes_resolved=None, cli_yes=None, pending=False)
+    assert late.outcome is FillOutcome.UNRESOLVED
+    # a resolved fill is scored at once, before the deadline: a known loss is never hidden
+    resolved = hs.settle_fill(**kwargs, venue_yes_resolved=True, cli_yes=True, pending=True)
+    assert resolved.outcome is FillOutcome.LOSS
+    mismatch = hs.settle_fill(**kwargs, venue_yes_resolved=False, cli_yes=True, pending=True)
+    assert mismatch.outcome is PENDING and mismatch.cause == "settlement_mismatch"
+    missing_cli = hs.settle_fill(**kwargs, venue_yes_resolved=False, cli_yes=None, pending=True)
+    assert missing_cli.outcome is PENDING and missing_cli.cause == "cli_final_missing"
