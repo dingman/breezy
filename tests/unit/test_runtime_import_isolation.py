@@ -138,6 +138,9 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # never relaxed).
     "scripts.ops.ambig_latch_phase_a_check",
     "scripts.analysis.maker_tape_census",  # MAKER S1 WP1 census
+    # B2 positive control: the shared core imports `breezy.runtime`, so source
+    # (c) picks it up; tracked, not excluded.
+    "scripts.venue._maker_control_core",
     "scripts.analysis.maker_stage0_probe",  # MAKER S2 WP0 probe
     "scripts.analysis.maker_stage0_nodelog",  # MAKER-S2 WP1 node-log scan
     "scripts.analysis.maker_stage0_schedule",  # MAKER-S2 WP1 process schedule

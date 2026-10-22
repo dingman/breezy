@@ -49,6 +49,9 @@ from tests.unit.test_polymarket_us_resting_sweep import (
     _second_process,
     _set_state_on,
 )
+from tests.unit.test_polymarket_us_submit_order_chain import (  # noqa: F401  (fixture, late getfixturevalue)
+    write_canonical_unverified,
+)
 
 _INDEX_KEY: Final[str] = client_module.RESTING_INDEX_KEY
 _ROW_PREFIX: Final[str] = client_module.RESTING_KEY_PREFIX
@@ -431,7 +434,7 @@ async def test_the_choke_point_sends_nothing_for_a_retired_ledger_slug_or_an_unr
 @pytest.mark.usefixtures("gate_env")
 @pytest.mark.parametrize("cause", ["no_sender", "canonical_unverified"])
 async def test_the_choke_point_sends_nothing_without_a_sender_or_a_verified_canonical_string(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, cause: str
 ) -> None:
     rig = await _rig(tmp_path, monkeypatch, pin=True)
     client = rig.client
@@ -439,7 +442,11 @@ async def test_the_choke_point_sends_nothing_without_a_sender_or_a_verified_cano
     if cause == "no_sender":
         client._order_sender = None
     else:
-        monkeypatch.setattr(write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
+        # The flag must be False only AFTER the rest is submitted (a False flag
+        # refuses the submit itself), so the shared chain fixture is requested
+        # late by name. This module never sets the attribute: the NO-SEND scan
+        # set (test_polymarket_us_submit_order_chain) stays exactly one file.
+        request.getfixturevalue("write_canonical_unverified")
     assert await client._cancel_slug_orders(_slug_of(command)) == "REFUSED_NO_SENDER"
     assert rig.sender.cancel_alls == []
     await client._disconnect()
