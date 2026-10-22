@@ -35,8 +35,10 @@ _ORDER_ID = "ABCDEF123456"
 _LEGACY_PROBE = "scripts/venue/polymarket_us_write_signing_probe.py"
 #: ARM B7 (S4 r4 WP6) re-digest, once: the probe's empty-body cancel-all sender now refuses
 #: unconditionally (prior fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f).
+#: Re-digested again at the B7 review fix T1 (flow-entry refusal). Prior:
+#: 93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3
 #: Pinned together with the AST tests at the end of this file and the M6 baseline entry.
-_LEGACY_PROBE_SHA256 = "93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3"
+_LEGACY_PROBE_SHA256 = "7dfe7f0ebe8abc398f298265b2142e80164b571ed3cd543926fab91eea0f231b"
 
 
 class _Resp:
@@ -271,7 +273,7 @@ def test_no_module_imports_the_legacy_cancel_all_helper_beyond_the_probe() -> No
 # sender left is the exec client's ``_cancel_slug_orders``.
 
 
-def _load_legacy_probe() -> Any:
+def _load_legacy_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
     import importlib.util
     import sys
 
@@ -280,7 +282,7 @@ def _load_legacy_probe() -> Any:
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+    monkeypatch.setitem(sys.modules, spec.name, module)  # no sys.modules leak past the test
     spec.loader.exec_module(module)
     return module
 
@@ -300,10 +302,12 @@ def _sender_calls_signed_post(source: str) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_the_legacy_probe_cancel_all_sender_refuses_before_any_io() -> None:
+async def test_the_legacy_probe_cancel_all_sender_refuses_before_any_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
-    probe = _load_legacy_probe()
+    probe = _load_legacy_probe(monkeypatch)
     client = _Client()
     with pytest.raises(probe.ProbeRefusal):
         await asyncio.wait_for(
@@ -328,3 +332,65 @@ def test_the_sender_pin_trips_on_a_planted_signed_post_call() -> None:
         "    return await _signed_post(*a, path=_CANCEL_ALL_PATH, body={})\n"
     )
     assert _sender_calls_signed_post(planted) is True
+
+
+# ----------------------------------------------- ARM B7 review T1: refuse at FLOW ENTRY
+#
+# Refusing only inside the sender left ``run_sequence`` posting a real order and then dying on
+# the retired cancel-all, stranding the order. Both legacy flows must now refuse BEFORE the
+# write-intent marker, before credentials are read and before any GET/POST.
+
+
+class _Boom(Exception):
+    pass
+
+
+def _tripwire(name: str) -> Any:
+    def _fn(*_a: Any, **_k: Any) -> Any:
+        raise _Boom(f"{name} reached: the flow did not refuse at entry")
+
+    return _fn
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["run_sequence", "run_probe"])
+async def test_legacy_flows_refuse_at_entry_with_zero_posts_and_no_marker(
+    flow: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    probe = _load_legacy_probe(monkeypatch)
+    client = _Client()
+    kwargs: dict[str, Any] = {
+        "directory": tmp_path,
+        "stamp": "t1",
+        "prepare_fn": _tripwire("prepare_fn"),
+        "read_transport_factory": _tripwire("read_transport_factory"),
+        "write_client_factory": lambda _config: client,
+    }
+    with pytest.raises(probe.ProbeRefusal, match="LEGACY_CANCEL_ALL_RETIRED"):
+        await asyncio.wait_for(getattr(probe, flow)(**kwargs), timeout=5)
+    assert client.calls == []
+    assert list(tmp_path.iterdir()) == []  # no write-intent marker, no artefact
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["run_sequence", "run_probe"])
+async def test_the_entry_refusal_stands_down_only_for_an_installed_test_stand_in(
+    flow: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-vacuity: the guard keys on the live sender, so the bookkeeping tests that install the
+    stand-in still run, and the unpatched module refuses."""
+    import asyncio
+
+    from tests.unit import legacy_probe_cancel_all_stand_in as stand_in
+
+    probe = _load_legacy_probe(monkeypatch)
+    stand_in.install(monkeypatch, probe)
+    with pytest.raises(_Boom, match="prepare_fn"):
+        await asyncio.wait_for(
+            getattr(probe, flow)(
+                directory=tmp_path, stamp="t1b", prepare_fn=_tripwire("prepare_fn")
+            ),
+            timeout=5,
+        )
