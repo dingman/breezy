@@ -77,6 +77,8 @@ SETTLED_QTY: Final[Decimal] = Decimal(1)
 SETTLEMENT_PENDING_WINDOW: Final[timedelta] = timedelta(hours=48)
 
 T1_MIN_LOSSES: Final[int] = 3
+#: T2 arms at n >= 3 exactly as pre-registered (plan r2 delta D5: "n >= 3"); small-n CP-bound
+#: firing is the declared rule, not a defect to retune.
 T2_MIN_N: Final[int] = 3
 T3_MIN_N: Final[int] = 4
 CP_CONFIDENCE: Final[float] = 0.95
@@ -313,7 +315,8 @@ def evaluate_harm_stop(
     """D5 over the settled fills. FAIL outranks HOLD; HOLD outranks PASS.
 
     W, L and n are per station-day (a day is a win only if every fill on it won); ``w*`` and the
-    cumulative PnL are per fill. PENDING fills are in no count."""
+    cumulative PnL are per fill. PENDING fills are in no count. T2 arms at n >= 3 as pre-registered
+    (D5: "n >= 3"); that small-n firing is the declared rule."""
     counted = [f for f in fills if f.outcome is not FillOutcome.PENDING]
     days: dict[str, bool] = {}
     for f in counted:

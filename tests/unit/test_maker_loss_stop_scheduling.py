@@ -7,9 +7,12 @@ job is untouched (review J1). Nothing here is installed, enabled or daemon-reloa
 
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
 from typing import Final
+
+import pytest
 
 from breezy.strategy.no_ladder_maker.harm_stop import maker_loss_stop_artefact_path
 from scripts.analysis import maker_loss_stop_producer as producer
@@ -96,3 +99,58 @@ def test_the_timer_fires_daily_at_1250z_after_the_truth_jobs() -> None:
 def test_the_command_lines_parse() -> None:
     for prefix in ("ExecStartPre", "ExecStart"):
         assert shlex.split(" ".join(_exec(prefix)))[0].endswith("/.venv/bin/python")
+
+
+# -- review D1-F5: sandbox hardening and the catalog-root source of truth ------------------------
+
+README: Final[Path] = DEPLOY / "README.md"
+HOST_TRADE_ENV: Final[Path] = Path.home() / ".config" / "breezy" / "breezy-trade.env"
+TRADE_ENV_VAR: Final[str] = "BREEZY_TRADE_CATALOG_ROOT"
+
+
+def _catalog_root_of(tokens: list[str]) -> str:
+    return tokens[tokens.index("--catalog-root") + 1]
+
+
+def _readme_quote_tape_path() -> str:
+    """No in-repo env template or example carries ``BREEZY_TRADE_CATALOG_ROOT`` (the node requires
+    it and has no default: ``breezy.runtime.settings`` raises when it is absent), so the in-repo
+    declaration of the real tape location is the deploy README's 2026-10-19 note."""
+    found = re.search(r"the quote tape lives at `(/[^`]+)`", README.read_text())
+    assert found is not None, "deploy/systemd/README.md no longer declares the quote tape location"
+    return found.group(1)
+
+
+def test_the_unit_is_sandboxed_to_exactly_the_artefact_directory() -> None:
+    lines = _lines(SERVICE)
+    assert "ProtectSystem=strict" in lines
+    assert "NoNewPrivileges=yes" in lines
+    writable = [line for line in lines if line.startswith("ReadWritePaths=")]
+    assert len(writable) == 1, "exactly one ReadWritePaths= line"
+    paths = writable[0].split("=", 1)[1].split()
+    root = Path(_catalog_root_of(_exec("ExecStart")))
+    artefact_dir = producer.artefact_path(root).parent
+    assert paths == [str(artefact_dir)], "only the dir latest.json and venue_settlements.json share"
+
+
+def test_the_units_catalog_root_is_the_declared_tape_location_in_both_steps() -> None:
+    expected = _readme_quote_tape_path()
+    assert _catalog_root_of(_exec("ExecStartPre")) == expected
+    assert _catalog_root_of(_exec("ExecStart")) == expected
+
+
+def test_the_readme_declaration_would_catch_a_drifted_root() -> None:
+    # plant: a unit whose root differs from the declaration must not compare equal
+    assert _catalog_root_of(_exec("ExecStart")) != _readme_quote_tape_path() + "/elsewhere"
+
+
+@pytest.mark.skipif(not HOST_TRADE_ENV.is_file(), reason="host breezy-trade.env not present")
+def test_the_units_catalog_root_equals_the_host_node_env_when_present() -> None:
+    """The host's ``~/.config/breezy/breezy-trade.env`` is the node's real source; it is outside
+    the repo, so this runs only on a host that has it."""
+    values = [
+        line.split("=", 1)[1].strip()
+        for line in HOST_TRADE_ENV.read_text().splitlines()
+        if line.startswith(f"{TRADE_ENV_VAR}=")
+    ]
+    assert values == [_catalog_root_of(_exec("ExecStart"))]

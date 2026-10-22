@@ -38,6 +38,11 @@ class CrossCheck:
 
 
 def _row(slug: str, *, cli_yes: bool) -> LabelRow:
+    """A carrier for ``reconcile_settlement``: ONLY ``role``, ``leg``, ``net_position_key`` and
+    ``settled_outcome`` are read by it. The ``fill_px`` / ``station`` / ``qty`` values here are
+    inert placeholders (a carrier, not a fill); do not make ``reconcile_settlement`` read them
+    without replacing them with real values (pinned by
+    ``test_reconcile_settlement_ignores_the_carrier_fill_px_station_and_qty``)."""
     return LabelRow(
         label_id=slug,
         decision_id=None,

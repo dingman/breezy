@@ -27,6 +27,17 @@ WorkingDirectory=/home/jon/breezy
 Slice=breezy-studies.slice
 UMask=0077
 
+# Hardening (review D1-F5). The whole file hierarchy is read-only to this unit except the ONE
+# directory both steps write: <catalog-root parent>/derived/maker-loss-stop/ (latest.json written by
+# the producer, venue_settlements.json by the collector). The state SQLite and the station catalog
+# are only READ. systemd refuses to start a unit whose ReadWritePaths= entry does not exist
+# (status 226/NAMESPACE, which fires OnFailure=), so the installer must first run
+#   mkdir -p -m 0755 /mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+# (tests/unit/test_maker_loss_stop_scheduling.py pins this path to the --catalog-root below).
+ProtectSystem=strict
+ReadWritePaths=/mnt/storage/breezy/catalog/quote_tape/derived/maker-loss-stop
+NoNewPrivileges=yes
+
 MemoryHigh=1G
 MemoryMax=1536M
 
