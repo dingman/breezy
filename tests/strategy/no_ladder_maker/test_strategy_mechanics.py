@@ -9,6 +9,7 @@ the refusal guards, the entry veto, the native poll timer, the hard-cancel backs
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -289,6 +290,8 @@ def test_a_gtd_expiry_event_redecides_and_reposts_within_the_permit() -> None:
     h.advance_to(first.order.expire_time_ns)  # Nautilus' managed GTD timer fires its cancel
     h.drain()
     h.expire(first.order)
+    assert h.submits(h.drain()) == [], "the last frame is hours old: a fresh one is required"
+    h.book("gte72lt73f", bids=(("0.06", 10),))
     (second,) = h.submits(h.drain())
     assert second.order.expire_time_ns > first.order.expire_time_ns
     assert second.order.expire_time_ns <= NOW_NS + 10 * HOUR_NS  # never past the permit
@@ -297,35 +300,38 @@ def test_a_gtd_expiry_event_redecides_and_reposts_within_the_permit() -> None:
 # --- veto, hard cancel, stop ---------------------------------------------------------------------
 
 
-def test_an_entry_veto_blocks_posting_and_cancels_all_orders_on_every_instrument_once() -> None:
+def test_an_entry_veto_blocks_posting_and_cancels_each_live_order_once_per_deadline() -> None:
     veto: dict[str, str | None] = {"reason": None}
     h = Harness(veto=lambda: veto["reason"])
     rung = _rung(h, "gte72lt73f")
     h.install(lambda ctx: want((rung, 89)))
     h.book("gte72lt73f")
-    h.post_and_accept()
+    (first,) = h.post_and_accept()
     veto["reason"] = "family_halt"
     h.book("gte72lt73f", bids=(("0.06", 10),))
     commands = h.drain()
-    assert sorted(map(str, h.cancel_all_calls)) == sorted(str(no_id("SFO", b)) for b in BANDS), (
-        "family halt -> cancel_all_orders for EVERY instrument of the ladder"
+    assert [c.client_order_id for c in h.cancels(commands)] == [first.order.client_order_id], (
+        "family halt -> a CancelOrder for every live order, read per order from the cache"
     )
-    assert [str(c.instrument_id) for c in h.cancel_alls(commands)] == [
-        str(no_id("SFO", "gte72lt73f"))
-    ], "Nautilus sends the command for the instrument that holds an order"
+    assert h.cancel_alls(commands) == [] and h.cancel_all_calls == []
     assert h.submits(commands) == []
-    h.cancel_all_calls.clear()
     h.book("gte72lt73f", bids=(("0.07", 10),))
-    h.advance(31)  # the poll timer re-checks the veto
-    assert h.cancel_all_calls == [], "the cancel-all is issued once per veto, not per tick"
+    h.advance(31)  # the poll re-sweeps, but the cancel is still inside its deadline
+    again = h.drain()
+    assert h.cancels(again) == [] and h.cancel_alls(again) == [], "one cancel per deadline"
 
 
 def test_a_veto_is_noticed_by_the_poll_timer_without_any_book_update() -> None:
     veto: dict[str, str | None] = {"reason": None}
     h = Harness(veto=lambda: veto["reason"])
+    rung = _rung(h, "gte72lt73f")
+    h.install(lambda ctx: want((rung, 89)))
+    h.book("gte72lt73f")
+    (first,) = h.post_and_accept()
     veto["reason"] = "loss_stop_fail"
     h.advance(31)
-    assert len(h.cancel_all_calls) == len(BANDS)
+    assert [c.client_order_id for c in h.cancels(h.drain())] == [first.order.client_order_id]
+    assert h.strategy.counters["cancel_everything_veto"] == 1
 
 
 def test_a_raising_veto_fails_closed() -> None:
@@ -339,11 +345,18 @@ def test_a_raising_veto_fails_closed() -> None:
     assert h.submits(h.drain()) == []
 
 
-def test_on_stop_cancels_all_orders_on_every_instrument() -> None:
+def test_on_stop_cancels_every_live_order_and_sends_nothing_when_there_is_none() -> None:
+    idle = Harness()
+    idle.drain()
+    idle.strategy.stop()
+    assert idle.drain() == []
     h = Harness()
-    h.drain()
+    rung = _rung(h, "gte72lt73f")
+    h.install(lambda ctx: want((rung, 89)))
+    h.book("gte72lt73f")
+    (first,) = h.post_and_accept()
     h.strategy.stop()
-    assert sorted(map(str, h.cancel_all_calls)) == sorted(str(no_id("SFO", b)) for b in BANDS)
+    assert [c.client_order_id for c in h.cancels(h.drain())] == [first.order.client_order_id]
 
 
 def test_nothing_is_posted_after_stop() -> None:
@@ -365,13 +378,23 @@ def test_the_hard_cancel_alert_cancels_the_station_and_stops_posting() -> None:
     hard = h.ladder.hard_cancel_ns
     assert hard > NOW_NS  # D 09:00 LST: after the permit window (R10-ERRATUM)
     assert hard == int(dt.datetime(2026, 9, 18, 17, 0, tzinfo=dt.UTC).timestamp()) * NS
-    h.advance_to(hard)
-    assert len(h.cancel_all_calls) == len(BANDS)
     h.book("gte72lt73f")
+    (first,) = h.post_and_accept()
+    h.clock.set_time(hard)
+    h.strategy._on_hard_alert(SimpleNamespace(name=f"MAKER-HARD:SFO:{DAY.isoformat()}"))
+    assert [c.client_order_id for c in h.cancels(h.drain())] == [first.order.client_order_id]
+    h.book("gte72lt73f", bids=(("0.06", 10),))
     assert h.submits(h.drain()) == []
 
 
-def test_the_poll_timer_queries_only_accepted_rests() -> None:
+def test_the_hard_cancel_alert_is_scheduled_at_the_ladders_hard_cancel_instant() -> None:
+    h = Harness()
+    h.install(lambda ctx: want())
+    h.advance_to(h.ladder.hard_cancel_ns)
+    assert h.ladder.hard_cancelled is True
+
+
+def test_the_poll_timer_queries_every_live_rest_in_flight_or_accepted() -> None:
     h = Harness()
     accepted_rung, pending_rung = _rung(h, "gte70lt71f"), _rung(h, "gte72lt73f")
     state = {"both": False}
@@ -386,10 +409,14 @@ def test_the_poll_timer_queries_only_accepted_rests() -> None:
     h.post_and_accept()
     state["both"] = True
     h.book("gte72lt73f")  # submitted, never accepted
-    assert len(h.submits(h.drain())) == 1
+    (pending,) = h.submits(h.drain())
+    h.mark_submitted(pending)
     h.advance(31)
-    queried = h.queries(h.drain())
-    assert [q.client_order_id for q in queried] == [h.ladder.rests[accepted_rung].client_order_id]
+    queried = {q.client_order_id for q in h.queries(h.drain())}
+    assert queried == {
+        h.ladder.rests[accepted_rung].client_order_id,
+        h.ladder.rests[pending_rung].client_order_id,
+    }
     assert h.ladder.rests[pending_rung].state is RestState.SUBMITTED
 
 

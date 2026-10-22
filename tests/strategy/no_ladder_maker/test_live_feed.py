@@ -144,6 +144,22 @@ def test_a_store_needs_a_ladder_and_is_rebuilt_when_a_row_or_the_ladder_changes(
     assert f.store("SFO", DAY) is not rebuilt
 
 
+def test_nbp_rows_survive_a_ladder_change_and_feed_the_rebuilt_store() -> None:
+    """V6: a new rung (a ladder change) drops the cached store, never the received rows."""
+    f = feed()
+    for variable in NBP_QUANTILE_VARIABLES:
+        f.push(point(variable), arrival_ns=CYCLE_NS + LAG)
+    f.set_ladder("SFO", DAY, [Rung("a", None, 65), Rung("b", 66, None)])
+    before = f.store("SFO", DAY)
+    rows_before = f.pinned_rows("SFO", DAY)
+    assert before is not None and len(rows_before) == len(NBP_QUANTILE_VARIABLES)
+    f.set_ladder("SFO", DAY, [Rung("a", None, 65), Rung("b", 66, 70), Rung("c", 71, None)])
+    after = f.store("SFO", DAY)
+    assert after is not None and after is not before, "the store is rebuilt for the new ladder"
+    assert f.pinned_rows("SFO", DAY) == rows_before, "no received vector was lost"
+    assert f.complete_cycle_count("SFO", DAY) == 1
+
+
 def test_a_complete_vector_needs_all_seven_variables() -> None:
     f = feed()
     for variable in NBP_QUANTILE_VARIABLES[:-1]:

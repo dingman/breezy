@@ -48,6 +48,8 @@ CALIBRATION: Final[Path] = (
 )
 CALIBRATION_SHA256: Final[str] = "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e"
 NS: Final[int] = 10**9
+#: the replay runs without the live stale-frame guard (see ``_replay``)
+NO_STALE_GUARD_S: Final[int] = 10**12
 CLOCK_ENDS: Final = frozenset({"GTD_EXPIRY", "CANCEL_PROCESS"})
 # timeline ranks at equal ts (simulator Kind order): fills (prints) < depth < forecast release
 _FILL, _DEPTH, _NBP = 0, 1, 2
@@ -154,6 +156,10 @@ def _replay(case: dict[str, Any], calibration: LiveCalibration) -> tuple[Harness
         permit_expires_at_ns=case["permit_end_ns"],
         calibration=calibration,
         theta=case["theta"],
+        # C3 proves the DECISION CORE equals the simulator's; the simulator has no stale-frame
+        # concept (it re-decides on the last frame at every expiry instant, and the seeded boot
+        # frames carry no arrival). The live stale-book guard is tested in test_strategy_robustness.
+        stale_book_s=NO_STALE_GUARD_S,
     )
     venue = FakeVenue(h)
     by_id = {str(i): i for i in yes_ids}

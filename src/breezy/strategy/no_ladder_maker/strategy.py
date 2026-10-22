@@ -13,14 +13,33 @@ Events and timers
 * ``on_data(ForecastPoint)``: feed ``LiveNbpFeed``; when a row is accepted, a 1 ns native time
   alert re-decides every ladder of the station strictly after the vector's availability (the
   look-ahead guard of ``classify_p_no``): the NBP release alert.
-* ``MAKER-POLL`` native timer (30 s): entry-veto check (cancels everything on a veto),
-  ``query_order`` of every accepted rest, instrument re-resolution from the cache.
+* ``MAKER-POLL`` native timer (30 s): entry-veto check (re-sweeps every poll while a veto is
+  latched), ``query_order`` of every live rest, the cancel deadline (a CANCELING rest not
+  acknowledged in ``CANCEL_DEADLINE_S`` is re-issued), reconciliation of a rest whose order the
+  cache already shows closed, instrument re-resolution from the cache.
 * ``MAKER-HARD:<station>:<day>`` time alert at D 09:00 LST (``hard_cancel_ns``): a harmless
   backstop only -- it falls after the permit window (R10-ERRATUM) -- that cancels the station's
-  rests and stops posting.
+  rests and stops posting. ``_decide`` repeats the check against the clock, so a lost alert cannot
+  leave a ladder posting past its window.
 * GTD expiry is Nautilus' managed timer (``manage_gtd_expiry=True``); ``expire_time`` is the
   core's ``gtd_expire_ns``. A price change is cancel, then a re-post decided on ``OrderCanceled``.
-* ``on_stop``: ``cancel_all_orders`` for every instrument of every ladder.
+  A shadow rest expires on its own alert at ``expire_ns``, so shadow mirrors live.
+* ``on_stop``, a veto and the hard cancel cancel PER ORDER from the cache (open AND in flight):
+  ``Strategy.cancel_all_orders`` only moves open orders to PENDING_CANCEL and the execution client
+  cancels ledger-bound rests only, so an in-flight order (no venue id yet) would be orphaned.
+  A cancel the venue refuses (``OrderCancelRejected``) or never acknowledges is re-issued by the
+  poll; an order accepted while its cancel is pending, or while vetoed, is cancelled on acceptance.
+
+Ladder day (V3/W4). A ladder's day D is frozen at ``on_start`` (tomorrow in the station's standard
+time). That is correct, not a rollover bug: the supervisor relaunches daily (16:40Z stop, 16:50Z
+launch), the posting window [D-1 16:50Z, D 02:50Z) lies wholly inside one session, and local
+midnight (the instant a re-derived day would change) is later than the window at every station.
+``test_a_session_posting_window_never_spans_two_ladder_days`` pins it.
+
+Restart (W2). Orders of this strategy already in the cache (open or in flight) are adopted as
+tracked rests when their rung registers, so a restart never double-posts; extras on a rung are
+cancelled. The order is non-post-only (venue discovery, plan): the stale-book guard
+(``STALE_BOOK_S``) and the truncation refusal are what keep a rest from taking.
 
 ``obs_cancel`` is NOT ported: the sharp arm never fed observation events (the design driver has no
 call site), so the strategy cancels on forecast, price, hard-cancel and veto only -- the same
@@ -33,12 +52,13 @@ and logs ``MAKER_WOULD_POST`` / ``MAKER_WOULD_CANCEL`` instead of ordering.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import logging
 from collections import Counter
 from collections.abc import Callable
 from decimal import Decimal
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 
 import pandas as pd
 from nautilus_trader.core.data import Data
@@ -46,12 +66,14 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
+    OrderCancelRejected,
     OrderDenied,
     OrderExpired,
     OrderFilled,
     OrderRejected,
 )
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
+from nautilus_trader.model.orders import Order
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.symbology import (
@@ -74,7 +96,11 @@ from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.ladder_ev.quantile_density import Rung as DensityRung
 from breezy.strategy.no_ladder_maker import rule
-from breezy.strategy.no_ladder_maker.config import NoLadderMakerConfig
+from breezy.strategy.no_ladder_maker.config import (
+    CANCEL_DEADLINE_S,
+    STALE_BOOK_S,
+    NoLadderMakerConfig,
+)
 from breezy.strategy.no_ladder_maker.ladder_state import (
     Ladder,
     Rest,
@@ -116,6 +142,7 @@ def _window_open_ns(day: dt.date) -> int:
 
 
 _NBP_PREFIX: Final[str] = "MAKER-NBP"
+_SHADOW_PREFIX: Final[str] = "MAKER-SHADOW"
 #: R15 (L-45) fail-closed bound on Depth10 subscriptions: four stations x ten rungs of ONE
 #: (D+1) ladder each. The venue caps subscriptions per CONNECTION (10, shared with TRADE); the
 #: pool shards across connections, and a boot that would exceed this bound refuses to subscribe
@@ -143,6 +170,23 @@ def _expire_timestamp(expire_ns: int) -> pd.Timestamp:
     return pd.Timestamp(expire_ns, unit="ns", tz="UTC")
 
 
+def _guarded[Handler: Callable[..., None]](handler: Handler) -> Handler:
+    """L-16: an event / timer handler never raises; a failure is logged with its traceback.
+
+    One decorator for every handler so no path can forget the guard (and a failure in one handler
+    never aborts the Nautilus dispatch that called it).
+    """
+
+    @functools.wraps(handler)
+    def wrapper(self: NoLadderMakerStrategy, *args: Any, **kwargs: Any) -> None:
+        try:
+            handler(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the single place a handler failure is absorbed
+            self._log_failure(f"{_CLASS_NAME}.{handler.__name__} failed", exc)
+
+    return cast(Handler, wrapper)
+
+
 class NoLadderMakerStrategy(Strategy):
     def __init__(
         self,
@@ -155,6 +199,7 @@ class NoLadderMakerStrategy(Strategy):
         submit_veto: Veto | None = None,
         fee_verified: Callable[[int], bool] | None = None,
         max_depth_subscriptions: int = MAX_DEPTH_SUBSCRIPTIONS,
+        stale_book_s: int = STALE_BOOK_S,
     ) -> None:
         super().__init__(config)
         self._params = params
@@ -163,6 +208,7 @@ class NoLadderMakerStrategy(Strategy):
         self._submit_veto = submit_veto
         self._fee_verified = fee_verified
         self._max_depth_subscriptions = max_depth_subscriptions
+        self._stale_book_ns = stale_book_s * _NS
         registry = default_registry()
         self._offsets = {
             s: registry.climate_day_window(_VENUE, s).std_utc_offset_hours for s in config.stations
@@ -180,12 +226,13 @@ class NoLadderMakerStrategy(Strategy):
         self._order_index: dict[ClientOrderId, tuple[tuple[str, dt.date], str]] = {}
         self._nbp_pending: set[str] = set()
         self._nbp_alerts = 0
+        self._shadow_alerts = 0
         self._veto_latched: str | None = None
         self._tracker = WantTracker()
         self.counters: Counter[str] = Counter()
 
     def _log_failure(self, message: str, exc: Exception) -> None:
-        """L-16: a handler never raises; the failure is logged with its traceback."""
+        """Log a swallowed handler failure with its traceback (L-16)."""
         self.log.exception(message, exc)
 
     # -- lifecycle ---------------------------------------------------------------------------
@@ -214,7 +261,7 @@ class NoLadderMakerStrategy(Strategy):
     def on_stop(self) -> None:
         self._stopping = True
         for name in tuple(self.clock.timer_names):
-            if name.startswith((_POLL_TIMER, _HARD_PREFIX, _NBP_PREFIX)):
+            if name.startswith((_POLL_TIMER, _HARD_PREFIX, _NBP_PREFIX, _SHADOW_PREFIX)):
                 self.clock.cancel_timer(name)
         self._cancel_everything("on_stop")
 
@@ -256,6 +303,7 @@ class NoLadderMakerStrategy(Strategy):
         self._by_yes[rung_id] = ((ladder.station, ladder.day), rung_id)
         self.subscribe_order_book_depth(yes_id)
         self._seed_held(ladder, ladder.rungs[rung_id])
+        self._adopt_existing(ladder, ladder.rungs[rung_id])
         self.log.info(f"{_CLASS_NAME} subscribed {yes_id}")
         return 1
 
@@ -280,6 +328,42 @@ class NoLadderMakerStrategy(Strategy):
         if self.cache.positions_open(instrument_id=rung.no_id):
             ladder.held.add(rung.rung_id)
 
+    def _adopt_existing(self, ladder: Ladder, rung: Rung) -> None:
+        """W2: orders of this strategy already live in the cache become tracked rests.
+
+        A restart never double-posts: the adopted order is the rung's rest (repriced, cancelled
+        or expired like any other). A second live order on one rung cannot be a rest of ours, so
+        it is cancelled. Orders of other strategies (an operator's) are never in this query.
+        """
+        live = sorted(self._live_orders(rung.no_id), key=lambda order: order.ts_init)
+        for position, order in enumerate(live):
+            if position:
+                self.counters["adopted_extra_cancelled"] += 1
+                if not order.is_pending_cancel:
+                    self.cancel_order(order)
+                continue
+            state = RestState.ACCEPTED
+            if order.is_pending_cancel:
+                state = RestState.CANCELING
+            elif order.is_inflight:
+                state = RestState.SUBMITTED
+            rest = Rest(
+                rung.rung_id,
+                round(float(order.price) * CENTS),
+                int(order.expire_time_ns),
+                state,
+                order.client_order_id,
+            )
+            if state is RestState.CANCELING:
+                rest.cancel_deadline_ns = self.clock.timestamp_ns() + CANCEL_DEADLINE_S * _NS
+            ladder.rests[rung.rung_id] = rest
+            self._order_index[order.client_order_id] = ((ladder.station, ladder.day), rung.rung_id)
+            self.counters["adopted_rests"] += 1
+            self.log.info(
+                f"MAKER_ADOPT station={ladder.station} day={ladder.day} rung={rung.rung_id} "
+                f"state={state.value} client_order_id={order.client_order_id}"
+            )
+
     def _publish_ladder(self, ladder: Ladder) -> None:
         if not ladder.rungs:
             return
@@ -300,30 +384,24 @@ class NoLadderMakerStrategy(Strategy):
 
     # -- data --------------------------------------------------------------------------------
 
+    @_guarded
     def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
-        try:
-            self._on_depth(depth)
-        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
-            self._log_failure(f"{_CLASS_NAME}: depth handler failed for {depth.instrument_id}", exc)
-
-    def _on_depth(self, depth: OrderBookDepth10) -> None:
         key_rung = self._by_yes.get(str(depth.instrument_id))
         if key_rung is None:
             return
         key, rung_id = key_rung
         ladder = self.ladders[key]
         ladder.books[rung_id] = frame_from_levels(rung_id, depth.ts_event, depth.bids, depth.asks)
+        ladder.arrivals[rung_id] = self.clock.timestamp_ns()
         self._decide(ladder)
 
+    @_guarded
     def on_data(self, data: Data) -> None:
         if not isinstance(data, ForecastPoint):
             return
-        try:
-            outcome = self._feed.push(data, arrival_ns=self.clock.timestamp_ns())
-            if outcome.accepted:
-                self._schedule_nbp_release(data.station)
-        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
-            self._log_failure(f"{_CLASS_NAME}: forecast handler failed", exc)
+        outcome = self._feed.push(data, arrival_ns=self.clock.timestamp_ns())
+        if outcome.accepted:
+            self._schedule_nbp_release(data.station)
 
     def _schedule_nbp_release(self, icao: str) -> None:
         """Re-decide the station strictly AFTER the vector's availability (look-ahead guard)."""
@@ -338,6 +416,7 @@ class NoLadderMakerStrategy(Strategy):
             callback=self._on_nbp_alert,
         )
 
+    @_guarded
     def _on_nbp_alert(self, event: Any) -> None:
         station = str(event.name).split(":")[1]
         self._nbp_pending.discard(station)
@@ -369,17 +448,13 @@ class NoLadderMakerStrategy(Strategy):
             ladder.selector_stamp = store
         return ladder.selector
 
+    @_guarded
     def _decide(self, ladder: Ladder) -> None:
-        try:
-            self._decide_unsafe(ladder)
-        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
-            self._log_failure(
-                f"{_CLASS_NAME}: decision failed station={ladder.station} day={ladder.day}", exc
-            )
-
-    def _decide_unsafe(self, ladder: Ladder) -> None:
         now = self.clock.timestamp_ns()
         if self._stopping or ladder.hard_cancelled or self._check_veto() is not None:
+            return
+        if now >= ladder.hard_cancel_ns:  # the hard-cancel alert never ran: do its job now
+            self._end_window(ladder)
             return
         selector = self._selector_for(ladder)
         if selector is None:
@@ -404,10 +479,24 @@ class NoLadderMakerStrategy(Strategy):
         for desired in plan.posts:
             self._post(ladder, desired, now)
 
+    def _end_window(self, ladder: Ladder) -> None:
+        """V3: the ladder's window is over -- stop posting and cancel, whatever the alert did."""
+        self.counters["refused_after_window"] += 1
+        ladder.hard_cancelled = True
+        self._cancel_ladder(ladder)
+        self.log.error(
+            f"{_CLASS_NAME}: station={ladder.station} day={ladder.day} is past its window end; "
+            "posting stopped and its rests cancelled"
+        )
+
     # -- guards ------------------------------------------------------------------------------
 
-    def _check_veto(self) -> str | None:
-        """The entry veto (family halt / harm stop); cancels everything when it first appears."""
+    def _check_veto(self, *, resweep: bool = False) -> str | None:
+        """The entry veto (family halt / harm stop); cancels everything when it first appears.
+
+        ``resweep`` (the poll) repeats the cancel sweep while the veto stays latched, so an order
+        that was in flight, or whose cancel was refused, cannot outlive the veto (W3/X2).
+        """
         if self._submit_veto is None:
             return None
         try:
@@ -415,12 +504,15 @@ class NoLadderMakerStrategy(Strategy):
         except Exception as exc:  # noqa: BLE001 - a raising veto refuses (fail closed)
             self._log_failure(f"{_CLASS_NAME}: submit veto raised", exc)
             reason = "veto_unreadable"
-        if reason is not None and self._veto_latched != reason:
+        if reason is None:
+            self._veto_latched = None
+            return None
+        changed = self._veto_latched != reason
+        if changed:
             self._veto_latched = reason
             self.log.error(f"{_CLASS_NAME}: entries vetoed reason={reason}; cancelling all rests")
+        if changed or resweep:
             self._cancel_everything(f"veto:{reason}")
-        elif reason is None:
-            self._veto_latched = None
         return reason
 
     def _send_refusal(self, now_ns: int) -> str | None:
@@ -442,6 +534,9 @@ class NoLadderMakerStrategy(Strategy):
         if now_ns < ladder.backoff_until_ns.get(desired.rung_id, 0):
             self.counters["backoff"] += 1
             return
+        if now_ns - ladder.arrivals.get(desired.rung_id, 0) > self._stale_book_ns:
+            self.counters["refused_stale_book"] += 1  # post_only is False: a stale ask would take
+            return
         refusal = book_refusal(ladder.books[desired.rung_id], desired.bid_cents)
         if refusal is not None:
             self.counters[f"refused_{refusal}"] += 1
@@ -460,6 +555,7 @@ class NoLadderMakerStrategy(Strategy):
             ladder.rests[desired.rung_id] = Rest(
                 desired.rung_id, desired.bid_cents, expire_ns, RestState.SHADOW
             )
+            self._schedule_shadow_expiry(ladder, desired.rung_id, expire_ns)
             self.log.info(
                 f"MAKER_WOULD_POST station={ladder.station} day={ladder.day} rung={rung.rung_id} "
                 f"bid_cents={desired.bid_cents} expire_ns={expire_ns}"
@@ -501,6 +597,8 @@ class NoLadderMakerStrategy(Strategy):
             f"client_order_id={order.client_order_id}"
         )
 
+    # -- cancels -----------------------------------------------------------------------------
+
     def _cancel_rest(self, ladder: Ladder, cancel: Cancel) -> None:
         rest = ladder.rests[cancel.rung_id]
         if rest.state is RestState.SHADOW:
@@ -512,46 +610,135 @@ class NoLadderMakerStrategy(Strategy):
             return
         order = self.cache.order(rest.client_order_id) if rest.client_order_id else None
         if order is None or order.is_closed:
-            return
-        rest.state = RestState.CANCELING
-        self.cancel_order(order)
+            return  # the terminal event is in transit; the poll reconciles it if it never comes
+        self._cancel_if_due(rest, order)
         self.log.info(
             f"MAKER_CANCEL station={ladder.station} rung={cancel.rung_id} reason={cancel.reason}"
         )
 
+    def _live_orders(self, instrument_id: InstrumentId) -> list[Order]:
+        """This strategy's open AND in-flight orders on an instrument (deduplicated).
+
+        ``cache.orders_open`` alone misses an order still SUBMITTED (no venue id yet);
+        ``cache.orders_inflight`` alone misses an ACCEPTED one. PENDING_CANCEL is in both.
+        """
+        found: dict[ClientOrderId, Order] = {}
+        for order in (
+            *self.cache.orders_open(instrument_id=instrument_id, strategy_id=self.id),
+            *self.cache.orders_inflight(instrument_id=instrument_id, strategy_id=self.id),
+        ):
+            if not order.is_closed:
+                found.setdefault(order.client_order_id, order)
+        return list(found.values())
+
+    def _request_cancel(self, rest: Rest, order: Order) -> None:
+        """Send (or re-send) the cancel of one tracked order and stamp its deadline.
+
+        ``Strategy.cancel_order`` sends nothing for an order already PENDING_CANCEL, so a re-issue
+        of an unacknowledged cancel goes through ``cancel_all_orders`` (the native path that does
+        accept PENDING_CANCEL); the execution client cancels ledger-bound rests only, so it can
+        touch nothing but our own order on that instrument.
+        """
+        if rest.state is RestState.CANCELING:
+            self.counters["cancel_reissued"] += 1
+        rest.state = RestState.CANCELING
+        rest.cancel_deadline_ns = self.clock.timestamp_ns() + CANCEL_DEADLINE_S * _NS
+        if order.is_pending_cancel:
+            self.cancel_all_orders(order.instrument_id)
+        else:
+            self.cancel_order(order)
+
+    def _cancel_if_due(self, rest: Rest, order: Order) -> None:
+        """Cancel ``order`` unless an earlier cancel of it is still inside its deadline."""
+        if order.is_pending_cancel and self.clock.timestamp_ns() < rest.cancel_deadline_ns:
+            return
+        self._request_cancel(rest, order)
+
+    def _cancel_ladder(self, ladder: Ladder) -> None:
+        """Cancel every live order of the ladder, per order, and drop its shadow rests."""
+        for rung in ladder.rungs.values():
+            for order in self._live_orders(rung.no_id):
+                located = self._order_index.get(order.client_order_id)
+                rest = ladder.rests.get(located[1]) if located is not None else None
+                if rest is None or rest.client_order_id != order.client_order_id:
+                    if not order.is_pending_cancel:  # an order of ours with no rest record
+                        self.cancel_order(order)
+                    continue
+                self._cancel_if_due(rest, order)
+        for rung_id, rest in tuple(ladder.rests.items()):
+            if rest.state is RestState.SHADOW:
+                del ladder.rests[rung_id]
+            elif rest.state is not RestState.CANCELING:
+                rest.state = RestState.CANCELING  # no live order in the cache: the poll reconciles
+                rest.cancel_deadline_ns = self.clock.timestamp_ns() + CANCEL_DEADLINE_S * _NS
+
     def _cancel_everything(self, reason: str) -> None:
-        """``cancel_all_orders`` for every instrument of every ladder (family halt, stop)."""
+        """Cancel every live order of every ladder (family halt, veto, stop)."""
         for ladder in self.ladders.values():
-            for rung in ladder.rungs.values():
-                self.cancel_all_orders(rung.no_id)
-            for rest in ladder.rests.values():
-                rest.state = (
-                    RestState.SHADOW if rest.state is RestState.SHADOW else RestState.CANCELING
-                )
-            ladder.rests = {
-                r: x for r, x in ladder.rests.items() if x.state is not RestState.SHADOW
-            }
+            self._cancel_ladder(ladder)
         self.counters[f"cancel_everything_{reason.split(':')[0]}"] += 1
+
+    # -- shadow ------------------------------------------------------------------------------
+
+    def _schedule_shadow_expiry(self, ladder: Ladder, rung_id: str, expire_ns: int) -> None:
+        """V5: a shadow rest expires at ``expire_ns`` exactly as the live GTD order would."""
+        self._shadow_alerts += 1
+        key = (ladder.station, ladder.day)
+        self.clock.set_time_alert_ns(
+            name=f"{_SHADOW_PREFIX}:{self._shadow_alerts}",
+            alert_time_ns=expire_ns,
+            callback=lambda event: self._on_shadow_expiry(key, rung_id, expire_ns),
+        )
+
+    @_guarded
+    def _on_shadow_expiry(self, key: tuple[str, dt.date], rung_id: str, expire_ns: int) -> None:
+        ladder = self.ladders[key]
+        rest = ladder.rests.get(rung_id)
+        if rest is None or rest.state is not RestState.SHADOW or rest.expire_ns != expire_ns:
+            return  # cancelled or replaced since: that rest's own alert, not this one
+        del ladder.rests[rung_id]
+        self.counters["shadow_expired"] += 1
+        self.log.info(f"MAKER_WOULD_EXPIRE station={ladder.station} rung={rung_id}")
+        self._decide(ladder)
 
     # -- timers ------------------------------------------------------------------------------
 
+    @_guarded
     def _on_poll(self, event: Any) -> None:
-        try:
-            self._check_veto()
-            self._resolve_instruments()
-            self._poll_open_orders()
-        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
-            self._log_failure(f"{_CLASS_NAME}: poll timer failed", exc)
+        self._check_veto(resweep=True)
+        self._resolve_instruments()
+        self._poll_open_orders()
 
     def _poll_open_orders(self) -> None:
+        """Query every live rest, enforce the cancel deadline, reconcile closed orders."""
         for ladder in self.ladders.values():
-            for rest in ladder.rests.values():
-                if rest.state is not RestState.ACCEPTED or rest.client_order_id is None:
+            closed = False
+            for rung_id, rest in tuple(ladder.rests.items()):
+                if rest.state is RestState.SHADOW:
                     continue
-                order = self.cache.order(rest.client_order_id)
-                if order is not None and not order.is_closed:
-                    self.query_order(order)
+                order = self.cache.order(rest.client_order_id) if rest.client_order_id else None
+                if order is None or order.is_closed:
+                    self._reconcile_closed(ladder, rung_id, order)
+                    closed = True
+                    continue
+                self.query_order(order)
+                if rest.state is RestState.CANCELING:
+                    self._cancel_if_due(rest, order)
+            if closed:
+                self._decide(ladder)
 
+    def _reconcile_closed(self, ladder: Ladder, rung_id: str, order: Order | None) -> None:
+        """A rest whose order the cache shows closed (or lacks): the event never reached us."""
+        self.counters["rest_reconciled_from_cache"] += 1
+        if order is not None and float(order.filled_qty) > 0:
+            ladder.held.add(rung_id)
+        del ladder.rests[rung_id]
+        self.log.warning(
+            f"{_CLASS_NAME}: rest reconciled from the cache station={ladder.station} "
+            f"rung={rung_id} status={order.status_string() if order is not None else 'absent'}"
+        )
+
+    @_guarded
     def _on_hard_alert(self, event: Any) -> None:
         """D 09:00 LST. Falls after the permit window; a harmless backstop (R10-ERRATUM)."""
         _, station, day_text = str(event.name).split(":")
@@ -559,8 +746,7 @@ class NoLadderMakerStrategy(Strategy):
         if ladder is None:
             return
         ladder.hard_cancelled = True
-        for rung in ladder.rungs.values():
-            self.cancel_all_orders(rung.no_id)
+        self._cancel_ladder(ladder)
         self.log.info(f"MAKER_HARD_CANCEL station={station} day={day_text}")
 
     # -- order events ------------------------------------------------------------------------
@@ -576,18 +762,49 @@ class NoLadderMakerStrategy(Strategy):
             return None
         return ladder, rung_id, rest
 
+    @_guarded
     def on_order_accepted(self, event: OrderAccepted) -> None:
         found = self._rest_for(event.client_order_id)
-        if found is not None and found[2].state is RestState.SUBMITTED:
-            found[2].state = RestState.ACCEPTED
+        if found is None:
+            return
+        ladder, _, rest = found
+        if rest.state is RestState.SUBMITTED:
+            rest.state = RestState.ACCEPTED
+        # An order the venue acknowledged AFTER we asked to cancel it (or while entries are
+        # vetoed / the window is over) is now cancellable: do it, never leave it resting (V2/X2).
+        if (
+            rest.state is RestState.CANCELING
+            or ladder.hard_cancelled
+            or self._stopping
+            or self._check_veto() is not None
+        ):
+            order = self.cache.order(event.client_order_id)
+            if order is not None and not order.is_closed:
+                self._cancel_if_due(rest, order)
 
+    @_guarded
     def on_order_canceled(self, event: OrderCanceled) -> None:
         self._close_rest(event.client_order_id, redecide=True)
 
+    @_guarded
+    def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
+        self.counters["cancel_rejected"] += 1
+        found = self._rest_for(event.client_order_id)
+        if found is None:
+            return  # a late refusal for a rest already closed or filled
+        found[2].cancel_deadline_ns = 0  # re-issue on the next poll (never a hot loop)
+        self.log.warning(
+            f"{_CLASS_NAME}: cancel rejected client_order_id={event.client_order_id} "
+            f"reason={event.reason}"
+        )
+        self._alert("MAKER_CANCEL_REJECTED", event.instrument_id, event.client_order_id, "WARN")
+
+    @_guarded
     def on_order_expired(self, event: OrderExpired) -> None:
         self._close_rest(event.client_order_id, redecide=True)
         self._alert("MAKER_ORDER_EXPIRED", event.instrument_id, event.client_order_id, "INFO")
 
+    @_guarded
     def on_order_filled(self, event: OrderFilled) -> None:
         found = self._rest_for(event.client_order_id)
         if found is not None:
@@ -596,10 +813,12 @@ class NoLadderMakerStrategy(Strategy):
             del ladder.rests[rung_id]
         self._alert("MAKER_ORDER_FILLED", event.instrument_id, event.client_order_id, "INFO")
 
+    @_guarded
     def on_order_denied(self, event: OrderDenied) -> None:
         self._close_rest(event.client_order_id, redecide=False, backoff=True)
         self._alert("MAKER_ORDER_DENIED", event.instrument_id, event.client_order_id, "WARN")
 
+    @_guarded
     def on_order_rejected(self, event: OrderRejected) -> None:
         self._close_rest(event.client_order_id, redecide=False, backoff=True)
         self._alert("MAKER_ORDER_REJECTED", event.instrument_id, event.client_order_id, "WARN")
@@ -617,6 +836,7 @@ class NoLadderMakerStrategy(Strategy):
         if redecide:
             self._decide(ladder)
 
+    @_guarded
     def _alert(
         self,
         event_name: str,

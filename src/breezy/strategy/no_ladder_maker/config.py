@@ -16,7 +16,9 @@ from typing import Final
 from nautilus_trader.trading.config import StrategyConfig
 
 __all__ = [
+    "CANCEL_DEADLINE_S",
     "DEFAULT_POLL_INTERVAL_S",
+    "STALE_BOOK_S",
     "AllowShortNotPermittedError",
     "NoLadderMakerConfig",
 ]
@@ -24,6 +26,15 @@ __all__ = [
 #: The ``query_order`` poll cadence (plan section 3); the native ``open_check_interval_secs`` is
 #: rejected in r3 (it would poll every open order the engine knows, not just ours).
 DEFAULT_POLL_INTERVAL_S: Final[int] = 30
+
+#: A cancel not acknowledged within this many seconds is re-queried and re-issued by the poll
+#: (two poll intervals): a lost ack or a refused cancel can never leave a rest CANCELING forever.
+CANCEL_DEADLINE_S: Final[int] = 60
+
+#: The newest Depth10 frame a post may rely on. The order is non-post-only (venue discovery: the
+#: plan keeps ``post_only=False``), so a stale frame whose ask has since dropped would TAKE; a rung
+#: whose frame is older than this is not posted until a fresh frame arrives.
+STALE_BOOK_S: Final[int] = 5
 
 
 class AllowShortNotPermittedError(ValueError):

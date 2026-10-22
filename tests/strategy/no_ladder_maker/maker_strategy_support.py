@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.core.fsm import InvalidStateTrigger
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     CancelAllOrders,
@@ -25,8 +26,8 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
-from nautilus_trader.model.enums import AssetClass, LiquiditySide, OrderSide
-from nautilus_trader.model.events import OrderDenied
+from nautilus_trader.model.enums import AssetClass, LiquiditySide, OrderSide, OrderStatus
+from nautilus_trader.model.events import OrderCancelRejected, OrderDenied
 from nautilus_trader.model.identifiers import AccountId, InstrumentId, TraderId, VenueOrderId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
@@ -53,7 +54,7 @@ from breezy.domain.weather_bucket_facts import (
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams
-from breezy.strategy.no_ladder_maker.config import NoLadderMakerConfig
+from breezy.strategy.no_ladder_maker.config import STALE_BOOK_S, NoLadderMakerConfig
 from breezy.strategy.no_ladder_maker.ladder_state import Ladder
 from breezy.strategy.no_ladder_maker.params import SHARP_V1, MakerRuleParams
 from breezy.strategy.no_ladder_maker.records import CENTS, Decision, DecisionContext, Desired
@@ -210,6 +211,7 @@ class Harness:
         instrument_ids: Sequence[InstrumentId] | None = None,
         calibration: LiveCalibration | None = None,
         theta: float = 0.0695,
+        stale_book_s: int = STALE_BOOK_S,
     ) -> None:
         self.clock = TestClock()
         self.clock.set_time(now_ns)
@@ -244,6 +246,7 @@ class Harness:
             submit_veto=veto,
             fee_verified=fee_verified,
             max_depth_subscriptions=max_depth_subscriptions,
+            stale_book_s=stale_book_s,
         )
         portfolio = Portfolio(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
         self.strategy.register(
@@ -342,14 +345,31 @@ class Harness:
 
     # -- venue answers ------------------------------------------------------------------------
 
-    def deliver(self, event: Any) -> None:
+    def deliver(self, event: Any, *, engine_tolerant: bool = False) -> None:
+        """Apply ``event`` to the cached order and publish it to the strategy.
+
+        ``engine_tolerant`` mirrors ``ExecutionEngine._apply_event_to_order``: an event the order
+        FSM refuses (``InvalidStateTrigger``) is logged, NOT applied, and still published.
+        """
         order = self.cache.order(event.client_order_id)
         if order is not None:
-            order.apply(event)
+            try:
+                order.apply(event)
+            except InvalidStateTrigger:
+                if not engine_tolerant:
+                    raise
             self.cache.update_order(order)  # keeps the open / in-flight indices true
         self.msgbus.publish(topic=f"events.order.{self.strategy.id}", msg=event)
 
+    def mark_submitted(self, command: SubmitOrder) -> None:
+        """The engine's ``OrderSubmitted``: the order is now IN FLIGHT (no venue id yet)."""
+        order = self.cache.order(command.order.client_order_id)
+        assert order is not None
+        if order.status is OrderStatus.INITIALIZED:
+            self.deliver(TestEventStubs.order_submitted(order, ts_event=self.clock.timestamp_ns()))
+
     def accept(self, command: SubmitOrder) -> None:
+        self.mark_submitted(command)
         self.deliver(
             TestEventStubs.order_accepted(
                 command.order,
@@ -360,6 +380,24 @@ class Harness:
 
     def cancel_ack(self, order: Any) -> None:
         self.deliver(TestEventStubs.order_canceled(order, ts_event=self.clock.timestamp_ns()))
+
+    def cancel_reject(self, order: Any, reason: str = "venue refused the cancel") -> None:
+        """``OrderCancelRejected``: the order returns to its pre-cancel status (Nautilus FSM)."""
+        self.deliver(
+            OrderCancelRejected(
+                trader_id=TRADER,
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                account_id=ACCOUNT,
+                reason=reason,
+                event_id=UUID4(),
+                ts_event=self.clock.timestamp_ns(),
+                ts_init=self.clock.timestamp_ns(),
+            ),
+            engine_tolerant=True,  # PENDING_CANCEL -> SUBMITTED is not a legal FSM edge (1.231)
+        )
 
     def expire(self, order: Any) -> None:
         self.deliver(TestEventStubs.order_expired(order, ts_event=self.clock.timestamp_ns()))

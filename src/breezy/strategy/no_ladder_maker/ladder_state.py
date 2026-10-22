@@ -59,6 +59,8 @@ class Rest:
     expire_ns: int
     state: RestState
     client_order_id: ClientOrderId | None = None
+    #: CANCELING only: the instant after which the cancel is re-queried and re-issued (0 = now)
+    cancel_deadline_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,9 @@ class Ladder:
     window_open_ns: int = 0
     rungs: dict[str, Rung] = field(default_factory=dict)
     books: dict[str, DepthFrame] = field(default_factory=dict)
+    #: rung -> OUR clock at the instant its newest frame arrived (the staleness guard's reference;
+    #: ``DepthFrame.ts_ns`` is the venue's ``transactTime``, a different clock)
+    arrivals: dict[str, int] = field(default_factory=dict)
     rests: dict[str, Rest] = field(default_factory=dict)
     held: set[str] = field(default_factory=set)
     #: rung -> earliest ns a re-post may be attempted (after a denial / rejection)
