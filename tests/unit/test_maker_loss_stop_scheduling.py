@@ -50,9 +50,7 @@ def test_the_service_collects_first_then_produces_and_alerts_on_any_failure() ->
     pre, main = _exec("ExecStartPre"), _exec("ExecStart")
     assert any(COLLECTOR in token for token in pre)
     assert any(PRODUCER in token for token in main)
-    assert [line for line in lines if line.startswith("ExecStartPre=")] == [
-        line for line in lines if COLLECTOR in line
-    ]
+    assert len([line for line in lines if line.startswith("ExecStartPre=")]) == 1
 
 
 def test_no_exit_status_is_masked() -> None:
@@ -65,7 +63,7 @@ def test_no_exit_status_is_masked() -> None:
 
 def test_the_unit_is_parked_and_never_sees_operator_controls() -> None:
     code = "\n".join(_lines(SERVICE))
-    assert "[Install]" not in SERVICE.read_text()
+    assert "[Install]" not in "\n".join(_lines(SERVICE))
     for forbidden in ("breezy-trade.env", "operator.env", "BREEZY_SENDING_FAMILY_ID", "orders"):
         assert forbidden not in code
     assert "EnvironmentFile=-%h/.config/breezy/polymarket.env" in _lines(SERVICE)

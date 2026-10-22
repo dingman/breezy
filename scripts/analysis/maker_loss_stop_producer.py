@@ -18,6 +18,11 @@ writes nothing but that artefact.
 The artefact lands at ``maker_loss_stop_artefact_path(--catalog-root)``, the path the node's probe
 reads (``--catalog-root`` is the node's ``BREEZY_TRADE_CATALOG_ROOT``).
 
+It runs once a day (``breezy-maker-loss-stop.timer``, 12:50Z), NOT after every settlement batch, so
+a loss that settles after 12:50Z is first counted the next day. A resolver-booked ``GET-`` fill
+on a family station HOLDs the maker verdict (fail closed): ``get_fills`` is scoped by station, so an
+FQ resolver fill on a maker station blocks the maker stop too.
+
 Exit status (so ``OnFailure=`` alerts): 0 PASS, 2 FAIL (a computed FAIL, or a sticky FAIL or
 unreadable file standing on disk), 3 HOLD, 1 error.
 
