@@ -3,7 +3,12 @@
 The harm stop (WP-D1, a later producer) judges the maker family on its BOOKED MAKER fills.
 It reads ``DurableFillRecord`` rows, which cannot gain a key (S4 r4 row K1: the exact key set
 and ``golden_exec_par_wp4_k1.json`` stay unedited), so the selector must be expressible on the
-keys that exist. This file freezes it at the FIXTURE level, with no D1 producer code:
+keys that exist. This file freezes it. The selector, classifier and cost used to be
+fixture-level references here; ARM D1 moved them, unchanged except the cost (below), into
+``breezy.strategy.no_ladder_maker.harm_stop``, which the producer imports, and this file now tests
+THAT code against the real writers. Reconciled deviation: the B6 fixture cost added a +0.01 slip
+allowance, but plan r2 delta D5 (binding, pre-declared) says ``slip 0`` and pins theta 0.0695, so
+the allowance is gone and the cost uses the D5 theta. Frozen contract:
 
 * the MAKER MARKER is the ``trade_id`` prefix ``POLL-``
   (``submit_chain.MAKER_POLL_TRADE_ID_PREFIX``, ``submit_chain.is_maker_poll_fill``):
@@ -26,15 +31,20 @@ import dataclasses
 import inspect
 import json
 import textwrap
-from collections.abc import Iterable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
 import pytest
-from nautilus_trader.model.identifiers import InstrumentId
 
-from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
+from breezy.strategy.no_ladder_maker.harm_stop import (
+    TAKER_THETA,
+    classify_family_fills,
+    d1_fail_closed,
+    d1_fill_cost,
+    d1_verdict,
+    select_maker_fills,
+)
 from tests.unit.ambig_latch_rig import (
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
@@ -65,102 +75,6 @@ GOLDEN_KEYS: Final[frozenset[str]] = frozenset(
         "feeSource",
     }
 )
-
-
-def _station_of(instrument_id: str) -> str:
-    """The station (city) segment of a daily-high slug: ``tc-temp-<city>high-...``."""
-    slug = str(InstrumentId.from_str(instrument_id).symbol.value).removesuffix("^no")
-    return str(slug.split("-")[2]).removesuffix("high")
-
-
-def select_maker_fills(records: list[Any], *, family_stations: frozenset[str]) -> list[Any]:
-    """THE FROZEN SELECTOR (fixture-level reference; D1 must reproduce it exactly)."""
-    return [
-        r
-        for r in records
-        if submit_chain.is_maker_poll_fill(r.trade_id)
-        and r.order_side == client_module.LONG_ONLY_SIDE
-        and _station_of(r.instrument_id) in family_stations
-    ]
-
-
-RESOLVER_TRADE_ID_PREFIX: Final[str] = "GET-"
-#: The per-fill allowance the win/harm cost adds on top of fill and fee (design: one cent).
-D1_COST_ALLOWANCE: Final[Decimal] = Decimal("0.01")
-
-
-@dataclasses.dataclass(frozen=True)
-class FamilyFillClassification:
-    """What D1 may know about the family's durable fills (pure, fixture-level reference)."""
-
-    #: the family's POLL- maker-booked BUY fills (the frozen selector's result)
-    maker_fills: tuple[Any, ...]
-    #: the family's OWN resolver-booked fills (``GET-`` trade id, TAKER-booked) on family slugs
-    get_fills: tuple[Any, ...]
-    #: any open AMBIGUOUS intent on a family slug (it may be a fill the poll never sees)
-    open_ambiguous_family_intent: bool
-
-
-def _station_of_slug(slug: str) -> str:
-    return str(slug.removesuffix("^no").split("-")[2]).removesuffix("high")
-
-
-def classify_family_fills(
-    records: list[Any],
-    *,
-    family_stations: frozenset[str],
-    open_ambiguous_slugs: Iterable[str],
-) -> FamilyFillClassification:
-    """THE FROZEN CLASSIFIER (fixture-level reference; D1 must reproduce it exactly).
-
-    ``maker_fills`` is :func:`select_maker_fills`; ``get_fills`` are the family's BUY fills
-    whose ``trade_id`` is the resolver's ``GET-`` synthetic id; the flag is true iff any open
-    AMBIGUOUS intent sits on a family slug. It never reads ``fee_reconciled`` (M1)."""
-    get_fills = tuple(
-        r
-        for r in records
-        if isinstance(r.trade_id, str)
-        and r.trade_id.startswith(RESOLVER_TRADE_ID_PREFIX)
-        and r.order_side == client_module.LONG_ONLY_SIDE
-        and _station_of(r.instrument_id) in family_stations
-    )
-    return FamilyFillClassification(
-        maker_fills=tuple(select_maker_fills(records, family_stations=family_stations)),
-        get_fills=get_fills,
-        open_ambiguous_family_intent=any(
-            _station_of_slug(slug) in family_stations for slug in open_ambiguous_slugs
-        ),
-    )
-
-
-def d1_fail_closed(classification: FamilyFillClassification) -> bool:
-    """D1 must fail closed (never PASS) while the maker tally may be missing family fills."""
-    return bool(classification.get_fills) or classification.open_ambiguous_family_intent
-
-
-def d1_verdict(classification: FamilyFillClassification, *, criterion_met: bool) -> str:
-    """``HOLD`` while failing closed, else ``PASS`` / ``CONTINUE`` by the criterion."""
-    if d1_fail_closed(classification):
-        return "HOLD"
-    return "PASS" if criterion_met else "CONTINUE"
-
-
-def d1_fill_cost(record: Any) -> Decimal:
-    """Per-fill cost for the win/harm criterion (M2): ``fill + max(booked fee, taker cent
-    fee) + D1_COST_ALLOWANCE``. The booked fee is ``cumulative_fee`` (never the raw venue
-    string, which may be a clamped rebate); the taker cent fee is the modelled TAKER fee of the
-    same fill. Raises ``ValueError`` when no taker fee can be modelled (fail closed)."""
-    taker = taker_fee_at_fill(
-        quantity=record.cumulative_qty,
-        price=record.cumulative_cost / record.cumulative_qty,
-        ts_event_ns=record.ts_event,
-        fee_coefficient_at_fill=record.fee_coefficient_at_fill,
-    )
-    if taker is None:
-        raise ValueError("no taker fee can be modelled for this fill; the cost is unknown")
-    booked: Decimal = record.cumulative_cost
-    fee: Decimal = max(record.cumulative_fee, taker.as_decimal())
-    return booked + fee + D1_COST_ALLOWANCE
 
 
 def _record(
@@ -415,20 +329,23 @@ def _costed(*, fee: str, raw: str | None, qty: str = "1", cost: str = "0.40") ->
 @pytest.mark.parametrize(
     ("fee", "raw", "expected"),
     [
-        # a clamped rebate books 0: the cost still carries the modelled taker cent fee (0.01)
+        # a clamped rebate books 0: the cost still carries the modelled taker cent fee (0.02 at
+        # theta 0.0695, p 0.40: 0.0695 * 0.24 = 0.01668)
         ("0", "-0.0125", "0.42"),
-        # an unreadable commission books the taker fee already; same figure
+        # an unreadable commission books the cent fee already; the modelled fee still binds
         ("0.01", None, "0.42"),
-        # a booked fee ABOVE the taker fee is the cost (never the lower modelled figure)
-        ("0.50", "0.50", "0.91"),
-        # booked fee equal to the taker cent fee
+        # a booked fee ABOVE the modelled fee is the cost (never the lower modelled figure)
+        ("0.50", "0.50", "0.90"),
         ("0.01", "0.01", "0.42"),
     ],
 )
-def test_the_win_harm_cost_is_fill_plus_the_larger_fee_plus_a_cent(
+def test_the_win_harm_cost_is_fill_plus_the_larger_fee_with_zero_slip(
     fee: str, raw: str | None, expected: str
 ) -> None:
-    """M2: cost = fill + max(booked fee, taker cent fee) + 0.01, never the raw booked fee."""
+    """M2 as RECONCILED to D5 (slip 0): cost = fill + max(booked fee, modelled taker fee).
+
+    The B6 fixture added a further +0.01 allowance; plan r2 delta D5 (binding, pre-declared rule
+    text) says ``slip 0``, so the allowance is removed. Every other frozen assertion is kept."""
     assert d1_fill_cost(_costed(fee=fee, raw=raw)) == Decimal(expected)
 
 
@@ -436,15 +353,23 @@ def test_the_win_harm_cost_scales_with_the_fill_and_ignores_the_raw_venue_string
     base = d1_fill_cost(_costed(fee="0.01", raw="0.01"))
     assert d1_fill_cost(_costed(fee="0.01", raw="-99")) == base, "venue_fee_raw is never read"
     two = d1_fill_cost(_costed(fee="0.03", raw="0.03", qty="2", cost="0.80"))
-    assert two == Decimal("0.80") + Decimal("0.03") + Decimal("0.01"), "taker fee at q=2 is 0.03"
+    assert two == Decimal("0.80") + Decimal("0.03"), "taker fee at q=2 is 0.03; slip 0"
 
 
-def test_the_win_harm_cost_fails_closed_without_a_pinned_taker_fee() -> None:
-    unpinned = dataclasses.replace(
-        _costed(fee="0.01", raw="0.01"), fee_coefficient_at_fill=None, ts_event=1
-    )
-    with pytest.raises(ValueError, match="taker fee"):
-        d1_fill_cost(unpinned)
+def test_the_win_harm_cost_uses_the_pinned_d5_theta_not_the_records_coefficient() -> None:
+    """D5 pins theta 0.0695. The B6 fixture read the record's coefficient (and refused when it
+    was unpinned); D5 makes the rule constant authoritative, so a record that pins a different
+    theta (0.06) or none at all is costed identically."""
+    assert TAKER_THETA == Decimal("0.0695")
+    pinned = _costed(fee="0", raw="0")
+    unpinned = dataclasses.replace(pinned, fee_coefficient_at_fill=None, ts_event=1)
+    other = dataclasses.replace(pinned, fee_coefficient_at_fill=Decimal("0.10"))
+    assert d1_fill_cost(pinned) == d1_fill_cost(unpinned) == d1_fill_cost(other) == Decimal("0.42")
+
+
+def test_the_win_harm_cost_has_no_slip_allowance() -> None:
+    # fill 0.40 + the 0.02 modelled fee, exactly: nothing else is added
+    assert d1_fill_cost(_costed(fee="0.02", raw="0.02")) == Decimal("0.40") + Decimal("0.02")
 
 
 def test_the_fee_reconciled_read_check_is_not_vacuous() -> None:
