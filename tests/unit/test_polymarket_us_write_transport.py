@@ -454,7 +454,17 @@ def test_write_transport_has_exactly_one_importer_and_it_does_not_re_export() ->
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "scripts/analysis/capture_no_side_preview.py",
         manifest,
+        # ARM B2 (plan_r2_delta D3): the maker positive-control script imports the transport and
+        # its write signer to rest/cancel its OWN probe orders -- a FIFTH row, WIDENED not
+        # relaxed; its N5, M6 and B9 rows are its own.
+        "scripts/venue/polymarket_us_maker_positive_control.py",
     }
+    b2_script = "scripts/venue/polymarket_us_maker_positive_control.py"
+    b2_source = (REPO_ROOT / b2_script).read_text(encoding="utf-8")
+    assert find_write_transport_importers(b2_script, b2_source)  # the row is exercised
+    assert find_write_transport_importers(
+        "scripts/venue/_planted_b2_copy.py", b2_source
+    )  # a copy elsewhere is a new importer
 
     factories_source = (REPO_ROOT / _FACTORIES_PATH).read_text(encoding="utf-8")
     assert find_write_transport_reexports(_FACTORIES_PATH, factories_source) == []
