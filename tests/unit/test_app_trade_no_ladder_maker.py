@@ -4,7 +4,8 @@ The committed manifest, calibration and boundary artefacts are copied into a tem
 unchanged, so the real loader and the real sha pins run). The node is the shared ``RecordingNode``
 (never started), so what is observed is exactly what ``run`` composed: one strategy, its veto
 (the SAME object on the strategy and on the exec client config), the strict harm-stop probe on the
-maker's own artefact path, the NBP publisher, and shadow-only sending (live OFF).
+maker's own artefact path, the NBP publisher, and shadow sending when orders are not
+requested (the permit is absent; the ruling itself is declared and copied into the temp tree).
 """
 
 from __future__ import annotations
@@ -48,7 +49,10 @@ ARTEFACTS: Final = (
     "pm_us_no_maker_sharp_v1.json",
     "artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
     "artefacts/not_applicable_boundary.json",
+    "rulings/RULING_MAKER_sharp_v1_live_small_2026-10-21.md",
 )
+RULING_ID: Final[str] = "RULING_MAKER_sharp_v1_live_small_2026-10-21"
+REAL_D0: Final[str] = "2026-10-25"
 
 
 @dataclass(frozen=True)
@@ -127,7 +131,7 @@ def test_boot_composes_one_shadow_only_maker_for_the_four_stations(
     obs = _boot(tmp_path, monkeypatch, verdict="PASS")
     (strategy,) = obs.strategies
     assert strategy.config.stations == STATIONS
-    assert strategy.config.shadow_only is True, "live sending is OFF: no ruling, no allowlist row"
+    assert strategy.config.shadow_only is True, "permit absent: orders were not requested"
     assert strategy.config.allow_short is False and strategy.config.manage_gtd_expiry is True
     assert strategy._theta == 0.0695
     assert strategy._params.max_rungs == 2
@@ -195,18 +199,20 @@ def test_the_maker_artefact_path_is_not_the_fq_path(
     assert set(_Node.observed.strategy_vetoes) == {"fq_loss_stop_unknown"}
 
 
-# --- the live-orders gate stays closed (D6 boot simulation) -----------------------------------
+# --- the live-orders gate (D6): shipped ruling enables; a closed copy still posts nothing ----
 
 
-def test_the_gate_is_closed_under_a_minted_permit_so_the_composed_strategy_cannot_send(
+def test_the_shipped_gate_enables_under_a_permit_and_a_closed_copy_posts_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With a permit present (stand-in: only ``expires_at_ns`` is read) the live-orders gate still
-    answers ``no_ruling`` -> ``shadow_only`` stays True, so a wanted rung produces ZERO commands.
+    """Permit present: the shipped ruling enables. A copy with the ruling stripped still answers
+    ``no_ruling``, so ``shadow_only`` stays True and a wanted rung produces ZERO commands.
 
     A real ``OrderSubmissionPermit`` needs the operator-reserved cap environment, which this change
     must not name or assign; the gate's only permit input is a presence bool (what is varied).
     """
+    import dataclasses
+
     from breezy.persistence.family_manifest import load_family_manifest
     from tests.strategy.no_ladder_maker.maker_strategy_support import (
         NOW_NS,
@@ -216,9 +222,19 @@ def test_the_gate_is_closed_under_a_minted_permit_so_the_composed_strategy_canno
 
     manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
     gate = live_orders_gate.live_orders_authorized(manifest, REPO, permit_present=True)
-    assert (gate.enabled, gate.reason, gate.ruling_sha256) == (False, "no_ruling", None)
+    assert (gate.enabled, gate.reason) == (True, "ok")
+    assert gate.ruling_sha256 == (
+        "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152"
+    )
 
-    h = Harness(shadow_only=not gate.enabled, permit_expires_at_ns=NOW_NS + 10**13)
+    closed = dataclasses.replace(manifest, live_orders_ruling=None)
+    closed_gate = live_orders_gate.live_orders_authorized(closed, REPO, permit_present=True)
+    assert (closed_gate.enabled, closed_gate.reason, closed_gate.ruling_sha256) == (
+        False,
+        "no_ruling",
+        None,
+    )
+    h = Harness(shadow_only=not closed_gate.enabled, permit_expires_at_ns=NOW_NS + 10**13)
     rung = h.rung("gte72lt73f")
     h.install(lambda ctx: want((rung, 89)))
     h.book("gte72lt73f")
@@ -235,7 +251,7 @@ def test_a_ruling_id_alone_with_a_permit_present_enables_nothing_and_refuses_the
 
     manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
     named = dataclasses.replace(
-        manifest, live_orders_ruling="RULING_MAKER_sharp_v1_live_small_2026-10-21"
+        manifest, live_orders_ruling="RULING_not_allowlisted_for_sharp_2026-10-21"
     )
     with pytest.raises(live_orders_gate.LiveOrdersGateRefusedError) as refused:
         live_orders_gate.live_orders_authorized(named, REPO, permit_present=True)
@@ -267,13 +283,13 @@ def test_the_maker_compose_branch_derives_shadow_only_from_the_gate_output() -> 
 PLACEHOLDER_D0: Final[str] = "2026-10-28"
 
 
-def test_the_shipped_manifest_still_carries_the_placeholder_d0_and_is_shadow() -> None:
-    """The ARM commit sets the real D0; until then the sentinel is shadow-only (a draft state)."""
+def test_the_shipped_manifest_carries_the_real_d0_and_the_ruling() -> None:
+    """The ARM commit replaced the sentinel. The shipped manifest is the real D0 plus the ruling."""
     from breezy.persistence.family_manifest import load_family_manifest
 
     manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
-    assert manifest.d0_climate_day == PLACEHOLDER_D0
-    assert manifest.live_orders_ruling is None
+    assert manifest.d0_climate_day == REAL_D0
+    assert manifest.live_orders_ruling == RULING_ID
 
 
 def test_the_placeholder_d0_is_refused_whenever_the_maker_would_send() -> None:
@@ -285,7 +301,8 @@ def test_the_placeholder_d0_is_refused_whenever_the_maker_would_send() -> None:
         refuse_placeholder_d0,
     )
 
-    manifest = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
+    shipped = load_family_manifest(REPO / "deploy" / "families" / f"{FAMILY}.json")
+    manifest = dataclasses.replace(shipped, d0_climate_day=PLACEHOLDER_D0, live_orders_ruling=None)
     refuse_placeholder_d0(manifest, shadow_only=True)  # shadow with the sentinel: allowed
     with pytest.raises(PlaceholderD0Error, match="placeholder"):
         refuse_placeholder_d0(manifest, shadow_only=False)
@@ -304,9 +321,10 @@ def test_boot_refuses_the_placeholder_d0_when_the_gate_answers_enabled(
 ) -> None:
     """Through ``run``: a gate that (hypothetically) said enabled still cannot boot the sentinel.
 
-    The gate's output is replaced by a stand-in; nothing real is enabled (no ruling, no allowlist
-    row, no permit, no cap is read or assigned).
+    The shipped manifest is no longer the sentinel, so this plants a synthetic placeholder copy
+    in the temp tree. The gate's output is replaced by a stand-in; no cap is read or assigned.
     """
+    import json
     from types import SimpleNamespace
 
     monkeypatch.setattr(
@@ -315,6 +333,10 @@ def test_boot_refuses_the_placeholder_d0_when_the_gate_answers_enabled(
         lambda *a, **k: SimpleNamespace(enabled=True, reason="ok", ruling_sha256="0" * 64),
     )
     _tree(tmp_path)
+    copied = tmp_path / "deploy" / "families" / f"{FAMILY}.json"
+    payload = json.loads(copied.read_text(encoding="utf-8"))
+    payload["d0_climate_day"] = PLACEHOLDER_D0
+    copied.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     catalog_root = tmp_path / "catalog"
     catalog_root.mkdir()

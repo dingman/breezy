@@ -12,9 +12,9 @@ service.
 
 from __future__ import annotations
 
+import pathlib
 import shutil
 import subprocess
-import pathlib
 from pathlib import Path
 
 import pytest
@@ -30,14 +30,13 @@ _EXPECTED_REMOVED_CURRENT = "Environment=BREEZY_CURRENT_RUNG_HOLD=1"
 _EXPECTED_REMOVED_CONTINUOUS = "Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1"
 #: The family the INSTALLED unit promotes. Updated on promotion (2026-09-20:
 #: pm_us_crh_cont -> pm_us_crh_v4, the class-C successor registered at the
-#: venue's drifted taker theta 0.0695). The id alone is a weak guard, so
+#: venue's drifted taker theta 0.0695; 2026-10-23 P4 arm: pm_us_crh_fq_v1 ->
+#: pm_us_no_maker_sharp_v1). The id alone is a weak guard, so
 #: `test_the_installed_unit_names_a_REGISTERED_family` additionally resolves
 #: it against deploy/families/ -- a unit naming an unregistered or DRAFT
 #: family must fail here, not at 16:50Z launch.
-_EXPECTED_SENDING_FAMILY_ID = "pm_us_crh_fq_v1"
-_EXPECTED_REPLACEMENT_ADDED = (
-    f"Environment=BREEZY_SENDING_FAMILY_ID={_EXPECTED_SENDING_FAMILY_ID}"
-)
+_EXPECTED_SENDING_FAMILY_ID = "pm_us_no_maker_sharp_v1"
+_EXPECTED_REPLACEMENT_ADDED = f"Environment=BREEZY_SENDING_FAMILY_ID={_EXPECTED_SENDING_FAMILY_ID}"
 _EXPECTED_SHADOW_PIN_ADDED = "Environment=BREEZY_CRH_CONT_PHASE0_SHADOW=0"
 _OPERATOR_ENV_LINE = "EnvironmentFile=-%h/breezy/operator.env"
 
@@ -106,6 +105,8 @@ def test_installed_unit_verifies_with_systemd_analyze(tmp_path: Path) -> None:
     candidate.write_text(_INSTALLED_UNIT.read_text())
     result = subprocess.run(
         [_SYSTEMD_ANALYZE, "verify", "--user", str(candidate)],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr

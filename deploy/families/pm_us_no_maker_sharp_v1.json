@@ -2,7 +2,7 @@
   "family_id": "pm_us_no_maker_sharp_v1",
   "venue": "polymarket_us",
   "trial_id_prefix": "no_ladder_maker/trial/pm_us_no_maker_sharp_v1/",
-  "d0_climate_day": "2026-10-28",
+  "d0_climate_day": "2026-10-25",
   "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
   "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
   "composition_kind": "no_ladder_maker",
@@ -15,5 +15,6 @@
     "SFO"
   ],
   "taker_fee_coefficient": "0.0695",
-  "status": "REGISTERED"
+  "status": "REGISTERED",
+  "live_orders_ruling": "RULING_MAKER_sharp_v1_live_small_2026-10-21"
 }

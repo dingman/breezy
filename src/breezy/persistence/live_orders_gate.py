@@ -84,6 +84,11 @@ _LIVE_ORDERS_ALLOWLIST: Final[frozenset[tuple[str, str, str]]] = frozenset(
             "RULING_operator_fq_live_real_orders_2026-10-01",
             "11c69d132a70d8e328d3720314336aa6f2cf176d52fd25d5f2e20a7189711c1f",
         ),
+        (
+            "pm_us_no_maker_sharp_v1",
+            "RULING_MAKER_sharp_v1_live_small_2026-10-21",
+            "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152",
+        ),
     }
 )
 
@@ -159,9 +164,7 @@ def _verify_ruling_file(ruling_id: str, expected_sha256: str, repo_root: Path) -
             f"ruling path for {ruling_id!r} escapes {_RULINGS_SUBTREE}",
         )
     if not ruling_path.is_file():
-        raise LiveOrdersGateRefusedError(
-            "ruling_missing", f"ruling file missing: {ruling_path}"
-        )
+        raise LiveOrdersGateRefusedError("ruling_missing", f"ruling file missing: {ruling_path}")
 
     actual_sha256 = hashlib.sha256(ruling_path.read_bytes()).hexdigest()
     if actual_sha256 != expected_sha256:

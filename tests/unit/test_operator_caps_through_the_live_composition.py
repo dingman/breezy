@@ -99,6 +99,9 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
 )
+from breezy.strategy.no_ladder_maker.composition import (
+    TRIAL_KEY_PREFIX as MAKER_TRIAL_KEY_PREFIX,
+)
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.polymarket_us_exec_shapes import TS_EVENT_TEXT, build_instrument
 from tests.unit.test_operator_control_assignment_scan import find_control_assignments
@@ -111,9 +114,7 @@ from tests.unit.test_polymarket_us_submit_order_chain import (
 )
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
-_SUPERVISOR_UNIT: Final[Path] = (
-    REPO_ROOT / "deploy" / "systemd" / "breezy-trade-supervisor.service"
-)
+_SUPERVISOR_UNIT: Final[Path] = REPO_ROOT / "deploy" / "systemd" / "breezy-trade-supervisor.service"
 _SENDING_FAMILY_LINE: Final[re.Pattern[str]] = re.compile(
     r"^Environment=BREEZY_SENDING_FAMILY_ID=(\S+)\s*$",
     re.MULTILINE,
@@ -135,16 +136,13 @@ _BELOW_ORDER_COST: Final[str] = "0.36"
 _SESSION_TOO_SMALL: Final[str] = "0.01"
 _SEEDED_SPENT: Final[str] = "1.23"
 _REFUSAL_SUFFIX: Final[str] = "; this client refuses to submit"
-_ABSENT: Final[str] = (
-    "is not set; live trading is operator-enabled only and has no default"
-)
+_ABSENT: Final[str] = "is not set; live trading is operator-enabled only and has no default"
 _POSITION_REFUSAL: Final[str] = (
     "refuses this order: its USD cost (price x quantity) exceeds the "
     "operator's per-position ceiling"
 )
 _DAILY_REFUSAL: Final[str] = (
-    "refuses this order: it would carry today's USD notional past the "
-    "operator's daily budget"
+    "refuses this order: it would carry today's USD notional past the operator's daily budget"
 )
 _SESSION_REFUSAL: Final[str] = (
     "order notional exceeds the permit's remaining notional budget" + _REFUSAL_SUFFIX
@@ -346,8 +344,10 @@ def _compose(tmp_path: Path, *, permit: Any, family_id: str) -> _Composition:
     the latch, ``submit_veto`` and ``exit_manifest`` that call receives.
     ``continuous_rung_hold`` mirrors ``app/trade.py`` 624-628, 650 and 659.
     ``forecast_quantile_ladder`` mirrors ``app/trade.py`` 730-734
-    (``forecast_halt_latch``), 743 and 744. Strategies are not built: the
-    cap binds at the exec client, and sizing is out of scope.
+    (``forecast_halt_latch``), 743 and 744. ``no_ladder_maker`` mirrors
+    ``app/trade.py`` ``_compose_no_ladder_maker`` (``MAKER_TRIAL_KEY_PREFIX``).
+    Strategies are not built: the cap binds at the exec client, and sizing
+    is out of scope.
     """
     unit_text = _SUPERVISOR_UNIT.read_text(encoding="utf-8")
     named_family_id = _unit_named_family_id(unit_text)
@@ -366,6 +366,9 @@ def _compose(tmp_path: Path, *, permit: Any, family_id: str) -> _Composition:
     elif manifest.composition_kind == "forecast_quantile_ladder":
         # app/trade.py:730-734 (forecast_halt_latch), 743, 744.
         halt_key_prefix = FORECAST_QUANTILE_TRIAL_KEY_PREFIX
+    elif manifest.composition_kind == "no_ladder_maker":
+        # app/trade.py:_compose_no_ladder_maker, key_prefix=MAKER_TRIAL_KEY_PREFIX.
+        halt_key_prefix = MAKER_TRIAL_KEY_PREFIX
     else:
         raise AssertionError(
             f"{family_id}: composition_kind {manifest.composition_kind!r} "

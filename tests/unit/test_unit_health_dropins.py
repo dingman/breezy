@@ -113,13 +113,23 @@ def test_a_dropin_that_sets_caps_or_the_permit_is_never_allowlisted(
     assert findings == [f"CRITICAL:{NAME}"] and allowlisted == ()
 
 
-def test_the_shipped_row_is_pinned_to_the_ruling_and_its_expiry() -> None:
-    (row,) = DROPIN_ALLOWLIST
-    assert (row.unit, row.dropin, row.ruling, row.expires) == (UNIT, NAME, RULING, "2026-12-31")
-    assert len(row.sha256) == 64
+def test_the_shipped_allowlist_is_empty() -> None:
+    assert DROPIN_ALLOWLIST == ()
 
 
-def test_the_live_dropin_matches_the_row_and_sets_only_the_orders_off_directive() -> None:
+#: The orders-off file stays on this host until deploy moves it out of ``.d``.
+#: The sha is the row this commit removed from ``DROPIN_ALLOWLIST``; the test
+#: injects that row instead of indexing the now-empty tuple.
+_INSTALLED_ORDERS_OFF = DropinAllow(
+    UNIT,
+    NAME,
+    "5ff0d6a1b157aa730cd9c87c4060e3016bed744777674b71af874c95c485e09d",
+    RULING,
+    "2026-12-31",
+)
+
+
+def test_the_live_dropin_matches_the_injected_orders_off_row() -> None:
     live = Path.home() / ".config/systemd/user" / f"{UNIT}.d" / NAME
     if not live.is_file():
         pytest.skip("the orders-off drop-in is not installed on this host")
@@ -131,7 +141,7 @@ def test_the_live_dropin_matches_the_row_and_sets_only_the_orders_off_directive(
         if line.strip() and not line.lstrip().startswith("#")
     ]
     assert directives == ["[Service]", "Environment=BREEZY_ORDERS_ENABLED=0"]
-    assert hashlib.sha256(data).hexdigest() == DROPIN_ALLOWLIST[0].sha256
+    assert hashlib.sha256(data).hexdigest() == _INSTALLED_ORDERS_OFF.sha256
 
 
 def test_the_reader_refuses_a_directory_and_an_oversize_file(tmp_path: Path) -> None:

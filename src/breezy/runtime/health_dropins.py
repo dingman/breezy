@@ -43,16 +43,10 @@ class DropinAllow:
     expires: str
 
 
-#: The orders-off drop-in of the FQ v2 no-trade ruling. Removed when that ruling is lifted.
-DROPIN_ALLOWLIST: Final[tuple[DropinAllow, ...]] = (
-    DropinAllow(
-        "breezy-trade-supervisor.service",
-        "fq-v1-halt-orders-off.conf",
-        "5ff0d6a1b157aa730cd9c87c4060e3016bed744777674b71af874c95c485e09d",
-        "RULING_FQ-v2-NO-TRADE_2026-10-08",
-        "2026-12-31",
-    ),
-)
+#: P4 arm: the orders-off row is removed. ``fq-v1-halt-orders-off.conf`` leaves
+#: the unit ``.d`` directory at deploy time, not in this commit. Rollback
+#: restores the row and its test together with the file.
+DROPIN_ALLOWLIST: Final[tuple[DropinAllow, ...]] = ()
 #: The only directives an allowlisted drop-in may contain: never caps, never the permit.
 _ALLOWED_DIRECTIVES: Final = frozenset({"[Service]", "Environment=BREEZY_ORDERS_ENABLED=0"})
 _DROPIN_MAX_BYTES: Final = 65_536

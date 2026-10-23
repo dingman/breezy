@@ -122,9 +122,7 @@ def test_an_unallowlisted_ruling_refuses(tmp_path: Path) -> None:
 
 
 def test_a_correct_ruling_id_for_the_wrong_family_id_refuses(tmp_path: Path) -> None:
-    manifest = _manifest(
-        tmp_path, family_id="some_other_family", live_orders_ruling=_RULING_ID
-    )
+    manifest = _manifest(tmp_path, family_id="some_other_family", live_orders_ruling=_RULING_ID)
 
     with pytest.raises(LiveOrdersGateRefusedError) as excinfo:
         live_orders_authorized(manifest, tmp_path, permit_present=True)
@@ -247,9 +245,7 @@ def test_ruling_sha256_is_none_when_no_ruling_is_declared(tmp_path: Path) -> Non
         ),
     ],
 )
-def test_a_refused_gate_never_exposes_a_ruling_sha256(
-    tmp_path: Path, build_manifest: Any
-) -> None:
+def test_a_refused_gate_never_exposes_a_ruling_sha256(tmp_path: Path, build_manifest: Any) -> None:
     """`app/trade.py`'s `except LiveOrdersGateRefusedError` branch hardcodes
     `ruling_sha256=none` on the boot log line -- correct only because the
     exception itself never carries a verified sha for ANY refusing reason
@@ -272,7 +268,7 @@ def test_the_fq_live_orders_boot_log_line_carries_ruling_sha256() -> None:
     source = (_REPO_ROOT / "src" / "breezy" / "app" / "trade.py").read_text(encoding="utf-8")
 
     assert re.search(r"fq_live_orders enabled=False.{0,120}ruling_sha256=none", source, re.DOTALL)
-    assert "live_orders.ruling_sha256 or \"none\"" in source
+    assert 'live_orders.ruling_sha256 or "none"' in source
     assert re.search(r"fq_live_orders enabled=%s.{0,160}ruling_sha256=%s", source, re.DOTALL)
 
 
@@ -362,9 +358,7 @@ def test_every_committed_manifest_still_loads_with_an_unchanged_sha256() -> None
     declares `family_id`."""
     families_dir = _REPO_ROOT / "deploy" / "families"
     all_json = sorted(families_dir.glob("*.json"))
-    manifest_paths = [
-        path for path in all_json if "family_id" in json.loads(path.read_text())
-    ]
+    manifest_paths = [path for path in all_json if "family_id" in json.loads(path.read_text())]
     assert manifest_paths, "no committed family manifests found"
     assert len(manifest_paths) < len(all_json), (
         "expected at least one non-manifest artefact file alongside the manifests"
@@ -373,3 +367,43 @@ def test_every_committed_manifest_still_loads_with_an_unchanged_sha256() -> None
     for path in manifest_paths:
         manifest = load_family_manifest(path, allow_draft=True)
         assert manifest.manifest_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# P4 arm: the sharp family's allowlist tuple and its on-disk ruling
+# ---------------------------------------------------------------------------
+
+_SHARP_FAMILY_ID = "pm_us_no_maker_sharp_v1"
+_SHARP_RULING_ID = "RULING_MAKER_sharp_v1_live_small_2026-10-21"
+_SHARP_RULING_SHA256 = "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152"
+_SHARP_MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / f"{_SHARP_FAMILY_ID}.json"
+_SHARP_DEPLOY_RULING_PATH = (
+    _REPO_ROOT / "deploy" / "families" / "rulings" / f"{_SHARP_RULING_ID}.md"
+)
+
+
+def test_the_sharp_tuple_and_the_on_disk_ruling_enable() -> None:
+    manifest = load_family_manifest(_SHARP_MANIFEST_PATH)
+    assert manifest.family_id == _SHARP_FAMILY_ID
+    assert manifest.live_orders_ruling == _SHARP_RULING_ID
+
+    decision = live_orders_authorized(manifest, _REPO_ROOT, permit_present=True)
+
+    assert decision.enabled is True
+    assert decision.reason == "ok"
+    assert decision.ruling_sha256 == _SHARP_RULING_SHA256
+
+
+def test_a_one_byte_change_to_a_copy_of_the_sharp_ruling_is_refused(tmp_path: Path) -> None:
+    """Mirror of the FQ tamper: one appended byte on a copy, never the committed file."""
+    manifest = load_family_manifest(_SHARP_MANIFEST_PATH)
+    rulings_dir = tmp_path / "deploy" / "families" / "rulings"
+    rulings_dir.mkdir(parents=True)
+    (rulings_dir / f"{_SHARP_RULING_ID}.md").write_bytes(
+        _SHARP_DEPLOY_RULING_PATH.read_bytes() + b"\n"
+    )
+
+    with pytest.raises(LiveOrdersGateRefusedError) as excinfo:
+        live_orders_authorized(manifest, tmp_path, permit_present=True)
+
+    assert excinfo.value.reason == "ruling_sha_mismatch"
