@@ -11,10 +11,10 @@ on the full tape (Delta = 0, +600 s, -600 s). Two runs are made here over the sa
 
 Both are held to the fixture's stored driver episodes. The simulator is the Stage 0 one on both
 sides (it is not part of the port); only the decision core differs. An episode's expire is not a
-simulator field, so it is derived from the port's `gtd_expire_ns` and held to the simulator's
-clock-cut end of that episode. That check proves clock-cut consistency (min(permit end, next UTC
-midnight)) only; hard-cancel parity is proven by `test_hard_cancel_*`, including the synthetic
-case where the window does reach D 09:00 LST.
+simulator field. Its clock-cut end is the uncapped cut (min of permit end, next UTC midnight and
+the hard cancel); the live `gtd_expire_ns` is that cut capped at the P3-licensed horizon. That
+check proves clock-cut consistency only; hard-cancel parity is proven by `test_hard_cancel_*`,
+including the synthetic case where the window does reach D 09:00 LST.
 
 R10 asked for LAX/SFO fixtures "spanning 17:00Z". That is unsatisfiable: no posting window spans
 D 09:00 LST (17:00Z on D for LAX/SFO; the permit ends D 02:50Z), per plan_r3_delta.md
@@ -201,16 +201,18 @@ def test_hard_cancel_is_after_the_permit_window_so_it_never_binds_the_expire(
 ) -> None:
     """Finding, pinned: D 09:00 LST lies after the permit end (D 02:50Z) on every maker station.
 
-    `gtd_expire_ns` is therefore min(permit end, next UTC midnight) for any booking inside the
-    window, in the simulator and in the port alike.
+    Inside the window the uncapped cut is min(permit end, next UTC midnight). At the open that
+    midnight is past the P3-licensed horizon, so the live GTD is booked + P3_LICENSED_GTD_NS.
     """
     for case in cases.values():
         sched = primary_schedule(case.day)
         hard = next(c[0] for c in case.raw["cuts"] if c[1] == "CANCEL_HARD")
         assert hard > sched.window_end_ns
         booked = sched.window_start_ns + 1
-        assert rule.gtd_expire_ns(booked, hard, sched.window_end_ns) == (
-            (booked // (86_400 * NS) + 1) * 86_400 * NS
+        midnight = (booked // (86_400 * NS) + 1) * 86_400 * NS
+        assert midnight <= sched.window_end_ns
+        assert rule.gtd_expire_ns(booked, hard, sched.window_end_ns) == min(
+            midnight, booked + rule.P3_LICENSED_GTD_NS
         )
 
 
@@ -435,11 +437,19 @@ def test_port_posts_exactly_what_the_driver_posts(
     for ep in port.episodes:
         if ep.refused_reason is not None:
             continue
-        expire = rule.gtd_expire_ns(ep.t0_ns + shift, hard, permit_end)
+        now = ep.t0_ns + shift
+        end_of_utc_day = (now // (86_400 * NS) + 1) * 86_400 * NS
+        schedule_cut = min(hard, permit_end, end_of_utc_day)
+        expire = rule.gtd_expire_ns(now, hard, permit_end)
+        assert expire == min(schedule_cut, now + rule.P3_LICENSED_GTD_NS)
         if ep.end_reason in CLOCK_ENDS:
-            assert ep.end_ns + shift == expire, "clock-cut consistency (not hard-cancel parity)"
+            assert ep.end_ns + shift == schedule_cut, (
+                "clock-cut consistency (not hard-cancel parity)"
+            )
         else:
-            assert ep.end_ns + shift <= expire, "clock-cut consistency (not hard-cancel parity)"
+            assert ep.end_ns + shift <= schedule_cut, (
+                "clock-cut consistency (not hard-cancel parity)"
+            )
 
 
 @pytest.mark.parametrize("case_id", _case_ids())

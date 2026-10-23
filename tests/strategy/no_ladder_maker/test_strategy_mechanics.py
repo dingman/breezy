@@ -19,6 +19,7 @@ from nautilus_trader.model.instruments import BinaryOption
 from breezy.strategy.no_ladder_maker.config import AllowShortNotPermittedError, NoLadderMakerConfig
 from breezy.strategy.no_ladder_maker.ladder_state import RestState
 from breezy.strategy.no_ladder_maker.records import CANCEL_PMIN, Decision
+from breezy.strategy.no_ladder_maker.rule import P3_LICENSED_GTD_NS
 from breezy.strategy.no_ladder_maker.strategy import (
     REPOST_BACKOFF_S,
     DepthSubscriptionBudgetError,
@@ -111,7 +112,7 @@ def test_a_wanted_rung_posts_buy_no_gtd_qty_1_on_the_no_leg() -> None:
     assert order.is_post_only is False
     assert cents_of(submit) == 89
     midnight = (NOW_NS // (24 * HOUR_NS) + 1) * 24 * HOUR_NS
-    assert order.expire_time_ns == min(midnight, NOW_NS + 10 * HOUR_NS)
+    assert order.expire_time_ns == min(midnight, NOW_NS + 10 * HOUR_NS, NOW_NS + P3_LICENSED_GTD_NS)
     assert h.ladder.rests[rung].state is RestState.SUBMITTED
 
 

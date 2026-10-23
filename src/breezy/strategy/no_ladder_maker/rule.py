@@ -228,14 +228,20 @@ def hard_cancel_ns(day: dt.date, std_offset_hours: int, params: MakerRuleParams)
     return _utc_ns(local) - std_offset_hours * _NS_PER_H
 
 
-def gtd_expire_ns(now_ns: int, hard_cancel: int, permit_expiry_ns: int) -> int:
-    """min(cancel_lst, permit expiry, end of the booking UTC day); spec lines 91-92.
+# P3 PASS 2026-10-23: one 4 h GTD rest held NEW and expired on time
+# (docs/evidence/P3_GTD_PROBE_2026-10-23.md). The cap rises only through a
+# later proven probe.
+P3_LICENSED_GTD_NS: Final[int] = 14_400 * _NS_PER_S
 
-    The r4 delta (i)10 caveat applies: a midnight cut re-posts at the same
-    instant in replay, live waits for the next event.
+
+def gtd_expire_ns(now_ns: int, hard_cancel: int, permit_expiry_ns: int) -> int:
+    """min(cancel_lst, permit expiry, end of the booking UTC day, now + P3_LICENSED_GTD_NS).
+
+    Spec lines 91-92. The r4 delta (i)10 caveat applies: a midnight cut re-posts
+    at the same instant in replay, live waits for the next event.
     """
     end_of_utc_day = (now_ns // _NS_PER_DAY + 1) * _NS_PER_DAY
-    return min(hard_cancel, permit_expiry_ns, end_of_utc_day)
+    return min(hard_cancel, permit_expiry_ns, end_of_utc_day, now_ns + P3_LICENSED_GTD_NS)
 
 
 def obs_cancel(upper_f: float, lower_edge_f: float, integer_c: bool = False) -> bool:
