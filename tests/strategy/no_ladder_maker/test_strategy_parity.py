@@ -4,7 +4,9 @@ C3 (``test_parity_vs_design_driver``) proved the ported decision CORE equals the
 replays the same C3 fixture through the real ``NoLadderMakerStrategy`` -- real selector over a real
 ``LiveNbpFeed`` store, real native GTD timers, real ``plan_actions`` -- and holds the orders it
 puts on the wire to the fixture's stored driver episodes: ``(t0, rung, price)`` of every posted
-rest, and the GTD expire of each rest whose end is a clock cut.
+rest, and the GTD expire of each rest whose end is a clock cut (that cut, capped at the
+P3-licensed horizon). A driver rest held past that horizon is also re-posted once, same rung
+and price, at ``t0 + P3_LICENSED_GTD_NS``; that re-post is the only allowed extra.
 
 What drives it (no new harness, no production seam): the fixture's recorded events are fed to the
 strategy's own handlers in simulator order on a ``TestClock`` -- ``OrderBookDepth10`` for every
@@ -23,6 +25,7 @@ ten displayed ask levels is refused (``TRUNCATED_FRAME``) where the recorder kne
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -37,6 +40,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     load_live_calibration,
 )
 from breezy.strategy.no_ladder_maker.ladder_state import frame_from_levels
+from breezy.strategy.no_ladder_maker.rule import P3_LICENSED_GTD_NS
 from scripts.analysis import maker_parity_fixture_extract as fx
 from scripts.analysis import maker_stage0_fill_events as s_events
 from tests.strategy.no_ladder_maker.maker_strategy_support import FakeVenue, Harness, depth
@@ -200,7 +204,13 @@ def test_the_strategy_posts_exactly_the_drivers_rests_at_delta_zero(
     expected = _expected_posts(case)
     assert expected, "a fixture with nothing posted proves nothing"
     _h, venue = _replay(case, calibration)
-    assert _actual_posts(case, venue) == expected
+    actual = _actual_posts(case, venue)
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    assert expected_counts <= actual_counts
+    for (t0, rung, cents), n in (actual_counts - expected_counts).items():
+        assert n == 1
+        assert expected_counts[(t0 - P3_LICENSED_GTD_NS, rung, cents)] >= 1
 
 
 @pytest.mark.parametrize("case_id", _case_ids())
@@ -217,7 +227,7 @@ def test_each_rests_gtd_expire_is_the_drivers_clock_cut(
     checked = 0
     for ep in case["expected"]["0"]:
         if ep[5] is None and ep[4] in CLOCK_ENDS:
-            assert expires[(ep[0], ep[1], ep[2])] == ep[3], ep
+            assert expires[(ep[0], ep[1], ep[2])] == min(ep[3], ep[0] + P3_LICENSED_GTD_NS), ep
             checked += 1
     assert checked >= 1, "no clock-cut episode in the fixture: the expire check proved nothing"
 

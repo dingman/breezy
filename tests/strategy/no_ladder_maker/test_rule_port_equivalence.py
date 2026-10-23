@@ -1,5 +1,8 @@
 """WP-C1: the live `no_ladder_maker` decision core equals the Stage 0 scripts, line for line.
 
+`gtd_expire_ns` is the exception: the live result is the script's cut, capped at the
+P3-licensed horizon (`P3_LICENSED_GTD_NS`).
+
 Every ported function is driven over a grid next to its `scripts.analysis` original. The
 originals read module globals, so each side runs under the design driver's own `rule_override`
 for the arm under test (`sharp`: `ARMS["sharp"]`; `control`: the shipped constants).
@@ -281,7 +284,9 @@ def test_clock_helpers_grid(arm: tuple[str, p.MakerRuleParams]) -> None:
     for now, cancel, permit in itertools.product(
         (noon, noon + 11 * NS_H + 1), (noon - 1, noon + 5 * NS_H), (noon + NS_H, noon + 30 * NS_H)
     ):
-        assert rule.gtd_expire_ns(now, cancel, permit) == s_rule.gtd_expire_ns(now, cancel, permit)
+        assert rule.gtd_expire_ns(now, cancel, permit) == min(
+            s_rule.gtd_expire_ns(now, cancel, permit), now + rule.P3_LICENSED_GTD_NS
+        )
     for upper, edge, intc in itertools.product(
         (76.0, 77.9, 78.0, 80.0), (80.0, 82.0), (False, True)
     ):
@@ -289,6 +294,34 @@ def test_clock_helpers_grid(arm: tuple[str, p.MakerRuleParams]) -> None:
     deadline = int(dt.datetime(2026, 9, 28, 12, tzinfo=dt.UTC).timestamp()) * 10**9
     for listed in (None, deadline - 1, deadline, deadline + 1):
         assert rule.listed_in_time(listed, DAY) == s_rule.listed_in_time(listed, DAY)
+
+
+def test_gtd_expire_is_now_plus_14400s_when_every_other_bound_is_later() -> None:
+    """cancel_lst, permit expiry and end of the UTC day all later than now + 4 h."""
+    now = int(dt.datetime(2026, 9, 29, 12, tzinfo=dt.UTC).timestamp()) * 10**9
+    horizon = 14_400 * 10**9
+    later = now + horizon + 10**9  # noon: the UTC day ends 12 h later, also past the cap
+    assert rule.gtd_expire_ns(now, later, later) == now + horizon
+
+
+def test_an_earlier_gtd_bound_still_wins_over_the_p3_horizon() -> None:
+    """A cancel_lst, permit expiry or UTC-day end earlier than the horizon still wins."""
+    now = int(dt.datetime(2026, 9, 29, 12, tzinfo=dt.UTC).timestamp()) * 10**9
+    horizon = 14_400 * 10**9
+    later = now + horizon + 10**9
+    cancel_lst = now + 10**9
+    permit = now + 2 * 10**9
+    assert rule.gtd_expire_ns(now, cancel_lst, later) == cancel_lst
+    assert rule.gtd_expire_ns(now, later, permit) == permit
+    evening = int(dt.datetime(2026, 9, 29, 22, tzinfo=dt.UTC).timestamp()) * 10**9
+    end_of_utc_day = (evening // (24 * NS_H) + 1) * 24 * NS_H
+    past_the_day = end_of_utc_day + horizon
+    assert end_of_utc_day < evening + horizon
+    assert rule.gtd_expire_ns(evening, past_the_day, past_the_day) == end_of_utc_day
+
+
+def test_p3_licensed_gtd_ns_is_14400_seconds() -> None:
+    assert rule.P3_LICENSED_GTD_NS == 14_400 * 10**9
 
 
 def test_reason_vocabulary_matches() -> None:
