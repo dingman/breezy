@@ -235,10 +235,11 @@ P3_LICENSED_GTD_NS: Final[int] = 14_400 * _NS_PER_S
 
 
 def gtd_expire_ns(now_ns: int, hard_cancel: int, permit_expiry_ns: int) -> int:
-    """min(cancel_lst, permit expiry, end of the booking UTC day, now + P3_LICENSED_GTD_NS).
+    """min(hard cancel, permit expiry, end of the booking UTC day, now + P3_LICENSED_GTD_NS).
 
-    Spec lines 91-92. The r4 delta (i)10 caveat applies: a midnight cut re-posts
-    at the same instant in replay, live waits for the next event.
+    Spec lines 91-92. A midnight cut or the 4 h cap re-posts at that instant in
+    replay; live re-posts on the next event after the cut as well (the managed
+    GTD timer cancels, then a fresh book posts the same rung again).
     """
     end_of_utc_day = (now_ns // _NS_PER_DAY + 1) * _NS_PER_DAY
     return min(hard_cancel, permit_expiry_ns, end_of_utc_day, now_ns + P3_LICENSED_GTD_NS)

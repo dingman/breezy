@@ -816,7 +816,31 @@ class NoLadderMakerStrategy(Strategy):
             ladder, rung_id, _ = found
             ladder.held.add(rung_id)
             del ladder.rests[rung_id]
+        else:
+            # Expiry (or any close) already dropped this rest. ``_order_index`` still
+            # names the rung; count the fill held and cancel a live re-post by its id.
+            self._hold_fill_of_closed_rest(event.client_order_id)
         self._alert("MAKER_ORDER_FILLED", event.instrument_id, event.client_order_id, "INFO")
+
+    def _hold_fill_of_closed_rest(self, client_order_id: ClientOrderId) -> None:
+        located = self._order_index.get(client_order_id)
+        if located is None:
+            return
+        key, rung_id = located
+        ladder = self.ladders[key]
+        ladder.held.add(rung_id)
+        rest = ladder.rests.get(rung_id)
+        if rest is None or rest.client_order_id == client_order_id:
+            if rest is not None:
+                del ladder.rests[rung_id]
+            return
+        if rest.state is RestState.SHADOW:
+            del ladder.rests[rung_id]
+            return
+        order = self.cache.order(rest.client_order_id) if rest.client_order_id is not None else None
+        if order is None or order.is_closed:
+            return  # the poll reconciles a rest whose order is already gone
+        self._request_cancel(rest, order)
 
     @_guarded
     def on_order_denied(self, event: OrderDenied) -> None:
