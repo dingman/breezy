@@ -95,7 +95,11 @@ class _SlowSender:
         self.response: Any = None
 
     async def post_order(
-        self, base_url: str, *, headers: Any, body: bytes,
+        self,
+        base_url: str,
+        *,
+        headers: Any,
+        body: bytes,
     ) -> Any:
         await asyncio.sleep(0)
         self.calls.append({"base_url": base_url, "headers": dict(headers), "body": body})
@@ -114,11 +118,22 @@ def _zero_fill_body(order_id: str) -> bytes:
     ).encode("utf-8")
 
 
-async def _build_race_client(tmp_path: Path, *, sender: Any) -> tuple[
-    PolymarketUSExecutionClient, list[Any], Any, Any,
+async def _build_race_client(
+    tmp_path: Path,
+    *,
+    sender: Any,
+    clock: Any | None = None,
+) -> tuple[
+    PolymarketUSExecutionClient,
+    list[Any],
+    Any,
+    Any,
 ]:
+    """``clock`` defaults to a live clock. Resting rigs pass a pinned ``TestClock``
+    so a multi-hour ``advance`` cannot cross UTC midnight under the permit."""
     loop = asyncio.get_running_loop()
-    clock = LiveClock()
+    if clock is None:
+        clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
 
@@ -185,7 +200,9 @@ async def _build_race_client(tmp_path: Path, *, sender: Any) -> tuple[
 
 
 def _submit_command(
-    client: PolymarketUSExecutionClient, factory: OrderFactory, tag: str,
+    client: PolymarketUSExecutionClient,
+    factory: OrderFactory,
+    tag: str,
 ) -> SubmitOrder:
     del tag  # kept for call-site readability only; the shared factory de-dupes ids
     instrument = build_instrument()
@@ -213,15 +230,20 @@ async def test_two_synchronous_submits_in_one_burst_spend_exactly_one_permit_slo
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(
+            MAX_POSITION_COST_USD_ENV_VAR,
+            "10.00",
+        ),
     ):
         sender = _SlowSender()
         sender.response = __import__(
             "breezy.adapters.polymarket_us.transport", fromlist=["VenueResponse"]
         ).VenueResponse(status=200, headers={}, body=_zero_fill_body("ord-race-1"))
         client, order_events, permit, _latch_cm = await _build_race_client(
-            tmp_path, sender=sender,
+            tmp_path,
+            sender=sender,
         )
 
         factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())

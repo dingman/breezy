@@ -145,8 +145,7 @@ def test_heartbeat_fires_on_stale_cycle_positive_control() -> None:
         "TEST_POSITIVE_CONTROL_nbp_nightly_stale_cycle"
     ]
     assert sink.payloads[0].detail == (
-        "TEST_POSITIVE_CONTROL target_alarm=nbp_nightly_stale_cycle "
-        "detail=newest_nbp_cycle_stale"
+        "TEST_POSITIVE_CONTROL target_alarm=nbp_nightly_stale_cycle detail=newest_nbp_cycle_stale"
     )
 
 
@@ -290,6 +289,12 @@ def test_candidate_artefact_never_writes_manifest_and_refuses_non_converged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # basetemp lives inside the worktree; the guard refuses any root under the
+    # real repo before it applies the home allow-list. Point the guard at a
+    # sibling that does not contain the candidate directory.
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir()
+    monkeypatch.setattr(nbp_learning_nightly, "_REPO_ROOT", fake_repo)
     fake_home = tmp_path / "home"
     monkeypatch.setenv("HOME", fake_home.as_posix())
     candidate_root = fake_home / ".local/share/breezy/derived/nbp_calibration/candidates"
@@ -311,7 +316,14 @@ def test_candidate_artefact_never_writes_manifest_and_refuses_non_converged(
         )
 
 
-def test_candidate_root_refuses_paths_outside_candidate_base(tmp_path: Path) -> None:
+def test_candidate_root_refuses_paths_outside_candidate_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same containment check as the write test: tmp_path is inside the repo,
+    # so an unpatched guard reports "inside the repo" before "must be under".
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir()
+    monkeypatch.setattr(nbp_learning_nightly, "_REPO_ROOT", fake_repo)
     with pytest.raises(ValueError, match="candidate root must be under"):
         nbp_learning_nightly.write_candidate_artefact(
             _artefact(), candidate_root=tmp_path / "elsewhere"
@@ -323,11 +335,13 @@ def test_candidate_root_refuses_repo_and_deploy_family_paths() -> None:
 
     with pytest.raises(ValueError, match="candidate root must not be inside the repo"):
         nbp_learning_nightly.write_candidate_artefact(
-            _artefact(), candidate_root=repo_root / ".local/share/breezy/derived/nbp_calibration/candidates"
+            _artefact(),
+            candidate_root=repo_root / ".local/share/breezy/derived/nbp_calibration/candidates",
         )
     with pytest.raises(ValueError, match="candidate root must not be inside the repo"):
         nbp_learning_nightly.write_candidate_artefact(
-            _artefact(), candidate_root=repo_root / "deploy" / "families" / "nbp_calibration" / "candidates"
+            _artefact(),
+            candidate_root=repo_root / "deploy" / "families" / "nbp_calibration" / "candidates",
         )
 
 
@@ -426,22 +440,16 @@ def test_known_non_half_probabilities_match_hand_computed_brier_and_reliability(
 
 def test_month_at_or_above_plan_n_is_tested_without_an_explicit_month_flag() -> None:
     rows = tuple(
-        _row(dt.date(2026, 3, day), residual_f=1.25)
-        for day in range(1, 16)
-        for _copy in range(4)
+        _row(dt.date(2026, 3, day), residual_f=1.25) for day in range(1, 16) for _copy in range(4)
     )
 
     report = nbp_learning_nightly.residual_by_month(rows)
 
     assert len(rows) == 60
-    assert [(item.month, item.n, item.status) for item in report] == [
-        ("2026-03", 60, "TESTED")
-    ]
+    assert [(item.month, item.n, item.status) for item in report] == [("2026-03", 60, "TESTED")]
 
     short_dates = tuple(
-        _row(dt.date(2026, 4, day), residual_f=1.0)
-        for day in range(1, 15)
-        for _copy in range(5)
+        _row(dt.date(2026, 4, day), residual_f=1.0) for day in range(1, 15) for _copy in range(5)
     )
     short = nbp_learning_nightly.residual_by_month(short_dates)
     assert short[0].n == 70

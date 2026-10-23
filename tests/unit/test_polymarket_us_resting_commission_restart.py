@@ -18,6 +18,7 @@ import pytest
 
 from tests.unit.ambig_latch_rig import (
     gate_env,  # noqa: F401 -- used via usefixtures
+    resting_morning_clock,
     submit_chain,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
@@ -35,14 +36,19 @@ async def _booked_then_rebooted(
 ) -> Any:
     """Process one books a poll fill (``commission`` None = absent), process two boots over its
     store; returns the NOT yet connected second client."""
-    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    rig, (command,) = await _rested(tmp_path, monkeypatch, clock=resting_morning_clock())
     _fill(rig, 0, commission="0.01" if commission is None else commission)
     if commission is None:
         del _payload(rig, 0)["commissionNotionalTotalCollected"]
     await rig.client._query_order(_query(rig, command))
     first = rig.client
     return await _second_process(
-        tmp_path, monkeypatch, first, first.latch_cm, sender=CancelSender()
+        tmp_path,
+        monkeypatch,
+        first,
+        first.latch_cm,
+        sender=CancelSender(),
+        clock=resting_morning_clock(),
     )
 
 

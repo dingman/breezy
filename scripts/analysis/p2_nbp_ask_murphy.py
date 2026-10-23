@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
-from typing import Protocol
+from pathlib import Path
+from typing import Any, NoReturn, Protocol, cast
 
 TEN_MINUTES_NS = 600 * 1_000_000_000
 _NS = 1_000_000_000
@@ -62,6 +63,41 @@ class NullError(RuntimeError):
 class _HasTs(Protocol):
     @property
     def ts_ns(self) -> int: ...
+
+
+class _BookSnap(Protocol):
+    """One tape instant the runner can score: a timestamp and optional L0 prices."""
+
+    @property
+    def ts_ns(self) -> int: ...
+
+    @property
+    def ask(self) -> float | None: ...
+
+    @property
+    def bid(self) -> float | None: ...
+
+
+class _ForecastVector(Protocol):
+    @property
+    def available_at_ns(self) -> int: ...
+
+    @property
+    def climate_day(self) -> dt.date: ...
+
+
+class _MurphyView(Protocol):
+    @property
+    def brier(self) -> float: ...
+
+    @property
+    def reliability(self) -> float: ...
+
+    @property
+    def resolution(self) -> float: ...
+
+    @property
+    def uncertainty(self) -> float: ...
 
 
 class _Decomposition(Protocol):
@@ -121,16 +157,12 @@ def assert_brier_identity(decomp: _Decomposition) -> None:
         )
 
 
-def d_res(
-    probs_a: Sequence[float], probs_b: Sequence[float], outcomes: Sequence[bool]
-) -> float:
+def d_res(probs_a: Sequence[float], probs_b: Sequence[float], outcomes: Sequence[bool]) -> float:
     """``RES(probs_a) − RES(probs_b)`` on the ten reliability bins."""
     from breezy.analysis.brier_decomposition import bin_by_edges, resolution_difference
     from breezy.analysis.nbp_calibration import RELIABILITY_BUCKET_EDGES
 
-    return resolution_difference(
-        probs_a, probs_b, outcomes, bin_by_edges(RELIABILITY_BUCKET_EDGES)
-    )
+    return resolution_difference(probs_a, probs_b, outcomes, bin_by_edges(RELIABILITY_BUCKET_EDGES))
 
 
 def assert_null_dres(asks: Sequence[float], outcomes: Sequence[bool]) -> None:
@@ -193,7 +225,7 @@ def verdict(
 # --- study runner (not imported by the pure tests) -----------------------------------------
 
 
-def _stop(message: str, code: int = 2) -> None:
+def _stop(message: str, code: int = 2) -> NoReturn:
     print(f"STOP {message}", file=sys.stderr)
     raise SystemExit(code)
 
@@ -217,7 +249,7 @@ class _Dir:
     upper: int | None
     rung_id: str
     instrument_id: str
-    path: object  # pathlib.Path, kept untyped here to avoid a runner import
+    path: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,7 +350,7 @@ def _run(smoke: bool) -> int:
     )
     try:
         calibration = load_live_calibration(
-            calibration_path, expected_sha256=_CALIBRATION_SHA
+            cast(str, calibration_path), expected_sha256=_CALIBRATION_SHA
         )
     except CalibrationArtefactPinMismatchError as exc:
         _stop(f"sha pin: {exc}")
@@ -335,7 +367,10 @@ def _run(smoke: bool) -> int:
     if smoke and smoke_n == 0:
         _stop("smoke found no SFO HIGH rung directories")
 
-    from forecast_cheap_screen_wp7 import _fixed_scalars, read_rung_tape
+    from forecast_cheap_screen_wp7 import (  # type: ignore[import-not-found]
+        _fixed_scalars,
+        read_rung_tape,
+    )
 
     price_scalar, size_scalar = _fixed_scalars()
     source = _NbpSource(Path.home() / ".local/share/breezy/derived/nbp")
@@ -419,11 +454,7 @@ def _run(smoke: bool) -> int:
     drops = [d for d in drops if d.climate_day >= scored_start]
     yes_takes = [t for t in yes_takes if t.climate_day >= scored_start]
     no_takes = [t for t in no_takes if t.climate_day >= scored_start]
-    population = [
-        item
-        for item in selected
-        if scored_start <= item.climate_day <= _SCORE_END
-    ]
+    population = [item for item in selected if scored_start <= item.climate_day <= _SCORE_END]
     if len(population) != len(events) + len(drops):
         _stop(
             f"census does not add up: population {len(population)} != "
@@ -583,18 +614,18 @@ def _run(smoke: bool) -> int:
 class _NbpSource:
     """``PartitionSource`` over ``nbp_derived_store``, cached for one climate day."""
 
-    root: object
-    _cache: dict = None  # type: ignore[assignment]
+    root: Path
+    _cache: dict[Path, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         self._cache = {}
 
-    def partition_path(self, cycle_date: dt.date, hour: int):
+    def partition_path(self, cycle_date: dt.date, hour: int) -> Path:
         from breezy.persistence.nbp_derived_store import partition_path
 
-        return partition_path(self.root, cycle_date, hour)  # type: ignore[arg-type]
+        return partition_path(self.root, cycle_date, hour)
 
-    def read_partition(self, path):
+    def read_partition(self, path: Path) -> Any:
         cached = self._cache.get(path)
         if cached is None:
             from breezy.persistence.nbp_derived_store import read_partition
@@ -607,7 +638,9 @@ class _NbpSource:
         self._cache.clear()
 
 
-def _load_truth(path):
+def _load_truth(
+    path: Path,
+) -> tuple[dict[tuple[str, dt.date], int], set[tuple[str, dt.date]]]:
     import csv
 
     values: dict[tuple[str, dt.date], set[int]] = {}
@@ -625,12 +658,12 @@ def _load_truth(path):
     return usable, conflicts
 
 
-def _list_rungs(depth_root):
+def _list_rungs(depth_root: Path) -> tuple[list[_Dir], dict[str, str], int]:
     """HIGH rung dirs for the four stations. NO-leg dirs are indexed, not scored."""
-    from market_calibration_scan import classify_directory
+    from market_calibration_scan import classify_directory  # type: ignore[import-not-found]
 
     classified: list[_Dir] = []
-    no_dirs: dict[str, object] = {}
+    no_dirs: dict[str, str] = {}
     full_n = 0
     import os
 
@@ -673,7 +706,9 @@ def _select_smoke(classified: list[_Dir], *, smoke: bool) -> tuple[list[_Dir], i
     return window, len(window)
 
 
-def _station_day(items, **kw):
+def _station_day(
+    items: Sequence[_Dir], **kw: Any
+) -> tuple[list[_Event], list[_Drop], list[_Take], list[_Take], dict[str, Any]]:
     from collections import Counter
     from pathlib import Path
 
@@ -688,7 +723,7 @@ def _station_day(items, **kw):
     gate = gate_instant_ns(climate_day)
     placed = _site_of(kw["site"], station)
 
-    def _window(item: _Dir):
+    def _window(item: _Dir) -> _BookSnap | None:
         instants, _rows = kw["read_rung_tape"](
             Path(item.path),
             std_utc_offset_hours=placed.offset_hours,
@@ -700,16 +735,14 @@ def _station_day(items, **kw):
         del instants
         return chosen
 
-    snapshots: dict[str, object] = {}
+    snapshots: dict[str, _BookSnap | None] = {}
     for rung_id, group in groups.items():
         group.sort(key=lambda item: item.instrument_id)
         for extra in group[1:]:
             extra_snap = _window(extra)
             if extra_snap is not None:
                 saw_snapshot = True
-            drops.append(
-                _Drop(station, climate_day, rung_id, "duplicate_rung")
-            )
+            drops.append(_Drop(station, climate_day, rung_id, "duplicate_rung"))
         primary = group[0]
         kept.append(primary)
         snapshots[primary.instrument_id] = _window(primary)
@@ -724,7 +757,7 @@ def _station_day(items, **kw):
     chain = kw["build_chain"](state, climate_day)
     gate_vector = chain.at(gate)
 
-    survivors: list[tuple[_Dir, object, object]] = []
+    survivors: list[tuple[_Dir, _BookSnap, _ForecastVector]] = []
     for item in kept:
         snap = snapshots[item.instrument_id]
         if snap is not None:
@@ -746,8 +779,8 @@ def _station_day(items, **kw):
     no_books_used = 0
     unpriced_no = 0
     if survivors:
-        by_vector: dict[int, list[tuple[_Dir, object, object]]] = {}
-        p_by_vector: dict[int, dict] = {}
+        by_vector: dict[int, list[tuple[_Dir, _BookSnap, _ForecastVector]]] = {}
+        p_by_vector: dict[int, Any] = {}
         for item, snap, vector in survivors:
             by_vector.setdefault(vector.available_at_ns, []).append((item, snap, vector))
         for available, rows in by_vector.items():
@@ -768,9 +801,7 @@ def _station_day(items, **kw):
                 continue
             triple = computed.get(item.rung_id)
             if triple is None or not _point_ok(triple.point):
-                drops.append(
-                    _Drop(station, climate_day, item.rung_id, "nonfinite_or_out_of_range")
-                )
+                drops.append(_Drop(station, climate_day, item.rung_id, "nonfinite_or_out_of_range"))
                 continue
             if gate_vector is None or vector is not gate_vector:
                 vector_differs += 1
@@ -783,7 +814,7 @@ def _station_day(items, **kw):
                     climate_day=climate_day,
                     rung_id=item.rung_id,
                     p_nbp=float(triple.point),
-                    ask=float(snap.ask),
+                    ask=float(cast(float, snap.ask)),
                     bid=None if snap.bid is None else float(snap.bid),
                     outcome=_hit(item, kw["truth"][(station, climate_day)]),
                     ts_ns=int(snap.ts_ns),
@@ -802,7 +833,7 @@ def _station_day(items, **kw):
                     vector=vector,
                     side="yes",
                     instrument_id=item.instrument_id,
-                    price=float(snap.ask),
+                    price=float(cast(float, snap.ask)),
                     ladder=eval_ladder,
                     latch=latch,
                     placed=placed,
@@ -811,13 +842,12 @@ def _station_day(items, **kw):
                 if isinstance(decision, kw["Take"]):
                     pnl = yes_taker_pnl_usd(
                         outcome=1 if events[-1].outcome else 0,
-                        ask=_ask_cash(float(snap.ask)),
+                        ask=_ask_cash(float(cast(float, snap.ask))),
                         ts_event_ns=int(snap.ts_ns),
                     )
                     if pnl is None:
                         _stop(
-                            "fee refused after evaluate for "
-                            f"{station} {climate_day} {item.rung_id}"
+                            f"fee refused after evaluate for {station} {climate_day} {item.rung_id}"
                         )
                     yes_takes.append(_Take(station, climate_day, "yes", pnl))
             no_take, used, unpriced = _maybe_no(
@@ -851,7 +881,7 @@ def _station_day(items, **kw):
     return events, drops, yes_takes, no_takes, notes
 
 
-def _site_of(site_fn, station: str):
+def _site_of(site_fn: Callable[..., Any], station: str) -> Any:
     return site_fn(station)
 
 
@@ -873,7 +903,14 @@ def _hit(item: _Dir, tmax_f: int) -> bool:
     )
 
 
-def _drop_reason(item, snap, vector, climate_day, truth, conflicts):
+def _drop_reason(
+    item: _Dir,
+    snap: _BookSnap | None,
+    vector: _ForecastVector | None,
+    climate_day: dt.date,
+    truth: Mapping[tuple[str, dt.date], int],
+    conflicts: set[tuple[str, dt.date]],
+) -> str | None:
     """One reason, in the pre-registered order. None means the rung is scored."""
     if vector is None:
         return "no_vector"
@@ -896,11 +933,11 @@ def _drop_reason(item, snap, vector, climate_day, truth, conflicts):
     return None
 
 
-def _reason_of(decision) -> str:
+def _reason_of(decision: object) -> str:
     return str(getattr(decision, "reason", "take"))
 
 
-def _evaluate_side(kw, **args):
+def _evaluate_side(kw: Mapping[str, Any], **args: Any) -> Any:
     from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_as_of
 
     theta = taker_fee_coefficient_as_of(int(args["snap"].ts_ns))
@@ -943,7 +980,7 @@ def _evaluate_side(kw, **args):
     return decision
 
 
-def _maybe_no(kw, **args):
+def _maybe_no(kw: Mapping[str, Any], **args: Any) -> tuple[_Take | None, bool, bool]:
     """Price a NO take only from a captured NO book. Never synthesize 1 − bid."""
     from breezy.domain.instrument_leg import sibling_symbol_of
 
@@ -1003,7 +1040,15 @@ def _maybe_no(kw, **args):
     return take, True, False
 
 
-def _cluster_cis(items, statistic, draw_fn, interval_fn, *, seed: int, iterations: int):
+def _cluster_cis(
+    items: Sequence[Any],
+    statistic: Any,
+    draw_fn: Any,
+    interval_fn: Any,
+    *,
+    seed: int,
+    iterations: int,
+) -> tuple[tuple[float, float], tuple[float, float]]:
     station = draw_fn(
         items,
         statistic=statistic,
@@ -1031,14 +1076,14 @@ def _fmt_ci(ci: tuple[float, float] | None) -> str:
     return f"[{_fmt(ci[0])}, {_fmt(ci[1])}]"
 
 
-def _fmt_decomp(decomp) -> str:
+def _fmt_decomp(decomp: _MurphyView) -> str:
     return (
         f"Brier {_fmt(decomp.brier)}; REL {_fmt(decomp.reliability)}; "
         f"RES {_fmt(decomp.resolution)}; UNC {_fmt(decomp.uncertainty)}"
     )
 
 
-def _evidence(**kw) -> str:
+def _evidence(**kw: Any) -> str:
     from collections import Counter
 
     events = kw["events"]
@@ -1051,9 +1096,7 @@ def _evidence(**kw) -> str:
     reason_lines = [header, "|---|---|---|---|---|---|"]
     for reason in _DROP_REASONS:
         cells = [str(by_station[station][reason]) for station in _STATIONS]
-        reason_lines.append(
-            f"| {reason} | " + " | ".join(cells) + f" | {by_reason[reason]} |"
-        )
+        reason_lines.append(f"| {reason} | " + " | ".join(cells) + f" | {by_reason[reason]} |")
     scored_counts = Counter(event.station for event in events)
     scored_line = " | ".join(f"{station} {scored_counts[station]}" for station in _STATIONS)
     mid_block = "MID set empty (no report)."

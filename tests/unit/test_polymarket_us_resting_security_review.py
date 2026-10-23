@@ -17,6 +17,7 @@ from tests.unit.ambig_latch_rig import (
     OPEN_ORDERS_PATH,
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
+    resting_morning_clock,
     run_passes,
     submit_chain,
     wire_payloads,
@@ -97,7 +98,7 @@ async def test_s3_a_crash_replay_of_record_fill_does_not_double_the_settle_cost(
     """Process one wrote the durable ``POLL-`` record, then died before retiring the row. The next
     boot's spend seed already counted that record; re-booking the same fill must not add its
     cost a second time."""
-    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    rig, (command,) = await _rested(tmp_path, monkeypatch, clock=resting_morning_clock())
     first = rig.client
     _fill(rig, 0, commission="0.01")
     path = submit_chain.order_by_id_path(_id_n(0))
@@ -111,7 +112,13 @@ async def test_s3_a_crash_replay_of_record_fill_does_not_double_the_settle_cost(
     assert len(_records(rig)) == 1, "the record was written before the crash"
     monkeypatch.delattr(first, "_retire_resting_row")
     second = await _second_process(
-        tmp_path, monkeypatch, first, first.latch_cm, sender=CancelSender(), payloads=payloads
+        tmp_path,
+        monkeypatch,
+        first,
+        first.latch_cm,
+        sender=CancelSender(),
+        payloads=payloads,
+        clock=resting_morning_clock(),
     )
     await second._connect()
     spent = second._ledger.spent_today_usd(now_ns=second._clock.timestamp_ns())

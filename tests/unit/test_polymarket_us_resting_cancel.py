@@ -112,6 +112,7 @@ from tests.unit.ambig_latch_rig import (
     caps,
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
+    resting_morning_clock,
     run_passes,
     submit_chain,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
@@ -172,14 +173,31 @@ class CancelSender(_SlowSender):
         return VenueResponse(status=200, headers={}, body=b"{}")
 
 
-async def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pin: bool = False) -> _Rig:
+async def _rig(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pin: bool = False,
+    clock: Any | None = None,
+) -> _Rig:
+    """``pin`` is the slug cancel-all certification flag, not the clock.
+
+    ``clock`` defaults to a live clock so a confirm deadline (a frozen
+    TestClock never reaches it) still elapses. Escalation passes
+    ``resting_morning_clock()`` and it is installed before the permit is minted.
+    """
     monkeypatch.setattr(submit_chain, "GTD_EXPIRY_VERIFIED", True)
     monkeypatch.setattr(submit_chain, "SLUG_SCOPED_CANCEL_ALL_VERIFIED", pin)
     monkeypatch.setattr(submit_chain, "RESTING_CONFIRM_DEADLINE_NS", 20_000_000)
     monkeypatch.setattr(submit_chain, "RESTING_CONFIRM_POLL_S", 0.001)
     monkeypatch.setattr(submit_chain, "CANCEL_RETRY_BACKOFF_S", (0.001,))
     sender = CancelSender()
-    client, events, _permit, _cm = await build_client(tmp_path, monkeypatch, sender=sender)
+    client, events, _permit, _cm = await build_client(
+        tmp_path,
+        monkeypatch,
+        sender=sender,
+        clock=clock,
+    )
     client._resting_accept_admitted = True
     no = build_no_leg_instrument()
     client._cache.add_instrument(no)
@@ -660,7 +678,7 @@ async def test_two_concurrent_cancels_never_post_the_same_id_and_do_not_clear_ea
 async def test_refused_cancel_alerts_before_the_latch_then_escalates_and_latches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _rig(tmp_path, monkeypatch, pin=True, clock=resting_morning_clock())
     client = rig.client
     command = await _submit_rest(rig, 0)
     rig.sender.on_cancel = lambda _id: client.advance(400)  # the order stays open
