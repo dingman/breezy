@@ -69,6 +69,27 @@ PRE_RESOLVER_CALLEES = frozenset(
         # WP-DR (2026-10-10): a pure date function, no I/O, no egress. ONE
         # named row added to the baseline; the delta stays pinned by `==`.
         "utc_day_for_ns",
+        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "submit_chain.resting_index_bytes",
+        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "submit_chain.resting_binding_bytes",
+        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "self._read_fill_index",
+        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "submit_chain.valid_venue_order_id",
+        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "submit_chain.resting_echo_matches",
+        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "self.generate_order_accepted",
+        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`). NAMED row added to the baseline, never relaxed.
+        "self._bind_resting_order",
         # EXEC-PAR WP4 (r5 5.WP4, r5.1 E2): NAMED rows added to the baseline,
         # never relaxed (L-12) -- local-state calls only (the slot table, the
         # exposure registry, a pure leg-magnitude helper). `true_up_booking`
@@ -160,12 +181,25 @@ PRE_RESOLVER_COROUTINES = frozenset(
         "_resolve_accept_fill",
         "_resolve_ambiguous_intents",
         "_resolve_terminal_zero",
+        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1). NAMED row added to the
+        # baseline, never relaxed.
+        "_bind_resting_order",
     }
 )
 
 PRE_PERMITTED_COROUTINES = frozenset(
     {
         "__call__",
+        # S4 WP3 (ARM B4, pin row P4a): NAMED row added to the baseline, never relaxed.
+        "_confirm_resting_order",
+        # S4 WP4 (ARM B5, pin row P4e): copy of the inventory row.
+        "_sweep_resting_orders_at_boot",
+        # S4 WP4 (ARM B5, pin row P4c): copy of the inventory row.
+        "_cancel_slug_orders",
+        # S4 WP4 (ARM B5, pin row P4b): copy of the inventory row.
+        "_cancel_resting_order",
+        # S4 WP4 (ARM B5, pin row P4a): copy of the inventory row.
+        "_confirm_cancel_terminal",
         "_batch_cancel_orders",
         "_cancel_all_orders",
         "_cancel_order",
@@ -259,6 +293,20 @@ PRE_ORDER_CALLEES = frozenset(
         "submit_chain.retirement_member",
         "submit_chain.unmappable_exit_order_reason",
         "submit_chain.unmappable_order_reason",
+        # S4 WP3 (ARM B4, pin row P1c): NAMED row added to the baseline, never relaxed.
+        "self._bind_resting_order",
+        # S4 WP3 (ARM B4, pin row P1a): NAMED row added to the baseline, never relaxed.
+        "self._confirm_resting_order",
+        # S4 WP3 (ARM B4, pin row P1d-2): NAMED row added to the baseline, never relaxed.
+        "submit_chain.build_resting_order_body",
+        # S4 WP3 (ARM B4, pin row P1d-1): NAMED row added to the baseline, never relaxed.
+        "submit_chain.unmappable_resting_order_reason",
+        # S4 WP4 (ARM B5, pin row P1e): NAMED row added to the baseline, never relaxed.
+        "self._resting_cancel_target",
+        # S4 WP4 (ARM B5, pin row P1b): NAMED row added to the baseline, never relaxed.
+        "self._cancel_resting_order",
+        # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row added to the baseline, never relaxed.
+        "self._reject_cancel_of",
         "submit_chain.venue_order_id",
         "submit_chain.wire_fingerprint_bytes",
     }
@@ -292,8 +340,15 @@ FROZEN_SOURCE_SHA256: Final[dict[str, str]] = {
 #: Re-pinned by EXEC-PAR r5 §5 WP4 + r5.1 E14 (with the exec client's own pin):
 #: the per-slug admission, the open-exposure pre-check, the two body pins, the
 #: `arm_slot` call and the registration all sit INSIDE this prefix by design.
+#: S4 WP3 (ARM B4, pin row P22): RE-PINNED ONCE, 4183d5f4... -> 3b31ef5a.... The
+#: prefix gains exactly (1) `is_resting_order = False`, (2) the `elif
+#: order.time_in_force == TimeInForce.GTD` shape-dispatch arm (supervisor
+#: admission denial, `unmappable_resting_order_reason`), (3) the `elif
+#: is_resting_order` body arm, and (4) `resting=`/`resting_expire_ns=` on the
+#: pre-POST `_note_ambiguous_open`. Every IOC and exit statement is unchanged
+#: (the IOC `else` arms and all the denials around them are byte-identical).
 SUBMIT_PREFIX_SHA256: Final[str] = (
-    "4183d5f475c62f6f7ccdea387cc7bce051063935400a83492d21441e52aec6eb"
+    "3b31ef5a07ac254a0997fbc0045b818ab1de1eb48f7cf9018ccfe53996ff0223"
 )
 
 
@@ -448,9 +503,14 @@ def test_the_new_functions_await_only_the_existing_get_seams() -> None:
 def test_store_set_occurs_exactly_once_in_the_scanned_bodies_with_the_pinned_key() -> None:
     assert "_adopt_no_id_venue_order" in firewall.EXEC_RESOLVER_COROUTINES
     sites = _store_set_sites(_client_tree())
-    assert [name for name, _ in sites] == ["_adopt_no_id_venue_order"]
-    key = sites[0][1].args[0]
-    assert ast.unparse(key) == "f'{RESOLVER_CONTEXT_KEY_PREFIX}{adopted.intent_id}'"
+    # S4 WP3 (ARM B4, pin row P21): WIDENED by exactly the binder's two writes
+    # (the binding row, then the index), each on its own pinned key; the adopt
+    # site and its key are unchanged.
+    assert [(name, ast.unparse(call.args[0])) for name, call in sites] == [
+        ("_adopt_no_id_venue_order", "f'{RESOLVER_CONTEXT_KEY_PREFIX}{adopted.intent_id}'"),
+        ("_bind_resting_order", "f'{RESTING_KEY_PREFIX}{venue_order_id}'"),
+        ("_bind_resting_order", "RESTING_INDEX_KEY"),
+    ]
 
 
 def test_the_real_client_has_no_resolver_violation() -> None:
@@ -477,7 +537,7 @@ def test_planting_a_second_store_set_fails_the_single_site_pin() -> None:
     source = CLIENT_PATH.read_text(encoding="utf-8")
     planted = _plant(source, "_resolve_no_order", "self._store_set('k', b'v')")
     names = [name for name, _ in _store_set_sites(ast.parse(planted))]
-    assert names != ["_adopt_no_id_venue_order"]
+    assert names != ["_adopt_no_id_venue_order", "_bind_resting_order", "_bind_resting_order"]
     assert names.count("_resolve_no_order") == 1
 
 

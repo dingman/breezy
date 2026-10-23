@@ -135,7 +135,14 @@ def test_compose_non_veto_return_value_is_registry_unreadable() -> None:
 
 #: ARCH C6 member table (AUTONOMY_ARCHITECTURE.md:742-752), one literal copy.
 ARCH_C6_KINDS: Final[frozenset[str]] = frozenset(
-    {"current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"}
+    {
+        "current_rung_hold",
+        "continuous_rung_hold",
+        "forecast_ladder",
+        "forecast_quantile_ladder",
+        # ARM C2: one named row; the maker has no fills-to-score plug-in yet (plain refusing).
+        "no_ladder_maker",
+    }
 )
 C6_PROTOCOLS: Final[tuple[type, ...]] = (
     CaptureAdapter,
@@ -154,6 +161,7 @@ EXPECTED_OFFLINE_TYPES: Final[dict[str, type]] = {
     "continuous_rung_hold": ContinuousRungHoldOfflinePlugin,
     "forecast_ladder": RefusingPlugin,
     "forecast_quantile_ladder": FqEvaluator,
+    "no_ladder_maker": RefusingPlugin,
 }
 
 
@@ -198,7 +206,7 @@ def test_family_plugin_exact_set() -> None:
     assert set(NODE_PLUGINS) == set(OFFLINE_PLUGINS) == _COMPOSITION_KINDS
     for registry in (NODE_PLUGINS, OFFLINE_PLUGINS):
         assert isinstance(registry, MappingProxyType)
-        assert len(registry) == 4
+        assert len(registry) == 5
     # NODE_PLUGINS is untouched: every kind is still the plain RefusingPlugin
     assert all(type(v) is RefusingPlugin for v in NODE_PLUGINS.values())
     # OFFLINE_PLUGINS: each kind is EXACTLY its named class (``type(...) is``, no subclass slips in)
@@ -293,7 +301,7 @@ def test_a_member_added_to_refusing_plugin_later_is_policed_automatically(
 def test_only_the_three_scorer_kinds_have_a_real_label() -> None:
     for kind, instance in OFFLINE_PLUGINS.items():
         has = getattr(instance, "has_scorer", False)
-        assert has is (kind != "forecast_ladder"), kind
+        assert has is (kind not in {"forecast_ladder", "no_ladder_maker"}), kind
         if not has:
             with pytest.raises(PluginRefused):
                 instance.label(None, None, None)

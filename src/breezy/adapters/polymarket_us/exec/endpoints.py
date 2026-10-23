@@ -65,6 +65,7 @@ is the operator's portfolio; only its byte length is ever named.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, Final
@@ -74,13 +75,16 @@ from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO
 
 __all__ = [
     "ACCOUNT_BALANCES_PATH",
+    "CANCEL_ORDER_PATH_TEMPLATE",
     "OPEN_ORDERS_PATH",
     "ORDER_BY_ID_PATH_PREFIX",
     "PORTFOLIO_POSITIONS_PATH",
     "PRIVATE_READ_PATHS",
     "PRIVATE_READ_QUOTA_KEY",
+    "cancel_order_path",
     "decode_private_payload",
     "order_by_id_path",
+    "valid_venue_order_id",
 ]
 
 #: Account balances. Response shape ``GetAccountBalancesResponse``
@@ -138,6 +142,35 @@ def order_by_id_path(order_id: str) -> str:
     if any(ch in _ORDER_ID_FORBIDDEN or ch.isspace() for ch in order_id):
         raise ValueError("venue order id carries a path, query, fragment or whitespace character")
     return f"{ORDER_BY_ID_PATH_PREFIX}{order_id}"
+
+
+#: The per-order CANCEL write path (``POST`` with a ``{marketSlug}`` body),
+#: ARM B1 / S4 r4 rows P7 + T3. The ONLY write-path literal this module may
+#: carry: V2-allowlisted by exact string equality, this module only. It is
+#: never spliced from :data:`ORDER_BY_ID_PATH_PREFIX`; :func:`cancel_order_path`
+#: fills the ``{order_id}`` placeholder from a validated id. Nothing here sends.
+CANCEL_ORDER_PATH_TEMPLATE: Final[str] = "/v1/order/{order_id}/cancel"
+
+#: Venue order ids as observed (WP0 discovery note, Corrections B2: 54 ids,
+#: all ``^[A-Z0-9]{12}$``). Fail-closed: widen only by an evidence-cited row.
+#: ``re.ASCII`` plus ``fullmatch`` -- ``$`` would accept a trailing newline.
+_VENUE_ORDER_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Z0-9]{12}", re.ASCII)
+
+
+def valid_venue_order_id(order_id: object) -> bool:
+    """True only for a 12-character ASCII upper-case alphanumeric venue id."""
+    return (
+        isinstance(order_id, str)
+        and order_id.isascii()
+        and _VENUE_ORDER_ID_RE.fullmatch(order_id) is not None
+    )
+
+
+def cancel_order_path(order_id: str) -> str:
+    """The signed/dispatched POST path cancelling one order (``ValueError`` if invalid)."""
+    if not valid_venue_order_id(order_id):
+        raise ValueError("venue order id must match [A-Z0-9]{12} (ASCII)")
+    return CANCEL_ORDER_PATH_TEMPLATE.format(order_id=order_id)
 
 
 #: The rate-limit budget both private reads spend from. Not a new quota key:

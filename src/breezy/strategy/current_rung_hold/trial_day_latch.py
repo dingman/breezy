@@ -70,6 +70,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     STARTUP_OPEN_ORDERS_PRESENT_REASON,
+    STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY,
     DurableFillRecord,
 )
 from breezy.adapters.polymarket_us.symbology import (
@@ -1517,7 +1518,11 @@ def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str |
     exec client's read must have SUCCEEDED (``open_orders_read_refused`` is
     exactly ``False``) AND returned an EMPTY list. A record predating those
     two keys, a refused read, a malformed list, or ANY open order -- on a
-    configured market or a foreign one -- is a refusal. Fail closed: an
+    configured market or a foreign one -- is a refusal, EXCEPT an order the exec
+    client bound itself (``own_resting`` is exactly ``True``, S4 WP4 4b), and even
+    that only while ``resting_cancel_unconfirmed`` is exactly ``False`` (a present key
+    that is anything else refuses at once; an absent key refuses only when an order
+    is open). Fail closed: an
     enumeration error is never an assumed-empty book. Reasons are stable
     tokens; :data:`STARTUP_OPEN_ORDERS_PRESENT_REASON` is the one the exec
     client also logs at ERROR when it writes such a record.
@@ -1537,8 +1542,21 @@ def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str |
     open_orders = evidence.get("open_orders")
     if not isinstance(open_orders, list):
         return "open_orders_malformed"
-    if open_orders:
+    # S4 WP4 (4b, the own-order rule): an order the exec client itself BOUND to a
+    # `resting:` row on the same market (``own_resting`` exactly ``True``) does not
+    # disarm the book; ANY other open order -- unbound, foreign, or recorded before
+    # the key existed -- still refuses.
+    if any(not (isinstance(o, dict) and o.get("own_resting") is True) for o in open_orders):
         return STARTUP_OPEN_ORDERS_PRESENT_REASON
+    # B5 review G9: an own order whose cancel the client could not confirm terminal must
+    # not let the strategy arm. A present key that is not exactly ``False`` (latched, or
+    # garbage) refuses outright; an ABSENT key (a record written before it existed) is
+    # UNKNOWN and refuses only while an own order is open -- no open order, no effect.
+    if STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY in evidence:
+        if evidence[STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY] is not False:
+            return STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY
+    elif open_orders:
+        return STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY
     return None
 
 

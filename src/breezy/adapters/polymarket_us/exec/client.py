@@ -301,6 +301,7 @@ from breezy.adapters.polymarket_us.exec.refusals import (
 from breezy.adapters.polymarket_us.exec.reports import (
     NON_FILL_TERMINAL_STATUSES,
     OpenOrderRecord,
+    assert_commission_bps_inert,
     build_execution_mass_status,
     derive_position_cost_basis,
     parse_account_balances,
@@ -308,13 +309,18 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_order_status_report,
     parse_position_status_report,
     position_leg,
+    recognised_commission,
+    resting_commission_text,
+    resting_commission_total,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import (
     fee_schedule_bucket,
     polymarket_us_fee,
     taker_fee_at_fill,
+    taker_fee_coefficient_as_of,
     taker_fee_coefficient_of,
+    taker_fee_exact_at_fill,
 )
 from breezy.adapters.polymarket_us.no_id_attribution import (
     NoIdEcho,
@@ -373,6 +379,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         GeneratePositionStatusReports,
         ModifyOrder,
         QueryAccount,
+        QueryOrder,
         SubmitOrder,
         SubmitOrderList,
     )
@@ -394,6 +401,7 @@ __all__ = [
     "RESOLVER_CONTEXT_KEY_PREFIX",
     "STARTUP_EVIDENCE_KEY",
     "STARTUP_OPEN_ORDERS_PRESENT_REASON",
+    "STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY",
     "VENUE_ORDER_ID_KEY_PREFIX",
     "AmbiguousResolverContext",
     "DurableFillRecord",
@@ -463,6 +471,13 @@ FILL_BY_FINGERPRINT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_by_fing
 #: arm`), so an old key is never overwritten or collided with.
 RESOLVER_CONTEXT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resolver/"
 
+#: S4 WP3: venue order id -> the durable binding row of a BOUND resting order
+#: (``{intentId, slug, clientOrderId, expireTimeNs}``), and the one index key
+#: listing the bound ids (the store has no prefix scan; the index is read
+#: three-way like the fill index). Written ONLY by ``_bind_resting_order``.
+RESTING_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resting/"
+RESTING_INDEX_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}resting_index"
+
 #: C1 (plan rev 6.1): the strategy's never-arm/re-arm gate reads this key at
 #: `on_start` and after every resolver terminal-zero resolution
 #: (`read_startup_position_evidence`). Overwritten on EVERY write -- there is
@@ -476,6 +491,11 @@ STARTUP_EVIDENCE_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}startup_evidence"
 #: lowest layer) so both sides spell one string.
 STARTUP_OPEN_ORDERS_PRESENT_REASON: Final[str] = "startup_open_orders_present"
 
+#: S4 WP4 (B5 review G9): the evidence key AND the never-arm refusal token for a
+#: latched ``resting_cancel_unconfirmed`` (an own order whose cancel could not be
+#: confirmed terminal must not let the strategy arm). One spelling for both sides.
+STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY: Final[str] = "resting_cancel_unconfirmed"
+
 #: How many leading characters of a venue order id an ERROR line may carry.
 _ORDER_ID_REDACT_PREFIX: Final[int] = 4
 
@@ -483,6 +503,26 @@ _ORDER_ID_REDACT_PREFIX: Final[int] = 4
 def _redact_order_id(venue_order_id: str) -> str:
     """A venue order id reduced to a short prefix for a log line."""
     return f"{venue_order_id[:_ORDER_ID_REDACT_PREFIX]}\u2026"
+
+
+def _loggable_order_id(venue_order_id: object) -> str:
+    """What a log line or an alert detail may say about an order id (B5 review G14): a
+    VALID venue id is redacted to its prefix; one of this client's own synthetic latch ids
+    is shown verbatim; anything else (an id that fails the allowlist, so possibly
+    attacker-shaped) is replaced, never echoed -- no log injection."""
+    if venue_order_id in _SYNTHETIC_LATCH_IDS:
+        return str(venue_order_id)
+    if isinstance(venue_order_id, str) and submit_chain.valid_venue_order_id(venue_order_id):
+        return _redact_order_id(venue_order_id)
+    return "<invalid-id>"
+
+
+def _loggable_slug(slug: object) -> str:
+    """A market slug as a log line or alert detail may carry it: a valid daily-high slug
+    verbatim, anything else replaced (B5 review G14)."""
+    if isinstance(slug, str) and submit_chain.is_daily_high_slug(slug):
+        return slug
+    return "<invalid-slug>"
 
 
 #: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
@@ -1171,6 +1211,42 @@ class AmbiguousResolverContext:
     #: price. Same AR-N6 trailing-optional shape: an OLD blob has no key and
     #: decodes ``None`` (not evaluable).
     wire_quantity: str | None = None
+    #: S4 WP3: True for a RESTING (GTD) order. Serialised ONLY when True, so an
+    #: IOC context's bytes are unchanged; absent decodes ``False`` (AR-N6).
+    resting: bool = False
+    #: The resting order's ``expire_time`` (UNIX ns), from which the
+    #: ``goodTillTime`` echo is re-derived. ``None`` unless ``resting``.
+    resting_expire_ns: int | None = None
+
+    @property
+    def resting_wire_echo(self) -> dict[str, Any] | None:
+        """The nine-key body view a resting confirm/bind matches the venue's
+        order against, re-derived from the durable context (so the with-id
+        resolver can bind after a restart), or ``None`` when not evaluable. A
+        property, so no scanned body builds it (no new callee)."""
+        if (
+            not self.resting
+            or self.resting_expire_ns is None
+            or self.wire_market_slug is None
+            or self.wire_price is None
+            or self.wire_outcome_side is None
+            or self.wire_action is None
+            or self.wire_quantity is None
+        ):
+            return None
+        try:
+            good_till = submit_chain.format_good_till_time(self.resting_expire_ns)
+        except ValueError:
+            return None
+        return {
+            "marketSlug": self.wire_market_slug,
+            "price": {"value": self.wire_price, "currency": "USD"},
+            "quantity": self.wire_quantity,
+            "tif": submit_chain.TIF_GTD,
+            "outcomeSide": self.wire_outcome_side,
+            "action": self.wire_action,
+            "goodTillTime": good_till,
+        }
 
     @property
     def wire_quantity_decimal(self) -> Decimal | None:
@@ -1202,11 +1278,16 @@ class AmbiguousResolverContext:
             outcome_side=self.wire_outcome_side,
             action=self.wire_action,
             price=self.wire_price,
+            resting=self.resting,
         )
 
     def to_bytes(self) -> bytes:
+        resting_keys: dict[str, Any] = (
+            {"resting": True, "restingExpireNs": self.resting_expire_ns} if self.resting else {}
+        )
         return json.dumps(
             {
+                **resting_keys,
                 "wireMarketSlug": self.wire_market_slug,
                 "wirePrice": self.wire_price,
                 "wireOutcomeSide": self.wire_outcome_side,
@@ -1284,6 +1365,15 @@ class AmbiguousResolverContext:
             baseline_ts_ns = None if raw_baseline_ts is None else int(raw_baseline_ts)
         except (TypeError, ValueError):
             baseline_ts_ns = None
+        # S4 WP3: trailing-optional resting marker (absent = IOC context).
+        resting = payload.get("resting") is True
+        raw_resting_expire = payload.get("restingExpireNs")
+        try:
+            resting_expire_ns = (
+                int(raw_resting_expire) if resting and raw_resting_expire is not None else None
+            )
+        except (TypeError, ValueError):
+            resting_expire_ns = None
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -1311,6 +1401,8 @@ class AmbiguousResolverContext:
                 baseline_durable_net=_optional_text("baselineDurableNet"),
                 baseline_ts_ns=baseline_ts_ns,
                 wire_quantity=_optional_text("wireQuantity"),
+                resting=resting,
+                resting_expire_ns=resting_expire_ns,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1345,6 +1437,59 @@ class StartupPositionSnapshot:
     net_position: str | None
 
 
+#: The synthetic latch id of a ledger enumeration failure (not a venue order id).
+_LEDGER_LATCH_ID: Final[str] = "ledger"
+#: The synthetic latch id of a boot-sweep failure (not a venue order id). No read of it can
+#: ever be terminal, so a latch under this id is cleared ONLY by the next boot (a fresh
+#: process starts unlatched and its own sweep re-decides); it is never cleared mid-run.
+_BOOT_SWEEP_LATCH_ID: Final[str] = "boot-sweep"
+_SYNTHETIC_LATCH_IDS: Final[frozenset[str]] = frozenset({_LEDGER_LATCH_ID, _BOOT_SWEEP_LATCH_ID})
+
+
+def _binding_row_fields(row: object) -> tuple[str, str, str, int] | None:
+    """``(intent_id, client_order_id, slug, expire_time_ns)`` out of a decoded binding row,
+    or ``None`` when the row is not an object or any field has the wrong type (B5 review
+    G10/G11): ids must be printable-ASCII ``str``, the slug a daily-high market slug, the
+    expiry a non-negative ``int`` (never a ``bool``). Absent keys default to empty / ``0``;
+    an empty slug is still reported (the loop treats it as terminal-unconfirmable).
+    """
+    if not isinstance(row, dict):
+        return None
+    intent_id = row.get("intentId", "")
+    client_order_id = row.get("clientOrderId", "")
+    slug = row.get("slug", "")
+    expire = row.get("expireTimeNs", 0)
+    for text in (intent_id, client_order_id):
+        if not isinstance(text, str) or not (text.isascii() and (text == "" or text.isprintable())):
+            return None
+    if not isinstance(slug, str) or (slug != "" and not submit_chain.is_daily_high_slug(slug)):
+        return None
+    if not isinstance(expire, int) or isinstance(expire, bool) or expire < 0:
+        return None
+    return intent_id, client_order_id, slug, expire
+
+
+@dataclass(frozen=True, slots=True)
+class RestingTarget:
+    """One resting order this client may cancel: a BOUND ``resting:`` row (``bound``)
+    or the HOLD context of a with-id rest the resolver has not yet decided.
+
+    ``slug`` is empty when the durable row was unreadable (the cancel loop treats
+    that as terminal-unconfirmable); ``instrument_id`` / ``strategy_id`` come from
+    the durable resolver context, else the run's cache (``None`` when neither
+    knows the order, in which case no native event is generated for it).
+    """
+
+    venue_order_id: str
+    slug: str
+    client_order_id: str
+    intent_id: str
+    instrument_id: str | None
+    strategy_id: str | None
+    expire_time_ns: int
+    bound: bool
+
+
 @dataclass(frozen=True, slots=True)
 class StartupOpenOrderSnapshot:
     """One enumerated open order, as the never-arm gate needs it: enough to
@@ -1354,6 +1499,11 @@ class StartupOpenOrderSnapshot:
     venue_order_id: str
     market_slug: str
     state: str
+    #: S4 WP4 (4b): True iff ``venue_order_id`` has a live ``resting:`` binding row
+    #: whose slug equals ``market_slug`` -- an order THIS client bound. The never-arm
+    #: gate then ignores it; anything else open still refuses. A record written
+    #: before this field decodes ``False`` (unrecorded is never "ours").
+    own_resting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1383,10 +1533,21 @@ class StartupPositionEvidence:
     #: UNKNOWN, never "none open".
     open_orders_read_refused: bool = True
     open_orders: tuple[StartupOpenOrderSnapshot, ...] = ()
+    #: B5 review G9: whether ``resting_cancel_unconfirmed`` was latched when this row
+    #: was written. ``None`` = UNRECORDED (a row written before the key existed): the
+    #: gate then refuses any OWN open order, and a row with no open orders is
+    #: unaffected. Omitted from the bytes while ``None`` so an old row round-trips.
+    resting_cancel_unconfirmed: bool | None = None
 
     def to_bytes(self) -> bytes:
+        latch: dict[str, bool] = (
+            {}
+            if self.resting_cancel_unconfirmed is None
+            else {STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY: self.resting_cancel_unconfirmed}
+        )
         return json.dumps(
             {
+                **latch,
                 "v": 1,
                 "ts_ns": self.ts_ns,
                 "eof_complete": self.eof_complete,
@@ -1401,6 +1562,7 @@ class StartupPositionEvidence:
                         "venue_order_id": o.venue_order_id,
                         "market_slug": o.market_slug,
                         "state": o.state,
+                        "own_resting": o.own_resting,
                     }
                     for o in self.open_orders
                 ],
@@ -1457,6 +1619,7 @@ class StartupPositionEvidence:
                         venue_order_id=str(entry["venue_order_id"]),
                         market_slug=str(entry["market_slug"]),
                         state=str(entry["state"]),
+                        own_resting=entry.get("own_resting") is True,
                     )
                     for entry in raw_open_orders
                 )
@@ -1475,6 +1638,14 @@ class StartupPositionEvidence:
                 positions=snapshots,
                 open_orders_read_refused=open_orders_read_refused,
                 open_orders=open_orders,
+                resting_cancel_unconfirmed=(
+                    _require_bool(
+                        payload[STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY],
+                        field=STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY,
+                    )
+                    if STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY in payload
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ExecutionReportMappingError(
@@ -1509,6 +1680,11 @@ _RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = NON_FILL_TERMINAL_S
 #: of ``_RESOLVER_TERMINAL_STATUSES`` with ``filled_qty > 0`` (the
 #: terminal-fill case above).
 _RESOLVER_FILL_STATUSES: Final[frozenset[OrderStatus]] = frozenset({OrderStatus.FILLED})
+
+#: S4 WP3: venue states a resting confirm keeps polling through (not yet NEW).
+_RESTING_CONFIRM_PENDING_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED}
+)
 
 
 def _resolver_long_position_state(
@@ -1623,6 +1799,8 @@ _RESOLVER_ZERO_FILL_MIN_AGE_NS: Final[int] = 120 * 1_000_000_000
 #: 65 s``; the rest is eventual-consistency margin for the activities and
 #: positions feeds (about 2x the with-id 120 s floor that gates the same read).
 _RESOLVER_NO_ID_MIN_AGE_NS: Final[int] = 300 * 1_000_000_000
+#: One second in nanoseconds (the S4 cancel loop's alert/latch arithmetic).
+_NANOS_PER_SECOND: Final[int] = 1_000_000_000
 #: P-c: 30 s venue timestamp tolerance + 30 s clock offset + 5 s maxBlockTime.
 _NO_ID_FATE_FIXED_NS: Final[int] = 65 * 1_000_000_000
 #: A CHOICE, not a derivation: chosen only so the forward bound equals the
@@ -1645,6 +1823,22 @@ _NO_ID_NO_FILL_REASON: Final[str] = (
 #: After a CONTRADICTION or INCOMPLETE verdict the no-id branch makes no
 #: further reads for that intent until this long has passed.
 _NO_ID_RECHECK_INTERVAL_NS: Final[int] = 60 * 1_000_000_000
+
+#: S4 WP3 (ARM r2 D2 RED b): the `next` of a CONTRADICTION on a RESTING no-id
+#: intent -- a maker fill that happened before the order could be adopted has
+#: no automated resolution (fail closed). Runbook: stop the node, `breezy-clear-
+#: submit-intent --list`, then clear that intent with the venue evidence
+#: (positions + activities show the held NO leg) and `--ack`; see
+#: `src/breezy/runtime/clear_submit_intent_cli.py`.
+_RESTING_NO_ID_OPERATOR_CLEAR_NEXT: Final[str] = (
+    "operator_clears_via_breezy_clear_submit_intent_after_venue_reconcile"
+)
+#: S4 WP5: the CRITICAL reason of a swept prior-process resting no-id intent whose slug shows a
+#: fill while the node was down (the holding moved unexplained, or a non-manual TRADE row
+#: sits on the slug since the intent was created). Stays AMBIGUOUS; the clearing path is the
+#: operator runbook above. And the default retirement reason of every other no-id intent.
+_RESTING_FILL_WHILE_DOWN_TOKEN: Final[str] = "resting_no_id_fill_while_down"
+_NO_ID_NO_FILL_RETIRE_REASON: Final[str] = "RESOLVER_NO_ID_NO_FILL"
 #: A manual trade this close to the baseline snapshot may or may not be in it
 #: (the venue's 30 s timestamp tolerance), so it cannot be reconciled.
 _NO_ID_MANUAL_STRADDLE_NS: Final[int] = 30 * 1_000_000_000
@@ -1804,6 +1998,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         exit_manifest: FamilyManifest | None = None,
         resolver_instrument_loader: Callable[[str], Any] | None = None,
         no_id_retire_admitted: bool = False,
+        resting_accept_admitted: bool = False,
+        sweep_retire_admitted: bool = False,
         frozen_cost_budget_bucket: str | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
@@ -1885,8 +2081,40 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: reassignment (set algebra on a frozenset, never `.add`), so the
         #: scanned order coroutine makes no new call.
         self._post_in_flight_intent_ids: frozenset[str] = frozenset()
+        # S4 WP3: bound resting orders. `_resting_bookings` maps a venue order id to
+        # `(intent_id, booking)` (the booking stays registered until a cancel/fill
+        # settles it); `_this_process_resting_ids` are the ids THIS process armed
+        # (the only ones whose permit slot a later cancel may restore);
+        # `_cancel_in_flight` are venue ids a cancel loop is working (the with-id
+        # resolver skips them, so it can neither bind nor retire one concurrently).
+        # All three are replaced, never mutated.
+        self._resting_bookings: dict[str, tuple[str, Any]] = {}
+        self._this_process_resting_ids: frozenset[str] = frozenset()
+        self._cancel_in_flight: frozenset[str] = frozenset()
+        # S4 WP4: the cancel loop's bookkeeping. `_unconfirmed_cancel_ids` are the venue
+        # ids whose cancel latched `resting_cancel_unconfirmed` (the latch clears when
+        # the last of them reads terminal); `_resting_cancel_alert_*` are the
+        # non-latching CRITICAL alert surface (`resting_cancel_alerts`). Replaced,
+        # never mutated.
+        self._unconfirmed_cancel_ids: frozenset[str] = frozenset()
+        self._resting_cancel_alert_details: dict[str, Mapping[str, str]] = {}
+        self._resting_cancel_alert_ns: dict[str, int] = {}
+        # Intents whose slug the boot sweep confirmed empty (process-local; WP5 reads it).
+        self._swept_resting_intent_ids: frozenset[str] = frozenset()
+        # Consecutive failed polls per bound id, and the ids latched
+        # `resting_query_unreadable` (the WP5 poll reports through `_note_resting_poll`).
+        self._resting_poll_failures: dict[str, int] = {}
+        self._unreadable_resting_ids: frozenset[str] = frozenset()
+        # S4 WP5: the non-latching CRITICAL alert surface of the two commission latches
+        # (`resting_commission_alerts`); value-free by construction. Replaced, never mutated.
+        self._resting_commission_alert_details: dict[str, Mapping[str, str]] = {}
         self._resolved_no_id_ts_ns: dict[str, int] = {}
         self._no_id_next_check_ns: dict[str, int] = {}
+        # S4 WP3: the first NO_FILL verdict time of a RESTING no-id intent. A rest needs
+        # TWO consecutive NO_FILL verdicts >= `_NO_ID_RECHECK_INTERVAL_NS` apart
+        # (a late-landing POST after the first read is then caught by the second).
+        # 0 = no streak (reset by any other verdict); removed at retirement.
+        self._no_id_resting_first_nofill_ns: dict[str, int] = {}
         self._settled_positions: list[InstrumentId] = []
         self._order_sender = order_sender
         self._write_signer = write_signer
@@ -1902,6 +2130,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `RESOLVER_NO_ID_NO_FILL` retirement reason. Set once at node boot;
         # `_resolve_no_order` refuses to retire without it (fail closed).
         self._no_id_retire_admitted: bool = bool(no_id_retire_admitted)
+        # S4 WP2/WP3: whether the running supervisor can decode the
+        # `ACCEPTED_RESTING` retirement reason. Set once at node boot; without it
+        # a resting submit is denied before any venue contact (fail closed), so
+        # no node can write a record the supervisor would read as corrupt (L-48).
+        self._resting_accept_admitted: bool = bool(resting_accept_admitted)
+        # S4 WP4: whether the running supervisor can decode the
+        # `BOOT_SWEEP_RESTING_NO_FILL` retirement reason. Set once at node boot;
+        # `_resolve_no_order` refuses that reason without it (fail closed), so a
+        # swept no-id rest stays AMBIGUOUS rather than write a record the
+        # supervisor would read as corrupt.
+        self._sweep_retire_admitted: bool = bool(sweep_retire_admitted)
         #: EXEC-PAR 3.9: the D-PREREG-frozen cap/budget bucket LABEL (never a
         #: dollar value), handed in by the composition root. At boot with K > 1
         #: a live label above it, an unreadable label, or an absent frozen label
@@ -2416,6 +2655,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # wholly before or wholly after this span. A raise propagates and
             # fails the connect closed, exactly as the seed does.
             self._register_open_intents_at_boot()
+            # S4 WP4 (B4 review item 1): the same synchronous span -- rehydrate every
+            # BOUND rest from the durable ledger so its exposure is registered (unknown
+            # notional: admission is refused) and its booking is tracked for the sweep.
+            self._rehydrate_resting_at_boot()
+            # B6 review P2: a restart must not silently clear the commission latches.
+            self._rederive_commission_latches()
             # AC6b (EDGE-2 plan r3, D8): the NEXT statement, no `await`
             # between -- a fill the resolver's own immediate pass above
             # already recorded (before this line runs) was necessarily
@@ -2431,6 +2676,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # `_reconcile_submit_intent`/`record_fill`), so it lands before
             # the resolver's NEXT periodic pass, not before its first.
             self._reconcile_no_side_first_order_key()
+            # S4 WP4 (4e): the boot sweep -- cancel-on-stop enforcement and the only
+            # retirement route for a prior-process no-id rest. BEFORE the startup
+            # evidence write below, so the evidence sees the swept book. Never raises:
+            # a failure latches and the node keeps refusing NEW rests.
+            await self._sweep_resting_orders_at_boot()
             # C1 (plan rev 6.1): the strategy's never-arm gate needs FRESH
             # startup evidence, taken AFTER reconciliation -- last, not
             # first, so a position opened or closed by whatever reconcile
@@ -3253,6 +3503,24 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 except Exception as exc:  # noqa: BLE001 - never kill the polling task
                     self._note_resolver_error(current.intent_id, exc)
                 continue
+            # S4 WP3 (r4 WP3.4): a with-id context whose POST (+ confirm) is still
+            # in flight belongs to `_submit_order`; the resolver must not act on
+            # it. A definite step (pure `in`, the shape of the no-id skip). For an
+            # IOC intent a with-id context is only ever written AFTER the POST's
+            # `finally`, so this never fires for one.
+            if current.intent_id in self._post_in_flight_intent_ids:
+                self._log.debug(
+                    f"resolver: intent {current.intent_id} POST in flight; skipping"
+                )
+                continue
+            # S4 WP3 (r4 WP3.8): a cancel loop owns this venue id; the resolver
+            # can neither bind a PENDING_CANCEL order nor retire it concurrently.
+            if context.venue_order_id in self._cancel_in_flight:
+                self._log.debug(
+                    f"resolver: venue order for intent {current.intent_id} has a "
+                    "cancel in flight; skipping"
+                )
+                continue
             try:
                 order_payload = await self._private_read(
                     submit_chain.order_by_id_path(context.venue_order_id)
@@ -3373,6 +3641,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"resolver: venue order {context.venue_order_id} is "
                     f"PARTIALLY_FILLED (cum={report.filled_qty}); a live "
                     "state, never resolves -- stays AMBIGUOUS, keep polling"
+                )
+                continue
+
+            # S4 WP3 (r4 WP3.7): a resting context whose GET reads a clean matching
+            # NEW (no age floor) binds through the SAME binder `_submit_order` uses.
+            # Terminal-zero and fills fall through to the unchanged paths below.
+            if (
+                context.resting
+                and report.order_status is OrderStatus.ACCEPTED
+                and report.filled_qty.raw == 0
+                and context.resting_wire_echo is not None
+                and submit_chain.resting_echo_matches(
+                    report, context.resting_wire_echo, order_body
+                )
+            ):
+                self._bind_resting_order(
+                    context, context.venue_order_id, self._clock.timestamp_ns()
                 )
                 continue
 
@@ -4299,6 +4584,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if intent_id in self._post_in_flight_intent_ids:
             self._log.debug(f"resolver: no-id intent {intent_id} POST in flight; skipping")
             return
+        # S4 WP5 (r3 "prior process"): a RESTING no-id intent THIS process did not arm (its
+        # booking died with the old process) is never classified by the attribution join: the
+        # order is gone. Only the boot sweep's "swept" marker lets it be evaluated at all.
+        resting_prior = (
+            context is not None
+            and context.resting
+            and intent_id not in self._ambiguous_bookings
+        )
+        swept_mode = resting_prior and intent_id in self._swept_resting_intent_ids
+        if resting_prior and not swept_mode:
+            self._log.debug(
+                f"resolver: prior-process resting no-id intent {intent_id} is not swept; "
+                "stays AMBIGUOUS"
+            )
+            return
         now_ns = self._clock.timestamp_ns()
         age_ns = now_ns - created_ns
         if age_ns < _RESOLVER_NO_ID_MIN_AGE_NS:
@@ -4486,21 +4786,70 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             for order in open_orders
             if self.client_order_id_for(VenueOrderId(order.venue_order_id)) is not None
         }
-        verdict = classify_no_id_evidence(
-            legs=join.legs,
-            passive_manual=join.passive_manual,
-            legs_complete=join.complete,
-            out_of_order=join.out_of_order,
-            open_orders=open_orders,
-            open_orders_ok=open_orders_ok,
-            known_order_ids=known,
-            echo=echo,
-            window_start_ns=window_start_ns,
-            window_end_ns=window_end_ns,
-        )
-        outcome_kind: str = verdict.kind
-        outcome_token = f"{verdict.token}"
+        adopt_id = ""
+        outcome_kind: str
+        if swept_mode:
+            # Prior-process swept rest: no attribution join. (b) any non-manual TRADE row on
+            # the slug at or after the intent's creation is a fill while down (the order was
+            # cancelled and read-confirmed gone); unreadable activities retry. Plain loop and
+            # comparisons only: no new callee in this scanned body.
+            outcome_kind = "NO_FILL"
+            outcome_token = "None"
+            if echo is None:
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "holding_unreadable"
+            elif not open_orders_ok:
+                # B6 review S1: an unread open-orders book is not a clear slug
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "open_orders_unreadable"
+            elif join.out_of_order or not join.complete:
+                outcome_kind = "INCOMPLETE"
+                outcome_token = "activities_incomplete"
+            else:
+                for open_order in open_orders:
+                    if open_order.market_slug == echo.slug:
+                        # B6 review S1: an order still open on the swept slug may yet fill
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "open_order_on_swept_slug"
+                row_index = 0
+                for leg in join.legs:
+                    passive_is_manual = join.passive_manual[row_index]
+                    row_index += 1  # noqa: SIM113 - enumerate() would be a new scanned callee
+                    if (
+                        not leg.manual
+                        and not passive_is_manual
+                        and leg.market_slug == echo.slug
+                        and leg.trade_create_ns >= created_ns
+                    ):
+                        outcome_kind = "CONTRADICTION"
+                        outcome_token = "unattributed_automated_trade_in_window"
+        else:
+            verdict = classify_no_id_evidence(
+                legs=join.legs,
+                passive_manual=join.passive_manual,
+                legs_complete=join.complete,
+                out_of_order=join.out_of_order,
+                open_orders=open_orders,
+                open_orders_ok=open_orders_ok,
+                known_order_ids=known,
+                echo=echo,
+                window_start_ns=window_start_ns,
+                window_end_ns=window_end_ns,
+            )
+            outcome_kind = verdict.kind
+            outcome_token = f"{verdict.token}"
+            adopt_id = f"{verdict.order_id}"
         manual_reason = ""
+        if (
+            outcome_kind == "ADOPT"
+            and context is not None
+            and context.resting
+            and not submit_chain.valid_venue_order_id(adopt_id)
+        ):
+            # A resting id is written into the durable resolver context and later
+            # spliced into GET and cancel paths: it must pass the allowlist HERE.
+            outcome_kind = "CONTRADICTION"
+            outcome_token = "adopted_resting_id_invalid"
 
         if outcome_kind == "NO_FILL":
             # The positions baseline, checked only when attribution is clean.
@@ -4579,11 +4928,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                                         "resolver: no-id holding delta reconciled by "
                                         f"{manual.count} manual leg(s)"
                                     )
+                        elif swept_mode:
+                            # (a) needs the baseline: without it the holding is not evaluable
+                            outcome_kind = "INCOMPLETE"
+                            outcome_token = "holding_unreadable"
                         elif (
                             echo.action == "ORDER_ACTION_BUY" and venue_leg_qty > durable_qty
                         ) or (echo.action != "ORDER_ACTION_BUY" and venue_leg_qty < durable_qty):
                             outcome_kind = "CONTRADICTION"
                             outcome_token = "unexplained_holding"
+                    elif swept_mode:
+                        # the instrument is not listed today: (a) is not evaluable
+                        outcome_kind = "INCOMPLETE"
+                        outcome_token = "holding_unreadable"
                 elif echo is None:
                     listed_instruments = 0
                     for candidate in self._instrument_provider.list_all():
@@ -4607,6 +4964,35 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._note_resolver_error(intent_id, exc)
                 return
 
+        if outcome_kind != "NO_FILL" and intent_id in self._no_id_resting_first_nofill_ns:
+            # A non-negative verdict resets the streak (0 = none; a dict-method call
+            # would be an unpermitted callee in this scanned coroutine).
+            self._no_id_resting_first_nofill_ns = {
+                **self._no_id_resting_first_nofill_ns,
+                intent_id: 0,
+            }
+        if outcome_kind == "NO_FILL" and context is not None and context.resting:
+            # S4 WP3: a RESTING order needs two consecutive complete negative
+            # passes, >= the recheck interval apart, before it is called NO_FILL.
+            first_nofill_ns = (
+                self._no_id_resting_first_nofill_ns[intent_id]  # noqa: SIM401
+                if intent_id in self._no_id_resting_first_nofill_ns
+                else 0
+            )
+            if first_nofill_ns == 0:
+                self._no_id_resting_first_nofill_ns = {
+                    **self._no_id_resting_first_nofill_ns,
+                    intent_id: now_ns,
+                }
+                self._no_id_next_check_ns[intent_id] = recheck_ns
+                self._log.info(
+                    f"resolver: resting no-id intent {intent_id} first negative pass; "
+                    "a second consecutive one is required before NO_FILL"
+                )
+                return
+            if now_ns - first_nofill_ns < _NO_ID_RECHECK_INTERVAL_NS:
+                self._no_id_next_check_ns[intent_id] = recheck_ns
+                return
         if outcome_kind == "CONTRADICTION":
             holding = outcome_token in {"unexplained_holding", "unexplained_holding_delta"}
             if holding and intent_id not in self._holding_contradiction_intent_ids:
@@ -4616,6 +5002,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     self._holding_contradiction_intent_ids | {intent_id}
                 )
                 self._contradiction_events_total += 1
+            if swept_mode:
+                # every contradiction of a swept prior-process rest is a fill while down
+                outcome_token = _RESTING_FILL_WHILE_DOWN_TOKEN
             details = {
                 "severity": "CRITICAL",
                 "event": "resolver_evidence_contradiction",
@@ -4625,9 +5014,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "no_id": "true",
                 "reason": outcome_token,
                 "next": (
-                    "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution"
-                    if holding
-                    else "no_id_recheck_60s"
+                    _RESTING_NO_ID_OPERATOR_CLEAR_NEXT
+                    if context is not None and context.resting
+                    else (
+                        "no_id_recheck_60s_manual_reconcile_then_launch_after_market_resolution"
+                        if holding
+                        else "no_id_recheck_60s"
+                    )
                 ),
             }
             if manual_reason:
@@ -4656,7 +5049,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return
             self._no_id_next_check_ns[intent_id] = recheck_ns
             try:
-                self._adopt_no_id_venue_order(context, f"{verdict.order_id}")
+                self._adopt_no_id_venue_order(context, adopt_id)
                 cached = self._cache.order(ClientOrderId(context.client_order_id))
                 if cached is not None and cached.status is OrderStatus.INITIALIZED:
                     self._generate_submitted(cached, now_ns)
@@ -4665,7 +5058,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return
             self._log.warning(
                 f"resolver: no-id intent {intent_id} adopted venue order "
-                f"{_redact_order_id(f'{verdict.order_id}')}; resolving on the with-id path"
+                f"{_redact_order_id(adopt_id)}; resolving on the with-id path"
             )
             return
         # NO_FILL with the baseline passing: the H2 analogue, set only by a
@@ -4675,7 +5068,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # the interval, never on every 5 s poll.
         self._no_id_next_check_ns[intent_id] = recheck_ns
         try:
-            self._resolve_no_order(intent_id, context, now_ns, positions, slug=intent_slug)
+            self._resolve_no_order(
+                intent_id,
+                context,
+                now_ns,
+                positions,
+                slug=intent_slug,
+                reason=(
+                    submit_chain.RETIRE_BOOT_SWEEP_RESTING_NO_FILL
+                    if swept_mode
+                    else _NO_ID_NO_FILL_RETIRE_REASON
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - see `_resolve_ambiguous_intents`
             self._note_resolver_error(intent_id, exc)
 
@@ -4698,16 +5102,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         positions: Mapping[str, Any] | None = None,
         *,
         slug: str = "",
+        reason: str = "RESOLVER_NO_ID_NO_FILL",
     ) -> None:
         """Retire a no-id intent that complete reads show neither an order nor a
         fill for. Mirrors :meth:`_resolve_terminal_zero` step for step.
 
-        Refuses unless the running supervisor can decode the new retirement
+        ``reason`` is the retirement name: the default keeps today's behaviour; the
+        S4 swept-rest reason ``BOOT_SWEEP_RESTING_NO_FILL`` is gated by its OWN
+        decode marker (``_sweep_retire_admitted``) instead.
+
+        Refuses unless the running supervisor can decode the retirement
         reason (``_no_id_retire_admitted``, fail-closed) and unless
         ``_resolved_no_id_ts_ns`` carries a complete negative pass from THIS run
         (the SAFETY H2 analogue). The AMBIGUOUS-refusal clear is the LAST step.
         """
-        if not self._no_id_retire_admitted:
+        sweep_reason = reason == submit_chain.RETIRE_BOOT_SWEEP_RESTING_NO_FILL
+        admitted = self._sweep_retire_admitted if sweep_reason else self._no_id_retire_admitted
+        if not admitted:
             already_blocked = intent_id in self._resolver_contradiction_details
             self._resolver_contradiction_details = {
                 **self._resolver_contradiction_details,
@@ -4778,8 +5189,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._ledger.abandon_open_exposure(intent_id)
                 settle_failed = True
         self._ambiguous_bookings.pop(intent_id, None)
-        self._retire(intent_id, "RESOLVER_NO_ID_NO_FILL", now_ns)
-        self._log.info(f"resolver: retired intent {intent_id} (RESOLVER_NO_ID_NO_FILL)")
+        self._retire(intent_id, reason, now_ns)
+        self._log.info(f"resolver: retired intent {intent_id} ({reason})")
         if booking is not None:
             # Same process only: on restart the ledger died with the process.
             if (
@@ -6012,8 +6423,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         fill_time_instrument: Instrument | None = None,
         intent_fingerprint: str | None = None,
         intent_created_ns: int | None = None,
+        maker_poll: bool = False,
     ) -> None:
         """Persist one venue order's cumulative totals and index it.
+
+        B6 review S8 (the ARM D1 single-writer rule, enforced in code): the ``POLL-`` trade-id
+        namespace marks a poll-booked MAKER fill and belongs to the resting-order poll alone
+        (``maker_poll=True``); any other caller recording a ``POLL-`` trade id (a venue-chosen
+        ``Execution.tradeId``) is refused before anything is written.
 
         AUD-13b (ruling R-1 = O4 mechanism (a)): the two fill write sites pass
         ``fill_time_instrument`` -- the ``Instrument`` in hand when the fill
@@ -6048,6 +6465,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         identical ``_FILL_WRITE_FAILED`` refusal path -- an index write
         failure never leaves the fill record written without it silently.
         """
+        if not maker_poll and submit_chain.is_maker_poll_fill(record.trade_id):
+            raise PolymarketUSError(
+                "a fill record may carry a POLL- trade id only from the resting-order poll "
+                "(the D1 maker-fill marker is single-writer)"
+            )
         if fill_time_instrument is not None:
             record = dataclasses.replace(
                 record,
@@ -6243,6 +6665,49 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return False
         return True
 
+    def _own_resting_pairs(self) -> frozenset[tuple[str, str]]:
+        """The ``(venue_order_id, slug)`` pairs the never-arm gate may call OURS (S4 WP4 4b,
+        tightened by B5 review G9): a BOUND ``resting:`` row with a non-empty intent id,
+        client order id and slug AND an open exposure for its intent in the ledger. An
+        unreadable index, a poisoned row or any failure here yields NONE, so every open
+        order stays foreign (the gate refuses) and the evidence write never raises.
+        """
+        try:
+            ledger = self._ledger
+            if ledger is None:
+                return frozenset()
+            return frozenset(
+                (t.venue_order_id, t.slug)
+                for t in (self._resting_ledger() or ())
+                if t.bound
+                and t.intent_id
+                and t.client_order_id
+                and t.slug
+                and ledger.has_open_exposure(t.intent_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed: no order is ours
+            self._log.error(f"startup evidence: own-order derivation failed ({type(exc).__name__})")
+            return frozenset()
+
+    def _resting_cancel_latched(self) -> bool:
+        """Whether ``resting_cancel_unconfirmed`` is latched now (the evidence key)."""
+        return bool(self._unconfirmed_cancel_ids) or any(
+            r.reason == submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+            for r in self._trading_refusals
+        )
+
+    def _resting_cancel_evidence(self) -> bool | None:
+        """The ``resting_cancel_unconfirmed`` value to RECORD in the startup evidence, or
+        ``None`` to omit the key. Written only when it carries information: ``True`` while
+        latched, ``False`` while an open order exists (the arm gate needs the explicit
+        ``False`` to exempt an own order). A flat book with the latch clear omits it, so
+        the row is byte-identical to the pre-S4 evidence (the K=1 golden) and the gate's
+        verdict is unchanged: an absent key refuses only when an order is open.
+        """
+        if self._resting_cancel_latched():
+            return True
+        return False if self._open_orders else None
+
     def _write_startup_position_evidence(
         self,
         *,
@@ -6270,6 +6735,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 if net_raw is not None:
                     net_position = str(net_raw)
             snapshots.append(StartupPositionSnapshot(slug=slug, net_position=net_position))
+        own_resting = self._own_resting_pairs()
         evidence = StartupPositionEvidence(
             ts_ns=now_ns,
             eof_complete=eof_complete,
@@ -6282,9 +6748,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     venue_order_id=o.venue_order_id,
                     market_slug=o.market_slug,
                     state=o.state,
+                    own_resting=(o.venue_order_id, o.market_slug) in own_resting,
                 )
                 for o in self._open_orders
             ),
+            resting_cancel_unconfirmed=self._resting_cancel_evidence(),
         )
         self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
         # R-9a (HF-4 rev2): the single writer of the watermark the resolver's
@@ -6598,12 +7066,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         report at all. That is the trade, stated rather than hidden.
         """
         if liquidity_side == LiquiditySide.MAKER:
-            self._refuse(
-                f"a MAKER reconciliation fill was priced for {instrument.id}: "
-                "Breezy is taker-only, so this is a fill it did not intend, and "
-                "the venue's documented maker coefficient is a REBATE -- the "
-                "TAKER coefficient charged here overstates the cost"
-            )
+            if self._maker_fill_is_a_bound_rest(instrument, last_qty, last_px):
+                # CC-1: a maker fill of one of OUR bound rests is the expected outcome of
+                # the resting-order path, not an event to alarm on. Priced at taker below.
+                self._log.warning(
+                    "reconciliation: a MAKER fill on "
+                    f"{base_slug_of(instrument.id)} matches a bound resting order "
+                    "(carve-out); priced at the taker figure, not refused"
+                )
+            else:
+                self._refuse(
+                    f"a MAKER reconciliation fill was priced for {instrument.id}: "
+                    "Breezy is taker-only, so this is a fill it did not intend, and "
+                    "the venue's documented maker coefficient is a REBATE -- the "
+                    "TAKER coefficient charged here overstates the cost"
+                )
         try:
             return polymarket_us_fee(instrument, last_qty, last_px)
         except FeeScheduleUnknownError as exc:
@@ -6621,6 +7098,50 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "on it, and this refusal freezes the instrument"
             )
             return None
+
+    def _maker_fill_is_a_bound_rest(
+        self, instrument: Instrument, last_qty: Quantity, last_px: Price
+    ) -> bool:
+        """CC-1 (S4 r4 WP5): is this MAKER reconciliation fill the expected fill of one of our
+        own bound rests? ALL of: the fill is for quantity 1; the instrument is that rest's
+        (base slug AND the rest's own leg instrument); the price EQUALS the rest's limit price
+        (Decimal equality, read from this run's cached order); the rest is unretired (still
+        in the ``resting:`` index). Default OFF and NEVER RAISES: an unreadable or unavailable
+        ledger (store closed, a bad row, any enumeration error), an unknown order or a
+        mismatch is ``False``, so the caller refuses exactly as before.
+
+        Residue (B6 review S5, accepted): ``calculate_commission`` carries no order side, so
+        the side of the fill is not checked; a MAKER fill that matches an unretired rest on
+        instrument, quantity and limit price is taken to be that rest's. The carve-out only
+        skips a refusal; the fill is still priced at the taker figure.
+
+        Post-retire window (B6 review, accepted): the rest must be UNRETIRED. Once the poll or
+        the cancel path has booked the fill and retired the row, a late MAKER reconciliation
+        fill of the same order no longer matches, so it refuses exactly as an unknown maker
+        fill does (an alarm, fail closed), never a silent second booking.
+        """
+        try:
+            if last_qty.as_decimal() != 1:
+                return False
+            ledger = self._enumerate_resting_ledger()
+            if ledger is None:
+                return False
+            slug = base_slug_of(instrument.id)
+            for target in ledger:
+                if not target.bound or target.slug != slug:
+                    continue
+                # B6 review S5: explicit equality. A row that does not name its leg
+                # instrument (None) never matches, so the refusal stands (fail closed).
+                if target.instrument_id != str(instrument.id):
+                    continue
+                cached = self._cache.order(ClientOrderId(target.client_order_id))
+                if cached is None or cached.price is None:
+                    continue
+                if cached.price.as_decimal() == last_px.as_decimal():
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - calculate_commission MUST NOT raise
+            return False
 
     # -- the order surface: refusal, and nothing else -----------------------
 
@@ -6680,12 +7201,28 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._create_fill_recorded_intent_ids = self._create_fill_recorded_intent_ids - {
             intent_id
         }
+        self._no_id_resting_first_nofill_ns = {
+            key: value
+            for key, value in self._no_id_resting_first_nofill_ns.items()
+            if key != intent_id
+        }
         # EXEC-PAR E1 leak backstop: every handler settles BEFORE calling here,
         # so an entry still open now is a registry leak. Never settle from here
         # (that would hide the leak and re-open the unregistered-booking raise):
         # log it and count it; the entry stays, which is conservative because it
         # keeps its headroom held.
-        if self._ledger is not None and self._ledger.has_open_exposure(intent_id):
+        # S4 WP3 carve-out: a BOUND resting order keeps its exposure registered by
+        # design (it is settled once, on the cancel/fill that ends the rest), so
+        # `ACCEPTED_RESTING` retirement of an intent that holds a resting booking
+        # is not a leak. ANY other retirement with an open entry still counts.
+        is_bound_rest = retire_name == submit_chain.RETIRE_ACCEPTED_RESTING and any(
+            held[0] == intent_id for held in self._resting_bookings.values()
+        )
+        if (
+            self._ledger is not None
+            and not is_bound_rest
+            and self._ledger.has_open_exposure(intent_id)
+        ):
             # A direct increment, not `_note_resolver_error`: that helper takes an
             # exception and dedupes its ERROR per intent, and routing a non-raise
             # leak through it would need a synthetic exception (E14.9).
@@ -6723,7 +7260,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         wire_quantity: int | str | None = None,
         register_booking: bool = True,
         capture_holding_baseline: bool = False,
-    ) -> None:
+        resting: bool = False,
+        resting_expire_ns: int | None = None,
+    ) -> AmbiguousResolverContext:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
         same-process true-up. Inert sync callee, named in the E0-NOSEND
@@ -6784,10 +7323,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             baseline_venue_net=None if baseline is None else baseline.venue_net,
             baseline_durable_net=None if baseline is None else baseline.durable_net,
             baseline_ts_ns=None if baseline is None else baseline.ts_ns,
+            resting=resting,
+            resting_expire_ns=resting_expire_ns if resting else None,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         if register_booking:
             self._ambiguous_bookings[intent_id] = booking
+        return context
 
     def _holding_baseline(
         self, instrument_id: InstrumentId, slug: str, now_ns: int
@@ -6927,6 +7469,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # than risking an `exit_view` used uninitialised.
         is_exit_order = exit_rule_tag is not None and order.side == OrderSide.SELL
         exit_view: _AdapterExitAuthorization | None = None
+        is_resting_order = False
         if is_exit_order:
             # Every log line for an exit carries `exit=` and the rule
             # (brief requirement), unconditionally -- before any deny/allow
@@ -6963,6 +7506,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 return self._deny(order, _EXIT_MANIFEST_ABSENT_REASON, now_ns)
             unmappable = submit_chain.unmappable_exit_order_reason(
                 order, instrument, exit_view, self._exit_manifest
+            )
+        elif order.time_in_force == TimeInForce.GTD:
+            # S4 WP3: a GTD entry is the RESTING shape. It is admitted only when the
+            # running supervisor can decode ACCEPTED_RESTING (fail closed); the
+            # IOC and exit shapes above and below are untouched. A missing permit
+            # reads as expiry 0, which the shape check refuses; the permit-absent
+            # denial below stays the authoritative reason for a real absence.
+            is_resting_order = True
+            if not self._resting_accept_admitted:
+                return self._deny(order, submit_chain.RESTING_NOT_ADMITTED_REASON, now_ns)
+            unmappable = submit_chain.unmappable_resting_order_reason(
+                order,
+                instrument,
+                permit_expires_at_ns=(
+                    0
+                    if submit_chain.permit_is_missing(self._permit)
+                    else self._permit.expires_at_ns
+                ),
+                now_ns=now_ns,
+                gtd_expiry_verified=submit_chain.GTD_EXPIRY_VERIFIED,
             )
         else:
             unmappable = submit_chain.unmappable_order_reason(order, instrument)
@@ -7032,6 +7595,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if is_exit_order:
             assert exit_view is not None  # narrowed by `is_exit_order` above
             body = submit_chain.build_exit_order_body(order, instrument, exit_view)
+        elif is_resting_order:
+            body = submit_chain.build_resting_order_body(order, instrument)
         else:
             body = submit_chain.build_order_body(order, instrument)
         # EXEC-PAR 3.3 step 5: the wire body must name the market the admission
@@ -7152,6 +7717,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
                 wire_quantity=body["quantity"],
+                resting=is_resting_order,
+                resting_expire_ns=order.expire_time_ns if is_resting_order else None,
             )
         except Exception:  # noqa: BLE001 - fail closed: never POST without a durable context
             if booking is not None:
@@ -7178,12 +7745,57 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             write_transport.ORDERS_PATH,
         )
         self._post_in_flight_intent_ids = self._post_in_flight_intent_ids | {intent.intent_id}
+        outcome: submit_chain.CreateOrderOutcome | None = None
+        resting_context: AmbiguousResolverContext | None = None
+        resting_verdict: submit_chain.RestingConfirmVerdict = submit_chain.RESTING_CONFIRM_HOLD
         try:
             response = await self._order_sender.post_order(
                 self._api_base_url,
                 headers=headers,
                 body=encoded,
             )
+            if is_resting_order:
+                # S4 WP3 (r4 WP3.4-5): classify and confirm INSIDE the one
+                # `try`/`finally`, so the in-flight mark covers POST + confirm (a
+                # held id would starve K=1, L-48). A 200+id for a rest is a
+                # with-id AMBIGUOUS: the with-id context (resting=True) is written
+                # BEFORE the confirm await, so a crash mid-confirm is resolved by
+                # the with-id resolver. Only a GET-verified NEW binds.
+                # (Named `created`, then assigned: the exception-block source slice of
+                # `test_ambiguous_exception_path_source_logs_the_exception_type_never_its_str`
+                # ends at the first `outcome = ...classify_create_order_outcome(` text.)
+                created = submit_chain.classify_create_order_outcome(
+                    response,
+                    instrument=instrument,
+                    account_id=self._issued_account_id,
+                    ts_init=now_ns,
+                    closing=False,
+                )
+                outcome = created
+                if (
+                    outcome.kind == submit_chain.KIND_AMBIGUOUS
+                    and outcome.venue_order_id is not None
+                ):
+                    resting_context = self._note_ambiguous_open(
+                        intent_id=intent.intent_id,
+                        venue_order_id=outcome.venue_order_id,
+                        order=order,
+                        notional_usd=order_notional,
+                        booking=booking,
+                        now_ns=now_ns,
+                        create_detail=outcome.detail,
+                        fill_parse_error=outcome.fill_parse_error,
+                        wire_market_slug=body["marketSlug"],
+                        wire_price=body["price"]["value"],
+                        wire_outcome_side=body["outcomeSide"],
+                        wire_action=body["action"],
+                        wire_quantity=body["quantity"],
+                        resting=True,
+                        resting_expire_ns=order.expire_time_ns,
+                    )
+                    resting_verdict = await self._confirm_resting_order(
+                        outcome.venue_order_id, body, instrument
+                    )
         except Exception as exc:
             self._refuse(
                 submit_chain.AMBIGUOUS_REASON,
@@ -7206,18 +7818,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         finally:
             self._post_in_flight_intent_ids = self._post_in_flight_intent_ids - {intent.intent_id}
-        outcome = submit_chain.classify_create_order_outcome(
-            response,
-            instrument=instrument,
-            account_id=self._issued_account_id,
-            ts_init=now_ns,
-            # INC-E2 response-side leg check: `is_exit_order` is the SAME
-            # tag-derived flag computed above (never re-derived here), so
-            # the response is checked against the closing-order echo table
-            # for exactly the orders the request side already tagged and
-            # mapped as a close.
-            closing=is_exit_order,
-        )
+        if outcome is None:
+            outcome = submit_chain.classify_create_order_outcome(
+                response,
+                instrument=instrument,
+                account_id=self._issued_account_id,
+                ts_init=now_ns,
+                # INC-E2 response-side leg check: `is_exit_order` is the SAME
+                # tag-derived flag computed above (never re-derived here), so
+                # the response is checked against the closing-order echo table
+                # for exactly the orders the request side already tagged and
+                # mapped as a close.
+                closing=is_exit_order,
+            )
         classified_line = (
             f"create-order classified kind={outcome.kind} {outcome.detail} "
             f"client_order_id={order.client_order_id.value}"
@@ -7249,6 +7862,32 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         retire_name = outcome.retirement_name
+        # S4 WP3: the venue confirmed a resting NEW with a matching echo. The
+        # binder (sync, no await) writes the binding row and index entry, retires
+        # ACCEPTED_RESTING, emits OrderSubmitted/OrderAccepted and releases K=1. If
+        # it cannot bind (an unreadable index) this falls through to the HOLD
+        # below: the with-id resolver decides.
+        resting_bound = False
+        if (
+            resting_verdict == submit_chain.RESTING_CONFIRM_NEW
+            and resting_context is not None
+            and outcome.venue_order_id is not None
+        ):
+            try:
+                resting_bound = self._bind_resting_order(
+                    resting_context, outcome.venue_order_id, now_ns
+                )
+            except Exception as exc:  # noqa: BLE001 - HOLD; the with-id resolver decides
+                # Exception TYPE only, never its message (it may embed a store path or
+                # key). The binder's writes are idempotent, so a partial bind is re-run
+                # by the with-id resolver.
+                self._log.error(
+                    "resting bind raised; holding "
+                    f"exc_type={exc.__class__.__name__} "
+                    f"client_order_id={order.client_order_id.value}"
+                )
+        if resting_bound:
+            return
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
             and outcome.fill is not None
@@ -7256,6 +7895,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             and outcome.filled_cost_usd is not None
         ):
             fill = outcome.fill
+            if is_resting_order:
+                # Spec section 3: a rest that crossed at create time is a TAKER
+                # fill, booked as today and counted separately from maker fills.
+                self._log.warning(
+                    "resting_order_crossed: a resting-shape order filled at create "
+                    f"time (taker) client_order_id={order.client_order_id.value}"
+                )
             # I1b (LIVE_FILL_SCORING_CHAIN_2026-09-05): `record_fill` is the
             # FIRST effectful action of this branch -- before `true_up_booking`,
             # `_retire`, `_generate_submitted` and `generate_order_filled` --
@@ -7580,25 +8226,1415 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 wire_outcome_side=body["outcomeSide"],
                 wire_action=body["action"],
                 wire_quantity=body["quantity"],
+                resting=is_resting_order,
+                resting_expire_ns=order.expire_time_ns if is_resting_order else None,
             )
         else:
             self._ambiguous_bookings[intent.intent_id] = booking
 
+    async def _confirm_resting_order(
+        self, venue_order_id: str, wire_echo: Mapping[str, Any], instrument: Any
+    ) -> submit_chain.RestingConfirmVerdict:
+        """S4 WP3: the bounded GET-confirm of a freshly created rest. GET-ONLY.
+
+        Polls the order-by-id read every ``RESTING_CONFIRM_POLL_S`` for up to
+        ``RESTING_CONFIRM_DEADLINE_S`` seconds and returns ``RESTING_CONFIRM_NEW``
+        only for a venue ``ACCEPTED`` order with nothing filled, whose echo
+        (slug, leg and BUY via the leg mapping, price, quantity, GTD tif,
+        ``goodTillTime``) matches ``wire_echo``. EVERYTHING else is
+        ``RESTING_CONFIRM_HOLD`` (the with-id resolver decides): an id that fails
+        the allowlist, a filled/partial/terminal/rejected read, an echo mismatch,
+        a non-GTD tif, a GET that never mapped before the deadline, a GET that
+        timed out (each read is bounded by the time left to the deadline), a
+        body that is not an object. Never books a fill, never retires, never sends; a
+        cancellation propagates (the pre-confirm context keeps the intent
+        resolvable).
+        """
+        if not submit_chain.valid_venue_order_id(venue_order_id):
+            self._log.error("resting confirm: the venue order id failed the allowlist; holding")
+            return submit_chain.RESTING_CONFIRM_HOLD
+        deadline_ns = self._clock.timestamp_ns() + submit_chain.RESTING_CONFIRM_DEADLINE_NS
+        while True:
+            # Each read is bounded by the time left to the deadline (never less than one
+            # poll interval), so a GET that never answers cannot outlive the confirm.
+            # Plain arithmetic and a comparison: no `max()` callee in this scanned body.
+            read_budget_s = (deadline_ns - self._clock.timestamp_ns()) / _NANOS_PER_SECOND
+            if read_budget_s < submit_chain.RESTING_CONFIRM_POLL_S:  # noqa: PLR1730
+                read_budget_s = submit_chain.RESTING_CONFIRM_POLL_S
+            try:
+                async with asyncio.timeout(read_budget_s):
+                    payload = await self._private_read(
+                        submit_chain.order_by_id_path(venue_order_id)
+                    )
+                nested = payload.get("order") if isinstance(payload, Mapping) else None
+                order_body = nested if isinstance(nested, Mapping) else payload
+                report = parse_order_status_report(
+                    order_body,
+                    instrument=instrument,
+                    account_id=self._issued_account_id,
+                    report_id=UUID4(),
+                    ts_init=self._clock.timestamp_ns(),
+                    closing=False,
+                )
+            except TimeoutError:
+                self._log.warning("resting confirm: the GET timed out; holding")
+                return submit_chain.RESTING_CONFIRM_HOLD
+            except Exception as exc:  # noqa: BLE001 - an unreadable GET is retried to the deadline
+                self._log.warning(
+                    f"resting confirm: GET did not map ({exc.__class__.__name__}); retrying"
+                )
+            else:
+                if report.order_status is OrderStatus.ACCEPTED:
+                    if report.filled_qty.raw == 0 and submit_chain.resting_echo_matches(
+                        report, wire_echo, order_body
+                    ):
+                        return submit_chain.RESTING_CONFIRM_NEW
+                    self._log.warning("resting confirm: not a clean matching NEW; holding")
+                    return submit_chain.RESTING_CONFIRM_HOLD
+                if report.order_status in _RESTING_CONFIRM_PENDING_STATUSES:
+                    self._log.debug("resting confirm: order not yet ACCEPTED; polling")
+                else:
+                    self._log.warning(
+                        "resting confirm: a non-NEW state (filled, partial or terminal); holding"
+                    )
+                    return submit_chain.RESTING_CONFIRM_HOLD
+            if self._clock.timestamp_ns() >= deadline_ns:
+                self._log.warning("resting confirm: deadline reached without a NEW; holding")
+                return submit_chain.RESTING_CONFIRM_HOLD
+            await asyncio.sleep(submit_chain.RESTING_CONFIRM_POLL_S)
+
+    def _bind_resting_order(
+        self, context: AmbiguousResolverContext, venue_order_id: str, now_ns: int
+    ) -> bool:
+        """S4 WP3: bind a venue-confirmed resting order. SYNC, no ``await``, no
+        sender. The ONLY writer of the ``resting`` rows. Called from
+        ``_submit_order`` (inline confirm) and from the with-id resolver (a GET
+        NEW of a ``resting`` context).
+
+        Steps, with no ``await`` between: (1) the binding row, then the index
+        entry (a three-way index read: an unreadable index refuses and binds
+        nothing); (2) rebind the process-local maps; (3) retire the intent
+        ``ACCEPTED_RESTING`` (releases the K=1 slot; the exposure stays registered
+        until a cancel/fill settles it); (4) emit ``OrderSubmitted`` (if still
+        INITIALIZED) and ``OrderAccepted``; (5) clear the global AMBIGUOUS
+        trading refusal iff no slot remains open (the A3 predicate of
+        ``_resolve_accept_fill``: another unresolved AMBIGUOUS intent keeps it).
+        Returns ``False`` (binding nothing) for an id failing the allowlist, a
+        context without a slug/expiry, or an unreadable index.
+        """
+        slug = context.wire_market_slug
+        expire_ns = context.resting_expire_ns
+        if (
+            not submit_chain.valid_venue_order_id(venue_order_id)
+            or slug is None
+            or expire_ns is None
+        ):
+            self._log.error(
+                "resting bind: refused (invalid id or an incomplete context) "
+                f"client_order_id={_redact_order_id(context.client_order_id)}"
+            )
+            return False
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None:
+            return False
+        intent_id = context.intent_id
+        self._store_set(
+            f"{RESTING_KEY_PREFIX}{venue_order_id}",
+            submit_chain.resting_binding_bytes(
+                intent_id=intent_id,
+                slug=slug,
+                client_order_id=context.client_order_id,
+                expire_time_ns=expire_ns,
+            ),
+        )
+        self._store_set(
+            RESTING_INDEX_KEY,
+            submit_chain.resting_index_bytes(
+                indexed if venue_order_id in indexed else [*indexed, venue_order_id]
+            ),
+        )
+        armed_by_this_process = intent_id in self._ambiguous_bookings
+        booking = self._ambiguous_bookings.pop(intent_id, None)
+        self._resting_bookings = {**self._resting_bookings, venue_order_id: (intent_id, booking)}
+        if armed_by_this_process:
+            self._this_process_resting_ids = self._this_process_resting_ids | {venue_order_id}
+        self._retire(intent_id, submit_chain.RETIRE_ACCEPTED_RESTING, now_ns)
+        cached = self._cache.order(ClientOrderId(context.client_order_id))
+        if cached is None:
+            self._log.warning("resting bind: the order is not in this run's cache; no event")
+        else:
+            if cached.status is OrderStatus.INITIALIZED:
+                self._generate_submitted(cached, now_ns)
+            self.generate_order_accepted(
+                strategy_id=StrategyId(context.strategy_id),
+                instrument_id=InstrumentId.from_str(context.instrument_id),
+                client_order_id=ClientOrderId(context.client_order_id),
+                venue_order_id=VenueOrderId(venue_order_id),
+                ts_event=now_ns,
+            )
+        no_slot_open = self._latch.open_slot_count() == 0
+        kept_refusals = [
+            refusal
+            for refusal in self._trading_refusals
+            if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            or (refusal.instrument == "" and not no_slot_open)
+            or (refusal.instrument != "" and refusal.instrument != slug)
+        ]
+        if len(kept_refusals) != len(self._trading_refusals):
+            self._trading_refusals = kept_refusals
+            self._ambiguous_refusal_clears += 1
+            self._log.info(
+                "resting bind: cleared the AMBIGUOUS trading refusal "
+                f"({submit_chain.AMBIGUOUS_REASON!r}) for intent {intent_id}"
+            )
+        return True
+
+    # -- S4 WP4: restart rehydration and the boot sweep ------------------------
+
+    def _rehydrate_resting_at_boot(self) -> None:
+        """B4 review item 1: after a restart a live bound rest must not be invisible.
+
+        For every BOUND ledger row (the index plus its binding row) register the
+        intent's exposure with an UNKNOWN notional -- the row does not carry one, so
+        the ledger refuses admission (``open exposure has an unknown notional``)
+        until the sweep's terminal read settles it -- and track its booking
+        (``None``: the prior process's booking died with it). Not added to
+        ``_this_process_resting_ids``: a cancel here restores nothing to this
+        process's permit. An unreadable index registers nothing (``_read_fill_index``
+        has already refused). A bad row (no intent id) is skipped; the sweep latches it.
+        """
+        if self._ledger is None or self._latch is None or not self._intent_reconciled:
+            self._log.warning(
+                "resting rehydration skipped: the intent ledger is not reconciled; the "
+                "boot sweep still cancels every bound rest"
+            )
+            return
+        now_ns = self._clock.timestamp_ns()
+        for target in self._resting_ledger() or ():
+            if not target.bound or not target.intent_id:
+                continue
+            try:
+                if not self._ledger.has_open_exposure(target.intent_id):
+                    self._ledger.register_open_exposure(
+                        target.intent_id,
+                        None,
+                        booking=None,
+                        seeded_partial_usd=Decimal(0),
+                        side="BUY",
+                        now_ns=now_ns,
+                    )
+                self._resting_bookings = {
+                    **self._resting_bookings,
+                    target.venue_order_id: (target.intent_id, None),
+                }
+            except Exception as exc:  # noqa: BLE001 - one bad row never fails `_connect`
+                self._latch_resting_cancel_unconfirmed(
+                    target.venue_order_id, f"rehydrate_failed:{type(exc).__name__}"
+                )
+
+    def _resting_noid_contexts(self) -> list[AmbiguousResolverContext]:
+        """The OPEN no-id resting contexts (the durable pre-POST slug ledger): a rest
+        whose POST may have landed with nothing to GET. SYNC."""
+        found: list[AmbiguousResolverContext] = []
+        if self._latch is None:
+            return found
+        for intent in self._latch.open_submit_intents():
+            context = self._boot_context_of(intent.intent_id)
+            if (
+                context is not None
+                and context.resting
+                and context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID
+                and context.wire_market_slug
+            ):
+                found.append(context)
+        return found
+
+    async def _sweep_resting_orders_at_boot(self) -> None:
+        """S4 WP4 (4e): the boot sweep over the durable resting ledger.
+
+        Cancels every ledger-bound id (per order, ONE bounded pass; the WHOLE sweep is
+        bounded by ``BOOT_SWEEP_DEADLINE_S`` so ``_connect`` cannot hang), then re-reads
+        the UNFILTERED open orders and certifies the ledger's slugs. Unbound orders are
+        NEVER cancelled only while SLUG_SCOPED_CANCEL_ALL_VERIFIED is False (they may be
+        the operator's): WARN-logged by id and ONE CRITICAL alert, and the arm gate keeps
+        refusing them. The pin is now True (S-2 PASS over sibling slugs, ARM post-B2
+        evidence ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json``): the
+        slug cancel-all removes an unbound order on a ledger slug (spec 9.18) after a WARN
+        naming it, so the "never cancelled" claim holds only for the False case. A ledger id
+        still open or still listed, a sweep that does not run,
+        overruns, or whose re-read is unreadable or uncertifiable, or a no-id context's
+        slug that is not empty latches
+        ``resting_cancel_unconfirmed`` and marks no intent swept. A no-id resting
+        intent is added to ``_swept_resting_intent_ids`` ONLY when its slug reads
+        empty on a certified re-read (WP5 alone retires it). Does not run (and latches)
+        without an injected sender and a verified canonical string; an empty ledger
+        posts and reads nothing; an unreadable index posts nothing and keeps its refusal.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            self._log.error("resting sweep: the ledger index is unreadable; nothing is cancelled")
+            return
+        noid = self._resting_noid_contexts()
+        if not ledger and not noid:
+            return
+        if (
+            self._order_sender is None
+            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
+        ):
+            self._log.error(
+                "resting sweep does not run: the sender is absent or canonical unverified; "
+                "no intent is swept; resting_cancel_unconfirmed is latched (new rests and "
+                "the never-arm gate refuse, even for an own order)"
+            )
+            self._latch_resting_cancel_unconfirmed(_BOOT_SWEEP_LATCH_ID, "boot_sweep_did_not_run")
+            return
+        ledger_ids = {t.venue_order_id for t in ledger}
+        ledger_slugs = {t.slug for t in ledger if t.slug}
+        try:
+            # B5 review G16: the WHOLE sweep (every id's POST + GET, both reads) is bounded,
+            # so a hung venue cannot hang `_connect`; the timeout latches via the handler below.
+            async with asyncio.timeout(submit_chain.BOOT_SWEEP_DEADLINE_S):
+                if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is True:
+                    # Pin True (r4 5.4): read the UNFILTERED book first so every unbound order
+                    # on a ledger slug is named (id prefix only) before the slug cancel-all
+                    # removes it (spec 9.18: a manual order on a family slug is cancelled).
+                    before = parse_open_orders(await self._private_read(OPEN_ORDERS_PATH))
+                    for record in before:
+                        foreign_here = record.venue_order_id not in ledger_ids
+                        if foreign_here and record.market_slug in ledger_slugs:
+                            self._log.warning(
+                                "resting sweep: unbound open order "
+                                f"{_redact_order_id(record.venue_order_id)} on "
+                                f"{record.market_slug} will be cancelled by the slug cancel-all"
+                            )
+                    for slug in ledger_slugs:
+                        await self._cancel_slug_orders(slug)
+                unresolved = await self._cancel_resting_order(
+                    [t.venue_order_id for t in ledger], max_passes=1
+                )
+                for venue_id in unresolved:
+                    self._latch_resting_cancel_unconfirmed(venue_id, "boot_sweep_unresolved")
+                payload = await self._private_read(OPEN_ORDERS_PATH)
+                if not submit_chain.open_orders_envelope_is_known(payload):
+                    raise ExecutionReportMappingError("open-orders envelope has an undeclared key")
+                records = parse_open_orders(payload)
+        except Exception as exc:  # noqa: BLE001 - never raise out of `_connect`
+            self._latch_resting_cancel_unconfirmed(
+                _BOOT_SWEEP_LATCH_ID, f"boot_sweep_reread_failed:{exc.__class__.__name__}"
+            )
+            return
+        noid_slugs = {c.wire_market_slug for c in noid}
+        foreign = [
+            r
+            for r in records
+            if r.venue_order_id not in ledger_ids and r.market_slug in ledger_slugs | noid_slugs
+        ]
+        for record in foreign:
+            self._log.warning(
+                f"resting sweep: unbound open order {_redact_order_id(record.venue_order_id)} "
+                f"on {record.market_slug} is NOT cancelled"
+            )
+        if foreign:
+            self._log.error(
+                f"resting sweep: {len(foreign)} unbound open order(s) on a ledger slug; "
+                "never cancelled, the never-arm gate keeps refusing"
+            )
+        # B5 review G7: a ledger id the re-read still LISTS contradicts its terminal per-id
+        # read; nothing is certified, so latch it (the per-id pass alone is not proof).
+        for record in records:
+            if record.venue_order_id in ledger_ids:
+                self._latch_resting_cancel_unconfirmed(
+                    record.venue_order_id, "boot_sweep_ledger_id_still_listed"
+                )
+        busy = {r.market_slug for r in records}
+        swept = [c.intent_id for c in noid if c.wire_market_slug not in busy]
+        if len(swept) != len(noid):
+            self._latch_resting_cancel_unconfirmed(
+                _BOOT_SWEEP_LATCH_ID, "boot_sweep_slug_not_empty_for_a_no_id_rest"
+            )
+        self._swept_resting_intent_ids = self._swept_resting_intent_ids | frozenset(swept)
+
+    # -- S4 WP4: the resting-order ledger, cancel loop and latches -------------
+
+    def _resting_ledger(self) -> tuple[RestingTarget, ...] | None:
+        """Every order this client may cancel: the ``resting:`` index ids (with their
+        durable binding rows) UNION the open with-id resting HOLD contexts. ``None``
+        when the index is UNREADABLE (``_read_fill_index`` has already refused): the
+        callers then treat the ledger as empty and issue zero POSTs. A row that will
+        not decode yields a target with an empty slug (terminal-unconfirmable in the
+        loop), never a skipped id. NEVER RAISES (B5 review G10): an unexpected failure
+        enumerating the ledger latches ``resting_cancel_unconfirmed`` and returns
+        ``None``, so ``_connect`` and the evidence write cannot be failed by a bad row.
+        """
+        try:
+            return self._enumerate_resting_ledger()
+        except Exception as exc:  # noqa: BLE001 - never raised out of the ledger
+            self._latch_resting_cancel_unconfirmed(
+                _LEDGER_LATCH_ID, f"ledger_enumeration_failed:{type(exc).__name__}"
+            )
+            return None
+
+    def _enumerate_resting_ledger(self) -> tuple[RestingTarget, ...] | None:
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None:
+            return None
+        found: list[RestingTarget] = []
+        for venue_order_id in indexed:
+            found.append(self._bound_target_of(venue_order_id))
+        if self._latch is not None:
+            for intent in self._latch.open_submit_intents():
+                context = self._boot_context_of(intent.intent_id)
+                if (
+                    context is not None
+                    and context.resting
+                    and context.venue_order_id != submit_chain.NO_VENUE_ORDER_ID
+                    and context.venue_order_id not in indexed
+                ):
+                    found.append(
+                        RestingTarget(
+                            venue_order_id=context.venue_order_id,
+                            slug=context.wire_market_slug or "",
+                            client_order_id=context.client_order_id,
+                            intent_id=context.intent_id,
+                            instrument_id=context.instrument_id,
+                            strategy_id=context.strategy_id,
+                            expire_time_ns=context.resting_expire_ns or 0,
+                            bound=False,
+                        )
+                    )
+        return tuple(found)
+
+    def _bound_target_of(self, venue_order_id: str) -> RestingTarget:
+        """The target for one indexed id, decoded DEFENSIVELY from its durable binding
+        row (B5 review G10/G11). A row that is missing, undecodable, not an object, or
+        carries a wrongly-typed field (a JSON ``null`` slug is NOT the string ``"None"``)
+        yields an UNUSABLE target -- empty slug and ids, still ``bound`` -- which the
+        cancel loop latches rather than posting; it never raises.
+        """
+        unusable = RestingTarget(venue_order_id, "", "", "", None, None, 0, True)
+        raw = self._store_get(f"{RESTING_KEY_PREFIX}{venue_order_id}")
+        row: Any = None
+        if raw:
+            try:
+                row = json.loads(raw)
+            except ValueError:  # includes UnicodeDecodeError
+                row = None
+        fields = _binding_row_fields(row)
+        if fields is None:
+            self._log.error("resting ledger: a bound id has no usable binding row")
+            return unusable
+        intent_id, client_order_id, slug, expire_time_ns = fields
+        instrument_id: str | None = None
+        strategy_id: str | None = None
+        try:
+            context = self._boot_context_of(intent_id) if intent_id else None
+            instrument_id = None if context is None else context.instrument_id
+            strategy_id = None if context is None else context.strategy_id
+            if instrument_id is None and client_order_id:
+                cached = self._cache.order(ClientOrderId(client_order_id))
+                if cached is not None:
+                    instrument_id = str(cached.instrument_id)
+                    strategy_id = str(cached.strategy_id)
+        except Exception as exc:  # noqa: BLE001 - a bad lookup leaves the order eventless
+            self._log.error(
+                f"resting ledger: a bound id's context lookup failed ({type(exc).__name__})"
+            )
+        return RestingTarget(
+            venue_order_id=venue_order_id,
+            slug=slug,
+            client_order_id=client_order_id,
+            intent_id=intent_id,
+            instrument_id=instrument_id,
+            strategy_id=strategy_id,
+            expire_time_ns=expire_time_ns,
+            bound=True,
+        )
+
+    def _resting_target_of(self, venue_order_id: str) -> RestingTarget | None:
+        """The ledger target for one venue id, or ``None`` (retired or unknown).
+
+        An UNREADABLE ledger is not "retired" (B5 review G5): it yields an unusable target
+        (empty slug, not bound) so the cancel loop LATCHES instead of treating the id as
+        done and dropping it silently.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            return RestingTarget(venue_order_id, "", "", "", None, None, 0, False)
+        for target in ledger:
+            if target.venue_order_id == venue_order_id:
+                return target
+        return None
+
+    def _resting_cancel_target(self, command: Any) -> tuple[RestingTarget, ...]:
+        """The ledger targets a cancel command names (SYNC; empty = none).
+
+        A ``CancelOrder`` matches by client order id; a ``CancelAllOrders`` matches
+        by instrument (and side) so cancel-all only ever touches ledger-bound
+        orders of THAT instrument -- never an unbound or operator order.
+        """
+        ledger = self._resting_ledger()
+        if ledger is None:
+            return ()
+        client_order_id = getattr(command, "client_order_id", None)
+        if client_order_id is not None:
+            return tuple(t for t in ledger if t.client_order_id == client_order_id.value)
+        wanted = str(command.instrument_id)
+        side = command.order_side
+        matched: list[RestingTarget] = []
+        for target in ledger:
+            if target.instrument_id != wanted:
+                continue
+            cached = self._cache.order(ClientOrderId(target.client_order_id))
+            if side != OrderSide.NO_ORDER_SIDE and cached is not None and cached.side != side:
+                continue
+            matched.append(target)
+        return tuple(matched)
+
+    def _retire_resting_row(self, venue_order_id: str) -> bool:
+        """The ONE winner of a bound rest's retirement. SYNC, no ``await``: read the
+        index three-way; an absent id (or an unreadable index) returns ``False`` and
+        does nothing; otherwise rewrite the index without it, tombstone the binding
+        row and drop the process-local booking. Every terminal path (cancel confirm,
+        venue-initiated terminal, the poll) goes through here, so exactly one settles.
+        """
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None or venue_order_id not in indexed:
+            return False
+        self._store_set(
+            RESTING_INDEX_KEY,
+            submit_chain.resting_index_bytes([v for v in indexed if v != venue_order_id]),
+        )
+        self._store_set(f"{RESTING_KEY_PREFIX}{venue_order_id}", b"")
+        return True
+
+    def _settle_resting_terminal(self, target: RestingTarget, verdict: str) -> bool:
+        """Retire a BOUND rest the venue shows terminal with nothing filled, once.
+
+        Wins ``_retire_resting_row`` (a loser returns ``False`` and does nothing),
+        settles the exposure via ``settle`` (never ``release_booking``), restores the
+        permit slot ONLY for an id this process armed (idempotently per venue id), and
+        only THEN emits the native ``OrderCanceled`` / ``OrderExpired`` / ``OrderRejected``
+        (per the venue's own terminal state, r4 section 6; only for an order this run's
+        cache knows; a failing emit is logged, never raised). A permit that cannot
+        restore (expired) is logged and skipped: a cancel never needs it.
+        """
+        venue_id = target.venue_order_id
+        held = self._resting_bookings.get(venue_id)
+        if not self._retire_resting_row(venue_id):
+            return False
+        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
+        now_ns = self._clock.timestamp_ns()
+        # B5 review G8: settle BEFORE the native event is emitted. The row is already
+        # retired, so an exception out of the emit must not strand the exposure or the
+        # permit slot; the emit itself is guarded below.
+        if self._ledger is not None:
+            try:
+                self._ledger.settle(
+                    target.intent_id,
+                    booking=None if held is None else held[1],
+                    realized_usd=None,
+                    fill_ts_ns=None,
+                    now_ns=now_ns,
+                )
+            except Exception as exc:  # noqa: BLE001 - never stick: abandon, count, go on
+                self._note_resolver_error(target.intent_id, exc)
+                self._ledger.abandon_open_exposure(target.intent_id)
+        if venue_id in self._this_process_resting_ids:
+            self._restore_resting_budget(target)
+        try:
+            self._emit_resting_terminal_event(target, verdict, now_ns)
+        except Exception as exc:  # noqa: BLE001 - the settle above already stands
+            self._log.error(
+                "resting terminal: the native event could not be emitted "
+                f"({exc.__class__.__name__})"
+            )
+        return True
+
+    def _emit_resting_terminal_event(
+        self, target: RestingTarget, verdict: str, now_ns: int
+    ) -> None:
+        """The native ``OrderCanceled`` / ``OrderExpired`` for a retired bound rest -- only
+        for an order this run's cache knows and has not already closed (SYNC)."""
+        cached = self._cache.order(ClientOrderId(target.client_order_id))
+        if (
+            cached is None
+            or cached.is_closed
+            or target.instrument_id is None
+            or not target.strategy_id
+        ):
+            return
+        events = {
+            "strategy_id": StrategyId(target.strategy_id),
+            "instrument_id": InstrumentId.from_str(target.instrument_id),
+            "client_order_id": ClientOrderId(target.client_order_id),
+            "venue_order_id": VenueOrderId(target.venue_order_id),
+            "ts_event": now_ns,
+        }
+        if verdict == submit_chain.CANCEL_READ_EXPIRED:
+            self.generate_order_expired(**events)
+        elif verdict == submit_chain.CANCEL_READ_REJECTED:
+            # r4 section 6: the venue's REJECTED is the native REJECTED status.
+            self.generate_order_rejected(
+                strategy_id=events["strategy_id"],
+                instrument_id=events["instrument_id"],
+                client_order_id=events["client_order_id"],
+                reason="venue state ORDER_STATE_REJECTED after acceptance",
+                ts_event=now_ns,
+            )
+        else:
+            self.generate_order_canceled(**events)
+
+    def _restore_resting_budget(self, target: RestingTarget) -> None:
+        """Give back the permit slot of a rest THIS process armed (idempotent per id)."""
+        venue_id = target.venue_order_id
+        context = self._boot_context_of(target.intent_id) if target.intent_id else None
+        if self._permit is None or context is None or self._budget_was_restored(venue_id):
+            return
+        try:
+            applied = restore_live_trading_budget(
+                permit=self._permit,
+                venue_order_id=venue_id,
+                order_notional_usd=context.notional_usd,
+            )
+        except LiveTradingPermissionError:
+            self._log.warning("resting cancel: the permit slot could not be restored; skipped")
+            return
+        if applied:
+            self._mark_budget_restored(venue_id)
+
+    async def _confirm_cancel_terminal(self, venue_order_id: str, market_slug: str) -> str:
+        """One GET of a cancelled order, classified by ``cancel_read_verdict``. GET-ONLY.
+
+        The authoritative answer after a cancel POST: a bare 200 proves nothing. An
+        unreadable GET (an id failing the allowlist, or an order whose echoed id or
+        ``marketSlug`` is not the one requested -- B5 review G15) is ``UNREADABLE``.
+        """
+        if not submit_chain.valid_venue_order_id(venue_order_id):
+            return submit_chain.CANCEL_READ_UNREADABLE
+        try:
+            payload = await self._private_read(submit_chain.order_by_id_path(venue_order_id))
+        except Exception as exc:  # noqa: BLE001 - an unreadable GET keeps the cancel pending
+            self._log.warning(f"resting cancel: confirm GET failed ({exc.__class__.__name__})")
+            return submit_chain.CANCEL_READ_UNREADABLE
+        nested = payload.get("order") if isinstance(payload, Mapping) else None
+        body = nested if isinstance(nested, Mapping) else payload
+        verdict = submit_chain.cancel_read_verdict(
+            body, expected_id=venue_order_id, expected_slug=market_slug
+        )
+        if verdict == submit_chain.CANCEL_READ_FILLED and not self._book_filled_read(
+            venue_order_id, body
+        ):
+            # B6: the cancel/sweep read that finds the order FILLED books the fill through
+            # the same single winner as the poll (durable record, event, settle). B6 review S2:
+            # a fill that could not be booked is NOT terminal for the loop: the id stays
+            # pending and its latch stays until a read books it.
+            return submit_chain.CANCEL_READ_UNREADABLE
+        return verdict
+
+    async def _cancel_resting_order(
+        self, venue_ids: list[str] | tuple[str, ...], *, max_passes: int | None = None
+    ) -> frozenset[str]:
+        """The RETRY-WHEN-OPEN cancel loop; returns the ids still unconfirmed.
+
+        Each pass makes ONE POST + confirm-GET attempt per pending id before any
+        backoff sleep, so no id head-of-line-blocks another. A terminal zero-fill read
+        retires a BOUND row once (``_settle_resting_terminal``); a HOLD context is
+        never retired here (the with-id resolver owns that); a fill read leaves the
+        row to the fill path. ``_cancel_in_flight`` carries the ids this loop owns
+        (the resolver skips them); an id another loop already owns is left to it.
+        ``max_passes=None`` loops until every id is terminal (the cancel command's own
+        task); the boot sweep passes a bound so ``_connect`` cannot hang.
+
+        Each id's attempt runs inside its own ``try``: any exception LATCHES
+        ``resting_cancel_unconfirmed`` for that id and the loop goes on to the next
+        (B5 review G10). The body is deliberately ONE coroutine (longer than the usual 50
+        lines): the single ``post_cancel_order`` send name, the exact callee set and the
+        sender-reference scope are pinned to THIS function (rows N2, P1b, P2, FW), so
+        extracting a per-id coroutine is a pin migration of its own, not a refactor.
+        """
+        owned = [v for v in venue_ids if v not in self._cancel_in_flight]
+        self._cancel_in_flight = self._cancel_in_flight | frozenset(owned)
+        pending = list(owned)
+        first_refused: dict[str, int] = {}
+        pass_no = 0
+        try:
+            while pending:
+                for venue_id in list(pending):
+                    # B5 review G2: an id that left `pending` is released NOW, so the
+                    # with-id resolver is not locked out for the rest of a long loop.
+                    self._release_cancel_in_flight(owned, pending)
+                    try:
+                        target = self._resting_target_of(venue_id)
+                        if not submit_chain.valid_venue_order_id(venue_id) or (
+                            target is not None and not target.slug
+                        ):
+                            self._latch_resting_cancel_unconfirmed(venue_id, "id_or_slug_unusable")
+                            pending.remove(venue_id)
+                            continue
+                        if target is None:
+                            pending.remove(venue_id)
+                            continue
+                        try:
+                            headers = self._write_signer.sign_headers(
+                                write_transport._WRITE_METHOD,
+                                submit_chain.cancel_order_path(venue_id),
+                            )
+                            await self._order_sender.post_cancel_order(
+                                self._api_base_url,
+                                headers=headers,
+                                order_id=venue_id,
+                                market_slug=target.slug,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - a refused POST is retried
+                            self._log.warning(
+                                f"resting cancel: POST failed or refused ({exc.__class__.__name__})"
+                            )
+                        verdict = await self._confirm_cancel_terminal(venue_id, target.slug)
+                        if verdict in (
+                            submit_chain.CANCEL_READ_CANCELED,
+                            submit_chain.CANCEL_READ_EXPIRED,
+                            submit_chain.CANCEL_READ_REJECTED,
+                        ):
+                            if target.bound:
+                                self._settle_resting_terminal(target, verdict)
+                            self._clear_resting_cancel_latch(venue_id)
+                            pending.remove(venue_id)
+                        elif verdict == submit_chain.CANCEL_READ_FILLED:
+                            self._log.warning(
+                                "resting cancel: the order filled; the fill path owns it"
+                            )
+                            # B5 review G3: a terminal read ends this id's cancel problem
+                            self._clear_resting_cancel_latch(venue_id)
+                            pending.remove(venue_id)
+                        else:
+                            now_ns = self._clock.timestamp_ns()
+                            if venue_id not in first_refused:
+                                first_refused[venue_id] = now_ns
+                            if self._note_cancel_refused(target, first_refused[venue_id], now_ns):
+                                await self._cancel_slug_orders(target.slug)
+                    except Exception as exc:  # noqa: BLE001 - B5 review G10: latch, go on
+                        self._latch_resting_cancel_unconfirmed(
+                            venue_id, f"cancel_attempt_failed:{exc.__class__.__name__}"
+                        )
+                        if venue_id in pending:
+                            pending.remove(venue_id)
+                self._release_cancel_in_flight(owned, pending)
+                pass_no += 1
+                if not pending or (max_passes is not None and pass_no >= max_passes):
+                    break
+                await asyncio.sleep(submit_chain.cancel_backoff_s(pass_no))
+        finally:
+            self._cancel_in_flight = self._cancel_in_flight - frozenset(owned)
+        return frozenset(pending)
+
+    def _release_cancel_in_flight(self, owned: list[str], pending: list[str]) -> None:
+        """Drop from ``_cancel_in_flight`` every id this loop owned that is no longer
+        pending (SYNC). Ids another loop owns were never in ``owned`` and are untouched."""
+        self._cancel_in_flight = self._cancel_in_flight - (frozenset(owned) - frozenset(pending))
+
+    async def _cancel_slug_orders(self, slug: Any) -> str:
+        """The ONE choke point of the slug-scoped venue cancel-all (escalation only).
+
+        Disabled (``UNSCOPED_UNVERIFIED``, nothing sent) until
+        ``SLUG_SCOPED_CANCEL_ALL_VERIFIED`` is flipped by a reviewed commit citing the
+        two-slug positive control. ``slug`` must be one of the LEDGER's slugs: an
+        empty, off-ledger or unreadable-index call posts nothing. The body is built
+        and re-validated inside the transport.
+        """
+        if submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED is not True:
+            return submit_chain.UNSCOPED_UNVERIFIED
+        ledger = self._resting_ledger() or ()
+        if slug not in {t.slug for t in ledger if t.slug}:
+            return "REFUSED_OFF_LEDGER"
+        if (
+            self._order_sender is None
+            or write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True
+        ):
+            return "REFUSED_NO_SENDER"
+        try:
+            headers = self._write_signer.sign_headers(
+                write_transport._WRITE_METHOD, write_transport.CANCEL_ALL_PATH
+            )
+            await self._order_sender.post_cancel_all(
+                self._api_base_url, headers=headers, slugs=[slug]
+            )
+        except Exception as exc:  # noqa: BLE001 - the per-order loop continues
+            self._log.warning(f"resting cancel: slug cancel-all failed ({exc.__class__.__name__})")
+            return "POST_FAILED"
+        return "POSTED"
+
+    def _note_cancel_refused(
+        self, target: RestingTarget, first_refused_ns: int, now_ns: int
+    ) -> bool:
+        """Alert-before-latch bookkeeping for one still-open cancel (SYNC).
+
+        The non-latching CRITICAL alert fires once the age from the FIRST refused
+        cancel reaches ``RETRY_ALERT_AGE_S`` (re-alerting every ``RETRY_REALERT_S``);
+        the latch only at ``cancel_latch_deadline_ns`` -- strictly later by
+        construction. Returns ``True`` iff it latched NOW (the caller then escalates
+        to the slug cancel-all, which is a no-op while that pin is False).
+        """
+        venue_id = target.venue_order_id
+        age_ns = now_ns - first_refused_ns
+        last_alert = self._resting_cancel_alert_ns.get(venue_id)
+        if age_ns >= submit_chain.RETRY_ALERT_AGE_S * _NANOS_PER_SECOND and (
+            last_alert is None
+            or now_ns - last_alert >= submit_chain.RETRY_REALERT_S * _NANOS_PER_SECOND
+        ):
+            self._resting_cancel_alert_ns = {**self._resting_cancel_alert_ns, venue_id: now_ns}
+            self._resting_cancel_alert_details = {
+                **self._resting_cancel_alert_details,
+                venue_id: {
+                    "severity": "CRITICAL",
+                    "event": "resting_cancel_alert",
+                    "venue_order_id": _loggable_order_id(venue_id),
+                    "slug": _loggable_slug(target.slug),
+                    "age_s": str(age_ns // _NANOS_PER_SECOND),
+                    "next": "cancel_loop_retrying_then_latch_resting_cancel_unconfirmed",
+                },
+            }
+            self._log.error(
+                f"resting_cancel_alert: venue order {_loggable_order_id(venue_id)} on "
+                f"{_loggable_slug(target.slug)} is still open "
+                f"{age_ns // _NANOS_PER_SECOND} s after its first refused cancel"
+            )
+        deadline_ns = submit_chain.cancel_latch_deadline_ns(first_refused_ns, target.expire_time_ns)
+        if now_ns >= deadline_ns and venue_id not in self._unconfirmed_cancel_ids:
+            self._latch_resting_cancel_unconfirmed(venue_id, "cancel_not_confirmed")
+            return True
+        return False
+
+    def _latch_resting_cancel_unconfirmed(self, venue_order_id: str, cause: str) -> None:
+        """Latch ``resting_cancel_unconfirmed``: NEW rests are refused (a global
+        durable refusal; cancels never consult it and continue). Clearing path: the
+        terminal read of every latched id (``_clear_resting_cancel_latch``), else the
+        next boot's sweep."""
+        self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids | {venue_order_id}
+        self._latch_resting_order(
+            submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON, venue_order_id, cause
+        )
+
+    def _latch_resting_order(self, reason: str, venue_order_id: str, cause: str) -> None:
+        """The ONE producer of the S4 resting-order latches (``resting_cancel_unconfirmed``,
+        ``resting_query_unreadable``): a CRITICAL log naming the latch token, then the
+        global durable refusal (deduped by reason) that refuses NEW rests only."""
+        self._log.error(
+            f"{reason.split(':', 1)[0]}: venue order {_loggable_order_id(venue_order_id)} "
+            f"({cause}); "
+            "new rests are refused, cancels continue"
+        )
+        self._refuse(reason)
+
+    def _note_resting_poll(self, venue_order_id: str, *, readable: bool) -> None:
+        """Record one poll GET of a bound rest (SYNC; the WP5 ``_query_order`` reports here).
+
+        Three consecutive failures for one id latch ``resting_query_unreadable`` (NEW
+        rests refused, cancels continue); a readable poll resets that id's count and,
+        when it was the last latched id, clears the latch (the clearing path).
+        """
+        if readable:
+            self._resting_poll_failures = {
+                k: v for k, v in self._resting_poll_failures.items() if k != venue_order_id
+            }
+            if venue_order_id not in self._unreadable_resting_ids:
+                return
+            self._unreadable_resting_ids = self._unreadable_resting_ids - {venue_order_id}
+            if not self._unreadable_resting_ids:
+                self._trading_refusals = [
+                    r
+                    for r in self._trading_refusals
+                    if r.reason != submit_chain.RESTING_QUERY_UNREADABLE_REASON
+                ]
+                self._log.info("resting poll: every latched id read again; latch cleared")
+            return
+        failures = self._resting_poll_failures.get(venue_order_id, 0) + 1
+        self._resting_poll_failures = {**self._resting_poll_failures, venue_order_id: failures}
+        self._log.warning(f"resting poll: GET failed for a bound rest ({failures} in a row)")
+        if (
+            failures >= submit_chain.RESTING_POLL_FAILURE_LATCH_COUNT
+            and venue_order_id not in self._unreadable_resting_ids
+        ):
+            self._unreadable_resting_ids = self._unreadable_resting_ids | {venue_order_id}
+            self._latch_resting_order(
+                submit_chain.RESTING_QUERY_UNREADABLE_REASON,
+                venue_order_id,
+                f"{failures} failed polls",
+            )
+
+    def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
+        """A terminal read of ``venue_order_id`` drops its alert and, when it was the
+        last latched id, the ``resting_cancel_unconfirmed`` refusal."""
+        self._resting_cancel_alert_details = {
+            k: v for k, v in self._resting_cancel_alert_details.items() if k != venue_order_id
+        }
+        self._resting_cancel_alert_ns = {
+            k: v for k, v in self._resting_cancel_alert_ns.items() if k != venue_order_id
+        }
+        if venue_order_id not in self._unconfirmed_cancel_ids:
+            return
+        self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids - {venue_order_id}
+        if self._unconfirmed_cancel_ids:
+            return
+        self._trading_refusals = [
+            r
+            for r in self._trading_refusals
+            if r.reason != submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON
+        ]
+        self._log.info("resting cancel: every latched cancel read terminal; latch cleared")
+
+    @property
+    def resting_cancel_alerts(self) -> tuple[Mapping[str, str], ...]:
+        """The non-latching CRITICAL cancel alerts, for the health surface (read like
+        :attr:`stale_ambiguous_intent_alerts`: this module cannot import the alert
+        sink)."""
+        return tuple(self._resting_cancel_alert_details.values())
+
+    @property
+    def resting_commission_alerts(self) -> tuple[Mapping[str, str], ...]:
+        """The CRITICAL commission alerts (`commission_bps_drift`,
+        `resting_commission_out_of_envelope`, `commission_unreadable`, and the non-latching
+        `resting_fill_mismatch`) for the health surface. Value-free: an alert names the
+        event, the order id prefix and the slug, never a commission figure."""
+        return tuple(self._resting_commission_alert_details.values())
+
+    # -- S4 WP5: the poll (`_query_order`) and the ONE fill booking -------------
+
+    def _resting_poll_target(self, command: Any) -> RestingTarget | None:
+        """The BOUND ledger target a ``QueryOrder`` names (SYNC), else ``None``: an order
+        the ledger does not bind (or only holds as a resolver context) is not polled."""
+        for target in self._resting_cancel_target(command):
+            if target.bound:
+                return target
+        return None
+
+    async def _query_order(self, command: QueryOrder) -> None:
+        """S4 WP5: the maker strategy's poll of ONE bound rest. GET-ONLY.
+
+        Reads the order-by-id endpoint and hands the body to the synchronous
+        ``_apply_resting_poll``: a fill is booked (durable record first, then the native
+        ``OrderFilled`` as MAKER, then the ledger settle), a venue terminal retires the
+        row like a cancel, a failed or mismatched read counts toward the
+        ``resting_query_unreadable`` latch. An order the ledger does not bind is a quiet
+        no-op. Never sends, never calls the native ``_send_order_status_report`` (the
+        report-injection seam stays closed).
+        """
+        target = self._resting_poll_target(command)
+        if target is None:
+            self._log.debug("resting poll: not a bound resting order; nothing to read")
+            return
+        try:
+            payload = await self._private_read(submit_chain.order_by_id_path(target.venue_order_id))
+        except Exception as exc:  # noqa: BLE001 - a failed GET is one strike, never fatal
+            self._log.warning(f"resting poll: the GET failed ({exc.__class__.__name__})")
+            self._note_resting_poll(target.venue_order_id, readable=False)
+            return
+        self._apply_resting_poll(target, payload)
+
+    def _resting_instrument(self, target: RestingTarget) -> Instrument | None:
+        """The loaded instrument of a bound rest (provider first, then the cache), or
+        ``None``. SYNC; never refuses (a ``_find_instrument`` refusal is a producer)."""
+        if target.instrument_id is None:
+            return None
+        instrument_id = InstrumentId.from_str(target.instrument_id)
+        found = self._instrument_provider.find(instrument_id)
+        return found if found is not None else self._cache.instrument(instrument_id)
+
+    def _parse_resting_read(
+        self, target: RestingTarget, body: Mapping[str, Any]
+    ) -> OrderStatusReport:
+        """The native status report of one read of a bound rest; RAISES when the body does
+        not map (an unknown key, a mismatched slug, no loaded instrument)."""
+        instrument = self._resting_instrument(target)
+        if instrument is None:
+            raise ExecutionReportMappingError("no loaded instrument for the bound rest")
+        return parse_order_status_report(
+            body,
+            instrument=instrument,
+            account_id=self._issued_account_id,
+            report_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+            closing=False,
+        )
+
+    def _apply_resting_poll(self, target: RestingTarget, payload: Any) -> None:
+        """One read of a bound rest, acted on (SYNC; never raises).
+
+        The read must ECHO the requested id and market (``cancel_read_verdict``); a live or
+        filled order must also map to a native report (``parse_order_status_report``); else
+        it is one failed poll (documented residue, B6 review: a FILLED read whose average price
+        the mapper refuses, e.g. a sub-cent ``avgPx``, stays unbooked and counts toward
+        ``resting_query_unreadable`` until a later read maps, or the operator reviews). A
+        readable read clears the poll counter and runs the commission bps watch, then: still
+        open -> nothing; filled -> :meth:`_book_resting_fill`; a zero-fill terminal -> the
+        single-winner retirement (as the cancel path, 4c).
+        """
+        venue_id = target.venue_order_id
+        report = None
+        try:
+            nested = payload.get("order") if isinstance(payload, Mapping) else None
+            body = nested if isinstance(nested, Mapping) else payload
+            verdict = submit_chain.cancel_read_verdict(
+                body, expected_id=venue_id, expected_slug=target.slug
+            )
+            if verdict == submit_chain.CANCEL_READ_UNREADABLE:
+                raise ExecutionReportMappingError("the read does not answer for this order")
+            if verdict in (submit_chain.CANCEL_READ_OPEN, submit_chain.CANCEL_READ_FILLED):
+                # A live or filled order must also MAP (a new key or a mismatched market
+                # is drift, fail-closed). A zero-fill terminal is decided by the verdict
+                # alone, as the cancel path does: its leaves are the venue's to define.
+                report = self._parse_resting_read(target, body)
+        except Exception as exc:  # noqa: BLE001 - one failed poll, never raised
+            self._log.warning(f"resting poll: the read did not map ({exc.__class__.__name__})")
+            self._note_resting_poll(venue_id, readable=False)
+            return
+        readable = True
+        try:
+            self._watch_commission_bps(target, body)
+            if verdict == submit_chain.CANCEL_READ_FILLED:
+                if report is not None and self._book_resting_fill(target, body, report):
+                    self._clear_resting_cancel_latch(venue_id)
+                else:
+                    # not booked: either another path won (the row is gone), or this fill
+                    # cannot be booked yet (no usable price, the record write failed) and the
+                    # row is still bound -- that is a failed poll, counted toward the latch
+                    readable = not self._rest_still_bound(venue_id)
+            elif verdict != submit_chain.CANCEL_READ_OPEN:
+                self._settle_resting_terminal(target, verdict)
+                self._clear_resting_cancel_latch(venue_id)
+        except Exception as exc:  # noqa: BLE001 - the poll never raises; the next one retries
+            self._log.error(f"resting poll: acting on a read failed ({exc.__class__.__name__})")
+            readable = False
+        self._note_resting_poll(venue_id, readable=readable)
+
+    def _rest_still_bound(self, venue_order_id: str) -> bool:
+        """Is ``venue_order_id`` still in the ``resting:`` index? (SYNC; an unreadable index
+        counts as still bound: nothing was proven retired.)"""
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        return indexed is None or venue_order_id in indexed
+
+    def _book_filled_read(self, venue_order_id: str, body: Mapping[str, Any]) -> bool:
+        """A FILLED terminal read made by the CANCEL path books the fill through the same
+        single winner as the poll (SYNC; never raises).
+
+        ``True`` when there is nothing left to book: not a bound rest, booked by this call, or
+        already booked by another path. ``False`` when the fill COULD NOT be booked and the row
+        is still bound (B6 review S2): the caller must keep the id pending and its latch."""
+        try:
+            target = self._resting_target_of(venue_order_id)
+            if target is None or not target.bound:
+                return True
+            report = self._parse_resting_read(target, body)
+            if self._book_resting_fill(target, body, report):
+                return True
+            return not self._rest_still_bound(venue_order_id)
+        except Exception as exc:  # noqa: BLE001 - the cancel loop goes on; the poll retries
+            self._log.error(
+                f"resting cancel: booking the filled read failed ({exc.__class__.__name__})"
+            )
+            return False
+
+    def _note_commission_alert(
+        self, event: str, venue_order_id: str, slug: str, extra: Mapping[str, str]
+    ) -> None:
+        """Record one value-free CRITICAL commission alert (once per event and order)."""
+        key = f"{event}:{venue_order_id}"
+        if key in self._resting_commission_alert_details:
+            return
+        self._resting_commission_alert_details = {
+            **self._resting_commission_alert_details,
+            key: {
+                "severity": "CRITICAL",
+                "event": event,
+                "venue_order_id": _loggable_order_id(venue_order_id),
+                "slug": _loggable_slug(slug),
+                "next": "new_rests_refused_cancels_continue_restart_after_review_clears",
+                **extra,
+            },
+        }
+
+    def _watch_commission_bps(self, target: RestingTarget, body: Mapping[str, Any]) -> None:
+        """Every poll GET: both bps fields must still read the string ``"0"``. A drift is
+        value-free (field NAMES only); it latches ``commission_bps_drift`` (NEW rests only)
+        and never changes what a fill is booked at."""
+        drift = assert_commission_bps_inert(body)
+        if drift is None:
+            return
+        fields = ",".join(drift.fields)
+        self._note_commission_alert(
+            "commission_bps_drift", target.venue_order_id, target.slug, {"fields": fields}
+        )
+        self._latch_resting_order(
+            submit_chain.COMMISSION_BPS_DRIFT_REASON, target.venue_order_id, f"fields {fields}"
+        )
+
+    def _book_resting_fill(
+        self, target: RestingTarget, body: Mapping[str, Any], report: OrderStatusReport
+    ) -> bool:
+        """The ONE booking of a bound rest's fill (SYNC; the poll AND the cancel/sweep
+        FILLED read call it). Returns ``True`` iff THIS call booked it.
+
+        Single winner: the rest must still be in the ``resting:`` index (a loser returns
+        ``False`` and writes nothing). Then, with no ``await`` between: (1) the durable
+        ``DurableFillRecord`` (``trade_id`` = the ``POLL-`` maker marker, ``cumulative_fee`` =
+        the RECOGNISED commission, ``venue_fee_raw`` = the venue's own string,
+        ``fee_reconciled = recognised == raw`` and in the envelope); (2) the native
+        ``OrderFilled`` as MAKER at the venue's commission (guarded: an order this run's
+        cache does not know gets no event; ``liquidity_side`` is MAKER by construction of the
+        bound-rest path, even if the bid crossed on arrival: conservative, the commission and
+        the cost are the venue's own, and an unbound order never reaches this method, so its
+        side is never inferred here); (3) the index row retired (guarded); (4) the
+        ledger settle at the realised cost. The event precedes the retire (B6 review S6; a
+        deviation from the r4 record-then-retire wording: the crash window is then a bound
+        row the next read re-books, never a stuck open order). A
+        fill is NEVER refused for its commission (L-48): an absent commission is booked
+        unreconciled at zero (the resolver's precedent), an out-of-envelope one still books
+        and latches.
+        """
+        venue_id = target.venue_order_id
+        indexed = self._read_fill_index(RESTING_INDEX_KEY)
+        if indexed is None or venue_id not in indexed:
+            return False
+        instrument = self._resting_instrument(target)
+        avg_px = report.avg_px
+        if instrument is None or target.instrument_id is None or avg_px is None or avg_px <= 0:
+            self._log.error(
+                "resting fill: no usable instrument or average price; the fill is not booked "
+                "and the next poll retries"
+            )
+            return False
+        raw: Decimal | None
+        raw_text: str | None
+        try:
+            raw = resting_commission_total(body)
+            raw_text = resting_commission_text(body)
+        except ExecutionReportMappingError:
+            raw, raw_text = None, None
+            self._log.warning("resting fill: no readable commission on the order; unreconciled")
+        quantity = report.filled_qty.as_decimal()
+        cost = quantity * avg_px
+        # `ts_event` is the BOOKING (poll) time: a venue `Order` carries `createTime` only (no
+        # fill time), and a resting order can be created on an earlier UTC day than it fills,
+        # so the creation time would mis-date the fill in the day index and the spend seed.
+        stamp_ns = self._clock.timestamp_ns()
+        within = self._commission_in_envelope(
+            self._taker_theta(instrument, stamp_ns), raw, avg_px, quantity, stamp_ns
+        )
+        if raw is None:
+            # B6 review P1 / SEC L8: an unreadable commission is booked at the MODELLED TAKER
+            # cent fee (conservative, the design cost), never at zero; 0 only if unpinned.
+            fallback = self._modelled_taker_fee(instrument, avg_px, quantity, stamp_ns)
+            recognised = Decimal(0) if fallback is None else fallback
+        else:
+            recognised = recognised_commission(
+                raw, sign_verified=submit_chain.MAKER_COMMISSION_SIGN_VERIFIED
+            )
+        record = DurableFillRecord(
+            venue_order_id=venue_id,
+            client_order_id=target.client_order_id,
+            instrument_id=target.instrument_id,
+            order_side=LONG_ONLY_SIDE,
+            cumulative_qty=quantity,
+            cumulative_cost=cost,
+            cumulative_fee=recognised,
+            fee_reconciled=raw is not None and recognised == raw and within,
+            ts_event=stamp_ns,
+            venue_fee_raw=raw_text,
+            trade_id=submit_chain.maker_poll_trade_id(venue_id),
+            order_qty=report.quantity.as_decimal(),
+        )
+        # B6 review S3: a durable POLL- record that already stands when this process holds no
+        # booking is a CRASH REPLAY (record_fill ran, the retire did not): the boot spend seed
+        # counted its cost, so the settle below must not add it again.
+        prior = self._resting_bookings.get(venue_id)
+        replayed = (prior is None or prior[1] is None) and self._poll_record_exists(venue_id)
+        try:
+            self.record_fill(record, fill_time_instrument=instrument, maker_poll=True)
+        except Exception as exc:  # noqa: BLE001 - never raised; the row stays for the next read
+            self._log.error(f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}")
+            self._latch_resting_order(_FILL_WRITE_FAILED, venue_id, "fill record not written")
+            return False
+        held = self._resting_bookings.get(venue_id)
+        self._log.info(
+            f"resting fill: booked the fill of {_redact_order_id(venue_id)} "
+            f"(commission sign {submit_chain.commission_sign_class(raw_text)})"
+        )
+        # B6 review S6: the native event goes BEFORE the retire, so a crash between the two
+        # leaves the row bound (the next read re-books it, see S3) instead of an order stuck
+        # open with its record already written; a failing retire is guarded (it may have
+        # raised after the index write) and never strands the settle below.
+        self._emit_resting_fill_event(target, report, instrument, recognised, stamp_ns)
+        try:
+            self._retire_resting_row(venue_id)
+        except Exception as exc:  # noqa: BLE001 - the booking completes; the next read retries
+            self._log.error(
+                f"resting fill: retiring the booked rest failed ({exc.__class__.__name__})"
+            )
+        self._resting_bookings = {k: v for k, v in self._resting_bookings.items() if k != venue_id}
+        self._settle_resting_fill(target, held, Decimal(0) if replayed else cost, stamp_ns)
+        self._watch_fill_against_order(target, report)
+        if raw is None:
+            self._flag_unreadable_commission(target.venue_order_id, target.slug)
+        self._check_commission_envelope(target, within)
+        return True
+
+    def _watch_fill_against_order(self, target: RestingTarget, report: OrderStatusReport) -> None:
+        """B6 review S7: a venue fill that is not the order we rested (a filled quantity other
+        than the cached order's, or a BUY average price above its limit) raises a value-free
+        CRITICAL ``resting_fill_mismatch`` alert. The fill is still booked at the venue's own
+        figures (never adjusted to the order); no latch. SYNC, never raises."""
+        try:
+            cached = self._cache.order(ClientOrderId(target.client_order_id))
+            if cached is None or cached.price is None:
+                return
+            differs = (
+                report.filled_qty.as_decimal() != cached.quantity.as_decimal()
+                or report.avg_px > cached.price.as_decimal()
+            )
+        except Exception as exc:  # noqa: BLE001 - a watch, never a refusal
+            self._log.warning(f"resting fill: order comparison failed ({exc.__class__.__name__})")
+            return
+        if differs:
+            self._note_commission_alert(
+                "resting_fill_mismatch",
+                target.venue_order_id,
+                target.slug,
+                {"next": "booked_at_venue_figures_operator_review"},
+            )
+            self._log.error(
+                f"resting fill: {_redact_order_id(target.venue_order_id)} differs from the "
+                "order that was rested (quantity or price); booked at the venue's figures"
+            )
+
+    def _poll_record_exists(self, venue_order_id: str) -> bool:
+        """Does a durable ``POLL-`` fill record already stand for ``venue_order_id``? (SYNC;
+        an unreadable or malformed record is ``False``: the cost is then counted, never lost.)"""
+        try:
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            return raw is not None and submit_chain.is_maker_poll_fill(
+                DurableFillRecord.from_bytes(raw).trade_id
+            )
+        except Exception:  # noqa: BLE001 - counting twice is the conservative direction
+            return False
+
+    def _taker_theta(self, instrument: Instrument, ts_ns: int) -> Decimal | None:
+        """The taker theta for a resting fill: the instrument's, else the dated schedule's
+        at ``ts_ns``; ``None`` when neither pins one. SYNC, never raises."""
+        theta = taker_fee_coefficient_of(instrument)
+        return theta if theta is not None else taker_fee_coefficient_as_of(ts_ns)
+
+    def _modelled_taker_fee(
+        self, instrument: Instrument, price: Decimal, quantity: Decimal, ts_ns: int
+    ) -> Decimal | None:
+        """The modelled TAKER cent fee of a fill (USD), or ``None`` when the schedule is
+        unpinned or the price is out of range. SYNC, never raises."""
+        try:
+            fee = taker_fee_at_fill(
+                quantity=quantity,
+                price=price,
+                ts_event_ns=ts_ns,
+                fee_coefficient_at_fill=self._taker_theta(instrument, ts_ns),
+            )
+        except Exception as exc:  # noqa: BLE001 - a fallback figure is never a refusal
+            self._log.warning(f"resting fill: no modelled taker fee ({exc.__class__.__name__})")
+            return None
+        return None if fee is None else fee.as_decimal()
+
+    def _flag_unreadable_commission(self, venue_order_id: str, slug: str) -> None:
+        """A FILLED rest whose commission could not be read: a value-free CRITICAL
+        ``commission_unreadable`` alert and the NEW-rests latch (the fill is already booked)."""
+        self._note_commission_alert("commission_unreadable", venue_order_id, slug, {})
+        self._latch_resting_order(
+            submit_chain.RESTING_COMMISSION_UNREADABLE_REASON,
+            venue_order_id,
+            "commission absent or unreadable",
+        )
+
+    def _rederive_commission_latches(self) -> None:
+        """B6 review P2: re-derive the two commission latches at boot from the CURRENT UTC
+        day's ``POLL-`` durable records, so a restart does not silently clear them. A record
+        with no readable ``venue_fee_raw`` re-latches ``commission_unreadable``; one above the
+        envelope (priced at the theta recorded AT FILL) re-latches
+        ``resting_commission_out_of_envelope``. SYNC and never raises: an unreadable index or
+        record is itself an unreadable commission for this purpose (fail closed)."""
+        today = utc_day_for_ns(self._clock.timestamp_ns()).isoformat()
+        indexed = self._read_fill_index(f"{FILL_BY_DAY_KEY_PREFIX}{today}")
+        for venue_id in indexed or ():
+            try:
+                raw_record = self._store_get(f"{FILL_KEY_PREFIX}{venue_id}")
+                record = None if raw_record is None else DurableFillRecord.from_bytes(raw_record)
+                if record is None or not submit_chain.is_maker_poll_fill(record.trade_id):
+                    continue
+                slug = base_slug_of(InstrumentId.from_str(record.instrument_id))
+                state = self._rederived_commission_state(record)
+                if state == "unreadable":
+                    self._flag_unreadable_commission(venue_id, slug)
+                elif state == "out":
+                    self._flag_out_of_envelope(venue_id, slug)
+            except Exception as exc:  # noqa: BLE001 - a bad record must not fail the connect
+                self._log.error(f"boot: commission re-derivation failed ({exc.__class__.__name__})")
+                self._flag_unreadable_commission(venue_id, "")
+
+    def _rederived_commission_state(self, record: DurableFillRecord) -> str:
+        """``"unreadable"`` / ``"out"`` / ``"ok"`` for one durable ``POLL-`` record. SYNC."""
+        if record.venue_fee_raw is None:
+            return "unreadable"
+        try:
+            raw = Decimal(record.venue_fee_raw)
+        except InvalidOperation:
+            return "unreadable"
+        if not raw.is_finite() or record.cumulative_qty <= 0:
+            return "unreadable"
+        theta = record.fee_coefficient_at_fill
+        if theta is None:
+            theta = taker_fee_coefficient_as_of(record.ts_event)
+        price = record.cumulative_cost / record.cumulative_qty
+        within = self._commission_in_envelope(
+            theta, raw, price, record.cumulative_qty, record.ts_event
+        )
+        return "ok" if within else "out"
+
+    def _emit_resting_fill_event(
+        self,
+        target: RestingTarget,
+        report: OrderStatusReport,
+        instrument: Instrument,
+        recognised: Decimal,
+        ts_ns: int,
+    ) -> None:
+        """The native ``OrderFilled`` of a poll-booked rest: ``liquidity_side=MAKER``,
+        commission = the RECOGNISED venue figure. Only for an order this run's cache knows
+        and has not closed; a failing emit is logged, never raised (the durable record and
+        the settle already stand)."""
+        cached = self._cache.order(ClientOrderId(target.client_order_id))
+        if cached is None or cached.is_closed or not target.strategy_id:
+            self._log.warning("resting fill: the order is not open in this run's cache; no event")
+            return
+        try:
+            self.generate_order_filled(
+                strategy_id=StrategyId(target.strategy_id),
+                instrument_id=InstrumentId.from_str(target.instrument_id or ""),
+                client_order_id=ClientOrderId(target.client_order_id),
+                venue_order_id=VenueOrderId(target.venue_order_id),
+                venue_position_id=None,
+                trade_id=TradeId(submit_chain.maker_poll_trade_id(target.venue_order_id)),
+                order_side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                last_qty=report.filled_qty,
+                last_px=instrument.make_price(report.avg_px),
+                quote_currency=USD,
+                commission=Money(recognised, USD),
+                liquidity_side=LiquiditySide.MAKER,
+                ts_event=ts_ns,
+            )
+        except Exception as exc:  # noqa: BLE001 - the durable record already stands
+            self._log.error(f"resting fill: the native event failed ({exc.__class__.__name__})")
+
+    def _settle_resting_fill(
+        self, target: RestingTarget, held: tuple[str, Any] | None, cost: Decimal, ts_ns: int
+    ) -> None:
+        """Settle the fill's exposure at its realised cost (a fill gives the permit slot
+        nothing back). A same-process booking is trued up; a prior process's (``None``) adds
+        the cost once; after the boot spend seed a fill with no registered exposure latches
+        the resolver's unbudgeted refusal (AC6b)."""
+        if self._ledger is None:
+            return
+        registered = False
+        try:
+            registered = self._ledger.settle(
+                target.intent_id,
+                booking=None if held is None else held[1],
+                realized_usd=cost,
+                fill_ts_ns=ts_ns,
+                now_ns=ts_ns,
+            )
+        except Exception as exc:  # noqa: BLE001 - abandon, count, go on
+            self._note_resolver_error(target.intent_id, exc)
+            self._ledger.abandon_open_exposure(target.intent_id)
+        if not registered and (held is None or held[1] is None) and self._spend_seeded:
+            self._latch_resting_order(
+                _RESOLVER_FILL_UNBUDGETED, target.venue_order_id, "the fill had no exposure"
+            )
+
+    def _commission_in_envelope(
+        self,
+        theta: Decimal | None,
+        raw: Decimal | None,
+        price: Decimal,
+        quantity: Decimal,
+        ts_ns: int,
+    ) -> bool:
+        """Is ``abs(raw)`` within the commission envelope of the fill
+        (``submit_chain.commission_envelope_bound`` at ``theta``)? ``True`` for an absent
+        commission and for an unpinned schedule (WARN: the watch is skipped, never a
+        refusal); ``False`` only for a commission above the bound. SYNC, never raises."""
+        if raw is None:
+            return True
+        try:
+            modelled = taker_fee_at_fill(
+                quantity=quantity, price=price, ts_event_ns=ts_ns, fee_coefficient_at_fill=theta
+            )
+            exact = taker_fee_exact_at_fill(
+                quantity=quantity, price=price, ts_event_ns=ts_ns, fee_coefficient_at_fill=theta
+            )
+            if modelled is None or exact is None:
+                self._log.warning("resting fill: the fee schedule is unpinned; envelope skipped")
+                return True
+            bound = submit_chain.commission_envelope_bound(
+                modelled=modelled.as_decimal(), exact=exact
+            )
+        except Exception as exc:  # noqa: BLE001 - the envelope is a watch, never a refusal
+            self._log.warning(f"resting fill: envelope check failed ({exc.__class__.__name__})")
+            return True
+        return abs(raw) <= bound
+
+    def _check_commission_envelope(self, target: RestingTarget, within: bool) -> None:
+        """A commission above the envelope (``within`` False): the fill is STILL booked (its
+        ``fee_reconciled`` is already False, B6 review S9); this latches
+        ``resting_commission_out_of_envelope`` (NEW rests only) and raises a value-free
+        CRITICAL alert. Never raises."""
+        if within:
+            return
+        self._flag_out_of_envelope(target.venue_order_id, target.slug)
+
+    def _flag_out_of_envelope(self, venue_order_id: str, slug: str) -> None:
+        """The alert and the NEW-rests latch of an out-of-envelope commission."""
+        self._note_commission_alert("resting_commission_out_of_envelope", venue_order_id, slug, {})
+        self._latch_resting_order(
+            submit_chain.RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON,
+            venue_order_id,
+            "commission above the modelled taker fee",
+        )
+
     async def _cancel_order(self, command: CancelOrder) -> None:
-        """Refuse. There is nothing to cancel: nothing can be sent."""
-        reason = (
-            "EXEC_SPINE R-4 has no order path, so no order of ours can be "
-            "resting at the venue to cancel"
-        )
-        self._log.error(f"Refusing to cancel {command.client_order_id!r}: {reason}")
-        self.generate_order_cancel_rejected(
-            strategy_id=command.strategy_id,
-            instrument_id=command.instrument_id,
-            client_order_id=command.client_order_id,
-            venue_order_id=command.venue_order_id,
-            reason=reason,
-            ts_event=self._clock.timestamp_ns(),
-        )
+        """S4 WP4: cancel ONE resting order of ours (bound, or a with-id HOLD context).
+
+        Refuses via ``generate_order_cancel_rejected`` unless the sender is
+        injected, the canonical string is verified, and the order maps to a venue
+        id in the ledger (a SUBMITTED order with no id yet is cancelled by its
+        venue ``goodTillTime``). Never arms the intent, never asserts the permit
+        (a cancel only reduces risk). The confirm-by-read loop is
+        ``_cancel_resting_order``; a bare 200 never emits ``OrderCanceled``.
+        """
+        targets = self._resting_cancel_target(command)
+        reason = ""
+        if self._order_sender is None:
+            reason = submit_chain.SENDER_ABSENT_REASON
+        elif write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            reason = submit_chain.CANONICAL_UNVERIFIED_REASON
+        elif not targets:
+            reason = "no bound or held resting order carries this client order id"
+        if reason:
+            self._log.error(f"Refusing to cancel {command.client_order_id!r}: {reason}")
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=command.venue_order_id,
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+        await self._cancel_resting_order((targets[0].venue_order_id,))
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         raise NotImplementedError(self._unsupported("order lists"))
@@ -7607,7 +9643,44 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         raise NotImplementedError(self._unsupported("order modification"))
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        raise NotImplementedError(self._unsupported("cancel-all"))
+        """S4 WP4: cancel every LEDGER-BOUND rest on ``command.instrument_id``.
+
+        One per-order cancel for each bound order of that instrument (and side);
+        an unbound or operator order is never touched and no venue cancel-all is
+        issued from this strategy path. Nothing to cancel is success.
+        """
+        targets = self._resting_cancel_target(command)
+        reason = ""
+        if self._order_sender is None:
+            reason = submit_chain.SENDER_ABSENT_REASON
+        elif write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            reason = submit_chain.CANONICAL_UNVERIFIED_REASON
+        if reason:
+            # B5 review G12: never a silent success -- tell the strategy, per target.
+            self._log.error(f"Refusing cancel-all: {reason}")
+            for target in targets:
+                self._reject_cancel_of(command, target, reason)
+            return
+        if not targets:
+            self._log.warning("cancel-all: no ledger-bound resting order on this instrument")
+            return
+        await self._cancel_resting_order([t.venue_order_id for t in targets])
+
+    def _reject_cancel_of(self, command: Any, target: RestingTarget, reason: str) -> None:
+        """``OrderCancelRejected`` for one ledger target of a refused cancel-all (SYNC)."""
+        try:
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=ClientOrderId(target.client_order_id),
+                venue_order_id=VenueOrderId(target.venue_order_id),
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the error line above already told the operator
+            self._log.error(
+                f"cancel-all: the rejection could not be emitted ({exc.__class__.__name__})"
+            )
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         raise NotImplementedError(self._unsupported("batch cancel"))

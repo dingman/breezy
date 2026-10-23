@@ -1853,6 +1853,19 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # send path.
         "_resolve_no_id_intent",
         "_no_id_trade_activity",
+        # S4 WP3 (ARM B4, pin row P4a): the bounded GET-confirm of a freshly created
+        # rest. GET-only (`EXEC_RESTING_CONFIRM_PERMITTED_CALLEES`, row N1, in
+        # `test_resting_path_firewall_delta.py`): no `_order_sender`, no signer.
+        "_confirm_resting_order",
+        # S4 WP4 (ARM B5, pin row P4b): the RETRY-WHEN-OPEN cancel loop; scanned by
+        # EXEC_CANCEL_SEND_PERMITTED_CALLEES (row N2): one send callee, post_cancel_order.
+        "_cancel_resting_order",
+        # S4 WP4 (ARM B5, pin row P4a): the GET-only cancel confirm (row N1).
+        "_confirm_cancel_terminal",
+        # S4 WP4 (ARM B5, pin row P4c): the slug cancel-all choke point (row N3).
+        "_cancel_slug_orders",
+        # S4 WP4 (ARM B5, pin row P4e): the boot sweep (row N4).
+        "_sweep_resting_orders_at_boot",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -2030,6 +2043,28 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # a second exemption from a ban that means "no I/O verb here").
         "submit_chain.wire_fingerprint_bytes",
         "submit_chain.unmappable_order_reason",
+        # S4 WP3 (ARM B4, pin row P1c): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
+        "self._bind_resting_order",
+        # S4 WP3 (ARM B4, pin row P1a): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
+        "self._confirm_resting_order",
+        # S4 WP3 (ARM B4, pin row P1d-2): referenced only from `_submit_order`
+        # (`test_resting_path_firewall_delta.py`).
+        "submit_chain.build_resting_order_body",
+        # S4 WP3 (ARM B4, pin row P1d-1): the pure resting-shape classifier. Referenced
+        # only from `_submit_order` (`test_resting_path_firewall_delta.py`).
+        "submit_chain.unmappable_resting_order_reason",
+        # S4 WP4 (ARM B5, pin row P1e): referenced only from _cancel_order/_cancel_all_orders
+        # (`test_resting_path_firewall_delta.py`).
+        "self._resting_cancel_target",
+        # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders
+        # (`test_resting_path_firewall_delta.py`).
+        "self._cancel_resting_order",
+        # S4 WP4 (ARM B5 review G12, pin row P1g): the per-target `OrderCancelRejected` of a
+        # cancel-all that cannot send; referenced only from _cancel_all_orders
+        # (`test_resting_path_firewall_delta.py`).
+        "self._reject_cancel_of",
         "submit_chain.build_order_body",
         "submit_chain.encode_order_body",
         "submit_chain.order_price_decimal",
@@ -2091,24 +2126,20 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
 #: A subset check (``defined <= permitted``) passes just as happily when a
 #: coroutine is DELETED, which is how ``_query_account`` -- the method
 #: ``live/execution_client.py:332`` calls with nothing defining it in the base
-#: -- could disappear without a failure. ``_query_order`` is declared here
-#: because the base DOES define it and this client does not override it.
+#: -- could disappear without a failure.
 #:
-#: "Declared unimplemented" means two DIFFERENT fates, and this set only ever
-#: holds the second one. ``_query_account`` is genuinely absent -- the base
-#: has nothing defining it, so the ``QueryAccount`` path would raise
-#: ``AttributeError`` were it ever left undeclared. ``_query_order`` is NOT
-#: absent: the base defines a real method (``live/execution_client.py:516-532``)
-#: that calls ``generate_order_status_report`` and, if the result is
-#: non-``None``, ``_send_order_status_report`` -- a report-injection seam that
-#: bypasses ``_submit_order``'s refusal latch. For this entry, "unimplemented"
-#: means the NATIVE default RUNS, unmodified, every time; the seam stays
-#: closed only because this client's own ``generate_order_status_report``
-#: always returns ``None`` (pinned in
-#: ``tests/unit/test_polymarket_us_exec_client.py`` by
-#: ``test_native_query_order_never_reaches_the_send_seam``), never because
-#: the coroutine is missing or raises.
-EXEC_DECLARED_UNIMPLEMENTED_COROUTINES = frozenset({"_query_order"})
+#: ARM maker-sharp B6 (S4 r4 pin row P3, RESTORED to its r3 form): the set is now EMPTY.
+#: ``_query_order`` used to be declared here because the base defines a real method
+#: (``live/execution_client.py:516-532``) that calls ``generate_order_status_report``
+#: and, if the result is non-``None``, ``_send_order_status_report`` -- a
+#: report-injection seam that bypasses ``_submit_order``'s refusal latch -- and this
+#: client did not override it. The client now DEFINES ``_query_order`` (the resting-order
+#: poll: GET-only, never ``_send_order_status_report``), so the name moved out of this
+#: escape hatch and into the scanned GET-only set ``EXEC_QUERY_PERMITTED_CALLEES``
+#: (``test_resting_path_firewall_delta.py``, row P3). ``_query_account`` is still
+#: genuinely absent from the base and must never be parked here: the cage rule table
+#: pins that widened neighbour.
+EXEC_DECLARED_UNIMPLEMENTED_COROUTINES: frozenset[str] = frozenset()
 
 #: Resolution A (plan rev 6.1), SAFETY M3 pin 2: the hole `find_exec_send_
 #: path_violations` left. That scanner only inspects a function whose NAME
@@ -2142,6 +2173,8 @@ EXEC_RESOLVER_COROUTINES = frozenset(
         "_no_id_trade_activity",
         "_resolve_no_order",
         "_adopt_no_id_venue_order",
+        # S4 WP3 (ARM B4, pin row P6a-1): the scanned binder helper (r3 R1).
+        "_bind_resting_order",
     }
 )
 
@@ -2156,6 +2189,27 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
     {
         "asyncio.sleep",
         "self._resolver_poll_interval_secs",
+        # S4 WP3 (ARM B4, pin row P6c-4): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
+        "submit_chain.resting_index_bytes",
+        # S4 WP3 (ARM B4, pin row P6c-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
+        "submit_chain.resting_binding_bytes",
+        # S4 WP3 (ARM B4, pin row P6c-2): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
+        "self._read_fill_index",
+        # S4 WP3 (ARM B4, pin row P6c-1): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
+        "submit_chain.valid_venue_order_id",
+        # S4 WP3 (ARM B4, pin row P6b): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`).
+        "submit_chain.resting_echo_matches",
+        # S4 WP3 (ARM B4, pin row P6a-3): used only in _bind_resting_order
+        # (`test_resting_path_firewall_delta.py`).
+        "self.generate_order_accepted",
+        # S4 WP3 (ARM B4, pin row P6a-2): used only in _resolve_ambiguous_intents
+        # (`test_resting_path_firewall_delta.py`).
+        "self._bind_resting_order",
         # Layers-contract review: `current()` + a bare `SubmitIntentState`
         # comparison would need `breezy.runtime.submit_intent` imported --
         # forbidden (`breezy.adapters` sits below `breezy.runtime`). Replaced
@@ -2436,6 +2490,24 @@ def _dotted_callee(node: ast.expr) -> str | None:
     return None
 
 
+#: S4 WP4 (ARM B5, pin row P2): the ONLY awaits a cancel-path order coroutine may make,
+#: and the two coroutines that may make them. Everything else an order coroutine awaits
+#: is still a violation (`_submit_order` keeps its own exemption above). The awaited
+#: coroutine is itself scanned (`EXEC_CANCEL_SEND_PERMITTED_CALLEES`, row N2, in
+#: `test_resting_path_firewall_delta.py`).
+EXEC_CANCEL_QUERY_AWAITED_CALLEES = frozenset({"self._cancel_resting_order"})
+EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES = frozenset({"_cancel_order", "_cancel_all_orders"})
+
+
+def _is_pinned_cancel_await(function: str, node: ast.Await) -> bool:
+    """True iff ``node`` is the one pinned await of an exempt cancel coroutine."""
+    return (
+        function in EXEC_CANCEL_AWAIT_EXEMPT_COROUTINES
+        and isinstance(node.value, ast.Call)
+        and _dotted_callee(node.value.func) in EXEC_CANCEL_QUERY_AWAITED_CALLEES
+    )
+
+
 def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
     """E0-NOSEND: what an order-lifecycle coroutine under ``exec/`` may DO.
 
@@ -2462,7 +2534,9 @@ def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
             continue
         for inner in ast.walk(node):
             if isinstance(inner, ast.AsyncFor | ast.AsyncWith) or (
-                isinstance(inner, ast.Await) and node.name != "_submit_order"
+                isinstance(inner, ast.Await)
+                and node.name != "_submit_order"
+                and not _is_pinned_cancel_await(node.name, inner)
             ):
                 violations.append(
                     Violation(
@@ -3333,6 +3407,23 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # BL-10 (r1/r2 delta): see the definition site's comment above.
             "submit_chain.wire_fingerprint_bytes",
             "submit_chain.unmappable_order_reason",
+            # S4 WP3 (ARM B4, pin row P1c): see the definition site.
+            "self._bind_resting_order",
+            # S4 WP3 (ARM B4, pin row P1a): see the definition site.
+            "self._confirm_resting_order",
+            # S4 WP3 (ARM B4, pin row P1d-2): see the definition site.
+            "submit_chain.build_resting_order_body",
+            # S4 WP3 (ARM B4, pin row P1d-1): see the definition site's comment.
+            "submit_chain.unmappable_resting_order_reason",
+            # S4 WP4 (ARM B5, pin row P1e): referenced only from _cancel_order/_cancel_all_orders
+            # (`test_resting_path_firewall_delta.py`).
+            "self._resting_cancel_target",
+            # S4 WP4 (ARM B5, pin row P1b): referenced only from _cancel_order/_cancel_all_orders
+            # (`test_resting_path_firewall_delta.py`).
+            "self._cancel_resting_order",
+            # S4 WP4 (ARM B5 review G12, pin row P1g): referenced only from _cancel_all_orders
+            # (`test_resting_path_firewall_delta.py`).
+            "self._reject_cancel_of",
             "submit_chain.build_order_body",
             "submit_chain.encode_order_body",
             "submit_chain.order_price_decimal",
@@ -3927,7 +4018,74 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # carries no `SOCKET_RESTORING_MARKERS`, constructs no client, and
         # only reads plain string constants and a pure hashing function.
         "tests/unit/autonomy/test_exec_intent_parity.py",
+        # ARM maker-sharp B1 (slice 3b5744eb, caught at B3): `test_polymarket_us_
+        # cancel_transport.py` imports `exec.endpoints` (`cancel_order_path`,
+        # `valid_venue_order_id`) to pin the per-order cancel path and the venue
+        # id allowlist. WIDENED, not relaxed (L-6/L-12): the comparison is still
+        # `==`; the module carries no `SOCKET_RESTORING_MARKERS` and drives the
+        # `write_transport` verbs against an injected recording `_Client` double --
+        # no real HttpClient, no socket.
+        "tests/unit/test_polymarket_us_cancel_transport.py",
+        # ARM maker-sharp B3 / S4 WP1 (plan S4 r4 delta section 9): `test_polymarket_
+        # us_resting_order_shape.py` imports `exec.submit_chain` and `exec.endpoints`
+        # to drive the PURE resting shape, 9-key GTD body builder, `format_good_
+        # till_time` and `resting_echo_matches` over fixture instruments and
+        # `parse_order_status_report` output. WIDENED, not relaxed (L-6/L-12): the
+        # comparison is still `==`; the module carries no `SOCKET_RESTORING_MARKERS`,
+        # builds no client and no sender -- every function under test is pure.
+        "tests/unit/test_polymarket_us_resting_order_shape.py",
+        # ARM maker-sharp B3 / S4 WP2 (plan S4 r3 WP2, P12): `test_resting_
+        # retirement_reasons.py` imports `exec.submit_chain` to pin the two
+        # `RETIRE_*` names it emits (`RETIRE_ACCEPTED_RESTING`, `RETIRE_BOOT_
+        # SWEEP_RESTING_NO_FILL`) and `retirement_member`, and the AST collector
+        # from `test_retirement_reason_superset.py`. WIDENED, not relaxed
+        # (L-6/L-12): the comparison is still `==`; the module carries no
+        # `SOCKET_RESTORING_MARKERS`, builds no client, and only touches the
+        # in-process submit-intent latch and the supervisor decode marker file.
+        "tests/unit/test_resting_retirement_reasons.py",
+        # ARM maker-sharp B3 / S4 r3 P16: `test_cage_rule_constants_are_pinned.py`
+        # now imports `exec.submit_chain` to pin `RESTING_PRICE_CAP` beside the
+        # other cage rule constants. WIDENED, not relaxed (L-6/L-12): the
+        # comparison is still `==`; the module carries no
+        # `SOCKET_RESTORING_MARKERS`, constructs no client, and only compares
+        # module-level constants (a `Decimal`) to their pins.
+        "tests/unit/test_cage_rule_constants_are_pinned.py",
+        # ARM D1 harm stop (review follow-up, 2026-10-22): the producer's fixture suite imports
+        # `DurableFillRecord` and `FILL_KEY_PREFIX` from `exec.client` to build and key the
+        # durable fill records it feeds the harm-stop evaluator, exactly like the fill-tally
+        # siblings above. WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+        # module carries no `SOCKET_RESTORING_MARKERS`, constructs no client and no sender, and
+        # opens no socket (a throwaway sqlite file, an injected CLI reader, a local JSON file);
+        # `test_d1_producer_suite_is_inside_x1_and_carries_no_marker` plants the marker.
+        "tests/strategy/no_ladder_maker/test_harm_stop_producer.py",
+        # ARM C2 (D4, MAX_RUNGS 2): `test_no_ladder_maker_max_rungs.py` imports `exec.reports`
+        # (`parse_position_status_report`) and drives the shipped resting-submit rig to prove the
+        # real exec client admits and books two NO-leg rests on one ladder and maps each rung's
+        # position to its own NO leg. WIDENED, not relaxed (L-6/L-12): the comparison is still
+        # `==`; the module carries no `SOCKET_RESTORING_MARKERS`, reuses the injected fake senders
+        # of its sibling exec suites and opens no socket;
+        # `test_c2_max_rungs_suite_is_inside_x1_and_carries_no_marker` plants the marker.
+        "tests/unit/test_no_ladder_maker_max_rungs.py",
     }
+
+
+def test_c2_max_rungs_suite_is_inside_x1_and_carries_no_marker() -> None:
+    path = "tests/unit/test_no_ladder_maker_max_rungs.py"
+    source = (REPO_ROOT / path).read_text()
+    assert _imports_exec_package(ast.parse(source))
+    assert find_exec_test_marker_violations(path, source) == []
+    planted = source + "\n" + _PLANTED_EXEC_TEST_WITH_MARKER
+    assert [v.rule for v in find_exec_test_marker_violations(path, planted)] == ["X1"]
+
+
+def test_d1_producer_suite_is_inside_x1_and_carries_no_marker() -> None:
+    path = "tests/strategy/no_ladder_maker/test_harm_stop_producer.py"
+    source = (REPO_ROOT / path).read_text()
+    assert _imports_exec_package(ast.parse(source))
+    assert find_exec_test_marker_violations(path, source) == []
+    # plant: the same module with a socket-restoring marker added is an X1 violation
+    planted = source + "\n" + _PLANTED_EXEC_TEST_WITH_MARKER
+    assert [v.rule for v in find_exec_test_marker_violations(path, planted)] == ["X1"]
 
 
 def test_x1_the_reach_detector_is_the_same_predicate_the_rule_uses() -> None:
@@ -4373,6 +4531,12 @@ def test_the_correct_shape_is_accepted_by_the_shape_check() -> None:
 #: silently widening around it.
 ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
     frozenset({"__init__"}) | ORDER_LIFECYCLE_COROUTINES | EXEC_RESOLVER_COROUTINES
+    # S4 WP4 (ARM B5, pin row FW-2): a NAMED term per reviewed row, never relaxed.
+    | frozenset({"_cancel_slug_orders"})
+    # S4 WP4 (ARM B5, pin row FW-1): a NAMED term per reviewed row, never relaxed.
+    | frozenset({"_cancel_resting_order"})
+    # S4 WP4 (ARM B5, pin row FW-8): a NAMED term per reviewed row, never relaxed.
+    | frozenset({"_sweep_resting_orders_at_boot"})
 )
 
 #: Pinned at HEAD (2026-09-26, before R-7-IMPL): the exact set of functions in
@@ -4382,7 +4546,32 @@ ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
 #: referencing it -- including a new helper the create-path accept-fill
 #: branch calls, such as R-7-IMPL's `_match_position_lag` -- is exactly what
 #: `find_order_sender_reference_violations` below refuses.
-ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"})
+ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"}) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-7): a NAMED member per reviewed row.
+        "_sweep_resting_orders_at_boot",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-6): a NAMED member per reviewed row.
+        "_cancel_all_orders",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-5): a NAMED member per reviewed row.
+        "_cancel_order",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-4): a NAMED member per reviewed row.
+        "_cancel_slug_orders",
+    }
+) | frozenset(
+    {
+        # S4 WP4 (ARM B5, pin row FW-3): a NAMED member per reviewed row.
+        "_cancel_resting_order",
+    }
+)
 
 
 def _functions_referencing_order_sender(path: str, source: str) -> set[str]:

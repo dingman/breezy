@@ -329,12 +329,32 @@ async def _signed_post_cancel_all(
     signer: Ed25519RequestSigner,
     clock: Any,
 ) -> tuple[int, str | None]:
-    """The legacy write (R-6.5P). No ``query``/``body`` parameter -- both
-    refused by construction, never accepted from a caller."""
-    status, response_type, _body = await _signed_post(
-        write_client, api_base_url, credentials, signer, clock, path=_CANCEL_ALL_PATH, body={}
+    """RETIRED (ARM B7, S4 r4 WP6; B1 LOW). This sent ``body={}`` to the cancel-all path,
+    which the venue reads as "cancel every open order on the account". It now refuses
+    unconditionally BEFORE any I/O: the only cancel-all sender is the exec client's slug-scoped
+    ``_cancel_slug_orders``. The signature is kept so the legacy flows still bracket their
+    reads, but they can no longer reach the write."""
+    raise ProbeRefusal(
+        "LEGACY_CANCEL_ALL_RETIRED: the empty-body account-wide cancel-all is retired; "
+        "no POST was issued. Use the slug-scoped cancel path."
     )
-    return status, response_type
+
+
+_RETIRED_CANCEL_ALL_SENDER = _signed_post_cancel_all
+
+
+def _refuse_while_cancel_all_is_retired() -> None:
+    """ARM B7 review T1: refuse at FLOW ENTRY, before the write-intent marker, before the
+    credential read and before any GET or POST. Refusing only inside the sender let
+    ``run_sequence`` POST a real order and then die on the retired cancel-all, stranding it.
+    Keyed on the live sender so the bookkeeping tests, which install a test-only stand-in over
+    ``_signed_post_cancel_all``, still drive the flows; production never replaces it."""
+    if _signed_post_cancel_all is _RETIRED_CANCEL_ALL_SENDER:
+        raise ProbeRefusal(
+            "LEGACY_CANCEL_ALL_RETIRED: the legacy write flows end in the retired empty-body "
+            "cancel-all, so they refuse before any I/O. No marker was written and no POST "
+            "was issued."
+        )
 
 
 def _extract_order_id(body: bytes | None) -> str | None:
@@ -393,6 +413,7 @@ async def run_probe(
     """Run the legacy probe end to end: pre-flight GET, one POST,
     post-flight GET, in that order. Every refusal path issues strictly
     fewer requests."""
+    _refuse_while_cancel_all_is_retired()
     from nautilus_trader.common.component import LiveClock
 
     filename = probe_artifact_filename(stamp=stamp)
@@ -546,6 +567,7 @@ async def run_sequence(
     stop is terminal (except S4's one bounded re-read). S2 (no eligible
     instrument) raises without writing an artefact; every other stop returns
     an observation for the caller to persist."""
+    _refuse_while_cancel_all_is_retired()
     from nautilus_trader.common.component import LiveClock
 
     if discovery is None:

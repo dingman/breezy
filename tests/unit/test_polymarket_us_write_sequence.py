@@ -31,6 +31,7 @@ from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 from breezy.adapters.polymarket_us.exec.submit_chain import ORDER_BODY_KEYS
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from tests.unit import legacy_probe_cancel_all_stand_in as legacy_stand_in
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "venue" / "polymarket_us_write_signing_probe.py"
@@ -65,6 +66,13 @@ def helper() -> ModuleType:
 @pytest.fixture(scope="module")
 def probe(helper: ModuleType) -> ModuleType:
     return _load(SCRIPT_PATH, "breezy_polymarket_us_write_sequence_probe")
+
+
+@pytest.fixture(autouse=True)
+def _legacy_cancel_all_stand_in(probe: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ARM B7: the probe's real cancel-all sender is retired (it refuses); the flow tests use
+    the test-only stand-in. The refusal itself is pinned in test_polymarket_us_cancel_transport."""
+    legacy_stand_in.install(monkeypatch, probe)
 
 
 # --------------------------------------------------------------------------

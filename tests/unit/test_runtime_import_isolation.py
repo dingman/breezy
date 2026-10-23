@@ -138,12 +138,19 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # never relaxed).
     "scripts.ops.ambig_latch_phase_a_check",
     "scripts.analysis.maker_tape_census",  # MAKER S1 WP1 census
+    # B2 positive control: the shared core imports `breezy.runtime`, so source
+    # (c) picks it up; tracked, not excluded.
+    "scripts.venue._maker_control_core",
     "scripts.analysis.maker_stage0_probe",  # MAKER S2 WP0 probe
     "scripts.analysis.maker_stage0_nodelog",  # MAKER-S2 WP1 node-log scan
     "scripts.analysis.maker_stage0_schedule",  # MAKER-S2 WP1 process schedule
     "scripts.analysis.maker_stage0_catalog_read",  # MAKER-S2 WP6 capture reader
     # MAKER-S2 second look C4: the parked trigger unit's `-m` entry (WIDENED by this one row).
     "scripts.analysis.maker_stage0_trigger",
+    # ARM D1: the maker harm-stop producer (ExecStartPost of the truth-dataset unit) imports
+    # `breezy.runtime.submit_intent`'s read-only slot decoder, so source (c) picks it up
+    # (WIDENED by this one row; the meta-test below is the plant: deleting it names this entry).
+    "scripts.analysis.maker_loss_stop_producer",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

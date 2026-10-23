@@ -1,0 +1,443 @@
+"""ARM B1 -- slug-scoped cancel transport verbs and their validation plants.
+
+Authority: ``docs/plans/backlog/ARM_MAKER_SHARP_2026-10-21/plan_r2_delta.md`` D2 and
+``MAKER_2026-10-12/S4_exec_resting_order_path_plan_r4_delta.md`` rows T1-T3, P7, N5.
+
+The venue treats an empty ``slugs`` list as "cancel every open order on the
+account", so the transport must make an empty or malformed list unconstructible,
+validating independently of the frozen ``symbology.parse_weather_slug``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import sys
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    CANCEL_ORDER_PATH_TEMPLATE,
+    cancel_order_path,
+    valid_venue_order_id,
+)
+from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO
+from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+from tests.unit import b2_control_fakes as b2_fakes
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_BASE = "https://api.example.invalid"
+_HEADERS = {"X-PM-Access-Key": "k"}
+_SLUG = "tc-temp-nychigh-2026-10-13-lt71f"
+_SLUG_B = "tc-temp-sfohigh-2026-10-13-gte72lt73f"
+_ORDER_ID = "ABCDEF123456"
+_LEGACY_PROBE = "scripts/venue/polymarket_us_write_signing_probe.py"
+#: ARM B7 (S4 r4 WP6) re-digest, once: the probe's empty-body cancel-all sender now refuses
+#: unconditionally (prior fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f).
+#: Re-digested again at the B7 review fix T1 (flow-entry refusal). Prior:
+#: 93961ec21bf996bd4f247e9a47457ea27ce5109d1c689206ff814d0c0cc18ba3
+#: Pinned together with the AST tests at the end of this file and the M6 baseline entry.
+_LEGACY_PROBE_SHA256 = "7dfe7f0ebe8abc398f298265b2142e80164b571ed3cd543926fab91eea0f231b"
+#: ARM B2 (plan_r2_delta D3): the maker positive-control script is the ONE other script that may
+#: name the cancel-all verb -- it calls ``PolymarketUSWriteTransport.post_cancel_all`` from a
+#: single guarded site (``ControlSession.cancel_slugs``: non-empty, de-duplicated, daily-HIGH
+#: slugs only) and never the legacy helper. sha-pinned: any edit re-reviews this row.
+_B2_CONTROL = "scripts/venue/polymarket_us_maker_positive_control.py"
+#: Re-digested once at the B2 review fixes (quote and close-time guards, node probe, signal
+#: handlers, activities paging). Prior digest:
+#: ee42945012ab87216271faf34ba067dfcfbda9009760839734be0ab29af3ab66
+#: Re-digested again at the B2 open-orders eof fix (exec rule: eof absent is complete,
+#: unknown envelope key refuses). Prior digest:
+#: 1bd4cdf9f4940b57179e291f3e0ea863f777e32abebf5423fbcc39bde4fffd50
+#: Re-digested once at the B2 slug-selection fix (production-parity candidates, paged listing,
+#: value-free selection diagnostics, --select-only). Prior digest:
+#: ff02492d959c32e2af3235703012f51ac73705e8ba7a0e4577481f6e5cde1e1f
+_B2_CONTROL_SHA256 = "c73801fa8839a25bf14e326701638efea3a90bbc76f49b98fbd334ef85b824dc"
+
+
+class _Resp:
+    status = 200
+    headers: ClassVar[dict[str, str]] = {}
+    body = b"{}"
+
+
+class _Client:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append({"url": url, **kwargs})
+        return _Resp()
+
+
+def _transport() -> tuple[PolymarketUSWriteTransport, _Client]:
+    client = _Client()
+    return PolymarketUSWriteTransport(client=client), client
+
+
+_BAD_SLUGS = [
+    pytest.param("", id="empty"),
+    pytest.param(_SLUG + "\n", id="trailing-newline"),
+    pytest.param("tc-temp-nychigh-2026-10-1３-lt71f", id="fullwidth-digit-in-date"),
+    pytest.param("tc-temp-nychigh-2026-10-13-lt71f ", id="trailing-space"),
+    pytest.param("TC-TEMP-NYCHIGH-2026-10-13-LT71F", id="uppercase"),
+    pytest.param("tc-temp-nychigh-2026-10-13", id="no-bounds"),
+    pytest.param("sports-nba-lal-bos-2026-10-13", id="non-weather"),
+    pytest.param("tc-temp-sjc-dec-lt40", id="monthly-non-daily"),
+]
+
+_BAD_IDS = [
+    pytest.param("", id="empty"),
+    pytest.param("ID\n", id="newline"),
+    pytest.param(_ORDER_ID + "\n", id="valid-plus-newline"),
+    pytest.param(_ORDER_ID.lower(), id="lowercase"),
+    pytest.param(_ORDER_ID[:11], id="11-chars"),
+    pytest.param(_ORDER_ID + "7", id="13-chars"),
+    pytest.param("ABCDEF12345٣", id="non-ascii-digit"),
+    pytest.param("ABCDEF12345É", id="non-ascii-letter"),
+    pytest.param("ABCDEF/23456", id="path-separator"),
+]
+
+
+# ---------------------------------------------------------------- order id / path
+
+
+def test_valid_venue_order_id_accepts_the_observed_shape() -> None:
+    assert valid_venue_order_id(_ORDER_ID) is True
+
+
+@pytest.mark.parametrize("bad", _BAD_IDS)
+def test_valid_venue_order_id_refuses_everything_outside_the_regex(bad: str) -> None:
+    assert valid_venue_order_id(bad) is False
+
+
+@pytest.mark.parametrize("bad", [None, 123, b"ABCDEF123456"])
+def test_valid_venue_order_id_refuses_non_strings(bad: object) -> None:
+    assert valid_venue_order_id(bad) is False
+
+
+def test_cancel_order_path_is_the_literal_template_filled() -> None:
+    assert CANCEL_ORDER_PATH_TEMPLATE == "/v1/order/{order_id}/cancel"
+    assert cancel_order_path(_ORDER_ID) == f"/v1/order/{_ORDER_ID}/cancel"
+
+
+@pytest.mark.parametrize("bad", _BAD_IDS)
+def test_cancel_order_path_refuses_invalid_ids(bad: str) -> None:
+    with pytest.raises(ValueError):
+        cancel_order_path(bad)
+
+
+# ---------------------------------------------------------------- T1 signatures
+
+
+def test_cancel_verbs_take_no_method_query_or_caller_bytes() -> None:
+    all_params = inspect.signature(PolymarketUSWriteTransport.post_cancel_all).parameters
+    one_params = inspect.signature(PolymarketUSWriteTransport.post_cancel_order).parameters
+    assert set(all_params) == {"self", "api_base_url", "headers", "slugs"}
+    assert set(one_params) == {"self", "api_base_url", "headers", "order_id", "market_slug"}
+    for params in (all_params, one_params):
+        assert not {"method", "query", "params", "timeout_secs", "body"} & set(params)
+
+
+# ---------------------------------------------------------------- post_cancel_order
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_order_posts_body_to_the_literal_path() -> None:
+    transport, client = _transport()
+    response = await transport.post_cancel_order(
+        _BASE + "/", headers=_HEADERS, order_id=_ORDER_ID, market_slug=_SLUG
+    )
+    assert response.status == 200
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert set(call) == {"url", "headers", "body", "keys"}
+    assert call["url"] == f"{_BASE}/v1/order/{_ORDER_ID}/cancel"
+    assert call["headers"] == _HEADERS
+    assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
+    assert json.loads(call["body"]) == {"marketSlug": _SLUG}
+    assert call["body"] == json.dumps({"marketSlug": _SLUG}).encode("ascii")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _BAD_IDS)
+async def test_post_cancel_order_refuses_bad_order_id_without_sending(bad: str) -> None:
+    transport, client = _transport()
+    with pytest.raises(ValueError):
+        await transport.post_cancel_order(_BASE, headers=_HEADERS, order_id=bad, market_slug=_SLUG)
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _BAD_SLUGS)
+async def test_post_cancel_order_refuses_bad_slug_without_sending(bad: str) -> None:
+    transport, client = _transport()
+    with pytest.raises(ValueError):
+        await transport.post_cancel_order(
+            _BASE, headers=_HEADERS, order_id=_ORDER_ID, market_slug=bad
+        )
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------- post_cancel_all
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_builds_and_sends_the_slugs_body() -> None:
+    transport, client = _transport()
+    await transport.post_cancel_all(_BASE, headers=_HEADERS, slugs=[_SLUG, _SLUG_B])
+    call = client.calls[0]
+    assert set(call) == {"url", "headers", "body", "keys"}
+    assert call["url"] == f"{_BASE}/v1/orders/open/cancel"
+    assert call["keys"] == [QUOTA_KEY_PORTFOLIO]
+    assert call["body"] == json.dumps({"slugs": [_SLUG, _SLUG_B]}).encode("ascii")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_slugs",
+    [
+        pytest.param([], id="empty-list"),
+        pytest.param([""], id="list-of-empty"),
+        pytest.param([_SLUG, ""], id="valid-plus-empty"),
+        pytest.param([_SLUG + "\n"], id="trailing-newline"),
+        pytest.param(["tc-temp-nychigh-2026-10-1３-lt71f"], id="fullwidth-digit"),
+        pytest.param([_SLUG, _SLUG], id="duplicate"),
+        pytest.param(_SLUG, id="bare-string-not-a-list"),
+        pytest.param(None, id="none"),
+        pytest.param([None], id="none-element"),
+        pytest.param([_SLUG.encode()], id="bytes-element"),
+    ],
+)
+async def test_post_cancel_all_refuses_unsafe_slugs_without_sending(bad_slugs: Any) -> None:
+    transport, client = _transport()
+    with pytest.raises(ValueError):
+        await transport.post_cancel_all(_BASE, headers=_HEADERS, slugs=bad_slugs)
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_all_cannot_be_called_bodiless() -> None:
+    transport, client = _transport()
+    with pytest.raises(TypeError):
+        await transport.post_cancel_all(_BASE, headers=_HEADERS)  # type: ignore[call-arg]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _BAD_SLUGS)
+async def test_post_cancel_all_refuses_each_bad_slug_in_a_valid_list(bad: str) -> None:
+    transport, client = _transport()
+    with pytest.raises(ValueError):
+        await transport.post_cancel_all(_BASE, headers=_HEADERS, slugs=[_SLUG, bad])
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------- N5-style tree scan
+
+_CANCEL_ALL_TOKENS = ("CANCEL_ALL_PATH", "_signed_post_cancel_all", "/v1/orders/open/cancel")
+_OWNER = "src/breezy/adapters/polymarket_us/write_transport.py"
+#: Row N5 (ARM B5): the exec client is the ONE extra file that may name the path, and only
+#: inside the single choke point ``_cancel_slug_orders`` (pinned by AST in
+#: ``test_resting_path_firewall_delta.py``, row N5).
+_CLIENT = "src/breezy/adapters/polymarket_us/exec/client.py"
+
+
+def _scan(tokens: tuple[str, ...], allowed: frozenset[str]) -> list[tuple[str, str]]:
+    hits: list[tuple[str, str]] = []
+    for root in ("src", "scripts"):
+        for path in sorted((REPO_ROOT / root).rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            if rel in allowed:
+                continue
+            text = path.read_text(encoding="utf-8")
+            hits.extend((rel, t) for t in tokens if t in text)
+    return hits
+
+
+def test_legacy_probe_exemption_is_sha_pinned() -> None:
+    digest = hashlib.sha256((REPO_ROOT / _LEGACY_PROBE).read_bytes()).hexdigest()
+    assert digest == _LEGACY_PROBE_SHA256
+
+
+def test_no_module_but_the_owner_and_the_pinned_probe_names_the_cancel_all_path() -> None:
+    exempt = frozenset({_OWNER, _LEGACY_PROBE, _CLIENT, _B2_CONTROL})
+    assert _scan(_CANCEL_ALL_TOKENS, exempt) == []
+
+
+def test_b2_control_exemption_is_sha_pinned_and_load_bearing() -> None:
+    """ARM B2 row plant: the digest is pinned, the exemption is exercised (the script really
+    names the verb), and without it the scan flags the script."""
+    digest = hashlib.sha256((REPO_ROOT / _B2_CONTROL).read_bytes()).hexdigest()
+    assert digest == _B2_CONTROL_SHA256
+    unexempted = _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE, _CLIENT}))
+    assert {path for path, _ in unexempted} == {_B2_CONTROL}
+
+
+def test_scan_sees_a_planted_reference(tmp_path: Path) -> None:
+    """Non-vacuity: the scanner flags a module that names the path or the helper."""
+    planted = REPO_ROOT / "scripts" / "venue" / "_b1_planted_reference.py"
+    planted.write_text("from x import _signed_post_cancel_all\n", encoding="utf-8")
+    try:
+        hits = _scan(_CANCEL_ALL_TOKENS, frozenset({_OWNER, _LEGACY_PROBE}))
+    finally:
+        planted.unlink()
+    assert ("scripts/venue/_b1_planted_reference.py", "_signed_post_cancel_all") in hits
+
+
+def test_no_module_imports_the_legacy_cancel_all_helper_beyond_the_probe() -> None:
+    assert _scan(("_signed_post_cancel_all",), frozenset({_LEGACY_PROBE})) == []
+
+
+# ------------------------------------------- ARM B7: the legacy empty cancel-all is retired
+#
+# B1 LOW / S4 r4 WP6: the legacy probe's ``_signed_post_cancel_all`` posts ``body={}`` to the
+# cancel-all path, which the venue reads as "cancel every open order on the account". WP6
+# forbids reusing it, so it now refuses unconditionally BEFORE any I/O and the only cancel-all
+# sender left is the exec client's ``_cancel_slug_orders``.
+
+
+def _load_legacy_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        "breezy_b7_legacy_probe_under_test", REPO_ROOT / _LEGACY_PROBE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)  # no sys.modules leak past the test
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sender_calls_signed_post(source: str) -> bool:
+    """Does ``_signed_post_cancel_all`` in ``source`` still reach the signed-POST helper?"""
+    import ast
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_signed_post_cancel_all":
+            return any(
+                isinstance(inner, ast.Call)
+                and getattr(inner.func, "id", getattr(inner.func, "attr", "")) == "_signed_post"
+                for inner in ast.walk(node)
+            )
+    raise AssertionError("_signed_post_cancel_all not found")
+
+
+@pytest.mark.asyncio
+async def test_the_legacy_probe_cancel_all_sender_refuses_before_any_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    probe = _load_legacy_probe(monkeypatch)
+    client = _Client()
+    with pytest.raises(probe.ProbeRefusal):
+        await asyncio.wait_for(
+            probe._signed_post_cancel_all(client, _BASE, None, None, None), timeout=5
+        )
+    assert client.calls == []
+
+
+def test_the_legacy_probe_cancel_all_sender_never_reaches_the_signed_post_helper() -> None:
+    source = (REPO_ROOT / _LEGACY_PROBE).read_text(encoding="utf-8")
+    assert _sender_calls_signed_post(source) is False
+
+
+def test_the_sender_pin_trips_on_a_planted_signed_post_call() -> None:
+    """Non-vacuity: restoring the legacy body (a ``_signed_post`` call) is caught."""
+    source = (REPO_ROOT / _LEGACY_PROBE).read_text(encoding="utf-8")
+    planted = source.replace(
+        "async def _signed_post_cancel_all(",
+        "async def _signed_post_cancel_all_old(",
+    ) + (
+        "\nasync def _signed_post_cancel_all(*a, **k):\n"
+        "    return await _signed_post(*a, path=_CANCEL_ALL_PATH, body={})\n"
+    )
+    assert _sender_calls_signed_post(planted) is True
+
+
+# ----------------------------------------------- ARM B7 review T1: refuse at FLOW ENTRY
+#
+# Refusing only inside the sender left ``run_sequence`` posting a real order and then dying on
+# the retired cancel-all, stranding the order. Both legacy flows must now refuse BEFORE the
+# write-intent marker, before credentials are read and before any GET/POST.
+
+
+class _Boom(Exception):
+    pass
+
+
+def _tripwire(name: str) -> Any:
+    def _fn(*_a: Any, **_k: Any) -> Any:
+        raise _Boom(f"{name} reached: the flow did not refuse at entry")
+
+    return _fn
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["run_sequence", "run_probe"])
+async def test_legacy_flows_refuse_at_entry_with_zero_posts_and_no_marker(
+    flow: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    probe = _load_legacy_probe(monkeypatch)
+    client = _Client()
+    kwargs: dict[str, Any] = {
+        "directory": tmp_path,
+        "stamp": "t1",
+        "prepare_fn": _tripwire("prepare_fn"),
+        "read_transport_factory": _tripwire("read_transport_factory"),
+        "write_client_factory": lambda _config: client,
+    }
+    with pytest.raises(probe.ProbeRefusal, match="LEGACY_CANCEL_ALL_RETIRED"):
+        await asyncio.wait_for(getattr(probe, flow)(**kwargs), timeout=5)
+    assert client.calls == []
+    assert list(tmp_path.iterdir()) == []  # no write-intent marker, no artefact
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["run_sequence", "run_probe"])
+async def test_the_entry_refusal_stands_down_only_for_an_installed_test_stand_in(
+    flow: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-vacuity: the guard keys on the live sender, so the bookkeeping tests that install the
+    stand-in still run, and the unpatched module refuses."""
+    import asyncio
+
+    from tests.unit import legacy_probe_cancel_all_stand_in as stand_in
+
+    probe = _load_legacy_probe(monkeypatch)
+    stand_in.install(monkeypatch, probe)
+    with pytest.raises(_Boom, match="prepare_fn"):
+        await asyncio.wait_for(
+            getattr(probe, flow)(
+                directory=tmp_path, stamp="t1b", prepare_fn=_tripwire("prepare_fn")
+            ),
+            timeout=5,
+        )
+
+
+@pytest.mark.parametrize(("payload", "complete"), b2_fakes.OPEN_ORDERS_ENVELOPES)
+def test_b2_open_orders_rule_agrees_with_the_exec_client(payload: Any, complete: bool) -> None:
+    """The script mirrors the exec client's envelope rule; both must accept the same set."""
+    from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+    from breezy.adapters.polymarket_us.exec import submit_chain
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    b2_fakes.load_control()
+    core = sys.modules["_maker_control_core"]
+
+    assert core.OPEN_ORDERS_KNOWN_ENVELOPE_KEYS == submit_chain._OPEN_ORDERS_KNOWN_ENVELOPE_KEYS
+    try:
+        exec_ok = submit_chain.open_orders_envelope_is_known(payload) and (
+            parse_open_orders(payload) == ()
+        )
+    except ExecutionReportMappingError:
+        exec_ok = False
+    assert (core.open_order_ids(payload) is not None) is exec_ok is complete

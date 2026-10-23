@@ -10,7 +10,9 @@ untouched: the write signer is a sibling type gated by
 from __future__ import annotations
 
 import base64
-from collections.abc import Awaitable, Callable, Mapping
+import json
+import re
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Final
 
 from nautilus_trader.common.component import Clock
@@ -22,6 +24,7 @@ from breezy.adapters.polymarket_us.errors import (
     SignatureClockSkewError,
     VenueTransportError,
 )
+from breezy.adapters.polymarket_us.exec.endpoints import cancel_order_path
 from breezy.adapters.polymarket_us.redaction import REDACTED, redact_url
 from breezy.adapters.polymarket_us.signing import (
     ACCESS_KEY_HEADER,
@@ -56,6 +59,26 @@ _WRITE_METHOD: str = next(iter(PERMITTED_WRITE_METHODS))
 
 CANCEL_ALL_PATH: Final[str] = "/v1/orders/open/cancel"
 ORDERS_PATH: Final[str] = "/v1/orders"
+
+
+#: Daily temperature market slug, validated here independently of the frozen
+#: ``symbology.parse_weather_slug``. ``fullmatch`` + ``re.ASCII`` (``\d`` is then
+#: ASCII-only) + an explicit ``isascii()``: ``$`` would admit a trailing newline
+#: and ``\d`` alone admits fullwidth digits.
+_DAILY_SLUG_RE: Final[re.Pattern[str]] = re.compile(
+    r"tc-temp-[a-z]{3}(?:high|low)-\d{4}-\d{2}-\d{2}-(?:(?:gte|lte|gt|lt)\d{1,3})+f",
+    re.ASCII,
+)
+
+
+def _require_daily_slug(slug: object) -> str:
+    if not isinstance(slug, str) or not slug.isascii() or _DAILY_SLUG_RE.fullmatch(slug) is None:
+        raise ValueError("market slug is not a daily temperature slug")
+    return slug
+
+
+def _dump_body(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(payload).encode("ascii")
 
 
 def _build_post_only_callable(client: Any) -> Callable[..., Awaitable[Any]]:
@@ -158,12 +181,49 @@ class PolymarketUSWriteTransport:
         self._post: Callable[..., Awaitable[Any]] = _build_post_only_callable(client)
 
     async def post_cancel_all(
-        self, api_base_url: str, *, headers: Mapping[str, str]
+        self, api_base_url: str, *, headers: Mapping[str, str], slugs: Sequence[str]
     ) -> VenueResponse:
-        """Dispatch the one pinned cancel-all write. No method, query, or body."""
+        """Dispatch the slug-scoped cancel-all. The body is built HERE.
+
+        The venue cancels EVERY open order on the account when ``slugs`` is
+        empty, so an empty, duplicated or malformed list is unconstructible:
+        each slug is validated by this module's own pattern, the body is built
+        with ``json.dumps`` and re-parsed before dispatch (signatures do not
+        cover the body).
+        """
+        if isinstance(slugs, (str, bytes)) or not isinstance(slugs, (list, tuple)):
+            raise ValueError("slugs must be a list or tuple of market slugs")  # noqa: TRY004 - one refusal type for every unsafe input
+        checked = [_require_daily_slug(s) for s in slugs]
+        if not checked:
+            raise ValueError("slugs must be non-empty: an empty list cancels the whole account")
+        if len(set(checked)) != len(checked):
+            raise ValueError("slugs must not contain duplicates")
+        body = _dump_body({"slugs": checked})
+        reparsed = json.loads(body)
+        if reparsed != {"slugs": checked} or len(reparsed["slugs"]) < 1:
+            raise ValueError("cancel-all body failed its own re-parse check")
         url = f"{api_base_url.rstrip('/')}{CANCEL_ALL_PATH}"
+        return await self._dispatch(url, headers, body)
+
+    async def post_cancel_order(
+        self,
+        api_base_url: str,
+        *,
+        headers: Mapping[str, str],
+        order_id: str,
+        market_slug: str,
+    ) -> VenueResponse:
+        """Dispatch the per-order cancel with its required ``{marketSlug}`` body."""
+        path = cancel_order_path(order_id)  # ValueError on an invalid id
+        body = _dump_body({"marketSlug": _require_daily_slug(market_slug)})
+        url = f"{api_base_url.rstrip('/')}{path}"
+        return await self._dispatch(url, headers, body)
+
+    async def _dispatch(self, url: str, headers: Mapping[str, str], body: bytes) -> VenueResponse:
         try:
-            response = await self._post(url, headers=dict(headers), keys=[QUOTA_KEY_PORTFOLIO])
+            response = await self._post(
+                url, headers=dict(headers), body=body, keys=[QUOTA_KEY_PORTFOLIO]
+            )
         except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError):
             raise VenueTransportError(
                 f"{_WRITE_METHOD} {redact_url(url)} failed at the transport layer"

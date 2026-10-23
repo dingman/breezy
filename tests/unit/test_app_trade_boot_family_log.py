@@ -223,6 +223,8 @@ def test_the_family_line_is_not_a_supervisor_readiness_marker() -> None:
         # never colliding with, the `boot_family ...` observability line
         # (`_BOOT_FAMILY_RE`) or any other readiness marker above.
         "forecast_quantile_ladder": "ForecastQuantileLadderStrategy subscribed",
+        # ARM C2: NoLadderMakerStrategy's own `subscribed n=<count>` line (one named row).
+        "no_ladder_maker": "NoLadderMakerStrategy subscribed",
     }
     for marker in COMPOSITION_KIND_SUBSCRIBED_MARKERS.values():
         assert "boot_family" not in marker

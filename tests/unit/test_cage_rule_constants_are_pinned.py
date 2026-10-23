@@ -72,6 +72,7 @@ import ast
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
@@ -79,6 +80,7 @@ import pytest
 
 import tests.unit.test_execution_egress_firewall_guard as firewall
 import tests.unit.test_polymarket_us_readonly_guard as readonly
+from breezy.adapters.polymarket_us.exec import submit_chain
 from tests.unit.test_polymarket_us_readonly_guard import Violation, iter_python_sources
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -349,6 +351,17 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # `EXEC_RESOLVER_COROUTINES`/`EXEC_RESOLVER_PERMITTED_CALLEES`.
                 "_resolve_no_id_intent",
                 "_no_id_trade_activity",
+                # S4 WP3 (ARM B4, pin row P4a): the bounded GET-confirm of a fresh
+                # rest; GET-only, scanned by row N1 (`test_resting_path_firewall_delta.py`).
+                "_confirm_resting_order",
+                # S4 WP4 (ARM B5, pin row P4e): copy of the inventory row.
+                "_sweep_resting_orders_at_boot",
+                # S4 WP4 (ARM B5, pin row P4c): copy of the inventory row.
+                "_cancel_slug_orders",
+                # S4 WP4 (ARM B5, pin row P4b): copy of the inventory row.
+                "_cancel_resting_order",
+                # S4 WP4 (ARM B5, pin row P4a): copy of the inventory row.
+                "_confirm_cancel_terminal",
                 "__call__",
             }
         ),
@@ -574,6 +587,20 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1c): NAMED row, see the definition site.
+                "self._bind_resting_order",
+                # S4 WP3 (ARM B4, pin row P1a): NAMED row, see the definition site.
+                "self._confirm_resting_order",
+                # S4 WP3 (ARM B4, pin row P1d-2): NAMED row, see the definition site.
+                "submit_chain.build_resting_order_body",
+                # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
+                "submit_chain.unmappable_resting_order_reason",
+                # S4 WP4 (ARM B5, pin row P1e): NAMED row, see the definition site.
+                "self._resting_cancel_target",
+                # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
+                "self._cancel_resting_order",
+                # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row, see the definition site.
+                "self._reject_cancel_of",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
@@ -670,6 +697,20 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # fingerprint_bytes` -- see the definition-site comment.
                 "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
+                # S4 WP3 (ARM B4, pin row P1c): NAMED row, see the definition site.
+                "self._bind_resting_order",
+                # S4 WP3 (ARM B4, pin row P1a): NAMED row, see the definition site.
+                "self._confirm_resting_order",
+                # S4 WP3 (ARM B4, pin row P1d-2): NAMED row, see the definition site.
+                "submit_chain.build_resting_order_body",
+                # S4 WP3 (ARM B4, pin row P1d-1): NAMED row, see the definition site.
+                "submit_chain.unmappable_resting_order_reason",
+                # S4 WP4 (ARM B5, pin row P1e): NAMED row, see the definition site.
+                "self._resting_cancel_target",
+                # S4 WP4 (ARM B5, pin row P1b): NAMED row, see the definition site.
+                "self._cancel_resting_order",
+                # S4 WP4 (ARM B5 review G12, pin row P1g): NAMED row, see the definition site.
+                "self._reject_cancel_of",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
                 "submit_chain.order_price_decimal",
@@ -708,18 +749,16 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="firewall",
         attr="EXEC_DECLARED_UNIMPLEMENTED_COROUTINES",
-        expected=frozenset({"_query_order"}),
-        widened=frozenset({"_query_order", "_query_account"}),
-        narrowed=frozenset(),
+        expected=frozenset(),
+        widened=frozenset({"_query_order"}),
+        narrowed=set(),
         why="the escape hatch that lets the coroutine INVENTORY be an equality "
-        "rather than a subset. The widened neighbour parks `_query_account` in "
-        "it -- the method `live/execution_client.py:332` calls with nothing "
-        "defining it in the base -- which is how a deletion would pass. "
-        "`_query_order` (the only member actually pinned) is a DIFFERENT "
-        "fate from `_query_account`: the base defines a real method that "
-        "runs unmodified and can call `_send_order_status_report` on a "
-        "non-None report -- 'unimplemented' here means the native default "
-        "runs, never that the coroutine raises AttributeError",
+        "rather than a subset. ARM B6 (S4 r4 row P3) EMPTIED it: `_query_order` is now a "
+        "defined, scanned GET-only coroutine (EXEC_QUERY_PERMITTED_CALLEES), so parking "
+        "it here again -- the widened neighbour -- would hide a deleted poll behind the "
+        "native default (which can call `_send_order_status_report`). The narrowed "
+        "neighbour is a plain `set()`: equal to the empty frozenset by value, refused "
+        "by type identity",
     ),
     RulePin(
         module="readonly",
@@ -954,9 +993,177 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "body and no longer banned; BUY_SHORT (SDK-snapshot-only) and SELL_ "
         "(naked short) are banned instead",
     ),
+    # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): the highest
+    # NO price a resting order may be posted at. Widening it posts dearer bids;
+    # narrowing it silently disarms the family's whole price band.
+    RulePin(
+        module="submit_chain",
+        attr="RESTING_PRICE_CAP",
+        # Old -> new: 0.80 (S4 r3 B_CAP) -> 0.89 (family pm_us_no_maker_sharp_v1 B_CAP),
+        # ruling RULING_MAKER_sharp_v1_live_small_2026-10-21. Neighbours re-chosen so they
+        # stay distinct from `expected` in both directions.
+        expected=Decimal("0.89"),
+        widened=Decimal("0.90"),
+        narrowed=Decimal("0.88"),
+        why="S4 P16: the resting shape's price cap (submit_chain.RESTING_PRICE_CAP), "
+        "re-valued to 0.89 by RULING_MAKER_sharp_v1_live_small_2026-10-21. "
+        "A value change is a re-valuing and needs a ruling-cited commit",
+    ),
+    # ARM maker-sharp B4 / S4 r4 P16 (one reviewed row, one commit): the bounded
+    # GET-confirm deadline for a fresh rest.
+    RulePin(
+        module="submit_chain",
+        attr="RESTING_CONFIRM_DEADLINE_S",
+        expected=5,
+        widened=6,
+        narrowed=4,
+        why="S4 P16 (B4): the bounded GET-confirm deadline for a fresh rest. Widening "
+        "holds K=1 and the budget longer; narrowing HOLDs more rests to the resolver",
+    ),
+    # ARM maker-sharp B4 / S4 r4 P16 (one reviewed row, one commit): the GET-confirm poll
+    # interval.
+    RulePin(
+        module="submit_chain",
+        attr="RESTING_CONFIRM_POLL_S",
+        expected=0.5,
+        widened=0.6,
+        narrowed=0.4,
+        why="S4 P16 (B4): the GET-confirm poll interval. Narrowing spends read quota; "
+        "widening delays the bind",
+    ),
+    # ARM maker-sharp B3 / S4 r3 P16 (one reviewed row, one commit): fail-closed
+    # until the positive control proves the venue expires a GTD order at
+    # goodTillTime (S-6). The flip is a reviewed commit citing that artifact.
+    RulePin(
+        module="submit_chain",
+        attr="GTD_EXPIRY_VERIFIED",
+        expected=True,
+        widened=False,
+        narrowed=1,
+        why="S4 P16: flipped True at ARM post-B2 on S-6 PASS (evidence "
+        "docs/evidence/b2/maker_positive_control_20261022T075159Z.json, sha256 "
+        "ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938). The plant is the "
+        "opposite value False (the resting shape would refuse every order); the narrowed "
+        "neighbour is an int 1: equal to True by value, refused by type identity",
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the slug-scoped cancel-all
+    # stays disabled until a reviewed commit cites the positive-control artifact (S-2). Narrowed
+    # neighbour is an int 0: equal to False by value, refused by type identity
+    RulePin(
+        module="submit_chain",
+        attr="SLUG_SCOPED_CANCEL_ALL_VERIFIED",
+        expected=True,
+        widened=False,
+        narrowed=1,
+        why=(
+            "S4 P16 (B5): flipped True at ARM post-B2 on S-2 PASS over sibling slugs "
+            "(slugs_share_event true; evidence "
+            "docs/evidence/b2/maker_positive_control_20261022T075159Z.json, sha256 "
+            "ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938). The plant is "
+            "the opposite value False (every cancel back to per-order); the narrowed neighbour "
+            "is an int 1: equal to True by value, refused by type identity"
+        ),
+    ),
+    # ARM maker-sharp B6 / S4 r4 P16 (one reviewed row, one commit): the maker commission
+    # sign is UNVERIFIED until WP6 observes a first own passive fill. While False the
+    # recognised commission clamps a negative (rebate) to zero everywhere it is booked. The
+    # flip is a reviewed commit citing the probe artifact; narrowed neighbour is an int 0
+    RulePin(
+        module="submit_chain",
+        attr="MAKER_COMMISSION_SIGN_VERIFIED",
+        expected=False,
+        widened=True,
+        narrowed=0,
+        why=(
+            "S4 P16 (B6): the maker commission sign is unverified until WP6 observes a first "
+            "own passive fill; while False a negative commission is never booked as a rebate. "
+            "Narrowed neighbour is an int 0: equal to False by value, refused by type identity"
+        ),
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): the in-coroutine backoff
+    # after each full pass of the RETRY-WHEN-OPEN cancel loop (last value repeats). Widening
+    # slows a refused cancel's retry; narrowing hammers a halted market
+    RulePin(
+        module="submit_chain",
+        attr="CANCEL_RETRY_BACKOFF_S",
+        expected=(5, 10, 20, 40, 60),
+        widened=(5, 10, 20, 40, 61),
+        narrowed=(5, 10, 20, 40),
+        why=(
+            "S4 P16 (B5): the in-coroutine backoff after each full pass of the RETRY-WHEN-OPEN "
+            "cancel loop (last value repeats). Widening slows a refused cancel's retry; "
+            "narrowing hammers a halted market"
+        ),
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): age from the FIRST refused
+    # cancel at which the non-latching CRITICAL alert fires. Widening delays the operator
+    # signal; narrowing alerts on routine venue lag
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_ALERT_AGE_S",
+        expected=600,
+        widened=601,
+        narrowed=599,
+        why=(
+            "S4 P16 (B5): age from the FIRST refused cancel at which the non-latching CRITICAL "
+            "alert fires. Widening delays the operator signal; narrowing alerts on routine "
+            "venue lag"
+        ),
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): re-alert cadence of an
+    # unconfirmed cancel after the first alert
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_REALERT_S",
+        expected=1800,
+        widened=1801,
+        narrowed=1799,
+        why="S4 P16 (B5): re-alert cadence of an unconfirmed cancel after the first alert",
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): grace after the order's
+    # expiry before an unconfirmed cancel latches resting_cancel_unconfirmed
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_LATCH_GRACE_S",
+        expected=120,
+        widened=121,
+        narrowed=119,
+        why=(
+            "S4 P16 (B5): grace after the order's expiry before an unconfirmed cancel latches "
+            "resting_cancel_unconfirmed"
+        ),
+    ),
+    # ARM maker-sharp B5 / S4 r4 P16 (one reviewed row, one commit): minimum gap between the
+    # alert age and the latch; it is what makes the alert strictly precede the latch for every
+    # input
+    RulePin(
+        module="submit_chain",
+        attr="RETRY_LATCH_FLOOR_S",
+        expected=60,
+        widened=61,
+        narrowed=59,
+        why=(
+            "S4 P16 (B5): minimum gap between the alert age and the latch; it is what makes "
+            "the alert strictly precede the latch for every input"
+        ),
+    ),
+    # ARM maker-sharp B6 review H1 (one reviewed row, one commit): the half-cent slack on the
+    # resting commission envelope.
+    RulePin(
+        module="submit_chain",
+        attr="COMMISSION_ENVELOPE_SLACK_USD",
+        expected=Decimal("0.005"),
+        widened=Decimal("0.006"),
+        narrowed=Decimal("0.004"),
+        why=(
+            "S4 P16 (B6 review H1): the slack added to the resting commission envelope bound. "
+            "Widening lets a larger over-charge pass unlatched; narrowing re-opens the false "
+            "latch on an ordinary fill"
+        ),
+    ),
 )
 
-_MODULES = {"readonly": readonly, "firewall": firewall}
+_MODULES = {"readonly": readonly, "firewall": firewall, "submit_chain": submit_chain}
 
 #: Every exemption the cage grants, as an EXACT path. Counter 1: a directory
 #: prefix would be a blanket allowance, and an entry naming a file that does
@@ -1058,6 +1265,22 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         # R-6.5b-0 review: B3-M, no module-level HttpClient holder.
         "readonly.B3M_SCAN_ROOTS",
         "readonly.B3M_HTTP_CLIENT_CTOR_NAMES",
+        # ARM maker-sharp B3 / S4 r3 P16: the resting price cap.
+        "submit_chain.RESTING_PRICE_CAP",
+        "submit_chain.GTD_EXPIRY_VERIFIED",
+        # ARM maker-sharp B4 / S4 r4 P16: the GET-confirm deadline.
+        "submit_chain.RESTING_CONFIRM_DEADLINE_S",
+        "submit_chain.RESTING_CONFIRM_POLL_S",
+        "submit_chain.RETRY_LATCH_FLOOR_S",
+        "submit_chain.RETRY_LATCH_GRACE_S",
+        "submit_chain.RETRY_REALERT_S",
+        "submit_chain.RETRY_ALERT_AGE_S",
+        "submit_chain.CANCEL_RETRY_BACKOFF_S",
+        "submit_chain.SLUG_SCOPED_CANCEL_ALL_VERIFIED",
+        # ARM maker-sharp B6 / S4 r4 P16: the maker commission sign gate.
+        "submit_chain.MAKER_COMMISSION_SIGN_VERIFIED",
+        # ARM maker-sharp B6 review H1: the commission envelope slack.
+        "submit_chain.COMMISSION_ENVELOPE_SLACK_USD",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason

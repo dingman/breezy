@@ -62,6 +62,7 @@ __all__ = [
     "taker_fee_at_fill",
     "taker_fee_coefficient_as_of",
     "taker_fee_coefficient_of",
+    "taker_fee_exact_at_fill",
 ]
 
 _ZERO = Decimal(0)
@@ -557,6 +558,40 @@ def taker_fee_coefficient_of(instrument: Instrument) -> Decimal | None:
         return None
 
 
+def taker_fee_exact_at_fill(
+    *,
+    quantity: Decimal,
+    price: Decimal,
+    ts_event_ns: int,
+    fee_coefficient_at_fill: Decimal | None,
+) -> Decimal | None:
+    """The modelled TAKER fee for a fill, UNROUNDED (``theta * C * p * (1 - p)``, USD).
+
+    The same theta resolution and range check as :func:`taker_fee_at_fill`, which is this
+    value banker's-rounded to the cent. ``None`` when no theta is pinned. Exists so a watch
+    that must not be fooled by the cent rounding (the resting commission envelope, ARM B6
+    review H1) reads the exact figure from the module that owns the fee arithmetic.
+
+    Raises
+    ------
+    ValueError
+        If ``price`` is outside ``[0, 1]``.
+    """
+    theta = (
+        fee_coefficient_at_fill
+        if fee_coefficient_at_fill is not None
+        else _fee_coefficient_as_of(ts_event_ns)
+    )
+    if theta is None:
+        return None
+    if price < _ZERO or price > _ONE:
+        raise ValueError(
+            f"Fill price {price} is outside the binary-option range [0, 1]; "
+            "refusing to model a Polymarket.us fee for it"
+        )
+    return theta * quantity * price * (_ONE - price)
+
+
 def taker_fee_at_fill(
     *,
     quantity: Decimal,
@@ -578,19 +613,14 @@ def taker_fee_at_fill(
     ValueError
         If ``price`` is outside ``[0, 1]``.
     """
-    theta = (
-        fee_coefficient_at_fill
-        if fee_coefficient_at_fill is not None
-        else _fee_coefficient_as_of(ts_event_ns)
+    exact = taker_fee_exact_at_fill(
+        quantity=quantity,
+        price=price,
+        ts_event_ns=ts_event_ns,
+        fee_coefficient_at_fill=fee_coefficient_at_fill,
     )
-    if theta is None:
+    if exact is None:
         return None
-    if price < _ZERO or price > _ONE:
-        raise ValueError(
-            f"Fill price {price} is outside the binary-option range [0, 1]; "
-            "refusing to model a Polymarket.us fee for it"
-        )
-    exact = theta * quantity * price * (_ONE - price)
     return Money(_round_bankers(exact, USD), USD)
 
 

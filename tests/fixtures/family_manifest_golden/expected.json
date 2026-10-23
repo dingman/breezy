@@ -80,11 +80,11 @@
       "sha256": "dc29fb89e5086a2b80e8714d97f02ea7d88ca26555aadb3811162501c39ab743"
     },
     "invalid/composition_bad.json[allow_draft=False]": {
-      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder']",
+      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder', 'no_ladder_maker']",
       "raises": "FamilyManifestValidationError"
     },
     "invalid/composition_bad.json[allow_draft=True]": {
-      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder']",
+      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder', 'no_ladder_maker']",
       "raises": "FamilyManifestValidationError"
     },
     "invalid/density_path_absolute.json[allow_draft=False]": {

@@ -126,6 +126,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, NamedTuple
 
@@ -290,6 +291,43 @@ _ORDER_KEYS: Final[frozenset[str]] = frozenset(
 #: THESE four is still an unknown key and is still refused.
 _ORDER_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
     {"action", "lastTransactTime", "manualOrderIndicator", "outcomeSide"}
+)
+
+#: The ``Order`` object as the venue actually sends it: the 20 keys the pinned
+#: SDK snapshot declares (:data:`_ORDER_KEYS`) plus the four observed-but-unread
+#: names (:data:`_ORDER_DRIFT_ALLOWED_KEYS`) -- 24 keys on a RESTING order
+#: (``MAKER_S4_WP0_VENUE_DISCOVERY_2026-10-13.md`` S-3). ADDITIVE: it is a
+#: literal pinned by a test, and it never replaces the 20-key snapshot row
+#: (``test_polymarket_us_exec_snapshot_drift.py``), which must keep matching
+#: the SDK exactly. Nothing at runtime consults it for acceptance; the mapper's
+#: own allowlist is still ``_ORDER_KEYS | _ORDER_DRIFT_ALLOWED_KEYS``.
+WIRE_ORDER_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "action",
+        "avgPx",
+        "cashOrderQty",
+        "commissionNotionalTotalCollected",
+        "commissionsBasisPoints",
+        "createTime",
+        "cumQuantity",
+        "goodTillTime",
+        "id",
+        "insertTime",
+        "intent",
+        "lastTransactTime",
+        "leavesQuantity",
+        "makerCommissionsBasisPoints",
+        "manualOrderIndicator",
+        "marketMetadata",
+        "marketSlug",
+        "outcomeSide",
+        "price",
+        "quantity",
+        "side",
+        "state",
+        "tif",
+        "type",
+    }
 )
 
 #: ``Execution`` (``types/orders.py:95-108``).
@@ -1215,6 +1253,79 @@ def parse_order_status_report(
 
 
 # ---------------------------------------------------------------------------
+# Resting-order commission (S4 r4 section 4): realised, signed, never inferred
+# ---------------------------------------------------------------------------
+
+#: Both ``Order`` bps fields read the string ``"0"`` on every own order observed
+#: (WP0 note (f)); they do NOT carry the live fee schedule. They are watched, not
+#: read: a change is a schema drift to latch on, never a rate to book.
+OBSERVED_COMMISSION_BPS: Final[str] = "0"
+_COMMISSION_BPS_FIELDS: Final[tuple[str, ...]] = (
+    "commissionsBasisPoints",
+    "makerCommissionsBasisPoints",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BpsDrift:
+    """Names of the bps fields that left :data:`OBSERVED_COMMISSION_BPS`.
+
+    VALUE-FREE by construction: it carries field names only, never what the venue
+    sent, so logging or alerting it cannot leak a venue value.
+    """
+
+    fields: tuple[str, ...]
+
+
+def resting_commission_total(order: Mapping[str, Any]) -> Decimal:
+    """The realised, SIGNED ``commissionNotionalTotalCollected`` of one ``Order``.
+
+    The only commission source for a resting order (never the bps fields, never
+    ``feeCoefficient``). Required: an absent field is a refusal, not a zero. The
+    sign is the venue's own and is preserved -- never ``abs`` (L-48: a negative
+    maker commission is a rebate, not a magnitude).
+    """
+    return _amount_field(order, "commissionNotionalTotalCollected", context="resting order")
+
+
+def resting_commission_text(order: Mapping[str, Any]) -> str:
+    """The venue's OWN string for the amount :func:`resting_commission_total` reads (exact,
+    never re-formatted: it is what ``DurableFillRecord.venue_fee_raw`` stores, and the
+    sign of the figure is that string's first character). Call it only after
+    :func:`resting_commission_total` accepted the same ``order``."""
+    amount = _require(order, "commissionNotionalTotalCollected", context="resting order")
+    value = amount.get("value") if isinstance(amount, Mapping) else amount
+    return value if isinstance(value, str) else str(value)
+
+
+def assert_commission_bps_inert(order: Mapping[str, Any]) -> BpsDrift | None:
+    """``None`` while both bps fields are exactly the string ``"0"``, else a drift.
+
+    Never raises and never echoes a value: an absent field, a non-string, or any
+    other string (including ``"0.0"``) names its field in the returned
+    :class:`BpsDrift` and nothing more.
+    """
+    drifted = tuple(
+        field
+        for field in _COMMISSION_BPS_FIELDS
+        if not (isinstance(order.get(field), str) and order.get(field) == OBSERVED_COMMISSION_BPS)
+    )
+    return BpsDrift(fields=drifted) if drifted else None
+
+
+def recognised_commission(raw: Decimal, *, sign_verified: bool) -> Decimal:
+    """The commission Breezy books: ``raw`` once the maker sign is verified, else
+    ``max(raw, 0)`` so an unverified negative can never be booked as a rebate.
+
+    ``raw`` itself is kept elsewhere (``venue_fee_raw``); only this recognised
+    value feeds ``cumulative_fee`` and the native ``OrderFilled.commission``.
+    """
+    if sign_verified:
+        return raw
+    return raw if raw > 0 else Decimal(0)
+
+
+# ---------------------------------------------------------------------------
 # Execution -> native FillReport
 # ---------------------------------------------------------------------------
 
@@ -1658,6 +1769,10 @@ _OPEN_ORDER_REQUIRED_KEYS: Final[tuple[str, ...]] = (
 )
 
 
+_MANUAL_ORDER_INDICATOR_MANUAL: Final[str] = "MANUAL_ORDER_INDICATOR_MANUAL"
+_MANUAL_ORDER_INDICATOR_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
+
+
 class OpenOrderRecord(NamedTuple):
     """One open order as the venue enumerates it -- instrument-FREE.
 
@@ -1686,6 +1801,20 @@ class OpenOrderRecord(NamedTuple):
     #: the live drift allowlist declares -- on the order row AND the response
     #: envelope -- sorted, capped at :data:`OPEN_ORDER_UNKNOWN_KEYS_MAX`.
     unknown_keys: tuple[str, ...]
+    #: ``manualOrderIndicator`` read as a tri-state: ``True`` for the declared
+    #: MANUAL value, ``False`` for the declared AUTOMATIC value, ``None`` for
+    #: anything else (absent, null, unrecognised). ``None`` is NOT own: an
+    #: attribution join may only claim an order the venue marks AUTOMATIC.
+    manual: bool | None = None
+
+
+def _manual_indicator_flag(payload: Mapping[str, Any]) -> bool | None:
+    indicator = payload.get("manualOrderIndicator")
+    if indicator == _MANUAL_ORDER_INDICATOR_MANUAL:
+        return True
+    if indicator == _MANUAL_ORDER_INDICATOR_AUTOMATIC:
+        return False
+    return None
 
 
 def _unknown_key_names(payload: Mapping[str, Any], *, known: frozenset[str]) -> list[str]:
@@ -1754,6 +1883,7 @@ def _open_order_record(
         tif=tif,
         create_time=create_time,
         unknown_keys=tuple(unknown[:OPEN_ORDER_UNKNOWN_KEYS_MAX]),
+        manual=_manual_indicator_flag(payload),
     )
 
 

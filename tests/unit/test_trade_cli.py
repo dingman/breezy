@@ -425,7 +425,9 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
         for topic, handler in node.kernel.msgbus.subscriptions
         if topic == COMPONENT_STATE_TOPIC
     ]
-    assert len(component_state_subscribers) == 4, node.kernel.msgbus.subscriptions
+    # ARM B7 (S4 r4 WP6) widens this count by ONE named row: `install_resting_alert`, the fifth
+    # watch, delivering `resting_cancel_alerts` + `resting_commission_alerts`.
+    assert len(component_state_subscribers) == 5, node.kernel.msgbus.subscriptions
 
 
 def test_the_reconciliation_refusal_reader_reads_the_exec_client_surface() -> None:
@@ -1609,6 +1611,36 @@ def test_repoll_timer_resumes_a_cleared_exec_client(caplog: pytest.LogCaptureFix
     assert any("event=open_intent_stale" in m for m in messages), "the siblings still fire"
 
 
+def test_the_resting_alert_handler_itself_is_wired_into_the_repoll_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B7 review P-1: assert the resting handler's IDENTITY and its reader, not just a count."""
+    captured: dict[str, Any] = {}
+
+    def resting_handler(event: object) -> None:
+        return None
+
+    def _spy_resting(msgbus: Any, **kwargs: Any) -> Any:
+        captured["resting_kwargs"] = kwargs
+        return resting_handler
+
+    def _spy_timer(clock: Any, **kwargs: Any) -> Any:
+        captured["handlers"] = tuple(kwargs["handlers"])
+        return lambda: None
+
+    monkeypatch.setattr(trade_cli, "install_resting_alert", _spy_resting)
+    monkeypatch.setattr(trade_cli, "install_refusal_repoll_timer", _spy_timer)
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    handlers = captured["handlers"]
+    assert handlers[4] is resting_handler, "resting_h sits right after degraded_h"
+    assert sum(1 for h in handlers if h is resting_handler) == 1
+    assert callable(captured["resting_kwargs"]["alerts"])
+    assert captured["resting_kwargs"]["alerts"]() == (), "no client yet: a missing client reads ()"
+
+
 def test_degraded_alert_and_resume_handler_are_wired_into_the_repoll_tuple(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1633,7 +1665,8 @@ def test_degraded_alert_and_resume_handler_are_wired_into_the_repoll_tuple(
 
     assert code == EXIT_OK
     handlers = captured["handlers"]
-    assert len(handlers) == 5
+    # ARM B7 (S4 r4 WP6): ONE named row added, `resting_h`, ahead of `_resume`.
+    assert len(handlers) == 6
     assert handlers[3] is degraded_handler
     assert handlers[-1].__name__ == "_resume"
     kwargs = captured["degraded_kwargs"]

@@ -236,6 +236,16 @@ _PERMITTED_CALLERS = frozenset(
         # `build_order_body`, calling `exit_wire_price_for_leg` for the exact
         # same reason -- one wire-price translation, one call site.
         "build_exit_order_body",
+        # WIDENED (not relaxed), S4 WP1/B3: `build_resting_order_body` is the
+        # resting-order counterpart of `build_order_body`; it renders the
+        # NO-leg wire price through the sanctioned `wire_price_for_leg`
+        # helper (never a hand-written `1 - p`) -- one named row, one call site.
+        "build_resting_order_body",
+        # WIDENED (not relaxed), S4 WP1/B4: `resting_echo_matches` is the
+        # resting body's echo cross-check; it maps the wire (YES) price back
+        # to the instrument price via the sanctioned `instrument_price_for_leg`
+        # (never a hand-written `1 - p`) -- one named row, one call site.
+        "resting_echo_matches",
         "parse_fill_report",
         "parse_order_status_report",
         "_cumulative_qty_and_cost",
@@ -320,6 +330,25 @@ def _innermost_function(ranges: list[tuple[str, int, int]], lineno: int) -> str 
     return min(candidates, key=lambda r: r[2] - r[1])[0]
 
 
+def _disallowed_call_sites(tree: ast.Module, rel: str) -> list[str]:
+    """Calls to a permitted leg_prices name made outside `_PERMITTED_CALLERS`."""
+    ranges = _function_ranges(tree)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _PERMITTED_IMPORTED_NAMES
+        ):
+            enclosing = _innermost_function(ranges, node.lineno)
+            if enclosing not in _PERMITTED_CALLERS:
+                found.append(
+                    f"{rel}:{node.lineno}: {node.func.id}() called inside "
+                    f"{enclosing!r}, not one of {sorted(_PERMITTED_CALLERS)}"
+                )
+    return found
+
+
 def test_exec_imports_complement_arithmetic_only_from_leg_prices() -> None:
     """(i) `exec/` imports only the two translation functions from
     `leg_prices`; (ii) those functions are called ONLY inside
@@ -341,18 +370,8 @@ def test_exec_imports_complement_arithmetic_only_from_leg_prices() -> None:
                 f"{rel} imports {extra} from leg_prices; only "
                 f"{_PERMITTED_IMPORTED_NAMES} are permitted under exec/"
             )
-            ranges = _function_ranges(tree)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id in _PERMITTED_IMPORTED_NAMES
-                ):
-                    enclosing = _innermost_function(ranges, node.lineno)
-                    assert enclosing in _PERMITTED_CALLERS, (
-                        f"{rel}:{node.lineno}: {node.func.id}() called inside "
-                        f"{enclosing!r}, not one of {sorted(_PERMITTED_CALLERS)}"
-                    )
+            violations = _disallowed_call_sites(tree, rel)
+            assert not violations, "; ".join(violations)
 
         if (
             rel != LEG_PRICES_PATH
@@ -365,3 +384,37 @@ def test_exec_imports_complement_arithmetic_only_from_leg_prices() -> None:
     assert complement_modules == [], (
         "complement arithmetic found outside leg_prices.py: " + ", ".join(complement_modules)
     )
+
+
+_PLANT_TEMPLATE = """
+from breezy.adapters.polymarket_us.leg_prices import wire_price_for_leg
+
+
+def {name}(leg, price):
+    return wire_price_for_leg(leg, price)
+"""
+
+
+def test_resting_row_widening_is_not_vacuous() -> None:
+    """The B3 row admits `build_resting_order_body` only: the same call in
+    any other function (or at module level) still trips the pin."""
+    permitted = ast.parse(_PLANT_TEMPLATE.format(name="build_resting_order_body"))
+    assert _disallowed_call_sites(permitted, "plant.py") == []
+
+    planted = ast.parse(_PLANT_TEMPLATE.format(name="build_something_else"))
+    violations = _disallowed_call_sites(planted, "plant.py")
+    assert len(violations) == 1
+    assert "'build_something_else'" in violations[0]
+
+    echo_ok = ast.parse(
+        _PLANT_TEMPLATE.format(name="resting_echo_matches").replace(
+            "wire_price_for_leg", "instrument_price_for_leg"
+        )
+    )
+    assert _disallowed_call_sites(echo_ok, "plant.py") == []
+    echo_bad = ast.parse(
+        _PLANT_TEMPLATE.format(name="other_echo").replace(
+            "wire_price_for_leg", "instrument_price_for_leg"
+        )
+    )
+    assert len(_disallowed_call_sites(echo_bad, "plant.py")) == 1

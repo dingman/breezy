@@ -54,10 +54,13 @@ __all__ = [
     "PARSE_STATUS_UNPARSEABLE",
     "PORTFOLIO_ACTIVITIES_PATH",
     "UNRECOGNISED_KIND",
+    "MarketResolution",
+    "ResolutionScan",
     "TradeActivityRef",
     "TradeRowScan",
     "page_min_create_ts_ns",
     "parse_external_flows",
+    "parse_position_resolutions",
     "trade_rows_for_order",
 ]
 
@@ -637,3 +640,156 @@ def page_min_create_ts_ns(page: Mapping[str, Any]) -> int | None:
         if ts is not None:
             times.append(ts)
     return min(times) if times else None
+
+
+# --------------------------------------------------------------------------
+# ACTIVITY_TYPE_POSITION_RESOLUTION: the venue's own YES resolution of a market
+# --------------------------------------------------------------------------
+
+_RESOLUTION_ACTIVITY_TYPE: Final[str] = "ACTIVITY_TYPE_POSITION_RESOLUTION"
+_MARKET_RESOLVED_STATUS: Final[str] = "MARKET_STATUS_RESOLVED"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """One market's venue resolution: ``yes_resolved`` is whether YES paid out."""
+
+    slug: str
+    yes_resolved: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionScan:
+    """What a page of activities says about resolved markets.
+
+    ``unreadable`` counts POSITION_RESOLUTION rows whose outcome could NOT be read with certainty;
+    they contribute no resolution (never a guess)."""
+
+    resolutions: tuple[MarketResolution, ...]
+    unreadable: int
+
+
+def _price_of(side: object) -> Decimal | None:
+    if not isinstance(side, Mapping):
+        return None
+    raw = side.get("price")
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _yes_resolved_of(slug: str, market: object) -> bool | None:
+    """YES paid out iff the resolved market's ``long`` side is priced 1 and the other side 0.
+
+    Read from ``market.marketSides`` (the captured shape: ``AMBIGUOUS_ORDER_2026-09-05_SFO/
+    activities_p0.json`` rows carry ``long: true`` Yes at ``"0"`` and ``long: false`` No at ``"1"``
+    for a market whose YES long position realised its whole cost as a loss). It does NOT read
+    ``outcomePrices`` (its label order contradicts ``marketSides`` in that capture) nor the row's
+    ``side`` (it is the same ``SHORT`` for a long holder that lost). Anything short of a RESOLVED,
+    closed market whose ``slug`` and both sides' ``identifier`` are PRESENT and equal to the row
+    slug, with exactly one long and one short side priced exactly {0, 1}, is ``None`` (no
+    defaulting: an absent slug or identifier is unreadable, never assumed to match)."""
+    if not isinstance(market, Mapping):
+        return None
+    if market.get("status") != _MARKET_RESOLVED_STATUS or market.get("closed") is not True:
+        return None
+    if market.get("slug") != slug:
+        return None
+    sides = market.get("marketSides")
+    if not isinstance(sides, list) or len(sides) != 2:
+        return None
+    if not all(isinstance(side, Mapping) and side.get("identifier") == slug for side in sides):
+        return None
+    longs = [side for side in sides if side.get("long") is True]
+    shorts = [side for side in sides if side.get("long") is False]
+    if len(longs) != 1 or len(shorts) != 1:
+        return None
+    long_price, short_price = _price_of(longs[0]), _price_of(shorts[0])
+    if long_price is None or short_price is None:
+        return None
+    if (long_price, short_price) == (Decimal(1), Decimal(0)):
+        return True
+    if (long_price, short_price) == (Decimal(0), Decimal(1)):
+        return False
+    return None
+
+
+def _decimal_field(holder: object, key: str, *, nested: bool) -> Decimal | None:
+    """``holder[key]`` (``{"value": "<decimal>"}`` when ``nested``) as a finite Decimal."""
+    if not isinstance(holder, Mapping):
+        return None
+    raw = holder.get(key)
+    if nested:
+        raw = raw.get("value") if isinstance(raw, Mapping) else None
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _yes_resolved_by_holder(resolution: Mapping[str, Any]) -> bool | None:
+    """The YES outcome implied by what the HOLDER's own position did at resolution.
+
+    ``beforePosition.netPosition`` > 0 is a long (YES) holder, < 0 a NO holder (the venue nets a NO
+    holding as short YES). The holder won iff the realised PnL change
+    (``afterPosition.realized`` - ``beforePosition.realized``) is positive, lost iff negative; a
+    loss larger than ``beforePosition.cost`` is impossible, so such a row is unreadable. A long
+    winner means YES paid out, a long loser NO; a NO winner means YES did not, a NO loser YES did.
+    Zero net position, zero PnL change or any missing field is ``None``. A winner who bought at
+    (or above) par realises <= 0 and so reads as a loser: it then DISAGREES with ``marketSides``
+    and the row is unreadable (conservative, never trusted)."""
+    before, after = resolution.get("beforePosition"), resolution.get("afterPosition")
+    net = _decimal_field(before, "netPosition", nested=False)
+    cost = _decimal_field(before, "cost", nested=True)
+    realized_before = _decimal_field(before, "realized", nested=True)
+    realized_after = _decimal_field(after, "realized", nested=True)
+    if net is None or cost is None or realized_before is None or realized_after is None:
+        return None
+    if net == 0 or cost <= 0:
+        return None
+    change = realized_after - realized_before
+    if change == 0 or change < -cost:
+        return None
+    holder_won = change > 0
+    holder_long = net > 0
+    return holder_won if holder_long else not holder_won
+
+
+def parse_position_resolutions(page: Mapping[str, Any]) -> ResolutionScan:
+    """The venue's YES resolution of every market a page of activities resolved.
+
+    Pure. Rows of any other type are ignored. A resolution row whose outcome cannot be read with
+    certainty counts in ``unreadable``; a page whose ``activities`` is not a list reads as one
+    unreadable row (never as "no resolutions")."""
+    activities = page.get("activities")
+    if not isinstance(activities, list):
+        return ResolutionScan((), 1)
+    found: list[MarketResolution] = []
+    unreadable = 0
+    for activity in activities:
+        if not isinstance(activity, Mapping) or activity.get("type") != _RESOLUTION_ACTIVITY_TYPE:
+            continue
+        resolution = activity.get("positionResolution")
+        slug = resolution.get("marketSlug") if isinstance(resolution, Mapping) else None
+        yes = (
+            _yes_resolved_of(slug, resolution.get("market"))
+            if isinstance(slug, str) and slug and isinstance(resolution, Mapping)
+            else None
+        )
+        # the holder's own PnL and side must CORROBORATE the market-side reading; a disagreement
+        # (or an unreadable holder) means neither is trusted
+        holder_yes = (
+            _yes_resolved_by_holder(resolution) if isinstance(resolution, Mapping) else None
+        )
+        if not isinstance(slug, str) or yes is None or holder_yes != yes:
+            unreadable += 1
+            continue
+        found.append(MarketResolution(slug=slug, yes_resolved=yes))
+    return ResolutionScan(tuple(found), unreadable)
