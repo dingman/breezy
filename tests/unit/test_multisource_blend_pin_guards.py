@@ -658,7 +658,13 @@ def test_the_runner_refuses_a_refrozen_prereg_before_scoring(tmp_path: Path) -> 
         skill.load_verified_prereg(prereg)
 
 
-def test_a_prereg_outside_git_is_refused_by_the_guard(tmp_path: Path) -> None:
+def test_a_prereg_outside_git_is_refused_by_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # git walks parents and would otherwise find this worktree when basetemp
+    # is inside the repo. The ceiling is the parent: a ceiling equal to cwd
+    # does not stop the walk.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", tmp_path.resolve().parent.as_posix())
     path = tmp_path / "loose.json"
     path.write_text(json.dumps({**_design(), "frozen_sha": "a" * 40}), encoding="utf-8")
 
