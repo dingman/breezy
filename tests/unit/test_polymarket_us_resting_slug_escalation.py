@@ -31,6 +31,7 @@ from tests.unit.ambig_latch_rig import (
     OPEN_ORDERS_PATH,
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
+    resting_morning_clock,
     submit_chain,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
@@ -232,6 +233,15 @@ def test_the_module_flags_are_the_production_flags_under_test() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _escalation_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Rig:
+    """Slug pin True and a fixed UTC morning, installed before the permit is minted.
+
+    ``_escalate`` walks the cancel clock several hours. A live clock started after
+    about 18:00Z crosses UTC midnight and ``spent_today_usd`` drops to 0.
+    """
+    return await _rig(tmp_path, monkeypatch, pin=True, clock=resting_morning_clock())
+
+
 async def _escalate(
     rig: _Rig, command: Any, *, extra_passes_s: float = 0.05
 ) -> tuple[asyncio.Future[None], list[int]]:
@@ -255,7 +265,7 @@ async def _escalate(
 async def test_an_unconfirmed_cancel_escalates_to_exactly_one_cancel_all_on_the_ledger_slug(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _escalation_rig(tmp_path, monkeypatch)
     client = rig.client
     command = await _submit_rest(rig, 0)
     await _submit_rest(rig, 1)
@@ -302,7 +312,7 @@ async def test_an_unconfirmed_cancel_escalates_to_exactly_one_cancel_all_on_the_
 async def test_escalation_names_only_the_unconfirmed_orders_slug_when_the_ledger_has_two(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _escalation_rig(tmp_path, monkeypatch)
     client = rig.client
     command = await _submit_rest(rig, 0)
     await _submit_rest(rig, 1)
@@ -324,7 +334,7 @@ async def test_escalation_names_only_the_unconfirmed_orders_slug_when_the_ledger
 async def test_a_rehydrated_ids_escalated_cancel_settles_once_and_restores_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _escalation_rig(tmp_path, monkeypatch)
     client = rig.client
     command = await _submit_rest(rig, 0)
     slug = _slug_of(command)
@@ -355,7 +365,7 @@ async def test_a_rehydrated_ids_escalated_cancel_settles_once_and_restores_nothi
 async def test_a_failing_cancel_all_post_never_breaks_the_per_order_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _escalation_rig(tmp_path, monkeypatch)
     client = rig.client
     command = await _submit_rest(rig, 0)
     settles = _spy_settles(monkeypatch, client)
@@ -678,7 +688,7 @@ async def test_the_only_cancel_all_wire_dispatch_is_one_slug_body_on_the_portfol
 ) -> None:
     """Through the real transport, an escalation puts exactly one cancel-all on the wire, whose
     body is exactly ``{"slugs": [ledger slug]}`` charged to the portfolio quota key."""
-    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    rig = await _escalation_rig(tmp_path, monkeypatch)
     client = rig.client
     http = _Http()
     sender = _RealTransportSender(http)

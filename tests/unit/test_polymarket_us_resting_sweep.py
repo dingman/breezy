@@ -53,11 +53,21 @@ async def _second_process(
     *,
     sender: CancelSender | None,
     payloads: dict[str, Any] | None = None,
+    clock: Any | None = None,
 ) -> Any:
     """Reboot over the first process's store with ``sender`` injected; both leg
-    instruments are loaded. NOT yet connected."""
+    instruments are loaded. NOT yet connected.
+
+    ``clock`` defaults to a live clock. A day-keyed spend assert passes the same
+    morning TestClock the first process was minted on, before this permit.
+    """
     client, latch_cm = await reboot_client(
-        tmp_path, monkeypatch, first_latch_cm=first_cm, first_client=first, admitted=True
+        tmp_path,
+        monkeypatch,
+        first_latch_cm=first_cm,
+        first_client=first,
+        admitted=True,
+        clock=clock,
     )
     for inst in (build_instrument(), build_no_leg_instrument()):
         client._cache.add_instrument(inst)

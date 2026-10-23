@@ -24,6 +24,7 @@ from tests.unit.ambig_latch_rig import (
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
     response_sender,
+    resting_morning_clock,
     run_passes,
     submit_chain,
     wire_payloads,
@@ -107,9 +108,13 @@ def _reasons(rig: _Rig) -> list[str]:
 
 
 async def _rested(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int = 1
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    n: int = 1,
+    *,
+    clock: Any | None = None,
 ) -> tuple[_Rig, list[Any]]:
-    rig = await _rig(tmp_path, monkeypatch)
+    rig = await _rig(tmp_path, monkeypatch, clock=clock)
     commands = [await _submit_rest(rig, i) for i in range(n)]
     for i in range(n):
         _inert_bps(rig, i)
@@ -710,7 +715,7 @@ async def test_boot_sweep_that_reads_a_rest_filled_books_it_and_the_next_boot_se
     """Durable fill record first, then settle (no event: the new run's cache has no such
     order), exposure closed, nothing restored to the new permit; the NEXT boot's
     seed-from-durable-fills accounting counts the same fill once."""
-    rig, (command,) = await _rested(tmp_path, monkeypatch)
+    rig, (command,) = await _rested(tmp_path, monkeypatch, clock=resting_morning_clock())
     first = rig.client
     intent_id = first._resting_bookings[_id_n(0)][0]
     _fill(rig, 0, commission="0.01")
@@ -718,7 +723,13 @@ async def test_boot_sweep_that_reads_a_rest_filled_books_it_and_the_next_boot_se
     payloads = {path: first._private_read._payloads[path]}
     sender = CancelSender()
     second = await _second_process(
-        tmp_path, monkeypatch, first, first.latch_cm, sender=sender, payloads=payloads
+        tmp_path,
+        monkeypatch,
+        first,
+        first.latch_cm,
+        sender=sender,
+        payloads=payloads,
+        clock=resting_morning_clock(),
     )
     await second._connect()
     records = tuple(second.fill_records_for(build_no_leg_instrument().id))
@@ -733,7 +744,12 @@ async def test_boot_sweep_that_reads_a_rest_filled_books_it_and_the_next_boot_se
     spent_now = second._ledger.spent_today_usd(now_ns=second._clock.timestamp_ns())
     assert spent_now == NO_PX
     third = await _second_process(
-        tmp_path, monkeypatch, second, second.latch_cm, sender=CancelSender()
+        tmp_path,
+        monkeypatch,
+        second,
+        second.latch_cm,
+        sender=CancelSender(),
+        clock=resting_morning_clock(),
     )
     await third._connect()
     assert third._ledger.spent_today_usd(now_ns=third._clock.timestamp_ns()) == NO_PX

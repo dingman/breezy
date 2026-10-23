@@ -2918,6 +2918,7 @@ async def _build_client_with_custom_loader(
     *,
     store_path: Path,
     resolver_instrument_loader: Callable[[str], Any] | None,
+    clock: Any | None = None,
 ) -> tuple[PolymarketUSExecutionClient, Any]:
     """Like ``_build_race_client``, but stops SHORT of calling ``_connect``
     -- the caller drives it -- and accepts an injected
@@ -2926,9 +2927,12 @@ async def _build_client_with_custom_loader(
     reproduces a process restart against a durable store that already
     carries an OPEN with-id AMBIGUOUS intent for an instrument this fresh
     process has not loaded yet -- exactly the shape the loader exists for.
+    ``clock`` defaults to a live clock; a reboot of a pinned resting rig
+    passes the same morning ``TestClock`` the permit was minted on.
     """
     loop = asyncio.get_running_loop()
-    clock = LiveClock()
+    if clock is None:
+        clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
     provider = InstrumentProvider()

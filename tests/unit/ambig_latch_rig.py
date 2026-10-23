@@ -68,7 +68,7 @@ from tests.unit.test_current_rung_hold_pre_arm_race import (
     _SlowSender,
     _submit_command,
 )
-from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+from tests.unit.test_polymarket_us_permit_issuance import clock_at, enable_operator_gate
 from tests.unit.test_polymarket_us_submit_order_chain import (
     write_canonical_verified,
 )
@@ -99,6 +99,7 @@ __all__ = [
     "read_paths",
     "reboot_client",
     "response_sender",
+    "resting_morning_clock",
     "rig_slug",
     "run_passes",
     "submit_chain",
@@ -210,6 +211,17 @@ class TimedClient(PolymarketUSExecutionClient):
         self.offset_clock.offset_ns += int(seconds * SEC_NS)
 
 
+def resting_morning_clock() -> Any:
+    """Public Nautilus ``TestClock`` at 2026-08-27T00:00:00Z (``clock_at``).
+
+    Pass it into the client builder BEFORE the permit is minted. Escalation
+    ``advance`` walks several hours; a midnight base keeps that walk inside one
+    UTC day, so ``spent_today_usd`` cannot roll to zero. ``advance`` itself is
+    unchanged (it still only adds to the offset).
+    """
+    return clock_at()
+
+
 # ---------------------------------------------------------------------------
 # Environment / builders
 # ---------------------------------------------------------------------------
@@ -275,13 +287,23 @@ async def build_client(
     sender: Any,
     admitted: bool | None = None,
     start: bool = False,
+    clock: Any | None = None,
 ) -> tuple[TimedClient, list[Any], Any, Any]:
     """``_build_race_client`` with :class:`TimedClient` substituted for the
-    client class (both builder modules reference it as a module global)."""
+    client class (both builder modules reference it as a module global).
+
+    ``clock`` is optional. Omit it and the builder keeps a live clock. Resting
+    rigs pass :func:`resting_morning_clock` so the permit and the ledger share
+    one fixed UTC morning.
+    """
     TimedClient.admitted = admitted
     monkeypatch.setattr(_race_tests, "PolymarketUSExecutionClient", TimedClient)
     monkeypatch.setattr(_resolver_tests, "PolymarketUSExecutionClient", TimedClient)
-    client, order_events, permit, latch_cm = await _build_race_client(tmp_path, sender=sender)
+    client, order_events, permit, latch_cm = await _build_race_client(
+        tmp_path,
+        sender=sender,
+        clock=clock,
+    )
     wire_payloads(client)
     if start:
         client.start()
@@ -299,9 +321,15 @@ async def reboot_client(
     first_client: Any,
     admitted: bool | None = None,
     resolver_instrument_loader: Any = None,
+    clock: Any | None = None,
 ) -> tuple[TimedClient, Any]:
     """Model a process restart: release the first process's flock and build a
-    fresh client over the SAME durable store (not yet connected)."""
+    fresh client over the SAME durable store (not yet connected).
+
+    Pass the same pinned ``clock`` the first process used, or a fresh
+    :func:`resting_morning_clock`, so the reboot's seed day matches the
+    durable fill's UTC day.
+    """
     await first_client._disconnect()
     first_latch_cm.__exit__(None, None, None)
     TimedClient.admitted = admitted
@@ -310,6 +338,7 @@ async def reboot_client(
         tmp_path,
         store_path=tmp_path / "exec_state.db",
         resolver_instrument_loader=resolver_instrument_loader,
+        clock=clock,
     )
     wire_payloads(client)
     assert isinstance(client, TimedClient)
