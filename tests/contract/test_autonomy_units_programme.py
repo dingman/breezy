@@ -73,6 +73,13 @@ _CARVE_OUTS: tuple[_CarveOut, ...] = (
         "resolve_family_manifest returns 3; the caller maps rc 3 to exit 0",
     ),
     _CarveOut(
+        "replay-daily-run.sh",
+        re.compile(r"composition_kind=no_ladder_maker"),
+        3,
+        re.compile(_IN_BLOCK_EXIT_0.format(rc=3), re.MULTILINE),
+        "resolve_family_manifest returns 3; the caller maps rc 3 to exit 0",
+    ),
+    _CarveOut(
         "score-live-trials-run.sh",
         re.compile(r"composition_kind=forecast_quantile_ladder"),
         2,

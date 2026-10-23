@@ -164,6 +164,12 @@ resolve_family_manifest() {
     say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder has no replay_daily_runner"
     return 3
   fi
+  # no_ladder_maker likewise has no replay strategy class. Same return 3:
+  # the caller treats rc 3 as a healthy by-design skip.
+  if [ "$kind" = "no_ladder_maker" ]; then
+    say "REPLAY DAILY SKIPPED -- composition_kind=no_ladder_maker has no replay_daily_runner"
+    return 3
+  fi
   status=$(manifest_field "$path" status)
   if [ "$status" != "REGISTERED" ]; then
     say "REPLAY DAILY SKIPPED -- sending family $id status=${status:-absent} is not REGISTERED"

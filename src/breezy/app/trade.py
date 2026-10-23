@@ -820,9 +820,7 @@ def _compose_forecast_quantile_ladder(
     )
     fq_loss_stop_probe.probe_once()
     fq_parity_cache = (
-        fq_bridge.ParityFileCache(
-            catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid()
-        )
+        fq_bridge.ParityFileCache(catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid())
         if manifest.family_id == fq_bridge.PARITY_SUBJECT
         else None
     )
@@ -949,11 +947,13 @@ def _compose_no_ladder_maker(
 
     ONE ``NoLadderMakerStrategy`` serves every manifest station. Sending is shadow-only unless the
     two-key live-orders gate (code-committed allowlist triple + verified ruling + a permit) answers
-    ``enabled``: the manifest ships WITHOUT a ``live_orders_ruling`` and the family is in no
-    allowlist, so the gate reads ``no_ruling`` and ``shadow_only`` stays True. The entry veto is the
-    family halt, then the STRICT maker harm stop (``derived/maker-loss-stop/latest.json``); a FAIL
-    sets the family halt, and the strategy answers any veto by cancelling every live order, per
-    order (open and in flight). The same veto object reaches the strategy and the exec client.
+    ``enabled``. The sharp manifest ships ``live_orders_ruling``
+    ``RULING_MAKER_sharp_v1_live_small_2026-10-21`` and is that allowlist triple: matching ruling
+    bytes plus a permit answer enabled, and ``shadow_only`` is False. A missing permit or a sha
+    mismatch keeps shadow-only. The entry veto is the family halt, then the STRICT maker harm stop
+    (``derived/maker-loss-stop/latest.json``); a FAIL sets the family halt, and the strategy answers
+    any veto by cancelling every live order, per order (open and in flight). The same veto object
+    reaches the strategy and the exec client.
     """
     extra_actors: list[Any] = []
     halt_latch, halt_veto = _open_halt_latch_preamble(

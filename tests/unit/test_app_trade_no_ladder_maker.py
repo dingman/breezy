@@ -224,7 +224,7 @@ def test_the_shipped_gate_enables_under_a_permit_and_a_closed_copy_posts_nothing
     gate = live_orders_gate.live_orders_authorized(manifest, REPO, permit_present=True)
     assert (gate.enabled, gate.reason) == (True, "ok")
     assert gate.ruling_sha256 == (
-        "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152"
+        "b6feef689e1d5c42d68414551a91d1859b39f1625e865ec7242d40362a18f923"
     )
 
     closed = dataclasses.replace(manifest, live_orders_ruling=None)

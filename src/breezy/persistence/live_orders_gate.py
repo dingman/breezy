@@ -87,7 +87,7 @@ _LIVE_ORDERS_ALLOWLIST: Final[frozenset[tuple[str, str, str]]] = frozenset(
         (
             "pm_us_no_maker_sharp_v1",
             "RULING_MAKER_sharp_v1_live_small_2026-10-21",
-            "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152",
+            "b6feef689e1d5c42d68414551a91d1859b39f1625e865ec7242d40362a18f923",
         ),
     }
 )

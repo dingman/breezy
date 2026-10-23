@@ -35,7 +35,7 @@ FQ_MANIFEST: Final[Path] = REPO / "deploy" / "families" / "pm_us_crh_fq_v1.json"
 KIND: Final[str] = "no_ladder_maker"
 FAMILY: Final[str] = "pm_us_no_maker_sharp_v1"
 RULING_ID: Final[str] = "RULING_MAKER_sharp_v1_live_small_2026-10-21"
-RULING_SHA256: Final[str] = "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152"
+RULING_SHA256: Final[str] = "b6feef689e1d5c42d68414551a91d1859b39f1625e865ec7242d40362a18f923"
 OLD_KINDS: Final[frozenset[str]] = frozenset(
     {"current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"}
 )

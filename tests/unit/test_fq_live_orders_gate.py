@@ -375,7 +375,7 @@ def test_every_committed_manifest_still_loads_with_an_unchanged_sha256() -> None
 
 _SHARP_FAMILY_ID = "pm_us_no_maker_sharp_v1"
 _SHARP_RULING_ID = "RULING_MAKER_sharp_v1_live_small_2026-10-21"
-_SHARP_RULING_SHA256 = "3dd44653bd9d6814ca2b0ea87e9d8bc1f028fa6f612e655216a486c113825152"
+_SHARP_RULING_SHA256 = "b6feef689e1d5c42d68414551a91d1859b39f1625e865ec7242d40362a18f923"
 _SHARP_MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / f"{_SHARP_FAMILY_ID}.json"
 _SHARP_DEPLOY_RULING_PATH = (
     _REPO_ROOT / "deploy" / "families" / "rulings" / f"{_SHARP_RULING_ID}.md"

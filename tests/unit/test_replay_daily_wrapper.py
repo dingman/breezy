@@ -15,6 +15,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WRAPPER = _REPO_ROOT / "deploy" / "systemd" / "replay-daily-run.sh"
 
@@ -22,9 +24,7 @@ _WRAPPER = _REPO_ROOT / "deploy" / "systemd" / "replay-daily-run.sh"
 def _systemctl_stub(tmp_path: Path, *, environment_line: str = "", exit_code: int = 0) -> Path:
     stub = tmp_path / "systemctl-stub.sh"
     stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' {shlex.quote(environment_line)}\n"
-        f"exit {exit_code}\n",
+        f"#!/usr/bin/env bash\nprintf '%s\\n' {shlex.quote(environment_line)}\nexit {exit_code}\n",
         encoding="utf-8",
     )
     stub.chmod(0o755)
@@ -129,7 +129,11 @@ def _run_wrapper(
 
 def test_wrapper_script_is_valid_bash() -> None:
     result = subprocess.run(
-        ["bash", "-n", str(_WRAPPER)], capture_output=True, text=True, timeout=10, check=False,
+        ["bash", "-n", str(_WRAPPER)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 
@@ -144,28 +148,38 @@ def test_systemctl_failure_exits_nonzero_never_a_benign_skip(tmp_path: Path) -> 
     assert not argv_log.exists() or "REPORT_SKIP" not in argv_log.read_text()
 
 
+@pytest.mark.parametrize(
+    ("family_id", "kind"),
+    [
+        ("pm_us_crh_fq_v1", "forecast_quantile_ladder"),
+        ("pm_us_no_maker_sharp_v1", "no_ladder_maker"),
+    ],
+)
 def test_a_forecast_quantile_ladder_sending_family_skips_without_replay_tooling(
     tmp_path: Path,
+    family_id: str,
+    kind: str,
 ) -> None:
-    """S7: forecast_quantile_ladder has no replay_daily_runner. The unit
-    prints the composition skip and exits 0 without invoking the census,
+    """S7: forecast_quantile_ladder and no_ladder_maker have no replay_daily_runner.
+    The unit prints the composition skip and exits 0 without invoking the census,
     the runner, or the skip recorder."""
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
         tmp_path,
-        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1",
+        environment_line=f"Environment=BREEZY_SENDING_FAMILY_ID={family_id}",
     )
     result = _run_wrapper(
-        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+        tmp_path,
+        python_stub=python_stub,
+        systemctl_stub=systemctl_stub,
     )
     assert result.returncode == 0, result.stderr
     log_text = (tmp_path / "derived" / "replay_daily.log").read_text(encoding="utf-8")
     assert (
-        "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder "
-        "has no replay_daily_runner"
+        f"REPLAY DAILY SKIPPED -- composition_kind={kind} has no replay_daily_runner"
     ) in log_text
-    # The ONLY runner call is the skip-state reset: an FQ composition skip is
-    # a healthy skip, so it must clear any LOCK_CONTENTION streak (no census,
+    # The ONLY runner call is the skip-state reset: a composition skip is a
+    # healthy skip, so it must clear any LOCK_CONTENTION streak (no census,
     # no replay run, no skip RECORD).
     calls = argv_log.read_text(encoding="utf-8").splitlines()
     assert len(calls) == 1 and calls[0].startswith("RESET_SKIP_STATE "), calls
@@ -201,10 +215,14 @@ def test_no_armed_family_exits_zero_and_records_a_skip(tmp_path: Path) -> None:
 def test_lock_contention_exits_zero_and_records_a_skip(tmp_path: Path) -> None:
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(
-        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub, hold_lock=True,
+        tmp_path,
+        python_stub=python_stub,
+        systemctl_stub=systemctl_stub,
+        hold_lock=True,
     )
     assert result.returncode == 0, result.stderr
     log_text = argv_log.read_text()
@@ -220,10 +238,14 @@ def test_a_crashing_skip_recorder_exits_nonzero_on_lock_contention(tmp_path: Pat
     recorder failing must itself be loud."""
     python_stub, argv_log = _python_stub(tmp_path, report_skip_exit_code=1)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(
-        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub, hold_lock=True,
+        tmp_path,
+        python_stub=python_stub,
+        systemctl_stub=systemctl_stub,
+        hold_lock=True,
     )
     assert result.returncode != 0
     log_text = (tmp_path / "derived" / "replay_daily.log").read_text()
@@ -244,7 +266,8 @@ def test_a_crashing_skip_recorder_exits_nonzero_on_no_armed_family(tmp_path: Pat
 def test_a_normal_run_invokes_the_census_then_the_runner_and_no_skip(tmp_path: Path) -> None:
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub)
     assert result.returncode == 0, result.stderr
@@ -255,9 +278,7 @@ def test_a_normal_run_invokes_the_census_then_the_runner_and_no_skip(tmp_path: P
 
 
 def _runner_argv_line(argv_log: Path) -> str:
-    (line,) = [
-        line for line in argv_log.read_text().splitlines() if line.startswith("RUNNER")
-    ]
+    (line,) = [line for line in argv_log.read_text().splitlines() if line.startswith("RUNNER")]
     return line
 
 
@@ -267,7 +288,8 @@ def test_the_runner_invocation_carries_max_targets_and_budget_s(tmp_path: Path) 
     that would fall back to `run_once` inside the runner."""
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub)
     assert result.returncode == 0, result.stderr
@@ -281,10 +303,13 @@ def test_the_runner_invocation_honours_a_max_targets_override(tmp_path: Path) ->
     nightly default via the SAME env var, never a second wrapper script."""
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(
-        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+        tmp_path,
+        python_stub=python_stub,
+        systemctl_stub=systemctl_stub,
         extra_env={"BREEZY_REPLAY_DAILY_MAX_TARGETS": "40"},
     )
     assert result.returncode == 0, result.stderr
@@ -302,10 +327,13 @@ def test_budget_arithmetic_stays_sane_when_seconds_already_exceeds_the_timeout(
     a malformed argv."""
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(
-        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
     )
     result = _run_wrapper(
-        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+        tmp_path,
+        python_stub=python_stub,
+        systemctl_stub=systemctl_stub,
         # bash seeds its builtin $SECONDS from an inherited env var of the
         # same name -- forces the wrapper's own elapsed-time read far past
         # TimeoutStartSec without an actual 1800s sleep.
