@@ -30,6 +30,7 @@ from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import LossStopPro
 from breezy.strategy.no_ladder_maker import harm_stop as hsm
 from breezy.strategy.no_ladder_maker import venue_settlement
 from breezy.strategy.no_ladder_maker.cli_final import registry_std_offset_hours
+from breezy.strategy.no_ladder_maker.composition import D0_PLACEHOLDER
 from breezy.strategy.no_ladder_maker.harm_stop import maker_loss_stop_artefact_path
 from breezy.strategy.no_ladder_maker.venue_settlement import VENUE_SCHEMA
 from scripts.analysis import maker_loss_stop_producer as producer
@@ -959,3 +960,30 @@ def test_a_manifest_without_d0_climate_day_fails_closed(
         assert not (world.derived / "latest.json").exists()
     err = capsys.readouterr().err
     assert "d0_climate_day" in err
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps({"d0_climate_day": D0_PLACEHOLDER}),
+        json.dumps({"d0_climate_day": 20261025}),
+        json.dumps({"d0_climate_day": "not-a-date"}),
+        json.dumps({"d0_climate_day": "20261025"}),
+        "[]",
+    ],
+    ids=["placeholder", "non_string", "bad_date", "compact", "array"],
+)
+def test_a_manifest_d0_that_cannot_floor_the_get_fill_exits_error_and_writes_nothing(
+    world: _World,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    body: str,
+) -> None:
+    """Placeholder, non-ISO, and non-object manifests must not invent a late floor."""
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    world.fill(_record(1, trade_id="GET-OLD", ts_event=1))
+    world.write_venue(datetime.now(tz=UTC))
+    manifest = tmp_path / "family.json"
+    manifest.write_text(body)
+    assert producer.main(_main_argv(world, manifest)) == producer.EXIT_ERROR
+    assert not (world.derived / "latest.json").exists()

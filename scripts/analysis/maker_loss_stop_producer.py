@@ -22,7 +22,8 @@ reads (``--catalog-root`` is the node's ``BREEZY_TRADE_CATALOG_ROOT``).
 It runs once a day (``breezy-maker-loss-stop.timer``, 12:50Z), NOT after every settlement batch, so
 a loss that settles after 12:50Z is first counted the next day. A resolver-booked ``GET-`` fill
 on a family station HOLDs the maker verdict only when its ``ts_event`` is at or after the family's
-posting-window open (D-1 16:50Z of manifest ``d0_climate_day``). An earlier FQ resolver fill on a
+posting-window open (D-1 16:50Z of manifest ``d0_climate_day``). The draft placeholder and any
+value that is not exactly ``YYYY-MM-DD`` are errors, never a floor. An earlier FQ resolver fill on a
 maker station does not block the maker stop. With no floor (``get_fill_not_before_ns`` unset) the
 HOLD stays unbounded, so a missing manifest must not be treated as "no floor".
 
@@ -72,6 +73,7 @@ from breezy.strategy.no_ladder_maker.cli_final import (
     catalog_cli_reader,
     registry_std_offset_hours,
 )
+from breezy.strategy.no_ladder_maker.composition import D0_PLACEHOLDER
 from breezy.strategy.no_ladder_maker.harm_stop import (
     FillOutcome,
     HarmStopResult,
@@ -237,8 +239,9 @@ def _get_fill_holds(fills: tuple[DurableFillRecord, ...], not_before_ns: int | N
 def family_get_fill_floor_ns(manifest: Path) -> int:
     """D-1 16:50Z of ``manifest``'s ``d0_climate_day``, as integer UTC ns.
 
-    ``OSError`` if the file cannot be read. ``ValueError`` if ``d0_climate_day`` is missing or
-    not an ISO date. Never invents a floor.
+    ``OSError`` if the file cannot be read. ``ValueError`` if ``d0_climate_day`` is missing,
+    equal to :data:`D0_PLACEHOLDER`, or not exactly ``YYYY-MM-DD`` (length 10, and
+    :meth:`datetime.date.fromisoformat` round-trips to the same text). Never invents a floor.
     """
     try:
         text = manifest.read_text(encoding="utf-8")
@@ -252,12 +255,20 @@ def family_get_fill_floor_ns(manifest: Path) -> int:
     day_text = raw if isinstance(raw, str) else None
     if day_text is None:
         raise ValueError(f"family manifest {manifest} lacks d0_climate_day")
+    if day_text == D0_PLACEHOLDER:
+        raise ValueError(
+            f"family manifest {manifest} d0_climate_day {day_text!r} is the draft placeholder"
+        )
     try:
         day = date.fromisoformat(day_text)
     except ValueError as exc:
         raise ValueError(
             f"family manifest {manifest} d0_climate_day {day_text!r} is not an ISO date"
         ) from exc
+    if len(day_text) != 10 or day.isoformat() != day_text:
+        raise ValueError(
+            f"family manifest {manifest} d0_climate_day {day_text!r} is not an ISO date"
+        )
     return window_open_ns(day)
 
 
