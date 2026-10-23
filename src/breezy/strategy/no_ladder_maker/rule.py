@@ -34,6 +34,8 @@ _NS_PER_DAY: Final[int] = 24 * _NS_PER_H
 _OBS_RUNG_F: Final[float] = 2.0  # spec line 98: within 1 rung (2 F)
 _INTEGER_C_WIDEN_F: Final[float] = 1.8  # spec line 99
 _LISTING_DEADLINE_UTC: Final[dt.time] = dt.time(12, 0)  # spec line 123: D-1 12:00Z
+#: D-1 16:50Z: the posting window opens for ladder day D (one constant, strategy and harm-stop).
+WINDOW_OPEN_UTC: Final[dt.time] = dt.time(16, 50)
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,12 @@ def k1_rung(selected: tuple[str, ...]) -> str | None:
 
 def _utc_ns(stamp: dt.datetime) -> int:
     return int(stamp.timestamp()) * _NS_PER_S
+
+
+def window_open_ns(day: dt.date) -> int:
+    """D-1 16:50Z, the instant the posting window opens for ladder day ``day``."""
+    opened = dt.datetime.combine(day - dt.timedelta(days=1), WINDOW_OPEN_UTC, tzinfo=dt.UTC)
+    return _utc_ns(opened)
 
 
 def hard_cancel_ns(day: dt.date, std_offset_hours: int, params: MakerRuleParams) -> int:

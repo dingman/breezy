@@ -53,6 +53,7 @@ def _record(
     bid: str = "0.86",
     qty: str = "1",
     leg: str = "^no",
+    ts_event: int | None = None,
 ) -> DurableFillRecord:
     oid = order or f"ORD-{city}-{day}"
     return DurableFillRecord(
@@ -64,7 +65,7 @@ def _record(
         cumulative_cost=Decimal(bid) * Decimal(qty),
         cumulative_fee=Decimal("0.01"),
         fee_reconciled=True,
-        ts_event=1_790_000_000_000_000_000 + day,
+        ts_event=1_790_000_000_000_000_000 + day if ts_event is None else ts_event,
         venue_fee_raw="0.01",
         trade_id=trade_id or f"POLL-{oid}",
         order_qty=Decimal(qty),
@@ -122,9 +123,13 @@ class _World:
         fetched_at: datetime | None = None,
         complete: bool = True,
         write_file: bool = True,
+        get_fill_not_before_ns: int | None = None,
     ) -> producer.Outcome:
         if write_file:
             self.write_venue(fetched_at or now, complete=complete)
+        kwargs: dict[str, Any] = {}
+        if get_fill_not_before_ns is not None:
+            kwargs["get_fill_not_before_ns"] = get_fill_not_before_ns
         return producer.produce(
             state_db=self.db,
             derived_dir=self.derived,
@@ -133,6 +138,7 @@ class _World:
             cli_reading=self.cli_reader,
             now=now,
             std_offset_hours=lambda station: self.offset,
+            **kwargs,
         )
 
     def artefact(self) -> dict[str, Any]:
@@ -474,7 +480,8 @@ def test_main_maps_the_verdict_to_the_exit_code_and_prints_one_json_line(
     assert producer.main(argv) == producer.EXIT_PASS
     printed = json.loads(capsys.readouterr().out)
     assert printed["verdict"] == "PASS" and printed["action"] == "written"
-    world.fill(_record(2, trade_id="GET-ORD-nyc-2"))
+    floor = producer.family_get_fill_floor_ns(producer.DEFAULT_FAMILY_MANIFEST)
+    world.fill(_record(2, trade_id="GET-ORD-nyc-2", ts_event=floor))
     assert producer.main(argv) == producer.EXIT_HOLD
     for d in (3, 4, 5):
         world.lose(d)
@@ -870,3 +877,85 @@ def test_f4_an_unknown_station_offset_holds_instead_of_losing(world: _World) -> 
 def test_f4_a_known_offset_adds_no_offset_hold_reason(world: _World) -> None:
     world.win(1)
     assert "station_offset_unknown" not in world.run().result.hold_reasons
+
+
+# -- GET- fill floor: D-1 16:50Z of the family manifest d0 ---------------------------------------
+
+#: 2026-10-25's posting-window open. A GET- fill strictly before this is not a live-family fill.
+_D0_FLOOR_NS: Final = int(datetime(2026, 10, 24, 16, 50, tzinfo=UTC).timestamp()) * 1_000_000_000
+
+
+def _main_argv(world: _World, manifest: Path) -> list[str]:
+    return [
+        "--station", "nyc",
+        "--state-db", str(world.db),
+        "--catalog-root", str(world.derived.parents[1] / "catalog"),
+        "--venue-settlements", str(world.venue_path),
+        "--family-manifest", str(manifest),
+    ]  # fmt: skip
+
+
+def test_a_get_fill_before_the_floor_passes_and_writes_latest(world: _World) -> None:
+    world.fill(_record(1, trade_id="GET-BEFORE", ts_event=_D0_FLOOR_NS - 1))
+    outcome = world.run(get_fill_not_before_ns=_D0_FLOOR_NS)
+    assert outcome.result.verdict.value == "PASS"
+    assert outcome.result.fills == 0
+    assert "get_fill" not in outcome.result.hold_reasons
+    body = world.artefact()
+    assert body["verdict"] == "PASS"
+    assert (world.derived / "latest.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "ts_event", [_D0_FLOOR_NS, _D0_FLOOR_NS + 1], ids=["at-bound", "after-bound"]
+)
+def test_a_get_fill_at_or_after_the_floor_holds_and_removes_a_standing_pass(
+    world: _World, ts_event: int
+) -> None:
+    assert world.run(get_fill_not_before_ns=_D0_FLOOR_NS).result.verdict.value == "PASS"
+    assert (world.derived / "latest.json").is_file()
+    world.fill(_record(2, trade_id="GET-LIVE", ts_event=ts_event))
+    outcome = world.run(get_fill_not_before_ns=_D0_FLOOR_NS)
+    assert outcome.result.verdict.value == "HOLD"
+    assert "get_fill" in outcome.result.hold_reasons
+    assert outcome.action == "removed"
+    assert not (world.derived / "latest.json").exists()
+
+
+def test_the_get_fill_floor_is_d_minus_1_1650z_of_manifest_d0(
+    world: _World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "family.json"
+    manifest.write_text(json.dumps({"d0_climate_day": "2026-10-25"}))
+    assert producer.family_get_fill_floor_ns(manifest) == _D0_FLOOR_NS
+    seen: dict[str, int | None] = {}
+    real = producer.produce
+
+    def spy(**kwargs: Any) -> producer.Outcome:
+        seen["floor"] = kwargs.get("get_fill_not_before_ns")
+        return real(**kwargs)
+
+    monkeypatch.setattr(producer, "produce", spy)
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    world.write_venue(datetime.now(tz=UTC))
+    assert producer.main(_main_argv(world, manifest)) == producer.EXIT_PASS
+    assert seen["floor"] == _D0_FLOOR_NS
+
+
+def test_a_manifest_without_d0_climate_day_fails_closed(
+    world: _World,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(producer, "catalog_cli_reader", lambda base: world.cli_reader)
+    world.fill(_record(1, trade_id="GET-OLD", ts_event=1))
+    world.write_venue(datetime.now(tz=UTC))
+    missing_field = tmp_path / "no-d0.json"
+    missing_field.write_text(json.dumps({"family_id": "pm_us_no_maker_sharp_v1"}))
+    absent = tmp_path / "missing.json"
+    for manifest in (missing_field, absent):
+        assert producer.main(_main_argv(world, manifest)) == producer.EXIT_ERROR
+        assert not (world.derived / "latest.json").exists()
+    err = capsys.readouterr().err
+    assert "d0_climate_day" in err

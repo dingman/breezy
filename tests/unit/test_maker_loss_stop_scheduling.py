@@ -82,6 +82,11 @@ def test_the_paths_are_explicit_and_the_producer_path_is_the_probes_path() -> No
             assert ["--station", station] in [tokens[i : i + 2] for i in range(len(tokens))]
     root = Path(main[main.index("--catalog-root") + 1])
     assert pre[pre.index("--catalog-root") + 1] == str(root), "collector and producer agree"
+    manifest_at = main.index("--family-manifest")
+    assert main[manifest_at + 1] == (
+        "/home/jon/breezy/deploy/families/pm_us_no_maker_sharp_v1.json"
+    )
+    assert "--family-manifest" not in pre
     assert producer.artefact_path(root) == maker_loss_stop_artefact_path(root)
     assert producer.artefact_path(root).parent == root.parent / "derived" / "maker-loss-stop"
 

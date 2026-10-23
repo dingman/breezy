@@ -132,15 +132,6 @@ _VENUE: Final[str] = "polymarket_us"
 _NS: Final[int] = 10**9
 _POLL_TIMER: Final[str] = "MAKER-POLL"
 _HARD_PREFIX: Final[str] = "MAKER-HARD"
-WINDOW_OPEN_UTC: Final[dt.time] = dt.time(16, 50)
-
-
-def _window_open_ns(day: dt.date) -> int:
-    """D-1 16:50Z, the instant the simulated posting window opens for ladder day ``day``."""
-    opened = dt.datetime.combine(day - dt.timedelta(days=1), WINDOW_OPEN_UTC, tzinfo=dt.UTC)
-    return int(opened.timestamp()) * 1_000_000_000
-
-
 _NBP_PREFIX: Final[str] = "MAKER-NBP"
 _SHADOW_PREFIX: Final[str] = "MAKER-SHADOW"
 #: R15 (L-45) fail-closed bound on Depth10 subscriptions: four stations x ten rungs of ONE
@@ -244,7 +235,7 @@ class NoLadderMakerStrategy(Strategy):
         for station in self.config.stations:
             day = local_standard_date(now, self._offsets[station]) + dt.timedelta(days=1)
             hard = rule.hard_cancel_ns(day, int(self._offsets[station]), self._params)
-            opens = _window_open_ns(day)
+            opens = rule.window_open_ns(day)
             self.ladders[(station, day)] = Ladder(station, day, hard, window_open_ns=opens)
             if hard > now:
                 self.clock.set_time_alert_ns(

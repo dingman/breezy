@@ -9,10 +9,10 @@ writes nothing but that artefact.
 
 * PASS / FAIL write the file atomically. FAIL is sticky (a restart needs a new dated ruling), and
   so is a standing file this producer cannot read back.
-* HOLD (GET- family fills, an open AMBIGUOUS family intent, an unreadable state DB or any
-  undecodable fill record, a missing / incomplete / stale venue-settlement file, or a family
-  station with no known UTC offset) removes a standing PASS so the probe vetoes at once, and never
-  touches a FAIL.
+* HOLD (a ``GET-`` family fill at or after the posting-window floor, an open AMBIGUOUS family
+  intent, an unreadable state DB or any undecodable fill record, a missing / incomplete / stale
+  venue-settlement file, or a family station with no known UTC offset) removes a standing PASS so
+  the probe vetoes at once, and never touches a FAIL.
 * Zero fills is a PASS. A fill whose settlement is not yet knowable is PENDING until 48 h after the
   end of its local station-day (in no count); after that it is a LOSS.
 
@@ -21,8 +21,10 @@ reads (``--catalog-root`` is the node's ``BREEZY_TRADE_CATALOG_ROOT``).
 
 It runs once a day (``breezy-maker-loss-stop.timer``, 12:50Z), NOT after every settlement batch, so
 a loss that settles after 12:50Z is first counted the next day. A resolver-booked ``GET-`` fill
-on a family station HOLDs the maker verdict (fail closed): ``get_fills`` is scoped by station, so an
-FQ resolver fill on a maker station blocks the maker stop too.
+on a family station HOLDs the maker verdict only when its ``ts_event`` is at or after the family's
+posting-window open (D-1 16:50Z of manifest ``d0_climate_day``). An earlier FQ resolver fill on a
+maker station does not block the maker stop. With no floor (``get_fill_not_before_ns`` unset) the
+HOLD stays unbounded, so a missing manifest must not be treated as "no floor".
 
 Exit status (so ``OnFailure=`` alerts): 0 PASS, 2 FAIL (a computed FAIL, or a sticky FAIL or
 unreadable file standing on disk), 3 HOLD, 1 error.
@@ -84,6 +86,7 @@ from breezy.strategy.no_ladder_maker.harm_stop import (
     station_of_slug,
 )
 from breezy.strategy.no_ladder_maker.harm_stop_artefact import ACTION_STICKY, Action, publish
+from breezy.strategy.no_ladder_maker.rule import window_open_ns
 from breezy.strategy.no_ladder_maker.venue_settlement import (
     VENUE_SETTLEMENTS_NAME,
     read_venue_settlement,
@@ -99,6 +102,9 @@ STATE_DB_ENV: Final[str] = "POLYMARKET_US_EXEC_STATE_DB"
 #: the node's own variable (``breezy.runtime.settings.TRADE_CATALOG_ROOT_VAR``; not imported: the
 #: producer stays free of ``breezy.runtime``)
 CATALOG_ROOT_ENV: Final[str] = "BREEZY_TRADE_CATALOG_ROOT"
+DEFAULT_FAMILY_MANIFEST: Final[Path] = (
+    Path(__file__).resolve().parents[2] / "deploy" / "families" / "pm_us_no_maker_sharp_v1.json"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +224,43 @@ def _truth_sha(settled: Sequence[tuple[str, SettledFill]]) -> str:
     return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
 
 
+def _get_fill_holds(fills: tuple[DurableFillRecord, ...], not_before_ns: int | None) -> bool:
+    """True when a classified ``GET-`` fill should HOLD.
+
+    ``None`` is the unbounded rule (any fill). A bound counts only ``ts_event >= not_before_ns``.
+    """
+    if not_before_ns is None:
+        return bool(fills)
+    return any(fill.ts_event >= not_before_ns for fill in fills)
+
+
+def family_get_fill_floor_ns(manifest: Path) -> int:
+    """D-1 16:50Z of ``manifest``'s ``d0_climate_day``, as integer UTC ns.
+
+    ``OSError`` if the file cannot be read. ``ValueError`` if ``d0_climate_day`` is missing or
+    not an ISO date. Never invents a floor.
+    """
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"family manifest {manifest} is not utf-8 text") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"family manifest {manifest} is not JSON") from exc
+    raw = payload.get("d0_climate_day") if isinstance(payload, dict) else None
+    day_text = raw if isinstance(raw, str) else None
+    if day_text is None:
+        raise ValueError(f"family manifest {manifest} lacks d0_climate_day")
+    try:
+        day = date.fromisoformat(day_text)
+    except ValueError as exc:
+        raise ValueError(
+            f"family manifest {manifest} d0_climate_day {day_text!r} is not an ISO date"
+        ) from exc
+    return window_open_ns(day)
+
+
 def produce(
     *,
     state_db: Path,
@@ -227,15 +270,20 @@ def produce(
     cli_reading: CliReading,
     now: datetime,
     std_offset_hours: StdOffset = registry_std_offset_hours,
+    get_fill_not_before_ns: int | None = None,
 ) -> Outcome:
-    """Evaluate D5 over the stores and publish. Reads only; the one write is ``latest.json``."""
+    """Evaluate D5 over the stores and publish. Reads only; the one write is ``latest.json``.
+
+    ``get_fill_not_before_ns`` floors the ``GET-`` HOLD at that UTC ns (inclusive). ``None`` keeps
+    the unbounded HOLD.
+    """
     state = _read_state(state_db)
     # a slug that is not the weather grammar is not a family slug (``station_of_slug`` -> "")
     classification = classify_family_fills(
         state.records, family_stations=family_stations, open_ambiguous_slugs=state.open_slugs
     )
     reasons = list(state.blocked)
-    if classification.get_fills:
+    if _get_fill_holds(classification.get_fills, get_fill_not_before_ns):
         reasons.append("get_fill")
     if classification.open_ambiguous_family_intent:
         reasons.append("open_ambiguous_family_intent")
@@ -339,6 +387,15 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--catalog-base", type=Path, default=None)
     parser.add_argument("--venue-settlements", type=Path, default=None)
+    parser.add_argument(
+        "--family-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "family manifest; d0_climate_day floors GET- fills at D-1 16:50Z "
+            f"(default: {DEFAULT_FAMILY_MANIFEST})"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -359,6 +416,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: --catalog-root or ${CATALOG_ROOT_ENV} is required", file=sys.stderr)
         return EXIT_ERROR
     latest = artefact_path(catalog_root)
+    manifest = args.family_manifest if args.family_manifest is not None else DEFAULT_FAMILY_MANIFEST
+    try:
+        floor_ns = family_get_fill_floor_ns(manifest)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     outcome = produce(
         state_db=state_db,
         derived_dir=latest.parent,
@@ -366,6 +429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         family_stations=frozenset(args.stations),
         cli_reading=catalog_cli_reader(args.catalog_base or args.data_root / "catalog"),
         now=datetime.now(tz=UTC),
+        get_fill_not_before_ns=floor_ns,
     )
     print(json.dumps(_summary(outcome), sort_keys=True))
     return exit_code_for(outcome)

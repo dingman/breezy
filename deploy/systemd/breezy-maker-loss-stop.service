@@ -58,7 +58,9 @@ Environment=POLYMARKET_US_EXEC_STATE_DB=%h/.local/share/breezy/state/exec_polyma
 # paths, no defaults. The station list is plan r3 R10's four; the family manifest replaces it when
 # C2 lands.
 ExecStartPre=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/venue/maker_settlement_collect.py --catalog-root /mnt/storage/breezy/catalog/quote_tape/polymarket_us --data-root %h/.local/share/breezy --catalog-base %h/.local/share/breezy/catalog --station lax --station sfo --station mdw --station mia
-ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py --catalog-root /mnt/storage/breezy/catalog/quote_tape/polymarket_us --data-root %h/.local/share/breezy --catalog-base %h/.local/share/breezy/catalog --station lax --station sfo --station mdw --station mia
+# --family-manifest is explicit (same as the other paths). Its d0_climate_day floors GET- HOLDs
+# at D-1 16:50Z; a missing file or a manifest without that field exits 1.
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/maker_loss_stop_producer.py --catalog-root /mnt/storage/breezy/catalog/quote_tape/polymarket_us --data-root %h/.local/share/breezy --catalog-base %h/.local/share/breezy/catalog --station lax --station sfo --station mdw --station mia --family-manifest /home/jon/breezy/deploy/families/pm_us_no_maker_sharp_v1.json
 
 # <=20 paced pages plus a catalog read: bounded. Type=oneshot ignores RuntimeMaxSec=; TimeoutStartSec=
 # bounds the whole run, ExecStartPre included.
