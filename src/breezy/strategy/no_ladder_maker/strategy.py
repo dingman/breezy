@@ -17,6 +17,10 @@ Events and timers
   latched), ``query_order`` of every live rest, the cancel deadline (a CANCELING rest not
   acknowledged in ``CANCEL_DEADLINE_S`` is re-issued), reconciliation of a rest whose order the
   cache already shows closed, instrument re-resolution from the cache.
+* Those four clock callbacks (poll, NBP release, hard cancel, shadow expiry) run on a
+  Rust/tokio thread under ``LiveClock``. ``on_start`` captures the kernel loop and hops each
+  onto it (``call_soon_threadsafe``); with no running loop (``TestClock`` / backtest) they stay
+  inline, so the thread-confined halt store is only read on the thread that opened it.
 * ``MAKER-HARD:<station>:<day>`` time alert at D 09:00 LST (``hard_cancel_ns``): a harmless
   backstop only -- it falls after the permit window (R10-ERRATUM) -- that cancels the station's
   rests and stops posting. ``_decide`` repeats the check against the clock, so a lost alert cannot
@@ -51,9 +55,11 @@ and logs ``MAKER_WOULD_POST`` / ``MAKER_WOULD_CANCEL`` instead of ordering.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import functools
 import logging
+import threading
 from collections import Counter
 from collections.abc import Callable
 from decimal import Decimal
@@ -223,6 +229,10 @@ class NoLadderMakerStrategy(Strategy):
         self._veto_latched: str | None = None
         self._tracker = WantTracker()
         self.counters: Counter[str] = Counter()
+        #: The kernel loop, captured in ``on_start``. ``None`` under TestClock / backtest
+        #: (no running loop), which keeps every clock callback inline.
+        self._kernel_loop: asyncio.AbstractEventLoop | None = None
+        self._kernel_thread: int | None = None
 
     def _log_failure(self, message: str, exc: Exception) -> None:
         """Log a swallowed handler failure with its traceback (L-16)."""
@@ -230,7 +240,42 @@ class NoLadderMakerStrategy(Strategy):
 
     # -- lifecycle ---------------------------------------------------------------------------
 
+    def _on_clock(self, callback: Callable[[Any], None]) -> Callable[[Any], None]:
+        """Hop a LiveClock callback onto the kernel loop, whole body included.
+
+        The clock thread must not cancel or submit either: only this wrapper runs
+        there. No running loop (TestClock / backtest) keeps today's inline call.
+        A callback already on the kernel thread stays inline too, so a TestClock
+        advance is not deferred into a later loop turn. A raise on the foreign
+        thread is logged and swallowed — the pyo3 clock wrapper discards it.
+        """
+
+        def _wrapped(event: Any) -> None:
+            loop = self._kernel_loop
+            if loop is None or threading.get_ident() == self._kernel_thread:
+                callback(event)
+                return
+            try:
+                if loop.is_closed():
+                    return
+                loop.call_soon_threadsafe(callback, event)
+            # BaseException, deliberately: this runs on the foreign (Rust/tokio)
+            # thread, where a raise is silently discarded (L-16).
+            except BaseException as exc:  # noqa: BLE001
+                _log.error(
+                    "failed to schedule maker clock callback exception_type=%s",
+                    type(exc).__name__,
+                )
+
+        return _wrapped
+
     def on_start(self) -> None:
+        try:
+            self._kernel_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._kernel_loop = None
+        else:
+            self._kernel_thread = threading.get_ident()
         now = self.clock.timestamp_ns()
         for station in self.config.stations:
             day = local_standard_date(now, self._offsets[station]) + dt.timedelta(days=1)
@@ -241,14 +286,14 @@ class NoLadderMakerStrategy(Strategy):
                 self.clock.set_time_alert_ns(
                     name=f"{_HARD_PREFIX}:{station}:{day.isoformat()}",
                     alert_time_ns=hard,
-                    callback=self._on_hard_alert,
+                    callback=self._on_clock(self._on_hard_alert),
                 )
         self.subscribe_data(nbm_forecast_point_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
         self._resolve_instruments()  # raises DepthSubscriptionBudgetError: refuse to start
         self.clock.set_timer(
             name=_POLL_TIMER,
             interval=dt.timedelta(seconds=self.config.poll_interval_s),
-            callback=self._on_poll,
+            callback=self._on_clock(self._on_poll),
         )
 
     def on_stop(self) -> None:
@@ -406,7 +451,7 @@ class NoLadderMakerStrategy(Strategy):
         self.clock.set_time_alert_ns(
             name=f"{_NBP_PREFIX}:{station}:{self._nbp_alerts}",
             alert_time_ns=self.clock.timestamp_ns() + 1,
-            callback=self._on_nbp_alert,
+            callback=self._on_clock(self._on_nbp_alert),
         )
 
     @_guarded
@@ -683,7 +728,9 @@ class NoLadderMakerStrategy(Strategy):
         self.clock.set_time_alert_ns(
             name=f"{_SHADOW_PREFIX}:{self._shadow_alerts}",
             alert_time_ns=expire_ns,
-            callback=lambda event: self._on_shadow_expiry(key, rung_id, expire_ns),
+            callback=self._on_clock(
+                lambda event: self._on_shadow_expiry(key, rung_id, expire_ns)
+            ),
         )
 
     @_guarded
