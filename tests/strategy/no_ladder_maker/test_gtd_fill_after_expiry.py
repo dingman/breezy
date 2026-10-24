@@ -12,6 +12,7 @@ order FSM rejects ``EXPIRED -> FILLED``; Nautilus still publishes that event
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any
 
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -40,7 +41,7 @@ def _arm(h: Harness) -> str:
     return rung
 
 
-def _fill_after_close(h: Harness, order: object) -> None:
+def _fill_after_close(h: Harness, order: Any) -> None:
     """Publish ``OrderFilled`` even though the order FSM refuses to apply it."""
     instrument = h.cache.instrument(order.instrument_id)
     h.deliver(
@@ -55,7 +56,7 @@ def _fill_after_close(h: Harness, order: object) -> None:
     )
 
 
-def _expire_after_fill(h: Harness, order: object) -> None:
+def _expire_after_fill(h: Harness, order: Any) -> None:
     """Publish ``OrderExpired`` after the order is already FILLED (FSM refuses it)."""
     h.deliver(
         TestEventStubs.order_expired(order, ts_event=h.clock.timestamp_ns()),

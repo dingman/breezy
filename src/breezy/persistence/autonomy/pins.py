@@ -34,7 +34,9 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
         # re-pin at ARM post-B2 (same submit_chain.py + client.py change); was 72f6d236...1a17
-        "aut6.health": "caa4d1142be1ff4a922e42130b2d7a64a6bdc92989f082ca67894e3b7cf8c832",
+        # re-pin at p4/arm (health_dropins.DROPIN_ALLOWLIST emptied; orders-off row
+        # removed); was caa4d114...c832
+        "aut6.health": "8a4723a004d7833af6c4e02f12fff0fc21e4d83b8caa9ea263495f661a8de5ac",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
