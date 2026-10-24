@@ -908,7 +908,7 @@ def test_promote_reviewed_revision_then_refetch_is_clean(
     assert log[-1] == {
         "body_sha256": meta["body_sha256"],
         "confirmed": promoted["promotion"]["confirmed"],
-        "event": "promoted",
+        "event": "promoting",
         "fetch_date": meta["fetch_date"],
         "marker": newest.name,
         "promoted_at": "2026-08-23T12:00:00Z",
@@ -1014,6 +1014,249 @@ def test_promote_refuses_unavailable_catalog_without_flag(
     latest = fetch.RevisionStore(tmp_path).latest_valid("NYC")
     assert latest is not None
     assert latest.promoted is True
+    assert latest.body_sha256 == meta["body_sha256"]
+
+
+def test_promote_refuses_confirm_matching_tampered_marker_not_body(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A confirm that matches a tampered marker value, not the body, is refused."""
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, meta = _newest_marker(tmp_path)
+    for change in meta["value_change_unconfirmed"]:
+        change["new_tmax_f"] = 91
+    newest.write_text(json.dumps(meta), encoding="utf-8")
+    tampered = ("2026-08-18=91", "2026-08-19=91", "2026-08-20=91")
+    _assert_refused(
+        fetch, tmp_path, newest.name, tampered, capsys, "does not match the stored body"
+    )
+
+
+def test_promote_refuses_older_than_promoted_target(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    later = dt.datetime(2026, 8, 24, 12, 0, tzinfo=dt.UTC)
+    code = _main_fetch(
+        fetch,
+        tmp_path,
+        cli_body(days(18, 20)),
+        lambda: int(later.timestamp() * 1e9),
+    )
+    assert code == fetch.EXIT_DISAGREEMENT
+    directory = tmp_path / "afos-cli" / "NYC"
+    unpromoted = [
+        path
+        for path in directory.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["promoted"] is False
+    ]
+    assert len(unpromoted) == 1
+    assert max(directory.glob("*.json")).name > unpromoted[0].name
+    _assert_refused(fetch, tmp_path, unpromoted[0].name, EXACT_CONFIRMS, capsys, "not newer")
+
+
+def test_promote_refuses_stale_baseline(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, meta = _newest_marker(tmp_path)
+    for change in meta["value_change_unconfirmed"]:
+        change["old_tmax_f"] = 84
+    newest.write_text(json.dumps(meta), encoding="utf-8")
+    _assert_refused(fetch, tmp_path, newest.name, EXACT_CONFIRMS, capsys, "stale baseline")
+
+
+def test_promote_refuses_correction_flag_only_change(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = {("NYC", day): SimpleNamespace(tmax_f=85) for day in days(18, 21)}
+    _nyc_only(fetch, monkeypatch, catalog)
+    assert _main_fetch(fetch, tmp_path, cli_body(days(18, 20))) == fetch.EXIT_OK
+    flagged = cli_body(days(18, 21), tmax=85).replace(
+        "CDUS41 KOKX 220626", "CDUS41 KOKX 220626 CCA"
+    )
+    assert _main_fetch(fetch, tmp_path, flagged) == fetch.EXIT_VALUE_CHANGE
+    _newest, meta = _newest_marker(tmp_path)
+    changes = meta["value_change_unconfirmed"]
+    assert changes
+    assert all(change["old_tmax_f"] == change["new_tmax_f"] for change in changes)
+    assert all(change["new_correction_flag"] is True for change in changes)
+    confirms = tuple(f"{change['climate_day']}=85" for change in changes)
+    _assert_refused(
+        fetch, tmp_path, _newest.name, confirms, capsys, "correction-flag-only change"
+    )
+
+
+def test_promote_logs_intent_before_marker_and_fsyncs_the_log(
+    fetch: ModuleType,
+    revisions: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The marker promotion block is authoritative; the log line is an audit trail."""
+    assert "authoritative" in (fetch.RevisionStore.promote.__doc__ or "")
+    assert "audit" in (fetch.RevisionStore.promote.__doc__ or "")
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    events: list[tuple[str, str]] = []
+    fsynced: list[int] = []
+    synced_during_append: list[int] = []
+    real_append, real_replace, real_fsync = (
+        revisions._append_jsonl,
+        revisions.os.replace,
+        revisions.os.fsync,
+    )
+
+    def spy_append(path: Path, record: dict[str, Any]) -> None:
+        start = len(fsynced)
+        real_append(path, record)
+        synced_during_append.extend(fsynced[start:])
+        events.append(("append", str(record.get("event"))))
+
+    def spy_replace(src: Any, dst: Any) -> None:
+        events.append(("replace", Path(dst).name))
+        real_replace(src, dst)
+
+    def spy_fsync(fd: int) -> None:
+        fsynced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(revisions, "_append_jsonl", spy_append)
+    monkeypatch.setattr(revisions.os, "replace", spy_replace)
+    monkeypatch.setattr(revisions.os, "fsync", spy_fsync)
+
+    code = _promote(fetch, tmp_path, newest.name, EXACT_CONFIRMS)
+    assert code == fetch.EXIT_OK
+    assert capsys.readouterr().out
+    append_at = events.index(("append", "promoting"))
+    replace_at = events.index(("replace", newest.name))
+    assert append_at < replace_at
+    assert synced_during_append, "changes.jsonl append must fsync before the marker rewrite"
+    log = (tmp_path / "afos-cli" / "NYC" / "changes.jsonl").read_text(encoding="utf-8")
+    assert '"event": "promoting"' in log
+    promoted = json.loads(newest.read_text(encoding="utf-8"))
+    assert promoted["promotion"]["reviewer_note"] == REVIEW_NOTE
+
+
+def test_append_jsonl_flushes_and_fsyncs(
+    revisions: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+    real_fsync = revisions.os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        seen.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(revisions.os, "fsync", spy_fsync)
+    path = tmp_path / "changes.jsonl"
+    revisions._append_jsonl(path, {"event": "promoting", "n": 1})
+    assert seen
+    assert json.loads(path.read_text(encoding="utf-8")) == {"event": "promoting", "n": 1}
+
+
+def test_promote_refuses_duplicate_confirm(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    duplicated = ("2026-08-18=90", "2026-08-18=90", "2026-08-19=90", "2026-08-20=90")
+    _assert_refused(fetch, tmp_path, newest.name, duplicated, capsys, "duplicate confirm")
+
+
+def test_promote_refuses_malformed_confirm(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    _assert_refused(fetch, tmp_path, newest.name, ("not-a-day=90",), capsys, "DAY=VALUE")
+    _assert_refused(fetch, tmp_path, newest.name, ("2026-13-40=90",), capsys, "DAY=VALUE")
+
+
+def test_promote_refuses_ambiguous_sha_prefix(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    directory = tmp_path / "afos-cli" / "NYC"
+    digest = "ab" * 32
+    for marker in directory.glob("*.json"):
+        meta = json.loads(marker.read_text(encoding="utf-8"))
+        meta["body_sha256"] = digest
+        marker.write_text(json.dumps(meta), encoding="utf-8")
+    _assert_refused(fetch, tmp_path, digest[:8], EXACT_CONFIRMS, capsys, "matched 2")
+
+
+def test_promote_refuses_path_traversal_revision(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    _assert_refused(
+        fetch,
+        tmp_path,
+        "../2026-08-23.001.json",
+        EXACT_CONFIRMS,
+        capsys,
+        "revision id must be a marker name or sha256 prefix",
+    )
+
+
+def test_promote_lock_contention_exits_3(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    before = tree_digest(tmp_path)
+    with (tmp_path / "afos-cli" / ".lock").open("a") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code = _promote(fetch, tmp_path, newest.name, EXACT_CONFIRMS)
+    assert code == fetch.EXIT_ABORTED == 3
+    assert "aborted" in capsys.readouterr().err
+    assert tree_digest(tmp_path) == before
+
+
+def test_promote_allow_no_catalog_succeeds(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, {})
+    newest, meta = _newest_marker(tmp_path)
+    assert meta["catalog_check"]["status"] == "unavailable"
+    code = _promote(fetch, tmp_path, newest.name, EXACT_CONFIRMS, allow_no_catalog=True)
+    captured = capsys.readouterr()
+    assert code == fetch.EXIT_OK
+    assert f"promoted NYC {newest.name}" in captured.out
+    latest = fetch.RevisionStore(tmp_path).latest_valid("NYC")
+    assert latest is not None and latest.promoted is True
     assert latest.body_sha256 == meta["body_sha256"]
 
 

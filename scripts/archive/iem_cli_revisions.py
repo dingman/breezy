@@ -18,10 +18,11 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import parse_qsl, urlsplit
 
 __all__ = [
     "AFOS_CACHE_SUBDIR",
@@ -45,6 +46,9 @@ _PROMOTE_EXIT_ABORTED: Final[int] = 3
 _MARKER_ID_RE: Final[re.Pattern[str]] = re.compile(r"\d{4}-\d{2}-\d{2}\.\d{3,}")
 _SHA_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{8,64}")
 _CONFIRM_RE: Final[re.Pattern[str]] = re.compile(r"(\d{4}-\d{2}-\d{2})=(-?\d+)\Z")
+_BODY_NAME_RE: Final[re.Pattern[str]] = re.compile(
+    r"(\d{4}-\d{2}-\d{2}\.\d{3,})\.[0-9a-f]{12}\.txt\Z"
+)
 
 AFOS_CACHE_SUBDIR: Final[str] = "afos-cli"
 LOCK_NAME: Final[str] = ".lock"
@@ -123,6 +127,8 @@ def sha256_hex(data: bytes) -> str:
 def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _parse_confirms(pairs: Sequence[str]) -> dict[str, int]:
@@ -354,7 +360,7 @@ def _promotion_log(
     reviewer_note: str,
 ) -> dict[str, Any]:
     return {
-        "event": "promoted",
+        "event": "promoting",
         "marker": marker_name,
         "fetch_date": meta["fetch_date"],
         "body_sha256": meta["body_sha256"],
@@ -362,6 +368,177 @@ def _promotion_log(
         "confirmed": _confirmed_pairs(confirmed),
         "reviewer_note": reviewer_note,
     }
+
+
+def _require_value_not_flag_only(meta: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Refuse a same-tmax change. Promote confirms values, not correction flags."""
+    raw = meta.get("value_change_unconfirmed")
+    if not isinstance(raw, list):
+        raise PromoteRefused("no unconfirmed value changes recorded")
+    rows: list[dict[str, Any]] = []
+    flag_only: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise PromoteRefused("value_change_unconfirmed entry is not an object")
+        day = item.get("climate_day")
+        old, new = item.get("old_tmax_f"), item.get("new_tmax_f")
+        old_flag = item.get("old_correction_flag")
+        new_flag = item.get("new_correction_flag")
+        if (
+            not isinstance(day, str)
+            or isinstance(old, bool)
+            or not isinstance(old, int)
+            or isinstance(new, bool)
+            or not isinstance(new, int)
+            or not isinstance(old_flag, bool)
+            or not isinstance(new_flag, bool)
+        ):
+            raise PromoteRefused("value_change_unconfirmed entry is malformed")
+        if old == new:
+            flag_only.append(day)
+        rows.append(
+            {
+                "climate_day": day,
+                "old_tmax_f": old,
+                "new_tmax_f": new,
+                "old_correction_flag": old_flag,
+                "new_correction_flag": new_flag,
+            }
+        )
+    if flag_only:
+        raise PromoteRefused(
+            "correction-flag-only change; promote confirms values only: " + ", ".join(flag_only)
+        )
+    return rows
+
+
+def _served_marker_name(revision: Revision) -> str:
+    match = _BODY_NAME_RE.fullmatch(revision.body_path.name)
+    if match is None:
+        raise PromoteRefused("baseline body name is not a revision body")
+    return f"{match.group(1)}.json"
+
+
+def _require_newer(marker: Path, current: Revision | None) -> Revision:
+    if current is None:
+        raise PromoteRefused("no promoted baseline")
+    current_name = _served_marker_name(current)
+    if marker.name <= current_name:
+        raise PromoteRefused(f"revision {marker.name} is not newer than promoted {current_name}")
+    return current
+
+
+def _stored_window(url: str) -> tuple[dt.date, dt.date]:
+    query = dict(parse_qsl(urlsplit(url).query))
+    try:
+        start = dt.date.fromisoformat(query["sdate"][:10])
+        end = dt.date.fromisoformat(query["edate"][:10]) - dt.timedelta(days=2)
+    except (KeyError, ValueError) as exc:
+        raise PromoteRefused(f"stored url has no parse window: {exc}") from exc
+    if end < start:
+        raise PromoteRefused("stored url window is inverted")
+    return start, end
+
+
+def _site_for(station: str, sites: Sequence[Any]) -> Any:
+    try:
+        found = [site for site in sites if site.site.cli_location == station]
+    except AttributeError as exc:
+        raise PromoteRefused(f"no site spec for {station}") from exc
+    if len(found) != 1:
+        raise PromoteRefused(f"no site spec for {station}")
+    return found[0]
+
+
+def _served_days(
+    *,
+    station: str,
+    text: str,
+    url: str,
+    parse_labels: Callable[..., Any],
+    sites: Sequence[Any],
+) -> dict[str, tuple[int, bool]]:
+    """tmax_f and correction_flag per day, via the fetch ``_parse_labels`` path."""
+    if not url:
+        raise PromoteRefused("stored url missing")
+    start, end = _stored_window(url)
+    parsed = parse_labels(_site_for(station, sites), text, url, start, end)
+    if not isinstance(parsed, tuple) or len(parsed) != 2 or not isinstance(parsed[0], Mapping):
+        raise PromoteRefused("label parser did not return labels")
+    served: dict[str, tuple[int, bool]] = {}
+    for day, label in parsed[0].items():
+        if not isinstance(day, dt.date):
+            raise PromoteRefused("label parser returned a non-date key")
+        tmax, flag = getattr(label, "tmax_f", None), getattr(label, "correction_flag", None)
+        if isinstance(tmax, bool) or not isinstance(tmax, int) or not isinstance(flag, bool):
+            continue
+        served[day.isoformat()] = (tmax, flag)
+    return served
+
+
+def _read_stored_body(directory: Path, meta: Mapping[str, Any]) -> tuple[str, str]:
+    name, url = meta.get("body_file"), meta.get("url")
+    if not isinstance(name, str) or not name or not isinstance(url, str) or not url:
+        raise PromoteRefused("stored body unreadable")
+    try:
+        return (directory / name).read_text(encoding="utf-8"), url
+    except (OSError, UnicodeError) as exc:
+        raise PromoteRefused(f"stored body unreadable: {exc}") from exc
+
+
+def _require_body_agreement(
+    served: Mapping[str, tuple[int, bool]],
+    confirmed: Mapping[str, int],
+    recorded: Mapping[str, int],
+) -> None:
+    for day, value in sorted(confirmed.items()):
+        got = served.get(day)
+        if got is None or got[0] != value:
+            raise PromoteRefused(f"confirm {day}={value} does not match the stored body")
+    for day, value in sorted(recorded.items()):
+        got = served.get(day)
+        if got is None or got[0] != value:
+            raise PromoteRefused(f"marker new_tmax_f for {day} does not match the stored body")
+
+
+def _require_baseline(
+    rows: Sequence[Mapping[str, Any]], served: Mapping[str, tuple[int, bool]]
+) -> None:
+    for row in rows:
+        day = str(row["climate_day"])
+        if served.get(day) != (row["old_tmax_f"], row["old_correction_flag"]):
+            raise PromoteRefused(f"stale baseline for {day}")
+
+
+def _check_against_bodies(
+    *,
+    station: str,
+    directory: Path,
+    meta: Mapping[str, Any],
+    confirmed: Mapping[str, int],
+    recorded: Mapping[str, int],
+    rows: Sequence[Mapping[str, Any]],
+    baseline: Revision,
+    parse_labels: Callable[..., Any],
+    sites: Sequence[Any],
+) -> None:
+    text, url = _read_stored_body(directory, meta)
+    target = _served_days(
+        station=station, text=text, url=url, parse_labels=parse_labels, sites=sites
+    )
+    _require_body_agreement(target, confirmed, recorded)
+    try:
+        baseline_text = baseline.body_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise PromoteRefused(f"baseline body unreadable: {exc}") from exc
+    served = _served_days(
+        station=station,
+        text=baseline_text,
+        url=baseline.url,
+        parse_labels=parse_labels,
+        sites=sites,
+    )
+    _require_baseline(rows, served)
 
 
 class RevisionStore:
@@ -500,8 +677,14 @@ class RevisionStore:
         reviewer_note: str,
         allow_no_catalog: bool,
         promoted_at: dt.datetime,
+        parse_labels: Callable[..., Any],
+        sites: Sequence[Any],
     ) -> Promotion:
-        """Rewrite one unpromoted marker in place. Holds the cache lock; never touches a body."""
+        """Rewrite one unpromoted marker in place. Holds the cache lock; never touches a body.
+
+        The marker ``promotion`` block is authoritative. The ``changes.jsonl`` line
+        is an audit trail (event ``promoting``), flushed and fsynced before that rewrite.
+        """
         if not isinstance(reviewer_note, str) or not reviewer_note.strip():
             raise PromoteRefused("reviewer note is required")
         confirmed = _parse_confirms(confirms)
@@ -514,6 +697,8 @@ class RevisionStore:
                 reviewer_note=reviewer_note,
                 allow_no_catalog=allow_no_catalog,
                 stamp=stamp,
+                parse_labels=parse_labels,
+                sites=sites,
             )
 
     def _promote_locked(
@@ -525,6 +710,8 @@ class RevisionStore:
         reviewer_note: str,
         allow_no_catalog: bool,
         stamp: str,
+        parse_labels: Callable[..., Any],
+        sites: Sequence[Any],
     ) -> Promotion:
         directory = self.station_dir(station)
         marker = _resolve_marker(directory, revision_id)
@@ -532,7 +719,21 @@ class RevisionStore:
         _require_promotable(meta, station)
         _require_body_sha(directory, meta)
         _require_catalog(meta.get("catalog_check"), allow_no_catalog)
-        _require_exact_confirms(_recorded_new_values(meta), confirmed)
+        recorded = _recorded_new_values(meta)
+        _require_exact_confirms(recorded, confirmed)
+        rows = _require_value_not_flag_only(meta)
+        baseline = _require_newer(marker, self.latest_valid(station))
+        _check_against_bodies(
+            station=station,
+            directory=directory,
+            meta=meta,
+            confirmed=confirmed,
+            recorded=recorded,
+            rows=rows,
+            baseline=baseline,
+            parse_labels=parse_labels,
+            sites=sites,
+        )
         try:
             updated = _promoted_marker(
                 meta, stamp=stamp, confirmed=confirmed, reviewer_note=reviewer_note
@@ -540,8 +741,9 @@ class RevisionStore:
             log_line = _promotion_log(meta, marker.name, stamp, confirmed, reviewer_note)
         except KeyError as exc:
             raise PromoteRefused(f"marker missing {exc}") from exc
-        atomic_write(marker, (json.dumps(updated, sort_keys=True) + "\n").encode())
+        # Intent first. The marker promotion block, not this line, is authoritative.
         _append_jsonl(directory / CHANGES_LOG_NAME, log_line)
+        atomic_write(marker, (json.dumps(updated, sort_keys=True) + "\n").encode())
         return Promotion(
             station=station,
             marker=marker.name,
@@ -550,7 +752,13 @@ class RevisionStore:
         )
 
 
-def run_promote_command(args: argparse.Namespace, *, now: dt.datetime) -> int:
+def run_promote_command(
+    args: argparse.Namespace,
+    *,
+    now: dt.datetime,
+    parse_labels: Callable[..., Any],
+    sites: Sequence[Any],
+) -> int:
     """Promote one revision. Exit codes match ``iem_cli_fetch`` (0 ok, 2 refused, 3 lock)."""
     from settlement_alignment_cache import (  # type: ignore[import-not-found]
         SettlementAlignmentCacheError,
@@ -565,6 +773,8 @@ def run_promote_command(args: argparse.Namespace, *, now: dt.datetime) -> int:
             reviewer_note=str(args.reviewer_note),
             allow_no_catalog=bool(args.allow_no_catalog),
             promoted_at=now,
+            parse_labels=parse_labels,
+            sites=sites,
         )
     except CacheLockedError as exc:
         print(f"aborted: {exc}", file=sys.stderr)

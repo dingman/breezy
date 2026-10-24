@@ -34,24 +34,18 @@ logged with its reason and returned by ``latest_valid_report``.
 
 VALUE CHANGES ARE NOT PROMOTED
 ------------------------------
-If a new body changes ``tmax_f`` or the correction flag on a day the previous
-promoted revision already covers, it is committed (evidence) but marked
-``promoted=false`` with ``value_change_unconfirmed`` (day, old, new) in its marker
-and in ``changes.jsonl``; ``latest_valid`` keeps serving the previous value and the
-fetch exits 4 so ``OnFailure`` alerts. ``promote STATION REVISION`` is the reviewed
-path (``--confirm DAY=VALUE`` for every new value, ``--reviewer-note``). It rewrites
-that marker ``promoted=true`` (body and other markers untouched) only when confirms,
-the body sha, and the catalog agree; otherwise exit 2. Unavailable needs ``--allow-no-catalog``.
+A covered-day ``tmax_f`` or correction-flag change is committed ``promoted=false``;
+``latest_valid`` keeps the previous value and fetch exits 4. ``promote`` rewrites
+that marker (body untouched) only when it is newer than ``latest_valid``, confirms
+and recorded ``new_tmax_f`` equal the body re-parsed by ``_parse_labels``, the
+recorded baseline still matches what ``latest_valid`` serves, and the catalog agrees.
+The marker ``promotion`` block is authoritative; the ``changes.jsonl`` line is an
+audit trail. Flag-only changes are refused (exit 2); ``--allow-no-catalog`` if unavailable.
 
-SINGLE WRITER
--------------
-``settlement_alignment_study.fetch_text_cached``/``fetch_bytes_cached`` are
-cache-read-only for AFOS CLI URLs (a miss raises ``AfosCliCacheMissError``).
-
-LAUNCH WINDOW
--------------
-Every subcommand refuses (exit 6) if started 16:30 <= UTC < 17:10; the timers carry
-no ``Persistent=true`` so a missed run is never replayed into that window.
+SINGLE WRITER / LAUNCH WINDOW
+-----------------------------
+``fetch_text_cached`` / ``fetch_bytes_cached`` are read-only for AFOS CLI URLs.
+Every subcommand refuses (exit 6) at 16:30 <= UTC < 17:10; no ``Persistent=true``.
 
 EXIT CODES
 ----------
@@ -785,7 +779,14 @@ def main(
         print("refused: inside the 16:30-17:10 UTC launch window", file=sys.stderr)
         return EXIT_LAUNCH_WINDOW
     if args.command == "promote":
-        return int(run_promote_command(args, now=_now(resolved_clock)))
+        return int(
+            run_promote_command(
+                args,
+                now=_now(resolved_clock),
+                parse_labels=_parse_labels,
+                sites=load_sites(),
+            )
+        )
     if args.command == "fetch":
         return _run_fetch(args, clock=resolved_clock, fetcher=fetcher)
     if args.command == "window-text":
