@@ -786,6 +786,247 @@ def test_dataset_oserror_exits_2_and_no_production_assert(
         assert not [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Assert)]
 
 
+# ---------------------------------------------------------------------------
+# Human-reviewed promotion of one unconfirmed revision
+# ---------------------------------------------------------------------------
+
+EXACT_CONFIRMS: Final[tuple[str, ...]] = (
+    "2026-08-18=90",
+    "2026-08-19=90",
+    "2026-08-20=90",
+)
+REVIEW_NOTE: Final[str] = "reviewed covered-day tmax change"
+
+
+def _agreeing_catalog() -> dict[tuple[str, dt.date], Any]:
+    return {("NYC", day): SimpleNamespace(tmax_f=90) for day in days(18, 21)}
+
+
+def _stage_unpromoted(
+    fetch: ModuleType,
+    cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: Any,
+) -> str:
+    """Commit a promoted baseline, then an unpromoted value-change revision."""
+    _nyc_only(fetch, monkeypatch, catalog)
+    changed = cli_body(days(18, 21), tmax=90)
+    _main_fetch(fetch, cache, cli_body(days(18, 20)))
+    assert _main_fetch(fetch, cache, changed) == fetch.EXIT_VALUE_CHANGE
+    return changed
+
+
+def _newest_marker(cache: Path) -> tuple[Path, dict[str, Any]]:
+    marker = max((cache / "afos-cli" / "NYC").glob("*.json"))
+    meta = json.loads(marker.read_text(encoding="utf-8"))
+    assert isinstance(meta, dict)
+    return marker, meta
+
+
+def _promote(
+    fetch: ModuleType,
+    cache: Path,
+    revision: str,
+    pairs: tuple[str, ...] | list[str],
+    *,
+    allow_no_catalog: bool = False,
+    note: str = REVIEW_NOTE,
+) -> int:
+    argv = [
+        "promote",
+        "--cache-dir",
+        str(cache),
+        "NYC",
+        revision,
+        "--reviewer-note",
+        note,
+    ]
+    for pair in pairs:
+        argv.extend(["--confirm", pair])
+    if allow_no_catalog:
+        argv.append("--allow-no-catalog")
+    return int(fetch.main(argv, clock=_clock_at(12, 0)))
+
+
+def _assert_refused(
+    fetch: ModuleType,
+    cache: Path,
+    revision: str,
+    pairs: tuple[str, ...] | list[str],
+    capsys: pytest.CaptureFixture[str],
+    needle: str,
+    *,
+    allow_no_catalog: bool = False,
+) -> None:
+    before = tree_digest(cache)
+    code = _promote(
+        fetch, cache, revision, pairs, allow_no_catalog=allow_no_catalog
+    )
+    assert code == fetch.EXIT_REFUSED
+    assert needle in capsys.readouterr().err
+    assert tree_digest(cache) == before
+
+
+def test_promote_reviewed_revision_then_refetch_is_clean(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    changed = _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    directory = tmp_path / "afos-cli" / "NYC"
+    markers = sorted(directory.glob("*.json"))
+    original_marker = markers[0].read_bytes()
+    newest, meta = _newest_marker(tmp_path)
+    body_path = directory / str(meta["body_file"])
+    body_bytes = body_path.read_bytes()
+    prior_log = (directory / "changes.jsonl").read_text(encoding="utf-8").splitlines()
+
+    code = _promote(fetch, tmp_path, newest.name, EXACT_CONFIRMS)
+    captured = capsys.readouterr()
+
+    assert code == fetch.EXIT_OK
+    assert f"promoted NYC {newest.name}" in captured.out
+    assert body_path.read_bytes() == body_bytes
+    assert markers[0].read_bytes() == original_marker
+    promoted = json.loads(newest.read_text(encoding="utf-8"))
+    assert promoted["promoted"] is True
+    assert promoted["value_change_unconfirmed"] == meta["value_change_unconfirmed"]
+    assert promoted["promotion"] == {
+        "promoted_at": "2026-08-23T12:00:00Z",
+        "confirmed": [
+            {"climate_day": "2026-08-18", "new_tmax_f": 90},
+            {"climate_day": "2026-08-19", "new_tmax_f": 90},
+            {"climate_day": "2026-08-20", "new_tmax_f": 90},
+        ],
+        "reviewer_note": REVIEW_NOTE,
+    }
+    log = [json.loads(line) for line in (directory / "changes.jsonl").read_text().splitlines()]
+    assert [json.dumps(json.loads(line), sort_keys=True) for line in prior_log] == [
+        json.dumps(row, sort_keys=True) for row in log[:-1]
+    ]
+    assert log[-1] == {
+        "body_sha256": meta["body_sha256"],
+        "confirmed": promoted["promotion"]["confirmed"],
+        "event": "promoted",
+        "fetch_date": meta["fetch_date"],
+        "marker": newest.name,
+        "promoted_at": "2026-08-23T12:00:00Z",
+        "reviewer_note": REVIEW_NOTE,
+    }
+    latest = fetch.RevisionStore(tmp_path).latest_valid("NYC")
+    assert latest is not None
+    assert latest.promoted is True
+    assert latest.body_sha256 == meta["body_sha256"]
+    assert latest.fetch_date == dt.date(2026, 8, 23)
+    assert body_path.read_bytes() == body_bytes
+    assert _main_fetch(fetch, tmp_path, changed) == fetch.EXIT_OK
+    assert body_path.read_bytes() == body_bytes
+    assert markers[0].read_bytes() == original_marker
+
+
+def test_promote_refuses_already_promoted(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    oldest = min((tmp_path / "afos-cli" / "NYC").glob("*.json"))
+    _assert_refused(fetch, tmp_path, oldest.name, EXACT_CONFIRMS, capsys, "already promoted")
+
+
+def test_promote_refuses_missing_day(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    _assert_refused(fetch, tmp_path, newest.stem, EXACT_CONFIRMS[:2], capsys, "missing=")
+
+
+def test_promote_refuses_wrong_value(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    wrong = ("2026-08-18=90", "2026-08-19=90", "2026-08-20=91")
+    _assert_refused(fetch, tmp_path, newest.stem, wrong, capsys, "wrong=")
+
+
+def test_promote_refuses_extra_day(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, _meta = _newest_marker(tmp_path)
+    _assert_refused(
+        fetch, tmp_path, newest.stem, (*EXACT_CONFIRMS, "2026-08-21=90"), capsys, "extra="
+    )
+
+
+def test_promote_refuses_body_sha_mismatch(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    newest, meta = _newest_marker(tmp_path)
+    body = tmp_path / "afos-cli" / "NYC" / str(meta["body_file"])
+    body.write_bytes(body.read_bytes() + b"\n")
+    _assert_refused(fetch, tmp_path, newest.stem, EXACT_CONFIRMS, capsys, "body sha256 mismatch")
+
+
+def test_promote_refuses_catalog_disagreement(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = {("NYC", day): SimpleNamespace(tmax_f=80) for day in days(18, 21)}
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, catalog)
+    newest, _meta = _newest_marker(tmp_path)
+    _assert_refused(fetch, tmp_path, newest.stem, EXACT_CONFIRMS, capsys, "catalog disagreement")
+
+
+def test_promote_refuses_unavailable_catalog_without_flag(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, {})
+    newest, meta = _newest_marker(tmp_path)
+    _assert_refused(fetch, tmp_path, newest.stem, EXACT_CONFIRMS, capsys, "catalog unavailable")
+
+    code = _promote(
+        fetch, tmp_path, str(meta["body_sha256"])[:12], EXACT_CONFIRMS, allow_no_catalog=True
+    )
+    assert code == fetch.EXIT_OK
+    latest = fetch.RevisionStore(tmp_path).latest_valid("NYC")
+    assert latest is not None
+    assert latest.promoted is True
+    assert latest.body_sha256 == meta["body_sha256"]
+
+
+def test_promote_refuses_missing_marker(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stage_unpromoted(fetch, tmp_path, monkeypatch, _agreeing_catalog())
+    _assert_refused(fetch, tmp_path, "2026-08-23.009", EXACT_CONFIRMS, capsys, "marker not found")
+
+
 def test_public_surface_and_size(fetch: ModuleType) -> None:
     assert {"Revision", "catalog_cross_check"} <= set(fetch.__all__)
     assert all(hasattr(fetch, name) for name in fetch.__all__)

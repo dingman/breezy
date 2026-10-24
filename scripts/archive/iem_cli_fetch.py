@@ -38,8 +38,10 @@ If a new body changes ``tmax_f`` or the correction flag on a day the previous
 promoted revision already covers, it is committed (evidence) but marked
 ``promoted=false`` with ``value_change_unconfirmed`` (day, old, new) in its marker
 and in ``changes.jsonl``; ``latest_valid`` keeps serving the previous value and the
-fetch exits 4 so ``OnFailure`` alerts. TODO(F2-follow-up, deliberately NOT built):
-promotion of an unconfirmed revision is a later explicit, human-reviewed path only.
+fetch exits 4 so ``OnFailure`` alerts. ``promote STATION REVISION`` is the reviewed
+path (``--confirm DAY=VALUE`` for every new value, ``--reviewer-note``). It rewrites
+that marker ``promoted=true`` (body and other markers untouched) only when confirms,
+the body sha, and the catalog agree; otherwise exit 2. Unavailable needs ``--allow-no-catalog``.
 
 SINGLE WRITER
 -------------
@@ -48,14 +50,14 @@ cache-read-only for AFOS CLI URLs (a miss raises ``AfosCliCacheMissError``).
 
 LAUNCH WINDOW
 -------------
-Both subcommands refuse (exit 6) if started 16:30 <= UTC < 17:10; the timers carry
+Every subcommand refuses (exit 6) if started 16:30 <= UTC < 17:10; the timers carry
 no ``Persistent=true`` so a missed run is never replayed into that window.
 
 EXIT CODES
 ----------
 0 complete
 1 one or more stations failed (HTTP/transport error, bad body, coverage reduced)
-2 refusal (``dataset`` cache miss, bad cache dir, or cache/output OSError)
+2 refusal (``dataset`` cache miss, bad cache dir, cache/output OSError, or a promote guard)
 3 aborted (request budget exhausted, or another writer holds the lock)
 4 value change on a covered day committed but NOT promoted (takes priority over 1)
 5 catalog disagreement on a committed station (all else complete)
@@ -92,6 +94,7 @@ from iem_cli_revisions import (  # type: ignore[import-not-found]
     RevisionStore,
     SkippedRevision,
     atomic_write,
+    run_promote_command,
     sha256_hex,
 )
 from iem_cli_window_text import (  # type: ignore[import-not-found]
@@ -176,7 +179,7 @@ EXIT_VALUE_CHANGE: Final[int] = 4
 EXIT_DISAGREEMENT: Final[int] = 5
 EXIT_LAUNCH_WINDOW: Final[int] = 6
 
-#: Both subcommands refuse inside [16:30, 17:10) UTC (the launch window).
+#: Every subcommand refuses inside [16:30, 17:10) UTC (the launch window).
 LAUNCH_WINDOW_START: Final[dt.time] = dt.time(16, 30)
 LAUNCH_WINDOW_END: Final[dt.time] = dt.time(17, 10)
 
@@ -651,6 +654,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             command.add_argument("--catalog-base", default=str(DEFAULT_CATALOG_DIR))
         else:
             command.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    promote = sub.add_parser("promote", help="promote one human-reviewed unconfirmed revision")
+    promote.add_argument("--cache-dir", default=str(DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR))
+    promote.add_argument("station", help="venue CLI station, [A-Z]{3}")
+    promote.add_argument("revision", help="marker id or body sha256 prefix")
+    promote.add_argument("--confirm", action="append", required=True, metavar="DAY=VALUE")
+    promote.add_argument("--reviewer-note", required=True)
+    promote.add_argument("--allow-no-catalog", action="store_true")
     add_window_text_arguments(
         sub.add_parser("window-text", help="cache one validated fmt=text window per maker station")
     )
@@ -774,6 +784,8 @@ def main(
     if _in_launch_window(resolved_clock):
         print("refused: inside the 16:30-17:10 UTC launch window", file=sys.stderr)
         return EXIT_LAUNCH_WINDOW
+    if args.command == "promote":
+        return int(run_promote_command(args, now=_now(resolved_clock)))
     if args.command == "fetch":
         return _run_fetch(args, clock=resolved_clock, fetcher=fetcher)
     if args.command == "window-text":
