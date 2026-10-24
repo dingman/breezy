@@ -9,7 +9,8 @@
 # K + T = 4 + 46 = 50 s; TimeoutStopSec=5. With the timer's AccuracySec=1s the worst end is
 # slot + 1 + 5 + 50 + 5 = slot + 61 s, so the 16:30Z and 16:45Z firings end by 16:31:01Z and
 # 16:46:01Z and the 17:10Z firing by 17:11:01Z.
-# OnFailure target: X-3 ships the line before the notifier unit exists (WP4/WP7).
+# OnFailure target: breezy-autonomy-failed@.service (runs breezy-study-failed unwrapped;
+# E-7a rule 5). The wrapped notifier row is still WP4/WP7, so the unit lint keeps onfailure_scope.
 [Unit]
 Description=Breezy AUT-6 alert canary (hourly :45, 16:30Z and 17:10Z, sandboxed)
 OnFailure=breezy-autonomy-failed@%n.service

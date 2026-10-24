@@ -38,8 +38,17 @@ DEFAULT_TMPFS_SIZE_BYTES: Final = 256 * 1024**2
 MAX_TMPFS_SIZE_BYTES: Final = 16 * 1024**3
 NOTIFIER_FALLBACK_ROWS: Final[frozenset[str]] = frozenset()
 AUTONOMY_OWNED_UNITS: Final[frozenset[str]] = frozenset()
-#: unit -> its E-7a rule-5 citation. Empty in seam B; filled by AUT-1.
-UNWRAPPED_RESIDUAL_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
+#: unit -> its E-7a rule-5 citation. The X-3 autonomy failure template is the one
+#: residual: ``breezy-autonomy-failed@.service`` runs ``breezy-study-failed`` unwrapped.
+#: The wrapped notifier row is still WP4/WP7, so callers stay ``onfailure_scope``.
+UNWRAPPED_RESIDUAL_UNITS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "breezy-autonomy-failed@": (
+            "E-7a rule 5: X-3 template runs breezy-study-failed unwrapped; "
+            "the wrapped notifier row is still WP4/WP7"
+        ),
+    }
+)
 #: unit -> owning-plan citation. Row units that are NOT autonomy-owned and only have their
 #: wrapper lines linted (B6-R4). Empty in seam B; AUT-1 adds the recorder (its stop hook only:
 #: the recorder's own ``ExecStart`` stays unwrapped, the E-7a rule-5 residual).
@@ -334,8 +343,9 @@ _LABEL_OUTCOMES_ROW: Final = BwrapRow(
 #: (``BREEZY_ALERT_WEBHOOK_URL``), no module in the closure imports a venue adapter, and the C2
 #: egress pin (``test_alert_egress_import_pin``) fixes which modules may import a network client.
 #:
-#: X-3: the unit ships ``OnFailure=breezy-autonomy-failed@%n.service`` before that notifier exists
-#: (WP4/WP7), so the unit lint reports one ``onfailure_scope`` error for it. That error is the
+#: X-3: callers name ``OnFailure=breezy-autonomy-failed@%n.service``. The template unit exists
+#: and runs ``breezy-study-failed`` unwrapped (``UNWRAPPED_RESIDUAL_UNITS``). The wrapped notifier
+#: row is still WP4/WP7, so the unit lint reports one ``onfailure_scope`` error. That error is the
 #: recorded gap and is pinned by ``test_deploy_units_config_lint_reports_only_the_x3_gap``.
 _ALERT_REDELIVER_ROW: Final = BwrapRow(
     name="breezy-autonomy-alert-redeliver",
@@ -781,11 +791,28 @@ def effective_line_only_units(
     )
 
 
+def effective_residual_units(
+    table: Mapping[str, BwrapRow], residual_units: Mapping[str, str] | None
+) -> Mapping[str, str]:
+    """The residual map to apply. An explicit map is used as given (and strictly validated).
+
+    ``None`` means the shipped map with units this table already lists removed. A fixture that
+    promotes ``breezy-autonomy-failed@`` into a wrapped row is that row, not the shipped
+    unwrapped residual. The shipped table does not list the unit, so the residual still applies.
+    """
+    if residual_units is not None:
+        return residual_units
+    row_units = frozenset(unit for row in table.values() for unit in row.units)
+    return MappingProxyType(
+        {unit: cite for unit, cite in UNWRAPPED_RESIDUAL_UNITS.items() if unit not in row_units}
+    )
+
+
 def validate_table(
     table: Mapping[str, BwrapRow] = AUTONOMY_BWRAP_TABLE,
     *,
     owned_units: frozenset[str] = AUTONOMY_OWNED_UNITS,
-    residual_units: Mapping[str, str] = UNWRAPPED_RESIDUAL_UNITS,
+    residual_units: Mapping[str, str] | None = None,
     wrapper_line_only_units: Mapping[str, str] | None = None,
     fallback_rows: Collection[str] = NOTIFIER_FALLBACK_ROWS,
 ) -> None:
@@ -793,6 +820,7 @@ def validate_table(
     if not table:
         raise TableError("the table has no rows")
     wrapper_line_only_units = effective_line_only_units(table, wrapper_line_only_units)
+    residual_units = effective_residual_units(table, residual_units)
     for key, row in table.items():
         _check_identity(key, row)
         _check_network(row, fallback_rows)

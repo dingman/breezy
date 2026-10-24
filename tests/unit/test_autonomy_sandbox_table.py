@@ -158,7 +158,14 @@ def test_constants_have_the_seam_b_values() -> None:
     assert dict(ALTERNATE_BIND_BASES) == {"aut4_fixture": ".local/share/breezy-autonomy-fixture"}
     assert NOTIFIER_FALLBACK_ROWS == frozenset()
     assert AUTONOMY_OWNED_UNITS == frozenset()
-    assert dict(UNWRAPPED_RESIDUAL_UNITS) == {}
+    # X-3: the template exists and is the one unwrapped residual. Exact map, not a subset:
+    # a second residual still fails this pin. The wrapped row is still absent (WP4/WP7).
+    assert dict(UNWRAPPED_RESIDUAL_UNITS) == {
+        "breezy-autonomy-failed@": (
+            "E-7a rule 5: X-3 template runs breezy-study-failed unwrapped; "
+            "the wrapped notifier row is still WP4/WP7"
+        ),
+    }
     assert CREDENTIAL_ENV_DENIED_EXACT == frozenset(
         {
             "PATH",
@@ -667,6 +674,20 @@ def test_unwrapped_residual_units_disjoint_and_cited() -> None:
     for bad in ("", "no citation here", "  "):
         with pytest.raises(TableError, match="cit"):
             validate_table(table, residual_units=MappingProxyType({"breezy-drill.service": bad}))
+
+
+def test_default_residual_yields_when_a_fixture_row_lists_the_unit() -> None:
+    """The shipped X-3 residual applies only while the table does not list that unit.
+
+    Fixture tables file ``breezy-autonomy-failed@`` as a wrapped row (the WP4 shape). The
+    default residual must yield so those fixtures stay valid. Passing the shipped map
+    explicitly still refuses the overlap.
+    """
+    base = _plain()
+    promoted = dataclasses.replace(base, units=base.units | frozenset({"breezy-autonomy-failed@"}))
+    validate_table(_table(promoted))
+    with pytest.raises(TableError, match="disjoint"):
+        validate_table(_table(promoted), residual_units=UNWRAPPED_RESIDUAL_UNITS)
 
 
 def test_module_exposes_no_state_changing_bus_verbs() -> None:

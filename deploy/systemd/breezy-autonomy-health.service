@@ -15,7 +15,8 @@
 # budget B = 15, timeout B + 3), ExecStart K + T = 115, TimeoutStopSec=5; with AccuracySec=1s the
 # worst end is slot + 1 + 5 + 20 + 115 + 5 = slot + 146 s, so the 16:41Z pass ends by 16:43:26Z, before
 # the 16:45Z fixed point. HEALTH_PASS_BUDGET_S (90 s) is inside the 110 s timeout.
-# OnFailure target: X-3 ships the line before the notifier unit exists (WP4/WP7).
+# OnFailure target: breezy-autonomy-failed@.service (runs breezy-study-failed unwrapped;
+# E-7a rule 5). The wrapped notifier row is still WP4/WP7, so the unit lint keeps onfailure_scope.
 [Unit]
 Description=Breezy AUT-6 unit health pass (every 10 minutes at :01, read-only, sandboxed)
 OnFailure=breezy-autonomy-failed@%n.service

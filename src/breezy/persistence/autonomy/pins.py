@@ -29,14 +29,17 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin at ARM post-B2 (GTD_EXPIRY_VERIFIED / SLUG_SCOPED_CANCEL_ALL_VERIFIED flipped
         # True in exec/submit_chain.py on S-2/S-6 PASS; exec/client.py sweep docstring);
         # was 4f857b29...7052
-        "aut2.label": "63c8031f6237c1a6b94af83f1d8162c164aa6db2e8f425f6e9af9779865c6d73",
+        # re-pin: table residual breezy-autonomy-failed@ plus effective_residual_units
+        # (fixture rows that list it yield); was 63c8031f...6d73
+        "aut2.label": "6ba8a4330117e51604f8080495cb4e747b348799d37d3e4f1850ff5ba69aaa94",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
         # re-pin at ARM post-B2 (same submit_chain.py + client.py change); was 72f6d236...1a17
         # re-pin at p4/arm (health_dropins.DROPIN_ALLOWLIST emptied; orders-off row
         # removed); was caa4d114...c832
-        "aut6.health": "8a4723a004d7833af6c4e02f12fff0fc21e4d83b8caa9ea263495f661a8de5ac",
+        # re-pin: same table.py residual yield (shared with aut2.label); was 8a4723a0...e5ac
+        "aut6.health": "cf686b8b5fb3face48df6edec31f50d07ca70a1a3ab535e325336dbd2e277a8d",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()
