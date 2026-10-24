@@ -29,8 +29,8 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
   falsified live (34 fills / 4 wins / −2.63; Σprice 6.36 expected wins); maker-sharp
   17/17 is an in-sample nomination (LB 0.839 < breakeven 0.865–0.888); PM.us ceiling
   ≈ $10–65/month even with an edge. Primary failure = edge, compounded by process.
-- **NO FAMILY TRADES** until P4 below arms under its own plan. Node runs
-  `pm_us_crh_fq_v1` orders OFF (drop-in `fq-v1-halt-orders-off.conf`).
+- **P4 ARMED 10-24 13:08Z**: `pm_us_no_maker_sharp_v1` is the only sending family from the
+  16:50Z launch; the FQ v1 orders-off drop-in is backed up, not deleted (rollback = restore it).
 - Prior backlog (ARM maker-sharp, MAKER S2–S5, BLOCKERS, calendar reads) is
   ARCHIVED, not scheduled: `docs/core/archive/PROGRESS_2026-10-22_pre-audit.md`.
   `arm/integration` (c614fb0b) is unmerged; P4 decides whether it is reused.
@@ -53,7 +53,7 @@ unless the plan names why.
 | 1 | P1 | Latency pre-flight on the sharp maker replay | — | — | — | **PASS** 10-22 (`docs/evidence/P1_latency_preflight_2026-10-22.md`; G0 exact set 17 / 1.96 at 8de5ebd4 on `design/maker-nobid-2026-10-21`; G1 `sharp_l1` 17 stress fills, 0 losers; L=5 s 16/16) |
 | 2 | P2 | NBP p vs venue ask at the 16:50Z D−1 launch | — | — | — | **FAIL** 10-22 (`docs/evidence/P2_NBP_VS_ASK_MURPHY_2026-10-22.md`; YES P&L −0.053/take, n 150, UB −0.008; D_res −0.023; independent PMR TRUSTWORTHY-WITH-CAVEATS). P2-DEL closed: keep FQ v1 dormant behind the orders-off drop-in, no deletion (`P2DEL_impact_check_r1.md`) |
 | 3 | P3 | Venue probe: ONE qty-1 GTD rest at $0.01 for 4 h | ≤ $0.01 | NEW to G−30 s, EXPIRED at G+60 s, echo ±1 s | CLAMPED / EARLY / LATE → multi-hour resting unsupported | **PASS** 10-23 (`docs/evidence/P3_GTD_PROBE_2026-10-23.md`; order D947ECW011MQ NEW at confirm/mid/G−30, EXPIRED at G+60 s, echo ≤1 s, no fill, account clean; run from 061856dd on `arm/b2-control`). Licenses a 4 h live GTD only |
-| 4 | P4 | Live qty-1 maker bids, sharp as built on `arm/integration`, live GTD capped at 4 h, existing caps (needs P1 + P3 PASS) | ≤ ~$21 lag-bounded | ≤ 1 loss in the first 37 settled station-days (p0 0.8747) AND net > 0 | 2nd loss = FAIL; < 8 station-days by day 21 or day 75 = STOP | IN PROGRESS 10-23 (P1 + P3 PASS) — `P4_plan_r2.md` (+r2.1, items 1–9); arm in a 01:00–16:40Z window after both full gates |
+| 4 | P4 | Live qty-1 maker bids, sharp as built on `arm/integration`, live GTD capped at 4 h, existing caps (needs P1 + P3 PASS) | ≤ ~$21 lag-bounded | ≤ 1 loss in the first 37 settled station-days (p0 0.8747) AND net > 0 | 2nd loss = FAIL; < 8 station-days by day 21 or day 75 = STOP | ARMED 10-24 13:08Z — feat 83b138b6 (full gate EXIT 0, 29138 passed); drop-in moved to `~/.config/systemd/user/dropin-backups/`, supervisor restarted (orders on, sending family sharp); loss-stop PASS 13:09Z; first live node = 16:50Z launch (D0 2026-10-25). Follow-ups: autonomy-health OnFailure unit name ends `.service.service` (alert never enqueues); truth-fetch 10-24 LAX value_change_unconfirmed |
 | 5 | P5 | Scale decision (only if P4 PASS) | operator | projected net clears operator hurdle | PM.us capped at tens of $/month → Kalshi question | READY — `P5_plan_r2.md` (+r2.1); one formula vs the operator hurdle |
 
 ### Calendar obligations
