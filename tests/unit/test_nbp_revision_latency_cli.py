@@ -11,6 +11,7 @@ import ast
 import datetime as dt
 import hashlib
 import math
+import resource
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -518,7 +519,7 @@ def test_the_address_space_cap_is_set_before_any_file_is_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(cli.resource, "setrlimit", lambda *_a: calls.append("cap"))
+    monkeypatch.setattr(resource, "setrlimit", lambda *_a: calls.append("cap"))
     args = _args("tau", "2026-10-13", "2026-10-26", artefact=tmp_path / "absent.json")
     with pytest.raises(FileNotFoundError):
         cli._run(args, None)
