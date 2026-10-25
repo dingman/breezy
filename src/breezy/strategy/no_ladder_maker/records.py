@@ -36,6 +36,10 @@ class DepthFrame:
 class Desired:
     rung_id: str
     bid_cents: int
+    # Evidence for the post log only. Excluded from equality and repr so parity and
+    # existing constructors (rung, cents) stay unchanged.
+    p_no: float | None = field(default=None, compare=False, repr=False)
+    b_max: float | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,8 @@ class Decision:
     drop_reason: str | None = None
     forecast_valid: bool = False
     dropped: Mapping[str, str] = field(default_factory=dict)
+    # Forecast cycle that served this decision (``PNoAtInstant.cycle``). Log-only.
+    cycle_ns: int | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         reasons = [*self.dropped.values(), *([self.drop_reason] if self.drop_reason else [])]
