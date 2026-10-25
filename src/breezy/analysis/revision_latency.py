@@ -609,7 +609,8 @@ class VariantSummary:
     placebo_point: float
     n_placebo: int
     p_value: float
-    leak_ok: bool
+    #: Takes are ordered t_a < t_dec < t_exit. A sanity flag, NOT evidence of absence of leakage.
+    timing_consistent: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,7 +638,7 @@ def qualifies(summary: VariantSummary) -> bool:
         and summary.n >= QUALIFY_MIN_TAKES
         and summary.n_climate >= QUALIFY_MIN_CLUSTERS
         and summary.missing_exit_rate <= QUALIFY_MAX_MISSING_EXIT
-        and summary.leak_ok
+        and summary.timing_consistent
         and summary.n_placebo > 0
         and summary.placebo_point <= QUALIFY_PLACEBO_RATIO * summary.point
     )

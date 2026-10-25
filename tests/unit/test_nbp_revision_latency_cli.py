@@ -464,13 +464,13 @@ def test_preflight_refuses_naive_freeze_missing_artefact_and_tau_below_the_floor
     artefact = tmp_path / "a.json"
     artefact.write_text("{}", encoding="utf-8")
     common = {"artefact": artefact}
-    with pytest.raises(ValueError, match="tz-aware"):
+    with pytest.raises(cli.RefusalError, match="tz-aware"):
         cli.preflight(
             _args("tau", "2026-10-13", "2026-10-26", freeze_utc="2026-10-26T00:00:00", **common)
         )
-    with pytest.raises(ValueError, match="freeze"):
+    with pytest.raises(cli.RefusalError, match="freeze"):
         cli.preflight(_args("tau", "2026-10-13", "2026-10-26", **common))
-    with pytest.raises(ValueError, match="artefact"):
+    with pytest.raises(cli.RefusalError, match="artefact"):
         cli.preflight(
             _args("tau", "2026-10-13", "2026-10-26", freeze_utc="2026-10-26T00:00:00+00:00")
         )
@@ -486,23 +486,65 @@ def test_tau_values_below_the_floors_are_refused_for_stages_0_and_1(
     artefact.write_text("{}", encoding="utf-8")
     base = {"prereg": prereg, "artefact": artefact}
     for primary, alt in ((0.05, 0.18), (0.13, 0.10), (None, 0.18)):
-        with pytest.raises(ValueError, match="tau"):
+        with pytest.raises(cli.RefusalError, match="tau"):
             cli.preflight(
                 _args("1", "2026-10-13", "2026-10-26", tau_primary=primary, tau_alt=alt, **base)
             )
 
 
-def test_main_turns_leak_guard_and_value_errors_into_a_refusal(
+def test_main_returns_2_only_for_policy_refusals_and_lets_bugs_propagate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     argv = ["--stage", "tau", "--start", "2026-10-13", "--end", "2026-10-26"]
-    for raised in (LeakGuardError(5, "x"), ValueError("empty")):
+    for refusal in (LeakGuardError(5, "x"), cli.PinRefused("p"), cli.UsageRefused("u")):
 
-        def _boom(*_a: object, _raised: Exception = raised) -> None:
+        def _refuse(*_a: object, _raised: Exception = refusal) -> None:
             raise _raised
 
-        monkeypatch.setattr(cli, "preflight", _boom)
+        monkeypatch.setattr(cli, "preflight", _refuse)
         assert cli.main(argv) == 2
+    assert issubclass(cli.ConfirmDayRefused, cli.RefusalError)
+    assert issubclass(cli.StageRefused, cli.RefusalError)
+
+    def _bug(*_a: object) -> None:
+        raise ValueError("a real bug with a message")
+
+    monkeypatch.setattr(cli, "preflight", _bug)
+    with pytest.raises(ValueError, match="real bug"):
+        cli.main(argv)
+
+
+def test_the_address_space_cap_is_set_before_any_file_is_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(cli.resource, "setrlimit", lambda *_a: calls.append("cap"))
+    args = _args("tau", "2026-10-13", "2026-10-26", artefact=tmp_path / "absent.json")
+    with pytest.raises(FileNotFoundError):
+        cli._run(args, None)
+    assert calls == ["cap"]
+
+
+def test_stage_0_1_tau_values_must_equal_the_tau_recorded_in_the_prereg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prereg = tmp_path / "prereg.md"
+    prereg.write_text("DEFAULT_SPLITS holdout_start\nTAU_PRIMARY=0.14 TAU_ALT=0.19\n", "utf-8")
+    monkeypatch.setattr(cli, "PREREG_SHA256", hashlib.sha256(prereg.read_bytes()).hexdigest())
+    artefact = tmp_path / "a.json"
+    artefact.write_text("{}", encoding="utf-8")
+    base = {"prereg": prereg, "artefact": artefact}
+    ok = _args("1", "2026-10-13", "2026-10-26", tau_primary=0.14, tau_alt=0.19, **base)
+    assert cli.preflight(ok) is not None
+    assert cli._tau_values(ok, cli.prereg_tau(prereg.read_text("utf-8"))).source == "prereg_text"
+    with pytest.raises(cli.RefusalError, match="prereg"):
+        cli.preflight(
+            _args("0", "2026-10-13", "2026-10-26", tau_primary=0.15, tau_alt=0.19, **base)
+        )
+    prereg.write_text("DEFAULT_SPLITS holdout_start\n", "utf-8")
+    monkeypatch.setattr(cli, "PREREG_SHA256", hashlib.sha256(prereg.read_bytes()).hexdigest())
+    with pytest.raises(cli.RefusalError, match="TAU_PRIMARY"):
+        cli.preflight(ok)
 
 
 def test_a_mismatched_prereg_sha_is_refused_and_a_matching_one_returns_the_text(
@@ -792,15 +834,15 @@ def test_stage_1_reports_the_v0_test_and_holm_over_v1_to_v4(
     assert tests["holm_V1_V4"]["p_values"] == pvals
 
 
-def test_summary_flags_no_placebo_evidence_and_computes_leak_ok_from_the_takes() -> None:
+def test_summary_flags_no_placebo_evidence_and_computes_timing_consistency_from_the_takes() -> None:
     data, cur = _data()
     run = core.VariantRun()
     core.score_station_day(data, [_ctx(cur)], core.VARIANTS[0], 0.13, run, apply_rule_b=False)
     summary = core.summarize(core.VARIANTS[0], run, iterations=10)
     assert summary.n_placebo == 0
-    assert summary.leak_ok is True
+    assert summary.timing_consistent is True
     bad = core.VariantRun(takes=[replace(run.takes[0], t_dec_ns=run.takes[0].available_at_ns)])
-    assert core.summarize(core.VARIANTS[0], bad, iterations=10).leak_ok is False
+    assert core.summarize(core.VARIANTS[0], bad, iterations=10).timing_consistent is False
 
 
 def test_guard_2_is_enforced_on_the_real_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -908,3 +950,103 @@ def test_dropped_events_and_mechanism_skips_are_counted_per_stratum(
     )
     assert report["counts"]["event_skip:13Z_D-1:no_prev_same_day"] == 1
     assert report["mechanism"]["skipped"]["13Z_D-1:no_prev_same_day"] == 1
+
+
+# ------------------------------------------------------------------ round 2
+
+
+def test_stage_tau_uses_the_same_listed_by_rule_as_scoring(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[str, ...]] = []
+
+    def _capture(**kw: object) -> dict[str, float]:
+        seen.append(tuple(r.rung_id for r in kw["ladder"]))  # type: ignore[attr-defined]
+        return {"r1": 0.30, "r2": -0.20}
+
+    monkeypatch.setattr(core, "rung_deltas", _capture)
+    data, _cur = _data()
+    listed = replace(data, listed_at={"r1": _CUR_AVAIL - NS, "r2": _CUR_AVAIL + 3600 * NS})
+    core.run_stage_tau(lambda _s, _d: listed, ("LAX",), (_DAY,), freeze_ns=_CUR_AVAIL + 1)
+    assert seen and all(ladder == ("r1",) for ladder in seen)
+
+
+def test_first_ts_init_reads_only_the_listing_instant_before_the_cutoff(tmp_path: Path) -> None:
+    from breezy.analysis.revision_latency import CUTOFF_C_NS
+    from scripts.analysis.nbp_revision_latency_io import read_first_ts_init
+
+    _write_depth(tmp_path / "a" / "x.parquet", [(5, 50, 0.4, 0.5), (6, 40, 0.4, 0.5)])
+    _write_depth(tmp_path / "a" / "y.parquet", [(7, 60, 0.4, 0.5), (9, CUTOFF_C_NS, 0.4, 0.5)])
+    assert read_first_ts_init(tmp_path / "a") == 40
+    assert read_first_ts_init(tmp_path / "none") is None
+
+
+def test_read_l0_book_decodes_the_same_prices_as_release_timing_b0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.analysis.nbp_revision_latency_io as io
+    import scripts.analysis.release_timing_b0 as b0
+
+    rows = [
+        (t, t, bid, ask)
+        for t, bid, ask in [
+            (1, 0.41, 0.45),
+            (2, None, 0.50),
+            (3, 0.43, None),
+            (4, 0.30, 0.31),
+            (5, 0.12, 0.99),
+            (6, None, None),
+            (7, 0.55, 0.57),
+        ]
+    ]
+    _write_depth(tmp_path / "inst" / "a.parquet", rows)
+    for batch_rows in (65_536, 3):  # 3 forces sliced batches (non-zero array offsets)
+        monkeypatch.setattr(io, "_BATCH_ROWS", batch_rows)
+        monkeypatch.setattr(b0, "_BATCH_ROWS", batch_rows)
+        mine = io.read_l0_book(tmp_path / "inst")
+        theirs = b0.read_top_of_book(tmp_path / "inst")
+        assert [r.ts_init for r in mine] == [int(t) for t in theirs.ts]
+        for row, bid, ask in zip(mine, theirs.bid, theirs.ask, strict=True):
+            assert (math.isnan(row.bid) and math.isnan(bid)) or row.bid == pytest.approx(bid)
+            assert (math.isnan(row.ask) and math.isnan(ask)) or row.ask == pytest.approx(ask)
+
+
+def test_read_l0_book_names_the_missing_column(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from scripts.analysis.nbp_revision_latency_io import BookSchemaError, read_l0_book
+
+    (tmp_path / "inst").mkdir()
+    pq.write_table(
+        pa.table({"ts_event": pa.array([1], pa.uint64())}), tmp_path / "inst" / "a.parquet"
+    )
+    with pytest.raises(BookSchemaError, match="ts_init"):
+        read_l0_book(tmp_path / "inst")
+
+
+def test_placebo_instants_skipped_by_the_cutoff_are_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data, cur = _data(heartbeat=_hb(_CUR_AVAIL - 3600 * NS, _CUR_AVAIL + 20_000 * NS, 60 * NS))
+    take = _score(data, _ctx(cur))
+    assert isinstance(take, core.Take)
+    instant = _ns("2026-10-20T15:00:00")
+    monkeypatch.setattr(core, "placebo_instants", lambda **_kw: (instant,))
+    monkeypatch.setattr(core, "before_cutoff", lambda t: t < instant)
+    skips: Counter[str] = Counter()
+    assert core._placebos_for(data, take, core.VARIANTS[0], skips) == []
+    assert skips["placebo_after_cutoff"] == 1
+
+
+def test_stage_output_labels_missing_flags_entry_time_only_and_records_peak_rss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    data, _cur = _data()
+    tau = core.TauValues(0.13, 0.18, "t")
+    stage0 = core.run_stage_0(lambda _s, _d: data, ("LAX",), (_DAY,), tau, iterations=10)
+    assert stage0["missing_attribution"]["scope"] == "entry_time_only"
+    assert "placebo_skips" in stage0
+    stage1 = core.run_stage_1(lambda _s, _d: data, ("LAX",), (_DAY,), tau, iterations=10)
+    for report in (stage0, stage1):
+        rss = report["peak_rss_kib_by_station_day"]
+        assert rss["LAX:2026-10-20"] > 0

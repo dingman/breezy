@@ -15,6 +15,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import re
 import resource
 import sys
 from collections.abc import Sequence
@@ -49,15 +50,23 @@ STAGES: Final[tuple[str, ...]] = ("tau", "0", "1", "2")
 ADDRESS_SPACE_CAP_BYTES: Final[int] = 8 * 1024**3
 
 
-class PinRefused(RuntimeError):
+class RefusalError(RuntimeError):
+    """A policy refusal (exit code 2). Anything else is a bug and propagates."""
+
+
+class UsageRefused(RefusalError):
+    """A missing or invalid argument (naive freeze, tau below its floor, no artefact)."""
+
+
+class PinRefused(RefusalError):
     """A sha pin is UNFROZEN/UNSET, or the file does not match it."""
 
 
-class ConfirmDayRefused(RuntimeError):
+class ConfirmDayRefused(RefusalError):
     """A pre-stage-2 stage was asked for a confirm-period climate day."""
 
 
-class StageRefused(RuntimeError):
+class StageRefused(RefusalError):
     """The requested stage cannot run (stage 2 is not built)."""
 
 
@@ -126,22 +135,43 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _freeze_ns(text: str | None) -> int:
     if text is None:
-        raise ValueError("--freeze-utc is required for stage tau")
+        raise UsageRefused("--freeze-utc is required for stage tau")
     stamp = dt.datetime.fromisoformat(text)
     if stamp.tzinfo is None:
-        raise ValueError("--freeze-utc must be tz-aware (e.g. 2026-10-26T00:00:00+00:00)")
+        raise UsageRefused("--freeze-utc must be tz-aware (e.g. 2026-10-26T00:00:00+00:00)")
     return int(stamp.timestamp()) * NS
 
 
-def _tau_values(args: argparse.Namespace) -> TauValues:
+_TAU_LINE = re.compile(r"^TAU_PRIMARY=(\S+)\s+TAU_ALT=(\S+)\s*$", re.MULTILINE)
+
+
+def prereg_tau(text: str) -> tuple[float, float]:
+    """The tau pair recorded in the prereg, from a line ``TAU_PRIMARY=0.13 TAU_ALT=0.18``."""
+    match = _TAU_LINE.search(text)
+    if match is None:
+        raise UsageRefused("the prereg has no 'TAU_PRIMARY=<x> TAU_ALT=<y>' line")
+    try:
+        return float(match.group(1)), float(match.group(2))
+    except ValueError as exc:
+        raise UsageRefused(f"unparseable TAU_PRIMARY/TAU_ALT in the prereg: {exc}") from exc
+
+
+def _floor_checked_tau(args: argparse.Namespace) -> tuple[float, float]:
     primary, alt = args.tau_primary, args.tau_alt
     if primary is None or alt is None:
-        raise ValueError("--tau-primary and --tau-alt (from the prereg tau report) are required")
+        raise UsageRefused("--tau-primary and --tau-alt (from the prereg tau report) are required")
     if primary < TAU_PRIMARY_FLOOR or alt < TAU_ALT_FLOOR:
-        raise ValueError(
+        raise UsageRefused(
             f"tau below the pinned floors ({TAU_PRIMARY_FLOOR}, {TAU_ALT_FLOOR}): {primary}, {alt}"
         )
-    return TauValues(primary, alt, "cli_argument_unverified_against_prereg")
+    return primary, alt
+
+
+def _tau_values(args: argparse.Namespace, recorded: tuple[float, float]) -> TauValues:
+    primary, alt = _floor_checked_tau(args)
+    if (primary, alt) != recorded:
+        raise UsageRefused(f"tau ({primary}, {alt}) differs from the prereg's TAU line {recorded}")
+    return TauValues(primary, alt, "prereg_text")
 
 
 def preflight(args: argparse.Namespace) -> str | None:
@@ -156,18 +186,20 @@ def preflight(args: argparse.Namespace) -> str | None:
         raise StageRefused("stage 2 (LD-OBF confirmation) is not built in this slice")
     refuse_confirm_days(date_range(args.start, args.end))
     if args.artefact is None:
-        raise ValueError("--artefact is required")
+        raise UsageRefused("--artefact is required")
     if args.stage == "tau":
         _freeze_ns(args.freeze_utc)
     else:
-        _tau_values(args)
+        assert text is not None
+        _floor_checked_tau(args)
+        _tau_values(args, prereg_tau(text))
     return text
 
 
 def _run(args: argparse.Namespace, prereg_text: str | None) -> int:
     days = date_range(args.start, args.end)
-    assert_guard_5(days, artefact_sha256=_file_sha256(args.artefact), prereg_text=prereg_text)
     resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_CAP_BYTES, ADDRESS_SPACE_CAP_BYTES))
+    assert_guard_5(days, artefact_sha256=_file_sha256(args.artefact), prereg_text=prereg_text)
     from scripts.analysis.nbp_revision_latency_io import make_loader  # real tape; never in tests
 
     loader = make_loader(
@@ -177,7 +209,7 @@ def _run(args: argparse.Namespace, prereg_text: str | None) -> int:
         report = run_stage_tau(loader, STATIONS, days, freeze_ns=_freeze_ns(args.freeze_utc))
     else:
         runner = run_stage_0 if args.stage == "0" else run_stage_1
-        report = runner(loader, STATIONS, days, _tau_values(args))
+        report = runner(loader, STATIONS, days, _tau_values(args, prereg_tau(prereg_text or "")))
     text = json.dumps(report, indent=2, sort_keys=True, default=json_default)
     if args.output is not None:
         args.output.write_text(text, encoding="utf-8")
@@ -190,7 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return _run(args, preflight(args))
-    except (PinRefused, ConfirmDayRefused, StageRefused, LeakGuardError, ValueError) as exc:
+    except (RefusalError, LeakGuardError) as exc:
         print(f"REFUSED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

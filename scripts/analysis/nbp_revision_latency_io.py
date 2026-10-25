@@ -62,6 +62,29 @@ def _price_or_nan(price_col: object, size_col: object) -> np.ndarray:
     return np.where(present, prices[:, 0].astype(np.float64) / _FIXED_SCALE, np.nan)
 
 
+class BookSchemaError(ValueError):
+    """A Depth10 parquet file lacks a column the loader needs."""
+
+
+def _require_columns(handle: pq.ParquetFile, path: Path, needed: list[str]) -> None:
+    absent = [name for name in needed if name not in handle.schema_arrow.names]
+    if absent:
+        raise BookSchemaError(f"{path}: missing Depth10 column(s) {absent}")
+
+
+def read_first_ts_init(instrument_dir: Path) -> int | None:
+    """The earliest ``ts_init`` before the cutoff (the rung's listing instant); no prices read."""
+    first: int | None = None
+    for path in sorted(instrument_dir.glob("*.parquet")):
+        with pq.ParquetFile(path) as handle:
+            _require_columns(handle, path, ["ts_init"])
+            for batch in handle.iter_batches(batch_size=_BATCH_ROWS, columns=["ts_init"]):
+                for t in batch.column("ts_init").to_numpy(zero_copy_only=False):
+                    if before_cutoff(int(t)) and (first is None or int(t) < first):
+                        first = int(t)
+    return first
+
+
 def read_l0_book(instrument_dir: Path) -> list[BookRow]:
     """Level-0 rows of ONE instrument directory on the ``ts_init`` clock, ascending.
 
@@ -69,6 +92,7 @@ def read_l0_book(instrument_dir: Path) -> list[BookRow]:
     rows: list[BookRow] = []
     for path in sorted(instrument_dir.glob("*.parquet")):
         with pq.ParquetFile(path) as handle:
+            _require_columns(handle, path, _COLUMNS)
             for batch in handle.iter_batches(batch_size=_BATCH_ROWS, columns=_COLUMNS):
                 ts = batch.column("ts_init").to_numpy(zero_copy_only=False)
                 bid = _price_or_nan(batch.column("bid_price_0"), batch.column("bid_size_0"))
@@ -138,6 +162,11 @@ def make_loader(
                 heartbeat.update(row.ts_init for row in rows)
                 if rows:
                     listed_at[rung_id] = rows[0].ts_init
+        else:  # stage tau: the listing instant only (one column), so tau and scoring share a ladder
+            for rung_id, (name, _rung) in rungs.items():
+                first = read_first_ts_init(depth_dir / name)
+                if first is not None:
+                    listed_at[rung_id] = first
         return StationDayData(
             station=station,
             climate_day=day,

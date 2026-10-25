@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import resource
 import statistics
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -514,7 +515,7 @@ def summarize(
     pnl = [t.pnl for t in takes]
     interval = wider_cluster_interval(takes, lambda t: t.pnl, iterations=iterations, seed=seed)
     sd = statistics.stdev(pnl) if len(pnl) > 1 else 0.0
-    leak_ok = all(
+    timing_consistent = all(
         t.t_dec_ns > t.available_at_ns + variant.lag_ns and t.t_exit_ns > t.t_dec_ns for t in takes
     )
     return VariantSummary(
@@ -531,7 +532,7 @@ def summarize(
         placebo_point=_mean([t.pnl for t in run.placebo_takes]),
         n_placebo=n_placebo,
         p_value=interval.p_one_sided,
-        leak_ok=leak_ok,
+        timing_consistent=timing_consistent,
     )
 
 
@@ -579,7 +580,11 @@ def count_event_skips(counts: Counter[str], contexts: Sequence[EventContext]) ->
 
 
 def _iter_data(
-    loader: Loader, stations: Sequence[str], days: Sequence[dt.date], census: Counter[str]
+    loader: Loader,
+    stations: Sequence[str],
+    days: Sequence[dt.date],
+    census: Counter[str],
+    rss: dict[str, int] | None = None,
 ) -> Iterator[StationDayData]:
     for day in days:
         if day > SEARCH_END:
@@ -591,6 +596,10 @@ def _iter_data(
                 census["no_station_day_data"] += 1
                 continue
             yield data
+            if rss is not None:  # peak so far (KiB on Linux), recorded after each station-day
+                rss[f"{station}:{day.isoformat()}"] = resource.getrusage(
+                    resource.RUSAGE_SELF
+                ).ru_maxrss
 
 
 def run_stage_tau(
@@ -599,7 +608,8 @@ def run_stage_tau(
     """tau from NBP data alone: the max positive dP of each 19Z-D-1 cycle that exists at freeze."""
     cycles: list[TauCycle] = []
     counts: Counter[str] = Counter()
-    for data in _iter_data(loader, stations, days, counts):
+    rss: dict[str, int] = {}
+    for data in _iter_data(loader, stations, days, counts, rss):
         contexts = build_events(data)
         count_event_skips(counts, contexts)
         for ctx in contexts:
@@ -615,10 +625,13 @@ def run_stage_tau(
         "book_clock": BOOK_CLOCK,
         "tau": to_plain(report),
         "counts": dict(counts),
+        "peak_rss_kib_by_station_day": rss,
     }
 
 
-def _placebos_for(data: StationDayData, take: Take, variant: Variant) -> list[float]:
+def _placebos_for(
+    data: StationDayData, take: Take, variant: Variant, skips: Counter[str] | None = None
+) -> list[float]:
     """Signed mark changes at METAR-offset placebo instants (guards 9 and the cutoff enforced)."""
     minute = (take.available_at_ns // (60 * NS)) % 60
     releases = data.chain.releases
@@ -645,6 +658,8 @@ def _placebos_for(data: StationDayData, take: Take, variant: Variant) -> list[fl
         )
         t_dec = instant + variant.lag_ns + 1
         if not before_cutoff(t_dec + variant.x_ns):
+            if skips is not None:
+                skips["placebo_after_cutoff"] += 1
             continue
         change = aligned_mark_change(
             series, t_dec_ns=t_dec, x_ns=variant.x_ns, missing_at=missing_at
@@ -655,7 +670,7 @@ def _placebos_for(data: StationDayData, take: Take, variant: Variant) -> list[fl
 
 
 def _kill_rows(
-    data: StationDayData, takes: Sequence[Take], variant: Variant
+    data: StationDayData, takes: Sequence[Take], variant: Variant, skips: Counter[str]
 ) -> tuple[list[KillRow], int]:
     rows: list[KillRow] = []
     unscorable = 0
@@ -668,7 +683,7 @@ def _kill_rows(
                 station=take.station,
                 climate_day=take.climate_day,
                 y_raw=take.y_raw,
-                placebo_ys=tuple(_placebos_for(data, take, variant)),
+                placebo_ys=tuple(_placebos_for(data, take, variant, skips)),
                 cost_e=take.cost_e,
                 missing_exit=take.missing_exit,
             )
@@ -762,7 +777,9 @@ def run_stage_0(
     kill_rows: dict[bool, list[KillRow]] = {True: [], False: []}
     counts: Counter[str] = Counter()
     skips: Counter[str] = Counter()
-    for data in _iter_data(loader, stations, days, counts):
+    placebo_skips: Counter[str] = Counter()
+    rss: dict[str, int] = {}
+    for data in _iter_data(loader, stations, days, counts, rss):
         contexts = build_events(data)
         count_event_skips(counts, contexts)
         mech.extend(_mechanism(data, contexts, skips))
@@ -770,7 +787,7 @@ def run_stage_0(
             day_run = VariantRun()
             score_station_day(data, contexts, primary, tau.primary, day_run, apply_rule_b=rule_b)
             merge_run(runs[rule_b], day_run)
-            rows, missing_mid = _kill_rows(data, day_run.takes, primary)
+            rows, missing_mid = _kill_rows(data, day_run.takes, primary, placebo_skips)
             kill_rows[rule_b].extend(rows)
             unscorable[rule_b] += missing_mid
     scorable = [r for r in mech if r.get("scorable")]
@@ -803,9 +820,14 @@ def run_stage_0(
             "covariate_adjusted_beta": "not_built: observed-temperature loader is out of scope",
         },
         "kill_cost": kill,
+        "placebo_skips": dict(placebo_skips),
+        "peak_rss_kib_by_station_day": rss,
         "census_after_rule_b": runs[True].census.report(),
         "census_before_rule_b": runs[False].census.report(),
-        "missing_attribution": to_plain(missing_attribution(_missing_flags(runs[True].census))),
+        "missing_attribution": {
+            **to_plain(missing_attribution(_missing_flags(runs[True].census))),
+            "scope": "entry_time_only",
+        },
     }
 
 
@@ -819,7 +841,8 @@ def run_stage_1(
 ) -> dict[str, Any]:
     runs = {variant.name: VariantRun() for variant in VARIANTS}
     counts: Counter[str] = Counter()
-    for data in _iter_data(loader, stations, days, counts):
+    rss: dict[str, int] = {}
+    for data in _iter_data(loader, stations, days, counts, rss):
         contexts = build_events(data)
         count_event_skips(counts, contexts)
         for variant in VARIANTS:
@@ -833,6 +856,7 @@ def run_stage_1(
         "book_clock": BOOK_CLOCK,
         "framing": STAGE1_FRAMING,
         "counts": dict(counts),
+        "peak_rss_kib_by_station_day": rss,
         "tau": _tau_record(tau),
         "tests": {
             "V0": {

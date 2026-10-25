@@ -131,7 +131,7 @@ def _summary(
     placebo_point: float = 0.0,
     n_placebo: int = 5,
     p_value: float = 0.20,
-    leak_ok: bool = True,
+    timing_consistent: bool = True,
 ) -> VariantSummary:
     return VariantSummary(
         name=name,
@@ -147,7 +147,7 @@ def _summary(
         placebo_point=placebo_point,
         n_placebo=n_placebo,
         p_value=p_value,
-        leak_ok=leak_ok,
+        timing_consistent=timing_consistent,
     )
 
 
