@@ -515,7 +515,7 @@ class NoLadderMakerStrategy(Strategy):
         for cancel in plan.cancels:
             self._cancel_rest(ladder, cancel)
         for desired in plan.posts:
-            self._post(ladder, desired, now)
+            self._post(ladder, desired, now, decision.cycle_ns)
 
     def _end_window(self, ladder: Ladder) -> None:
         """V3: the ladder's window is over -- stop posting and cancel, whatever the alert did."""
@@ -564,7 +564,7 @@ class NoLadderMakerStrategy(Strategy):
 
     # -- orders ------------------------------------------------------------------------------
 
-    def _post(self, ladder: Ladder, desired: Desired, now_ns: int) -> None:
+    def _post(self, ladder: Ladder, desired: Desired, now_ns: int, cycle_ns: int | None) -> None:
         rung = ladder.rungs[desired.rung_id]
         if now_ns < ladder.window_open_ns:
             self.counters["refused_before_window"] += 1
@@ -607,9 +607,25 @@ class NoLadderMakerStrategy(Strategy):
             self.counters[f"refused_{send_refusal}"] += 1
             self.log.info(f"{_CLASS_NAME}: no submit {rung.rung_id} reason={send_refusal}")
             return
-        self._submit(ladder, rung, desired, expire_ns)
+        self._submit(ladder, rung, desired, expire_ns, cycle_ns)
 
-    def _submit(self, ladder: Ladder, rung: Rung, desired: Desired, expire_ns: int) -> None:
+    def _maker_post_evidence(self, desired: Desired, cycle_ns: int | None) -> str:
+        """``p_no`` / ``b_max`` / slack / cycle, or ``na`` for all four when any is absent."""
+        p_no, cap = desired.p_no, desired.b_max
+        if p_no is None or cap is None or cycle_ns is None:
+            return "p_no=na b_max=na edge_slack=na cycle_ns=na"
+        bid = desired.bid_cents / CENTS
+        slack = p_no - bid - self._theta * bid * (1.0 - bid)
+        return f"p_no={p_no:.4f} b_max={cap:.2f} edge_slack={slack:.4f} cycle_ns={cycle_ns}"
+
+    def _submit(
+        self,
+        ladder: Ladder,
+        rung: Rung,
+        desired: Desired,
+        expire_ns: int,
+        cycle_ns: int | None,
+    ) -> None:
         instrument = self.cache.instrument(rung.no_id)
         if instrument is None:
             self.log.error(f"{_CLASS_NAME}: NO instrument vanished from cache: {rung.no_id}")
@@ -635,7 +651,8 @@ class NoLadderMakerStrategy(Strategy):
         self.log.info(
             f"MAKER_POST station={ladder.station} day={ladder.day} rung={rung.rung_id} "
             f"bid_cents={desired.bid_cents} expire_ns={expire_ns} "
-            f"client_order_id={order.client_order_id}"
+            f"client_order_id={order.client_order_id} "
+            f"{self._maker_post_evidence(desired, cycle_ns)}"
         )
 
     # -- cancels -----------------------------------------------------------------------------
@@ -728,9 +745,7 @@ class NoLadderMakerStrategy(Strategy):
         self.clock.set_time_alert_ns(
             name=f"{_SHADOW_PREFIX}:{self._shadow_alerts}",
             alert_time_ns=expire_ns,
-            callback=self._on_clock(
-                lambda event: self._on_shadow_expiry(key, rung_id, expire_ns)
-            ),
+            callback=self._on_clock(lambda event: self._on_shadow_expiry(key, rung_id, expire_ns)),
         )
 
     @_guarded

@@ -179,6 +179,12 @@ def _desired(
     return tuple(Desired(r, round(b * CENTS)) for r, b in priced if b is not None)
 
 
+def _with_post_evidence(item: Desired, p_yes: Mapping[str, float], cfg: SelectorConfig) -> Desired:
+    """Attach the model p_NO and its price ceiling; the posted cents stay as priced."""
+    p_no = 1.0 - p_yes[item.rung_id]
+    return Desired(item.rung_id, item.bid_cents, p_no, rule.b_max(p_no, cfg.theta, cfg.params))
+
+
 def _abstain(served: AbstainReason, tracker: WantTracker | None) -> Decision:
     if tracker is not None:
         tracker.abstentions[served.reason] += 1
@@ -244,11 +250,13 @@ def _priced(
     if tracker is not None and unbooked:  # hindsight, write-only: what the rule would want unbooked
         wanted = plan.select(bids)
         tracker.wanted_without_book.update(r for r in wanted if r not in ctx.books)
-    desired = _desired(chosen, bookable, ctx)
+    bare = _desired(chosen, bookable, ctx)
+    desired = tuple(_with_post_evidence(item, p_yes, cfg) for item in bare)
     return Decision(
         desired=desired,
         forecast_valid=True,
-        dropped=_dropped(ctx, desired, reasons),
+        dropped=_dropped(ctx, bare, reasons),
+        cycle_ns=served.cycle,
     )
 
 
