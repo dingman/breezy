@@ -182,3 +182,23 @@ def test_sources_have_no_hour_of_day_predicate_and_no_asdict() -> None:
         assert _HOUR_PREDICATE.search(text) is None, path
         assert "asdict" not in text, path
         assert "os.environ" not in text, path
+
+
+def test_missing_exit_candidates_are_skipped_not_carried_forward() -> None:
+    t_exit = 5_000 * NS
+    as_of = BookRow(t_exit - 1_000, 0.41, 0.45)
+    inside = BookRow(t_exit + 5 * 60 * NS, 0.62, 0.64)
+    gap_until = t_exit + 60 * NS  # a recorder outage covers t_exit and the next minute
+
+    def missing_at(t: int) -> bool:
+        return t <= gap_until
+
+    got = first_bid_in_window((as_of, inside), t_exit, W_NS, missing_at=missing_at)
+    assert got.bid == pytest.approx(0.62)
+    assert got.ts_ns == inside.ts_init
+    assert got.filled_inside_window is True
+    assert got.n_skipped_missing == 1
+    everything = first_bid_in_window((as_of, inside), t_exit, W_NS, missing_at=lambda _t: True)
+    assert everything.missing_exit is True
+    assert everything.bid == 0.0
+    assert everything.n_skipped_missing == 2

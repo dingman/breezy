@@ -19,15 +19,23 @@ import resource
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Final, NoReturn
+from typing import Final
 
 from breezy.analysis.revision_latency import (
     CONFIRM_START,
-    TauReport,
+    TAU_ALT_FLOOR,
+    TAU_PRIMARY_FLOOR,
+    LeakGuardError,
     assert_guard_5,
 )
-from breezy.strategy.weather_common.revision_gate import (
-    NS,
+from breezy.strategy.no_ladder_maker.pno_store import STATIONS
+from breezy.strategy.weather_common.revision_gate import NS
+from scripts.analysis.nbp_revision_latency_core import (
+    TauValues,
+    json_default,
+    run_stage_0,
+    run_stage_1,
+    run_stage_tau,
 )
 
 #: Frozen by the prereg commit. UNFROZEN makes every stage refuse (plan Phase P step 5).
@@ -116,65 +124,75 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _refuse(message: str) -> NoReturn:
-    print(f"REFUSED: {message}", file=sys.stderr)
-    raise SystemExit(2)
+def _freeze_ns(text: str | None) -> int:
+    if text is None:
+        raise ValueError("--freeze-utc is required for stage tau")
+    stamp = dt.datetime.fromisoformat(text)
+    if stamp.tzinfo is None:
+        raise ValueError("--freeze-utc must be tz-aware (e.g. 2026-10-26T00:00:00+00:00)")
+    return int(stamp.timestamp()) * NS
 
 
-def preflight(args: argparse.Namespace) -> str:
-    """Every refusal, in order, before any I/O. Returns the prereg text."""
+def _tau_values(args: argparse.Namespace) -> TauValues:
+    primary, alt = args.tau_primary, args.tau_alt
+    if primary is None or alt is None:
+        raise ValueError("--tau-primary and --tau-alt (from the prereg tau report) are required")
+    if primary < TAU_PRIMARY_FLOOR or alt < TAU_ALT_FLOOR:
+        raise ValueError(
+            f"tau below the pinned floors ({TAU_PRIMARY_FLOOR}, {TAU_ALT_FLOOR}): {primary}, {alt}"
+        )
+    return TauValues(primary, alt, "cli_argument_unverified_against_prereg")
+
+
+def preflight(args: argparse.Namespace) -> str | None:
+    """Every refusal that needs no tape, in order. Returns the prereg text (None for stage tau).
+
+    Stage tau is outcome-free and runs BEFORE the prereg exists, so it is exempt from the prereg
+    pin; it keeps the confirm-day refusal."""
     if args.stage == "2":
         require_selection(args.selection)
-    text = require_prereg(args.prereg)
+    text = None if args.stage == "tau" else require_prereg(args.prereg)
     if args.stage == "2":
         raise StageRefused("stage 2 (LD-OBF confirmation) is not built in this slice")
     refuse_confirm_days(date_range(args.start, args.end))
+    if args.artefact is None:
+        raise ValueError("--artefact is required")
+    if args.stage == "tau":
+        _freeze_ns(args.freeze_utc)
+    else:
+        _tau_values(args)
     return text
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
-    try:
-        prereg_text = preflight(args)
-    except (PinRefused, ConfirmDayRefused, StageRefused) as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
-        return 2
+def _run(args: argparse.Namespace, prereg_text: str | None) -> int:
+    days = date_range(args.start, args.end)
+    assert_guard_5(days, artefact_sha256=_file_sha256(args.artefact), prereg_text=prereg_text)
     resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_CAP_BYTES, ADDRESS_SPACE_CAP_BYTES))
-    from scripts.analysis.nbp_revision_latency_core import (
-        json_default,
-        run_stage_0,
-        run_stage_1,
-        run_stage_tau,
-    )
     from scripts.analysis.nbp_revision_latency_io import make_loader  # real tape; never in tests
 
-    days = date_range(args.start, args.end)
-    artefact = args.artefact
-    if artefact is None:
-        _refuse("--artefact is required")
-    assert_guard_5(days, artefact_sha256=_file_sha256(artefact), prereg_text=prereg_text)
-    if args.stage == "tau" and args.freeze_utc is None:
-        _refuse("--freeze-utc is required for stage tau")
     loader = make_loader(
-        artefact, args.derived_root, args.tape_root, with_books=args.stage != "tau"
+        args.artefact, args.derived_root, args.tape_root, with_books=args.stage != "tau"
     )
-    from breezy.strategy.no_ladder_maker.pno_store import STATIONS
-
     if args.stage == "tau":
-        freeze_ns = int(dt.datetime.fromisoformat(args.freeze_utc).timestamp()) * NS
-        report = run_stage_tau(loader, STATIONS, days, freeze_ns=freeze_ns)
+        report = run_stage_tau(loader, STATIONS, days, freeze_ns=_freeze_ns(args.freeze_utc))
     else:
-        if args.tau_primary is None or args.tau_alt is None:
-            _refuse("--tau-primary and --tau-alt come from the prereg tau report")
-        tau = TauReport(0, 0.0, 0.0, args.tau_primary, args.tau_alt, False, False, 0, 0)
         runner = run_stage_0 if args.stage == "0" else run_stage_1
-        report = runner(loader, STATIONS, days, tau)
+        report = runner(loader, STATIONS, days, _tau_values(args))
     text = json.dumps(report, indent=2, sort_keys=True, default=json_default)
     if args.output is not None:
         args.output.write_text(text, encoding="utf-8")
     else:
         print(text)
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        return _run(args, preflight(args))
+    except (PinRefused, ConfirmDayRefused, StageRefused, LeakGuardError, ValueError) as exc:
+        print(f"REFUSED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

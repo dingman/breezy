@@ -8,30 +8,30 @@ import datetime as dt
 import math
 import statistics
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
-from breezy.analysis.nbp_calibration import cluster_bootstrap_draws, percentile_interval
 from breezy.analysis.release_timing import EventObservation
 from breezy.analysis.revision_latency import (
-    CI_ALPHA,
+    HOLM_ALPHA,
     KILL_BOOTSTRAP_DRAWS,
     KILL_SEED,
     SEARCH_END,
     STAGE1_FRAMING,
     KillRow,
     TauCycle,
-    TauReport,
     VariantSummary,
     aligned_mark_change,
+    assert_guard_2,
     assert_guard_3,
     assert_guard_4,
     assert_guard_7,
-    assert_guard_8,
+    assert_guard_9,
     assert_guard_10,
     assert_guard_11,
+    before_cutoff,
     derive_tau,
     fraction_of_move,
     kill_cost,
@@ -39,7 +39,9 @@ from breezy.analysis.revision_latency import (
     missing_attribution,
     placebo_instants,
     rung_deltas,
+    secondary_holm,
     select,
+    wider_cluster_interval,
 )
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     CalibrationArtefactUnknownVersionError,
@@ -81,6 +83,9 @@ MECHANISM_GRID_NS: Final[tuple[int, ...]] = tuple(
     seconds * NS for seconds in (30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800)
 )
 MECHANISM_BOOT: Final[int] = 20000
+#: Every stage reads the book on the receipt clock (plan R3); ts_event is never used.
+BOOK_CLOCK: Final[str] = "ts_init"
+MECHANISM_PRE_NS: Final[int] = 3600 * NS
 _DAY_NS: Final[int] = 86400 * NS
 _EPOCH: Final[dt.date] = dt.date(1970, 1, 1)
 
@@ -109,6 +114,16 @@ DROP_RULE_B_MOVED: Final[str] = "rule_b_already_moved"
 DROP_PERMIT: Final[str] = "permit"
 DROP_ENTRY_FEE: Final[str] = "fee_unpinned"
 DROP_EXIT_FEE: Final[str] = "exit_fee_unpinned"
+SKIP_GRID_MISSING: Final[str] = "grid_missing"
+SKIP_AFTER_CUTOFF: Final[str] = "after_cutoff"
+
+
+class TauValues(NamedTuple):
+    """The two tau thresholds a stage scores with, and where they came from (never fabricated)."""
+
+    primary: float
+    alt: float
+    source: str
 
 
 # ------------------------------------------------------------------------ variants
@@ -206,6 +221,8 @@ class StationDayData:
     books: Mapping[str, BookSeries]
     gaps: Mapping[str, tuple[GapSpan, ...]]
     heartbeat: tuple[int, ...]
+    #: First ``ts_init`` per rung (its listing instant); empty means listing times are unknown.
+    listed_at: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +239,13 @@ def stratum_of(cycle_runtime_ns: int, climate_day: dt.date) -> str | None:
     day = _EPOCH + dt.timedelta(days=cycle_runtime_ns // _DAY_NS)
     cycle_z = (cycle_runtime_ns % _DAY_NS) // (3600 * NS)
     return STRATA.get(((day - climate_day).days, cycle_z))
+
+
+def ladder_at(data: StationDayData, t_ns: int) -> tuple[Rung, ...]:
+    """Rungs listed at or before ``t_ns`` (all rungs when listing times are unknown)."""
+    if not data.listed_at:
+        return data.ladder
+    return tuple(r for r in data.ladder if data.listed_at.get(r.rung_id, t_ns + 1) <= t_ns)
 
 
 def build_events(data: StationDayData) -> list[EventContext]:
@@ -241,7 +265,7 @@ def build_events(data: StationDayData) -> list[EventContext]:
                 deltas = rung_deltas(
                     prev=prev,
                     cur=cur,
-                    ladder=data.ladder,
+                    ladder=ladder_at(data, cur.available_at_ns + L_ALT_NS + 1),
                     calibration=data.calibration,
                     latitude_deg=data.latitude_deg,
                     climate_day=data.climate_day,
@@ -282,6 +306,11 @@ def _as_of(series: BookSeries, t_ns: int) -> BookRow | None:
     if row is not None:
         assert_guard_3((row,), t_ns)
     return row
+
+
+def _missing_at(data: StationDayData, rung: str) -> Callable[[int], bool]:
+    gaps = data.gaps.get(rung, ())
+    return lambda t_ns: is_missing(gaps, data.heartbeat, t_ns).missing
 
 
 def _half_spread(row: BookRow | None) -> float:
@@ -334,14 +363,23 @@ def score_event(
     live = data.chain.at(t_dec)
     if shift_ns == 0 and (live is None or live.available_at_ns != cur.available_at_ns):
         return DROP_SUPERSEDED
+    if shift_ns == 0:
+        assert_guard_2(
+            available_at_ns=cur.available_at_ns,
+            lag_ns=variant.lag_ns,
+            t_dec_ns=t_dec,
+            chain_available_at_ns=None if live is None else live.available_at_ns,
+        )
     assert_guard_7(climate_day=ctx.climate_day, t_dec_ns=t_dec, pre_stage2=True)
     rung = bands.r_plus
     entry, reason = _entry_reason(data, ctx, rung, t_dec)
     if reason is not None or entry is None:
         return reason or DROP_NO_ASK
     series = data.books[rung]
+    missing_at = _missing_at(data, rung)
     if apply_rule_b:
-        reference = _as_of(series, cur.available_at_ns + shift_ns)
+        t_ref = cur.available_at_ns + shift_ns
+        reference = None if missing_at(t_ref) else _as_of(series, t_ref)
         if reference is None or math.isnan(reference.ask):
             return DROP_RULE_B_REFERENCE
         if entry.ask > reference.ask + RULE_B_SHARE * bands.delta_plus:
@@ -350,13 +388,12 @@ def score_event(
     if not permit_ok(t_dec, t_exit):
         return DROP_PERMIT
     assert_guard_11(t_dec, t_exit, t_exit + W_NS, inside_permit=is_inside_nominal_permit)
-    exit_bid = first_bid_in_window(series, t_exit, W_NS)
+    exit_bid = first_bid_in_window(series, t_exit, W_NS, missing_at=missing_at)
     result = markout_pnl(ask=entry.ask, t_dec_ns=t_dec, exit_bid=exit_bid)
     if isinstance(result, str):
         return result
-    assert_guard_8(result.entry_fee)
     stress = markout_pnl(ask=entry.ask, t_dec_ns=t_dec, exit_bid=exit_bid, tick=STRESS_TICK)
-    exit_row = _as_of(series, t_exit)
+    exit_row = None if exit_bid.ts_ns is None else _as_of(series, exit_bid.ts_ns)
     cost = result.entry_fee + result.exit_fee + _half_spread(entry) + _half_spread(exit_row)
     return Take(
         station=ctx.station,
@@ -372,7 +409,7 @@ def score_event(
         pnl=result.pnl,
         stress_pnl=None if isinstance(stress, str) else stress.pnl,
         cost_e=cost,
-        y_raw=aligned_mark_change(series, t_dec_ns=t_dec, x_ns=variant.x_ns),
+        y_raw=aligned_mark_change(series, t_dec_ns=t_dec, x_ns=variant.x_ns, missing_at=missing_at),
         missing_exit=result.missing_exit,
         filled_inside_window=result.filled_inside_window,
     )
@@ -420,8 +457,8 @@ def merge_run(into: VariantRun, other: VariantRun) -> None:
     into.placebo_takes.extend(other.placebo_takes)
 
 
-def tau_for(variant: Variant, report: TauReport) -> float:
-    return report.tau_primary if variant.tau_key == "primary" else report.tau_alt
+def tau_for(variant: Variant, tau: TauValues) -> float:
+    return tau.primary if variant.tau_key == "primary" else tau.alt
 
 
 def score_station_day(
@@ -452,52 +489,49 @@ def _mean(values: Sequence[float]) -> float:
     return math.fsum(values) / len(values) if values else 0.0
 
 
-def _wider_take_interval(
-    takes: Sequence[Take], *, iterations: int, seed: int
-) -> tuple[float, float, float]:
-    """``(lo, hi, one_sided_p)`` from the wider of the station-day and climate-day bootstraps."""
-
-    def _stat(drawn: Sequence[Take]) -> float:
-        return _mean([take.pnl for take in drawn])
-
-    lows, highs, ps = [], [], []
-    for key in (lambda t: (t.station, t.climate_day), lambda t: t.climate_day):
-        draws = cluster_bootstrap_draws(
-            takes, statistic=_stat, cluster_key=key, seed=seed, iterations=iterations
-        )
-        lo, hi = percentile_interval(draws, alpha=CI_ALPHA)
-        lows.append(lo)
-        highs.append(hi)
-        ps.append(sum(1 for d in draws if d <= 0.0) / len(draws))
-    return min(lows), max(highs), max(ps)
-
-
 def summarize(
     variant: Variant, run: VariantRun, *, iterations: int, seed: int = STAGE1_SEED
 ) -> VariantSummary:
     takes = run.takes
+    n_placebo = len(run.placebo_takes)
     if not takes:
         return VariantSummary(
-            variant.name, variant.primary, 0.0, 0.0, 0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, 1.0, True
+            variant.name,
+            variant.primary,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            n_placebo,
+            1.0,
+            True,
         )
     pnl = [t.pnl for t in takes]
-    point = _mean(pnl)
-    lo, hi, p_value = _wider_take_interval(takes, iterations=iterations, seed=seed)
+    interval = wider_cluster_interval(takes, lambda t: t.pnl, iterations=iterations, seed=seed)
     sd = statistics.stdev(pnl) if len(pnl) > 1 else 0.0
+    leak_ok = all(
+        t.t_dec_ns > t.available_at_ns + variant.lag_ns and t.t_exit_ns > t.t_dec_ns for t in takes
+    )
     return VariantSummary(
         name=variant.name,
         primary=variant.primary,
-        point=point,
-        lo=lo,
-        hi=hi,
+        point=interval.mean,
+        lo=interval.lo,
+        hi=interval.hi,
         n=len(takes),
         n_climate=len({t.climate_day for t in takes}),
         missing_exit_rate=sum(1 for t in takes if t.missing_exit) / len(takes),
         hit_rate=sum(1 for p in pnl if p > 0.0) / len(pnl),
-        mean_over_sd=point / sd if sd > 0.0 else 0.0,
+        mean_over_sd=interval.mean / sd if sd > 0.0 else 0.0,
         placebo_point=_mean([t.pnl for t in run.placebo_takes]),
-        p_value=p_value,
-        leak_ok=True,
+        n_placebo=n_placebo,
+        p_value=interval.p_one_sided,
+        leak_ok=leak_ok,
     )
 
 
@@ -534,12 +568,19 @@ def to_plain(obj: object) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- stages
 
-Loader = Callable[[str, dt.date], "StationDayData | None"]
+Loader = Callable[[str, dt.date], StationDayData | None]
+
+
+def count_event_skips(counts: Counter[str], contexts: Sequence[EventContext]) -> None:
+    """Per-stratum visibility of events that never got a delta (e.g. the 13Z cycle)."""
+    for ctx in contexts:
+        if ctx.prev_reason is not None:
+            counts[f"event_skip:{ctx.stratum}:{ctx.prev_reason}"] += 1
 
 
 def _iter_data(
     loader: Loader, stations: Sequence[str], days: Sequence[dt.date], census: Counter[str]
-) -> Any:
+) -> Iterator[StationDayData]:
     for day in days:
         if day > SEARCH_END:
             census["excluded_day"] += 1
@@ -559,7 +600,9 @@ def run_stage_tau(
     cycles: list[TauCycle] = []
     counts: Counter[str] = Counter()
     for data in _iter_data(loader, stations, days, counts):
-        for ctx in build_events(data):
+        contexts = build_events(data)
+        count_event_skips(counts, contexts)
+        for ctx in contexts:
             counts["events"] += 1
             if ctx.stratum != TRADABLE_STRATUM or ctx.bands is None:
                 continue
@@ -567,16 +610,21 @@ def run_stage_tau(
             if delta is not None:
                 cycles.append(TauCycle(ctx.cur.available_at_ns, 19, delta))
     report = derive_tau(cycles, freeze_ns=freeze_ns)
-    return {"stage": "tau", "tau": to_plain(report), "counts": dict(counts)}
+    return {
+        "stage": "tau",
+        "book_clock": BOOK_CLOCK,
+        "tau": to_plain(report),
+        "counts": dict(counts),
+    }
 
 
-def _placebos_for(
-    data: StationDayData, take: Take, variant: Variant, *, shift: int = 0
-) -> list[float]:
+def _placebos_for(data: StationDayData, take: Take, variant: Variant) -> list[float]:
+    """Signed mark changes at METAR-offset placebo instants (guards 9 and the cutoff enforced)."""
     minute = (take.available_at_ns // (60 * NS)) % 60
     releases = data.chain.releases
     days = tuple(data.climate_day + dt.timedelta(days=d) for d in (-1, 0, 1))
     series = data.books[take.rung_id]
+    missing_at = _missing_at(data, take.rung_id)
     out: list[float] = []
     for instant in placebo_instants(
         minute_of_hour=minute,
@@ -587,8 +635,19 @@ def _placebos_for(
         instrument_id=take.rung_id,
         event_instrument_id=take.rung_id,
     ):
+        assert_guard_9(
+            instant_ns=instant,
+            releases_ns=releases,
+            climate_day=data.climate_day,
+            offset_hours=data.offset_hours,
+            instrument_id=take.rung_id,
+            event_instrument_id=take.rung_id,
+        )
+        t_dec = instant + variant.lag_ns + 1
+        if not before_cutoff(t_dec + variant.x_ns):
+            continue
         change = aligned_mark_change(
-            series, t_dec_ns=instant + variant.lag_ns + 1 + shift, x_ns=variant.x_ns
+            series, t_dec_ns=t_dec, x_ns=variant.x_ns, missing_at=missing_at
         )
         if change is not None:
             out.append(change)
@@ -617,28 +676,47 @@ def _kill_rows(
     return rows, unscorable
 
 
-def _mechanism(data: StationDayData, contexts: Sequence[EventContext]) -> list[dict[str, Any]]:
-    """Both signs, every stratum: signed mid change over the grid from ``t_a``."""
+def _mid_at(series: BookSeries, missing_at: Callable[[int], bool], t_ns: int) -> float | None:
+    return None if missing_at(t_ns) else mid(_as_of(series, t_ns))
+
+
+def _mechanism(
+    data: StationDayData, contexts: Sequence[EventContext], skips: Counter[str]
+) -> list[dict[str, Any]]:
+    """Both signs, every stratum: signed mid change over the grid from ``t_a``.
+
+    Every mid is read only where the book is not missing (R3) and before the cutoff; a skipped
+    event is counted per stratum in ``skips`` (``"<stratum>:<reason>"``)."""
     rows: list[dict[str, Any]] = []
     for ctx in contexts:
         bands = ctx.bands
         if bands is None:
+            skips[f"{ctx.stratum}:{ctx.prev_reason}"] += 1
             continue
         for sign, rung, delta in (
             (1.0, bands.r_plus, bands.delta_plus),
             (-1.0, bands.r_minus, bands.delta_minus),
         ):
-            series = data.books.get(rung) if rung is not None else None
-            if series is None or delta is None:
+            if rung is None or delta is None:
+                continue
+            series = data.books.get(rung)
+            if series is None:
+                skips[f"{ctx.stratum}:{DROP_NO_BOOK}"] += 1
                 continue
             t_a = ctx.cur.available_at_ns
-            level0 = mid(series.as_of(t_a))
-            path = [(t_a + g, mid(series.as_of(t_a + g))) for g in MECHANISM_GRID_NS]
-            if level0 is None or any(v is None for _, v in path):
+            if not before_cutoff(t_a + max(MECHANISM_GRID_NS)):
+                skips[f"{ctx.stratum}:{SKIP_AFTER_CUTOFF}"] += 1
                 rows.append({"stratum": ctx.stratum, "sign": sign, "scorable": False})
                 continue
-            levels = [(ts, sign * (v - level0)) for ts, v in path if v is not None]
-            pre = mid(series.as_of(t_a - 3600 * NS))
+            missing_at = _missing_at(data, rung)
+            level0 = _mid_at(series, missing_at, t_a)
+            path = {g: _mid_at(series, missing_at, t_a + g) for g in MECHANISM_GRID_NS}
+            if level0 is None or any(v is None for v in path.values()):
+                skips[f"{ctx.stratum}:{SKIP_GRID_MISSING}"] += 1
+                rows.append({"stratum": ctx.stratum, "sign": sign, "scorable": False})
+                continue
+            by_offset = {g: sign * (v - level0) for g, v in path.items() if v is not None}
+            pre = _mid_at(series, missing_at, t_a - MECHANISM_PRE_NS)
             rows.append(
                 {
                     "stratum": ctx.stratum,
@@ -646,9 +724,11 @@ def _mechanism(data: StationDayData, contexts: Sequence[EventContext]) -> list[d
                     "scorable": True,
                     "day": ctx.climate_day,
                     "abs_dp": abs(delta),
-                    "y60": levels[1][1] if len(levels) > 1 else 0.0,
-                    "y_grid": [v for _, v in levels],
-                    "half_life_s": fraction_of_move(levels, t_a, 0.0),
+                    "y60m": by_offset[X_PRIMARY_NS],
+                    "y_grid": [by_offset[g] for g in MECHANISM_GRID_NS],
+                    "half_life_s": fraction_of_move(
+                        [(t_a + g, by_offset[g]) for g in MECHANISM_GRID_NS], t_a, 0.0
+                    ),
                     "y_pre": None if pre is None else sign * (level0 - pre),
                 }
             )
@@ -670,7 +750,7 @@ def run_stage_0(
     loader: Loader,
     stations: Sequence[str],
     days: Sequence[dt.date],
-    tau: TauReport,
+    tau: TauValues,
     *,
     iterations: int = KILL_BOOTSTRAP_DRAWS,
 ) -> dict[str, Any]:
@@ -680,25 +760,19 @@ def run_stage_0(
     runs = {True: VariantRun(), False: VariantRun()}
     unscorable = {True: 0, False: 0}
     kill_rows: dict[bool, list[KillRow]] = {True: [], False: []}
-    flags: list[MissingClass] = []
     counts: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
     for data in _iter_data(loader, stations, days, counts):
         contexts = build_events(data)
-        mech.extend(_mechanism(data, contexts))
+        count_event_skips(counts, contexts)
+        mech.extend(_mechanism(data, contexts, skips))
         for rule_b in (True, False):
             day_run = VariantRun()
-            score_station_day(
-                data, contexts, primary, tau.tau_primary, day_run, apply_rule_b=rule_b
-            )
+            score_station_day(data, contexts, primary, tau.primary, day_run, apply_rule_b=rule_b)
             merge_run(runs[rule_b], day_run)
             rows, missing_mid = _kill_rows(data, day_run.takes, primary)
             kill_rows[rule_b].extend(rows)
             unscorable[rule_b] += missing_mid
-            if rule_b:
-                flags.extend(
-                    is_missing(data.gaps.get(t.rung_id, ()), data.heartbeat, t.t_dec_ns)
-                    for t in day_run.takes
-                )
     scorable = [r for r in mech if r.get("scorable")]
     half_lives = [r["half_life_s"] for r in scorable if r.get("half_life_s") is not None]
     kill = {
@@ -715,11 +789,14 @@ def run_stage_0(
     median_half_life = statistics.median(half_lives) if half_lives else None
     return {
         "stage": "0",
+        "book_clock": BOOK_CLOCK,
+        "tau": _tau_record(tau),
         "counts": dict(counts),
         "mechanism": {
             "n_events": len(mech),
             "n_scorable": len(scorable),
-            "beta_y60_on_abs_dp": _slope_report(scorable, "y60"),
+            "skipped": dict(sorted(skips.items())),
+            "beta_y60m_on_abs_dp": _slope_report(scorable, "y60m"),
             "pre_release_slope": _slope_report(scorable, "y_pre"),
             "median_half_life_s": median_half_life,
             "too_fast": median_half_life is not None and median_half_life < primary.lag_ns / NS,
@@ -728,7 +805,7 @@ def run_stage_0(
         "kill_cost": kill,
         "census_after_rule_b": runs[True].census.report(),
         "census_before_rule_b": runs[False].census.report(),
-        "missing_attribution": to_plain(missing_attribution(flags)),
+        "missing_attribution": to_plain(missing_attribution(_missing_flags(runs[True].census))),
     }
 
 
@@ -736,7 +813,7 @@ def run_stage_1(
     loader: Loader,
     stations: Sequence[str],
     days: Sequence[dt.date],
-    tau: TauReport,
+    tau: TauValues,
     *,
     iterations: int = KILL_BOOTSTRAP_DRAWS,
 ) -> dict[str, Any]:
@@ -744,15 +821,31 @@ def run_stage_1(
     counts: Counter[str] = Counter()
     for data in _iter_data(loader, stations, days, counts):
         contexts = build_events(data)
+        count_event_skips(counts, contexts)
         for variant in VARIANTS:
             score_station_day(data, contexts, variant, tau_for(variant, tau), runs[variant.name])
     summaries = [summarize(v, runs[v.name], iterations=iterations) for v in VARIANTS]
     selection = select(summaries)
+    by_name = {s.name: s for s in summaries}
+    secondary_p = [by_name[name].p_value for name in ("V1", "V2", "V3", "V4")]
     return {
         "stage": "1",
+        "book_clock": BOOK_CLOCK,
         "framing": STAGE1_FRAMING,
         "counts": dict(counts),
-        "tau": to_plain(tau),
+        "tau": _tau_record(tau),
+        "tests": {
+            "V0": {
+                "alpha": HOLM_ALPHA,
+                "p_value": by_name["V0"].p_value,
+                "reject": by_name["V0"].p_value <= HOLM_ALPHA,
+            },
+            "holm_V1_V4": {
+                "alpha": HOLM_ALPHA,
+                "p_values": secondary_p,
+                "reject": list(secondary_holm(secondary_p)),
+            },
+        },
         "variants": {
             s.name: {
                 **to_plain(s),
@@ -767,3 +860,18 @@ def run_stage_1(
         "selection": to_plain(selection),
         "settlement_pnl": "not_built: report-only; truth opens only via report_settlement()",
     }
+
+
+def _tau_record(tau: TauValues) -> dict[str, Any]:
+    return {"primary": tau.primary, "alt": tau.alt, "source": tau.source}
+
+
+def _missing_flags(census: Census) -> list[MissingClass]:
+    """Entry-side missing classifications, from the census drops (amendment 4)."""
+    gap = census.drops.get(DROP_BOOK_GAP, 0)
+    beat = census.drops.get(DROP_BOOK_HEARTBEAT, 0)
+    return [
+        *[MissingClass(True, "quote_tape_gap")] * gap,
+        *[MissingClass(True, "heartbeat")] * beat,
+        *[MissingClass(False, "present")] * census.takes,
+    ]

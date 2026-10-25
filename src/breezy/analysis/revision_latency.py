@@ -18,7 +18,7 @@ import math
 import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
 from breezy.analysis import nbp_calibration
 from breezy.analysis.nbp_calibration import cluster_bootstrap_draws, percentile_interval
@@ -168,7 +168,7 @@ def assert_guard_4(*, available_at_ns: int, cycle_runtime_ns: int) -> None:
 
 
 def assert_guard_5(
-    search_days: Sequence[dt.date], *, artefact_sha256: str, prereg_text: str
+    search_days: Sequence[dt.date], *, artefact_sha256: str, prereg_text: str | None
 ) -> None:
     if artefact_sha256 != ARTEFACT_SHA256:
         raise LeakGuardError(5, "calibration artefact sha does not match the pin")
@@ -177,6 +177,8 @@ def assert_guard_5(
     holdout_start = nbp_calibration.DEFAULT_SPLITS.holdout_start
     if holdout_start > min(search_days) - dt.timedelta(days=1):
         raise LeakGuardError(5, f"holdout_start {holdout_start} is too late for the search days")
+    if prereg_text is None:  # stage tau runs before the prereg exists; the citation comes later
+        return
     missing = [marker for marker in PROVENANCE_MARKERS if marker not in prereg_text]
     if missing:
         raise LeakGuardError(5, f"provenance citation absent from the prereg: {missing}")
@@ -209,11 +211,6 @@ def assert_guard_7(*, climate_day: dt.date, t_dec_ns: int, pre_stage2: bool) -> 
         raise LeakGuardError(7, f"D {climate_day} is outside the search corpus (excluded)")
     if t_dec_ns >= CUTOFF_C_NS:
         raise LeakGuardError(7, "search t_dec is at or after the cutoff C")
-
-
-def assert_guard_8(entry_fee: object | None) -> None:
-    if entry_fee is None:
-        raise LeakGuardError(8, "entry fee is None (a counted drop, never a take)")
 
 
 def _placebo_violation(
@@ -258,6 +255,11 @@ def placebo_instants(
         for instant in raw
         if _placebo_violation(instant, releases_ns, climate_day, offset_hours) is None
     )
+
+
+def before_cutoff(instant_ns: int) -> bool:
+    """True while a read instant is strictly before the cutoff C."""
+    return instant_ns < CUTOFF_C_NS
 
 
 def assert_guard_9(
@@ -344,10 +346,17 @@ def rung_deltas(
 
 
 def aligned_mark_change(
-    rows: Sequence[BookRow] | BookSeries, *, t_dec_ns: int, x_ns: int
+    rows: Sequence[BookRow] | BookSeries,
+    *,
+    t_dec_ns: int,
+    x_ns: int,
+    missing_at: Callable[[int], bool] | None = None,
 ) -> float | None:
-    """``mid(t_dec + X) - mid(t_dec)`` as-of; None when either mid is missing (amendment 2)."""
+    """``mid(t_dec + X) - mid(t_dec)`` as-of; None when either mid is missing (amendment 2),
+    including an endpoint that is missing by gap or heartbeat (R3), never carried forward."""
     series = rows if isinstance(rows, BookSeries) else BookSeries(rows)
+    if missing_at is not None and (missing_at(t_dec_ns) or missing_at(t_dec_ns + x_ns)):
+        return None
     start, end = mid(series.as_of(t_dec_ns)), mid(series.as_of(t_dec_ns + x_ns))
     if start is None or end is None:
         return None
@@ -421,27 +430,43 @@ class KillResult:
     k_did_hi: float | None
 
 
-def _wider_interval(
-    rows: Sequence[KillRow], value: Callable[[KillRow], float], *, iterations: int, seed: int
-) -> tuple[float, float, float]:
-    """``(mean, lo, hi)``: the wider of the station-day and climate-day clustered intervals."""
+class _Clustered(Protocol):
+    @property
+    def station(self) -> str: ...
 
-    def _mean(drawn: Sequence[KillRow]) -> float:
-        return math.fsum(value(row) for row in drawn) / len(drawn)
+    @property
+    def climate_day(self) -> dt.date: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterInterval:
+    mean: float
+    lo: float
+    hi: float
+    p_one_sided: float
+
+
+def wider_cluster_interval[C: _Clustered](
+    items: Sequence[C], value: Callable[[C], float], *, iterations: int, seed: int
+) -> ClusterInterval:
+    """Mean of ``value`` with the WIDER of the station-day and climate-day clustered 95%
+    intervals; ``p_one_sided`` is the larger share of draws at or below zero (H0: mean <= 0)."""
+
+    def _mean(drawn: Sequence[C]) -> float:
+        return math.fsum(value(item) for item in drawn) / len(drawn)
 
     lows: list[float] = []
     highs: list[float] = []
-    for key in (
-        lambda row: (row.station, row.climate_day),
-        lambda row: row.climate_day,
-    ):
+    ps: list[float] = []
+    for key in (lambda item: (item.station, item.climate_day), lambda item: item.climate_day):
         draws = cluster_bootstrap_draws(
-            rows, statistic=_mean, cluster_key=key, seed=seed, iterations=iterations
+            items, statistic=_mean, cluster_key=key, seed=seed, iterations=iterations
         )
         lo, hi = percentile_interval(draws, alpha=CI_ALPHA)
         lows.append(lo)
         highs.append(hi)
-    return _mean(rows), min(lows), max(highs)
+        ps.append(sum(1 for d in draws if d <= 0.0) / len(draws))
+    return ClusterInterval(_mean(items), min(lows), max(highs), max(ps))
 
 
 def kill_cost(
@@ -464,12 +489,13 @@ def kill_cost(
     missing_rate = n_missing / total if total else 0.0
     k_raw = k_raw_lo = k_raw_hi = k_did = k_did_hi = None
     if rows:
-        k_raw, k_raw_lo, k_raw_hi = _wider_interval(
+        raw = wider_cluster_interval(
             rows, lambda row: row.y_raw - row.cost_e, iterations=iterations, seed=seed
         )
+        k_raw, k_raw_lo, k_raw_hi = raw.mean, raw.lo, raw.hi
         with_placebos = [row for row in rows if row.placebo_ys]
         if with_placebos:
-            k_did, _lo, k_did_hi = _wider_interval(
+            did = wider_cluster_interval(
                 with_placebos,
                 lambda row: (
                     row.y_raw - math.fsum(row.placebo_ys) / len(row.placebo_ys) - row.cost_e
@@ -477,6 +503,7 @@ def kill_cost(
                 iterations=iterations,
                 seed=seed,
             )
+            k_did, k_did_hi = did.mean, did.hi
     if (
         n < KILL_MIN_EVENTS
         or len(days) < KILL_MIN_CLUSTERS
@@ -580,6 +607,7 @@ class VariantSummary:
     hit_rate: float
     mean_over_sd: float
     placebo_point: float
+    n_placebo: int
     p_value: float
     leak_ok: bool
 
@@ -590,6 +618,7 @@ class SelectionResult:
     chosen: tuple[str, ...]
     stage2_go: bool
     audit_names: tuple[str, ...]
+    flags: tuple[str, ...] = ()
 
 
 def audit_pending(summary: VariantSummary) -> bool:
@@ -609,23 +638,38 @@ def qualifies(summary: VariantSummary) -> bool:
         and summary.n_climate >= QUALIFY_MIN_CLUSTERS
         and summary.missing_exit_rate <= QUALIFY_MAX_MISSING_EXIT
         and summary.leak_ok
+        and summary.n_placebo > 0
         and summary.placebo_point <= QUALIFY_PLACEBO_RATIO * summary.point
     )
 
 
-def select(summaries: Sequence[VariantSummary]) -> SelectionResult:
-    """Frozen selection rule: V0 plus the best qualifying secondary, else the top two."""
-    pending = tuple(s.name for s in summaries if audit_pending(s))
-    eligible = [s for s in summaries if s.name not in pending and qualifies(s)]
+def _rank(eligible: Sequence[VariantSummary]) -> tuple[VariantSummary, ...]:
     primary = [s for s in eligible if s.primary]
     secondaries = sorted((s for s in eligible if not s.primary), key=lambda s: (-s.lo, s.name))
-    ranked = [*primary, *secondaries[:1]] if primary else secondaries[:2]
+    return tuple([*primary, *secondaries[:1]] if primary else secondaries[:2])
+
+
+def select(summaries: Sequence[VariantSummary]) -> SelectionResult:
+    """Frozen selection rule: V0 plus the best qualifying secondary, else the top two.
+
+    A pending audit that could change the ranking (it would qualify but for the audit hold)
+    withholds the selection: the result is AUDIT-PENDING with nothing chosen."""
+    pending = tuple(s.name for s in summaries if audit_pending(s))
+    flags = tuple(f"{s.name}:NO_PLACEBO_EVIDENCE" for s in summaries if s.n_placebo == 0)
+    eligible = [s for s in summaries if s.name not in pending and qualifies(s)]
+    ranked = _rank(eligible)
+    could_change = [s for s in summaries if s.name in pending and qualifies(s)]
+    if could_change and {s.name for s in _rank([*eligible, *could_change])} != {
+        s.name for s in ranked
+    }:
+        return SelectionResult("AUDIT-PENDING", (), False, pending, flags)
     if ranked:
         return SelectionResult(
             "SELECTED",
             tuple(s.name for s in ranked),
             ranked[0].point >= STAGE2_MIN_NET_USD,
             pending,
+            flags,
         )
     status = "AUDIT-PENDING" if pending else "SCREEN-FAIL"
-    return SelectionResult(status, (), False, pending)
+    return SelectionResult(status, (), False, pending, flags)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import bisect
 import datetime as dt
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, NamedTuple
 
@@ -87,6 +87,7 @@ class ExitBid:
     ts_ns: int | None
     missing_exit: bool
     filled_inside_window: bool
+    n_skipped_missing: int = 0
 
 
 class SignedBands(NamedTuple):
@@ -192,14 +193,25 @@ def is_missing(gaps: Sequence[GapSpan], heartbeat_ts: Sequence[int], t_ns: int) 
     return MissingClass(True, REASON_HEARTBEAT)
 
 
-def first_bid_in_window(rows: Iterable[BookRow] | BookSeries, t_exit_ns: int, w_ns: int) -> ExitBid:
+def first_bid_in_window(
+    rows: Iterable[BookRow] | BookSeries,
+    t_exit_ns: int,
+    w_ns: int,
+    *,
+    missing_at: Callable[[int], bool] | None = None,
+) -> ExitBid:
     """First instant in ``[t_exit, t_exit + W]`` with a bid: ``t_exit`` itself, then each later
-    snapshot's ``ts_init``. No bid anywhere in the window gives ``bid = 0`` flagged missing."""
+    snapshot's ``ts_init``. A candidate instant that is missing by R3 (``missing_at``) is skipped,
+    never carried forward. No bid anywhere in the window gives ``bid = 0`` flagged missing."""
     series = _series(rows)
-    at_exit = series.as_of(t_exit_ns)
-    if at_exit is not None and not math.isnan(at_exit.bid):
-        return ExitBid(at_exit.bid, t_exit_ns, False, False)
-    for row in series.after_through(t_exit_ns, t_exit_ns + w_ns):
-        if not math.isnan(row.bid):
-            return ExitBid(row.bid, row.ts_init, False, True)
-    return ExitBid(0.0, None, True, False)
+    skipped = 0
+    candidates: list[tuple[int, BookRow | None]] = [(t_exit_ns, series.as_of(t_exit_ns))]
+    candidates += [(r.ts_init, r) for r in series.after_through(t_exit_ns, t_exit_ns + w_ns)]
+    for instant, row in candidates:
+        if row is None or math.isnan(row.bid):
+            continue
+        if missing_at is not None and missing_at(instant):
+            skipped += 1
+            continue
+        return ExitBid(row.bid, instant, False, instant != t_exit_ns, skipped)
+    return ExitBid(0.0, None, True, False, skipped)

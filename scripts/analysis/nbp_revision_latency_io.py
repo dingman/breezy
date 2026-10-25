@@ -1,36 +1,85 @@
 """Real-data loader for the LAT-1 scorer. Never imported by the tests; never run on real data
 until the prereg is frozen (every stage refuses while ``PREREG_SHA256`` is UNFROZEN).
 
-One station-day is loaded at a time. Tape time is the tape's ``ts_event`` column (the only clock
-``read_top_of_book`` exposes), used as the book clock; ``ts_init`` is not read (plan deviation).
+One station-day is loaded at a time. The book clock is the tape's ``ts_init`` (receipt time): the
+Depth10 parquet is read directly with pyarrow, scoped to one instrument directory, because
+``release_timing_b0.read_top_of_book`` exposes only ``ts_event``. Rows received at or after the
+cutoff C are never loaded.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from collections import defaultdict
-from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
+import numpy as np
+import pyarrow.parquet as pq
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 from breezy.adapters.polymarket_us.symbology import parse_weather_slug, slug_closed_interval
-from breezy.analysis.revision_latency import ARTEFACT_SHA256, chain_for
+from breezy.analysis.revision_latency import (
+    ARTEFACT_SHA256,
+    before_cutoff,
+    chain_for,
+    pinned_cycles,
+)
 from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
 from breezy.strategy.ladder_ev.quantile_density import Rung
-from breezy.strategy.no_ladder_maker.pno_store import build_state, read_pinned, site
+from breezy.strategy.no_ladder_maker.pno_store import build_state, site
 from breezy.strategy.weather_common.revision_gate import BookRow, BookSeries, GapSpan
-from scripts.analysis.nbp_revision_latency_core import StationDayData
+from scripts.analysis.nbp_revision_latency_core import Loader, StationDayData
 from scripts.analysis.p2_nbp_ask_murphy import _NbpSource
-from scripts.analysis.release_timing_b0 import DEPTH_DIR, parse_instrument, read_top_of_book
+from scripts.analysis.release_timing_b0 import DEPTH_DIR, parse_instrument
 
 DEFAULT_DERIVED: Final[Path] = Path.home() / ".local/share/breezy/derived/nbp"
 DEFAULT_TAPE: Final[Path] = Path("/mnt/storage/breezy/catalog/quote_tape/polymarket_us")
 _VENUE_SUFFIX: Final[str] = ".POLYMARKET_US"
 
-Loader = Callable[[str, dt.date], StationDayData | None]
+_FIXED_SCALE: Final[float] = 1e16
+_BATCH_ROWS: Final[int] = 65_536
+_COLUMNS: Final[list[str]] = [
+    "ts_init",
+    "bid_price_0",
+    "bid_size_0",
+    "ask_price_0",
+    "ask_size_0",
+]
+
+
+def _price_or_nan(price_col: object, size_col: object) -> np.ndarray:
+    """A fixed_size_binary(16) price column as floats; NaN where the size is zero (empty side)."""
+
+    def _words(array: object) -> np.ndarray:
+        start = array.offset * 2  # type: ignore[attr-defined]
+        flat = np.frombuffer(array.buffers()[1], dtype="<u8")  # type: ignore[attr-defined]
+        return flat[start : start + len(array) * 2].reshape(-1, 2)  # type: ignore[arg-type]
+
+    prices, sizes = _words(price_col), _words(size_col)
+    present = (sizes[:, 0] != 0) | (sizes[:, 1] != 0)
+    return np.where(present, prices[:, 0].astype(np.float64) / _FIXED_SCALE, np.nan)
+
+
+def read_l0_book(instrument_dir: Path) -> list[BookRow]:
+    """Level-0 rows of ONE instrument directory on the ``ts_init`` clock, ascending.
+
+    Rows received at or after the cutoff C are dropped. An empty side is NaN."""
+    rows: list[BookRow] = []
+    for path in sorted(instrument_dir.glob("*.parquet")):
+        with pq.ParquetFile(path) as handle:
+            for batch in handle.iter_batches(batch_size=_BATCH_ROWS, columns=_COLUMNS):
+                ts = batch.column("ts_init").to_numpy(zero_copy_only=False)
+                bid = _price_or_nan(batch.column("bid_price_0"), batch.column("bid_size_0"))
+                ask = _price_or_nan(batch.column("ask_price_0"), batch.column("ask_size_0"))
+                rows.extend(
+                    BookRow(int(t), float(b), float(a))
+                    for t, b, a in zip(ts, bid, ask, strict=True)
+                    if before_cutoff(int(t))
+                )
+    rows.sort(key=lambda row: row.ts_init)
+    return rows
 
 
 def _rung_of(name: str) -> Rung | None:
@@ -76,20 +125,19 @@ def make_loader(
         rungs = {r.rung_id: (name, r) for name in names if (r := _rung_of(name)) is not None}
         if not rungs:
             return None
-        pinned = read_pinned(source, placed.icao, day)
+        pinned = pinned_cycles(source, placed.icao, day)
         chain = chain_for(build_state(pinned.rows, placed.offset_hours, "none"), day)
         source.clear()
         books: dict[str, BookSeries] = {}
         heartbeat: set[int] = set()
+        listed_at: dict[str, int] = {}
         if with_books:
             for rung_id, (name, _rung) in rungs.items():
-                top = read_top_of_book(depth_dir / name)
-                rows = [
-                    BookRow(int(t), float(b), float(a))
-                    for t, b, a in zip(top.ts, top.bid, top.ask, strict=True)
-                ]
+                rows = read_l0_book(depth_dir / name)
                 books[rung_id] = BookSeries(rows)
                 heartbeat.update(row.ts_init for row in rows)
+                if rows:
+                    listed_at[rung_id] = rows[0].ts_init
         return StationDayData(
             station=station,
             climate_day=day,
@@ -101,6 +149,7 @@ def make_loader(
             books=books,
             gaps={rid: gaps.get(name, ()) for rid, (name, _r) in rungs.items()},
             heartbeat=tuple(sorted(heartbeat)),
+            listed_at=listed_at,
         )
 
     return load

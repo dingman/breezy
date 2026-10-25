@@ -24,6 +24,7 @@ from breezy.analysis.release_timing import (
 )
 from breezy.analysis.revision_latency import (
     ARTEFACT_SHA256,
+    CUTOFF_C_NS,
     KILL_BOOTSTRAP_DRAWS,
     STAGE1_FRAMING,
     STAGE2_MIN_NET_USD,
@@ -38,11 +39,11 @@ from breezy.analysis.revision_latency import (
     assert_guard_4,
     assert_guard_5,
     assert_guard_7,
-    assert_guard_8,
     assert_guard_9,
     assert_guard_10,
     assert_guard_11,
     audit_pending,
+    before_cutoff,
     chain_for,
     decision_record_sha256,
     derive_tau,
@@ -57,6 +58,7 @@ from breezy.analysis.revision_latency import (
     rung_deltas,
     secondary_holm,
     select,
+    wider_cluster_interval,
 )
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.ladder_ev.forecast_state import (
@@ -127,6 +129,7 @@ def _summary(
     hit_rate: float = 0.5,
     mean_over_sd: float = 0.5,
     placebo_point: float = 0.0,
+    n_placebo: int = 5,
     p_value: float = 0.20,
     leak_ok: bool = True,
 ) -> VariantSummary:
@@ -142,6 +145,7 @@ def _summary(
         hit_rate=hit_rate,
         mean_over_sd=mean_over_sd,
         placebo_point=placebo_point,
+        n_placebo=n_placebo,
         p_value=p_value,
         leak_ok=leak_ok,
     )
@@ -337,9 +341,6 @@ def test_guards_1_through_4_and_7_through_11_raise_on_a_crafted_violation() -> N
             pre_stage2=True,
         )
     assert guard_7.value.guard == 7
-    with pytest.raises(LeakGuardError) as guard_8:
-        assert_guard_8(None)
-    assert guard_8.value.guard == 8
     with pytest.raises(LeakGuardError) as guard_9:
         assert_guard_9(
             instant_ns=_ns(_DAY, 8),
@@ -560,3 +561,58 @@ def test_chain_for_and_pinned_cycles_use_the_store_helpers(tmp_path: object) -> 
 
     pinned = pinned_cycles(_Source(), "KLAX", day)
     assert len(pinned.missing) == 3
+
+
+def test_aligned_mark_change_is_none_when_an_endpoint_is_missing_by_gap() -> None:
+    t_dec = 10_000
+    rows = (BookRow(t_dec - 1, 0.48, 0.52), BookRow(t_dec + 60 * NS - 1, 0.54, 0.56))
+    assert aligned_mark_change(rows, t_dec_ns=t_dec, x_ns=60 * NS) == pytest.approx(0.05)
+    gap_at_end = lambda t: t >= t_dec + 60 * NS
+    assert aligned_mark_change(rows, t_dec_ns=t_dec, x_ns=60 * NS, missing_at=gap_at_end) is None
+
+
+def test_no_placebo_evidence_means_the_variant_does_not_qualify_and_is_flagged() -> None:
+    bare = _summary("V0", primary=True, point=0.02, lo=0.01, n_placebo=0)
+    assert not qualifies(bare)
+    assert qualifies(_summary("V0", primary=True, point=0.02, lo=0.01, n_placebo=1))
+    result = select((bare, _summary("V1", lo=0.01)))
+    assert result.chosen == ("V1",)
+    assert result.flags == ("V0:NO_PLACEBO_EVIDENCE",)
+
+
+def test_a_pending_audit_that_could_change_the_ranking_withholds_the_selection() -> None:
+    pending = _summary("V0", primary=True, point=0.05, lo=0.02)
+    others = (_summary("V1", lo=0.02), _summary("V2", lo=0.01))
+    held = select((pending, *others))
+    assert held.status == "AUDIT-PENDING"
+    assert held.chosen == ()
+    assert held.stage2_go is False
+    assert held.audit_names == ("V0",)
+    # An audit trigger on a variant that would not qualify anyway cannot change the ranking.
+    harmless = _summary("V0", primary=True, point=0.05, lo=0.02, placebo_point=0.04)
+    free = select((harmless, *others))
+    assert free.status == "SELECTED"
+    assert free.chosen == ("V1", "V2")
+
+
+def test_wider_cluster_interval_is_shared_and_reports_a_one_sided_p() -> None:
+    rows = [
+        KillRow("LAX", dt.date(2026, 9, 1) + dt.timedelta(days=i), 0.10, (), 0.0, False)
+        for i in range(20)
+    ]
+    got = wider_cluster_interval(rows, lambda r: r.y_raw, iterations=50, seed=1)
+    assert got.mean == pytest.approx(0.10)
+    assert got.lo == pytest.approx(0.10) and got.hi == pytest.approx(0.10)
+    assert got.p_one_sided == 0.0
+
+
+def test_guard_5_skips_only_the_citation_when_no_prereg_exists_yet() -> None:
+    days = (dt.date(2026, 9, 18),)
+    assert_guard_5(days, artefact_sha256=ARTEFACT_SHA256, prereg_text=None)
+    with pytest.raises(LeakGuardError):
+        assert_guard_5(days, artefact_sha256="0" * 64, prereg_text=None)
+
+
+def test_reads_at_or_after_the_cutoff_are_rejected() -> None:
+    assert before_cutoff(CUTOFF_C_NS - 1) is True
+    assert before_cutoff(CUTOFF_C_NS) is False

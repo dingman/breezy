@@ -6,17 +6,21 @@ while ``PREREG_SHA256`` is UNFROZEN, and the exit fixture fills INSIDE the W win
 
 from __future__ import annotations
 
+import argparse
 import ast
 import datetime as dt
 import hashlib
 import math
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import scripts.analysis.nbp_revision_latency as cli
 import scripts.analysis.nbp_revision_latency_core as core
-from breezy.analysis.revision_latency import LeakGuardError, TauReport
+from breezy.analysis.revision_latency import LeakGuardError
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
 from breezy.strategy.ladder_ev.quantile_density import Rung
 from breezy.strategy.no_ladder_maker.pno_store import VectorChain
@@ -96,7 +100,11 @@ def _data(
         tuple(v.available_at_ns for v in vectors),
     )
     series = BookSeries(_book_rows() if rows is None else rows)
-    beat = (_T_DEC - 30 * NS, _T_EXIT, _T_EXIT + 5 * 60 * NS) if heartbeat is None else heartbeat
+    beat = (
+        (cur_avail - 1, cur_avail + core.L_PRIMARY_NS - 30 * NS, _T_EXIT, _T_EXIT + 5 * 60 * NS)
+        if heartbeat is None
+        else heartbeat
+    )
     data = core.StationDayData(
         station="LAX",
         climate_day=_DAY,
@@ -265,7 +273,7 @@ def test_a_late_release_whose_exit_window_leaves_the_permit_is_a_permit_drop() -
         [BookRow(avail - 1, 0.30, 0.35), BookRow(avail + 200 * NS, 0.40, 0.45)],
         cur_avail=avail,
         cur_runtime=runtime,
-        heartbeat=(avail + 250 * NS,),
+        heartbeat=(avail - 1, avail + 250 * NS),
     )
     assert _score(late, _ctx(cur)) == core.DROP_PERMIT
 
@@ -298,17 +306,49 @@ def test_census_identity_holds_end_to_end_and_a_broken_census_is_fatal() -> None
     assert raised.value.guard == 10
 
 
-def test_the_pre_release_placebo_take_is_scored_look_ahead_and_diagnostic() -> None:
+def _placebo_rows() -> list[BookRow]:
     avail = _CUR_AVAIL
-    rows = _book_rows() + [
+    return _book_rows() + [
         BookRow(avail - 90 * 60 * NS, 0.20, 0.25),
         BookRow(avail - 80 * 60 * NS, 0.22, 0.26),
     ]
-    data, cur = _data(rows)
+
+
+def _placebo_heartbeat() -> tuple[int, ...]:
+    shifted = _T_DEC - core.PRE_RELEASE_SHIFT_NS
+    points = {
+        _CUR_AVAIL - core.PRE_RELEASE_SHIFT_NS - 1,
+        _CUR_AVAIL - 1,
+        shifted - 30 * NS,
+        shifted + core.X_PRIMARY_NS,
+        _T_DEC - 30 * NS,
+        _T_EXIT,
+        _T_EXIT + 5 * 60 * NS,
+    }
+    return tuple(sorted(points))
+
+
+def test_the_pre_release_placebo_take_is_scored_look_ahead_and_diagnostic() -> None:
+    data, cur = _data(_placebo_rows(), heartbeat=_placebo_heartbeat())
     run = core.VariantRun()
     core.score_station_day(data, [_ctx(cur)], core.VARIANTS[0], 0.13, run, apply_rule_b=False)
     assert run.census.takes == 1
     assert len(run.takes) == 1
+    assert len(run.placebo_takes) == 1
+    placebo = run.placebo_takes[0]
+    assert placebo.t_dec_ns == _T_DEC - core.PRE_RELEASE_SHIFT_NS
+    assert placebo.ask == pytest.approx(0.25)
+    assert placebo.bid == pytest.approx(0.22)
+    # 0.22 - 0.25 - fee(0.25)=0.01 - fee(0.22)=0.01
+    assert placebo.pnl == pytest.approx(-0.05)
+
+
+def test_a_dropped_pre_release_placebo_leaves_no_placebo_take() -> None:
+    data, cur = _data()
+    run = core.VariantRun()
+    core.score_station_day(data, [_ctx(cur)], core.VARIANTS[0], 0.13, run, apply_rule_b=False)
+    assert len(run.takes) == 1
+    assert run.placebo_takes == []
 
 
 # ---------------------------------------------------------------------------- stages
@@ -323,7 +363,7 @@ def test_stage_1_and_stage_0_run_end_to_end_on_synthetic_books(
 ) -> None:
     _patched_deltas(monkeypatch)
     data, _cur = _data()
-    tau = TauReport(5, 0.1, 0.2, 0.13, 0.18, True, True, 3, 2)
+    tau = core.TauValues(0.13, 0.18, "test")
 
     def loader(station: str, day: dt.date) -> core.StationDayData | None:
         return data if (station, day) == ("LAX", _DAY) else None
@@ -337,7 +377,8 @@ def test_stage_1_and_stage_0_run_end_to_end_on_synthetic_books(
         census = variant["census"]
         assert census["population"] == census["takes"] + sum(census["drops"].values()), name
     assert report["variants"]["V0"]["census"]["takes"] == 1
-    assert report["selection"]["status"] in {"SCREEN-FAIL", "AUDIT-PENDING", "SELECTED"}
+    assert report["selection"]["status"] == "AUDIT-PENDING"  # one lucky take trips an audit trigger
+    assert report["selection"]["chosen"] == ()
 
     stage0 = core.run_stage_0(loader, ("LAX",), (_DAY,), tau, iterations=20)
     assert stage0["census_after_rule_b"]["takes"] == 1
@@ -363,24 +404,105 @@ def test_stage_tau_uses_only_19z_cycles_available_before_the_freeze(
 # ----------------------------------------------------------------------- pins and CLI
 
 
-def test_every_stage_refuses_while_the_prereg_pin_is_unfrozen(tmp_path: Path) -> None:
+def _args(stage: str, start: str, end: str, **extra: object) -> argparse.Namespace:
+    base: dict[str, object] = {
+        "stage": stage,
+        "start": dt.date.fromisoformat(start),
+        "end": dt.date.fromisoformat(end),
+        "prereg": None,
+        "selection": None,
+        "artefact": None,
+        "derived_root": None,
+        "tape_root": None,
+        "output": None,
+        "freeze_utc": None,
+        "tau_primary": None,
+        "tau_alt": None,
+    }
+    base.update(extra)
+    return argparse.Namespace(**base)
+
+
+def test_stages_0_1_2_refuse_while_the_prereg_pin_is_unfrozen(tmp_path: Path) -> None:
     assert cli.PREREG_SHA256 == cli.UNFROZEN
     prereg = tmp_path / "prereg.md"
     prereg.write_text("DEFAULT_SPLITS holdout_start", encoding="utf-8")
-    for stage in ("tau", "0", "1", "2"):
-        argv = [
-            "--stage",
-            stage,
-            "--start",
-            "2026-10-13",
-            "--end",
-            "2026-10-26",
-            "--prereg",
-            str(prereg),
-        ]
-        assert cli.main(argv) == 2, stage
+    for stage in ("0", "1", "2"):
+        argv = ["--stage", stage, "--start", "2026-10-13", "--end", "2026-10-26"]
+        assert cli.main([*argv, "--prereg", str(prereg)]) == 2, stage
     with pytest.raises(cli.PinRefused):
         cli.require_prereg(prereg)
+
+
+def test_stage_tau_is_exempt_from_the_prereg_pin_but_keeps_the_confirm_day_refusal() -> None:
+    assert cli.PREREG_SHA256 == cli.UNFROZEN
+    ok = _args(
+        "tau",
+        "2026-10-13",
+        "2026-10-26",
+        artefact=Path("a.json"),
+        freeze_utc="2026-10-26T00:00:00+00:00",
+    )
+    assert cli.preflight(ok) is None  # no prereg text yet; the pin is not consulted
+    late = _args(
+        "tau",
+        "2026-10-20",
+        "2026-10-28",
+        artefact=Path("a.json"),
+        freeze_utc="2026-10-26T00:00:00+00:00",
+    )
+    with pytest.raises(cli.ConfirmDayRefused):
+        cli.preflight(late)
+    for stage in ("0", "1"):
+        with pytest.raises(cli.PinRefused):
+            cli.preflight(_args(stage, "2026-10-13", "2026-10-26"))
+
+
+def test_preflight_refuses_naive_freeze_missing_artefact_and_tau_below_the_floors(
+    tmp_path: Path,
+) -> None:
+    artefact = tmp_path / "a.json"
+    artefact.write_text("{}", encoding="utf-8")
+    common = {"artefact": artefact}
+    with pytest.raises(ValueError, match="tz-aware"):
+        cli.preflight(
+            _args("tau", "2026-10-13", "2026-10-26", freeze_utc="2026-10-26T00:00:00", **common)
+        )
+    with pytest.raises(ValueError, match="freeze"):
+        cli.preflight(_args("tau", "2026-10-13", "2026-10-26", **common))
+    with pytest.raises(ValueError, match="artefact"):
+        cli.preflight(
+            _args("tau", "2026-10-13", "2026-10-26", freeze_utc="2026-10-26T00:00:00+00:00")
+        )
+
+
+def test_tau_values_below_the_floors_are_refused_for_stages_0_and_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prereg = tmp_path / "prereg.md"
+    prereg.write_text("DEFAULT_SPLITS holdout_start", encoding="utf-8")
+    monkeypatch.setattr(cli, "PREREG_SHA256", hashlib.sha256(prereg.read_bytes()).hexdigest())
+    artefact = tmp_path / "a.json"
+    artefact.write_text("{}", encoding="utf-8")
+    base = {"prereg": prereg, "artefact": artefact}
+    for primary, alt in ((0.05, 0.18), (0.13, 0.10), (None, 0.18)):
+        with pytest.raises(ValueError, match="tau"):
+            cli.preflight(
+                _args("1", "2026-10-13", "2026-10-26", tau_primary=primary, tau_alt=alt, **base)
+            )
+
+
+def test_main_turns_leak_guard_and_value_errors_into_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = ["--stage", "tau", "--start", "2026-10-13", "--end", "2026-10-26"]
+    for raised in (LeakGuardError(5, "x"), ValueError("empty")):
+
+        def _boom(*_a: object, _raised: Exception = raised) -> None:
+            raise _raised
+
+        monkeypatch.setattr(cli, "preflight", _boom)
+        assert cli.main(argv) == 2
 
 
 def test_a_mismatched_prereg_sha_is_refused_and_a_matching_one_returns_the_text(
@@ -465,3 +587,324 @@ def test_markout_fee_comes_from_the_p2_cash_taker_fee() -> None:
     from scripts.analysis.p2_nbp_ask_murphy import cash_taker_fee_usd
 
     assert vars(core)["cash_taker_fee_usd"] is cash_taker_fee_usd
+
+
+# ------------------------------------------------------------------ review fixes (HIGH/MEDIUM)
+
+
+def _hb(start: int, stop: int, step: int = 120 * NS) -> tuple[int, ...]:
+    return tuple(range(start, stop, step))
+
+
+def test_every_stage_report_names_the_book_clock_ts_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patched_deltas(monkeypatch)
+    data, _cur = _data()
+    tau = core.TauValues(0.13, 0.18, "test")
+
+    def loader(_s: str, _d: dt.date) -> core.StationDayData:
+        return data
+
+    assert (
+        core.run_stage_tau(loader, ("LAX",), (_DAY,), freeze_ns=_CUR_AVAIL + 1)["book_clock"]
+        == "ts_init"
+    )
+    assert (
+        core.run_stage_0(loader, ("LAX",), (_DAY,), tau, iterations=10)["book_clock"] == "ts_init"
+    )
+    assert (
+        core.run_stage_1(loader, ("LAX",), (_DAY,), tau, iterations=10)["book_clock"] == "ts_init"
+    )
+
+
+def _write_depth(path: Path, rows: list[tuple[int, int, float | None, float | None]]) -> None:
+    """rows: (ts_event, ts_init, bid, ask); None = empty side (size 0)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def price(value: float | None) -> bytes:
+        return round((value or 0.0) * 1e16).to_bytes(8, "little") + bytes(8)
+
+    def size(value: float | None) -> bytes:
+        return (0 if value is None else 1).to_bytes(8, "little") + bytes(8)
+
+    table = pa.table(
+        {
+            "ts_event": pa.array([r[0] for r in rows], pa.uint64()),
+            "ts_init": pa.array([r[1] for r in rows], pa.uint64()),
+            "bid_price_0": pa.array([price(r[2]) for r in rows], pa.binary(16)),
+            "bid_size_0": pa.array([size(r[2]) for r in rows], pa.binary(16)),
+            "ask_price_0": pa.array([price(r[3]) for r in rows], pa.binary(16)),
+            "ask_size_0": pa.array([size(r[3]) for r in rows], pa.binary(16)),
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def test_the_loader_reads_ts_init_so_a_row_received_after_t_dec_is_never_used(
+    tmp_path: Path,
+) -> None:
+    from scripts.analysis.nbp_revision_latency_io import read_l0_book
+
+    t_dec = 2_000 * NS
+    _write_depth(
+        tmp_path / "inst" / "a.parquet",
+        [
+            (t_dec - 10 * NS, t_dec - 5 * NS, 0.40, 0.44),
+            (t_dec - 10 * NS, t_dec + 10 * NS, 0.90, 0.95),  # ts_event < t_dec < ts_init
+            (t_dec - 1 * NS, t_dec + 20 * NS, None, 0.60),
+        ],
+    )
+    book = read_l0_book(tmp_path / "inst")
+    assert [row.ts_init for row in book] == [t_dec - 5 * NS, t_dec + 10 * NS, t_dec + 20 * NS]
+    series = BookSeries(book)
+    got = series.as_of(t_dec)
+    assert got is not None and got.ask == pytest.approx(0.44)
+    assert math.isnan(book[2].bid) and book[2].ask == pytest.approx(0.60)
+
+
+def test_the_loader_drops_rows_received_at_or_after_the_cutoff(tmp_path: Path) -> None:
+    from breezy.analysis.revision_latency import CUTOFF_C_NS
+    from scripts.analysis.nbp_revision_latency_io import read_l0_book
+
+    _write_depth(
+        tmp_path / "inst" / "a.parquet",
+        [(CUTOFF_C_NS - 2, CUTOFF_C_NS - 1, 0.4, 0.5), (CUTOFF_C_NS - 1, CUTOFF_C_NS, 0.4, 0.5)],
+    )
+    assert [r.ts_init for r in read_l0_book(tmp_path / "inst")] == [CUTOFF_C_NS - 1]
+
+
+def test_an_exit_during_a_recorder_gap_is_not_carried_forward_and_counts_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    gap = GapSpan(_T_EXIT - NS, _T_EXIT + W_NS + NS, True)
+    data, cur = _data(
+        [BookRow(_CUR_AVAIL - 1, 0.30, 0.35), BookRow(_T_DEC - 60 * NS, 0.40, 0.45)],
+        gaps=(gap,),
+        heartbeat=(_CUR_AVAIL - 1, _T_DEC - 30 * NS, _T_EXIT, _T_EXIT + 5 * 60 * NS),
+    )
+    take = _score(data, _ctx(cur))
+    assert isinstance(take, core.Take)
+    assert take.missing_exit is True  # the pre-gap bid .40 is NOT the exit
+    assert take.bid == 0.0
+    assert take.y_raw is None  # the t_exit mid is missing by gap, not carried forward
+    tau = core.TauValues(0.13, 0.18, "test")
+    report = _stage0_report(data, tau)
+    assert report["kill_cost"]["after_rule_b"]["missing_exit_rate"] == 1.0
+
+
+def _stage0_report(data: core.StationDayData, tau: core.TauValues) -> dict[str, Any]:
+    def loader(_s: str, _d: dt.date) -> core.StationDayData:
+        return data
+
+    return core.run_stage_0(loader, ("LAX",), (_DAY,), tau, iterations=10)
+
+
+def test_the_rule_b_reference_ask_is_not_used_when_missing_by_gap() -> None:
+    gap = GapSpan(_CUR_AVAIL - NS, _CUR_AVAIL + NS, True)
+    data, cur = _data(gaps=(gap,))
+    assert _score(data, _ctx(cur)) == core.DROP_RULE_B_REFERENCE
+
+
+def test_y60m_is_the_sixty_minute_move_not_the_one_minute_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    t_a = _CUR_AVAIL
+    rows = [
+        BookRow(t_a - 1, 0.28, 0.32),  # mid 0.30
+        BookRow(t_a + 30 * NS, 0.30, 0.32),  # mid 0.31: the 60 s move is only +0.01
+        BookRow(t_a + 3000 * NS, 0.40, 0.44),  # mid 0.42: the 3600 s move is +0.12
+    ]
+    data, cur = _data(rows, heartbeat=_hb(t_a - 600 * NS, t_a + 11_000 * NS))
+    mech = core._mechanism(data, [_ctx(cur)], Counter())
+    row = next(r for r in mech if r["sign"] == 1.0)
+    assert row["scorable"] is True
+    assert row["y60m"] == pytest.approx(0.12)
+    assert "y60" not in row
+    assert row["y_grid"][1] == pytest.approx(0.01)  # the 60 s point still exists on the grid
+
+
+def test_mechanism_grid_points_in_a_gap_are_unscorable_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    t_a = _CUR_AVAIL
+    gap = GapSpan(t_a + 3500 * NS, t_a + 3700 * NS, True)  # covers the 3600 s grid point
+    data, cur = _data(
+        [BookRow(t_a - 1, 0.28, 0.32), BookRow(t_a + 30 * NS, 0.30, 0.34)],
+        gaps=(gap,),
+        heartbeat=_hb(t_a - 600 * NS, t_a + 11_000 * NS),
+    )
+    skips: Counter[str] = Counter()
+    mech = core._mechanism(data, [_ctx(cur)], skips)
+    assert all(r["scorable"] is False for r in mech)
+    assert skips["19Z_D-1:grid_missing"] == 1  # r+ reads the gapped rung
+    assert skips["19Z_D-1:no_book"] == 1  # r- has no tape book in the fixture
+
+
+def test_mechanism_reads_at_or_after_the_cutoff_are_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    t_a = _CUR_AVAIL
+    monkeypatch.setattr(core, "before_cutoff", lambda t: t < t_a + 600 * NS)
+    data, cur = _data(
+        [BookRow(t_a - 1, 0.28, 0.32)], heartbeat=_hb(t_a - 600 * NS, t_a + 11_000 * NS)
+    )
+    skips: Counter[str] = Counter()
+    mech = core._mechanism(data, [_ctx(cur)], skips)
+    assert all(r["scorable"] is False for r in mech)
+    assert skips["19Z_D-1:after_cutoff"] >= 1
+
+
+def test_stage_1_records_the_tau_source_without_fabricated_zero_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    data, _cur = _data()
+    report = core.run_stage_1(
+        lambda _s, _d: data,
+        ("LAX",),
+        (_DAY,),
+        core.TauValues(0.14, 0.2, "prereg-tau-report"),
+        iterations=10,
+    )
+    assert report["tau"] == {"primary": 0.14, "alt": 0.2, "source": "prereg-tau-report"}
+
+
+def test_stage_1_reports_the_v0_test_and_holm_over_v1_to_v4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    data, _cur = _data()
+    report = core.run_stage_1(
+        lambda _s, _d: data, ("LAX",), (_DAY,), core.TauValues(0.13, 0.18, "t"), iterations=10
+    )
+    tests = report["tests"]
+    assert tests["V0"]["alpha"] == 0.025
+    assert tests["V0"]["reject"] == (tests["V0"]["p_value"] <= 0.025)
+    pvals = [report["variants"][n]["p_value"] for n in ("V1", "V2", "V3", "V4")]
+    from breezy.analysis.revision_latency import secondary_holm
+
+    assert tests["holm_V1_V4"]["reject"] == list(secondary_holm(pvals))
+    assert tests["holm_V1_V4"]["p_values"] == pvals
+
+
+def test_summary_flags_no_placebo_evidence_and_computes_leak_ok_from_the_takes() -> None:
+    data, cur = _data()
+    run = core.VariantRun()
+    core.score_station_day(data, [_ctx(cur)], core.VARIANTS[0], 0.13, run, apply_rule_b=False)
+    summary = core.summarize(core.VARIANTS[0], run, iterations=10)
+    assert summary.n_placebo == 0
+    assert summary.leak_ok is True
+    bad = core.VariantRun(takes=[replace(run.takes[0], t_dec_ns=run.takes[0].available_at_ns)])
+    assert core.summarize(core.VARIANTS[0], bad, iterations=10).leak_ok is False
+
+
+def test_guard_2_is_enforced_on_the_real_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    data, cur = _data()
+    monkeypatch.setattr(core, "decision_instant", lambda avail, lag: avail + lag)  # not strict
+    with pytest.raises(LeakGuardError) as raised:
+        _score(data, _ctx(cur))
+    assert raised.value.guard == 2
+
+
+def test_guard_3_is_enforced_when_the_book_serves_a_future_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data, cur = _data()
+    monkeypatch.setattr(BookSeries, "as_of", lambda self, t: BookRow(t + 1, 0.4, 0.45))
+    with pytest.raises(LeakGuardError) as raised:
+        _score(data, _ctx(cur))
+    assert raised.value.guard == 3
+
+
+def test_guard_11_is_enforced_when_the_permit_precheck_is_bypassed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    avail = _ns("2026-10-20T01:30:00")
+    late, cur = _data(
+        [BookRow(avail - 1, 0.30, 0.35), BookRow(avail + 200 * NS, 0.40, 0.45)],
+        cur_avail=avail,
+        cur_runtime=avail - 65 * 60 * NS,
+        heartbeat=(avail - 1, avail + 250 * NS),
+    )
+    monkeypatch.setattr(core, "permit_ok", lambda *_a: True)
+    with pytest.raises(LeakGuardError) as raised:
+        _score(late, _ctx(cur))
+    assert raised.value.guard == 11
+
+
+def test_guard_9_is_enforced_on_every_placebo_instant(monkeypatch: pytest.MonkeyPatch) -> None:
+    data, cur = _data()
+    take = _score(data, _ctx(cur))
+    assert isinstance(take, core.Take)
+    inside_release = data.chain.releases[0] + 60 * NS
+    monkeypatch.setattr(core, "placebo_instants", lambda **_kw: (inside_release,))
+    with pytest.raises(LeakGuardError) as raised:
+        core._placebos_for(data, take, core.VARIANTS[0])
+    assert raised.value.guard == 9
+
+
+def test_placebo_reads_at_or_after_the_cutoff_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    data, cur = _data(heartbeat=_hb(_CUR_AVAIL - 3600 * NS, _CUR_AVAIL + 20_000 * NS, 60 * NS))
+    take = _score(data, _ctx(cur))
+    assert isinstance(take, core.Take)
+    instant = _ns("2026-10-20T15:00:00")
+    monkeypatch.setattr(core, "placebo_instants", lambda **_kw: (instant,))
+    monkeypatch.setattr(core, "before_cutoff", lambda t: t < instant)
+    assert core._placebos_for(data, take, core.VARIANTS[0]) == []
+
+
+def test_the_ladder_for_an_event_holds_only_rungs_listed_by_t_dec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, ...]] = []
+
+    def _capture(**kw: object) -> dict[str, float]:
+        seen.append(tuple(r.rung_id for r in kw["ladder"]))  # type: ignore[attr-defined]
+        return {"r1": 0.30, "r2": -0.20}
+
+    monkeypatch.setattr(core, "rung_deltas", _capture)
+    data, _cur = _data()
+    listed = replace(data, listed_at={"r1": _CUR_AVAIL - NS, "r2": _CUR_AVAIL + 3600 * NS})
+    core.build_events(listed)
+    assert seen and all(ladder == ("r1",) for ladder in seen)
+
+
+def test_unknown_era_and_nonfinite_deltas_are_counted_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
+        CalibrationArtefactUnknownVersionError,
+    )
+
+    data, _cur = _data()
+
+    def _unknown(**_kw: object) -> dict[str, float]:
+        raise CalibrationArtefactUnknownVersionError("v9")
+
+    monkeypatch.setattr(core, "rung_deltas", _unknown)
+    assert {c.prev_reason for c in core.build_events(data)} >= {core.DROP_UNKNOWN_ERA}
+    monkeypatch.setattr(core, "rung_deltas", lambda **_kw: {"r1": math.nan, "r2": 0.1})
+    assert {c.prev_reason for c in core.build_events(data)} >= {core.DROP_NONFINITE}
+
+
+def test_dropped_events_and_mechanism_skips_are_counted_per_stratum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patched_deltas(monkeypatch)
+    data, _cur = _data()
+    lonely = _vector(_PREV_AVAIL, _PREV_RUNTIME)  # the 13Z D-1 cycle has no predecessor
+    chain = VectorChain((lonely.available_at_ns,), (lonely,), (lonely.available_at_ns,))
+    report = core.run_stage_0(
+        lambda _s, _d: replace(data, chain=chain),
+        ("LAX",),
+        (_DAY,),
+        core.TauValues(0.13, 0.18, "t"),
+        iterations=10,
+    )
+    assert report["counts"]["event_skip:13Z_D-1:no_prev_same_day"] == 1
+    assert report["mechanism"]["skipped"]["13Z_D-1:no_prev_same_day"] == 1
