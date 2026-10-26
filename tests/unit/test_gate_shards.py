@@ -1428,12 +1428,14 @@ def test_shell_execution_proof_fails_when_a_test_does_not_run(
 
 
 def test_shell_skips_empty_shards_explicitly(tmp_path: Path, run_dir: Path) -> None:
-    fake = _fake(tmp_path, ids=["tests/unit/test_one.py::test_a"])
+    # A tail file is needed: phase 2 runs only in the tail, so an empty tail is red (rc 4).
+    ids = ["tests/unit/test_one.py::test_a", "tests/unit/test_tier_infra.py::test_tail_member"]
+    fake = _fake(tmp_path, ids=ids)
     result = _run_parallel(fake, run_dir, "--shards", "3")
     assert result.returncode == 0, result.stderr + result.stdout
     assert "empty" in result.stdout.lower()
     runs = [c for c in fake.calls() if not c["collect"] and c["phase2"] != "1"]
-    assert len(runs) == 1
+    assert len(runs) == 2  # one shard plus the tail
 
 
 def test_shell_collect_skipped_module_is_not_assigned_and_is_checked(

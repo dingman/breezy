@@ -362,6 +362,54 @@ def plan_flake_rerun(
     return FlakePlan(True, "", args, [key_label(k) for k in sorted(failing)])
 
 
+# --- phase-2-once proof ----------------------------------------------------------------------
+
+_DEFERRED_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\[breezy\] gate: phase1 rc=\d+ phase2 DEFERRED \(parallel shard; NOT a gate run\)$"
+)
+_TAIL_PHASE2_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\[breezy\] gate: phase1 rc=\d+ phase2 rc=0$"
+)
+
+
+def phase2_proof(shard_logs: Mapping[str, str | None], tail_log: str | None) -> list[str]:
+    """Errors proving phase 2 ran exactly once, in the serial tail, and never in a shard.
+
+    ``shard_logs`` maps each deferred job (shards and the load-flake rerun) to its wrapper
+    log text (``None`` = unreadable or absent); ``tail_log`` is the tail's. Every deferred
+    log needs exactly one ``DEFERRED`` line and no ``phase2 rc=`` line; the tail log needs
+    exactly one ``phase1 rc=N phase2 rc=0`` line, no other ``phase2 rc=`` line and no
+    ``DEFERRED`` line. Empty list = proven."""
+    errors: list[str] = []
+    for name, text in sorted(shard_logs.items()):
+        if text is None:
+            errors.append(f"phase 2: job {name} has no readable log")
+            continue
+        lines = text.splitlines()
+        deferred = [x for x in lines if "DEFERRED" in x]
+        if len(deferred) != 1 or not _DEFERRED_RE.match(deferred[0]):
+            errors.append(
+                f"phase 2: job {name} has {len(deferred)} DEFERRED line(s); expected exactly one"
+            )
+        if any("phase2 rc=" in x for x in lines):
+            errors.append(f"phase 2: job {name} ran phase 2 (a 'phase2 rc=' line); it must defer")
+    if tail_log is None:
+        errors.append("phase 2 never ran: the tail has no readable log")
+        return errors
+    lines = tail_log.splitlines()
+    ran = [x for x in lines if _TAIL_PHASE2_RE.match(x)]
+    other = [x for x in lines if "phase2 rc=" in x and not _TAIL_PHASE2_RE.match(x)]
+    if len(ran) != 1:
+        errors.append(
+            f"phase 2: the tail has {len(ran)} 'phase2 rc=0' line(s); expected exactly one"
+        )
+    for line in other:
+        errors.append(f"phase 2: the tail reports a failing or odd phase 2: {line}")
+    if any("DEFERRED" in x for x in lines):
+        errors.append("phase 2: the tail deferred phase 2; it must run it")
+    return errors
+
+
 # --- reference recording ---------------------------------------------------------------------
 
 

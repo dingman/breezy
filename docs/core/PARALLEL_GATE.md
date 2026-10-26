@@ -32,8 +32,8 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
   `PER_SHARD_GB = 1.5` is a MEAN-based budget, not a peak bound: Phase 0 measured per-shard peak
   summed RSS of 1.0 to 1.9 GB (tail 1.90 GB), and the whole-run dip in `MemAvailable` for 7
   shards was 4.5 GB, about 0.65 GB per shard. The 4 GB reserve absorbs the peaks.
-- Exit code: the first nonzero among the shards (in order), the serial tail, then the
-  execution proof (4). `2` means refused before any test ran (bad run dir, empty or failed
+- Exit code: the first nonzero among the shards (in order), the serial tail, the execution
+  proof (4), then the phase-2 proof (4). `2` means refused before any test ran (bad run dir, empty or failed
   collection, partition error).
 - Scratch (`bt/`, `tmp/`) is deleted on green and kept on red (gate dirs are always removed); `logs/`, `junit/` and
   `plan/` are always kept. SIGINT/SIGTERM send TERM to every job's process group (the whole-suite
@@ -55,13 +55,29 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
    `yield`, a mutated module-level accumulator, or uses a wide-scope conftest fixture.
 4. Every shard runs through `run_tests_no_egress.sh` with a private `BREEZY_GATE_DIR`
    (outside the tree, see above), and a private `TMPDIR` and `--basetemp` under the run dir, in
-   its own session. The wrapper's phase 2 (the `bwrap_host` registry, about 3 s) runs ONCE PER
-   JOB, so a run does it N + 1 times (shards plus tail); its return code propagates.
+   its own session. The wrapper's phase 2 (the `bwrap_host` registry, about 3 s) runs exactly
+   ONCE per run, in the serial tail, never in a shard: concurrent phase-2 copies take flocks
+   that moved the host `/proc/locks` count one of its tests compares against. Shards and the
+   load-flake rerun set `BREEZY_GATE_PHASE2=defer` and write a 0600 `.parallel-shard` token in
+   their gate dir; the wrapper accepts `defer` only for a real (non-symlink, user-owned)
+   gate dir exactly two levels under `$HOME/.cache/breezy-gate/par/` holding that token, else
+   it prints `phase-2 defer refused: not a parallel shard` and exits 2 (any other value
+   exits 2 too; the variable is unset before pytest). A deferred job prints
+   `[breezy] gate: phase1 rc=X phase2 DEFERRED (parallel shard; NOT a gate run)` and exits
+   with phase 1's rc. The tail never defers; its phase-2 return code propagates. An empty
+   tail is red (4, "phase 2 never ran"): a stand-in selection would run a test twice.
+   Unset, the wrapper behaves exactly as before.
 5. After every shard exits and whole-host CPU idle, sampled from `/proc/stat` over a 3 s window
    (`gate_shards.py cpu-idle`), reaches 90 % (wait bounded to 120 s; the measured value is
    printed; the 1-minute loadavg lags too far behind to use), the tail runs: `tier_lanes.SERIAL_FILES`, real-clock-budget files and
    files that write shared fixed paths (`scripts/ci/gate_reviewed.json`, `serial_tail`).
-6. **Execution proof** (`gate_shards.py verify`), from JUnit:
+6. **Phase-2 proof** (`gate_shards.py phase2-proof`, logic in `gate_verify.phase2_proof`), from
+   the job logs, exit 4 unless: every shard (and flake-rerun) log has exactly one `DEFERRED`
+   line and no `phase2 rc=` line, and the tail log has exactly one `phase1 rc=N phase2 rc=0`
+   line (no other `phase2 rc=`, no `DEFERRED`). The wrapper's own phase-2 verdict (exactly 41
+   passed, no skips) already makes a bad phase 2 nonzero. A load-flake rerun is skipped while
+   this proof fails, so a rerun can never supersede a phase-2 fault.
+   **Execution proof** (`gate_shards.py verify`), from JUnit:
    - every collected node id appears exactly once (missing, extra or duplicated key: exit 4);
    - any failure, error or strict xpass: exit 4;
    - skips and xfails must be listed in `scripts/ci/gate_reference.json` (`non_pass`, one set

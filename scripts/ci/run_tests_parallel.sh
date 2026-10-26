@@ -7,7 +7,7 @@
 # are unsafe beside other shards (real-clock budgets, shared fixed paths)
 # serially, then PROVES from JUnit output that every collected test ran exactly
 # once with an expected outcome. Exit: the first nonzero among shards (in
-# order), the tail, then the execution proof (4). 2 = refused before any test.
+# order), the tail, the execution proof (4), the phase-2 proof (4). 2 = refused before any test.
 # After the tail, failures that are ONLY committed load flakes (gate_reviewed.json
 # "load_flakes", at most 3 keys) are rerun once, serially, on a quiet host.
 #
@@ -17,6 +17,12 @@
 # every bwrap_host test. The root is refused if it resolves inside the tree or already
 # exists, and is removed when the run ends (green, red, refused or signalled) -- only ever
 # a direct child of the par root (gate_shards.py rm-gate-root).
+#
+# Phase 2 (the fixed bwrap_host registry) runs exactly ONCE per run, in the serial tail. Every
+# shard and the load-flake rerun set BREEZY_GATE_PHASE2=defer and carry the wrapper's
+# .parallel-shard token in their gate dir; the tail never defers. `gate_shards.py
+# phase2-proof` reads the job logs and fails the run (4) unless that holds. Concurrent
+# phase-2 copies disturb the host-wide /proc/locks count one of its tests compares.
 #
 # Usage: scripts/ci/run_tests_parallel.sh --run-dir <tree>/.pytest-tmp/<name> [--shards N]
 #
@@ -91,6 +97,9 @@ trap cleanup_gate_root EXIT
 
 log() { echo "[gate] $*"; }
 
+# Only start_job decides whether a job defers phase 2; never inherit it.
+unset BREEZY_GATE_PHASE2
+
 N="$("$TOOL_PY" "$SHARDS_PY" plan-n ${shards_requested:+--shards "$shards_requested"})" || exit 2
 
 live_pids=()
@@ -125,12 +134,19 @@ trap on_signal INT TERM
 # Start one job in its own session and process group (so a signal reaches its
 # children). Per-job isolation: gate dir, TMPDIR and basetemp are all private.
 # The job writes "<rc> <wall seconds>" to logs/<name>.rc when it ends.
+# `mode` is `defer` (shards, load-flake rerun: skip phase 2, write the wrapper's token) or
+# `run` (the tail: runs phase 2).
 LAST_PID=""
 start_job() {
-  local name="$1" xml="$2"
-  shift 2
+  local name="$1" xml="$2" mode="$3" defer_env=()
+  shift 3
   install -d -m 0700 "$GATE_ROOT/$name" "$RUN/tmp/$name"
+  if [[ "$mode" == defer ]]; then
+    install -m 0600 /dev/null "$GATE_ROOT/$name/.parallel-shard"
+    defer_env=(BREEZY_GATE_PHASE2=defer)
+  fi
   setsid env \
+    "${defer_env[@]}" \
     BREEZY_GATE_DIR="$GATE_ROOT/$name" \
     TMPDIR="$RUN/tmp/$name" \
     JOB_RC_FILE="$RUN/logs/$name.rc" \
@@ -209,7 +225,7 @@ for ((k = 0; k < N; k++)); do
     log "shard s$k: empty, skipped"
     continue
   fi
-  start_job "s$k" "$RUN/junit/s$k.xml" "${args[@]}"
+  start_job "s$k" "$RUN/junit/s$k.xml" defer "${args[@]}"
   pid_of["s$k"]="$LAST_PID"
   jobs_run+=("s$k")
 done
@@ -223,15 +239,34 @@ done
 
 # --- 4. serial tail (after every shard has exited, once the host is quiet) --------------------
 mapfile -t tail_args < "$RUN/plan/tail.args"
+tail_empty_rc=0
 if [[ "${#tail_args[@]}" -eq 0 ]]; then
-  log "tail: empty, skipped"
+  # Phase 2 only runs in the tail, so an empty tail means it never ran: red. (Giving the tail
+  # a stand-in selection would run a test twice and break the execution proof.)
+  log "tail: empty; phase 2 never ran"
+  tail_empty_rc=4
 else
   quiet_wait "tail files=${#tail_args[@]}"
-  start_job tail "$RUN/junit/tail.xml" "${tail_args[@]}"
+  start_job tail "$RUN/junit/tail.xml" run "${tail_args[@]}"
   wait_job "$LAST_PID"
   rc_of[tail]="$JOB_RC"
   jobs_run+=(tail)
 fi
+
+# Prove phase 2 ran exactly once, in the tail: every non-tail job log deferred it, the tail log
+# ran it green. Prints the verdict; the caller silences it for the pre-rerun check.
+phase2_proof_run() {
+  local name p2_args=()
+  for name in "${jobs_run[@]}"; do
+    if [[ "$name" != tail ]]; then
+      p2_args+=(--shard-log "$RUN/logs/$name.log")
+    fi
+  done
+  if [[ -f "$RUN/logs/tail.log" ]]; then
+    p2_args+=(--tail-log "$RUN/logs/tail.log")
+  fi
+  "$TOOL_PY" "$SHARDS_PY" phase2-proof "${p2_args[@]}"
+}
 
 # --- 4b. load-flake rerun (committed flakes only, at most 3 keys, serial, quiet host) ---------
 flake_labels=""
@@ -242,7 +277,10 @@ for name in "${jobs_run[@]}"; do
     any_failed=1
   fi
 done
-if [[ "$any_failed" -eq 1 ]]; then
+if [[ "$any_failed" -eq 1 ]] && ! phase2_proof_run > /dev/null; then
+  # A phase-2 fault is not a load flake: a passing rerun must never supersede it.
+  log "phase 2 not proven (see the proof below); no load-flake rerun"
+elif [[ "$any_failed" -eq 1 ]]; then
   plan_args=(--ids "$RUN/plan/whole.ids" --out "$RUN/plan/flake.args")
   for name in "${jobs_run[@]}"; do
     plan_args+=(--job "$name" "${rc_of[$name]}" "$RUN/junit/$name.xml")
@@ -251,7 +289,7 @@ if [[ "$any_failed" -eq 1 ]]; then
     mapfile -t flake_args < "$RUN/plan/flake.args"
     quiet_wait "flake rerun"
     log "load-flake rerun (once): $flake_labels"
-    start_job flake "$RUN/junit/flake-rerun.xml" "${flake_args[@]}"
+    start_job flake "$RUN/junit/flake-rerun.xml" defer "${flake_args[@]}"
     wait_job "$LAST_PID"
     rc_of[flake]="$JOB_RC"
     jobs_run+=(flake)
@@ -315,6 +353,14 @@ proof_rc=0
 "$TOOL_PY" "$SHARDS_PY" verify "${verify_args[@]}" \
   --junit "${junit_shards[@]}" --tail-junit "${tail_junit[@]}" || proof_rc=$?
 rcs+=("$proof_rc")
+
+# --- 6b. phase 2 ran once, in the tail ----------------------------------------------------------
+p2_rc=0
+phase2_proof_run || p2_rc=$?
+rcs+=("$p2_rc")
+if [[ "$tail_empty_rc" -ne 0 ]]; then
+  rcs+=("$tail_empty_rc")
+fi
 
 final="$("$TOOL_PY" "$SHARDS_PY" aggregate "${rcs[@]}")" || {
   log "aggregate of the job return codes failed (${rcs[*]}); refusing to pass"
