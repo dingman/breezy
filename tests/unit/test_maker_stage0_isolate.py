@@ -129,14 +129,37 @@ def _comparable(out: Any) -> dict[str, Any]:
     }
 
 
+def _require_unpinned_hashseed() -> None:
+    """Fail in the gate (egress-block attested), skip in any other environment."""
+    seed = os.environ.get("PYTHONHASHSEED")
+    if seed is None:
+        return
+    if "BREEZY_TEST_OS_EGRESS_BLOCK" not in os.environ:
+        pytest.skip(f"PYTHONHASHSEED={seed} is exported, but this is not the gate")
+    pytest.fail(
+        f"PYTHONHASHSEED={seed} is exported: every spawned child would share one hash seed, "
+        "blinding the isolated-vs-in-process and determinism comparisons to hash-order bugs. "
+        "Unset it for the gate."
+    )
+
+
+def test_hashseed_guard_fails_in_the_gate_and_skips_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setenv("BREEZY_TEST_OS_EGRESS_BLOCK", "1")
+    with pytest.raises(pytest.fail.Exception, match="PYTHONHASHSEED=0"):
+        _require_unpinned_hashseed()
+    monkeypatch.delenv("BREEZY_TEST_OS_EGRESS_BLOCK")
+    with pytest.raises(pytest.skip.Exception, match="not the gate"):
+        _require_unpinned_hashseed()
+    monkeypatch.delenv("PYTHONHASHSEED")
+    _require_unpinned_hashseed()  # unset: nothing to report in either environment
+
+
 def test_the_gate_environment_does_not_pin_pythonhashseed() -> None:
     """Child-side hash-order coverage needs every child to draw its own random hash seed."""
-    if "PYTHONHASHSEED" in os.environ:
-        pytest.fail(
-            f"PYTHONHASHSEED={os.environ['PYTHONHASHSEED']} is exported: every spawned child "
-            "would share one hash seed, blinding the isolated-vs-in-process and determinism "
-            "comparisons to hash-order bugs. Unset it for the gate."
-        )
+    _require_unpinned_hashseed()
 
 
 @pytest.mark.parametrize("variant", list(WORLDS))

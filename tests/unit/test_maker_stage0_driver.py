@@ -1077,6 +1077,10 @@ def test_a_failing_void_keeps_the_original_cause_in_the_message(
 PROBE_KEY = "breezy-determinism-probe"
 CHILD_HASH_SEED = "20260101"  # fixed and non-zero: the parent's own seed is random per process
 CHILD_TIMEOUT_S = 600.0
+#: Compared files allowed to hold the run's base path: report.md carries the absolute ledger
+#: path (`| verdict ledger` line, <base>/derived/...). Every other compared file must be clean.
+BASE_ALLOWED: frozenset[str] = frozenset({"report.md"})
+LEDGER_LINE = "| verdict ledger"
 _JOIN_S = 30.0
 
 
@@ -1120,6 +1124,9 @@ def _cold_probe(cfg: drv.RunConfig | None, seed: str) -> int:
     except EOFError:
         status, payload = "err", "the child closed its pipe without a result"
     proc.join(_JOIN_S)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(_JOIN_S)
     if status != "ok":
         pytest.fail(f"the determinism child failed:\n{payload}")
     assert proc.exitcode == 0, f"the determinism child exited with {proc.exitcode}"
@@ -1142,6 +1149,8 @@ def test_full_run_is_deterministic(
 
     Both runs are `isolate=False`: the isolate-equivalence tests pin isolated == in-process.
     """
+    # Known limit: this proves A is warm, not that the memo reaches an output (M7 is not caught,
+    # a module-global counter, M7b, is).
     assert sc._SCANS, "run A must be warm: `inprocess_spied` fills the scan memo in this process"
     first = _fresh(world, tmp_path / "a", isolate=False, pinned_dates=True)
     second = _fresh(world, tmp_path / "b", isolate=False, pinned_dates=True)
@@ -1158,7 +1167,17 @@ def test_full_run_is_deterministic(
         assert list(csv.DictReader(handle)), "scored_episodes.csv has no data rows"
     with (a / "station_days.csv").open(newline="") as handle:
         assert sum(int(r["n_episodes"] or 0) for r in csv.DictReader(handle)) > 0
-    for name in sorted(set(names) - VOLATILE):
+    compared = sorted(set(names) - VOLATILE)
+    for cfg in (first, second):  # `_normalised` blanks the base path, so check it directly
+        base = str(cfg.out_dir.parent.parent).encode()
+        leaks = [
+            n for n in compared if base in (cfg.out_dir / n).read_bytes() and n not in BASE_ALLOWED
+        ]
+        assert not leaks, f"{cfg.out_dir}: the run's base path leaked into {leaks}"
+        report_lines = (cfg.out_dir / "report.md").read_text().splitlines()
+        stray = [x for x in report_lines if base.decode() in x and not x.startswith(LEDGER_LINE)]
+        assert not stray, f"{cfg.out_dir}: base path outside the ledger line of report.md"
+    for name in compared:
         assert _normalised(first, name) == _normalised(second, name), name
 
 
