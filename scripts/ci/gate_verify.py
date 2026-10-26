@@ -364,48 +364,91 @@ def plan_flake_rerun(
 
 # --- phase-2-once proof ----------------------------------------------------------------------
 
+#: Exit status of a deferred (phase-2-skipped) wrapper run whose phase 1 passed. Never 0: a
+#: deferred run is not gate evidence, so it must not look like a pass to anything but the
+#: parallel driver, which maps it back to 0 for a job it launched with defer (see
+#: ``deferred_job_rc``). Mirrors ``DEFERRED_PASS_RC`` in ``run_tests_no_egress.sh``.
+DEFERRED_PASS_RC: Final[int] = 10
+
+#: Every count below is over wrapper verdict lines only (lines that START with
+#: ``[breezy] gate: phase1 rc=N phase2 ``), so pytest output that merely mentions the words
+#: cannot move a count.
+_GATE_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\[breezy\] gate: phase1 rc=\d+ phase2 ")
+_DEFERRED_ANY_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\[breezy\] gate: phase1 rc=\d+ phase2 DEFERRED\b"
+)
 _DEFERRED_RE: Final[re.Pattern[str]] = re.compile(
     r"^\[breezy\] gate: phase1 rc=\d+ phase2 DEFERRED \(parallel shard; NOT a gate run\)$"
 )
+_DEFERRED_PASS_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\[breezy\] gate: phase1 rc=0 phase2 DEFERRED \(parallel shard; NOT a gate run\)$"
+)
+_RAN_ANY_RE: Final[re.Pattern[str]] = re.compile(r"^\[breezy\] gate: phase1 rc=\d+ phase2 rc=")
 _TAIL_PHASE2_RE: Final[re.Pattern[str]] = re.compile(
     r"^\[breezy\] gate: phase1 rc=\d+ phase2 rc=0$"
 )
+
+
+def read_log(path: str) -> str | None:
+    """A job log's text, or ``None`` when it cannot be read (absent logs fail the proof)."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _gate_lines(text: str) -> list[str]:
+    return [x for x in text.splitlines() if _GATE_LINE_RE.match(x)]
+
+
+def deferred_job_rc(rc: int, log: str | None) -> int:
+    """The driver's rc for a job it launched with defer: ``DEFERRED_PASS_RC`` becomes 0 only
+    when the log holds exactly one anchored DEFERRED verdict line and it says ``phase1 rc=0``.
+    Every other rc, and every other log, keeps the rc as is (a failure if nonzero). Never call
+    this for the tail: the tail never defers, so its rc 10 stays a failure."""
+    if rc != DEFERRED_PASS_RC or log is None:
+        return rc
+    lines = [x for x in log.splitlines() if _DEFERRED_ANY_RE.match(x)]
+    if len(lines) == 1 and _DEFERRED_PASS_RE.match(lines[0]):
+        return 0
+    return rc
 
 
 def phase2_proof(shard_logs: Mapping[str, str | None], tail_log: str | None) -> list[str]:
     """Errors proving phase 2 ran exactly once, in the serial tail, and never in a shard.
 
     ``shard_logs`` maps each deferred job (shards and the load-flake rerun) to its wrapper
-    log text (``None`` = unreadable or absent); ``tail_log`` is the tail's. Every deferred
-    log needs exactly one ``DEFERRED`` line and no ``phase2 rc=`` line; the tail log needs
-    exactly one ``phase1 rc=N phase2 rc=0`` line, no other ``phase2 rc=`` line and no
-    ``DEFERRED`` line. Empty list = proven."""
+    log text (``None`` = unreadable or absent); ``tail_log`` is the tail's. Only wrapper
+    verdict lines (``[breezy] gate: phase1 rc=...``) are counted. Every deferred log needs
+    exactly one ``DEFERRED`` line and no ``phase2 rc=`` line; the tail log needs exactly one
+    ``phase1 rc=N phase2 rc=0`` line, no other ``phase2 rc=`` line and no ``DEFERRED`` line.
+    Empty list = proven."""
     errors: list[str] = []
     for name, text in sorted(shard_logs.items()):
         if text is None:
             errors.append(f"phase 2: job {name} has no readable log")
             continue
-        lines = text.splitlines()
-        deferred = [x for x in lines if "DEFERRED" in x]
+        lines = _gate_lines(text)
+        deferred = [x for x in lines if _DEFERRED_ANY_RE.match(x)]
         if len(deferred) != 1 or not _DEFERRED_RE.match(deferred[0]):
             errors.append(
                 f"phase 2: job {name} has {len(deferred)} DEFERRED line(s); expected exactly one"
             )
-        if any("phase2 rc=" in x for x in lines):
+        if any(_RAN_ANY_RE.match(x) for x in lines):
             errors.append(f"phase 2: job {name} ran phase 2 (a 'phase2 rc=' line); it must defer")
     if tail_log is None:
         errors.append("phase 2 never ran: the tail has no readable log")
         return errors
-    lines = tail_log.splitlines()
+    lines = _gate_lines(tail_log)
     ran = [x for x in lines if _TAIL_PHASE2_RE.match(x)]
-    other = [x for x in lines if "phase2 rc=" in x and not _TAIL_PHASE2_RE.match(x)]
+    other = [x for x in lines if _RAN_ANY_RE.match(x) and not _TAIL_PHASE2_RE.match(x)]
     if len(ran) != 1:
         errors.append(
             f"phase 2: the tail has {len(ran)} 'phase2 rc=0' line(s); expected exactly one"
         )
     for line in other:
         errors.append(f"phase 2: the tail reports a failing or odd phase 2: {line}")
-    if any("DEFERRED" in x for x in lines):
+    if any(_DEFERRED_ANY_RE.match(x) for x in lines):
         errors.append("phase 2: the tail deferred phase 2; it must run it")
     return errors
 

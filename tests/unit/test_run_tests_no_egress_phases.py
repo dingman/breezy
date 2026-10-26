@@ -4,6 +4,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.support import bwrap_host_phase as phase
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -254,6 +256,7 @@ def test_gate_dir_reuse_is_chmod_0700(tmp_path: Path) -> None:
 # --- BREEZY_GATE_PHASE2=defer (parallel shard opt-in) -------------------------------------
 
 TOKEN_NAME = ".parallel-shard"
+DEFERRED_PASS_RC = 10
 REFUSED = "[breezy] phase-2 defer refused: not a parallel shard"
 
 
@@ -355,22 +358,17 @@ def test_defer_without_gate_dir_is_refused(tmp_path: Path) -> None:
     _assert_refused(tmp_path, result)
 
 
-def test_bad_phase2_value_is_refused_before_phase1(tmp_path: Path) -> None:
-    gate = _par_gate(tmp_path)
-    for value in ("skip", "", "DEFER", "1"):
-        sub = tmp_path / f"v{abs(hash(value))}"
-        sub.mkdir()
-        shutil_gate = _par_gate(sub)
-        result = _defer_run(sub, shutil_gate, value=value)
-        assert result.returncode == 2, (value, result.stderr)
-        assert "BREEZY_GATE_PHASE2 must be 'defer'" in result.stderr
-        assert not (sub / "calls.log").exists()
-    assert gate.is_dir()
+@pytest.mark.parametrize("value", ["skip", "", "DEFER", "1"])
+def test_bad_phase2_value_is_refused_before_phase1(tmp_path: Path, value: str) -> None:
+    result = _defer_run(tmp_path, _par_gate(tmp_path), value=value)
+    assert result.returncode == 2, result.stderr
+    assert "BREEZY_GATE_PHASE2 must be 'defer'" in result.stderr
+    assert not (tmp_path / "calls.log").exists()
 
 
-def test_valid_defer_skips_phase2_and_exits_zero(tmp_path: Path) -> None:
+def test_valid_defer_skips_phase2_and_exits_deferred_pass_rc_never_zero(tmp_path: Path) -> None:
     result = _defer_run(tmp_path, _par_gate(tmp_path))
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == DEFERRED_PASS_RC != 0, result.stderr
     assert (
         "[breezy] gate: phase1 rc=0 phase2 DEFERRED (parallel shard; NOT a gate run)"
         in result.stderr
@@ -439,7 +437,7 @@ def test_phase2_gate_var_never_reaches_pytest(tmp_path: Path) -> None:
         timeout=60,
         check=False,
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == DEFERRED_PASS_RC, result.stderr
     assert seen.read_text(encoding="utf-8") == "[]\n"
 
 
@@ -448,3 +446,10 @@ def test_unset_phase2_var_still_runs_phase2(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "phase1 rc=0 phase2 rc=0" in result.stderr
     assert "DEFERRED" not in result.stderr
+
+
+def test_deferred_pass_rc_is_the_same_constant_in_the_wrapper_and_the_gate_module() -> None:
+    wrapper = SCRIPT.read_text(encoding="utf-8")
+    verify = (REPO_ROOT / "scripts" / "ci" / "gate_verify.py").read_text(encoding="utf-8")
+    assert f"\nDEFERRED_PASS_RC={DEFERRED_PASS_RC}\n" in wrapper
+    assert f"DEFERRED_PASS_RC: Final[int] = {DEFERRED_PASS_RC}\n" in verify

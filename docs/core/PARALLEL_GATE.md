@@ -64,7 +64,13 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
    it prints `phase-2 defer refused: not a parallel shard` and exits 2 (any other value
    exits 2 too; the variable is unset before pytest). A deferred job prints
    `[breezy] gate: phase1 rc=X phase2 DEFERRED (parallel shard; NOT a gate run)` and exits
-   with phase 1's rc. The tail never defers; its phase-2 return code propagates. An empty
+   with phase 1's rc, or with `DEFERRED_PASS_RC` (10) when phase 1 passed: a deferred run never
+   exits 0. Only the driver maps 10 back to 0, and only for a job it launched with defer
+   (shard or load-flake rerun) whose log holds exactly one anchored `phase1 rc=0 ... DEFERRED`
+   line (`gate_verify.deferred_job_rc`); the tail's rc 10, or any 10 without that line, stays a
+   failure. The guard catches accidents and is not a security boundary (whoever can write the
+   token can defer), and a defer run is never gate evidence. An empty `BREEZY_GATE_PHASE2` is
+   refused with rc 2 like any other non-`defer` value. The tail never defers; its phase-2 return code propagates. An empty
    tail is red (4, "phase 2 never ran"): a stand-in selection would run a test twice.
    Unset, the wrapper behaves exactly as before.
 5. After every shard exits and whole-host CPU idle, sampled from `/proc/stat` over a 3 s window
@@ -74,7 +80,8 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
 6. **Phase-2 proof** (`gate_shards.py phase2-proof`, logic in `gate_verify.phase2_proof`), from
    the job logs, exit 4 unless: every shard (and flake-rerun) log has exactly one `DEFERRED`
    line and no `phase2 rc=` line, and the tail log has exactly one `phase1 rc=N phase2 rc=0`
-   line (no other `phase2 rc=`, no `DEFERRED`). The wrapper's own phase-2 verdict (exactly 41
+   line (no other `phase2 rc=`, no `DEFERRED`). Only wrapper verdict lines (those starting
+   `[breezy] gate: phase1 rc=`) are counted, so pytest output that quotes the words cannot move a count. The wrapper's own phase-2 verdict (exactly 41
    passed, no skips) already makes a bad phase 2 nonzero. A load-flake rerun is skipped while
    this proof fails, so a rerun can never supersede a phase-2 fault.
    **Execution proof** (`gate_shards.py verify`), from JUnit:

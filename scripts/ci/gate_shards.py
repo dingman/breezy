@@ -88,11 +88,13 @@ from gate_verify import (
     RecordResult,
     Verdict,
     assert_serial_junit_path,
+    deferred_job_rc,
     env_skip_matches,
     parse_junit,
     parse_reason_for,
     phase2_proof,
     plan_flake_rerun,
+    read_log,
     record_reference,
     verify,
 )
@@ -690,16 +692,14 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_log(path: str) -> str | None:
-    try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+def _cmd_deferred_rc(args: argparse.Namespace) -> int:
+    print(deferred_job_rc(args.rc, read_log(args.log)))
+    return 0
 
 
 def _cmd_phase2_proof(args: argparse.Namespace) -> int:
-    shard_logs = {Path(p).stem: _read_log(p) for p in args.shard_log}
-    errors = phase2_proof(shard_logs, _read_log(args.tail_log) if args.tail_log else None)
+    shard_logs = {Path(p).stem: read_log(p) for p in args.shard_log}
+    errors = phase2_proof(shard_logs, read_log(args.tail_log) if args.tail_log else None)
     for line in errors:
         print(f"[phase2] ERROR {line}")
     if errors:
@@ -776,6 +776,10 @@ def _parser() -> argparse.ArgumentParser:
     p2.add_argument("--shard-log", action="append", default=[])
     p2.add_argument("--tail-log", default=None)
     p2.set_defaults(func=_cmd_phase2_proof)
+    drc = sub.add_parser("deferred-rc")
+    drc.add_argument("--rc", type=int, required=True)
+    drc.add_argument("--log", required=True)
+    drc.set_defaults(func=_cmd_deferred_rc)
     agg = sub.add_parser("aggregate")
     agg.add_argument("rcs", nargs="*", type=int)
     agg.set_defaults(func=_cmd_aggregate)

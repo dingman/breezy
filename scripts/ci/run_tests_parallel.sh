@@ -157,6 +157,16 @@ start_job() {
   live_pids+=("$LAST_PID")
 }
 
+# A job launched with defer exits DEFERRED_PASS_RC (10) when its phase 1 passed. Map that to 0
+# only when its log holds exactly one anchored DEFERRED line with phase1 rc=0; any other rc, or
+# a missing line, stays as is (a failure). Never used for the tail.
+settle_deferred() {
+  local name="$1" mapped
+  if mapped="$("$TOOL_PY" "$SHARDS_PY" deferred-rc --rc "$JOB_RC" --log "$RUN/logs/$name.log")"; then
+    JOB_RC="$mapped"
+  fi
+}
+
 # Wait for a tracked job, set JOB_RC to its status and stop tracking it.
 JOB_RC=0
 wait_job() {
@@ -234,6 +244,7 @@ log "started ${#jobs_run[@]} shards (N=$N)"
 declare -A rc_of=()
 for name in "${jobs_run[@]}"; do
   wait_job "${pid_of[$name]}"
+  settle_deferred "$name"
   rc_of["$name"]="$JOB_RC"
 done
 
@@ -291,6 +302,7 @@ elif [[ "$any_failed" -eq 1 ]]; then
     log "load-flake rerun (once): $flake_labels"
     start_job flake "$RUN/junit/flake-rerun.xml" defer "${flake_args[@]}"
     wait_job "$LAST_PID"
+    settle_deferred flake
     rc_of[flake]="$JOB_RC"
     jobs_run+=(flake)
     if [[ "$JOB_RC" -eq 0 ]]; then
@@ -313,6 +325,7 @@ echo "[gate] job    rc  wall(s)  args"
 rcs=()
 for name in "${jobs_run[@]}"; do
   read -r job_rc job_wall < "$RUN/logs/$name.rc" || { job_rc="${rc_of[$name]}"; job_wall="?"; }
+  if [[ "$name" != tail && "${rc_of[$name]}" -eq 0 ]]; then job_rc=0; fi  # mapped deferred pass
   if [[ "$name" == flake ]]; then
     nargs="$(wc -l < "$RUN/plan/flake.args")"
   else

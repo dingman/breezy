@@ -40,6 +40,10 @@ unset BREEZY_BWRAP_HOST_PHASE BREEZY_GATE_COLLECT_ONLY_CLAIM BREEZY_GATE_COLLECT
 # BREEZY_GATE_PHASE2=defer is the parallel driver's opt-in: a shard skips phase 2 (the
 # driver's serial tail runs it once). Read it, then unset it so it never reaches pytest.
 # Unset keeps today's behaviour exactly; any other value is refused before phase 1.
+# A deferred run is not a gate run, so it never exits 0: when phase 1 passed it exits
+# DEFERRED_PASS_RC. Only the parallel driver maps that back to 0, for a job it launched
+# with defer (gate_verify.deferred_job_rc). Phase 1 failures keep their own rc.
+DEFERRED_PASS_RC=10
 PHASE2_DEFER=0
 if [[ -n "${BREEZY_GATE_PHASE2+x}" ]]; then
   phase2_mode="$BREEZY_GATE_PHASE2"
@@ -199,7 +203,8 @@ fi
 
 if [[ "$PHASE2_DEFER" == 1 ]]; then
   echo "[breezy] gate: phase1 rc=$phase1_rc phase2 DEFERRED (parallel shard; NOT a gate run)" >&2
-  exit "$phase1_rc"
+  [[ "$phase1_rc" -ne 0 ]] && exit "$phase1_rc"
+  exit "$DEFERRED_PASS_RC"
 fi
 
 phase2_rc=0
