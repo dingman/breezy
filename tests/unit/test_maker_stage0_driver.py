@@ -15,7 +15,7 @@ import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from scripts.analysis import maker_stage0_catalog_read as catalog_read
 from scripts.analysis import maker_stage0_driver as drv
 from scripts.analysis import maker_stage0_events_build as eb
 from scripts.analysis import maker_stage0_finish as fin
+from scripts.analysis import maker_stage0_inputs as inputs
 from scripts.analysis import maker_stage0_modes as modes_mod
 from scripts.analysis import maker_stage0_preflight as pf
 from scripts.analysis import maker_stage0_render as render
@@ -70,6 +71,11 @@ SIDECARS = {
 }  # fmt: skip
 FORBIDDEN_PROGRESS = ("fill", "rate", "label", "verdict", "episode", "loss", "win")
 RESULT_FILES = ("scored_episodes.csv", "s3_inputs.json", "station_days.csv", "episodes.jsonl")
+#: Module-scoped runs that tests share read-only; `_shared_outputs_unchanged` guards each.
+SHARED_RUN_FIXTURES = ("e2e", "s4_stop", "inprocess_spied")
+
+
+Digests = tuple[tuple[str, str], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,6 +85,43 @@ class Run:
     repo: Path
     summary: drv.RunSummary
     world: rw.World
+    atomic_writes: tuple[str, ...] = ()
+    digests: Digests = ()
+
+
+class SpySnapshot(NamedTuple):
+    pulled: int
+
+
+class InProcessSpied(NamedTuple):
+    """The one in-process (`isolate=False`) run with the order spy and the consumed-iterator spy."""
+
+    order: tuple[str, ...]
+    early_pulls: tuple[int, ...]
+    spies: tuple[SpySnapshot, ...]
+    cfg: drv.RunConfig
+    digests: Digests
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _digests_of(cfg: drv.RunConfig) -> Digests:
+    """Every path under the run dir, the ledger file, and the repo's HEAD and dirty state.
+
+    `work_root` is excluded on purpose: test_driver_refuses_existing_run_dir calls
+    `drv.run(e2e.cfg)` again, which may touch scratch there before it raises `RunDirExists`.
+    """
+    entries: list[tuple[str, str]] = []
+    for path in sorted(cfg.out_dir.rglob("*")):
+        rel = "run_dir/" + path.relative_to(cfg.out_dir).as_posix()
+        entries.append((rel, _sha256(path) if path.is_file() else "<dir>"))
+    entries.append(("ledger", _sha256(cfg.ledger) if cfg.ledger.exists() else "<absent>"))
+    entries.append(("git_head", pins_fx._git(cfg.repo_root, "rev-parse", "HEAD").strip()))
+    status = pins_fx._git(cfg.repo_root, "status", "--porcelain")
+    entries.append(("git_status", hashlib.sha256(status.encode()).hexdigest()))
+    return tuple(entries)
 
 
 def make_cfg(
@@ -115,14 +158,122 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> rw.World:
 
 
 @pytest.fixture(scope="module")
-def e2e(world: rw.World, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Run]:
+def e2e(world: rw.World, tmp_path_factory: pytest.TempPathFactory) -> Run:
+    """One verdict run on the fixture world, shared read-only by every `e2e` consumer.
+
+    It also records which files `fin` wrote atomically (a pass-through spy). Its digest covers
+    the run dir, the ledger and the repo state, but NOT `work_root`: test
+    `test_driver_refuses_existing_run_dir` calls `drv.run(e2e.cfg)`, which may touch scratch
+    there before it raises. `_shared_outputs_unchanged` re-checks the digest after each test.
+    """
     base = tmp_path_factory.mktemp("e2e")
     repo = pins_fx._repo(base)
+    written: list[str] = []
+    real = inputs.write_text_atomic
+
+    def spy(path: Path, text: str) -> Path:
+        written.append(path.name)
+        return real(path, text)
+
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
+        mp.setattr(fin, "write_text_atomic", spy)
         cfg = make_cfg(world, base, repo)
         summary = drv.run(cfg)
-    yield Run(cfg, cfg.out_dir, repo, summary, world)
+    return Run(cfg, cfg.out_dir, repo, summary, world, tuple(written), _digests_of(cfg))
+
+
+@pytest.fixture(scope="module")
+def s4_stop(tmp_path_factory: pytest.TempPathFactory) -> Run:
+    """One STOP-S4 run (no covered bid-bearing day): completes, never voids."""
+    base = tmp_path_factory.mktemp("s4_stop")
+    world = rw.build_world(base / "w", census_changes={"covered_bidlive": False})
+    cfg = _fresh(world, base / "r")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
+        summary = drv.run(cfg)
+    return Run(cfg, cfg.out_dir, cfg.repo_root, summary, world, (), _digests_of(cfg))
+
+
+@pytest.fixture(scope="module")
+def inprocess_spied(world: rw.World, tmp_path_factory: pytest.TempPathFactory) -> InProcessSpied:
+    """One `isolate=False` run with both spies, for the two structure tests.
+
+    `sim643` wraps `sim618`, which wraps the real `simulate_station_day`, so the consumed-iterator
+    spy wraps the episodes the order spy let through. `verify_first_s6` is forbidden inside a
+    verdict run. The guards fail the fixture if a spy never fired, so no test can pass vacuously.
+    """
+    base = tmp_path_factory.mktemp("inprocess_spied")
+    cfg = _fresh(world, base, isolate=False)
+    episodes_path = cfg.out_dir / "episodes.jsonl"
+    real_sim, real_truth = eb.simulate_station_day, rep.load_truth
+    order: list[str] = []
+    early_pulls: list[int] = []
+    spies: list[Spy] = []
+
+    def written() -> int:
+        return len(episodes_path.read_text().splitlines()) if episodes_path.exists() else 0
+
+    class Spy:
+        """A consumed-iterator spy: each episode must be on disk before the next is pulled."""
+
+        def __init__(self, items: tuple[Any, ...]) -> None:
+            self.items, self.base, self.pulled = iter(items), written(), 0
+
+        def __iter__(self) -> Spy:
+            return self
+
+        def __next__(self) -> Any:
+            if written() - self.base != self.pulled:
+                early_pulls.append(self.pulled)
+            item = next(self.items)
+            self.pulled += 1
+            return item
+
+    def sim618(*args: Any, **kw: Any) -> Any:
+        order.append("sim")
+        return real_sim(*args, **kw)
+
+    def sim643(*args: Any, **kw: Any) -> Any:
+        result = sim618(*args, **kw)
+        if not result.episodes:
+            return result
+        spy = Spy(result.episodes)
+        spies.append(spy)
+        return dataclasses.replace(result, episodes=cast(Any, spy))
+
+    def truth(*args: Any, **kw: Any) -> Any:
+        order.append("truth")
+        return real_truth(*args, **kw)
+
+    def never(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("verify-first must not run inside a verdict run")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
+        mp.setattr(eb, "simulate_station_day", sim643)
+        mp.setattr(rep, "load_truth", truth)
+        mp.setattr(drv, "verify_first_s6", never)
+        drv.run(cfg)
+    if not spies or not order:
+        raise AssertionError("the in-process run never reached its spies")
+    return InProcessSpied(
+        tuple(order),
+        tuple(early_pulls),
+        tuple(SpySnapshot(s.pulled) for s in spies),
+        cfg,
+        _digests_of(cfg),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _shared_outputs_unchanged(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Fail (as a teardown error) any test that altered a shared run's outputs."""
+    yield
+    for name in SHARED_RUN_FIXTURES:
+        shared = request.node.funcargs.get(name)
+        if shared is not None:
+            assert _digests_of(shared.cfg) == shared.digests, f"{name} outputs changed"
 
 
 def _rows(path: Path) -> list[dict[str, str]]:
@@ -615,69 +766,22 @@ def test_verify_first_runs_only_in_its_mode_and_only_on_2026_06_30(
 # --- structure: scoring after simulation; streaming; import closure ---------------------------
 
 
-def test_driver_scores_only_after_simulation_completes(
-    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    order: list[str] = []
-    real_sim, real_truth = eb.simulate_station_day, rep.load_truth
-
-    def sim(*args: Any, **kw: Any) -> Any:
-        order.append("sim")
-        return real_sim(*args, **kw)
-
-    def truth(*args: Any, **kw: Any) -> Any:
-        order.append("truth")
-        return real_truth(*args, **kw)
-
-    def never(*_a: Any, **_k: Any) -> Any:
-        raise AssertionError("verify-first must not run inside a verdict run")
-
-    monkeypatch.setattr(eb, "simulate_station_day", sim)
-    monkeypatch.setattr(rep, "load_truth", truth)
-    monkeypatch.setattr(drv, "verify_first_s6", never)
-    drv.run(_fresh(world, tmp_path, isolate=False))
+def test_driver_scores_only_after_simulation_completes(inprocess_spied: InProcessSpied) -> None:
+    order = list(inprocess_spied.order)
     assert order.count("truth") == 1 and order[-1] == "truth"
     assert order.count("sim") >= 2 and "truth" not in order[:-1]
 
 
 def test_driver_writes_each_episode_to_disk_before_the_next_is_pulled(
-    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    inprocess_spied: InProcessSpied,
 ) -> None:
-    real_sim = eb.simulate_station_day
-    cfg = _fresh(world, tmp_path, isolate=False)
-    episodes_path = cfg.out_dir / "episodes.jsonl"
-    early_pulls: list[int] = []
-    spies: list[Spy] = []
+    spies = list(inprocess_spied.spies)
+    early_pulls = list(inprocess_spied.early_pulls)
+    episodes_path = inprocess_spied.cfg.out_dir / "episodes.jsonl"
 
     def written() -> int:
         return len(episodes_path.read_text().splitlines()) if episodes_path.exists() else 0
 
-    class Spy:
-        """A consumed-iterator spy: each episode must be on disk before the next is pulled."""
-
-        def __init__(self, items: tuple[Any, ...]) -> None:
-            self.items, self.base, self.pulled = iter(items), written(), 0
-
-        def __iter__(self) -> Spy:
-            return self
-
-        def __next__(self) -> Any:
-            if written() - self.base != self.pulled:
-                early_pulls.append(self.pulled)
-            item = next(self.items)
-            self.pulled += 1
-            return item
-
-    def sim(*args: Any, **kw: Any) -> Any:
-        result = real_sim(*args, **kw)
-        if not result.episodes:
-            return result
-        spy = Spy(result.episodes)
-        spies.append(spy)
-        return dataclasses.replace(result, episodes=cast(Any, spy))
-
-    monkeypatch.setattr(eb, "simulate_station_day", sim)
-    drv.run(cfg)
     consumed = [s for s in spies if s.pulled]
     assert consumed and sum(s.pulled for s in consumed) == written()  # the primary pass only
     assert early_pulls == []  # never pulled ahead of the file: nothing accumulated first
@@ -809,10 +913,8 @@ def test_bracketed_unit_runs_both_hypotheses_and_converts_sizes_per_hypothesis(
 STOP_S4 = "STOP-S4-NO-BID-BEARING-DAYS"
 
 
-def test_s4_no_bid_bearing_days_is_a_reported_stop_not_a_void(tmp_path: Path) -> None:
-    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
-    cfg = _fresh(world, tmp_path / "r")
-    summary = drv.run(cfg)  # completes: the caller (CLI) exits 0
+def test_s4_no_bid_bearing_days_is_a_reported_stop_not_a_void(s4_stop: Run) -> None:
+    cfg, summary = s4_stop.cfg, s4_stop.summary  # the run completed: the caller (CLI) exits 0
     assert summary.label == STOP_S4 and summary.run_dir == cfg.out_dir
     assert not _void_dir(cfg).exists() and cfg.out_dir.is_dir()
     s3 = json.loads((cfg.out_dir / "s3_inputs.json").read_text())
@@ -824,13 +926,9 @@ def test_s4_no_bid_bearing_days_is_a_reported_stop_not_a_void(tmp_path: Path) ->
     assert [e["kind"] for e in _ledger(cfg)] == ["verdict_run_start"]  # the entry stays
 
 
-def test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict(
-    e2e: Run, tmp_path: Path
-) -> None:
+def test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict(e2e: Run, s4_stop: Run) -> None:
     real = json.loads((e2e.run_dir / "s3_inputs.json").read_text())
-    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
-    cfg = _fresh(world, tmp_path / "r")
-    drv.run(cfg)
+    cfg = s4_stop.cfg
     assert set(json.loads((cfg.out_dir / "s3_inputs.json").read_text())) == set(real)
 
 
@@ -1135,20 +1233,8 @@ def test_the_tail_csv_source_and_episodes_jsonl_are_pinned(world: rw.World, tmp_
     assert pins["episodes_jsonl"]["sha256"] == hashlib.sha256(episodes).hexdigest()
 
 
-def test_result_files_are_written_atomically(
-    world: rw.World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import scripts.analysis.maker_stage0_inputs as inputs
-
-    written: list[str] = []
-    real = inputs.write_text_atomic
-
-    def spy(path: Path, text: str) -> Path:
-        written.append(path.name)
-        return real(path, text)
-
-    monkeypatch.setattr(fin, "write_text_atomic", spy)
-    drv.run(_fresh(world, tmp_path))
+def test_result_files_are_written_atomically(e2e: Run) -> None:
+    written = e2e.atomic_writes
     assert {"s3_inputs.json", "report.md", "station_days.csv", "scored_episodes.csv",
             "tail_reliability.csv"} <= set(written)  # fmt: skip
 
@@ -1212,10 +1298,8 @@ def test_the_report_carries_every_disclosure_obligation(e2e: Run) -> None:
         assert needle in text, needle
 
 
-def test_the_s4_stop_report_discloses_the_consumed_ledger_entry(tmp_path: Path) -> None:
-    world = rw.build_world(tmp_path / "w", census_changes={"covered_bidlive": False})
-    cfg = _fresh(world, tmp_path / "r")
-    drv.run(cfg)
+def test_the_s4_stop_report_discloses_the_consumed_ledger_entry(s4_stop: Run) -> None:
+    cfg = s4_stop.cfg
     text = (cfg.out_dir / "report.md").read_text()
     for needle in ("ledger entry is consumed", "no label", "n_sd = 0", "new dated declaration"):
         assert needle in text, needle

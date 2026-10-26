@@ -145,6 +145,9 @@ DEFAULT_TEST_MS: Final[int] = 100
 COUNT_WEIGHT_MS: Final[int] = 1000
 #: Run names are short so AF_UNIX paths (107 bytes) under the run dir fit.
 RUN_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+#: A parametrisation suffix is a safe pytest argument when it holds no ``::``, no nested ``[``
+#: and no whitespace; only then may a non-consumer function be cut into one unit per node.
+SAFE_PARAM_RE: Final[re.Pattern[str]] = re.compile(r"^\[[A-Za-z0-9_.\-]+\]$")
 SOCKET_PATH_LIMIT: Final[int] = 107
 SOCKET_NAME_RESERVE: Final[int] = 48
 RC_USAGE: Final[int] = 2
@@ -155,7 +158,7 @@ RC_USAGE: Final[int] = 2
 #: must share one process. ``world`` is cheap and used everywhere, so it is not
 #: an affinity fixture.
 SPLIT_FILES: Final[dict[str, tuple[str, ...]]] = {
-    "tests/unit/test_maker_stage0_driver.py": ("e2e",),
+    "tests/unit/test_maker_stage0_driver.py": ("e2e", "s4_stop", "inprocess_spied"),
     "tests/unit/test_aud07_m1c_census.py": ("canonical_cal_b_dir",),
     "tests/unit/test_maker_stage0_isolate.py": (),
     "tests/unit/test_maker_stage0_isolate_followups.py": (),
@@ -342,22 +345,40 @@ def _split_units(
 ) -> list[_Unit]:
     text = sources[path] if sources and path in sources else (REPO_ROOT / path).read_text("utf-8")
     consumers = affinity_consumers(text, fixtures) if fixtures else set()
-    counts: dict[str, int] = {}
+    nodes_of: dict[str, list[str]] = {}
     for nodeid in members:
-        counts[function_unit(nodeid)] = counts.get(function_unit(nodeid), 0) + 1
+        nodes_of.setdefault(function_unit(nodeid), []).append(nodeid)
     file_median: dict[str, int] = {}
     weight_of: dict[str, int] = {}
-    for unit, count in counts.items():
+    for unit, nodes in nodes_of.items():
         weight_of[unit] = (
-            COUNT_WEIGHT_MS * count
+            COUNT_WEIGHT_MS * len(nodes)
             if count_only
-            else _function_weight(unit, count, path, durations, file_median)
+            else _function_weight(unit, len(nodes), path, durations, file_median)
         )
-    group = sorted(u for u in counts if u.partition("::")[2] in consumers)
-    units = [_Unit(u, (u,), weight_of[u]) for u in sorted(counts) if u not in group]
+    group = sorted(u for u in nodes_of if u.partition("::")[2] in consumers)
+    units: list[_Unit] = []
+    for unit in sorted(nodes_of):
+        if unit in group:
+            continue
+        if _splittable(unit, nodes_of[unit]):
+            units.extend(_node_units(sorted(nodes_of[unit]), weight_of[unit]))
+        else:
+            units.append(_Unit(unit, (unit,), weight_of[unit]))
     if group:
         units.append(_Unit("|".join(group), tuple(group), sum(weight_of[u] for u in group)))
     return units
+
+
+def _splittable(unit: str, nodes: Sequence[str]) -> bool:
+    """True when every node of ``unit`` carries a safe parametrisation suffix."""
+    return all(SAFE_PARAM_RE.fullmatch(node[len(unit) :]) for node in nodes)
+
+
+def _node_units(nodes: Sequence[str], weight_ms: int) -> list[_Unit]:
+    """One unit per node; the integer parts sum exactly to ``weight_ms``."""
+    base, extra = divmod(weight_ms, len(nodes))
+    return [_Unit(node, (node,), base + (1 if i < extra else 0)) for i, node in enumerate(nodes)]
 
 
 # --- shard count -----------------------------------------------------------------------------

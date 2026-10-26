@@ -46,6 +46,8 @@ from aud07_m1c_census import (
 )
 from aud07_m1c_merge import MergeCoverageError, MergeStageError
 
+from tests.support.fresh_rng import fresh_global_rng
+
 
 def test_stress_set_covers_t1_in_half_min_observed_to_0_15_and_dt_down_to_1e_4() -> None:
     """The stress grid's t_1 values stay within [0.5*min_observed, 0.15]
@@ -103,25 +105,23 @@ _TINY_REPS = 1
 
 
 @pytest.mark.heavy
-def test_chunked_census_plus_derive_pin_equals_the_all_in_one_result(tmp_path: Path) -> None:
+def test_chunked_census_plus_derive_pin_equals_the_all_in_one_result(
+    tmp_path: Path, canonical_cal_b_dir: Path
+) -> None:
     """Chunked (one `run_census_chunk` call per cell, many files) must
     produce the SAME derived eps_pin/census as all-in-one (one wide
-    `run_census_chunk` call covering all 49 cells in one file) -- proving
+    `run_census_chunk` call covering all 49 cells in one file, which is the
+    module fixture's pass) -- proving
     chunking has no effect on the result. `_TINY_REPS` keeps this fast
     while covering the real, full 49-cell grid (never a shrunk grid --
     `run_derive_pin` requires exactly 49 cells)."""
     code_sha = "a" * 40
     n_cells = len(M1C_GRID)
 
+    # The all-in-one side is the module fixture's real pass (the identical writer call), copied
+    # byte for byte; the chunked side below stays a fresh real pass.
     all_in_one_dir = tmp_path / "all_in_one"
-    all_in_one_dir.mkdir()
-    run_census_chunk(
-        0, n_cells, out_path=all_in_one_dir / "cell_all.jsonl",
-        reps_per_cell=_TINY_REPS, code_sha=code_sha,
-    )
-    run_stress_chunk(
-        out_path=all_in_one_dir / "stress.jsonl", code_sha=code_sha, in_dir=all_in_one_dir
-    )
+    _copy_canonical_cal_b(canonical_cal_b_dir, all_in_one_dir)
     pin_all_in_one = run_derive_pin(
         in_dir=all_in_one_dir,
         out_census=all_in_one_dir / "census.json",
@@ -130,14 +130,15 @@ def test_chunked_census_plus_derive_pin_equals_the_all_in_one_result(tmp_path: P
 
     chunked_dir = tmp_path / "chunked"
     chunked_dir.mkdir()
-    for i in range(n_cells):
-        run_census_chunk(
-            i, i + 1, out_path=chunked_dir / f"cell_{i:02d}.jsonl",
-            reps_per_cell=_TINY_REPS, code_sha=code_sha,
+    with fresh_global_rng():  # independent of the fixture's pass, whatever seeded it
+        for i in range(n_cells):
+            run_census_chunk(
+                i, i + 1, out_path=chunked_dir / f"cell_{i:02d}.jsonl",
+                reps_per_cell=_TINY_REPS, code_sha=code_sha,
+            )
+        run_stress_chunk(
+            out_path=chunked_dir / "stress.jsonl", code_sha=code_sha, in_dir=chunked_dir
         )
-    run_stress_chunk(
-        out_path=chunked_dir / "stress.jsonl", code_sha=code_sha, in_dir=chunked_dir
-    )
     pin_chunked = run_derive_pin(
         in_dir=chunked_dir,
         out_census=chunked_dir / "census.json",
@@ -184,8 +185,12 @@ def canonical_cal_b_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One real 49-cell census plus its stress row, written by
     `run_census_chunk` / `run_stress_chunk` (L-42: never stub
     `run_census_cell`). The three derive-pin refusal tests copy this
-    JSONL into their own directory and derive the negative case; the
-    chunk-vs-all-in-one test keeps its own second pass."""
+    JSONL into their own directory and derive the negative case. The
+    chunk-vs-all-in-one test now uses this pass as its all-in-one side. That
+    reverses the earlier separate-pass decision: the fixture makes the
+    identical writer call, and the chunked side stays a fresh real pass under
+    a fresh global RNG, so the comparison still sets two independent real
+    writer outputs against each other. Saves about 49 s."""
     out_dir = tmp_path_factory.mktemp("canonical_cal_b")
     code_sha = "a" * 40
     n_cells = len(M1C_GRID)
