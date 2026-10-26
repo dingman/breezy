@@ -20,6 +20,7 @@ from scripts.analysis import maker_stage0_events_build as eb
 from scripts.analysis import maker_stage0_isolate as iso
 from tests.fixtures.maker_stage0 import replay_world as rw
 from tests.fixtures.maker_stage0 import two_parity_world as tpw
+from tests.support.stage0_outputs import VOLATILE, _normalised
 from tests.unit import test_maker_stage0_driver as drv_fx
 from tests.unit import test_maker_stage0_isolate as iso_t
 from tests.unit import test_maker_stage0_pno as pno_fx
@@ -62,8 +63,8 @@ def test_first_day_parity_wins_and_isolated_equals_in_process_for_differing_ladd
     assert iso_t._comparable(seen[0]) == iso_t._comparable(seen[1])
     names = {p.name for p in child.out_dir.iterdir()}
     assert names == {p.name for p in local.out_dir.iterdir()}
-    for name in sorted(names - iso_t.VOLATILE):
-        assert iso_t._normalised(child, name) == iso_t._normalised(local, name), name
+    for name in sorted(names - VOLATILE):
+        assert _normalised(child, name) == _normalised(local, name), name
     replayed = _days_with_books(seen[0])
     assert {rw.DAY.isoformat(), tpw.ODD_DAY.isoformat()} <= replayed  # both ladders really ran
     assert max(replayed) == tpw.ODD_DAY.isoformat()  # the odd ladder is the LAST replayed day

@@ -64,7 +64,6 @@ DRIVER_HEAVY_FUNCTIONS: Final[tuple[str, ...]] = (
     "test_verify_first_runs_only_in_its_mode_and_only_on_2026_06_30",
     "test_bracketed_unit_runs_both_hypotheses_and_converts_sizes_per_hypothesis",
     "test_a_ladder_listed_after_d_minus_1_noon_is_a_listing_abstention_not_a_bid",
-    "test_full_run_is_deterministic",
     "test_bench_weighs_replayed_days_only_and_runs_every_variant",
     "test_the_tail_csv_source_and_episodes_jsonl_are_pinned",
     "test_tail_only_csv_is_written_atomically",
@@ -86,6 +85,7 @@ DRIVER_SHARED_CONSUMERS: Final[dict[str, tuple[str, ...]]] = {
     "inprocess_spied": (
         "test_driver_scores_only_after_simulation_completes",
         "test_driver_writes_each_episode_to_disk_before_the_next_is_pulled",
+        "test_full_run_is_deterministic",
     ),
 }
 

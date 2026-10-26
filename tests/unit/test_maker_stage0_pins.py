@@ -40,7 +40,7 @@ MANIFEST_REL = "deploy/families/pm_us_crh_fq_v1.json"
 DOC_REL = "docs/evidence/NBP_S2_VALIDATE_RESULT_2026-09-30.md"
 
 
-def _git(repo: Path, *args: str) -> str:
+def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
     done = subprocess.run(
         [
             "git",
@@ -59,6 +59,7 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return done.stdout
 
@@ -103,7 +104,16 @@ def _doc(
     )
 
 
-def _repo(tmp_path: Path, *, doc: str | None = None, manifest_sha: str = ARTEFACT_SHA) -> Path:
+PINNED_GIT_DATE = "2026-01-01T00:00:00+0000"
+
+
+def _repo(
+    tmp_path: Path,
+    *,
+    doc: str | None = None,
+    manifest_sha: str = ARTEFACT_SHA,
+    pinned_dates: bool = False,
+) -> Path:
     repo = tmp_path / "repo"
     for rel, data in {
         ARTEFACT_REL: ARTEFACT_BYTES.decode(),
@@ -129,7 +139,12 @@ def _repo(tmp_path: Path, *, doc: str | None = None, manifest_sha: str = ARTEFAC
         target.write_text(data)
     _git(repo, "init", "-q")
     _git(repo, "add", "--", ".")
-    _git(repo, "commit", "-q", "-m", "init")
+    env = (
+        {**os.environ, "GIT_AUTHOR_DATE": PINNED_GIT_DATE, "GIT_COMMITTER_DATE": PINNED_GIT_DATE}
+        if pinned_dates
+        else None
+    )
+    _git(repo, "commit", "-q", "-m", "init", env=env)
     return repo
 
 
@@ -530,3 +545,12 @@ def test_catalog_manifest_is_written_atomically(
     with pytest.raises(OSError, match="disk full"):
         manifest.write(out)
     assert out.read_text() == "OLD"
+
+
+def test_repo_with_pinned_dates_has_the_same_head_under_any_path(tmp_path: Path) -> None:
+    heads = []
+    for name in ("a", "b"):
+        base = tmp_path / name
+        base.mkdir()
+        heads.append(_git(_repo(base, pinned_dates=True), "rev-parse", "HEAD").strip())
+    assert heads[0] == heads[1] and len(heads[0]) == 40
