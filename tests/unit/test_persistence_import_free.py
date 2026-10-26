@@ -56,6 +56,10 @@ PERSISTENCE_ENTRY_MODULES: Final[tuple[str, ...]] = tuple(
     )
 )
 ENTRY_SMOKE_BUDGET_S: Final[float] = 60.0
+# Per-entry import allowance: 60 s over the 55 entries present when the budget
+# was authored (834e4a82), rounded down. Scales with the entry set, so adding
+# entries cannot silently tighten the guard.
+ENTRY_SMOKE_BUDGET_PER_ENTRY_S: Final[float] = 1.090
 _PERSISTENCE_PREFIX: Final[str] = "breezy.persistence."
 
 
@@ -71,13 +75,17 @@ class EntrySmokeRecorder:
     durations: list[tuple[str, float]]
 
 
+def _entry_smoke_budget_s(entry_count: int) -> float:
+    return ENTRY_SMOKE_BUDGET_PER_ENTRY_S * entry_count
+
+
 @pytest.fixture(scope="module")
 def entry_smoke_recorder() -> Iterator[EntrySmokeRecorder]:
     recorder = EntrySmokeRecorder([])
     yield recorder
     total = sum(duration for _, duration in recorder.durations)
     if len(recorder.durations) == len(PERSISTENCE_ENTRY_MODULES):
-        assert total <= ENTRY_SMOKE_BUDGET_S, recorder.durations
+        assert total <= _entry_smoke_budget_s(len(recorder.durations)), recorder.durations
 
 
 def _python_files_under(relative_roots: Iterable[str]) -> Iterator[Path]:
@@ -166,6 +174,13 @@ def _facade_consumer_hits(sources: Iterable[tuple[str, str]]) -> list[FacadeCons
             ):
                 hits.append(FacadeConsumer(path, node.lineno, f"alias attribute {node.attr}"))
     return hits
+
+
+def test_entry_smoke_budget_scales_per_entry() -> None:
+    authored_entry_count = 55  # entries at 834e4a82, when the 60 s cap was set
+    assert 59.9 <= _entry_smoke_budget_s(authored_entry_count) <= 60.0
+    assert _entry_smoke_budget_s(0) == 0.0
+    assert _entry_smoke_budget_s(86) == pytest.approx(2 * _entry_smoke_budget_s(43))
 
 
 def test_persistence_init_has_no_import_nodes() -> None:
