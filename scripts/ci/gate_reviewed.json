@@ -8,6 +8,7 @@
   "tests/unit/test_alert_delivery.py",
   "tests/unit/test_alert_outbox_concurrency.py",
   "tests/unit/test_alert_outbox_hardening.py",
+  "tests/unit/test_asos_recent_refresh.py",
   "tests/unit/test_aut2_delivery.py",
   "tests/unit/test_autonomy_bind_integrity.py",
   "tests/unit/test_autonomy_bus_handoff.py",
@@ -20,6 +21,7 @@
   "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
   "tests/unit/test_exec_par_bg5c_wpd_driver.py",
   "tests/unit/test_exec_par_wp5b_watcher.py",
+  "tests/unit/test_execution_egress_firewall_guard.py",
   "tests/unit/test_hypothesis_triage.py",
   "tests/unit/test_ingest_health_emission_escalation.py",
   "tests/unit/test_nbp_calibration.py",
@@ -32,11 +34,13 @@
   "tests/unit/test_registry_replay_parity.py",
   "tests/unit/test_registry_resolver.py",
   "tests/unit/test_replay_sufficiency_census.py",
+  "tests/unit/test_trade_cli.py",
   "tests/unit/test_trade_supervisor.py",
   "tests/unit/test_unit_health.py",
   "tests/unit/test_unit_health_intraday.py",
   "tests/unit/test_unit_health_review.py",
   "tests/unit/test_us_source_collector.py",
+  "tests/unit/test_us_source_collector_unit.py",
   "tests/unit/test_venue_positions_read.py"
  ],
  "groups": [
@@ -53,7 +57,7 @@
    ]
   },
   {
-   "reason": "fixed-path or home literals are inert: dummy argv/config values, absence assertions or read-only Path.home() lookups; nothing is written to a location shared between shards",
+   "reason": "fixed-path or home literals are inert: dummy argv/config values, absence assertions or read-only Path.home() lookups; nothing is written to a location shared between shards; every path-scan hit line was read individually (2026-10-26): each is a dummy argument, an absence/refusal assertion, a path-shape or AST-scan string, a read-only Path.home() lookup, or lives under tmp_path. The two files that WRITE fixed /tmp paths (test_trade_cli, test_asos_recent_refresh) are in the serial tail instead.",
    "paths": [
     "tests/contract/test_live_fill_scoring_chain_contract.py",
     "tests/contract/test_rung_hold_families_mutual_exclusion_contract.py",
@@ -64,7 +68,6 @@
     "tests/strategy/forecast_quantile_ladder/test_strategy.py",
     "tests/unit/test_archive_cache.py",
     "tests/unit/test_archive_table_upper_bound_2026_09_14.py",
-    "tests/unit/test_asos_recent_refresh.py",
     "tests/unit/test_aud05_side_aware_stratum.py",
     "tests/unit/test_aut1_wp0_log_line_premises.py",
     "tests/unit/test_autonomy_paths.py",
@@ -93,7 +96,6 @@
     "tests/unit/test_runtime_settings.py",
     "tests/unit/test_settlement_alignment_cache_defaults.py",
     "tests/unit/test_structural_pin_guard.py",
-    "tests/unit/test_trade_cli.py",
     "tests/unit/test_unit_health_dropins.py",
     "tests/unit/test_whole_tape_paper_replay.py"
    ]
@@ -124,7 +126,6 @@
     "tests/unit/test_exec_par_bg5c_wpd_final.py",
     "tests/unit/test_exec_par_bg5c_wpd_review.py",
     "tests/unit/test_exec_par_wp7_replay.py",
-    "tests/unit/test_execution_egress_firewall_guard.py",
     "tests/unit/test_ingest_actor_observability_hardening.py",
     "tests/unit/test_ingest_nws_actor.py",
     "tests/unit/test_nbm_quantile_actor.py",
@@ -293,7 +294,6 @@
     "tests/unit/test_station_candidate_register_unit.py",
     "tests/unit/test_te1_accounting.py",
     "tests/unit/test_unit_execstart_imports.py",
-    "tests/unit/test_us_source_collector_unit.py",
     "tests/unit/test_wp11b_active_family_registry.py"
    ]
   }
@@ -380,22 +380,22 @@
    "tests.unit.test_us_source_collector_unit",
    "test_bwrap_probe_alerts_env_is_present_and_read_only",
    "^bwrap_profile_ok failed under this environment: [\\s\\S]*$",
-   "static",
-   "host kernel: unprivileged user namespaces may be denied"
+   "resource",
+   "load/host dependent bwrap failure text (stderr varies); resource so the file runs in the serial tail only, never inside a shard"
   ],
   [
    "tests.unit.test_us_source_collector_unit",
    "test_bwrap_probe_blocks_credentials_and_writes_outside_archive_dir",
    "^bwrap_profile_ok failed under this environment: [\\s\\S]*$",
-   "static",
-   "host kernel: unprivileged user namespaces may be denied"
+   "resource",
+   "load/host dependent bwrap failure text (stderr varies); resource so the file runs in the serial tail only, never inside a shard"
   ],
   [
    "tests.unit.test_us_source_collector_unit",
    "test_bwrap_probe_real_collector_help_runs_under_the_profile",
    "^bwrap_profile_ok failed under this environment: [\\s\\S]*$",
-   "static",
-   "host kernel: unprivileged user namespaces may be denied"
+   "resource",
+   "load/host dependent bwrap failure text (stderr varies); resource so the file runs in the serial tail only, never inside a shard"
   ],
   [
    "tests.unit.test_nbp_skill_study",
@@ -443,8 +443,8 @@
    "tests.unit.test_execution_egress_firewall_guard",
    "test_n5_the_launcher_mechanism_actually_blocks_egress_on_this_host",
    "^bwrap unusable on this host: [\\s\\S]*$",
-   "static",
-   "host kernel: unprivileged user namespaces may be denied"
+   "resource",
+   "load/host dependent bwrap failure text (stderr varies); resource so the file runs in the serial tail only, never inside a shard"
   ],
   [
    "tests.unit.test_execution_egress_firewall_guard",
@@ -571,6 +571,14 @@
    "^root ignores directory modes$",
    "static",
    "invocation: skips only when run as root (euid 0)"
+  ]
+ ],
+ "load_flakes": [
+  [
+   "tests.unit.test_persistence_import_free",
+   "test_persistence_entry_module_imports_cleanly",
+   "file",
+   "the module-scoped import budget (60 s total over ~84 subprocess imports) is asserted at teardown and lands on whichever parametrisation runs last (it was replay_sufficiency_census in one run and lamp_archive_runs in another, so the whole function is listed); it fails 2 of 3 under load 4-7 and passes quiet. Rerun the WHOLE file once on a quiet host so the budget is checked again."
   ]
  ]
 }

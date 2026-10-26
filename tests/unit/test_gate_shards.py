@@ -17,9 +17,11 @@ import importlib.util
 import json
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Sequence
@@ -70,6 +72,7 @@ def _load() -> ModuleType:
 
 
 gs: Any = _load()
+gv: Any = sys.modules.get("gate_verify", gs)
 
 
 def _ids(*pairs: tuple[str, int]) -> list[str]:
@@ -316,7 +319,7 @@ def test_partition_refuses_duplicate_ids_before_splitting(monkeypatch: pytest.Mo
     def boom(*_a: object, **_k: object) -> None:
         raise AssertionError("split_lanes reached despite duplicate ids")
 
-    monkeypatch.setattr(gs, "_split_lanes", boom)
+    monkeypatch.setattr(gs, "split_lanes", boom)
     with pytest.raises(ValueError, match="duplicate"):
         gs.partition([*_PLAIN, _PLAIN[0]], 3, None, tail_files=(), split_files={})
 
@@ -875,27 +878,46 @@ def test_record_reads_only_serial_junit() -> None:
             gs.assert_serial_junit_path(Path("/x/junit") / bad)
 
 
+def _record(
+    cases: Sequence[Any],
+    reference: dict[str, Any] | None = None,
+    *,
+    reason: str = "seed",
+    reasons_for: dict[str, str] | None = None,
+    expected: set[tuple[str, str]] | None = None,
+    **extra: Any,
+) -> Any:
+    """``record_reference`` with the collected keys defaulting to the serial run's own."""
+    keys = {(c.classname, c.name) for c in cases} if expected is None else expected
+    return gs.record_reference(
+        cases,
+        reference,
+        run_slow=extra.pop("run_slow", "0"),
+        reason=reason,
+        reasons_for=reasons_for or {},
+        expected_keys=keys,
+        **extra,
+    )
+
+
 def test_record_refuses_a_red_serial_run() -> None:
     cases = gs.parse_junit(_xml(_case("t.a", "p", FAIL)))
     with pytest.raises(ValueError, match="not green"):
-        gs.record_reference(cases, None, run_slow="0", reason="seed", reasons_for={})
+        _record(cases)
 
 
 def test_record_accepts_a_serial_rerun_only_for_keys_that_failed_and_now_pass() -> None:
     red = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky", ERROR)))
     green = gs.parse_junit(_xml(_case("t.a", "flaky")))
     still_red = gs.parse_junit(_xml(_case("t.a", "flaky", FAIL)))
-    result = gs.record_reference(
-        red, None, run_slow="0", reason="seed", reasons_for={}, reruns=green
-    )
+    why = {"t.a::flaky": "import budget flake under load, passes serially"}
+    result = _record(red, reasons_for=why, reruns=green)
     assert result.reference["non_pass"]["0"] == []
     assert any("rerun" in line for line in result.diff)
     with pytest.raises(ValueError, match="not green"):
-        gs.record_reference(
-            red, None, run_slow="0", reason="seed", reasons_for={}, reruns=still_red
-        )
+        _record(red, reasons_for=why, reruns=still_red)
     with pytest.raises(ValueError, match="not green"):
-        gs.record_reference(red, None, run_slow="0", reason="seed", reasons_for={}, reruns=[])
+        _record(red, reruns=[])
 
 
 def test_record_seeds_non_pass_entries_with_the_blanket_reason_and_never_lists_passes() -> None:
@@ -906,7 +928,7 @@ def test_record_seeds_non_pass_entries_with_the_blanket_reason_and_never_lists_p
             _case("t.a", "x", XFAIL.format(msg="known")),
         )
     )
-    result = gs.record_reference(cases, None, run_slow="0", reason="seed: serial", reasons_for={})
+    result = _record(cases, reason="seed: serial")
     entries = result.reference["non_pass"]["0"]
     assert [(e["name"], e["outcome"], e["message"], e["why"]) for e in entries] == [
         ("s", "skip", "no store", "seed: serial"),
@@ -919,13 +941,9 @@ def test_record_requires_a_per_key_reason_for_a_changed_existing_key() -> None:
     old = _reference(_np("s"))
     cases = gs.parse_junit(_xml(_case("t.a", "s", SKIP.format(msg="different"))))
     with pytest.raises(ValueError, match="reason-for"):
-        gs.record_reference(cases, old, run_slow="0", reason="blanket", reasons_for={})
-    result = gs.record_reference(
-        cases,
-        old,
-        run_slow="0",
-        reason="blanket",
-        reasons_for={"t.a::s": "venue changed the message"},
+        _record(cases, old, reason="blanket")
+    result = _record(
+        cases, old, reason="blanket", reasons_for={"t.a::s": "venue changed the message"}
     )
     assert result.reference["non_pass"]["0"][0]["why"] == "venue changed the message"
 
@@ -934,8 +952,8 @@ def test_record_requires_a_reason_and_prunes_stale_entries() -> None:
     old = _reference(_np("gone"))
     cases = gs.parse_junit(_xml(_case("t.a", "gone")))
     with pytest.raises(ValueError, match="reason"):
-        gs.record_reference(cases, old, run_slow="0", reason="", reasons_for={})
-    result = gs.record_reference(cases, old, run_slow="0", reason="refresh", reasons_for={})
+        _record(cases, old, reason="")
+    result = _record(cases, old, reason="refresh")
     assert result.reference["non_pass"]["0"] == []
     assert any(line.startswith("-") for line in result.diff)
 
@@ -943,7 +961,7 @@ def test_record_requires_a_reason_and_prunes_stale_entries() -> None:
 def test_record_keeps_the_other_run_slow_set() -> None:
     old = _reference(_np("s"), slow="1")
     cases = gs.parse_junit(_xml(_case("t.a", "p")))
-    result = gs.record_reference(cases, old, run_slow="0", reason="seed", reasons_for={})
+    result = _record(cases, old)
     assert result.reference["non_pass"]["1"] == old["non_pass"]["1"]
     assert result.reference["non_pass"]["0"] == []
 
@@ -982,17 +1000,17 @@ def _meminfo(avail_gb: float) -> str:
 
 
 def test_choose_n_low_memory_normal_and_override() -> None:
-    low, low_reason = gs.choose_n(_meminfo(9), None, 2.0)
+    low, low_reason = gs.choose_n(_meminfo(9), None, 2.0, cpus=64)
     assert low == 2 and "memory" in low_reason
-    normal, _ = gs.choose_n(_meminfo(40), None, 2.0)
+    normal, _ = gs.choose_n(_meminfo(40), None, 2.0, cpus=64)
     assert normal == 10
-    override, reason = gs.choose_n(_meminfo(40), 4, 2.0)
+    override, reason = gs.choose_n(_meminfo(40), 4, 2.0, cpus=64)
     assert override == 4 and "requested" in reason
-    capped, _ = gs.choose_n(_meminfo(40), 99, 2.0)
+    capped, _ = gs.choose_n(_meminfo(40), 99, 2.0, cpus=64)
     assert capped == 10
-    floor, _ = gs.choose_n(_meminfo(1), None, 2.0)
+    floor, _ = gs.choose_n(_meminfo(1), None, 2.0, cpus=64)
     assert floor == 1
-    assert gs.choose_n(_meminfo(9), 8, 2.0)[0] == 2
+    assert gs.choose_n(_meminfo(9), 8, 2.0, cpus=64)[0] == 2
 
 
 def test_choose_n_refuses_unreadable_meminfo() -> None:
@@ -1042,10 +1060,20 @@ def test_validate_run_dir_refuses_paths_too_long_for_unix_sockets() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate_shards_is_stdlib_only_and_writes_no_environment() -> None:
+GATE_MODULES: Final[tuple[str, ...]] = (
+    "gate_shards.py",
+    "gate_verify.py",
+    "gate_fixtures.py",
+    "gate_classify.py",
+    "gate_host.py",
+)
+
+
+@pytest.mark.parametrize("module_file", GATE_MODULES)
+def test_gate_modules_are_stdlib_only_and_write_no_environment(module_file: str) -> None:
     import ast
 
-    text = SHARDS_PY.read_text(encoding="utf-8")
+    text = (SHARDS_PY.parent / module_file).read_text(encoding="utf-8")
     tree = ast.parse(text)
     imported: set[str] = set()
     for node in ast.walk(tree):
@@ -1053,7 +1081,8 @@ def test_gate_shards_is_stdlib_only_and_writes_no_environment() -> None:
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             imported.add(node.module.split(".")[0])
-    assert imported <= set(sys.stdlib_module_names) | {"__future__"}
+    siblings = {m.removesuffix(".py") for m in GATE_MODULES}
+    assert imported <= set(sys.stdlib_module_names) | {"__future__"} | siblings
     names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
         n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
     }
@@ -1099,7 +1128,7 @@ def test_committed_json_files_are_well_formed() -> None:
 # ---------------------------------------------------------------------------
 
 _FAKE_PYTEST: Final[str] = r"""
-import json, os, sys
+import json, os, signal, sys, time
 from pathlib import Path
 sys.path.insert(0, os.environ["FAKE_SCRIPTS_DIR"])
 import gate_shards as gs
@@ -1133,6 +1162,13 @@ with log.open("a") as handle:
     }) + "\n")
 if os.environ.get("BREEZY_BWRAP_HOST_PHASE") == "1":
     sys.exit(int(os.environ.get("BREEZY_FAKE_PHASE2_RC", "0")))
+if universe.get("ignore_term"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+nap = universe.get("sleep_collect_s" if collect else "sleep_s", 0)
+if nap:
+    with Path(universe["pid_file"]).open("a") as handle:
+        handle.write(f"{os.getpid()}\n")
+    time.sleep(nap)
 
 def selected(nodeid):
     if not positional:
@@ -1146,6 +1182,9 @@ chosen = [n for n in universe["ids"] if selected(n)]
 drop = universe.get("drop_from_run", [])
 fail = universe.get("fail", [])
 skip = universe.get("skip", {})
+once = universe.get("fail_once", [])
+seen_path = Path(os.environ["BREEZY_FAKE_UNIVERSE"]).with_suffix(".seen")
+seen = seen_path.read_text().split() if seen_path.exists() else []
 if collect:
     for n in chosen:
         print(n)
@@ -1170,14 +1209,18 @@ for n in chosen:
         continue
     cls, name = gs.nodeid_to_key(n)
     child = ""
-    if n in fail:
+    if n in fail or (n in once and n not in seen):
         child = '<failure message="boom">x</failure>'; rc = 1
+        if n in once:
+            seen.append(n)
     elif n in skip:
         child = f'<skipped type="pytest.skip" message="{skip[n]}">f:1: {skip[n]}</skipped>'
     cases.append(f'<testcase classname="{cls}" name="{name}" time="0.01">{child}</testcase>')
 if xml:
     Path(xml).parent.mkdir(parents=True, exist_ok=True)
     Path(xml).write_text('<testsuites><testsuite>' + "".join(cases) + '</testsuite></testsuites>')
+if once:
+    seen_path.write_text("\n".join(seen))
 sys.exit(rc)
 """
 
@@ -1389,3 +1432,631 @@ def test_shell_script_never_writes_the_environment_and_leaves_the_default_gate_d
     assert ".cache/breezy-gate" not in text
     assert "setsid" in text and "mapfile -t" in text
     assert not re.search(r"(?<![\"$\[])@\S+\.(args|txt)", text)  # no pytest @file argv
+
+
+# ---------------------------------------------------------------------------
+# review round: record (F1, F2), advisory (F3), signals (F4), ENV_SKIPS (F5),
+# quiet host (F6), load flakes (F7b), module split (F8), minor items
+# ---------------------------------------------------------------------------
+
+_SERIAL_KEYS: Final[set[tuple[str, str]]] = {("t.a", "p"), ("t.a", "flaky")}
+
+
+def test_record_rerun_must_be_a_pass_not_a_skip_or_xfail() -> None:
+    red = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky", ERROR)))
+    why = {"t.a::flaky": "load flake"}
+    for child in (SKIP.format(msg="no store"), XFAIL.format(msg="known")):
+        rerun = gs.parse_junit(_xml(_case("t.a", "flaky", child)))
+        with pytest.raises(ValueError, match="not green"):
+            _record(red, reasons_for=why, reruns=rerun)
+
+
+def test_record_refuses_a_rerun_that_holds_duplicate_keys_for_one_test() -> None:
+    red = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky", ERROR)))
+    rerun = gs.parse_junit(_xml(_case("t.a", "flaky"), _case("t.a", "flaky", ERROR)))
+    with pytest.raises(ValueError, match="exactly one"):
+        _record(red, reasons_for={"t.a::flaky": "x"}, reruns=rerun)
+
+
+def test_record_refuses_a_rerun_key_that_did_not_fail_in_the_serial_run() -> None:
+    serial = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky", ERROR)))
+    rerun = gs.parse_junit(_xml(_case("t.a", "flaky"), _case("t.a", "p", SKIP.format(msg="m"))))
+    with pytest.raises(ValueError, match="did not fail"):
+        _record(serial, reasons_for={"t.a::flaky": "x", "t.a::p": "x"}, reruns=rerun)
+
+
+def test_record_rerun_substitution_needs_its_own_reason_for() -> None:
+    red = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky", ERROR)))
+    green = gs.parse_junit(_xml(_case("t.a", "flaky")))
+    with pytest.raises(ValueError, match=r"--reason-for t\.a::flaky"):
+        _record(red, reruns=green)
+
+
+def test_record_blanket_reason_covers_only_genuinely_new_modules() -> None:
+    old = _reference(_np("s"))
+    kept = SKIP.format(msg="no store")
+    cases = gs.parse_junit(
+        _xml(
+            _case("t.a", "s", kept),
+            _case("t.a", "new_skip", SKIP.format(msg="surprise")),
+            _case("t.fresh", "n", SKIP.format(msg="fresh module")),
+        )
+    )
+    known = {"t.a"}
+    with pytest.raises(ValueError, match=r"existing module t\.a.*--reason-for t\.a::new_skip"):
+        _record(cases, old, reason="blanket", known_modules=known)
+    result = _record(
+        cases,
+        old,
+        reason="blanket",
+        known_modules=known,
+        reasons_for={"t.a::new_skip": "venue added a skip"},
+    )
+    whys = {e["name"]: e["why"] for e in result.reference["non_pass"]["0"]}
+    assert whys == {"s": "seed", "new_skip": "venue added a skip", "n": "blanket"}
+
+
+def test_record_first_seed_against_an_empty_reference_may_use_the_blanket_reason() -> None:
+    cases = gs.parse_junit(_xml(_case("t.a", "s", SKIP.format(msg="m"))))
+    for empty in (None, {"version": 1, "non_pass": {}}, {"version": 1, "non_pass": {"0": []}}):
+        result = _record(cases, empty, reason="first seed", known_modules={"t.a"})
+        assert result.reference["non_pass"]["0"][0]["why"] == "first seed"
+
+
+def test_record_checks_the_serial_junit_covers_the_whole_collected_id_set() -> None:
+    partial = gs.parse_junit(_xml(_case("t.a", "p")))
+    with pytest.raises(ValueError, match="does not match the collected ids: 1 missing"):
+        _record(partial, expected=_SERIAL_KEYS)
+    surplus = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "flaky"), _case("t.a", "zz")))
+    with pytest.raises(ValueError, match="1 extra"):
+        _record(surplus, expected=_SERIAL_KEYS)
+    # a partial run must not prune an existing entry
+    old = _reference(_np("s"))
+    with pytest.raises(ValueError, match="missing"):
+        _record(gs.parse_junit(_xml(_case("t.a", "p"))), old, expected={("t.a", "p"), ("t.a", "s")})
+
+
+def test_record_allows_collection_skip_keys_beyond_the_collected_ids() -> None:
+    cases = gs.parse_junit(
+        _xml(
+            _case("t.a", "p"),
+            _case("", "tests.unit.test_gone", '<skipped message="collection skipped">x</skipped>'),
+        )
+    )
+    result = _record(cases, expected={("t.a", "p")})
+    assert result.reference["non_pass"]["0"][0]["classname"] == ""
+
+
+def test_parse_reason_for_names_the_malformed_argument() -> None:
+    assert gv.parse_reason_for(["t.a::s=venue changed", "t.b::x=a=b"]) == {
+        "t.a::s": "venue changed",
+        "t.b::x": "a=b",
+    }
+    for bad in ("no-equals-sign", "=text only", "key-only=", "  =  "):
+        with pytest.raises(ValueError, match="malformed --reason-for"):
+            gv.parse_reason_for(["t.a::s=ok", bad])
+    with pytest.raises(ValueError, match="twice"):
+        gv.parse_reason_for(["k=a", "k=b"])
+
+
+def test_flake_rerun_junit_is_never_read_by_record() -> None:
+    for name in ("flake-rerun.xml", "flake.xml"):
+        with pytest.raises(ValueError, match="serial"):
+            gs.assert_serial_junit_path(Path("/x/junit") / name)
+
+
+def _cli(*args: str | Path, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SHARDS_PY), *map(str, args)],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_record_cli_requires_ids_and_names_a_malformed_reason_for(tmp_path: Path) -> None:
+    serial = tmp_path / "serial.xml"
+    serial.write_text(_xml(_case("tests.unit.test_a", "test_x")), encoding="utf-8")
+    ids = tmp_path / "ids.txt"
+    ids.write_text("tests/unit/test_a.py::test_x\ntests/unit/test_a.py::test_y\n", encoding="utf-8")
+    reference = tmp_path / "ref.json"
+    base: list[str | Path] = ["record", "--from-junit", serial, "--reference", reference]
+    base += ["--reason", "seed"]
+    assert _cli(*base).returncode == 2  # --ids is required
+    partial = _cli(*base, "--ids", ids, "--dry-run")
+    assert partial.returncode == 2 and "1 missing" in partial.stderr
+    ids.write_text("tests/unit/test_a.py::test_x\n", encoding="utf-8")
+    bad = _cli(*base, "--ids", ids, "--reason-for", "oops", "--dry-run")
+    assert bad.returncode == 2 and "malformed --reason-for 'oops'" in bad.stderr
+    good = _cli(*base, "--ids", ids)
+    assert good.returncode == 0, good.stderr
+    assert json.loads(reference.read_text())["non_pass"]["0"] == []
+
+
+# --- F3: advisory is never presented as plain GREEN --------------------------------------
+
+
+def test_verify_a_test_seam_override_forces_advisory_even_on_the_primary_tree() -> None:
+    jobs = {"s0": _xml(_case("t.a", "p", SKIP.format(msg="surprise")), _case("t.a", "s"))}
+    parsed = {name: gs.parse_junit(text) for name, text in jobs.items()}
+    verdict = gs.verify(
+        expected_keys=_KEYS,
+        jobs=parsed,
+        collect_cases=[],
+        reference=_reference(_np("s")),
+        env_skips=(),
+        tail_jobs=set(),
+        run_slow="0",
+        primary_tree=True,
+        forced_advisory=["BREEZY_GATE_REFERENCE=/x"],
+    )
+    assert verdict.rc == 0 and verdict.authoritative is False and verdict.advisories
+    assert "OUTCOME CHECK ADVISORY" in verdict.summary
+    assert "BREEZY_GATE_REFERENCE=/x" in verdict.summary
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_is_primary_tree_tells_a_main_tree_from_a_linked_worktree_and_a_non_repo(
+    run_dir: Path,
+) -> None:
+    main = run_dir / "main"
+    main.mkdir(parents=True)
+    _git(main, "init", "-q", "-b", "main")
+    (main / "f.txt").write_text("x", encoding="utf-8")
+    _git(main, "add", "f.txt")
+    _git(main, "commit", "-q", "-m", "init")
+    linked = run_dir / "linked"
+    _git(main, "worktree", "add", "-q", str(linked), "-b", "side")
+    plain = run_dir / "plain"
+    plain.mkdir()
+    assert gs.is_primary_tree(main) is True
+    assert gs.is_primary_tree(linked) is False
+    assert gs.is_primary_tree(plain) is False
+    assert (linked / ".git").is_file() and (main / ".git").is_dir()
+
+
+def test_shell_advisory_green_says_so_on_the_final_line(tmp_path: Path, run_dir: Path) -> None:
+    fake = _fake(tmp_path)
+    result = _run_parallel(fake, run_dir, "--shards", "2")
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "[gate] GATE GREEN (OUTCOME CHECK ADVISORY)" in result.stdout.splitlines()
+    assert "test seams active" in result.stdout and "BREEZY_GATE_REFERENCE=" in result.stdout
+    assert "GATE GREEN (parallel" not in result.stdout
+
+
+def test_shell_an_explicit_reference_that_is_missing_is_an_error_not_empty(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    missing = tmp_path / "does-not-exist.json"
+    result = _run_parallel(
+        fake, run_dir, "--shards", "2", extra_env={"BREEZY_GATE_REFERENCE": str(missing)}
+    )
+    assert result.returncode == 4
+    assert "GATE GREEN" not in result.stdout
+    assert "explicit reference file is missing or unreadable" in result.stderr
+
+
+# --- F4: signals reach every job; survivors are KILLed -----------------------------------
+
+
+def _alive(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def _signal_run(
+    tmp_path: Path, run_dir: Path, **universe: Any
+) -> tuple[subprocess.Popen[str], list[int], float]:
+    pid_file = tmp_path / "pids.txt"
+    fake = _fake(tmp_path, pid_file=str(pid_file), **universe)
+    proc = subprocess.Popen(
+        [str(PARALLEL_SH), "--run-dir", str(run_dir), "--shards", "2"],
+        cwd=REPO_ROOT,
+        env=fake.env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not (pid_file.exists() and pid_file.read_text().strip()):
+        time.sleep(0.1)
+    pids = [int(x) for x in pid_file.read_text().split()] if pid_file.exists() else []
+    started = time.monotonic()
+    proc.send_signal(signal.SIGTERM)
+    return proc, pids, started
+
+
+def _assert_all_gone(pids: list[int]) -> None:
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and any(_alive(p) for p in pids):
+        time.sleep(0.1)
+    assert pids and not [p for p in pids if _alive(p)]
+
+
+def test_shell_signal_kills_a_job_that_ignores_term_and_reaps_before_exiting(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    proc, pids, _ = _signal_run(tmp_path, run_dir, sleep_s=60, ignore_term=True)
+    try:
+        out, _err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, out
+    _assert_all_gone(pids)
+
+
+def test_shell_signal_during_collection_reaches_the_collect_job(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    proc, pids, _ = _signal_run(tmp_path, run_dir, sleep_collect_s=60)
+    try:
+        out, _err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, out
+    _assert_all_gone(pids)
+
+
+# --- F5: ENV_SKIPS patterns that accept any text are not "static" ------------------------
+
+
+def test_no_static_env_skip_accepts_arbitrary_trailing_text() -> None:
+    open_tail = re.compile(r"(\[\\s\\S\]\*|\.\*|\.\+|\[\^\]]\*)\$$")
+    loose = [
+        f"{e.classname}::{e.name}"
+        for e in gs.ENV_SKIPS
+        if e.tag == "static" and open_tail.search(e.message_re)
+    ]
+    assert loose == []
+
+
+def test_bwrap_probe_skips_are_resource_so_their_files_run_in_the_serial_tail() -> None:
+    probes = [
+        e for e in gs.ENV_SKIPS if "bwrap" in e.message_re and "not installed" not in e.message_re
+    ]
+    assert len(probes) >= 4
+    assert {e.tag for e in probes} == {"resource"}
+    tail = set(gs.tail_files())
+    assert "tests/unit/test_us_source_collector_unit.py" in tail
+    assert "tests/unit/test_execution_egress_firewall_guard.py" in tail
+
+
+# --- F6: the quiet-host wait reads CPU idle, not loadavg ---------------------------------
+
+
+def _stat(idle: int, busy: int, iowait: int = 0) -> str:
+    return f"cpu  {busy} 0 0 {idle} {iowait} 0 0 0 0 0\ncpu0 1 1 1 1 1 1 1 1 1 1\n"
+
+
+def test_cpu_idle_percent_is_the_idle_share_between_two_samples() -> None:
+    assert gs.cpu_idle_percent(_stat(100, 100), _stat(900, 200)) == pytest.approx(800 / 900 * 100)
+    assert gs.cpu_idle_percent(_stat(0, 0), _stat(0, 50)) == 0.0
+    assert gs.cpu_idle_percent(_stat(0, 0, 0), _stat(50, 0, 50)) == 100.0  # iowait counts idle
+
+
+def test_cpu_idle_percent_refuses_samples_that_did_not_advance_or_lack_a_cpu_line() -> None:
+    with pytest.raises(ValueError, match="advance"):
+        gs.cpu_idle_percent(_stat(5, 5), _stat(5, 5))
+    with pytest.raises(ValueError, match="cpu line"):
+        gs.cpu_idle_percent("intr 1\n", _stat(5, 5))
+
+
+def test_cpu_idle_cli_measures_the_real_host() -> None:
+    done = _cli("cpu-idle", "--window", "0.3")
+    assert done.returncode == 0, done.stderr
+    assert 0.0 <= float(done.stdout) <= 100.0
+
+
+def test_shell_tail_wait_prints_the_measured_cpu_idle_not_loadavg(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    result = _run_parallel(
+        fake, run_dir, "--shards", "2", extra_env={"BREEZY_GATE_TAIL_MAX_WAIT_S": "3"}
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert re.search(
+        r"tail files=\d+: cpu_idle=\d+(\.\d)?% threshold=90% waited=\d+s", result.stdout
+    )
+    assert "load1" not in result.stdout
+
+
+# --- F7b: committed load flakes are rerun once, nothing else -----------------------------
+
+PERSIST_FILE: Final[str] = "tests/unit/test_persistence_import_free.py"
+PERSIST_ID: Final[str] = (
+    f"{PERSIST_FILE}::test_persistence_entry_module_imports_cleanly"
+    "[scripts.analysis.replay_sufficiency_census]"
+)
+PERSIST_LABEL: Final[str] = (
+    "tests.unit.test_persistence_import_free::"
+    "test_persistence_entry_module_imports_cleanly[scripts.analysis.replay_sufficiency_census]"
+)
+
+
+def test_load_flakes_start_with_only_the_persistence_import_budget() -> None:
+    entries = gs.load_flakes()
+    assert [(e.classname, e.name) for e in entries] == [
+        ("tests.unit.test_persistence_import_free", "test_persistence_entry_module_imports_cleanly")
+    ]
+    assert gs.load_flake_problems(entries, REPO_ROOT) == []
+    assert (REPO_ROOT / PERSIST_FILE).is_file()
+
+
+def test_load_flake_function_entries_cover_every_parametrisation_but_nothing_else() -> None:
+    entries = gs.load_flakes()
+    keys = [
+        gs.nodeid_to_key(i)
+        for i in (
+            PERSIST_ID,
+            f"{PERSIST_FILE}::test_persistence_entry_module_imports_cleanly[breezy]",
+            f"{PERSIST_FILE}::test_persistence_init_has_no_import_nodes",
+            "tests/unit/test_other.py::test_persistence_entry_module_imports_cleanly[x]",
+        )
+    ]
+    expanded = gs.expand_load_flakes(entries, keys)
+    assert sorted(n for _, n in expanded) == [
+        "test_persistence_entry_module_imports_cleanly[breezy]",
+        "test_persistence_entry_module_imports_cleanly[scripts.analysis.replay_sufficiency_census]",
+    ]
+    exact = gs.LoadFlake("c", "f[1]", "node", "why")
+    assert list(gs.expand_load_flakes([exact], [("c", "f[1]"), ("c", "f[2]")])) == [("c", "f[1]")]
+
+
+def test_load_flake_hygiene_names_a_bad_entry() -> None:
+    bad = gs.LoadFlake("tests.unit.test_nope", "test_x", "sometimes", " ")
+    problems = gs.load_flake_problems([bad], REPO_ROOT)
+    assert any("rerun must be" in p for p in problems) and any("empty" in p for p in problems)
+    assert any("no test file" in p for p in problems)
+
+
+def _case_fail(name: str, cls: str = "t.a") -> str:
+    return _case(cls, name, ERROR)
+
+
+def test_plan_flake_rerun_is_eligible_only_for_listed_keys_within_the_limit() -> None:
+    flakes = {("t.a", f"f{i}"): "node" for i in range(5)}
+    args = {k: f"t/a.py::{k[1]}" for k in flakes}
+    one = {"tail": gs.parse_junit(_xml(_case("t.a", "p"), _case_fail("f0")))}
+    plan = gs.plan_flake_rerun(one, {"tail": 1}, flakes, args)
+    assert plan.eligible and plan.args == ["t/a.py::f0"] and plan.labels == ["t.a::f0"]
+    off = {"tail": gs.parse_junit(_xml(_case_fail("f0"), _case_fail("other")))}
+    assert not gs.plan_flake_rerun(off, {"tail": 1}, flakes, args).eligible
+    many = {"tail": gs.parse_junit(_xml(*[_case_fail(f"f{i}") for i in range(4)]))}
+    assert "exceed" in gs.plan_flake_rerun(many, {"tail": 1}, flakes, args).reason
+    assert not gs.plan_flake_rerun(
+        {"tail": gs.parse_junit(_xml(_case("t.a", "p")))}, {}, flakes, args
+    ).eligible
+
+
+def test_plan_flake_rerun_refuses_unexplained_nonzero_job_codes() -> None:
+    flakes = {("t.a", "f0"): "file"}
+    args = {("t.a", "f0"): "t/a.py"}
+    jobs = {
+        "s0": gs.parse_junit(_xml(_case("t.a", "p"))),
+        "tail": gs.parse_junit(_xml(_case_fail("f0"))),
+    }
+    assert gs.plan_flake_rerun(jobs, {"s0": 0, "tail": 1}, flakes, args).eligible
+    crashed = gs.plan_flake_rerun(jobs, {"s0": 1, "tail": 1}, flakes, args)
+    assert not crashed.eligible and "s0" in crashed.reason
+    interrupted = gs.plan_flake_rerun(jobs, {"s0": 0, "tail": 2}, flakes, args)
+    assert not interrupted.eligible
+    missing = gs.plan_flake_rerun(jobs, {"tail": 1}, flakes, {})
+    assert not missing.eligible
+
+
+def _flake_verify(jobs: dict[str, str], rerun: str | None, flakes: set[tuple[str, str]]) -> Any:
+    return gs.verify(
+        expected_keys={("t.a", "p"), ("t.a", "f0")},
+        jobs={n: gs.parse_junit(x) for n, x in jobs.items()},
+        collect_cases=[],
+        reference=_reference(),
+        env_skips=(),
+        tail_jobs={"tail"},
+        run_slow="0",
+        primary_tree=True,
+        load_flakes=flakes,
+        flake_rerun=gs.parse_junit(rerun) if rerun else [],
+    )
+
+
+def test_verify_replaces_a_listed_flake_by_its_single_passing_rerun() -> None:
+    jobs = {"tail": _xml(_case("t.a", "p"), _case_fail("f0"))}
+    flakes = {("t.a", "f0")}
+    ok = _flake_verify(jobs, _xml(_case("t.a", "f0"), _case("t.a", "p")), flakes)
+    assert ok.rc == 0 and ok.flaked == ("t.a::f0",)
+    assert _flake_verify(jobs, None, flakes).rc == 4  # no rerun: still a failure
+    assert _flake_verify(jobs, _xml(_case_fail("f0")), flakes).rc == 4
+    twice = _xml(_case("t.a", "f0"), _case("t.a", "f0"))
+    assert _flake_verify(jobs, twice, flakes).rc == 4
+    assert _flake_verify(jobs, _xml(_case("t.a", "f0")), set()).rc == 4  # not on the list
+    assert (
+        _flake_verify(
+            {"tail": _xml(_case("t.a", "p"), _case("t.a", "f0"))}, _xml(_case("t.a", "f0")), flakes
+        ).rc
+        == 4
+    )
+
+
+def test_verify_one_off_list_failure_forgives_nothing() -> None:
+    jobs = {"tail": _xml(_case_fail("p"), _case_fail("f0"))}
+    verdict = _flake_verify(jobs, _xml(_case("t.a", "f0")), {("t.a", "f0")})
+    assert verdict.rc == 4 and verdict.flaked == ()
+
+
+def _persist_universe(**extra: Any) -> dict[str, Any]:
+    return {"ids": [*_SHELL_IDS, PERSIST_ID, f"{PERSIST_FILE}::test_other"], **extra}
+
+
+def _flake_shell(tmp_path: Path, **extra: Any) -> _Fake:
+    return _Fake(tmp_path / "fake", _persist_universe(**extra))
+
+
+def test_shell_a_listed_load_flake_is_rerun_once_and_the_gate_is_green(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _flake_shell(tmp_path, fail_once=[PERSIST_ID])
+    result = _run_parallel(fake, run_dir, "--shards", "2")
+    assert result.returncode == 0, result.stderr + result.stdout
+    expected = f"GATE GREEN (OUTCOME CHECK ADVISORY; 1 load-flake rerun(s): {PERSIST_LABEL})"
+    assert expected in result.stdout
+    runs = [c for c in fake.calls() if not c["collect"] and c["phase2"] != "1"]
+    assert runs[-1]["args"] == [PERSIST_FILE]
+    assert (run_dir / "junit" / "flake-rerun.xml").is_file()
+    assert not list((run_dir / "junit").glob("serial*"))
+
+
+def test_shell_a_flake_that_fails_again_on_rerun_stays_red(tmp_path: Path, run_dir: Path) -> None:
+    fake = _flake_shell(tmp_path, fail=[PERSIST_ID])
+    result = _run_parallel(fake, run_dir, "--shards", "2")
+    assert result.returncode != 0 and "GATE GREEN" not in result.stdout
+    assert "GATE RED" in result.stdout
+
+
+def test_shell_an_off_list_failure_is_never_rerun(tmp_path: Path, run_dir: Path) -> None:
+    fake = _flake_shell(tmp_path, fail=["tests/unit/test_two.py::test_c"], fail_once=[PERSIST_ID])
+    result = _run_parallel(fake, run_dir, "--shards", "2")
+    assert result.returncode == 1
+    assert not (run_dir / "junit" / "flake-rerun.xml").exists()
+    assert "load-flake rerun (once)" not in result.stdout
+
+
+def test_shell_a_nonzero_shard_without_a_failing_testcase_is_not_a_flake(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _flake_shell(tmp_path, fail_once=[PERSIST_ID])
+    result = _run_parallel(fake, run_dir, "--shards", "1", extra_env={"BREEZY_FAKE_PHASE2_RC": "7"})
+    assert result.returncode != 0 and "GATE GREEN" not in result.stdout
+    assert not (run_dir / "junit" / "flake-rerun.xml").exists()
+
+
+# --- F8: module split, lazy data, sibling registration -----------------------------------
+
+
+def test_every_gate_module_stays_under_the_soft_line_ceiling() -> None:
+    for name in GATE_MODULES:
+        lines = (SHARDS_PY.parent / name).read_text(encoding="utf-8").count("\n")
+        assert lines <= 800, (name, lines)
+
+
+def test_tier_lanes_helper_registers_the_module_it_loads() -> None:
+    module = gs.tier_lanes()
+    assert sys.modules["tier_lanes"] is module
+
+
+def test_bad_reviewed_json_is_a_clear_error_at_use_not_an_import_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    classify = sys.modules["gate_classify"]
+    bad = tmp_path / "gate_reviewed.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(classify, "REVIEWED_JSON", bad)
+    classify.reviewed_data.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="gate_reviewed.json"):
+            gs.serial_tail()
+        bad.write_text('{"serial_tail": []}', encoding="utf-8")
+        classify.reviewed_data.cache_clear()
+        with pytest.raises(ValueError, match="load_flakes|must be a list"):
+            _ = gs.ENV_SKIPS
+    finally:
+        monkeypatch.undo()
+        classify.reviewed_data.cache_clear()
+    assert gs.serial_tail()
+
+
+def test_importing_gate_shards_loads_no_reviewed_data() -> None:
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import gate_shards, gate_classify;"
+        "print(gate_classify.reviewed_data.cache_info().currsize)"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(SHARDS_PY.parent)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "0"
+
+
+# --- minor items -------------------------------------------------------------------------
+
+
+def test_choose_n_is_capped_by_the_cpu_count_and_refuses_a_non_positive_request() -> None:
+    n, reason = gs.choose_n(_meminfo(64), 10, 1.5, cpus=3)
+    assert n == 3 and "cpu" in reason
+    assert gs.choose_n(_meminfo(64), None, 1.5, cpus=1)[0] == 1
+    with pytest.raises(ValueError, match="at least 1"):
+        gs.choose_n(_meminfo(64), 0, 1.5, cpus=4)
+
+
+def test_cli_rejects_a_shard_count_below_one() -> None:
+    for command in (
+        ["plan-n", "--shards", "0"],
+        ["partition", "--ids", "x", "--shards", "-1", "--out-dir", "y"],
+    ):
+        done = _cli(*command)
+        assert done.returncode == 2 and "must be >= 1" in done.stderr
+
+
+def test_partition_and_verify_map_an_unreadable_ids_file_to_their_return_codes(
+    tmp_path: Path,
+) -> None:
+    gone = tmp_path / "gone.txt"
+    assert (
+        _cli("partition", "--ids", gone, "--shards", "2", "--out-dir", tmp_path / "o").returncode
+        == 2
+    )
+    done = _cli("verify", "--ids", gone, "--collect-xml", tmp_path / "c.xml")
+    assert done.returncode == 4 and "error:" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "body", ["", "<testsuites><testsuite><testcase classname=", "not xml at all"]
+)
+def test_verify_maps_a_truncated_or_garbled_junit_to_rc_4(tmp_path: Path, body: str) -> None:
+    ids = tmp_path / "ids.txt"
+    ids.write_text("tests/unit/test_a.py::test_x\n", encoding="utf-8")
+    collect = tmp_path / "collect.xml"
+    collect.write_text(_xml(), encoding="utf-8")
+    shard = tmp_path / "s0.xml"
+    shard.write_text(body, encoding="utf-8")
+    done = _cli(
+        "verify", "--ids", ids, "--collect-xml", collect, "--junit", shard, "--repo-root", tmp_path
+    )
+    assert done.returncode == 4 and "error:" in done.stderr
+
+
+def test_shell_logs_when_the_return_code_aggregate_fails(tmp_path: Path, run_dir: Path) -> None:
+    shim = tmp_path / "python-shim"
+    _exe(
+        shim,
+        f'#!/usr/bin/env bash\nif [[ "${{2:-}}" == "aggregate" ]]; then exit 5; fi\n'
+        f'exec "{sys.executable}" "$@"\n',
+    )
+    fake = _fake(tmp_path)
+    result = _run_parallel(
+        fake, run_dir, "--shards", "2", extra_env={"BREEZY_GATE_TOOL_PYTHON": str(shim)}
+    )
+    assert result.returncode == 2
+    assert "aggregate of the job return codes failed" in result.stdout
