@@ -159,7 +159,7 @@ _TIMING_RE: Final[re.Pattern[str]] = re.compile(
     r"perf_counter|monotonic|time\.time\(\)|deadline|wait_for|timeout_s"
 )
 _PATH_RE: Final[re.Pattern[str]] = re.compile(
-    r"/tmp/|/dev/shm|AF_UNIX|~/\.cache|\$HOME|Path\.home\(\)|expanduser"
+    r"/tmp/|/dev/shm|AF_UNIX|~/\.cache|\$HOME|Path\.home\(\)|expanduser|_gate_generated"
 )
 
 

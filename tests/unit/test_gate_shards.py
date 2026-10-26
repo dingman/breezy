@@ -739,6 +739,22 @@ def test_path_scan_finds_fixed_paths_home_and_expanduser(tmp_path: Path) -> None
     }
 
 
+def test_path_scan_finds_a_test_that_plants_a_generated_module_into_src(tmp_path: Path) -> None:
+    unit = tmp_path / "tests" / "unit"
+    unit.mkdir(parents=True)
+    (unit / "test_plants.py").write_text(
+        "path = PKG / f'_gate_generated_{stem}.py'\npath.write_text(source)\n", encoding="utf-8"
+    )
+    (unit / "test_reads.py").write_text("x = 1\n", encoding="utf-8")
+    assert gs.path_scan_files(tmp_path) == {"tests/unit/test_plants.py"}
+
+
+def test_src_writing_gate_tests_are_in_the_serial_tail() -> None:
+    tail = set(gs.tail_files())
+    assert "tests/unit/test_nautilus_native_import_gate.py" in tail
+    assert "tests/unit/test_strategy_module_gate.py" in tail
+
+
 def test_env_skips_are_well_formed_justified_and_resource_files_are_in_the_tail() -> None:
     assert gs.ENV_SKIPS, "ENV_SKIPS must be seeded"
     assert gs.env_skip_problems(gs.ENV_SKIPS, gs.tail_files(), REPO_ROOT) == []

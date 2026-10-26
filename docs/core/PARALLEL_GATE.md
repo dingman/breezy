@@ -132,7 +132,7 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
 - A file that flakes in a parallel run moves to `serial_tail`. Every file matching the timing
   scan (`perf_counter`, `monotonic`, `time.time()`, `deadline`, `wait_for`, `timeout_s`) or the
   fixed-path scan (`/tmp/`, `/dev/shm`, `AF_UNIX`, `~/.cache`, `$HOME`, `Path.home()`,
-  `expanduser`) must be in `serial_tail` or in `groups` (with a reason): enforced by
+  `expanduser`, `_gate_generated`: a test planting a module into `src/`) must be in `serial_tail` or in `groups` (with a reason): enforced by
   `tests/unit/test_gate_shards.py`. Known limit: clocks and literals inside `src/` helpers are
   invisible to the scan.
 - Path-scan classification is a real read, not a signal match: every hit line of every
