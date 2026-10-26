@@ -11,6 +11,13 @@
 # After the tail, failures that are ONLY committed load flakes (gate_reviewed.json
 # "load_flakes", at most 3 keys) are rerun once, serially, on a quiet host.
 #
+# Per-job gate dirs live OUTSIDE the tree, at $HOME/.cache/breezy-gate/par/<run-name>/<job>
+# (0700; the serial wrapper's own default gate-dir root). Phase 2 puts its basetemp under the
+# gate dir and the sandbox binds the repo read-only, so a gate dir inside the tree breaks
+# every bwrap_host test. The root is refused if it resolves inside the tree or already
+# exists, and is removed when the run ends (green, red, refused or signalled) -- only ever
+# a direct child of the par root (gate_shards.py rm-gate-root).
+#
 # Usage: scripts/ci/run_tests_parallel.sh --run-dir <tree>/.pytest-tmp/<name> [--shards N]
 #
 # Test seams (environment): BREEZY_GATE_TOOL_PYTHON (stdlib interpreter for
@@ -33,7 +40,7 @@ TAIL_MAX_WAIT_S="${BREEZY_GATE_TAIL_MAX_WAIT_S:-120}"
 # /proc/stat over a short window (the 1-minute loadavg lags too far behind).
 TAIL_QUIET_IDLE_PCT=90
 TAIL_IDLE_WINDOW_S=3
-KILL_GRACE_S=2
+KILL_GRACE_S=10
 REFERENCE_EXPLICIT=0
 if [[ -n "${BREEZY_GATE_REFERENCE+x}" ]]; then
   REFERENCE_EXPLICIT=1
@@ -71,7 +78,16 @@ if [[ -e "$RUN" ]]; then
   echo "error: run dir already exists: $RUN" >&2
   exit 2
 fi
-install -d -m 0700 "$RUN" "$RUN/gate" "$RUN/junit" "$RUN/logs" "$RUN/plan" "$RUN/bt" "$RUN/tmp"
+GATE_ROOT="$("$TOOL_PY" "$SHARDS_PY" gate-root --repo-root "$REPO_ROOT" --home "$HOME" "$(basename "$RUN")")" || exit 2
+install -d -m 0700 "$RUN" "$RUN/junit" "$RUN/logs" "$RUN/plan" "$RUN/bt" "$RUN/tmp"
+install -d -m 0700 "$HOME/.cache" "$HOME/.cache/breezy-gate" "$(dirname "$GATE_ROOT")" "$GATE_ROOT"
+
+# Remove this run's gate dirs on every way out (EXIT also fires after on_signal's exit 130).
+cleanup_gate_root() {
+  "$TOOL_PY" "$SHARDS_PY" rm-gate-root --home "$HOME" "$GATE_ROOT" ||
+    echo "[gate] warning: gate dirs left in place: $GATE_ROOT" >&2
+}
+trap cleanup_gate_root EXIT
 
 log() { echo "[gate] $*"; }
 
@@ -113,9 +129,9 @@ LAST_PID=""
 start_job() {
   local name="$1" xml="$2"
   shift 2
-  install -d -m 0700 "$RUN/gate/$name" "$RUN/tmp/$name"
+  install -d -m 0700 "$GATE_ROOT/$name" "$RUN/tmp/$name"
   setsid env \
-    BREEZY_GATE_DIR="$RUN/gate/$name" \
+    BREEZY_GATE_DIR="$GATE_ROOT/$name" \
     TMPDIR="$RUN/tmp/$name" \
     JOB_RC_FILE="$RUN/logs/$name.rc" \
     bash -c 'start=$(date +%s); rc=0; "$@" || rc=$?; echo "$rc $(( $(date +%s) - start ))" > "$JOB_RC_FILE"; exit "$rc"' \
@@ -159,8 +175,8 @@ quiet_wait() {
 }
 
 # --- 1. whole-suite collection (also the source of collection-time skips) ---------------------
-install -d -m 0700 "$RUN/gate/c0" "$RUN/tmp/c0"
-setsid env BREEZY_GATE_DIR="$RUN/gate/c0" TMPDIR="$RUN/tmp/c0" \
+install -d -m 0700 "$GATE_ROOT/c0" "$RUN/tmp/c0"
+setsid env BREEZY_GATE_DIR="$GATE_ROOT/c0" TMPDIR="$RUN/tmp/c0" \
   "$WRAPPER" --collect-only -p no:randomly -p no:cacheprovider \
   --basetemp "$RUN/bt/c0" --junitxml "$RUN/junit/collect.xml" \
   > "$RUN/logs/collect.out" 2> "$RUN/logs/collect.err" &
@@ -327,11 +343,11 @@ if [[ "$final" -eq 0 ]]; then
     log "GATE GREEN ($joined)"
     log "(the serial gate remains the reference)"
   fi
-  rm -rf -- "$RUN/bt" "$RUN/tmp" "$RUN/gate"
+  rm -rf -- "$RUN/bt" "$RUN/tmp"
   "$TOOL_PY" "$SHARDS_PY" durations --from-junit "${junit_shards[@]}" "${tail_junit[@]}" \
     --out "$RUN/durations.suggested.json" || true
   log "suggested duration refresh: $RUN/durations.suggested.json (adopt it deliberately; never auto-written)"
 else
-  log "GATE RED rc=$final; scratch and logs kept in $RUN"
+  log "GATE RED rc=$final; scratch and logs kept in $RUN (gate dirs removed)"
 fi
 exit "$final"

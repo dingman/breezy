@@ -16,6 +16,8 @@ suites. No venue contact: every sender and private read is a local double.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Final
 
@@ -61,12 +63,19 @@ class Inject404:
     """
 
     def __init__(
-        self, client: Any, ids: frozenset[str] | None = None, first: int | None = None
+        self,
+        client: Any,
+        ids: frozenset[str] | None = None,
+        first: int | None = None,
+        stall_s: float = 0.0,
+        on_hit: Callable[[int], None] | None = None,
     ) -> None:
         self.inner = client._private_read
         self._payloads = self.inner._payloads  # the rig's scripted payloads stay reachable
         self.ids = ids
         self.first = first  # 404 only the first N matching reads, then pass through
+        self.stall_s = stall_s  # block the loop on the first 404 (a starved host, a GC pause)
+        self.on_hit = on_hit  # called with the hit count after each injected 404
         self.active = True
         self.hits: list[str] = []
         client._private_read = self
@@ -83,6 +92,10 @@ class Inject404:
             and (self.first is None or len(self.hits) < self.first)
         ):
             self.hits.append(path)
+            if self.stall_s and len(self.hits) == 1:
+                time.sleep(self.stall_s)  # noqa: ASYNC251 - a deliberate whole-loop stall
+            if self.on_hit is not None:
+                self.on_hit(len(self.hits))
             raise client_module.PrivateReadRefused(status=404, path=path, body=b"")
         return await self.inner(path, *args, **kwargs)
 
@@ -102,6 +115,9 @@ async def test_resting_confirm_404_then_200_returns_NEW(
     client = rig.client
     command = _rest_command(client)
     rig.set_get(_venue_order(command))
+    # The rig's 20 ms deadline would expire after one attempt on a starved host; this test ends
+    # on the third read, so the production 5 s deadline loses nothing and cannot flake.
+    monkeypatch.setattr(submit_chain, "RESTING_CONFIRM_DEADLINE_NS", 5_000_000_000)
     gate = Inject404(client, first=2)  # two 404s, then the venue "catches up"
     real_confirm = client._confirm_resting_order
     verdicts: list[str] = []
@@ -124,14 +140,25 @@ async def test_resting_confirm_404_then_200_returns_NEW(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
+@pytest.mark.parametrize("stall_s", [0.0, 0.1], ids=["no_stall", "first_read_stalls"])
 async def test_resting_confirm_404_to_deadline_holds_and_intent_stays_ambiguous(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stall_s: float
 ) -> None:
     rig = await _submit_rig(tmp_path, monkeypatch)
     client = rig.client
     command = _rest_command(client)
     rig.set_get(_venue_order(command))  # the order IS there; only the read 404s
-    gate = Inject404(client)
+    # The confirm's deadline is read from the client's Python-visible clock. Give it the real
+    # 5 s deadline (the rig's 20 ms one is only wall-clock luck: a stall before the second read
+    # expires it after ONE attempt) and move the clock past it right after the second 404, so
+    # "retried to the deadline" no longer depends on how fast the host is.
+    monkeypatch.setattr(submit_chain, "RESTING_CONFIRM_DEADLINE_NS", 5_000_000_000)
+
+    def expire_after_second_404(hit_count: int) -> None:
+        if hit_count == 2:
+            client.advance(submit_chain.RESTING_CONFIRM_DEADLINE_S + 1)
+
+    gate = Inject404(client, stall_s=stall_s, on_hit=expire_after_second_404)
     budget_before = _remaining(rig)
     await client._submit_order(command)
     intent = rig.intent()

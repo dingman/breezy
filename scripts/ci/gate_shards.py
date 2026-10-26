@@ -77,7 +77,9 @@ from gate_host import (
     TAIL_IDLE_WINDOW_S,
     choose_n,
     cpu_idle_percent,
+    gate_root,
     is_primary_tree,
+    remove_gate_root,
 )
 from gate_verify import (
     RC_PROOF_MISMATCH,
@@ -484,6 +486,24 @@ def _cmd_check_run_dir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gate_root(args: argparse.Namespace) -> int:
+    try:
+        print(gate_root(Path(args.repo_root), Path(args.home), args.run_name))
+    except ValueError as exc:
+        _err(f"error: {exc}")
+        return RC_USAGE
+    return 0
+
+
+def _cmd_rm_gate_root(args: argparse.Namespace) -> int:
+    try:
+        remove_gate_root(Path(args.home), Path(args.root))
+    except (OSError, ValueError) as exc:
+        _err(f"error: {exc}")
+        return RC_USAGE
+    return 0
+
+
 def _cmd_partition(args: argparse.Namespace) -> int:
     try:
         ids = _read_ids(Path(args.ids))
@@ -619,18 +639,16 @@ def _cmd_record(args: argparse.Namespace) -> int:
             reruns.extend(parse_junit(Path(rerun).read_text(encoding="utf-8")))
         reasons_for = parse_reason_for(args.reason_for)
         reference = _load_json(Path(args.reference))
-        durations = _load_json(Path(args.durations))
-        has_entries = any((reference or {}).get("non_pass", {}).values())
-        if durations is None and has_entries:
-            raise ValueError(f"durations file {args.durations} is needed to find existing modules")
-        modules = {nodeid_to_key(f)[1] for f in (durations or {}).get("files", {})}
+        ids = _read_ids(Path(args.ids))
+        # "Existing" modules are the ones in the collected run, not a durations snapshot.
+        modules = {_dotted_module(i.split("::", 1)[0]) for i in ids}
         result = record_reference(
             parse_junit(path.read_text(encoding="utf-8")),
             reference,
             run_slow=args.run_slow,
             reason=args.reason,
             reasons_for=reasons_for,
-            expected_keys=expected_keys(_read_ids(Path(args.ids)), []),
+            expected_keys=expected_keys(ids, []),
             known_modules=modules,
             reruns=reruns,
         )
@@ -686,6 +704,15 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--repo-root", default=str(REPO_ROOT))
     check.add_argument("run_dir")
     check.set_defaults(func=_cmd_check_run_dir)
+    groot = sub.add_parser("gate-root")
+    groot.add_argument("--repo-root", default=str(REPO_ROOT))
+    groot.add_argument("--home", required=True)
+    groot.add_argument("run_name")
+    groot.set_defaults(func=_cmd_gate_root)
+    rmroot = sub.add_parser("rm-gate-root")
+    rmroot.add_argument("--home", required=True)
+    rmroot.add_argument("root")
+    rmroot.set_defaults(func=_cmd_rm_gate_root)
     part = sub.add_parser("partition")
     part.add_argument("--ids", required=True)
     part.add_argument("--shards", type=_positive_int, required=True)
@@ -716,7 +743,6 @@ def _parser() -> argparse.ArgumentParser:
     rec.add_argument("--from-junit", required=True)
     rec.add_argument("--ids", required=True)
     rec.add_argument("--reference", default=str(CI_DIR / "gate_reference.json"))
-    rec.add_argument("--durations", default=str(CI_DIR / "gate_durations.json"))
     rec.add_argument("--run-slow", default="0")
     rec.add_argument("--reason", required=True)
     rec.add_argument("--reason-for", action="append", default=[])

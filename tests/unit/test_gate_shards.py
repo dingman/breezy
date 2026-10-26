@@ -21,6 +21,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -1230,11 +1231,33 @@ def _exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+#: Fake HOMEs made by ``_Fake``; the driver refuses a gate dir inside the repo tree and
+#: ``tmp_path`` is inside it (basetemp lives in the tree), so the fake HOME is made under
+#: the real one and removed at session end.
+_FAKE_HOMES: Final[list[Path]] = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _remove_fake_homes() -> Iterator[None]:
+    yield
+    for home in _FAKE_HOMES:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _make_fake_home() -> Path:
+    base = Path.home() / ".cache" / "gs-test-homes"
+    base.mkdir(parents=True, exist_ok=True)
+    home = Path(tempfile.mkdtemp(prefix="h-", dir=base))
+    _FAKE_HOMES.append(home)
+    return home
+
+
 class _Fake:
     """A throwaway toolchain: fake python/bwrap/unshare plus a universe of ids."""
 
     def __init__(self, root: Path, universe: dict[str, Any]) -> None:
         self.root = root
+        self.home = _make_fake_home()
         root.mkdir(parents=True)
         self.bin = root / "bin"
         self.bin.mkdir()
@@ -1267,7 +1290,7 @@ class _Fake:
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         env = {
             "PATH": f"{self.bin}:/usr/bin:/bin",
-            "HOME": str(self.root / "home"),
+            "HOME": str(self.home),
             "BREEZY_PYTHON": str(self.bin / "python"),
             "BREEZY_GATE_TOOL_PYTHON": sys.executable,
             "BREEZY_FAKE_LOG": str(self.log),
@@ -1318,6 +1341,11 @@ def _run_parallel(
     )
 
 
+def _gate_root(home: Path, run_dir: Path) -> Path:
+    """Where the parallel driver keeps its per-job gate dirs (outside the tree)."""
+    return home / ".cache" / "breezy-gate" / "par" / run_dir.name
+
+
 def _fake(tmp_path: Path, **universe: Any) -> _Fake:
     return _Fake(tmp_path / "fake", {"ids": _SHELL_IDS, **universe})
 
@@ -1333,9 +1361,12 @@ def test_shell_green_run_executes_every_unit_with_per_job_isolation(
     assert len({c["gate_dir"] for c in runs}) == 3
     assert len({c["tmpdir"] for c in runs}) == 3
     assert len({c["basetemp"] for c in runs}) == 3
+    gate_root = _gate_root(fake.home, run_dir)
     for call in runs:
-        for key in ("gate_dir", "tmpdir", "basetemp"):
+        for key in ("tmpdir", "basetemp"):
             assert str(call[key]).startswith(str(run_dir)), call
+        assert str(call["gate_dir"]).startswith(f"{gate_root}/"), call
+        assert not str(call["gate_dir"]).startswith(str(REPO_ROOT)), call
     assert all(not a.startswith("@") for c in runs for a in c["args"])
     shard_args = sorted(a for c in runs[:2] for a in c["args"])
     assert "tests/unit/test_tier_infra.py" not in shard_args
@@ -1426,12 +1457,111 @@ def test_shell_green_run_removes_scratch_and_failed_run_keeps_logs(
     assert (run_dir / "logs").is_dir()
 
 
-def test_shell_script_never_writes_the_environment_and_leaves_the_default_gate_dir() -> None:
+def test_shell_script_never_writes_the_environment_and_never_uses_the_default_gate_dir() -> None:
     text = PARALLEL_SH.read_text(encoding="utf-8")
     assert "os.environ" not in text
-    assert ".cache/breezy-gate" not in text
+    assigned = re.findall(r"BREEZY_GATE_DIR=(\S+)", text)
+    assert assigned and all(a.startswith('"$GATE_ROOT/') for a in assigned), assigned
+    assert "$RUN/gate" not in text  # no gate dir inside the tree
     assert "setsid" in text and "mapfile -t" in text
     assert not re.search(r"(?<![\"$\[])@\S+\.(args|txt)", text)  # no pytest @file argv
+
+
+def test_shell_gate_dirs_are_removed_after_green_and_red_runs(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    assert _run_parallel(fake, run_dir, "--shards", "2").returncode == 0
+    assert not _gate_root(fake.home, run_dir).exists()
+    assert (fake.home / ".cache" / "breezy-gate" / "par").is_dir()
+    red = tmp_path / "red"
+    red_fake = _fake(red, fail=["tests/unit/test_two.py::test_c"])
+    red_dir = run_dir.parent / f"{run_dir.name}r"
+    try:
+        assert _run_parallel(red_fake, red_dir, "--shards", "2").returncode == 1
+        assert not _gate_root(red_fake.home, red_dir).exists()
+        assert (red_dir / "logs").is_dir()  # logs stay on red
+    finally:
+        shutil.rmtree(red_dir, ignore_errors=True)
+
+
+def test_shell_refuses_when_a_gate_dir_would_resolve_inside_the_repo(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    inside_home = REPO_ROOT / ".pytest-tmp" / f"{run_dir.name}-home"
+    try:
+        result = _run_parallel(fake, run_dir, extra_env={"HOME": str(inside_home)})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "inside the repo" in result.stderr
+        assert fake.calls() == [] and not run_dir.exists()
+        assert not (inside_home / ".cache").exists()
+    finally:
+        shutil.rmtree(inside_home, ignore_errors=True)
+
+
+def test_shell_refuses_when_the_gate_root_is_a_symlink_into_the_repo(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    target = REPO_ROOT / ".pytest-tmp" / f"{run_dir.name}-lnk"
+    target.mkdir(parents=True)
+    breezy_gate = fake.home / ".cache" / "breezy-gate"
+    breezy_gate.mkdir(parents=True)
+    (breezy_gate / "par").symlink_to(target)
+    try:
+        result = _run_parallel(fake, run_dir)
+        assert result.returncode == 2 and "inside the repo" in result.stderr
+        assert fake.calls() == [] and list(target.iterdir()) == []
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+def test_shell_refuses_an_existing_gate_root_and_leaves_it_alone(
+    tmp_path: Path, run_dir: Path
+) -> None:
+    fake = _fake(tmp_path)
+    root = _gate_root(fake.home, run_dir)
+    root.mkdir(parents=True)
+    (root / "keep.txt").write_text("someone else's", encoding="utf-8")
+    result = _run_parallel(fake, run_dir)
+    assert result.returncode == 2 and "already exists" in result.stderr
+    assert (root / "keep.txt").read_text(encoding="utf-8") == "someone else's"
+    assert fake.calls() == [] and not run_dir.exists()
+
+
+def test_rm_gate_root_removes_only_a_direct_child_of_the_par_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    par = home / ".cache" / "breezy-gate" / "par"
+    victim = par / "run1"
+    (victim / "s0").mkdir(parents=True)
+    (victim / "s0" / "f").write_text("x", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("x", encoding="utf-8")
+    (par / "link").symlink_to(outside)
+    sibling = home / ".cache" / "breezy-gate" / "p1-confirm.abc"
+    sibling.write_text("x", encoding="utf-8")
+    refused = [
+        par,
+        par.parent,
+        home,
+        tmp_path / "outside",
+        par / "link",
+        par / "run1" / "s0",
+        par / ".." / "p1-confirm.abc",
+        par / "nope" / ".." / "run1",
+        Path("/"),
+    ]
+    for bad in refused:
+        done = _cli("rm-gate-root", "--home", home, bad)
+        assert done.returncode == 2, (bad, done.stdout, done.stderr)
+    assert victim.is_dir() and (outside / "precious").is_file() and sibling.is_file()
+    assert par.is_dir() and (par / "link").is_symlink()
+    ok = _cli("rm-gate-root", "--home", home, victim)
+    assert ok.returncode == 0, ok.stderr
+    assert not victim.exists() and par.is_dir()
+    assert _cli("rm-gate-root", "--home", home, victim).returncode == 0  # already gone
 
 
 # ---------------------------------------------------------------------------
@@ -1496,11 +1626,53 @@ def test_record_blanket_reason_covers_only_genuinely_new_modules() -> None:
     assert whys == {"s": "seed", "new_skip": "venue added a skip", "n": "blanket"}
 
 
-def test_record_first_seed_against_an_empty_reference_may_use_the_blanket_reason() -> None:
+def test_record_first_seed_with_no_reference_file_may_use_the_blanket_reason() -> None:
     cases = gs.parse_junit(_xml(_case("t.a", "s", SKIP.format(msg="m"))))
-    for empty in (None, {"version": 1, "non_pass": {}}, {"version": 1, "non_pass": {"0": []}}):
-        result = _record(cases, empty, reason="first seed", known_modules={"t.a"})
-        assert result.reference["non_pass"]["0"][0]["why"] == "first seed"
+    result = _record(cases, None, reason="first seed", known_modules={"t.a"})
+    assert result.reference["non_pass"]["0"][0]["why"] == "first seed"
+
+
+def test_record_strict_reasons_apply_whenever_the_reference_file_exists() -> None:
+    cases = gs.parse_junit(_xml(_case("t.a", "s", SKIP.format(msg="m"))))
+    for existing in ({"version": 1, "non_pass": {}}, {"version": 1, "non_pass": {"0": []}}):
+        with pytest.raises(ValueError, match=r"existing module t\.a.*--reason-for t\.a::s"):
+            _record(cases, existing, reason="blanket", known_modules={"t.a"})
+        ok = _record(
+            cases, existing, reason="blanket", known_modules={"t.a"}, reasons_for={"t.a::s": "why"}
+        )
+        assert ok.reference["non_pass"]["0"][0]["why"] == "why"
+
+
+def test_record_rejects_a_reason_for_that_matches_no_key_and_names_it() -> None:
+    cases = gs.parse_junit(_xml(_case("t.a", "p"), _case("t.a", "s", SKIP.format(msg="m"))))
+    with pytest.raises(ValueError, match=r"matches no key.*t\.a::typo"):
+        _record(cases, None, reasons_for={"t.a::s": "ok", "t.a::typo": "oops"})
+    ok = _record(cases, None, reasons_for={"t.a::s": "ok"})
+    assert ok.reference["non_pass"]["0"][0]["why"] == "ok"
+
+
+def test_record_cli_takes_existing_modules_from_the_collected_ids_not_the_durations_file(
+    tmp_path: Path,
+) -> None:
+    serial = tmp_path / "serial.xml"
+    serial.write_text(
+        _xml(_case("tests.unit.test_a", "test_x", SKIP.format(msg="new skip"))), encoding="utf-8"
+    )
+    ids = tmp_path / "ids.txt"
+    ids.write_text("tests/unit/test_a.py::test_x\n", encoding="utf-8")
+    reference = tmp_path / "ref.json"
+    reference.write_text(json.dumps({"version": 1, "non_pass": {"0": []}}), encoding="utf-8")
+    missing_durations = tmp_path / "no-such-durations.json"
+    base: list[str | Path] = ["record", "--from-junit", serial, "--reference", reference]
+    base += ["--ids", ids, "--reason", "seed", "--dry-run"]
+    refused = _cli(*base)
+    assert refused.returncode == 2 and "existing module tests.unit.test_a" in refused.stderr
+    assert "durations" not in refused.stderr
+    assert not missing_durations.exists()
+    named = _cli(*base, "--reason-for", "tests.unit.test_a::test_x=venue added a skip")
+    assert named.returncode == 0, named.stderr
+    stray = _cli(*base, "--reason-for", "tests.unit.test_a::test_x=a", "--reason-for", "t.b::y=b")
+    assert stray.returncode == 2 and "matches no key" in stray.stderr and "t.b::y" in stray.stderr
 
 
 def test_record_checks_the_serial_junit_covers_the_whole_collected_id_set() -> None:
@@ -1609,7 +1781,7 @@ def _git(cwd: Path, *args: str) -> None:
 
 
 def test_is_primary_tree_tells_a_main_tree_from_a_linked_worktree_and_a_non_repo(
-    run_dir: Path,
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     main = run_dir / "main"
     main.mkdir(parents=True)
@@ -1619,12 +1791,26 @@ def test_is_primary_tree_tells_a_main_tree_from_a_linked_worktree_and_a_non_repo
     _git(main, "commit", "-q", "-m", "init")
     linked = run_dir / "linked"
     _git(main, "worktree", "add", "-q", str(linked), "-b", "side")
+    inside = main / "sub"
+    inside.mkdir()
     plain = run_dir / "plain"
     plain.mkdir()
+    # Keep git from finding an enclosing repository (this tree's own checkout) above run_dir.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(run_dir))
     assert gs.is_primary_tree(main) is True
     assert gs.is_primary_tree(linked) is False
     assert gs.is_primary_tree(plain) is False
+    # A directory INSIDE a repository is not the top of one, so it is not a primary tree.
+    assert gs.is_primary_tree(inside) is False
     assert (linked / ".git").is_file() and (main / ".git").is_dir()
+
+
+def test_is_primary_tree_is_false_for_a_plain_dir_inside_an_enclosing_repo(run_dir: Path) -> None:
+    # No ceiling: the enclosing repository (this checkout, primary or linked) resolves for
+    # a subdirectory of it, which must still not count as a primary tree.
+    plain = run_dir / "plain-in-repo"
+    plain.mkdir(parents=True)
+    assert gs.is_primary_tree(plain) is False
 
 
 def test_shell_advisory_green_says_so_on_the_final_line(tmp_path: Path, run_dir: Path) -> None:
@@ -1662,7 +1848,7 @@ def _alive(pid: int) -> bool:
 
 def _signal_run(
     tmp_path: Path, run_dir: Path, **universe: Any
-) -> tuple[subprocess.Popen[str], list[int], float]:
+) -> tuple[subprocess.Popen[str], list[int], float, Path]:
     pid_file = tmp_path / "pids.txt"
     fake = _fake(tmp_path, pid_file=str(pid_file), **universe)
     proc = subprocess.Popen(
@@ -1679,7 +1865,7 @@ def _signal_run(
     pids = [int(x) for x in pid_file.read_text().split()] if pid_file.exists() else []
     started = time.monotonic()
     proc.send_signal(signal.SIGTERM)
-    return proc, pids, started
+    return proc, pids, started, fake.home
 
 
 def _assert_all_gone(pids: list[int]) -> None:
@@ -1692,27 +1878,31 @@ def _assert_all_gone(pids: list[int]) -> None:
 def test_shell_signal_kills_a_job_that_ignores_term_and_reaps_before_exiting(
     tmp_path: Path, run_dir: Path
 ) -> None:
-    proc, pids, _ = _signal_run(tmp_path, run_dir, sleep_s=60, ignore_term=True)
+    proc, pids, signalled, home = _signal_run(tmp_path, run_dir, sleep_s=60, ignore_term=True)
     try:
-        out, _err = proc.communicate(timeout=20)
+        out, _err = proc.communicate(timeout=40)
     finally:
         if proc.poll() is None:
             proc.kill()
+    waited = time.monotonic() - signalled
     assert proc.returncode == 130, out
+    assert waited >= 9, f"a TERM-ignoring job must get the full grace period, got {waited:.1f}s"
     _assert_all_gone(pids)
+    assert not _gate_root(home, run_dir).exists()
 
 
 def test_shell_signal_during_collection_reaches_the_collect_job(
     tmp_path: Path, run_dir: Path
 ) -> None:
-    proc, pids, _ = _signal_run(tmp_path, run_dir, sleep_collect_s=60)
+    proc, pids, _, home = _signal_run(tmp_path, run_dir, sleep_collect_s=60)
     try:
-        out, _err = proc.communicate(timeout=20)
+        out, _err = proc.communicate(timeout=40)
     finally:
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == 130, out
     _assert_all_gone(pids)
+    assert not _gate_root(home, run_dir).exists()
 
 
 # --- F5: ENV_SKIPS patterns that accept any text are not "static" ------------------------

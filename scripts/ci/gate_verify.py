@@ -456,13 +456,19 @@ def record_reference(
       a partial serial run cannot prune entries.
     * ``reruns`` are serial re-runs of keys that failed under load; each must be a
       single passing testcase of a key that failed, with its own ``reasons_for``.
-    * Against a non-empty reference, a new or changed non-pass key in a test module
-      listed in ``known_modules`` needs its own ``reasons_for``; the blanket
-      ``reason`` covers only keys of genuinely new modules (or the first seed).
+    * Whenever a reference file exists (even an empty one), a new or changed non-pass key
+      in a test module listed in ``known_modules`` (the modules of the collected run)
+      needs its own ``reasons_for``; the blanket ``reason`` covers only keys outside
+      those modules (collection-time skips) and the very first seed (no reference at all).
+    * Every ``reasons_for`` key must name a key of the serial run or rerun.
     """
     if not reason.strip():
         raise ValueError("a --reason is required to refresh the reference")
     diff: list[str] = []
+    seen_labels = {key_label((c.classname, c.name)) for c in [*cases, *reruns]}
+    unmatched = sorted(set(reasons_for) - seen_labels)
+    if unmatched:
+        raise ValueError(f"--reason-for matches no key in the serial run or rerun: {unmatched}")
     cases = _resolve_reruns(cases, reruns, reasons_for, diff)
     keys = [(c.classname, c.name) for c in cases]
     bad = [c for c in cases if c.outcome == "fail"]
@@ -478,7 +484,7 @@ def record_reference(
             f"{[key_label(k) for k in extra[:2]]}"
         )
     old_sets: dict[str, list[dict[str, str]]] = dict((reference or {}).get("non_pass", {}))
-    strict = any(old_sets.values())
+    strict = reference is not None  # a reference file exists: no blanket reasons in it
     old = {(e["classname"], e["name"]): e for e in old_sets.get(run_slow, [])}
     entries: list[dict[str, str]] = []
     for case in sorted(
