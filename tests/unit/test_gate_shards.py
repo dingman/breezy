@@ -62,16 +62,32 @@ DRIVER_HEAVY_FUNCTIONS: Final[tuple[str, ...]] = (
     "test_tail_only_is_report_only_and_records_code_sha",
     "test_tail_only_needs_a_clean_tree",
     "test_verify_first_runs_only_in_its_mode_and_only_on_2026_06_30",
-    "test_driver_scores_only_after_simulation_completes",
-    "test_driver_writes_each_episode_to_disk_before_the_next_is_pulled",
     "test_bracketed_unit_runs_both_hypotheses_and_converts_sizes_per_hypothesis",
     "test_a_ladder_listed_after_d_minus_1_noon_is_a_listing_abstention_not_a_bid",
     "test_full_run_is_deterministic",
     "test_bench_weighs_replayed_days_only_and_runs_every_variant",
     "test_the_tail_csv_source_and_episodes_jsonl_are_pinned",
-    "test_result_files_are_written_atomically",
     "test_tail_only_csv_is_written_atomically",
 )
+
+#: Driver tests that read one of the shared module-scoped runs. Each fixture maps to the
+#: functions that must stay its consumers (they moved here from DRIVER_HEAVY_FUNCTIONS or
+#: joined the group): the run is built once per module, so they must share a process.
+DRIVER_SHARED_CONSUMERS: Final[dict[str, tuple[str, ...]]] = {
+    "e2e": (
+        "test_result_files_are_written_atomically",
+        "test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict",
+    ),
+    "s4_stop": (
+        "test_s4_no_bid_bearing_days_is_a_reported_stop_not_a_void",
+        "test_s4_stop_s3_inputs_carry_exactly_the_keys_of_a_real_verdict",
+        "test_the_s4_stop_report_discloses_the_consumed_ledger_entry",
+    ),
+    "inprocess_spied": (
+        "test_driver_scores_only_after_simulation_completes",
+        "test_driver_writes_each_episode_to_disk_before_the_next_is_pulled",
+    ),
+}
 
 
 def _load() -> ModuleType:
@@ -212,13 +228,20 @@ def test_real_driver_e2e_consumers_form_one_group_and_exclude_heavy_functions() 
     assert len(consumers) >= 15
     assert "test_end_to_end_on_the_fixture_produces_a_verdict_and_every_artifact" in consumers
     assert "test_stats_rerun_on_scored_csv_reproduces_tables" in consumers
+    assert set(gs.SPLIT_FILES[DRIVER]) == set(DRIVER_SHARED_CONSUMERS)
+    every: set[str] = set()
+    for fixture, functions in DRIVER_SHARED_CONSUMERS.items():
+        of_fixture: set[str] = gs.affinity_consumers(text, [fixture])
+        for fn in functions:
+            assert fn in of_fixture, (fixture, fn)
+        every |= of_fixture
     for heavy in DRIVER_HEAVY_FUNCTIONS:
-        assert heavy not in consumers, heavy
+        assert heavy not in every, heavy
 
 
 def test_real_driver_partition_gives_one_e2e_group_and_each_heavy_function_its_own_unit() -> None:
     text = (REPO_ROOT / DRIVER).read_text(encoding="utf-8")
-    consumers = gs.affinity_consumers(text, ["e2e"])
+    consumers = gs.affinity_consumers(text, gs.SPLIT_FILES[DRIVER])
     functions = re.findall(r"^def (test_\w+)\(", text, flags=re.MULTILINE)
     ids = [f"{DRIVER}::{name}" for name in functions]
     part = gs.partition(ids, 6, None, sources={DRIVER: text})
@@ -395,23 +418,158 @@ def _split_ids() -> list[str]:
     ]
 
 
-def test_split_file_units_are_functions_with_parametrisations_kept_together() -> None:
+def test_split_file_units_split_safe_params_and_keep_consumer_params_together() -> None:
     path = "tests/unit/test_split.py"
+    source = _split_source() + "@pytest.mark.parametrize('x', [1, 2])\ndef test_gp(e2e, x): ...\n"
+    ids = [*_split_ids(), f"{path}::test_gp[1]", f"{path}::test_gp[2]"]
     part = gs.partition(
-        _split_ids(),
+        ids,
         8,
         None,
-        sources={path: _split_source()},
+        sources={path: source},
         split_files={path: ("e2e",)},
         tail_files=(),
     )
     args = _unit_args(part)
-    assert f"{path}::test_param" in args
-    assert not any("[" in a for a in args)
+    for param in ("1", "2", "3"):
+        assert f"{path}::test_param[{param}]" in args  # safe ids: one unit per node
+    assert f"{path}::test_param" not in args
+    assert f"{path}::test_gp" in args  # a consumer's params stay grouped
+    assert not any(a.startswith(f"{path}::test_gp[") for a in args)
     assert f"{path}::TestK::test_m" in args
     group_shards = [s for s in part.shards if f"{path}::test_g1" in s]
     assert len(group_shards) == 1 and f"{path}::test_g2" in group_shards[0]
+    assert f"{path}::test_gp" in group_shards[0]
     assert f"{path}::test_heavy_a" not in group_shards[0]
+
+
+_PARAM_SOURCE: Final[str] = (
+    "import pytest\n"
+    "@pytest.mark.parametrize('v', ['a-b', 'c'])\ndef test_p(v): ...\n"
+    "@pytest.mark.parametrize('v', ['x::y', 'z[1]'])\ndef test_q(v): ...\n"
+    "@pytest.mark.parametrize('v', ['a b', 'c'], ids=['a b', 'c'])\ndef test_s(v): ...\n"
+    "class TestK:\n"
+    "    @pytest.mark.parametrize('v', [1, 2])\n    def test_n(self, v): ...\n"
+)
+
+
+def _param_ids(path: str) -> list[str]:
+    return [
+        f"{path}::test_p[a-b]",
+        f"{path}::test_p[c]",
+        f"{path}::test_q[x::y]",
+        f"{path}::test_q[z[1]]",
+        f"{path}::test_s[a b]",
+        f"{path}::test_s[c]",
+        f"{path}::TestK::test_n[1]",
+        f"{path}::TestK::test_n[2]",
+    ]
+
+
+def _param_partition(path: str, durations: Any = None) -> Any:
+    return gs.partition(
+        _param_ids(path),
+        4,
+        durations,
+        sources={path: _PARAM_SOURCE},
+        split_files={path: ()},
+        tail_files=(),
+    )
+
+
+def test_only_ids_made_of_safe_characters_split_into_per_node_args() -> None:
+    path = "tests/unit/test_params.py"
+    args = _unit_args(_param_partition(path))
+    assert f"{path}::test_p[a-b]" in args and f"{path}::test_p[c]" in args
+    assert f"{path}::test_p" not in args
+    # `::` or a nested `[` inside an id is not a safe pytest argument: the function stays whole.
+    assert args.count(f"{path}::test_q") == 1
+    assert not any(a.startswith(f"{path}::test_q[") for a in args)
+
+
+def test_an_id_containing_a_space_keeps_its_function_whole() -> None:
+    path = "tests/unit/test_params.py"
+    args = _unit_args(_param_partition(path))
+    assert args.count(f"{path}::test_s") == 1
+    assert not any(a.startswith(f"{path}::test_s[") for a in args)
+
+
+def test_parametrised_class_methods_split_per_node() -> None:
+    path = "tests/unit/test_params.py"
+    args = _unit_args(_param_partition(path))
+    assert f"{path}::TestK::test_n[1]" in args and f"{path}::TestK::test_n[2]" in args
+    assert f"{path}::TestK::test_n" not in args
+
+
+def test_split_node_weights_sum_exactly_to_the_function_weight() -> None:
+    path = "tests/unit/test_params.py"
+    ids = [f"{path}::test_p[{n}]" for n in ("a", "b", "c")]
+    durations = {"functions": {"tests.unit.test_params::test_p": 10}, "files": {path: 10}}
+    part = gs.partition(
+        ids,
+        3,
+        durations,
+        sources={path: "import pytest\n@pytest.mark.parametrize('v', 'abc')\ndef test_p(v): ..."},
+        split_files={path: ()},
+        tail_files=(),
+    )
+    weights = [part.weights_ms[f"{path}::test_p[{n}]"] for n in ("a", "b", "c")]
+    assert weights == [4, 3, 3] and sum(weights) == 10
+
+
+def test_durations_from_param_cases_feed_the_partition_without_losing_weight() -> None:
+    path = "tests/unit/test_params.py"
+    cases = gs.parse_junit(
+        _xml(
+            _case("tests.unit.test_params", "test_p[a]", time="1.001"),
+            _case("tests.unit.test_params", "test_p[b]", time="2.0"),
+            _case("tests.unit.test_params", "test_p[c]", time="3.0"),
+        )
+    )
+    durations = gs.build_durations(cases, [path], split_files=[path])
+    assert durations["functions"] == {"tests.unit.test_params::test_p": 6001}
+    ids = [f"{path}::test_p[{n}]" for n in ("a", "b", "c")]
+    part = gs.partition(
+        ids,
+        3,
+        durations,
+        sources={path: "import pytest\n@pytest.mark.parametrize('v', 'abc')\ndef test_p(v): ..."},
+        split_files={path: ()},
+        tail_files=(),
+    )
+    assert sum(part.weights_ms.values()) == durations["functions"]["tests.unit.test_params::test_p"]
+
+
+def test_every_split_arg_selects_exactly_one_collected_node(tmp_path: Path) -> None:
+    (tmp_path / "test_syn.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('v', ['a-b', 'c', 'd.e', 'f_g'])\ndef test_p(v): ...\n"
+        "class TestK:\n"
+        "    @pytest.mark.parametrize('v', [1, 2])\n    def test_n(self, v): ...\n",
+        encoding="utf-8",
+    )
+    ids = [f"test_syn.py::test_p[{v}]" for v in ("a-b", "c", "d.e", "f_g")]
+    ids += [f"test_syn.py::TestK::test_n[{v}]" for v in (1, 2)]
+    source = (tmp_path / "test_syn.py").read_text(encoding="utf-8")
+    part = gs.partition(
+        ids,
+        3,
+        None,
+        sources={"test_syn.py": source},
+        split_files={"test_syn.py": ()},
+        tail_files=(),
+    )
+    args = _unit_args(part)
+    assert sorted(args) == sorted(ids)
+    for arg in args:
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:randomly",
+             "-p", "no:cacheprovider", "-o", "addopts=", "--rootdir", str(tmp_path), arg],
+            cwd=tmp_path, capture_output=True, text=True, check=False, timeout=120,
+        )  # fmt: skip
+        assert done.returncode == 0, (arg, done.stdout, done.stderr)
+        selected = [ln for ln in done.stdout.splitlines() if ln.startswith("test_syn.py::")]
+        assert selected == [arg], (arg, done.stdout)
 
 
 def test_split_units_spread_across_shards() -> None:
