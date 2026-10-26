@@ -151,6 +151,9 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # `breezy.runtime.submit_intent`'s read-only slot decoder, so source (c) picks it up
     # (WIDENED by this one row; the meta-test below is the plant: deleting it names this entry).
     "scripts.analysis.maker_loss_stop_producer",
+    # LAT-1: the real-data loader reads quote-tape gaps through `breezy.runtime.quote_tape_gaps`
+    # (the sanctioned loader), so source (c) picks it up. Offline analysis only.
+    "scripts.analysis.nbp_revision_latency_io",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
