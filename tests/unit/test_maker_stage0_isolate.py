@@ -10,7 +10,6 @@ a repeat of the same day starting from a fresh process.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import os
 import struct
@@ -30,6 +29,7 @@ from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis.maker_stage0_events_build import LocalDayViolation
 from scripts.analysis.maker_stage0_station_loop import LoopOutput
 from tests.fixtures.maker_stage0 import replay_world as rw
+from tests.support.stage0_outputs import VOLATILE, _normalised
 from tests.unit import test_maker_stage0_driver as drv_fx
 from tests.unit import test_maker_stage0_pno as pno_fx
 
@@ -47,10 +47,6 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> rw.World:
 @pytest.fixture(autouse=True)
 def _calibration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
-
-
-def _sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 # --- module-level so the spawned child can import them (patched over ``_child_main``) -----------
@@ -100,7 +96,6 @@ def _run(world: rw.World, tmp_path: Path, **over: Any) -> drv.RunConfig:
     return cfg
 
 
-VOLATILE = {"run_manifest.json", "pins.json", "progress.jsonl"}  # times, code sha, paths, RSS
 WORLDS: dict[str, dict[str, Any]] = {
     "base": {},
     "second_instance": {"second_instance": True},  # two instances: LRU reuse vs a fresh child
@@ -134,15 +129,37 @@ def _comparable(out: Any) -> dict[str, Any]:
     }
 
 
-def _normalised(cfg: drv.RunConfig, name: str) -> bytes:
-    """The artefact with run-specific values blanked: code sha, base dir, volatile files' shas."""
-    code_sha = json.loads((cfg.out_dir / "run_manifest.json").read_text())["git_commit"]
-    data = (cfg.out_dir / name).read_bytes()
-    data = data.replace(code_sha.encode(), b"<CODE>")
-    data = data.replace(str(cfg.out_dir.parent.parent).encode(), b"<BASE>")
-    for volatile in VOLATILE:
-        data = data.replace(_sha(cfg.out_dir / volatile).encode(), b"<VOLATILE>")
-    return data
+def _require_unpinned_hashseed() -> None:
+    """Fail in the gate (egress-block attested), skip in any other environment."""
+    seed = os.environ.get("PYTHONHASHSEED")
+    if seed is None:
+        return
+    if "BREEZY_TEST_OS_EGRESS_BLOCK" not in os.environ:
+        pytest.skip(f"PYTHONHASHSEED={seed} is exported, but this is not the gate")
+    pytest.fail(
+        f"PYTHONHASHSEED={seed} is exported: every spawned child would share one hash seed, "
+        "blinding the isolated-vs-in-process and determinism comparisons to hash-order bugs. "
+        "Unset it for the gate."
+    )
+
+
+def test_hashseed_guard_fails_in_the_gate_and_skips_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setenv("BREEZY_TEST_OS_EGRESS_BLOCK", "1")
+    with pytest.raises(pytest.fail.Exception, match="PYTHONHASHSEED=0"):
+        _require_unpinned_hashseed()
+    monkeypatch.delenv("BREEZY_TEST_OS_EGRESS_BLOCK")
+    with pytest.raises(pytest.skip.Exception, match="not the gate"):
+        _require_unpinned_hashseed()
+    monkeypatch.delenv("PYTHONHASHSEED")
+    _require_unpinned_hashseed()  # unset: nothing to report in either environment
+
+
+def test_the_gate_environment_does_not_pin_pythonhashseed() -> None:
+    """Child-side hash-order coverage needs every child to draw its own random hash seed."""
+    _require_unpinned_hashseed()
 
 
 @pytest.mark.parametrize("variant", list(WORLDS))

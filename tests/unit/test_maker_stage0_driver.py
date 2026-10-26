@@ -12,8 +12,11 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import multiprocessing as mp
 import re
+import traceback
 from collections.abc import Iterator
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -29,6 +32,7 @@ from scripts.analysis import maker_stage0_modes as modes_mod
 from scripts.analysis import maker_stage0_preflight as pf
 from scripts.analysis import maker_stage0_render as render
 from scripts.analysis import maker_stage0_report as rep
+from scripts.analysis import maker_stage0_scoped_convert as sc
 from scripts.analysis import maker_stage0_verify_first as vf
 from scripts.analysis.maker_stage0_catalog_read import CatalogSession, query_window_ns
 from scripts.analysis.maker_stage0_events_build import LocalDayViolation
@@ -43,6 +47,7 @@ from scripts.analysis.maker_stage0_rows import CsvCellError, CsvColumnError
 from scripts.analysis.maker_stage0_scored import VerdictRefused
 from scripts.analysis.maker_stage0_verdict import UNDERPOWERED
 from tests.fixtures.maker_stage0 import replay_world as rw
+from tests.support.stage0_outputs import VOLATILE, _normalised
 from tests.unit import test_maker_stage0_pins as pins_fx
 from tests.unit import test_maker_stage0_pno as pno_fx
 from tests.unit.test_maker_stage0_probe import _slug as pt_slug
@@ -457,8 +462,10 @@ def test_driver_refuses_existing_run_dir(e2e: Run) -> None:
 # --- refusals before the ledger ---------------------------------------------------------------
 
 
-def _fresh(world: rw.World, tmp_path: Path, **over: Any) -> drv.RunConfig:
-    repo = pins_fx._repo(tmp_path)
+def _fresh(
+    world: rw.World, tmp_path: Path, *, pinned_dates: bool = False, **over: Any
+) -> drv.RunConfig:
+    repo = pins_fx._repo(tmp_path, pinned_dates=pinned_dates)
     return make_cfg(world, tmp_path, repo, **over)
 
 
@@ -1067,38 +1074,111 @@ def test_a_failing_void_keeps_the_original_cause_in_the_message(
 
 # --- review fixes: determinism (py H2) and the capture-hashed manifest (py H3) -----------------
 
-MASKED_REPORT_LINES = (
-    "# MAKER-S2 Stage 0 replay:",  # run_id
-    "| code_sha (git_commit)",  # the fixture repo's commit sha (commit time)
-    "| verdict ledger",  # absolute ledger path
-    "| progress.jsonl",  # sidecar sha: wall-clock and RSS per station-day
-)
-MASKED_S3_KEYS = ("code_sha",)
+PROBE_KEY = "breezy-determinism-probe"
+CHILD_HASH_SEED = "20260101"  # fixed and non-zero: the parent's own seed is random per process
+CHILD_TIMEOUT_S = 600.0
+#: Compared files allowed to hold the run's base path: report.md carries the absolute ledger
+#: path (`| verdict ledger` line, <base>/derived/...). Every other compared file must be clean.
+BASE_ALLOWED: frozenset[str] = frozenset({"report.md"})
+LEDGER_LINE = "| verdict ledger"
+_JOIN_S = 30.0
 
 
-def _mask_report(text: str) -> str:
-    return "\n".join(
-        "<masked>" if line.startswith(MASKED_REPORT_LINES) else line for line in text.splitlines()
-    )
+def _probe() -> int:
+    """A string hash: equal across processes only when their PYTHONHASHSEED values are equal."""
+    return hash(PROBE_KEY)
 
 
-def _mask_s3(text: str) -> dict[str, Any]:
-    return {k: v for k, v in json.loads(text).items() if k not in MASKED_S3_KEYS}
+def run_once(conn: Connection, cfg: drv.RunConfig | None) -> None:
+    """Spawned-child entry (top level so ``spawn`` can import it): one cold run, or the probe only.
+
+    Sends ``("ok", probe)`` or ``("err", traceback text)``; exception objects are never pickled.
+    """
+    try:
+        if cfg is not None:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(drv, "load_calibration", lambda _model: pno_fx._calibration())
+                drv.run(cfg)
+        conn.send(("ok", _probe()))
+    except Exception:  # noqa: BLE001 - reported to the parent, which fails the test with it
+        conn.send(("err", traceback.format_exc()))
+    finally:
+        conn.close()
 
 
-def test_full_run_is_deterministic(world: rw.World, tmp_path: Path) -> None:
-    first = _fresh(world, tmp_path / "a", name="run_a")
-    second = _fresh(world, tmp_path / "b", name="run_b")
+def _cold_probe(cfg: drv.RunConfig | None, seed: str) -> int:
+    """Run ``run_once`` in ONE spawned child under ``PYTHONHASHSEED=seed``; return its probe."""
+    ctx = mp.get_context("spawn")
+    receiver, sender = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=run_once, args=(sender, cfg))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("PYTHONHASHSEED", seed)
+        proc.start()
+    sender.close()
+    if not receiver.poll(CHILD_TIMEOUT_S):
+        proc.kill()
+        proc.join(_JOIN_S)
+        pytest.fail(f"the determinism child gave no result in {CHILD_TIMEOUT_S:.0f} s")
+    try:
+        status, payload = receiver.recv()
+    except EOFError:
+        status, payload = "err", "the child closed its pipe without a result"
+    proc.join(_JOIN_S)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(_JOIN_S)
+    if status != "ok":
+        pytest.fail(f"the determinism child failed:\n{payload}")
+    assert proc.exitcode == 0, f"the determinism child exited with {proc.exitcode}"
+    return int(payload)
+
+
+def test_probe_children_agree_on_one_seed_and_differ_across_seeds() -> None:
+    """Positive control for the hash-seed difference the determinism test relies on."""
+    same = (_cold_probe(None, "11"), _cold_probe(None, "11"))
+    other = _cold_probe(None, "22")
+    assert same[0] == same[1]
+    assert other != same[0]
+
+
+def test_full_run_is_deterministic(
+    world: rw.World, tmp_path: Path, inprocess_spied: InProcessSpied
+) -> None:
+    """Run A: warm parent (memo + caches populated, parent hash seed). Run B: ONE cold child with
+    another PYTHONHASHSEED. Every output file must match once run-specific values are blanked.
+
+    Both runs are `isolate=False`: the isolate-equivalence tests pin isolated == in-process.
+    """
+    # Known limit: this proves A is warm, not that the memo reaches an output (M7 is not caught,
+    # a module-global counter, M7b, is).
+    assert sc._SCANS, "run A must be warm: `inprocess_spied` fills the scan memo in this process"
+    first = _fresh(world, tmp_path / "a", isolate=False, pinned_dates=True)
+    second = _fresh(world, tmp_path / "b", isolate=False, pinned_dates=True)
     drv.run(first)
-    drv.run(second)
+    child_probe = _cold_probe(second, CHILD_HASH_SEED)
+    assert _probe() != child_probe, "the child shared the parent's hash seed: B would add nothing"
     a, b = first.out_dir, second.out_dir
-    for name in ("station_days.csv", "scored_episodes.csv", "catalog_slice_manifest.json"):
-        assert (a / name).read_bytes() == (b / name).read_bytes(), name
-    assert _mask_s3((a / "s3_inputs.json").read_text()) == _mask_s3(
-        (b / "s3_inputs.json").read_text()
-    )
-    ra, rb = (_mask_report((d / "report.md").read_text()).splitlines() for d in (a, b))
-    assert [(x, y) for x, y in zip(ra, rb, strict=True) if x != y] == []
+    commits = [json.loads((d / "run_manifest.json").read_text())["git_commit"] for d in (a, b)]
+    assert commits[0] == commits[1], "pinned git dates must give equal commits before masking"
+    names = sorted(p.name for p in a.iterdir())
+    assert names == sorted(p.name for p in b.iterdir())
+    assert (a / "episodes.jsonl").stat().st_size > 0
+    with (a / "scored_episodes.csv").open(newline="") as handle:
+        assert list(csv.DictReader(handle)), "scored_episodes.csv has no data rows"
+    with (a / "station_days.csv").open(newline="") as handle:
+        assert sum(int(r["n_episodes"] or 0) for r in csv.DictReader(handle)) > 0
+    compared = sorted(set(names) - VOLATILE)
+    for cfg in (first, second):  # `_normalised` blanks the base path, so check it directly
+        base = str(cfg.out_dir.parent.parent).encode()
+        leaks = [
+            n for n in compared if base in (cfg.out_dir / n).read_bytes() and n not in BASE_ALLOWED
+        ]
+        assert not leaks, f"{cfg.out_dir}: the run's base path leaked into {leaks}"
+        report_lines = (cfg.out_dir / "report.md").read_text().splitlines()
+        stray = [x for x in report_lines if base.decode() in x and not x.startswith(LEDGER_LINE)]
+        assert not stray, f"{cfg.out_dir}: base path outside the ledger line of report.md"
+    for name in compared:
+        assert _normalised(first, name) == _normalised(second, name), name
 
 
 def test_catalog_slice_manifest_hashes_the_capture_files_by_relative_path(e2e: Run) -> None:
