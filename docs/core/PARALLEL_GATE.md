@@ -16,7 +16,17 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
 
 - `--run-dir` must be a NEW directory directly under `<tree>/.pytest-tmp/`, name of at most
   16 characters (`[A-Za-z0-9_-]`), so AF_UNIX paths under it fit in 107 bytes. Anything else
-  exits 2. The default `~/.cache/breezy-gate` is never used.
+  exits 2.
+- Gate dirs live OUTSIDE the tree, at `$HOME/.cache/breezy-gate/par/<run-name>/<job>` (mode 0700;
+  the serial wrapper's own default gate-dir root). Phase 2 puts its basetemp under the gate dir
+  and the sandbox binds the repo read-only, so a gate dir inside the tree breaks every
+  `bwrap_host` test (`bwrap: Can't remount readonly ... Invalid argument`). The driver refuses
+  to start (exit 2) if the root resolves inside the repo tree (HOME under the tree, or `par` a
+  symlink into it) or already exists (a concurrent run with the same name, or a leftover of a
+  SIGKILLed run: remove it by hand). The root is removed when the run ends, on green, red,
+  refusal and signal alike; the removal (`gate_shards.py rm-gate-root`) deletes only a real
+  directory that is a direct child of `par/` and refuses anything else. Phase-1 basetemp and
+  `TMPDIR` stay under `<run>/bt` and `<run>/tmp`.
 - Shard count: `N = clamp(min(--shards or 10, floor((MemAvailable_GB - 4) / PER_SHARD_GB)), 1, 10)`,
   printed with the reason; also capped by `os.cpu_count()`, and `--shards` must be at least 1.
   `PER_SHARD_GB = 1.5` is a MEAN-based budget, not a peak bound: Phase 0 measured per-shard peak
@@ -25,9 +35,11 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
 - Exit code: the first nonzero among the shards (in order), the serial tail, then the
   execution proof (4). `2` means refused before any test ran (bad run dir, empty or failed
   collection, partition error).
-- Scratch (`bt/`, `tmp/`, `gate/`) is deleted on green and kept on red; `logs/`, `junit/` and
+- Scratch (`bt/`, `tmp/`) is deleted on green and kept on red (gate dirs are always removed); `logs/`, `junit/` and
   `plan/` are always kept. SIGINT/SIGTERM send TERM to every job's process group (the whole-suite
-  collect job included), wait 2 s, send KILL to the survivors, reap them, and exit 130.
+  collect job included), wait 10 s, send KILL to the survivors, reap them, and exit 130. The
+  group kill cannot reach a descendant that started its own session (`setsid`, a daemonised
+  helper): such a process can outlive the run, so check for strays after an interrupted run.
 
 ## How it works
 
@@ -41,10 +53,10 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
    of one function are never separated. A drift guard fails if a split file gains a wider
    autouse fixture, `usefixtures`/`getfixturevalue`, teardown after a non-function
    `yield`, a mutated module-level accumulator, or uses a wide-scope conftest fixture.
-4. Every shard runs through `run_tests_no_egress.sh` with a private `BREEZY_GATE_DIR`,
-   `TMPDIR` and `--basetemp` under the run dir, in its own session. The wrapper's phase 2 (the
-   `bwrap_host` registry, about 3 s) runs ONCE PER JOB, so a run does it N + 1 times (shards
-   plus tail); its return code propagates, and in a git worktree it always fails (36 tests).
+4. Every shard runs through `run_tests_no_egress.sh` with a private `BREEZY_GATE_DIR`
+   (outside the tree, see above), and a private `TMPDIR` and `--basetemp` under the run dir, in
+   its own session. The wrapper's phase 2 (the `bwrap_host` registry, about 3 s) runs ONCE PER
+   JOB, so a run does it N + 1 times (shards plus tail); its return code propagates.
 5. After every shard exits and whole-host CPU idle, sampled from `/proc/stat` over a 3 s window
    (`gate_shards.py cpu-idle`), reaches 90 % (wait bounded to 120 s; the measured value is
    printed; the 1-minute loadavg lags too far behind to use), the tail runs: `tier_lanes.SERIAL_FILES`, real-clock-budget files and
@@ -56,8 +68,9 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
      per `BREEZY_RUN_SLOW` value) or match an `ENV_SKIPS` entry (host-dependent skip,
      exact key or function prefix, anchored message regex, `static`/`resource` tag; a
      `resource` skip inside a shard exits 4). Passing tests are never listed.
-   - Skip/xfail divergence is authoritative only on the primary tree (`git rev-parse
-     --git-dir` equals `--git-common-dir`, so a linked worktree is not primary) with a
+   - Skip/xfail divergence is authoritative only on the primary tree (the directory is itself the
+     top level of its repository, `--show-toplevel`, and `git rev-parse --git-dir` equals
+     `--git-common-dir`; a linked worktree, or a directory merely inside a repository, is not) with a
      reference set for the current `run_slow` and no test seam active; otherwise the proof
      summary says `OUTCOME CHECK ADVISORY` and the final shell line reads
      `GATE GREEN (OUTCOME CHECK ADVISORY)`. An advisory pass is never printed as plain green.
@@ -79,15 +92,18 @@ cd <tree> && PYTHONPATH=<tree>/src:<tree> \
   `run_tests_no_egress.sh ... --junitxml <run>/junit/serial.xml`, then
   `python3 scripts/ci/gate_shards.py record --from-junit <run>/junit/serial.xml --reason "<why>"`.
   `record` also takes `--ids <run>/plan/whole.ids` (the collected ids): the serial JUnit must
-  cover them exactly, so a partial serial run cannot prune entries. Against a non-empty
-  reference, every new or changed skip/xfail in a test module that already exists
-  (`gate_durations.json` `files`) needs its own `--reason-for KEY=TEXT`; the blanket
-  `--reason` covers only keys of genuinely new modules and the first seed into an empty
-  reference. A serial run that failed only because of load (for example the 60 s import
+  cover them exactly, so a partial serial run cannot prune entries, and the modules of those ids
+  are the "existing" modules. Whenever the reference file exists (even empty), every new or
+  changed skip/xfail in an existing module needs its own `--reason-for KEY=TEXT`; the blanket
+  `--reason` covers only collection-time skips of modules that are not in the run and the very
+  first seed (no reference file). A `--reason-for` key that matches no key of the serial run or
+  rerun is refused, naming it. A serial run that failed only because of load (for example the 60 s import
   budget) is accepted only with a serial rerun: `--rerun-junit <run>/junit/serial-rerun-<name>.xml`;
   each substituted key must have failed in the serial run, appear exactly once in the rerun
-  as a PASS (a skip or xfail is refused), and carry its own `--reason-for`. A malformed
-  `--reason-for` is refused naming the argument. The diff is printed; nothing is committed.
+  as a PASS (a skip or xfail is refused), and carry its own `--reason-for`. To record a load-flake rerun, rerun ONLY the failed node ids
+  (`run_tests_no_egress.sh <failed node id>... --junitxml <run>/junit/serial-rerun-<name>.xml`),
+  never the whole file: a whole-file rerun holds passing keys that did not fail and is refused
+  ("did not fail"). A malformed `--reason-for` is refused naming the argument. The diff is printed; nothing is committed.
 - Durations: a green parallel run writes `<run>/durations.suggested.json`; adopt it with
   `gate_shards.py durations --from-junit ... --out scripts/ci/gate_durations.json`.
 - A file that flakes in a parallel run moves to `serial_tail`. Every file matching the timing
@@ -143,5 +159,6 @@ for that reason) and an order-dependent fd-count assertion in
 showed fd `41` in the BEFORE listing and gone from the AFTER one: a stale fd held by garbage
 from an earlier test was closed by a collector pass inside the window; the test now collects
 before the baseline and disables the collector inside the window, with the same equality
-assertion). The `bwrap_host` phase-2 tests fail in a git
-worktree for a host-mount reason, not because of sharding; the serial gate shows the same 36.
+assertion). The 36 phase-2 `bwrap_host` failures
+seen in worktree runs came from the gate dir sitting inside the (read-only bound) tree, not from the
+worktree: with the gate dir outside the tree phase 2 passes (41 tests) in a worktree too.

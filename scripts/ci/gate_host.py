@@ -1,4 +1,4 @@
-"""Host probes for the parallel gate: shard sizing, CPU idle, and primary-tree detection.
+"""Host probes for the parallel gate: shard sizing, CPU idle, primary tree and gate dirs.
 
 Stdlib only; split from ``gate_shards.py``.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Final
@@ -98,8 +99,60 @@ def _git_path(root: Path, flag: str) -> Path | None:
 
 
 def is_primary_tree(repo_root: Path) -> bool:
-    """True only for the main working tree (git dir == common git dir); a linked
-    worktree, a non-repository or a missing ``git`` is not primary."""
+    """True only for the main working tree: ``repo_root`` is itself the top level of a
+    repository and its git dir is the common git dir. A linked worktree, a directory
+    that merely sits inside some repository, a non-repository or a missing ``git`` is
+    not primary."""
+    top = _git_path(repo_root, "--show-toplevel")
     git_dir = _git_path(repo_root, "--git-dir")
     common = _git_path(repo_root, "--git-common-dir")
-    return git_dir is not None and common is not None and git_dir == common
+    if top is None or git_dir is None or common is None:
+        return False
+    return top == repo_root.resolve() and git_dir == common
+
+
+#: Where each parallel job's private gate dir lives: under the serial wrapper's own
+#: default gate-dir root, never inside the repository (the sandbox binds the repo
+#: read-only, and phase 2 puts its basetemp under the gate dir).
+PAR_ROOT_PARTS: Final[tuple[str, ...]] = (".cache", "breezy-gate", "par")
+
+
+def par_root(home: Path) -> Path:
+    return home.joinpath(*PAR_ROOT_PARTS)
+
+
+def _is_inside(path: Path, parent: Path) -> bool:
+    resolved, base = path.resolve(), parent.resolve()
+    return resolved == base or base in resolved.parents
+
+
+def gate_root(repo_root: Path, home: Path, run_name: str) -> Path:
+    """The per-run gate-dir root ``<home>/.cache/breezy-gate/par/<run_name>``.
+
+    Fail closed: refuses a root that resolves inside the repository tree (HOME under the
+    tree, or ``par`` a symlink into it) and a root that already exists (another run, or
+    a leftover of a killed one, owns it)."""
+    root = par_root(home) / run_name
+    if _is_inside(root, repo_root):
+        raise ValueError(
+            f"gate dir root would be inside the repo tree ({root} -> {root.resolve()}); "
+            "the sandbox binds the repo read-only, so phase 2 cannot use it"
+        )
+    if root.exists() or root.is_symlink():
+        raise ValueError(
+            f"gate dir root already exists: {root} (another run, or a leftover: remove it by hand)"
+        )
+    return root
+
+
+def remove_gate_root(home: Path, root: Path) -> None:
+    """Delete ``root`` only if it is a real directory directly under ``<home>/.cache/
+    breezy-gate/par``. Anything else (the par root itself, a symlink, a deeper path, a
+    path with ``..``, a path outside) is refused and left alone. A root already gone is fine."""
+    parent = par_root(home)
+    if ".." in root.parts or root.parent.resolve() != parent.resolve() or not root.name:
+        raise ValueError(f"refusing to remove {root}: not a direct child of {parent}")
+    if root.is_symlink():
+        raise ValueError(f"refusing to remove {root}: it is a symlink")
+    if root.exists():
+        shutil.rmtree(root)
