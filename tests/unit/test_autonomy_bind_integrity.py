@@ -7,6 +7,7 @@ needs bwrap. Alias, escape and "never create a bind source" cases are the point.
 from __future__ import annotations
 
 import dataclasses
+import gc
 import os
 import socket
 import stat
@@ -300,9 +301,18 @@ def test_duplicate_bind_is_refused(roots: SandboxRoots) -> None:
 
 
 def test_a_refusal_closes_the_binds_opened_before_it(roots: SandboxRoots) -> None:
+    # Stale fd-holding garbage from earlier tests is finalised BEFORE the baseline, and the
+    # collector is off inside the window, so no fd can be closed (or hidden) by a GC pass
+    # mid-test: an fd the refusal leaks stays open and is still caught by the equality below.
+    gc.collect()
     before = _open_fds()
-    _refused(roots, _row("cache/a", "cache/never-made"), "missing")
-    assert _open_fds() == before
+    gc.disable()
+    try:
+        _refused(roots, _row("cache/a", "cache/never-made"), "missing")
+        after = _open_fds()
+    finally:
+        gc.enable()
+    assert after == before
 
 
 def test_fixture_root_row_resolves_against_the_alternate_base(

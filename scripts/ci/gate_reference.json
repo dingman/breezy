@@ -1,0 +1,1625 @@
+{
+ "non_pass": {
+  "0": [
+   {
+    "classname": "tests.contract.test_autonomy_units_programme",
+    "message": "wrapper has no exit 75 path",
+    "name": "test_infra_exit_75_stays_a_loud_failure_on_the_owning_unit[capital-flow-pull-run.sh]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.contract.test_autonomy_units_programme",
+    "message": "wrapper has no exit 75 path",
+    "name": "test_infra_exit_75_stays_a_loud_failure_on_the_owning_unit[family-tally-v2-run.sh]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.contract.test_autonomy_units_programme",
+    "message": "wrapper has no exit 75 path",
+    "name": "test_infra_exit_75_stays_a_loud_failure_on_the_owning_unit[live-tally-run.sh]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.contract.test_autonomy_units_programme",
+    "message": "wrapper has no exit 75 path",
+    "name": "test_infra_exit_75_stays_a_loud_failure_on_the_owning_unit[score-live-trials-run.sh]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.contract.test_autonomy_units_programme",
+    "message": "wrapper has no exit 75 path",
+    "name": "test_infra_exit_75_stays_a_loud_failure_on_the_owning_unit[slot-guard-run.sh]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.contract.test_reconciliation_settlement_price_hazard",
+    "message": "RED for EXEC_SPINE R-9, STILL. R-4 landed `src/breezy/adapters/polymarket_us/exec/client.py`, so the module is no longer empty and the `_send_order_status_report` seam IS reachable -- it is the native `_query_order` path, CALLED (not absent) at `live/execution_client.py:516-532`, closed only because this client's own `generate_order_status_report` always returns `None` (pinned by `tests/unit/test_polymarket_us_exec_client.py::test_native_query_order_never_reaches_the_send_seam`). What is still genuinely missing is R-9's OWN guard: nothing yet supplies an NWS-keyed settlement price to that seam, and no `SettlementExitActor` exists to drive it. The assertions below are at FULL strength and are NOT to be weakened. `strict=True` means this file goes RED the moment R-9's guard lands: an XPASS fails the suite, forcing the marker off. That is the intended signal, not a regression.",
+    "name": "test_reconciliation_fallback_price_is_never_booked",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_aut6_bwrap_rows",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_aut6_rows_keep_temp_and_final_in_one_bind_with_exdev_control",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_aut6_bwrap_rows",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_every_aut6_row_self_probe_both_directions_under_real_bwrap[breezy-autonomy-alert-redeliver]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_aut6_bwrap_rows",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_every_aut6_row_self_probe_both_directions_under_real_bwrap[breezy-autonomy-canary]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_aut6_bwrap_rows",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_every_aut6_row_self_probe_both_directions_under_real_bwrap[breezy-autonomy-health]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_aut6_bwrap_rows",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_health_reads_systemd_and_journal_inside_its_bwrap_row",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_child_env_is_explicit_and_has_no_egress_attestation",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_credentials_dir_readonly_only_listed_names",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_dns_row_has_only_resolv_file_and_hosts_lookup_works",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_home_listing_is_rebinds_only",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_nested_userns_disabled",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_notify_row_rebinds_notify_socket_node",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_own_bind_writable",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_probe_state_write_erofs",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_proc_row_host_pid_environ_root_eacces_kill_esrch",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_proc_row_reads_host_proc_locks_and_pid_status",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_repo_and_bind_ancestors_erofs",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_run_has_no_host_sockets",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_run_readonly_and_allowlisted_entries_only",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_ssh_aws_gnupg_netrc_enoent",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_studies_lock_rebind_excludes_both_ways",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_wrapper_provides_private_tmp",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_bwrap_xdg_cache_home_is_private_tmp",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_concurrent_children_share_binds_and_keep_private_tmp",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_harness_children_have_no_network",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_proc_row_child_namespace_pid_names_other_host_process",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_production_home_mount_args_hide_real_home",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_production_roots_argv_execs_the_venv_interpreter",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_self_probe_passes_inside_row_and_fails_with_wrong_row",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_selftest_cli_proc_checks_report_host_view",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_autonomy_sandbox_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_selftest_cli_reports_tmp_size_and_exact_home_listing",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_bus_handoff_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_in_row_symlink_plant_then_unsandboxed_snapshot_refuses",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_bus_handoff_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_in_row_systemctl_fails_and_snapshot_readable",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_bwrap_host_phase_witness",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_phase2_witness_children_use_bwrap_unshare_net",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_bwrap_host_phase_witness",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_phase2_witness_parent_has_not_loaded_refused_modules",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_bwrap_host_phase_witness",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_phase2_witness_sees_phase_env_only",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_capture_studies_lock_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_studies_lock_in_row_alone_succeeds",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_capture_studies_lock_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_studies_lock_in_row_held_by_host_ewouldblock",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_wal_snapshot_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_mode_ro_in_place_fails_under_bwrap_without_sidecars",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_wal_snapshot_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_take_flock_true_under_bwrap_readonly_lock",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_wal_snapshot_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_wal_snapshot_under_bwrap_sidecars_absent",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.integration.test_wal_snapshot_namespace",
+    "message": "bwrap_host test runs in phase 2 of scripts/ci/run_tests_no_egress.sh",
+    "name": "test_wal_snapshot_under_bwrap_sidecars_present",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_app_trade_fq_loss_stop_wiring",
+    "message": "F6 already merged into base; diff scope verified at merge",
+    "name": "test_f6_diff_name_only_is_within_scope",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_app_trade_fq_loss_stop_wiring",
+    "message": "F6 already merged into base; diff scope verified at merge",
+    "name": "test_f6_trade_py_changes_only_compose_fq",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_app_trade_fq_loss_stop_wiring",
+    "message": "F6 already merged into base; diff scope verified at merge",
+    "name": "test_scope_guards_stay_active_when_base_lacks_f6",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_aut2_units_no_expected_failure",
+    "message": "AUT-2 WP9 lands the reconcile units",
+    "name": "test_every_aut2_unit_exits_nonzero_on_genuine_failure[aut2-reconciliation]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_aut2_units_no_expected_failure",
+    "message": "AUT-2 WP9 lands the reconcile units",
+    "name": "test_every_aut2_unit_exits_nonzero_on_genuine_failure[reconcile-poststop]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_aut2_units_no_expected_failure",
+    "message": "AUT-2 WP9 lands the reconcile units",
+    "name": "test_every_aut2_unit_exits_zero_on_no_input[aut2-reconciliation]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_aut2_units_no_expected_failure",
+    "message": "AUT-2 WP9 lands the reconcile units",
+    "name": "test_every_aut2_unit_exits_zero_on_no_input[reconcile-poststop]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_adapter_reader_fixtures_written_through_record_fill",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_admissibility_predicate_shared[watch_actor]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_alpha_index_never_resets",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_ambiguous_intent_cancels_swap_not_incumbent_launch",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_attest_cadence_has_no_expiry_gap[schedule]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_attest_expiry_and_chain_staleness_veto_entries",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_attest_requires_every_listed_detector",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_attest_veto_armed_after_first_attest",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_attest_veto_rearmed_only_after_post_swap_attest",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_bad_demand_file_vetoes_venue[actor]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-4; blocks none",
+    "name": "test_calibration_leg_relative_inconclusive_below_min_buckets",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_cause_verdict_ids_subset_of_acted_rows",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_champion_own_artefact_mismatch_at_load_is_integrity",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_child_env_drops_inbound_registry_keys",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_child_env_touches_only_registry_keys",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks none",
+    "name": "test_classify_current_intent_states",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_compose_refuses_without_entry_veto_slot",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_containment_checks_read_directory_not_phantom_base",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-1; blocks none",
+    "name": "test_decision_id_unique_per_take",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_demand_archive_crash_between_copy_and_unlink_is_idempotent",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_demand_archive_differing_bytes_is_integrity",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_demand_archive_tmpfile_fallback_sweeps_named_temp",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_demotion_latency_slo",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_demotion_never_requires_policy_and_is_immediate[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_detectors_and_drawdown_include_drill_fills[detectors]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP11; blocks none",
+    "name": "test_detectors_and_drawdown_include_drill_fills[drawdown]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP3; blocks PROMOTE",
+    "name": "test_drawdown_inert_ceiling_is_pins_literal_not_policy_key[policy]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP11; blocks none",
+    "name": "test_drawdown_producer_handshake_with_labels",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_drill_fills_spend_venue_budget",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_drill_halt_never_freezes_or_writes_exec_store[exec_store]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_drill_inject_mapped_only_in_clause",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_drill_inject_passes_when_marker_absent",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_drill_marker_read_error_never_resumes",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_drill_rollback_to_superseded_incumbent_admitted",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_drill_timeline_matches_aut7_sequence",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_engine_heartbeat_stale_vetoes",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_entry_guard_cache_invalidated_on_fill",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_entry_guard_exact_key_reads_only",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_entry_veto_closed_before_first_tick_and_on_stale_tick",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-1; blocks none",
+    "name": "test_every_exit_fill_joins",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_every_live_verdict_journaled_once_per_daily_pass",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks RESUME,ROLLBACK",
+    "name": "test_failed_drill_close_restored_at_next_prelaunch",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_failed_rollback_halts_champion",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_family_source_fixed_in_unit",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_fee_schedule_verdict_feeds_fee_verified_checks",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_fill_reader_production_default_runs_once",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_halted_family_boots_entries_vetoed_exits_live",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_hand_relaunch_without_registry_source_refused",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_holdout_opens_cache_has_named_writer",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_absent_after_attest_clears_via_reset_cli",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_reset_cannot_unhalt",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_reset_cli_journals_alerts_and_chains",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_reset_never_refunds_counters",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_reset_requires_expected_head",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_hwm_reset_store_refuses_carried_counters_below_export[store]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_incumbent_boot_survives_child_ambiguous_intent",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_infeasible_nomination_charges_no_alpha[store]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-4; blocks none",
+    "name": "test_infeasible_nomination_charges_no_alpha[verdict]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_intraday_engine_is_restrictive_only[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_intraday_pass_yields_to_prelaunch_lock",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_l1_cutover_abort_leaves_no_key_and_no_registry",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_l1_cutover_hwm_write_slot_ends_by_164455",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_l1_cutover_late_write_completion_aborts",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_l1_cutover_lock_acquired_at_164454_aborts",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_l1_cutover_writes_initial_hwm_under_exec_flock",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_mirror_read_failure_is_integrity",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_no_policy_fail_demotes_never_widens",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_node_loads_artefact_from_store_by_row_sha",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_node_relaunch_rule_family_id_and_seq_prefix[node]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_node_writes_hwm_at_boot_before_first_entry",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_nomination_columns_required_and_read_by_k_check[k_check]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_nomination_refused_past_k_max_lifetime",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_nomination_refused_second_in_window",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-3; blocks none",
+    "name": "test_own_outcome_effect_not_vacuous",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-3; blocks none",
+    "name": "test_own_outcome_refused_below_min_gate_decisions",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_pending_write_uses_intraday_reconciliation[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP3; blocks PROMOTE",
+    "name": "test_policy_block_not_looser_than_code_ceilings",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP3; blocks PROMOTE",
+    "name": "test_policy_map_not_looser_than_fallback_map",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_post_launch_swap_cancel_restores_incumbent[supervisor]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-2; blocks none",
+    "name": "test_post_stop_producer_inconclusive_without_stop_signal",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_prelaunch_requires_post_stop_reconciliation",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_prelaunch_writes_rollback_and_activate_atomically[prelaunch]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks ACTIVATE,ROLLBACK",
+    "name": "test_prelaunch_writes_rollback_and_activate_atomically[store_atomic]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_producer_demand_write_is_restrictive_only[aut6_producer_ast]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_production_detector_ignores_shadow_marker",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP3; blocks PROMOTE",
+    "name": "test_promote_disabled_when_eta_after_kill",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_promotion_requires_reconciled_state",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_reconciliation_and_entry_guard_never_read_canary_store[adapter_reader]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-3; blocks none",
+    "name": "test_refit_writes_only_fresh_sha_dir",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_registry_champion_requires_live_orders_gate_for_every_kind[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_registry_shadow_logs_agreement_and_spawns_env_family",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_registry_unavailable_mints_no_permit",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_registry_unreadable_veto_clears_only_after_verified_read",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_registry_veto_leaves_exit_seam_open",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_relaunch_request_schema_exact_set",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE,SUPERSEDE",
+    "name": "test_repeat_supersede_same_family_is_not_replay[store]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP8; blocks HWM_RESET",
+    "name": "test_resolver_resolves_after_hwm_reset",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_restrictive_commit_failure_sets_node_veto",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks RESUME",
+    "name": "test_resume_admission_reads_policy_block_bounds",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_resume_clears_registry_halted_without_relaunch",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_resume_written_only_at_prelaunch[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ACTIVATE",
+    "name": "test_retired_demand_file_archived",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_rollback_fee_check_uses_verdict_not_node_memory",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_rollback_restores_byte_identical_artefact",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_root_admit_only_when_venue_has_no_sender[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_root_admit_refused_after_operator_halt_within_cooldown",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_root_admit_refused_on_stale_halt_mirror",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_root_admit_requires_own_allowlist_triple[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP2; blocks none",
+    "name": "test_rung_net_position_veto_crosses_legs_and_families[adapter_reader]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP10; blocks none",
+    "name": "test_shadow_bootstrap_creates_export_dir",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_shadow_detector_ignores_production_marker",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_shadow_never_vetoes_or_arms_hand_relaunch_rule",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_shadow_probe_marker_accepted_only_under_shadow_root",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_shadow_resolution_cannot_reach_build_child_env",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks none",
+    "name": "test_submit_intent_record_extraction_is_move_only",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks none",
+    "name": "test_submit_intent_record_module_has_no_file_io",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP6; blocks none",
+    "name": "test_supervisor_busy_retry_only_at_launch",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_swap_cannot_exceed_daily_budget_across_namespaces",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_target_byte_mismatch_ineligible_without_freeze[selection]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-7; blocks ROLLBACK",
+    "name": "test_target_manifest_mismatch_marks_ineligible",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_transient_veto_writes_no_transition",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_try_submit_latency_independent_of_webhook_latency",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_two_intraday_passes_inside_launch_window",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP1; blocks PROMOTE",
+    "name": "test_two_pending_nominees_get_distinct_k",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_verdict_acceptance_rules",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_verdict_accepted_after_attest",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_verdict_subject_sha_must_match_row",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP4; blocks ROOT_ADMIT",
+    "name": "test_verdict_validity_ceiling[engine]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_verify_and_load_share_bytes[loader]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_applies_admitted_prefix_then_vetoes",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_busy_tick_is_unverified_not_veto",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_export_seq_never_lowered",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_never_reads_projection",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_refused_ticks_idempotent",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_watch_actor_store_touches_stay_on_loop_thread",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_watchdog_kill_paged_once_via_notifier_marker_else_fallback_critical",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_watchdog_unit_config_declares_notify_watchdog_restart_startlimit_and_notifyaccess_all",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-6; blocks none",
+    "name": "test_watchdog_units_are_literal_and_exclude_trade_supervisor_engine",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-4; blocks none",
+    "name": "test_window_cap_below_n_min_is_inconclusive",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_cross_area",
+    "message": "AUT-5:WP5; blocks none",
+    "name": "test_write_monotone_skips_stale_boot_write_after_tick",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_owner_placeholders",
+    "message": "ARCH-0-seamA:8d; blocks none",
+    "name": "test_envelope_pending_names_empty",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_plugins",
+    "message": "AUT-1; blocks none",
+    "name": "test_every_non_retired_manifest_resolves_to_full_plugins[capture]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_plugins",
+    "message": "AUT-6; blocks none",
+    "name": "test_every_non_retired_manifest_resolves_to_full_plugins[detectors]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_plugins",
+    "message": "AUT-4; blocks none",
+    "name": "test_every_non_retired_manifest_resolves_to_full_plugins[evaluator]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_plugins",
+    "message": "AUT-3; blocks none",
+    "name": "test_every_non_retired_manifest_resolves_to_full_plugins[refitter]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_autonomy_plugins",
+    "message": "AUT-2; blocks none",
+    "name": "test_every_non_retired_manifest_resolves_to_full_plugins[scorer]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_capture_audit_stubs",
+    "message": "got empty parameter set for (module)",
+    "name": "test_every_stub_has_a_docstring_and_only_raises_not_implemented[NOTSET]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_capture_audit_stubs",
+    "message": "got empty parameter set for (module)",
+    "name": "test_every_stub_raises_not_implemented_when_called[NOTSET]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_census_column_scan_memory.TestNewPathDeltaRssBoundAtD6_150k",
+    "message": "slow D=6x150k memory test; set BREEZY_RUN_SLOW=1 to run",
+    "name": "test_d1_vs_d6_at_150k_rows_per_day",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_detector_catalog",
+    "message": "AUT6_EXPECTED_SKIP:policy_map_pending_AUT-5b",
+    "name": "test_policy_detector_map_covers_catalog_exactly",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_drawdown_producer",
+    "message": "AUT-5:WP11; blocks none",
+    "name": "test_drawdown_gates_on_labels_consumable",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_exec_par_bg8_supervisor_probes",
+    "message": "dead-watcher and resolver alerts need a live node",
+    "name": "test_every_breaker_alert_only_alerts_and_never_respawns_or_kills[False-probe0]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_exec_par_bg8_supervisor_probes",
+    "message": "dead-watcher and resolver alerts need a live node",
+    "name": "test_every_breaker_alert_only_alerts_and_never_respawns_or_kills[False-probe1]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_exec_par_bg8_supervisor_probes",
+    "message": "dead-watcher and resolver alerts need a live node",
+    "name": "test_every_breaker_alert_only_alerts_and_never_respawns_or_kills[False-probe5]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_exec_par_wp5b_config",
+    "message": "configured K=1: D-PREREG freeze checks apply at K>1 only",
+    "name": "test_real_repo_freeze_enforcement",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_exec_par_wp7_replay",
+    "message": "driven by the child-process replay test",
+    "name": "test_replay_session_dump_for_child_process",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_execution_egress_firewall_guard",
+    "message": "bwrap unusable on this host: bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces. See <https://deb.li/bubblewrap> or <file:///usr/share/doc/bubblewrap/README.De",
+    "name": "test_n5_the_launcher_mechanism_actually_blocks_egress_on_this_host",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_extend_dedupe_filtered",
+    "message": "slow child-process RSS-scaling test; set BREEZY_RUN_SLOW=1 to run",
+    "name": "test_filtered_extend_dedupe_rss_does_not_scale_with_other_instruments_depth_truncation",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_multi_position_validation_2026_09_14",
+    "message": "measured: observed one-sided efficacy-crossing rate ~0.059 at seed 20260914 / 5000 reps (0.0592) and seed 20260914 / 2000 reps (0.058), both > alpha(0.025) + 0.01 slack = 0.035, under k in {1,2,3} MIXED qty in {1,2,3}. A qty=1-only control (same methodology, same seed family) measures ~0.011-0.013 -- within tolerance -- so the inflation is a genuine mixed-qty effect (higher qty pushes a station-day's variance up to 9x a single Bernoulli term, so I saturates far faster than the artefact's n_k/n_max=0.25-per-draw schedule assumes, and the realised-t boundary interpolation undershoots at that faster accrual), not a simulation artefact. Increment A ships at qty=1 only (R3-2), where this statistic is correctly calibrated; Increment B (qty>1) needs the boundary re-validated (plan Rev3 S3 'Increment B: re-run (ii) with qty>1') before it can rely on this artefact. Per R3-3 disposition, this does NOT block Increment A and the artefact is NOT re-solved here. AUD-06a (2026-09-25, docs/evidence/RULING_r11_qty_envelope_2026-09-25.md): re-validation at a dimensionless qty-envelope sweep (Amendment C, MULTI_POSITION_PER_STATION_2026-09-14.md) reproduced both figures, found the recorded mechanism's monotonicity STRONGLY supported (Spearman rho=0.83, p=0.0001 across 29 cells) but returned an INDETERMINATE mechanism verdict because the qty=1 control anchor itself departs from the artefact's assumed schedule under a realistic (non-uniform, cheap) BE prior -- a confound unrelated to qty. No envelope was published; this xfail is unchanged and stays strict pending a completed grid or a reconsidered control-anchor tolerance. FULL-GRID UPDATE (2026-09-25): all 320 cells run; a domain-reviewed baseline-relative anchor (Amendment C2) was added and BOTH anchors still return INDETERMINATE (rho=0.87/0.70, p=0.0001, n=280) -- C2 fixed the qty=1-vs-BE-prior confound but exposed a SEPARATE, qty-independent finding: 16/56 q_max=1 cells already exceed alpha, and every one is a MIXED (YES+NO) side_mix cell, so boundary over-crossing is not purely a qty effect. Raw data (not a formal envelope) shows 100% of q_max>=2 cells (224/224) over alpha in every stratum, fold increase 1.27x-17.95x at q_max=2 -- see the RULING artefact's full-grid addendum.",
+    "name": "test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "sensitivity study, not an H0 finding (see module docstring (1b)): independent Gaussian ask noise + selection-on-noise manufactures a real edge; reports (does not gate) the resulting crossing-rate inflation. Numbers recorded in docs/evidence/NO_SIDE_LDOBF_REVALIDATION_2026-09-14.md.",
+    "name": "test_noisy_ask_sensitivity_crossing_rate_report[2]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "sensitivity study, not an H0 finding (see module docstring (1b)): independent Gaussian ask noise + selection-on-noise manufactures a real edge; reports (does not gate) the resulting crossing-rate inflation. Numbers recorded in docs/evidence/NO_SIDE_LDOBF_REVALIDATION_2026-09-14.md.",
+    "name": "test_noisy_ask_sensitivity_crossing_rate_report[3]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "sensitivity study, not an H0 finding (see module docstring (1b)): independent Gaussian ask noise + selection-on-noise manufactures a real edge; reports (does not gate) the resulting crossing-rate inflation. Numbers recorded in docs/evidence/NO_SIDE_LDOBF_REVALIDATION_2026-09-14.md.",
+    "name": "test_noisy_ask_sensitivity_crossing_rate_report[4]",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[300-1]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[300-2]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[300-3]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[300-4]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[90-1]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[90-2]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[90-3]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_no_side_ldobf_validation_2026_09_14",
+    "message": "full-size Monte-Carlo (>=20k reps/config); set BREEZY_FULL_MC=1",
+    "name": "test_real_selection_rule_crossing_rate_full[90-4]",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_promotion_proposal",
+    "message": "real evidence artefacts are not present on this host",
+    "name": "test_step14_one_real_run_against_todays_evidence_c8",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_runtime_live_order_guard",
+    "message": "MEASURED against nautilus_trader==1.231.0: `OrderInitialized.reconciliation` (`model/events/order.pyx:481`) is a hardcoded `return False`, regardless of the constructor argument. Verified directly: constructing `OrderInitialized(..., reconciliation=True)` and reading `.reconciliation` back returns `False`. The guard's `event.reconciliation` check (R-6a \u00a72) is therefore inert for this event type even in a unit test that constructs the event directly -- not only 'dead because Nautilus never publishes it' (M1), but dead because the flag cannot be read back at all. Nautilus is immutable here; this is not a Breezy defect to fix. `strict=True` means an XPASS (Nautilus corrected the property) fails the suite and forces a re-read, which is the intended signal.",
+    "name": "test_a_nautilus_reconciliation_event_is_out_of_jurisdiction",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_runtime_live_order_guard",
+    "message": "Same measured defect as `test_a_nautilus_reconciliation_event_is_out_of_jurisdiction` -- see that test and the module docstring. This is \u00a72's OWN motivating case (a resting post-only order found at the venue on restart): it fails for the identical reason, since `event.reconciliation` reads `False` regardless.",
+    "name": "test_a_reconciled_post_only_order_is_also_out_of_jurisdiction",
+    "outcome": "xfail",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_unit_health_dropins",
+    "message": "the orders-off drop-in is not installed on this host",
+    "name": "test_the_live_dropin_matches_the_injected_orders_off_row",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_us_source_collector_unit",
+    "message": "bwrap_profile_ok failed under this environment: bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces. See <https://deb.li/bubblewrap> or <file:///usr/share/doc/bubblewrap/README.Debian.gz>.",
+    "name": "test_bwrap_probe_alerts_env_is_present_and_read_only",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_us_source_collector_unit",
+    "message": "bwrap_profile_ok failed under this environment: bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces. See <https://deb.li/bubblewrap> or <file:///usr/share/doc/bubblewrap/README.Debian.gz>.",
+    "name": "test_bwrap_probe_blocks_credentials_and_writes_outside_archive_dir",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   },
+   {
+    "classname": "tests.unit.test_us_source_collector_unit",
+    "message": "bwrap_profile_ok failed under this environment: bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces. See <https://deb.li/bubblewrap> or <file:///usr/share/doc/bubblewrap/README.Debian.gz>.",
+    "name": "test_bwrap_probe_real_collector_help_runs_under_the_profile",
+    "outcome": "skip",
+    "why": "seed: serial reference 2026-10-26 (worktree perf/parallel-gate, base 6af68cd3)"
+   }
+  ],
+  "1": []
+ },
+ "version": 1
+}
