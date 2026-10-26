@@ -68,7 +68,14 @@ from gate_classify import (
     tier_lanes,
     timing_scan_files,
 )
-from gate_fixtures import affinity_consumers, drift_problems
+from gate_fixtures import (
+    Unit,
+    affinity_consumers,
+    drift_problems,
+    node_units,
+    refuse_duplicates,
+    splittable,
+)
 from gate_host import (
     DEFAULT_SHARDS,
     MAX_SHARDS,
@@ -148,9 +155,6 @@ DEFAULT_TEST_MS: Final[int] = 100
 COUNT_WEIGHT_MS: Final[int] = 1000
 #: Run names are short so AF_UNIX paths (107 bytes) under the run dir fit.
 RUN_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
-#: A parametrisation suffix is a safe pytest argument when it holds no ``::``, no nested ``[``
-#: and no whitespace; only then may a non-consumer function be cut into one unit per node.
-SAFE_PARAM_RE: Final[re.Pattern[str]] = re.compile(r"^\[[A-Za-z0-9_.\-]+\]$")
 SOCKET_PATH_LIMIT: Final[int] = 107
 SOCKET_NAME_RESERVE: Final[int] = 48
 RC_USAGE: Final[int] = 2
@@ -251,21 +255,6 @@ class Partition(NamedTuple):
     warnings: list[str]
 
 
-class _Unit(NamedTuple):
-    key: str
-    args: tuple[str, ...]
-    weight_ms: int
-
-
-def refuse_duplicates(ids: Sequence[str]) -> None:
-    if len(set(ids)) != len(ids):
-        counts: dict[str, int] = {}
-        for nodeid in ids:
-            counts[nodeid] = counts.get(nodeid, 0) + 1
-        dupes = sorted(i for i, c in counts.items() if c > 1)
-        raise ValueError(f"duplicate node ids in the collection: {dupes[:3]}")
-
-
 def _int_ms(value: float) -> int:
     return max(0, round(value))
 
@@ -315,7 +304,7 @@ def partition(
     dur: Mapping[str, Any] = durations or {}
     files_ms: Mapping[str, float] = dur.get("files", {})
     median_ms = _int_ms(dur.get("median_test_ms", DEFAULT_TEST_MS))
-    units: list[_Unit] = []
+    units: list[Unit] = []
     tail: list[str] = []
     for path in sorted(by_file):
         members = by_file[path]
@@ -328,7 +317,7 @@ def partition(
                 weight = _int_ms(files_ms[path])
             else:
                 weight = median_ms * len(members)
-            units.append(_Unit(path, (path,), weight))
+            units.append(Unit(path, (path,), weight))
         else:
             units.extend(_split_units(path, members, splits[path], sources, dur, durations is None))
     weights = {u.key: u.weight_ms for u in units}
@@ -345,7 +334,7 @@ def _split_units(
     sources: Mapping[str, str] | None,
     durations: Mapping[str, Any],
     count_only: bool,
-) -> list[_Unit]:
+) -> list[Unit]:
     text = sources[path] if sources and path in sources else (REPO_ROOT / path).read_text("utf-8")
     consumers = affinity_consumers(text, fixtures) if fixtures else set()
     nodes_of: dict[str, list[str]] = {}
@@ -360,28 +349,17 @@ def _split_units(
             else _function_weight(unit, len(nodes), path, durations, file_median)
         )
     group = sorted(u for u in nodes_of if u.partition("::")[2] in consumers)
-    units: list[_Unit] = []
+    units: list[Unit] = []
     for unit in sorted(nodes_of):
         if unit in group:
             continue
-        if _splittable(unit, nodes_of[unit]):
-            units.extend(_node_units(sorted(nodes_of[unit]), weight_of[unit]))
+        if splittable(unit, nodes_of[unit]):
+            units.extend(node_units(sorted(nodes_of[unit]), weight_of[unit]))
         else:
-            units.append(_Unit(unit, (unit,), weight_of[unit]))
+            units.append(Unit(unit, (unit,), weight_of[unit]))
     if group:
-        units.append(_Unit("|".join(group), tuple(group), sum(weight_of[u] for u in group)))
+        units.append(Unit("|".join(group), tuple(group), sum(weight_of[u] for u in group)))
     return units
-
-
-def _splittable(unit: str, nodes: Sequence[str]) -> bool:
-    """True when every node of ``unit`` carries a safe parametrisation suffix."""
-    return all(SAFE_PARAM_RE.fullmatch(node[len(unit) :]) for node in nodes)
-
-
-def _node_units(nodes: Sequence[str], weight_ms: int) -> list[_Unit]:
-    """One unit per node; the integer parts sum exactly to ``weight_ms``."""
-    base, extra = divmod(weight_ms, len(nodes))
-    return [_Unit(node, (node,), base + (1 if i < extra else 0)) for i, node in enumerate(nodes)]
 
 
 # --- shard count -----------------------------------------------------------------------------

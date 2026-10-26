@@ -8,8 +8,9 @@ granularity. Used by ``gate_shards.py`` and pinned by ``tests/unit/test_gate_sha
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 _WIDE_SCOPES: Final[frozenset[str]] = frozenset({"class", "module", "package", "session"})
 _MUTATORS: Final[frozenset[str]] = frozenset(
@@ -176,3 +177,36 @@ def drift_problems(
     for name in sorted(set(wide) & used):
         problems.append(f"uses conftest fixture {name!r} (scope {wide[name]!r})")
     return problems
+
+
+# --- node-level splitting ---
+
+#: A parametrisation suffix is a safe pytest argument when it holds no ``::``, no nested ``[``
+#: and no whitespace; only then may a non-consumer function be cut into one unit per node.
+SAFE_PARAM_RE: Final[re.Pattern[str]] = re.compile(r"^\[[A-Za-z0-9_.\-]+\]$")
+
+
+class Unit(NamedTuple):
+    key: str
+    args: tuple[str, ...]
+    weight_ms: int
+
+
+def splittable(unit: str, nodes: Sequence[str]) -> bool:
+    """True when every node of ``unit`` carries a safe parametrisation suffix."""
+    return all(SAFE_PARAM_RE.fullmatch(node[len(unit) :]) for node in nodes)
+
+
+def node_units(nodes: Sequence[str], weight_ms: int) -> list[Unit]:
+    """One unit per node; the integer parts sum exactly to ``weight_ms``."""
+    base, extra = divmod(weight_ms, len(nodes))
+    return [Unit(node, (node,), base + (1 if i < extra else 0)) for i, node in enumerate(nodes)]
+
+
+def refuse_duplicates(ids: Sequence[str]) -> None:
+    if len(set(ids)) != len(ids):
+        counts: dict[str, int] = {}
+        for nodeid in ids:
+            counts[nodeid] = counts.get(nodeid, 0) + 1
+        dupes = sorted(i for i, c in counts.items() if c > 1)
+        raise ValueError(f"duplicate node ids in the collection: {dupes[:3]}")
