@@ -37,6 +37,47 @@ fi
 
 unset BREEZY_BWRAP_HOST_PHASE BREEZY_GATE_COLLECT_ONLY_CLAIM BREEZY_GATE_COLLECT_ONLY_CONFIRM_FILE
 
+# BREEZY_GATE_PHASE2=defer is the parallel driver's opt-in: a shard skips phase 2 (the
+# driver's serial tail runs it once). Read it, then unset it so it never reaches pytest.
+# Unset keeps today's behaviour exactly; any other value is refused before phase 1.
+# A deferred run is not a gate run, so it never exits 0: when phase 1 passed it exits
+# DEFERRED_PASS_RC. Only the parallel driver maps that back to 0, for a job it launched
+# with defer (gate_verify.deferred_job_rc). Phase 1 failures keep their own rc.
+DEFERRED_PASS_RC=10
+PHASE2_DEFER=0
+if [[ -n "${BREEZY_GATE_PHASE2+x}" ]]; then
+  phase2_mode="$BREEZY_GATE_PHASE2"
+  unset BREEZY_GATE_PHASE2
+  if [[ "$phase2_mode" != "defer" ]]; then
+    echo "[breezy] BREEZY_GATE_PHASE2 must be 'defer' (got: $phase2_mode)" >&2
+    exit 2
+  fi
+  # A parallel shard's gate dir is exactly $HOME/.cache/breezy-gate/par/<run>/<job>, a real
+  # directory chain (no symlink), owned by this user, holding the driver's 0600 token.
+  par_root="$HOME/.cache/breezy-gate/par"
+  gate_rel="${BREEZY_GATE_DIR:-}"
+  gate_rel="${gate_rel#"$par_root"/}"
+  defer_ok=0
+  if [[ -n "${BREEZY_GATE_DIR:-}" && "${BREEZY_GATE_DIR}" == "$par_root"/* \
+        && "$gate_rel" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$ ]]; then
+    defer_ok=1
+    for part in "$HOME/.cache" "$HOME/.cache/breezy-gate" "$par_root" \
+        "$par_root/${gate_rel%%/*}" "$BREEZY_GATE_DIR"; do
+      if [[ -L "$part" || ! -d "$part" ]]; then defer_ok=0; fi
+    done
+    token="$BREEZY_GATE_DIR/.parallel-shard"
+    if [[ ! -O "$BREEZY_GATE_DIR" || -L "$token" || ! -f "$token" || ! -O "$token" \
+          || "$(stat -c %a "$token")" != "600" ]]; then
+      defer_ok=0
+    fi
+  fi
+  if [[ "$defer_ok" -ne 1 ]]; then
+    echo "[breezy] phase-2 defer refused: not a parallel shard" >&2
+    exit 2
+  fi
+  PHASE2_DEFER=1
+fi
+
 GATE_DIR="${BREEZY_GATE_DIR:-$HOME/.cache/breezy-gate}"
 if [[ -e "$GATE_DIR" && ! -d "$GATE_DIR" ]]; then
   echo "[breezy] gate dir is not a directory: $GATE_DIR" >&2
@@ -158,6 +199,12 @@ fi
 if [[ "$collect_only" == 1 && "$(cat -- "$P1_CONFIRM")" == "collect-only" ]]; then
   echo "[breezy] gate: phase1 rc=$phase1_rc phase2 omitted (collect-only confirmed)" >&2
   exit "$phase1_rc"
+fi
+
+if [[ "$PHASE2_DEFER" == 1 ]]; then
+  echo "[breezy] gate: phase1 rc=$phase1_rc phase2 DEFERRED (parallel shard; NOT a gate run)" >&2
+  [[ "$phase1_rc" -ne 0 ]] && exit "$phase1_rc"
+  exit "$DEFERRED_PASS_RC"
 fi
 
 phase2_rc=0

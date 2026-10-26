@@ -4,6 +4,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.support import bwrap_host_phase as phase
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -249,3 +251,205 @@ def test_gate_dir_reuse_is_chmod_0700(tmp_path: Path) -> None:
     result = _run_script(tmp_path)
     assert result.returncode == 0, result.stderr
     assert stat.S_IMODE(gate_dir.stat().st_mode) == 0o700
+
+
+# --- BREEZY_GATE_PHASE2=defer (parallel shard opt-in) -------------------------------------
+
+TOKEN_NAME = ".parallel-shard"
+DEFERRED_PASS_RC = 10
+REFUSED = "[breezy] phase-2 defer refused: not a parallel shard"
+
+
+def _par_gate(
+    tmp_path: Path, *, token: bool = True, parts: tuple[str, ...] = ("run", "s0")
+) -> Path:
+    """A gate dir at HOME/.cache/breezy-gate/par/<parts...> (HOME = tmp_path/home)."""
+    gate = tmp_path / "home" / ".cache" / "breezy-gate" / "par"
+    for part in parts:
+        gate = gate / part
+    gate.mkdir(parents=True, mode=0o700)
+    if token:
+        tok = gate / TOKEN_NAME
+        tok.write_text("shard\n", encoding="utf-8")
+        tok.chmod(0o600)
+    return gate
+
+
+def _defer_run(
+    tmp_path: Path, gate: Path | str, *, value: str = "defer", args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
+    return _run_script(
+        tmp_path,
+        *args,
+        extra_env={"BREEZY_GATE_DIR": str(gate), "BREEZY_GATE_PHASE2": value},
+    )
+
+
+def _assert_refused(tmp_path: Path, result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode == 2, result.stderr
+    assert REFUSED in result.stderr
+    assert not (tmp_path / "calls.log").exists()
+
+
+def test_defer_without_token_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path, token=False)
+    _assert_refused(tmp_path, _defer_run(tmp_path, gate))
+
+
+def test_defer_with_gate_dir_outside_par_root_is_refused(tmp_path: Path) -> None:
+    gate = tmp_path / "elsewhere" / "run" / "s0"
+    gate.mkdir(parents=True, mode=0o700)
+    (gate / TOKEN_NAME).write_text("x", encoding="utf-8")
+    (gate / TOKEN_NAME).chmod(0o600)
+    _assert_refused(tmp_path, _defer_run(tmp_path, gate))
+
+
+def test_defer_with_gate_dir_one_level_too_shallow_is_refused(tmp_path: Path) -> None:
+    _assert_refused(tmp_path, _defer_run(tmp_path, _par_gate(tmp_path, parts=("run",))))
+
+
+def test_defer_with_gate_dir_one_level_too_deep_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path, parts=("run", "s0", "deeper"))
+    _assert_refused(tmp_path, _defer_run(tmp_path, gate))
+
+
+def test_defer_with_symlinked_gate_dir_is_refused(tmp_path: Path) -> None:
+    real = _par_gate(tmp_path, parts=("run", "real"))
+    link = real.parent / "s0"
+    link.symlink_to(real, target_is_directory=True)
+    _assert_refused(tmp_path, _defer_run(tmp_path, link))
+
+
+def test_defer_with_symlinked_run_dir_is_refused(tmp_path: Path) -> None:
+    real = _par_gate(tmp_path, parts=("real", "s0"))
+    link = real.parent.parent / "run"
+    link.symlink_to(real.parent, target_is_directory=True)
+    _assert_refused(tmp_path, _defer_run(tmp_path, link / "s0"))
+
+
+def test_defer_with_symlinked_token_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path, token=False)
+    real = tmp_path / "real-token"
+    real.write_text("x", encoding="utf-8")
+    real.chmod(0o600)
+    (gate / TOKEN_NAME).symlink_to(real)
+    _assert_refused(tmp_path, _defer_run(tmp_path, gate))
+
+
+def test_defer_with_token_mode_not_0600_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path)
+    (gate / TOKEN_NAME).chmod(0o644)
+    _assert_refused(tmp_path, _defer_run(tmp_path, gate))
+
+
+def test_defer_with_trailing_slash_gate_dir_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path)
+    _assert_refused(tmp_path, _defer_run(tmp_path, f"{gate}/"))
+
+
+def test_defer_with_dotdot_in_gate_dir_is_refused(tmp_path: Path) -> None:
+    gate = _par_gate(tmp_path)
+    _assert_refused(tmp_path, _defer_run(tmp_path, Path(f"{gate.parent}/../run/s0")))
+
+
+def test_defer_without_gate_dir_is_refused(tmp_path: Path) -> None:
+    _par_gate(tmp_path)
+    result = _run_script(tmp_path, extra_env={"BREEZY_GATE_DIR": "", "BREEZY_GATE_PHASE2": "defer"})
+    _assert_refused(tmp_path, result)
+
+
+@pytest.mark.parametrize("value", ["skip", "", "DEFER", "1"])
+def test_bad_phase2_value_is_refused_before_phase1(tmp_path: Path, value: str) -> None:
+    result = _defer_run(tmp_path, _par_gate(tmp_path), value=value)
+    assert result.returncode == 2, result.stderr
+    assert "BREEZY_GATE_PHASE2 must be 'defer'" in result.stderr
+    assert not (tmp_path / "calls.log").exists()
+
+
+def test_valid_defer_skips_phase2_and_exits_deferred_pass_rc_never_zero(tmp_path: Path) -> None:
+    result = _defer_run(tmp_path, _par_gate(tmp_path))
+    assert result.returncode == DEFERRED_PASS_RC != 0, result.stderr
+    assert (
+        "[breezy] gate: phase1 rc=0 phase2 DEFERRED (parallel shard; NOT a gate run)"
+        in result.stderr
+    )
+    assert result.stderr.count("DEFERRED") == 1
+    assert "phase2 rc=" not in result.stderr
+    log = _log(tmp_path)
+    assert log.count("PYTEST") == 1
+    assert "env:1:" not in log
+
+
+def test_valid_defer_exits_with_phase1_rc(tmp_path: Path) -> None:
+    result = _defer_run(tmp_path, _par_gate(tmp_path), args=("--phase1-fail",))
+    assert result.returncode == 5
+    assert "phase1 rc=5 phase2 DEFERRED" in result.stderr
+    assert "phase2 rc=" not in result.stderr
+    assert _log(tmp_path).count("PYTEST") == 1
+
+
+def test_valid_defer_exits_one_when_phase1_rc_is_one(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake_bwrap(bin_dir / "bwrap")
+    py = bin_dir / "python"
+    _write_executable(py, "#!/usr/bin/env bash\nexit 1\n")
+    gate = _par_gate(tmp_path)
+    env = _script_env(bin_dir=bin_dir, fake_python=py, log=tmp_path / "calls.log", gate_dir=gate)
+    env["HOME"] = str(tmp_path / "home")
+    env["BREEZY_GATE_PHASE2"] = "defer"
+    result = subprocess.run(
+        [str(SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "phase1 rc=1 phase2 DEFERRED" in result.stderr
+
+
+def test_phase2_gate_var_never_reaches_pytest(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake_bwrap(bin_dir / "bwrap")
+    seen = tmp_path / "seen.txt"
+    py = bin_dir / "python"
+    _write_executable(
+        py,
+        "#!/usr/bin/env bash\n"
+        'if [[ ${1:-} == "-I" ]]; then printf "%s\\n" tests/x.py; exit 0; fi\n'
+        f'printf "[%s]\\n" "${{BREEZY_GATE_PHASE2+set}}" >> "{seen}"\n'
+        "exit 0\n",
+    )
+    gate = _par_gate(tmp_path)
+    env = _script_env(bin_dir=bin_dir, fake_python=py, log=tmp_path / "calls.log", gate_dir=gate)
+    env["HOME"] = str(tmp_path / "home")
+    env["BREEZY_GATE_PHASE2"] = "defer"
+    result = subprocess.run(
+        [str(SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == DEFERRED_PASS_RC, result.stderr
+    assert seen.read_text(encoding="utf-8") == "[]\n"
+
+
+def test_unset_phase2_var_still_runs_phase2(tmp_path: Path) -> None:
+    result = _run_script(tmp_path)
+    assert result.returncode == 0
+    assert "phase1 rc=0 phase2 rc=0" in result.stderr
+    assert "DEFERRED" not in result.stderr
+
+
+def test_deferred_pass_rc_is_the_same_constant_in_the_wrapper_and_the_gate_module() -> None:
+    wrapper = SCRIPT.read_text(encoding="utf-8")
+    verify = (REPO_ROOT / "scripts" / "ci" / "gate_verify.py").read_text(encoding="utf-8")
+    assert f"\nDEFERRED_PASS_RC={DEFERRED_PASS_RC}\n" in wrapper
+    assert f"DEFERRED_PASS_RC: Final[int] = {DEFERRED_PASS_RC}\n" in verify

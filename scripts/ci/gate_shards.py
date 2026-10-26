@@ -88,10 +88,13 @@ from gate_verify import (
     RecordResult,
     Verdict,
     assert_serial_junit_path,
+    deferred_job_rc,
     env_skip_matches,
     parse_junit,
     parse_reason_for,
+    phase2_proof,
     plan_flake_rerun,
+    read_log,
     record_reference,
     verify,
 )
@@ -689,6 +692,22 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_deferred_rc(args: argparse.Namespace) -> int:
+    print(deferred_job_rc(args.rc, read_log(args.log)))
+    return 0
+
+
+def _cmd_phase2_proof(args: argparse.Namespace) -> int:
+    shard_logs = {Path(p).stem: read_log(p) for p in args.shard_log}
+    errors = phase2_proof(shard_logs, read_log(args.tail_log) if args.tail_log else None)
+    for line in errors:
+        print(f"[phase2] ERROR {line}")
+    if errors:
+        return RC_PROOF_MISMATCH
+    print(f"[phase2] phase 2 ran once, in the tail ({len(shard_logs)} deferred job(s))")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -753,6 +772,14 @@ def _parser() -> argparse.ArgumentParser:
     dur.add_argument("--from-junit", nargs="+", required=True)
     dur.add_argument("--out", required=True)
     dur.set_defaults(func=_cmd_durations)
+    p2 = sub.add_parser("phase2-proof")
+    p2.add_argument("--shard-log", action="append", default=[])
+    p2.add_argument("--tail-log", default=None)
+    p2.set_defaults(func=_cmd_phase2_proof)
+    drc = sub.add_parser("deferred-rc")
+    drc.add_argument("--rc", type=int, required=True)
+    drc.add_argument("--log", required=True)
+    drc.set_defaults(func=_cmd_deferred_rc)
     agg = sub.add_parser("aggregate")
     agg.add_argument("rcs", nargs="*", type=int)
     agg.set_defaults(func=_cmd_aggregate)
