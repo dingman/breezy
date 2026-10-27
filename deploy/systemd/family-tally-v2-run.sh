@@ -100,6 +100,7 @@ resolve_champion_manifest() {
     return 1
   fi
   CHAMPION_MANIFEST=$path
+  SENDING_FAMILY_ID=$id
   return 0
 }
 
@@ -188,6 +189,16 @@ if [ "$FAMILY" = "$PM_FAMILY" ]; then
   GUARD_OUT=$("$PY" -m breezy.runtime.structural_pin_guard --family "$FAMILY" --token "$CHECK_TOKEN" 2>&1)
   GUARD_RC=$?
   say "$GUARD_OUT"
+  if [ "$GUARD_RC" -ne 0 ] && [ "${SENDING_FAMILY_ID:-}" != "$PM_FAMILY" ]; then
+    # Retired-family skip: the pin gate only protects the tally while
+    # pm_us_crh_v2 is the SENDING family. Once another family sends, the pin
+    # can never be MATCH for v2 and the daily unit would fail forever -- exit 0
+    # with an explicit line instead. Never silent; while v2 IS the sender (or
+    # the sender is unknown) a not-ready pin still exits 1 below.
+    echo "FAMILY TALLY V2 ($FAMILY) SKIPPED -- family retired/not sending (sending family is ${SENDING_FAMILY_ID:-unknown})"
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- family retired/not sending (sending family is ${SENDING_FAMILY_ID:-unknown}); pin guard said: $GUARD_OUT"
+    exit 0
+  fi
   if [ "$GUARD_RC" -ne 0 ]; then
     MSG="FAMILY TALLY V2 ($FAMILY) STRUCTURAL PIN NOT READY -- $GUARD_OUT (token '$CHECK_TOKEN')"
     echo "$MSG"

@@ -54,6 +54,12 @@ def _systemctl_stub(
     return stub
 
 
+def _v2_sending_systemctl(tmp_path: Path) -> Path:
+    """The structural pin gate only fails closed while pm_us_crh_v2 is the
+    SENDING family; a not-ready pin for a non-sending v2 is SKIPPED (exit 0)."""
+    return _systemctl_stub(tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v2")
+
+
 def _valid_family_ids() -> set[str]:
     """B6: a family manifest is valid only when its own `family_id` field
     equals the file's basename -- excludes `gs_boundary_pm_us_crh_v2.json`
@@ -917,6 +923,7 @@ esac
         ["pm_us_crh_v2"],
         tmp_path,
         stub_python=stub,
+        systemctl_stub=_v2_sending_systemctl(tmp_path),
         set_state_db=True,
     )
     blob = _wrapper_output_blob(result, tmp_path)
@@ -954,6 +961,7 @@ esac
         ["pm_us_crh_v2"],
         tmp_path,
         stub_python=stub,
+        systemctl_stub=_v2_sending_systemctl(tmp_path),
         set_state_db=True,
     )
     blob = _wrapper_output_blob(result, tmp_path)
@@ -994,6 +1002,7 @@ esac
         ["pm_us_crh_v2"],
         tmp_path,
         stub_python=stub,
+        systemctl_stub=_v2_sending_systemctl(tmp_path),
         set_state_db=True,
         state_db=other_db,
     )
@@ -1373,3 +1382,77 @@ esac
     assert b"THIS-RUN-TRACEBACK" in payload
     assert b"HEAD-MARKER" not in payload
     assert len(payload) <= _TALLY_ERR_BOUND_BYTES
+
+
+def _guard_probe_stub(tmp_path: Path) -> Path:
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "NO_NODE"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    echo "structural-pin-guard: UNAVAILABLE token='NO_NODE' (required MATCH)"
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def test_retired_v2_family_with_unready_pin_exits_0_with_an_explicit_skipped_line(
+    tmp_path: Path,
+) -> None:
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_no_maker_sharp_v1"
+    )
+
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=_guard_probe_stub(tmp_path),
+        systemctl_stub=systemctl,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKIPPED -- family retired/not sending" in result.stdout
+    assert "pm_us_no_maker_sharp_v1" in result.stdout
+    assert "STRUCTURAL PIN NOT READY" not in result.stdout
+    log_text = (tmp_path / "derived" / "family_tally_v2.log").read_text()
+    assert "SKIPPED -- family retired/not sending" in log_text
+
+
+def test_sending_v2_family_with_unready_pin_still_exits_1(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=_guard_probe_stub(tmp_path),
+        systemctl_stub=_v2_sending_systemctl(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "STRUCTURAL PIN NOT READY" in result.stdout
+    assert "retired/not sending" not in result.stdout
+
+
+def test_v4_family_never_takes_the_retired_skip_path(tmp_path: Path) -> None:
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_no_maker_sharp_v1"
+    )
+
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=_guard_probe_stub(tmp_path),
+        systemctl_stub=systemctl,
+    )
+
+    assert "retired/not sending" not in result.stdout
+    assert "STRUCTURAL PIN" not in result.stdout
