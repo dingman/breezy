@@ -1727,9 +1727,22 @@ def test_the_n0_path_logs_a_warning_naming_family_prefix(
         result = read_filled_trials_state_db(store_path, **_reader_kwargs(family_prefix=prefix))
     assert result == ((), (), {}, {})
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any(
-        "pm_us_no_maker_sharp_v1" in r.getMessage() and prefix in r.getMessage() for r in warnings
-    )
+    assert any(f"trial_id_prefix={prefix}" in r.getMessage() for r in warnings)
+
+
+def test_the_n0_warning_never_presents_trial_as_a_family_id(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("exec/polymarket_us/startup_evidence", b"x")
+    store.close()
+    prefix = "current_rung_hold/trial/"
+    with caplog.at_level(logging.WARNING):
+        read_filled_trials_state_db(store_path, **_reader_kwargs(family_prefix=prefix))
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(f"trial_id_prefix={prefix}" in m for m in messages)
+    assert not any("family trial" in m for m in messages)
 
 
 def test_prefix_keys_for_no_census_station_still_fail_the_positive_control(

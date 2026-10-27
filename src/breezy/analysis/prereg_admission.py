@@ -49,6 +49,8 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 #: re-parse of `Instrument.price_increment`.
 _TICK: Final[Decimal] = Decimal("0.01")
 
+_LOG = logging.getLogger(__name__)
+
 
 class FillSourceUnreadableError(Exception):
     """The state-DB fill source could not be opened read-only or read (A5).
@@ -237,8 +239,6 @@ def compute_residual(exclusions: Sequence[FillExclusion]) -> Decimal:
     return total
 
 
-_LOG = logging.getLogger(__name__)
-
 #: A key is a recognisable exec-latch key when it is a trial latch
 #: (`<family>/trial/...`) or lives in the exec client's state namespace.
 _TRIAL_LATCH_MARKER: Final[str] = "/trial/"
@@ -392,11 +392,9 @@ def read_filled_trials_state_db(
         # store (wrong DB) or prefix keys for no census station still refuse.
         has_prefix_key = any(isinstance(k, str) and k.startswith(family_prefix) for k, _ in rows)
         if _has_recognisable_exec_key(rows) and not has_prefix_key:
-            family_id = family_prefix.rstrip("/").rsplit("/", 1)[-1]
             _LOG.warning(
-                "positive control: store has exec keys but none under family %s "
-                "(trial_id_prefix %s); scoring n=0",
-                family_id,
+                "positive control: store has exec keys but none under "
+                "trial_id_prefix=%s; scoring n=0",
                 family_prefix,
             )
             return (), (), {}, {}

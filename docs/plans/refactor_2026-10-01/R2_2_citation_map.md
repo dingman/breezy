@@ -34,37 +34,37 @@ module itself when the definition, or a stayed import, was not moved).
 | cite | symbol | script_module | new_module | new_location |
 |---|---|---|---|---|
 | `score_live_trials.py:1584-1586` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
-| `score_live_trials.py:326-465, 1544-1626` | `FillExclusion` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:98` |
+| `score_live_trials.py:326-465, 1544-1626` | `FillExclusion` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:100` |
 | `score_live_trials.py:326-465, 1544-1626` | `_validate_qty` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:293` |
-| `score_live_trials.py:326-465, 1544-1626` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
+| `score_live_trials.py:326-465, 1544-1626` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
 | `score_live_trials.py:326-465, 1544-1626` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
 | `score_live_trials.py:326-465, 1544-1626` | `_append_excluded_fills` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:925` |
-| `score_live_trials.py:379` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
+| `score_live_trials.py:379` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
 | `score_live_trials.py:364-376` | `_validate_qty` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:293` |
-| `score_live_trials.py:364-376` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:449` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:379-446` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
+| `score_live_trials.py:364-376` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:449` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:379-446` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
 | `score_live_trials.py:1402-1406` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
 | `score_live_trials.py:238-252` | `ProvenanceConflict` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:231` |
 | `score_live_trials.py:238-252` | `_write_or_assert_live_provenance_sidecar` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:235` |
 | `score_live_trials.py:530` | `_filled_trial_from_json` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:351` |
-| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `FillSourceUnreadableError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:53` |
-| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `StorePositiveControlFailedError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:61` |
+| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `FillSourceUnreadableError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:55` |
+| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `StorePositiveControlFailedError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:63` |
 | `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `_LIVE_PROVENANCE_VALUE` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:221` |
 | `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `_FILL_ORDER_SIDECAR_NAME` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:228` |
 | `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `_MALFORMED_ROW_ERRORS` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:285` |
-| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:221` |
-| `score_live_trials.py:205-220` | `StorePositiveControlFailedError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:61` |
+| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:39-41,198-201,230-232,289-292,465-468` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:223` |
+| `score_live_trials.py:205-220` | `StorePositiveControlFailedError` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:63` |
 | `score_live_trials.py:205-220` | `NodeStorePreflightRefused` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:202` |
 | `score_live_trials.py:245` | `_write_or_assert_live_provenance_sidecar` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:235` |
-| `score_live_trials.py:466,475,489` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:466,475,489` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:221` |
+| `score_live_trials.py:466,475,489` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:466,475,489` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:223` |
 | `score_live_trials.py:466,475,489` | `read_filled_trials_jsonl` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:308` |
 | `score_live_trials.py:534` | `_filled_trial_from_json` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:351` |
 | `score_live_trials.py:366-370` | `_validate_qty` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:293` |
 | `score_live_trials.py:496` | `read_filled_trials_jsonl` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:308` |
-| `score_live_trials.py:472-474` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:221` |
+| `score_live_trials.py:472-474` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:223` |
 | `score_live_trials.py:554-560` | `_filled_trial_from_json` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:351` |
 | `score_live_trials.py:554-560` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
 | `score_live_trials.py:611,675,689,707,861,1079,1788` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
@@ -77,8 +77,8 @@ module itself when the definition, or a stayed import, was not moved).
 | `score_live_trials.py:255-295` | `_write_or_assert_live_provenance_sidecar` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:235` |
 | `score_live_trials.py:255-295` | `_append_fill_order_entries` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:254` |
 | `score_live_trials.py:255-295` | `_MALFORMED_ROW_ERRORS` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:285` |
-| `score_live_trials.py:402-525` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:402-525` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:221` |
+| `score_live_trials.py:402-525` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:402-525` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:223` |
 | `score_live_trials.py:402-525` | `read_filled_trials_jsonl` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:308` |
 | `score_live_trials.py:47-60,161-185` | `_EXCLUDED_FILLS_ARTEFACT_NAME` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:170` |
 | `score_live_trials.py:47-60,161-185` | `_UNRESOLVED_TAKES_ARTEFACT_NAME` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:179` |
@@ -93,7 +93,7 @@ module itself when the definition, or a stayed import, was not moved).
 | `score_live_trials.py:722` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
 | `score_live_trials.py:1213` | `_read_bucket_facts_by_instrument_id` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:107` |
 | `score_live_trials.py:557-950` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
-| `score_live_trials.py:557-950` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:660` |
+| `score_live_trials.py:557-950` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:658` |
 | `score_live_trials.py:1465-1467` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
 | `score_live_trials.py:610` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
 | `score_live_trials.py:1789` | `main` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:1187` |
@@ -114,12 +114,12 @@ module itself when the definition, or a stayed import, was not moved).
 | `score_live_trials.py:877-891` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
 | `score_live_trials.py:1450-1468` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
 | `score_live_trials.py:361-1588` | `_validate_qty` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:293` |
-| `score_live_trials.py:361-1588` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:129` |
-| `score_live_trials.py:361-1588` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:221` |
+| `score_live_trials.py:361-1588` | `_admit_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:131` |
+| `score_live_trials.py:361-1588` | `compute_residual` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:223` |
 | `score_live_trials.py:361-1588` | `read_filled_trials_jsonl` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:308` |
 | `score_live_trials.py:361-1588` | `_filled_trial_from_json` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:351` |
 | `score_live_trials.py:361-1588` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:255` |
-| `score_live_trials.py:361-1588` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:660` |
+| `score_live_trials.py:361-1588` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:658` |
 | `score_live_trials.py:361-1588` | `UnresolvedTake` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:378` |
 | `score_live_trials.py:361-1588` | `_decode_intent_state` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:401` |
 | `score_live_trials.py:361-1588` | `find_unresolved_takes` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:427` |
