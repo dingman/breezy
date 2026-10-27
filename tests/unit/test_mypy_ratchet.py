@@ -403,7 +403,7 @@ CLEAN: Final[tuple[str, ...]] = (
 #: no Any-typed base. tests/unit 1288->1257 (-31, measured).
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 3,
-    "scripts/analysis": 351,
+    "scripts/analysis": 350,
     "scripts/archive": 8,
     "scripts/venue": 23,
     "tests/contract": 7,
