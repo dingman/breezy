@@ -11,6 +11,7 @@ calls and ``from score_live_trials import ...`` keep resolving.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -19,7 +20,11 @@ from pathlib import Path
 from typing import Final
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
-from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
+from breezy.adapters.polymarket_us.exec.client import (
+    FILL_KEY_PREFIX,
+    STATE_KEY_NAMESPACE,
+    DurableFillRecord,
+)
 from breezy.adapters.polymarket_us.exec.no_side_keys import (
     NO_SIDE_FIRST_LIVE_ORDER_KEY,
     NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
@@ -231,6 +236,22 @@ def compute_residual(exclusions: Sequence[FillExclusion]) -> Decimal:
         total += Decimal(exclusion.qty) * (Decimal(exclusion.fill_px) + Decimal(exclusion.fee))
     return total
 
+
+_LOG = logging.getLogger(__name__)
+
+#: A key is a recognisable exec-latch key when it is a trial latch
+#: (`<family>/trial/...`) or lives in the exec client's state namespace.
+_TRIAL_LATCH_MARKER: Final[str] = "/trial/"
+
+
+def _has_recognisable_exec_key(rows: Sequence[tuple[object, object]]) -> bool:
+    """Positive control: the store holds >= 1 key the exec stack writes."""
+    return any(
+        isinstance(k, str) and (_TRIAL_LATCH_MARKER in k or k.startswith(STATE_KEY_NAMESPACE))
+        for k, _ in rows
+    )
+
+
 def read_filled_trials_state_db(
     path: Path,
     *,
@@ -370,7 +391,14 @@ def read_filled_trials_state_db(
         # prefix, is n=0 (the family has not written a latch yet). A wholly empty
         # store (wrong DB) or prefix keys for no census station still refuse.
         has_prefix_key = any(isinstance(k, str) and k.startswith(family_prefix) for k, _ in rows)
-        if rows and not has_prefix_key:
+        if _has_recognisable_exec_key(rows) and not has_prefix_key:
+            family_id = family_prefix.rstrip("/").rsplit("/", 1)[-1]
+            _LOG.warning(
+                "positive control: store has exec keys but none under family %s "
+                "(trial_id_prefix %s); scoring n=0",
+                family_id,
+                family_prefix,
+            )
             return (), (), {}, {}
         raise StorePositiveControlFailedError("store_positive_control_failed")
 

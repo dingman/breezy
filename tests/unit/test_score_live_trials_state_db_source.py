@@ -1686,10 +1686,50 @@ def test_v2_zero_prefix_keys_in_a_populated_store_is_n0(tmp_path: Path) -> None:
     # test_an_empty_but_valid_store_fails_the_positive_control.
     store_path = tmp_path / "state.sqlite"
     store = SqliteStateStore(store_path)
-    store.set("unrelated/key", b"x")
+    store.set("exec/polymarket_us/startup_evidence", b"x")
     store.close()
     result = read_filled_trials_state_db(store_path, **_reader_kwargs())
     assert result == ((), (), {}, {})
+
+
+def test_populated_store_with_only_unrecognised_keys_still_refuses(tmp_path: Path) -> None:
+    # Positive control: a wrong/stale DB holding rows but no recognisable exec
+    # key (no `/trial/` latch, no exec namespace) must refuse, not score n=0.
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("unrelated/key", b"x")
+    store.set("some/other/namespace", b"y")
+    store.close()
+    with pytest.raises(StorePositiveControlFailedError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
+def test_populated_store_with_a_recognised_trial_key_returns_n0_for_other_prefix(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("some_other_family/trial/x/LAX/2026-09-05", b"x")
+    store.close()
+    result = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    assert result == ((), (), {}, {})
+
+
+def test_the_n0_path_logs_a_warning_naming_family_prefix(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("exec/polymarket_us/startup_evidence", b"x")
+    store.close()
+    prefix = "no_ladder_maker/trial/pm_us_no_maker_sharp_v1/"
+    with caplog.at_level(logging.WARNING):
+        result = read_filled_trials_state_db(store_path, **_reader_kwargs(family_prefix=prefix))
+    assert result == ((), (), {}, {})
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "pm_us_no_maker_sharp_v1" in r.getMessage() and prefix in r.getMessage() for r in warnings
+    )
 
 
 def test_prefix_keys_for_no_census_station_still_fail_the_positive_control(

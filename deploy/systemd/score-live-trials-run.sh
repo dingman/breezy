@@ -369,8 +369,13 @@ for CITY in $STATIONS; do
 done
 
 if [ "$STATUS" -eq 0 ]; then
+  # Marker semantics: it means "scorer ran for every registered family", NOT
+  # "every family has scored trials". Families that write no trial latches
+  # (currently no_ladder_maker) score n=0 here; their fills are attributed by
+  # the ledger, not by this scorer.
+  MARKER_NOTE="scorer ran for every registered family; families that write no trial latches (currently no_ladder_maker) score n=0 and their fills are attributed by the ledger, not here"
   : > "$OUT/score_live_trials_ok_$STAMP"
-  say "score-live-trials ok"
+  say "score-live-trials ok -- $MARKER_NOTE"
 fi
 
 exit "$STATUS"
