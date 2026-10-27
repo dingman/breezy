@@ -755,6 +755,39 @@ def test_an_empty_but_valid_store_fails_the_positive_control(tmp_path: Path) -> 
         read_filled_trials_state_db(store_path, **_reader_kwargs())
 
 
+def test_a_readable_store_with_no_keys_under_the_family_prefix_scores_n0(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    # a populated store (another family's latch) with zero keys under THIS prefix
+    _seed_latch(
+        store,
+        family_prefix="no_ladder_maker/trial/other_family_v1/",
+        station=_STATION,
+    )
+    store.close()
+
+    result = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(family_prefix="no_ladder_maker/trial/pm_us_no_maker_sharp_v1/"),
+    )
+
+    assert result == ((), (), {}, {})
+
+
+def test_an_empty_store_under_the_continuous_prefix_still_scores_n0(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    SqliteStateStore(store_path).close()
+
+    result = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(family_prefix="continuous_rung_hold/trial/pm_us_crh_v3/"),
+    )
+
+    assert result == ((), (), {}, {})
+
+
 def test_a_latch_for_another_census_station_passes_the_positive_control(tmp_path: Path) -> None:
     store_path = tmp_path / "state.sqlite"
     store = SqliteStateStore(store_path)
@@ -1646,10 +1679,25 @@ def test_v3_zero_keys_is_n0_not_store_failure(tmp_path: Path) -> None:
     assert fees == {}
 
 
-def test_v2_zero_keys_is_still_store_failure(tmp_path: Path) -> None:
+def test_v2_zero_prefix_keys_in_a_populated_store_is_n0(tmp_path: Path) -> None:
+    # Superseded pin: this used to refuse. A readable store holding other keys
+    # but none under the family prefix is n=0 for any family; only a wholly
+    # empty store (wrong DB) still refuses -- see
+    # test_an_empty_but_valid_store_fails_the_positive_control.
     store_path = tmp_path / "state.sqlite"
     store = SqliteStateStore(store_path)
     store.set("unrelated/key", b"x")
+    store.close()
+    result = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    assert result == ((), (), {}, {})
+
+
+def test_prefix_keys_for_no_census_station_still_fail_the_positive_control(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, station="ZZZ", climate_day=_DAY_ISO)
     store.close()
     with pytest.raises(StorePositiveControlFailedError):
         read_filled_trials_state_db(store_path, **_reader_kwargs())

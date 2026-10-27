@@ -93,7 +93,7 @@ module itself when the definition, or a stayed import, was not moved).
 | `score_live_trials.py:722` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:234` |
 | `score_live_trials.py:1213` | `_read_bucket_facts_by_instrument_id` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:107` |
 | `score_live_trials.py:557-950` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:234` |
-| `score_live_trials.py:557-950` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:627` |
+| `score_live_trials.py:557-950` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:632` |
 | `score_live_trials.py:1465-1467` | `score_live_trials` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:623` |
 | `score_live_trials.py:610` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:234` |
 | `score_live_trials.py:1789` | `main` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:1187` |
@@ -119,7 +119,7 @@ module itself when the definition, or a stayed import, was not moved).
 | `score_live_trials.py:361-1588` | `read_filled_trials_jsonl` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:308` |
 | `score_live_trials.py:361-1588` | `_filled_trial_from_json` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:351` |
 | `score_live_trials.py:361-1588` | `read_filled_trials_state_db` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:234` |
-| `score_live_trials.py:361-1588` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:627` |
+| `score_live_trials.py:361-1588` | `_admit_one_fill` | `score_live_trials` | `breezy.analysis.prereg_admission` | `src/breezy/analysis/prereg_admission.py:632` |
 | `score_live_trials.py:361-1588` | `UnresolvedTake` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:378` |
 | `score_live_trials.py:361-1588` | `_decode_intent_state` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:401` |
 | `score_live_trials.py:361-1588` | `find_unresolved_takes` | `score_live_trials` | `score_live_trials` | `scripts/analysis/score_live_trials.py:427` |

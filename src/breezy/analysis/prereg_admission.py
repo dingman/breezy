@@ -364,8 +364,13 @@ def read_filled_trials_state_db(
             break
     if not has_census_latch:
         # v3 Phase 0: a store with zero prefix keys is n=0, not a store failure.
-        # v2 branch is unchanged (positive control still refuses).
         if family_prefix.startswith("continuous_rung_hold/"):
+            return (), (), {}, {}
+        # Any family: a readable store holding keys, none under this family's
+        # prefix, is n=0 (the family has not written a latch yet). A wholly empty
+        # store (wrong DB) or prefix keys for no census station still refuse.
+        has_prefix_key = any(isinstance(k, str) and k.startswith(family_prefix) for k, _ in rows)
+        if rows and not has_prefix_key:
             return (), (), {}, {}
         raise StorePositiveControlFailedError("store_positive_control_failed")
 
