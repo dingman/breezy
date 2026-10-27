@@ -114,11 +114,18 @@ from breezy.strategy.no_ladder_maker.ladder_state import (
     Rung,
     book_refusal,
     frame_from_levels,
+    own_excluded,
 )
 from breezy.strategy.no_ladder_maker.live_feed import LiveNbpFeed
 from breezy.strategy.no_ladder_maker.params import SHARP_V1, MakerRuleParams
 from breezy.strategy.no_ladder_maker.reconcile import Cancel, plan_actions
-from breezy.strategy.no_ladder_maker.records import CENTS, Decision, DecisionContext, Desired
+from breezy.strategy.no_ladder_maker.records import (
+    CENTS,
+    Decision,
+    DecisionContext,
+    DepthFrame,
+    Desired,
+)
 from breezy.strategy.no_ladder_maker.selector import SelectorConfig, WantTracker, build_selector
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -140,6 +147,8 @@ _POLL_TIMER: Final[str] = "MAKER-POLL"
 _HARD_PREFIX: Final[str] = "MAKER-HARD"
 _NBP_PREFIX: Final[str] = "MAKER-NBP"
 _SHADOW_PREFIX: Final[str] = "MAKER-SHADOW"
+#: every maker order is one contract (the sizing the design driver and the replay assume)
+ORDER_QTY: Final[int] = 1
 #: R15 (L-45) fail-closed bound on Depth10 subscriptions: four stations x ten rungs of ONE
 #: (D+1) ladder each. The venue caps subscriptions per CONNECTION (10, shared with TRADE); the
 #: pool shards across connections, and a boot that would exceed this bound refuses to subscribe
@@ -430,6 +439,7 @@ class NoLadderMakerStrategy(Strategy):
         key, rung_id = key_rung
         ladder = self.ladders[key]
         ladder.books[rung_id] = frame_from_levels(rung_id, depth.ts_event, depth.bids, depth.asks)
+        ladder.departed.pop(rung_id, None)  # a fresh frame no longer shows a cancelled rest
         self._last_frame_ns = self.clock.timestamp_ns()
         self._decide(ladder)
 
@@ -486,6 +496,25 @@ class NoLadderMakerStrategy(Strategy):
             ladder.selector_stamp = store
         return ladder.selector
 
+    @staticmethod
+    def _books_without_own_rests(ladder: Ladder) -> dict[str, DepthFrame]:
+        """SEL-1: the displayed books minus our own venue-resting orders (the rule's contract).
+
+        A SUBMITTED / ACCEPTED / CANCELING rest is in the venue book until ``OrderCanceled`` and
+        stays in the STORED frame until the next frame (``Ladder.departed``); a SHADOW rest never
+        reached the venue. Pricing from a book that contains our bid would chase it up.
+        """
+        books = dict(ladder.books)
+        for rung_id, cents in ladder.departed.items():
+            frame = books.get(rung_id)
+            if frame is not None:
+                books[rung_id] = own_excluded(frame, cents, ORDER_QTY)
+        for rung_id, rest in ladder.rests.items():
+            frame = books.get(rung_id)
+            if frame is not None and rest.state is not RestState.SHADOW:
+                books[rung_id] = own_excluded(frame, rest.bid_cents, ORDER_QTY)
+        return books
+
     @_guarded
     def _decide(self, ladder: Ladder) -> None:
         now = self.clock.timestamp_ns()
@@ -499,7 +528,7 @@ class NoLadderMakerStrategy(Strategy):
             return
         ctx = DecisionContext(
             now_ns=now,
-            books=MappingProxyType(dict(ladder.books)),
+            books=MappingProxyType(self._books_without_own_rests(ladder)),
             live_bids=MappingProxyType({r: rest.bid_cents for r, rest in ladder.rests.items()}),
             held=frozenset(ladder.held),
         )
@@ -633,7 +662,7 @@ class NoLadderMakerStrategy(Strategy):
         order = self.order_factory.limit(
             instrument_id=rung.no_id,
             order_side=OrderSide.BUY,
-            quantity=instrument.make_qty(Decimal(1)),
+            quantity=instrument.make_qty(Decimal(ORDER_QTY)),
             price=instrument.make_price(Decimal(desired.bid_cents) / Decimal(CENTS)),
             time_in_force=TimeInForce.GTD,
             expire_time=_expire_timestamp(expire_ns),
@@ -911,8 +940,10 @@ class NoLadderMakerStrategy(Strategy):
         found = self._rest_for(client_order_id)
         if found is None:
             return
-        ladder, rung_id, _ = found
+        ladder, rung_id, rest = found
         del ladder.rests[rung_id]
+        if not backoff and rest.state is not RestState.SHADOW:  # it was on the venue book
+            ladder.departed[rung_id] = rest.bid_cents
         if backoff:
             ladder.backoff_until_ns[rung_id] = self.clock.timestamp_ns() + REPOST_BACKOFF_S * _NS
         if redecide:

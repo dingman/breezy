@@ -13,13 +13,23 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.instruments import BinaryOption
 
 from breezy.strategy.no_ladder_maker.config import AllowShortNotPermittedError, NoLadderMakerConfig
-from breezy.strategy.no_ladder_maker.ladder_state import RestState
-from breezy.strategy.no_ladder_maker.records import CANCEL_PMIN, Decision
-from breezy.strategy.no_ladder_maker.rule import P3_LICENSED_GTD_NS
+from breezy.strategy.no_ladder_maker.ladder_state import RestState, own_excluded
+from breezy.strategy.no_ladder_maker.params import SHARP_V1
+from breezy.strategy.no_ladder_maker.records import (
+    CANCEL_PMIN,
+    Decision,
+    DecisionContext,
+    DepthFrame,
+    Desired,
+)
+from breezy.strategy.no_ladder_maker.rule import P3_LICENSED_GTD_NS, decide_bid
+from breezy.strategy.no_ladder_maker.selector import best_no_bid, no_ask
 from breezy.strategy.no_ladder_maker.strategy import (
     REPOST_BACKOFF_S,
     DepthSubscriptionBudgetError,
@@ -517,3 +527,122 @@ def test_nothing_is_posted_before_the_window_opens_at_d_minus_1_1650z() -> None:
     h.advance_to(opens)
     h.book("gte72lt73f", bids=(("0.06", 10),))
     assert len(h.submits(h.drain())) == 1
+
+
+# --- SEL-1: the book the rule prices from excludes our own resting order -----------------------
+
+_P_NO_AT_CAP = 0.99  # b_max = B_CAP (89c) at theta 0.0695: the cap never binds below the book
+_THETA = 0.0695
+
+
+def _book_priced(rung: str) -> Any:
+    """The real bid rule on the context's book (best NO bid, NO ask), for one rung."""
+
+    def script(ctx: DecisionContext) -> Decision:
+        frame = ctx.books[rung]
+        bid = decide_bid(_P_NO_AT_CAP, best_no_bid(frame), no_ask(frame), _THETA, SHARP_V1).bid
+        assert bid is not None
+        return Decision(desired=(Desired(rung, round(bid * 100)),), forecast_valid=True)
+
+    return script
+
+
+def test_own_resting_bid_is_excluded_from_best_no_bid() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    seen = h.install(_book_priced(rung))
+    h.book("gte72lt73f", asks=(("0.20", 3),))  # best NO bid 80 -> we rest at 81
+    (first,) = h.post_and_accept()
+    assert cents_of(first) == 81
+    # Our 81c NO bid now shows on the YES book as an ask at 19c, below the foreign 20c level.
+    h.book("gte72lt73f", asks=(("0.19", 1), ("0.20", 3)))
+    ctx = seen[-1]
+    assert best_no_bid(ctx.books[rung]) == 0.80, "the context's best NO bid is the foreign 80"
+    assert h.drain() == [], "same price: no REPLACE cancel, no re-post"
+    assert h.ladder.rests[rung].bid_cents == 81
+
+
+def test_own_exclusion_keeps_foreign_size_at_our_level() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    seen = h.install(_book_priced(rung))
+    h.book("gte72lt73f", asks=(("0.20", 3),))
+    h.post_and_accept()
+    h.book("gte72lt73f", asks=(("0.19", 5), ("0.20", 3)))  # foreign 4 + our 1 at 19c
+    assert seen[-1].books[rung].yes_asks == ((19, 4), (20, 3))
+    assert h.ladder.books[rung].yes_asks == ((19, 5), (20, 3)), "the stored frame stays raw"
+
+
+def test_replaced_outranked_rung_yields_slot_like_the_replay_20261026() -> None:
+    bands = ("gte79f", "gte71lt72f", "lt71f")
+    h = Harness(bands=bands)
+    low, mid, outranked = (_rung(h, b) for b in ("gte79f", "gte71lt72f", "lt71f"))
+    phase = {"n": 1}
+
+    def script(ctx: DecisionContext) -> Decision:
+        if phase["n"] == 1:
+            return want((low, 81), (mid, 89))
+        return want((mid, 89), (outranked, 89), (low, 82))  # gte79f repriced and outranked
+
+    h.install(script)
+    for band in bands:
+        h.book(band)
+    h.post_and_accept()
+    assert set(h.ladder.rests) == {low, mid}
+    phase["n"] = 2
+    h.book("gte79f", bids=(("0.06", 10),))
+    (cancel,) = h.cancels(h.drain())
+    h.cancel_ack(h.cache.order(cancel.client_order_id))
+    posted = h.submits(h.drain())
+    assert [str(s.order.instrument_id) for s in posted] == [str(no_id("SFO", "lt71f"))]
+    assert low not in h.ladder.rests and set(h.ladder.rests) == {mid, outranked}
+
+
+def _frame(
+    asks: tuple[tuple[int, int], ...], bids: tuple[tuple[int, int], ...] = ((5, 10),)
+) -> Any:
+    return DepthFrame(rung_id="r", ts_ns=1, yes_bids=bids, yes_asks=asks)
+
+
+def test_own_excluded_drops_a_level_that_reaches_zero_and_never_goes_negative() -> None:
+    frame = _frame(((19, 1), (20, 3)))
+    assert own_excluded(frame, 81, 1).yes_asks == ((20, 3),)
+    assert own_excluded(frame, 81, 5).yes_asks == ((20, 3),), "more than displayed: level gone"
+    assert own_excluded(frame, 81, 1).yes_bids == frame.yes_bids
+    assert own_excluded(frame, 70, 1) is frame, "no level of ours in the frame: untouched"
+
+
+_levels = st.dictionaries(st.integers(1, 99), st.integers(1, 9), max_size=10).map(
+    lambda d: tuple(sorted(d.items()))
+)
+
+
+@given(asks=_levels, bid_cents=st.integers(75, 89), qty=st.integers(1, 3))
+def test_own_exclusion_never_raises_the_computed_bid(
+    asks: tuple[tuple[int, int], ...], bid_cents: int, qty: int
+) -> None:
+    frame = _frame(asks)
+    cut = own_excluded(frame, bid_cents, qty)
+    assert all(size > 0 for _, size in cut.yes_asks)
+    others = [lv for lv in frame.yes_asks if lv[0] != 100 - bid_cents]
+    assert [lv for lv in cut.yes_asks if lv[0] != 100 - bid_cents] == others
+    if not cut.yes_asks:  # we were the whole NO bid side: the true book is empty (replay parity)
+        return
+    before = decide_bid(_P_NO_AT_CAP, best_no_bid(frame), no_ask(frame), _THETA, SHARP_V1)
+    after = decide_bid(_P_NO_AT_CAP, best_no_bid(cut), no_ask(cut), _THETA, SHARP_V1)
+    if before.bid is not None:
+        assert after.bid is None or after.bid <= before.bid
+
+
+def test_a_cancelled_own_bid_stays_excluded_from_the_stored_frame_until_the_next_frame() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    h.install(_book_priced(rung))
+    h.book("gte72lt73f", asks=(("0.20", 3),))
+    (first,) = h.post_and_accept()
+    assert cents_of(first) == 81
+    h.book("gte72lt73f", asks=(("0.19", 1), ("0.22", 3)))  # foreign best NO bid fell to 78
+    assert len(h.cancels(h.drain())) == 1  # REPLACED 81 -> 79
+    h.cancel_ack(first.order)  # the stored frame still shows our cancelled 19c ask
+    (second,) = h.submits(h.drain())
+    assert cents_of(second) == 79, "re-priced from the foreign book, not chased up from our ghost"

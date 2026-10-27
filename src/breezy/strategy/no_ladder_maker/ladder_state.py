@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Final, Protocol, SupportsFloat
 
@@ -29,6 +29,7 @@ __all__ = [
     "Rung",
     "book_refusal",
     "frame_from_levels",
+    "own_excluded",
 ]
 
 DEPTH10_LEVELS: Final[int] = 10
@@ -90,6 +91,9 @@ class Ladder:
     held: set[str] = field(default_factory=set)
     #: rung -> earliest ns a re-post may be attempted (after a denial / rejection)
     backoff_until_ns: dict[str, int] = field(default_factory=dict)
+    #: rung -> price of a rest the venue just cancelled/expired. The stored frame (taken before the
+    #: cancel) still displays it, so SEL-1 keeps excluding it until the next frame replaces it
+    departed: dict[str, int] = field(default_factory=dict)
     hard_cancelled: bool = False
     selector: RungSelector | None = None
     selector_stamp: object = None
@@ -113,6 +117,29 @@ def frame_from_levels(
         )
 
     return DepthFrame(rung_id=rung_id, ts_ns=ts_ns, yes_bids=levels(bids), yes_asks=levels(asks))
+
+
+def own_excluded(frame: DepthFrame, bid_cents: int, qty: int) -> DepthFrame:
+    """``frame`` without our own resting BUY NO of ``qty`` at ``bid_cents`` (SEL-1).
+
+    A NO buy is a SELL on the YES book, so our bid shows as YES-ask size at ``100 - bid_cents``.
+    Only that size is subtracted, never below zero; a level that reaches 0 is dropped and every
+    other level (and the bid side) is untouched. ``frame`` itself is returned when nothing at our
+    level can be ours, so identity-keyed memos stay warm.
+    """
+    level = CENTS - bid_cents
+    remaining = qty
+    asks: list[Level] = []
+    for price, size in frame.yes_asks:
+        if price == level and remaining > 0:
+            taken = min(size, remaining)
+            remaining -= taken
+            size -= taken
+        if size > 0:
+            asks.append((price, size))
+    if remaining == qty:
+        return frame
+    return replace(frame, yes_asks=tuple(asks))
 
 
 def book_refusal(

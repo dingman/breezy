@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -54,6 +54,7 @@ CALIBRATION_SHA256: Final[str] = "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad
 NS: Final[int] = 10**9
 #: the replay runs without the live stale-frame guard (see ``_replay``)
 NO_STALE_GUARD_S: Final[int] = 10**12
+DEPTH_LEVELS: Final[int] = 10
 CLOCK_ENDS: Final = frozenset({"GTD_EXPIRY", "CANCEL_PROCESS"})
 # timeline ranks at equal ts (simulator Kind order): fills (prints) < depth < forecast release
 _FILL, _DEPTH, _NBP = 0, 1, 2
@@ -87,6 +88,26 @@ def _depth_10(frame: s_events.DepthFrame, yes: InstrumentId) -> Any:
         bids=side(frame.yes_bids, descending=True),
         asks=side(frame.yes_asks, descending=False),
     )
+
+
+def _with_resting(frame: s_events.DepthFrame, yes: InstrumentId, venue: FakeVenue) -> Any:
+    """What a real venue shows: the fixture's foreign book PLUS our own resting NO bids.
+
+    The recorded tape never had our orders in it. A resting BUY NO at ``c`` cents is YES-ask size
+    at ``100 - c``; the strategy excludes exactly that before it prices (SEL-1), so the book it
+    prices from equals the fixture frame and the driver parity holds. The venue shows ten levels.
+    """
+    no_id = sibling_instrument_id(yes)
+    asks = dict(frame.yes_asks)
+    for _slug, order in venue.open.values():
+        if order.instrument_id == no_id:
+            level = 100 - cents_of_order(order)
+            asks[level] = asks.get(level, 0) + int(order.quantity)
+    return replace(frame, yes_asks=tuple(sorted(asks.items())[:DEPTH_LEVELS]))
+
+
+def cents_of_order(order: Any) -> int:
+    return round(float(order.price) * 100)
 
 
 def _forecast_point(row: Any) -> ForecastPoint:
@@ -172,7 +193,8 @@ def _replay(case: dict[str, Any], calibration: LiveCalibration) -> tuple[Harness
         h.advance_to(ts)
         venue.pump()
         if rank == _DEPTH:
-            h.strategy.on_order_book_depth(_depth_10(payload, by_id[payload.rung_id]))
+            yes = by_id[payload.rung_id]
+            h.strategy.on_order_book_depth(_depth_10(_with_resting(payload, yes, venue), yes))
         elif rank == _NBP:
             h.strategy.on_data(_forecast_point(payload))
             h.advance_to(ts + 1)  # the 1 ns NBP release alert
