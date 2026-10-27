@@ -4308,6 +4308,25 @@ def _status_only(
     return 0
 
 
+def read_balance_lines(logs_dir: Path) -> list[str]:
+    """Every `AccountState(` line of every node log, file-sorted, in order.
+
+    The node logs are GBs, so each file is STREAMED and only matching lines
+    are held (`parse_account_state_line` ignores every other line anyway).
+    Line content is the file line minus its trailing newline.
+    """
+    balance_lines: list[str] = []
+    if not logs_dir.is_dir():
+        return balance_lines
+    for log_path in sorted(logs_dir.glob("breezy-trade-*.log")):
+        try:
+            with log_path.open(errors="replace") as fh:
+                balance_lines.extend(ln.rstrip("\n") for ln in fh if "AccountState(" in ln)
+        except OSError:
+            continue
+    return balance_lines
+
+
 def _run(
     *,
     exec_state_db_path: Path,
@@ -4410,13 +4429,7 @@ def _run(
 
         period_days_count = _days_between(period_start, period_end)
         days = [_shift_iso_day(period_start, delta) for delta in range(period_days_count)]
-        balance_lines: list[str] = []
-        if logs_dir.is_dir():
-            for log_path in sorted(logs_dir.glob("breezy-trade-*.log")):
-                try:
-                    balance_lines.extend(log_path.read_text(errors="replace").splitlines())
-                except OSError:
-                    continue
+        balance_lines = read_balance_lines(logs_dir)
         balance_series = daily_balance_series(balance_lines, days=days)
         daily_balances = {
             day: (point.total_usd if point is not None else None)

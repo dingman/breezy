@@ -6040,3 +6040,53 @@ class TestSchemaV4AndKeptUnsettledSignal:
 
         assert "unsettled_count=len(permanently_unsettled)" in call
         assert "roi_status" not in call
+
+
+class TestBalanceLinesAreStreamedFromNodeLogs:
+    """Fix D: the node logs are GBs; only `AccountState(` lines may be held,
+    and no log may be read whole via `Path.read_text`."""
+
+    def _logs(self, tmp_path: Path) -> tuple[Path, list[str]]:
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        first = _REAL_ACCOUNT_STATE_LINE.replace(
+            "2026-09-21T16:50:57.980817596Z", "2026-09-04T00:00:00.000000000Z"
+        )
+        second = _REAL_ACCOUNT_STATE_LINE.replace(
+            "2026-09-21T16:50:57.980817596Z", "2026-09-05T00:00:00.000000000Z"
+        ).replace("total=100.00 USD", "total=99.57 USD")
+        third = _REAL_ACCOUNT_STATE_LINE
+        noise = [f"2026-09-0{i}T00:00:00Z INFO unrelated line {i}" for i in range(1, 6)]
+        (logs_dir / "breezy-trade-20260904T000000Z.log").write_text(
+            "\n".join([noise[0], first, noise[1], noise[2], second, noise[3]]) + "\n"
+        )
+        # no trailing newline, and an invalid UTF-8 byte (errors="replace")
+        (logs_dir / "breezy-trade-20260905T000000Z.log").write_bytes(
+            (noise[4] + "\n" + third).encode() + b"\n\xff junk\n"
+        )
+        # the glob `breezy-trade-*.log` also matches the supervisor log (as it
+        # always did); sorted, it comes last
+        (logs_dir / "breezy-trade-supervisor.log").write_text(first + "\n")
+        return logs_dir, [first, second, third, first]
+
+    def test_only_matching_lines_are_returned_in_file_then_line_order(
+        self, tmp_path: Path
+    ) -> None:
+        logs_dir, expected = self._logs(tmp_path)
+
+        assert _prr.read_balance_lines(logs_dir) == expected
+
+    def test_no_log_is_read_whole(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        logs_dir, expected = self._logs(tmp_path)
+
+        def _boom(self: Path, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("Path.read_text must not be used on node logs")
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+
+        assert _prr.read_balance_lines(logs_dir) == expected
+
+    def test_a_missing_logs_dir_yields_no_lines(self, tmp_path: Path) -> None:
+        assert _prr.read_balance_lines(tmp_path / "absent") == []
