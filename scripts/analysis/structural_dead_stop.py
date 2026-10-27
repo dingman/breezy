@@ -219,6 +219,9 @@ def covered_listed_station_days(
     return count
 
 
+_NS_PER_S = 1_000_000_000
+
+
 def _afternoon_extent_depth(
     *,
     instrument_ids: Sequence[str],
@@ -236,7 +239,7 @@ def _afternoon_extent_depth(
     start_ns, end_ns = window_ns
     extremes: set[int] = set()
     for instrument_id in instrument_ids:
-        _count, first_ns, last_ns = scan_depth_window(
+        _row_count, first_ns, last_ns = scan_depth_window(
             files_by_id.get(urisafe_identifier(instrument_id), ()),
             start_ns=start_ns,
             end_ns=end_ns,
@@ -248,7 +251,7 @@ def _afternoon_extent_depth(
         "afternoon-extent": tuple(
             DepthObservation(
                 instrument_id="afternoon-extent",
-                ts_event=dt.datetime.fromtimestamp(ns / 1_000_000_000, tz=dt.UTC),
+                ts_event=dt.datetime.fromtimestamp(ns / _NS_PER_S, tz=dt.UTC),
                 best_ask=None,
                 ask_ladder=None,
                 best_bid=None,

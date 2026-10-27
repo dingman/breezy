@@ -94,9 +94,7 @@ def _count(sds_mod: ModuleType, root: Path, monkeypatch: pytest.MonkeyPatch) -> 
     )
 
 
-def _oracle(
-    sds_mod: ModuleType, h4_mod: ModuleType, root: Path
-) -> int:
+def _oracle(sds_mod: ModuleType, h4_mod: ModuleType, root: Path) -> int:
     depth_root = root / "data" / "order_book_depths"
     ma = sys.modules["ma_prelock_winner_ask_study"]
 

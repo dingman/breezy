@@ -220,6 +220,11 @@ def scan_depth_window(
     in-window row (for callers whose rule is "any captured snapshot", e.g. the
     structural-dead-stop afternoon coverage); the default is unchanged.
 
+    With ``ask_masked=False`` the ask columns are still projected and
+    schema/no-null asserted, so a malformed file raises
+    ``CatalogColumnScanError`` where ``load_depth`` would not -- a deliberate,
+    slightly stricter behaviour.
+
     Object-free: projects only ``ts_event`` and ``ask_size_0..9`` per row
     group via ``pyarrow.parquet.ParquetFile.iter_batches``, so memory is
     O(batch) + O(#instruments) rather than O(#rows) -- no ``OrderBookDepth10``
