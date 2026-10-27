@@ -439,7 +439,6 @@ class NoLadderMakerStrategy(Strategy):
         key, rung_id = key_rung
         ladder = self.ladders[key]
         ladder.books[rung_id] = frame_from_levels(rung_id, depth.ts_event, depth.bids, depth.asks)
-        ladder.departed.pop(rung_id, None)  # a fresh frame no longer shows a cancelled rest
         self._last_frame_ns = self.clock.timestamp_ns()
         self._decide(ladder)
 
@@ -501,18 +500,21 @@ class NoLadderMakerStrategy(Strategy):
         """SEL-1: the displayed books minus our own venue-resting orders (the rule's contract).
 
         A SUBMITTED / ACCEPTED / CANCELING rest is in the venue book until ``OrderCanceled`` and
-        stays in the STORED frame until the next frame (``Ladder.departed``); a SHADOW rest never
-        reached the venue. Pricing from a book that contains our bid would chase it up.
+        stays in the STORED frame until the next frame (``Ladder.departed``). Pricing from a book
+        that contains our bid would chase it up.
         """
         books = dict(ladder.books)
-        for rung_id, cents in ladder.departed.items():
+        for rung_id, (cents, shown) in ladder.departed.items():
             frame = books.get(rung_id)
-            if frame is not None:
+            if frame is shown:  # any newer frame object no longer displays the cancelled order
                 books[rung_id] = own_excluded(frame, cents, ORDER_QTY)
         for rung_id, rest in ladder.rests.items():
             frame = books.get(rung_id)
-            if frame is not None and rest.state is not RestState.SHADOW:
-                books[rung_id] = own_excluded(frame, rest.bid_cents, ORDER_QTY)
+            # a SHADOW rest never reached the venue; a frame stamped at or before the post cannot
+            # contain the order (live latency is positive), so subtracting would strip a foreign one
+            if frame is None or rest.state is RestState.SHADOW or frame.ts_ns <= rest.posted_ns:
+                continue
+            books[rung_id] = own_excluded(frame, rest.bid_cents, ORDER_QTY)
         return books
 
     @_guarded
@@ -674,6 +676,7 @@ class NoLadderMakerStrategy(Strategy):
             expire_ns,
             RestState.SUBMITTED,
             order.client_order_id,
+            posted_ns=self.clock.timestamp_ns(),
         )
         self._order_index[order.client_order_id] = ((ladder.station, ladder.day), desired.rung_id)
         self.submit_order(order)
@@ -819,7 +822,9 @@ class NoLadderMakerStrategy(Strategy):
         self.counters["rest_reconciled_from_cache"] += 1
         if order is not None and float(order.filled_qty) > 0:
             ladder.held.add(rung_id)
-        del ladder.rests[rung_id]
+        rest = ladder.rests.pop(rung_id)
+        if order is None or float(order.filled_qty) == 0:
+            self._note_departed(ladder, rung_id, rest)
         self.log.warning(
             f"{_CLASS_NAME}: rest reconciled from the cache station={ladder.station} "
             f"rung={rung_id} status={order.status_string() if order is not None else 'absent'}"
@@ -934,6 +939,13 @@ class NoLadderMakerStrategy(Strategy):
         self._close_rest(event.client_order_id, redecide=False, backoff=True)
         self._alert("MAKER_ORDER_REJECTED", event.instrument_id, event.client_order_id, "WARN")
 
+    @staticmethod
+    def _note_departed(ladder: Ladder, rung_id: str, rest: Rest) -> None:
+        """SEL-1: the stored frame still shows a venue order that has just left the book."""
+        frame = ladder.books.get(rung_id)
+        if frame is not None and rest.state is not RestState.SHADOW:
+            ladder.departed[rung_id] = (rest.bid_cents, frame)
+
     def _close_rest(
         self, client_order_id: ClientOrderId, *, redecide: bool, backoff: bool = False
     ) -> None:
@@ -942,8 +954,10 @@ class NoLadderMakerStrategy(Strategy):
             return
         ladder, rung_id, rest = found
         del ladder.rests[rung_id]
-        if not backoff and rest.state is not RestState.SHADOW:  # it was on the venue book
-            ladder.departed[rung_id] = rest.bid_cents
+        # departed only when not backoff: a denied/rejected order never reached the venue book,
+        # and a fill is covered by ``held`` (the rung is no longer priced)
+        if not backoff:
+            self._note_departed(ladder, rung_id, rest)
         if backoff:
             ladder.backoff_until_ns[rung_id] = self.clock.timestamp_ns() + REPOST_BACKOFF_S * _NS
         if redecide:

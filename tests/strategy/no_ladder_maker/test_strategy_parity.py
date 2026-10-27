@@ -32,6 +32,7 @@ from typing import Any, Final
 
 import pytest
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.orders import Order
 
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.domain.forecast_point import ForecastPoint
@@ -101,12 +102,13 @@ def _with_resting(frame: s_events.DepthFrame, yes: InstrumentId, venue: FakeVenu
     asks = dict(frame.yes_asks)
     for _slug, order in venue.open.values():
         if order.instrument_id == no_id:
-            level = 100 - cents_of_order(order)
+            level = 100 - _cents_of_order(order)
             asks[level] = asks.get(level, 0) + int(order.quantity)
     return replace(frame, yes_asks=tuple(sorted(asks.items())[:DEPTH_LEVELS]))
 
 
-def cents_of_order(order: Any) -> int:
+def _cents_of_order(order: Order) -> int:
+    """The resting order's limit price in whole cents."""
     return round(float(order.price) * 100)
 
 

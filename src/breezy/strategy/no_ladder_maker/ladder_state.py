@@ -62,6 +62,9 @@ class Rest:
     client_order_id: ClientOrderId | None = None
     #: CANCELING only: the instant after which the cancel is re-queried and re-issued (0 = now)
     cancel_deadline_ns: int = 0
+    #: clock instant of the submit (0 = adopted, unknown). A frame stamped at or before it cannot
+    #: contain this order, so SEL-1 must not subtract it from that frame.
+    posted_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +94,10 @@ class Ladder:
     held: set[str] = field(default_factory=set)
     #: rung -> earliest ns a re-post may be attempted (after a denial / rejection)
     backoff_until_ns: dict[str, int] = field(default_factory=dict)
-    #: rung -> price of a rest the venue just cancelled/expired. The stored frame (taken before the
-    #: cancel) still displays it, so SEL-1 keeps excluding it until the next frame replaces it
-    departed: dict[str, int] = field(default_factory=dict)
+    #: rung -> (price, stored frame) of a rest the venue just cancelled/expired. That frame (taken
+    #: before the cancel) still displays it, so SEL-1 excludes it only while that very frame object
+    #: is the rung's stored book; the next frame replaces the object and ends the exclusion.
+    departed: dict[str, tuple[int, DepthFrame]] = field(default_factory=dict)
     hard_cancelled: bool = False
     selector: RungSelector | None = None
     selector_stamp: object = None

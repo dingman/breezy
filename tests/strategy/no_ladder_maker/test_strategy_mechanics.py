@@ -13,10 +13,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
 from breezy.strategy.no_ladder_maker.config import AllowShortNotPermittedError, NoLadderMakerConfig
 from breezy.strategy.no_ladder_maker.ladder_state import RestState, own_excluded
@@ -480,7 +481,6 @@ def test_a_no_position_already_open_on_a_rung_counts_toward_max_rungs_after_a_re
     from nautilus_trader.model.identifiers import PositionId, StrategyId
     from nautilus_trader.model.objects import Price
     from nautilus_trader.model.position import Position
-    from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
     from tests.strategy.no_ladder_maker.maker_strategy_support import ACCOUNT
 
@@ -554,6 +554,7 @@ def test_own_resting_bid_is_excluded_from_best_no_bid() -> None:
     h.book("gte72lt73f", asks=(("0.20", 3),))  # best NO bid 80 -> we rest at 81
     (first,) = h.post_and_accept()
     assert cents_of(first) == 81
+    h.advance(1)  # a frame that contains our order is later than the post
     # Our 81c NO bid now shows on the YES book as an ask at 19c, below the foreign 20c level.
     h.book("gte72lt73f", asks=(("0.19", 1), ("0.20", 3)))
     ctx = seen[-1]
@@ -568,6 +569,7 @@ def test_own_exclusion_keeps_foreign_size_at_our_level() -> None:
     seen = h.install(_book_priced(rung))
     h.book("gte72lt73f", asks=(("0.20", 3),))
     h.post_and_accept()
+    h.advance(1)
     h.book("gte72lt73f", asks=(("0.19", 5), ("0.20", 3)))  # foreign 4 + our 1 at 19c
     assert seen[-1].books[rung].yes_asks == ((19, 4), (20, 3))
     assert h.ladder.books[rung].yes_asks == ((19, 5), (20, 3)), "the stored frame stays raw"
@@ -617,6 +619,7 @@ _levels = st.dictionaries(st.integers(1, 99), st.integers(1, 9), max_size=10).ma
 )
 
 
+@settings(derandomize=True)
 @given(asks=_levels, bid_cents=st.integers(75, 89), qty=st.integers(1, 3))
 def test_own_exclusion_never_raises_the_computed_bid(
     asks: tuple[tuple[int, int], ...], bid_cents: int, qty: int
@@ -641,8 +644,74 @@ def test_a_cancelled_own_bid_stays_excluded_from_the_stored_frame_until_the_next
     h.book("gte72lt73f", asks=(("0.20", 3),))
     (first,) = h.post_and_accept()
     assert cents_of(first) == 81
+    h.advance(1)
     h.book("gte72lt73f", asks=(("0.19", 1), ("0.22", 3)))  # foreign best NO bid fell to 78
     assert len(h.cancels(h.drain())) == 1  # REPLACED 81 -> 79
     h.cancel_ack(first.order)  # the stored frame still shows our cancelled 19c ask
     (second,) = h.submits(h.drain())
     assert cents_of(second) == 79, "re-priced from the foreign book, not chased up from our ghost"
+
+
+def test_a_repost_at_the_same_price_on_the_same_stale_frame_subtracts_exactly_one() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    price = {"cents": 81}
+    seen = h.install(lambda ctx: want((rung, price["cents"])))
+    h.book("gte72lt73f", asks=(("0.20", 3),))
+    (first,) = h.post_and_accept()
+    h.advance(1)
+    price["cents"] = 82  # reprice: REPLACE on the next frame
+    h.book("gte72lt73f", asks=(("0.19", 2), ("0.20", 3)))  # our 1 + a foreign 1 at 19c
+    assert len(h.cancels(h.drain())) == 1
+    price["cents"] = 81  # the cancel is acked and the rung is wanted at 81 again
+    h.cancel_ack(first.order)
+    assert len(h.submits(h.drain())) == 1  # re-posted at 81 on the SAME stale frame
+    h.strategy._decide(h.ladder)
+    # only the cancelled order is on that frame: the new rest cannot be, so ONE contract goes
+    assert seen[-1].books[rung].yes_asks == ((19, 1), (20, 3))
+
+
+def test_a_departed_price_stops_being_excluded_once_the_frame_object_changes() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    seen = h.install(_book_priced(rung))
+    h.book("gte72lt73f", asks=(("0.20", 3),))
+    (first,) = h.post_and_accept()
+    h.advance(1)
+    h.book("gte72lt73f", asks=(("0.19", 1), ("0.22", 3)))
+    h.drain()
+    h.cancel_ack(first.order)
+    assert seen[-1].books[rung].yes_asks == ((22, 3),), "the stale frame still has our ghost"
+    h.advance(1)
+    h.book("gte72lt73f", asks=(("0.19", 1), ("0.22", 3)))  # a NEW frame: a foreign 19c now
+    assert seen[-1].books[rung].yes_asks == ((19, 1), (22, 3))
+
+
+def test_a_frame_older_than_our_post_is_never_stripped_of_a_foreign_contract() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    seen = h.install(_book_priced(rung))
+    # a frame taken BEFORE the post: a foreign contract already sits at the 89c cap level (11c ask)
+    h.book("gte72lt73f", ts_ns=NOW_NS - NS, asks=(("0.11", 1), ("0.20", 3)))
+    (first,) = h.post_and_accept()
+    assert cents_of(first) == 89
+    h.strategy._decide(h.ladder)  # the same stale frame, our order not in it yet
+    assert seen[-1].books[rung].yes_asks == ((11, 1), (20, 3))
+    assert h.drain() == [], "no REPLACE: the foreign cap-level contract still holds our price"
+
+
+def test_a_poll_reconciled_close_does_not_chase_its_own_ghost() -> None:
+    h = Harness()
+    rung = _rung(h, "gte72lt73f")
+    h.install(_book_priced(rung))
+    h.book("gte72lt73f", asks=(("0.20", 3),))
+    (first,) = h.post_and_accept()
+    h.advance(1)
+    h.book("gte72lt73f", asks=(("0.19", 1), ("0.20", 3)))
+    assert h.drain() == []
+    order = h.cache.order(first.order.client_order_id)
+    order.apply(TestEventStubs.order_canceled(order, ts_event=h.clock.timestamp_ns()))
+    h.cache.update_order(order)  # the venue closed it; the event never reached the strategy
+    h.strategy._poll_open_orders()
+    (again,) = h.submits(h.drain())
+    assert cents_of(again) == 81, "re-priced from the foreign 80, not ratcheted to 82"
