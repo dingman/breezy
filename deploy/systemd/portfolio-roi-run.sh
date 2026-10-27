@@ -123,8 +123,11 @@ SCRIPT_OUT=$(mktemp "$OUT/.portfolio_roi_run.XXXXXX")
 umask "$OLD_UMASK"
 trap 'rm -f "$SCRIPT_OUT"' EXIT
 
-if "$PY" "$REPO/scripts/analysis/portfolio_roi_report.py" >>"$SCRIPT_OUT" 2>&1; then
-  cat "$SCRIPT_OUT" >> "$LOG"
+# Stream the report's stdout/stderr into $LOG LIVE (tee -a) so a run killed by
+# the unit timeout or OOM still leaves its output behind; the private copy in
+# $SCRIPT_OUT feeds the summary scan only. `set -o pipefail` keeps the
+# report's own exit status as the pipeline's (tee never fails first).
+if "$PY" "$REPO/scripts/analysis/portfolio_roi_report.py" 2>&1 | tee -a "$LOG" >>"$SCRIPT_OUT"; then
   SUMMARY_LINE=$(grep '^PORTFOLIO_ROI ' "$SCRIPT_OUT" | tail -n 1 || true)
   if [ -n "$SUMMARY_LINE" ]; then
     if printf '%s' "$SUMMARY_LINE" | grep -Eq '\$|[0-9]+\.[0-9]{2}|USD'; then
@@ -137,6 +140,5 @@ if "$PY" "$REPO/scripts/analysis/portfolio_roi_report.py" >>"$SCRIPT_OUT" 2>&1; 
   exit 0
 fi
 
-cat "$SCRIPT_OUT" >> "$LOG"
 say "PORTFOLIO ROI REPORT FAILED (see stderr above in $LOG)"
 exit 1

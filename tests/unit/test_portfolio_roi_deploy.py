@@ -185,7 +185,7 @@ def test_wrapper_invokes_the_report_script_with_no_arguments() -> None:
     # i.e. no CLI argument was smuggled onto this line.
     after_script = invocation.split("portfolio_roi_report.py\"", 1)[1]
     before_redirect = after_script.split(">>", 1)[0].strip()
-    assert before_redirect == ""
+    assert before_redirect in ("", '2>&1 | tee -a "$LOG"')
 
 
 def _run_wrapper(
@@ -415,3 +415,37 @@ def test_lock_contention_skip_line_reaches_stdout_with_exit_zero(tmp_path: Path)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+
+
+def test_report_output_is_streamed_into_the_log_while_the_report_runs(tmp_path: Path) -> None:
+    """A report killed mid-run (timeout/OOM) must still leave its output in
+    the log: the stub only exits 0 if its first line is ALREADY in the log
+    while it is still running."""
+    log = tmp_path / "derived" / "portfolio_roi.log"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'streamed-early-line'\n"
+        "for _ in $(seq 1 50); do\n"
+        f"  grep -q 'streamed-early-line' '{log}' 2>/dev/null && exit 0\n"
+        "  sleep 0.1\n"
+        "done\n"
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().count("streamed-early-line") == 1
+
+
+def test_a_failing_report_exit_code_survives_the_tee_pipeline(tmp_path: Path) -> None:
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text("#!/usr/bin/env bash\necho partial\nexit 7\n")
+    stub.chmod(0o755)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 1
+    assert "PORTFOLIO ROI REPORT FAILED" in result.stdout
