@@ -30,8 +30,10 @@ WorkingDirectory=/home/jon/breezy
 # peak). Still cites that incident's date and unit because every unit on
 # this host now carries an explicit ceiling for that reason, however small
 # its own working set.
-MemoryHigh=512M
-MemoryMax=1G
+# L-58: derived from the 2026-10-27 measurement (436 MB peak, 85 s, 94 logs streamed);
+# the former 512M throttled the 17:40Z run.
+MemoryHigh=1G
+MemoryMax=1536M
 
 # Shared aggregate ceiling across the nightly studies -- this unit takes
 # the same shared flock the wrapper below opens, so it participates in the

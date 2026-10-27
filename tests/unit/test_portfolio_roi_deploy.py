@@ -97,10 +97,11 @@ def test_timer_tick_is_after_the_1720_family_tally_tick() -> None:
     assert tick > _dt.time(17, 20, 0)
 
 
-def test_service_declares_memory_ceiling_in_the_light_unit_band() -> None:
+def test_service_declares_memory_ceiling_derived_from_the_measured_peak() -> None:
+    # L-58: 2026-10-27 measured peak 436 MB -> MemoryHigh=1G, MemoryMax=1536M.
     text = _SERVICE.read_text()
-    assert _directive_value(text, "MemoryHigh") == "512M"
-    assert _directive_value(text, "MemoryMax") == "1G"
+    assert _directive_value(text, "MemoryHigh") == "1G"
+    assert _directive_value(text, "MemoryMax") == "1536M"
 
 
 def test_service_declares_umask_and_studies_slice() -> None:
