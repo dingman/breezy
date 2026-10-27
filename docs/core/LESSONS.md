@@ -57,9 +57,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-10 — A brief's vocabulary becomes a subagent's verified fact (2026-09-01)
 **Mistake:** An unverified Nautilus taxonomy was presented as confirmed to cut scope.
-**Prevention:** Verify every fact a brief states (version, API name, taxonomy, coverage span, execution semantic) against source before dispatch, or mark it `UNVERIFIED - confirm before relying`; run the plan peer review before any implementation, even for small increments.
+**Prevention:** Verify every fact a brief states (version, API name, taxonomy, coverage span, execution semantic) against source before dispatch, or mark it `UNVERIFIED - confirm before relying`; run the plan peer review before any implementation, even for small increments. The reverse direction binds too: a returning agent's INFERENCE (2026-10-27: "the selector drops a rung during its own async REPLACE cancel") is a hypothesis until a second agent confirms it from code — never write it into PROGRESS.md as a defect or into a design brief as the premise before that confirmation (the code read showed replay and live reallocate the slot identically; the real gap was elsewhere).
 **Applied:** 2026-09-01
-**Last updated:** 2026-09-01
+**Last updated:** 2026-10-27
 
 ### L-12 — Widen an exact-set barrier, never relax it
 **Mistake:** Exact-set barriers went red; shared pytest addopts edit changed a pinned filter.
@@ -259,9 +259,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-47 — A blanket "verified against installed source" covers nothing; one unverified premise can contradict your own repo's measured fact (2026-09-19)
 **Mistake:** Blanket 'verified' covered an uncited claim contradicting a repo measurement.
-**Prevention:** Cite file:line for every factual claim about an installed library (a blanket assurance counts for nothing), grep `src/` and `docs/` for prior measurements and STOP on contradiction, show the code path reaches any claimed trap, and strike a refuted premise in place and re-derive the decision.
+**Prevention:** Cite file:line for every factual claim about an installed library (a blanket assurance counts for nothing), grep `src/` and `docs/` for prior measurements and STOP on contradiction, show the code path reaches any claimed trap, and strike a refuted premise in place and re-derive the decision. The same rule binds an ARM checklist: every pre-ARM gate item carries its MEASURED value in the ARM commit message (2026-10-27: the P4 gate "replay with `unreadable == 0`" was never met — `unreadable=1` on every producer run since install — and no waiver was recorded; a ticked box with no number is a blanket assurance).
 **Applied:** 2026-09-19
-**Last updated:** 2026-09-19
+**Last updated:** 2026-10-27
 
 ### L-48 — A latch whose only clearing path it blocks is a deadlock, not a safety stop (2026-09-24)
 **Mistake:** AMBIGUOUS intent held the latch OPEN; its clearing path rejected the body.
@@ -338,3 +338,21 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Before any planned reboot run `systemctl --user stop breezy-quote-tape.service` and wait for the `Stopped` line (`deploy/systemd/README.md:89-102`); after any unclean reboot run the census on the open instance at once and accept the loss — never salvage or reclassify under a pre-registered classifier after seeing counts.
 **Applied:** 2026-10-20
 **Last updated:** 2026-10-20
+
+### L-64 — A live test premised on a replay fill rate pre-registers an opportunity monitor beside it (2026-10-27)
+**Mistake:** P4 was armed on an in-sample 0.70 fills/day; that rate was carried by a 10-09..10-13 thin-queue burst (3.5 h/station-day vs 1.36 before it), the thin-queue opportunity fell ≈3× right after the selection window closed, and the "market disagrees with model" rungs that produced all 17 in-sample fills were 0/day from 10-17 on. Three live windows produced 0 fills and the only diagnosis available was post hoc.
+**Prevention:** Before arming any family whose evidence depends on being filled, pre-register and schedule (daily, read-only, from the tape) the market-opportunity statistic the fills came from — here thin-queue rest-hours per station-day and the count of disagree rungs — with its in-sample level and a STOP/INCONCLUSIVE threshold written beside the fill-rate rate check; a drop in the monitor rules the test inconclusive-by-regime on the day it happens, not at day 21.
+**Applied:** 2026-10-27
+**Last updated:** 2026-10-27
+
+### L-65 — A replay tape never holds the strategy's own orders; a live book does (2026-10-27)
+**Mistake:** The maker priced live from a Depth10 frame that contained its own resting NO bid (a YES ask at `100 − bid`); `selector.py` did not exclude it, so when our bid was best it ratcheted one tick per frame toward the cap, REPLACEd, and lost the slot — on the only thin-queue rung seen live in three days. The Stage 0 replay never did this because the pre-arm tape had no orders of ours, and its fill pass also modelled no order-count budget, latches or cancel-ack latency (live keeps 9 of 17 replay fills under those alone).
+**Prevention:** Before promoting a family from replay to live, (a) make the parity fixture echo the strategy's own open orders into every frame it prices from and assert live == replay posts under that echo; (b) list every venue limit the exec path enforces (order-count budget, intent latch, AMBIGUOUS latch, cancel-ack wait, GTD cap) and either model each in the replay or post-filter the replay's fills under it and report the survivors as the live expectation; (c) treat post-arm tape as self-contaminated for any later replay of that family.
+**Applied:** 2026-10-27
+**Last updated:** 2026-10-27
+
+### L-66 — The serial gate without an in-tree basetemp lands on the 16 GB tmpfs and fails DiskLow (2026-10-27)
+**Mistake:** `scripts/ci/run_tests_no_egress.sh` run with no `--basetemp` put pytest's tmp under `/tmp` (tmpfs, 4.8 GB free); the Stage 0 driver preflight requires 10 GB free on the tmp filesystem, so 97 Stage 0 tests failed `DiskLow` and the only real finding (a stale mypy ceiling) was buried under them for 32 minutes.
+**Prevention:** Always invoke the serial gate as `scripts/ci/run_tests_no_egress.sh --basetemp /home/jon/breezy/.pytest-tmp/<name>` and `rm -rf` that directory after reading `GATE_EXIT`; when a gate fails with ≥50 failures, group the `E ` lines by message before reading any single traceback — one environmental cause looks like a hundred bugs.
+**Applied:** 2026-10-27
+**Last updated:** 2026-10-27
