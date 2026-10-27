@@ -211,9 +211,14 @@ def scan_depth_window(
     end_ns: int,
     should_stop: Callable[[], None],
     batch_size: int = _DEFAULT_BATCH_SIZE,
+    ask_masked: bool = True,
 ) -> tuple[int, int | None, int | None]:
     """In-window, ask-masked Depth10 row count + first/last ``ts_event``,
     for one instrument's already-converted parquet files.
+
+    ``ask_masked=False`` drops the populated-ask filter and counts every
+    in-window row (for callers whose rule is "any captured snapshot", e.g. the
+    structural-dead-stop afternoon coverage); the default is unchanged.
 
     Object-free: projects only ``ts_event`` and ``ask_size_0..9`` per row
     group via ``pyarrow.parquet.ParquetFile.iter_batches``, so memory is
@@ -255,10 +260,8 @@ def scan_depth_window(
                 should_stop()
                 _assert_no_nulls(batch, columns, file_path=file_path)
                 ts_column = batch.column(_TS_EVENT_COLUMN)
-                combined_mask = pc.and_(
-                    _ask_mask(batch, zero),
-                    _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns),
-                )
+                window = _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns)
+                combined_mask = pc.and_(_ask_mask(batch, zero), window) if ask_masked else window
                 matched = ts_column.filter(combined_mask).to_pylist()
                 row_count += len(matched)
                 first_ns, last_ns = _fold_extent(first_ns, last_ns, matched)

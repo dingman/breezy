@@ -48,7 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cli_basis_setup_win_rate_study import DENSE_STATIONS
-from h4_preliminary_economic_read import DepthObservation, load_depth
+from h4_preliminary_economic_read import DepthObservation
 from ma_prelock_winner_ask_study import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
@@ -61,11 +61,14 @@ from ma_prelock_winner_ask_study import (
     discover_station_days,
     instrument_ids_for,
 )
+from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+from nautilus_trader.persistence.funcs import urisafe_identifier
 from settlement_alignment_study import load_sites
 
 from breezy.adapters.polymarket_us.tape_records import QuoteTapeGap, resolved_gaps_by_seq
 from breezy.normalize.climate_day import standard_time_zone
+from breezy.persistence.catalog_column_scan import group_files_by_identifier, scan_depth_window
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 
@@ -216,6 +219,45 @@ def covered_listed_station_days(
     return count
 
 
+def _afternoon_extent_depth(
+    *,
+    instrument_ids: Sequence[str],
+    files_by_id: Mapping[str, Sequence[str]],
+    window_ns: tuple[int, int],
+) -> dict[str, tuple[DepthObservation, ...]]:
+    """Stand-in depth for `collect_window_instants`: the first/last captured
+    snapshot inside ``window_ns`` across the rungs, read column-wise.
+
+    Coverage is `max(instants) - min(instants)` over every in-window snapshot of
+    every rung (ask populated or not), so only the extremes matter. Object-free
+    (`scan_depth_window`, ``ask_masked=False``) instead of building a full
+    `OrderBookDepth10` per row for the whole catalog.
+    """
+    start_ns, end_ns = window_ns
+    extremes: set[int] = set()
+    for instrument_id in instrument_ids:
+        _count, first_ns, last_ns = scan_depth_window(
+            files_by_id.get(urisafe_identifier(instrument_id), ()),
+            start_ns=start_ns,
+            end_ns=end_ns,
+            should_stop=lambda: None,
+            ask_masked=False,
+        )
+        extremes.update(ns for ns in (first_ns, last_ns) if ns is not None)
+    return {
+        "afternoon-extent": tuple(
+            DepthObservation(
+                instrument_id="afternoon-extent",
+                ts_event=dt.datetime.fromtimestamp(ns / 1_000_000_000, tz=dt.UTC),
+                best_ask=None,
+                ask_ladder=None,
+                best_bid=None,
+            )
+            for ns in sorted(extremes)
+        )
+    }
+
+
 def count_covered_listed_station_days_from_catalog(
     *,
     catalog_root: Path,
@@ -226,9 +268,9 @@ def count_covered_listed_station_days_from_catalog(
     """The I/O wrapper: discovers listed station-days, then counts coverage.
 
     Reuses `discover_station_days` / `instrument_ids_for`
-    (`ma_prelock_winner_ask_study.py:547-567`) for "listed", and `load_depth`
-    (`h4_preliminary_economic_read.py:572`) for the captured instants --
-    the same quote-tape catalog reader the M_A/M_B studies already use.
+    (`ma_prelock_winner_ask_study.py:547-567`) for "listed", and the
+    column-projected `scan_depth_window` for the captured instants, bounded to
+    each day's afternoon window (never full Depth10 objects).
     """
     depth_root = catalog_root / "data" / "order_book_depths"
     station_days = discover_station_days(
@@ -236,11 +278,17 @@ def count_covered_listed_station_days_from_catalog(
     )
     std_utc_offset_by_city = {spec.city: spec.std_utc_offset_hours for spec in load_sites()}
 
+    files_by_id = group_files_by_identifier(ParquetDataCatalog(str(catalog_root)), OrderBookDepth10)
+
     def _loader(city: str, climate_day: dt.date) -> Mapping[str, Sequence[DepthObservation]]:
         instrument_ids = instrument_ids_for(
             depth_root=depth_root, city=city, climate_day=climate_day
         )
-        return load_depth(catalog_root=catalog_root, instrument_ids=instrument_ids)
+        return _afternoon_extent_depth(
+            instrument_ids=instrument_ids,
+            files_by_id=files_by_id,
+            window_ns=_afternoon_window_ns(climate_day, std_utc_offset_by_city[city]),
+        )
 
     return covered_listed_station_days(
         station_days=station_days,
