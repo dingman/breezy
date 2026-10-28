@@ -31,7 +31,9 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # was 4f857b29...7052
         # re-pin: table residual breezy-autonomy-failed@ plus effective_residual_units
         # (fixture rows that list it yield); was 63c8031f...6d73
-        "aut2.label": "6ba8a4330117e51604f8080495cb4e747b348799d37d3e4f1850ff5ba69aaa94",
+        # re-pin: order-shape drift in exec/reports.py and exec/client.py (97d3fd9e), both in the
+        # label_run closure only; was 6ba8a433...aa94
+        "aut2.label": "6fd44dbcba861e36717e7f875199d03f4eca043fb940c3dc2830fde6c9245f88",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
