@@ -368,3 +368,9 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Every strategy clock callback that touches thread-confined state (state store, exec-client latches, caches) goes through the `_on_clock` wrapper that hops onto the kernel loop (`loop.call_soon_threadsafe`, loop captured in `on_start`; fix ed888605); any review of a new timer or of exec-client state mutation names the thread it runs on, and the first live minutes after a new timer are checked for thread errors.
 **Applied:** 2026-10-24
 **Last updated:** 2026-10-28
+
+### L-69 — The bot's venue account is shared with a human; any manual position latches the node by design (2026-10-28)
+**Mistake:** After a gated, reviewed fix was relaunched at 23:45Z the node denied every submit: the account held a $5 NBA parlay bought through the venue UI six minutes earlier (`crossd-…`, a combo market with no public Market object), and the exec client's fail-closed guard on positions it cannot map or net refused to trade. The whole relaunched window was lost, the fix could not be confirmed live, and the same account had NBA prop fills on 10-20 that nobody had connected to the bot's readiness.
+**Prevention:** Before every node launch or relaunch run the read-only positions probe (`GET /v1/portfolio/positions` via the shipped client) and treat any slug outside `tc-temp-*` as a launch blocker to SURFACE to the operator, never to work around: do not sell, hide or allowlist the position and do not weaken the guard. Record the operator's standing decision (no manual trading on the bot's account, or accept refused windows) in PROGRESS.md and re-check it whenever a boot logs `instrument_absent>0`.
+**Applied:** 2026-10-28
+**Last updated:** 2026-10-28
