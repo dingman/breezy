@@ -301,10 +301,10 @@ def test_the_2026_09_11_drift_fields_are_declared_but_unread(
     assert report.filled_qty == Quantity.from_str("10.00")
 
 
-def test_a_fifth_undeclared_field_alongside_the_drift_set_is_still_refused(
+def test_an_undeclared_field_alongside_the_2026_09_11_drift_set_is_still_refused(
     order: dict[str, Any], instrument: BinaryOption
 ) -> None:
-    """The drift allowance is exactly four fields, not "anything new"."""
+    """An undeclared field beside the drift set is still refused, not "anything new"."""
     with pytest.raises(ExecutionReportMappingError, match="settlementInstruction"):
         parse_order_status_report(
             {
@@ -320,6 +320,65 @@ def test_a_fifth_undeclared_field_alongside_the_drift_set_is_still_refused(
             report_id=REPORT_ID,
             ts_init=TS_INIT,
         )
+
+
+_ORDER_SHAPE_DRIFT_2026_10_28 = (
+    "estimatedAmount",
+    "estimatedCommission",
+    "principal",
+)
+
+
+def _with_2026_10_28_null_drift(order: dict[str, Any]) -> dict[str, Any]:
+    """The shared order fixture plus the three keys, each JSON null."""
+    return {**order, **dict.fromkeys(_ORDER_SHAPE_DRIFT_2026_10_28, None)}
+
+
+def test_the_2026_10_28_null_drift_fields_parse_into_an_order_status_report(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """ORDER_SHAPE_DRIFT_2026-10-28: the three new keys, null on an unfilled
+    rest, are declared-but-unread. The report matches the fixture without them."""
+    # Non-null 3-field values untested; populated type UNKNOWN (ORDER_SHAPE_DRIFT_2026-10-28.md).
+    kwargs: dict[str, Any] = {
+        "instrument": instrument,
+        "account_id": ACCOUNT_ID,
+        "report_id": REPORT_ID,
+        "ts_init": TS_INIT,
+    }
+    plain = parse_order_status_report(order, **kwargs)
+    drifted = parse_order_status_report(_with_2026_10_28_null_drift(order), **kwargs)
+
+    assert isinstance(drifted, OrderStatusReport)
+    assert drifted.order_status == plain.order_status
+    assert drifted.filled_qty == plain.filled_qty
+    assert drifted.quantity == plain.quantity
+    assert drifted.price == plain.price
+    assert drifted.avg_px == plain.avg_px
+    assert drifted.venue_order_id == plain.venue_order_id
+    assert drifted.order_side == plain.order_side
+
+
+def test_an_undeclared_key_beside_the_2026_10_28_drift_is_still_refused(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The 2026-10-28 allowance is those three names, not any new key."""
+    with pytest.raises(ExecutionReportMappingError, match="futureKey"):
+        parse_order_status_report(
+            {**_with_2026_10_28_null_drift(order), "futureKey": None},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_the_2026_10_28_drift_names_are_declared_but_unread() -> None:
+    """Present on both allowlists; absent from the SDK snapshot row."""
+    names = frozenset(_ORDER_SHAPE_DRIFT_2026_10_28)
+    assert names <= _ORDER_DRIFT_ALLOWED_KEYS
+    assert names <= reports_module.WIRE_ORDER_KEYS
+    assert names.isdisjoint(_ORDER_KEYS)
 
 
 def test_the_2026_09_12_market_metadata_drift_fields_are_declared_but_unread(
@@ -1933,6 +1992,8 @@ _OBSERVED_WIRE_ORDER_KEYS = frozenset(
         "commissionsBasisPoints",
         "createTime",
         "cumQuantity",
+        "estimatedAmount",
+        "estimatedCommission",
         "goodTillTime",
         "id",
         "insertTime",
@@ -1945,6 +2006,7 @@ _OBSERVED_WIRE_ORDER_KEYS = frozenset(
         "marketSlug",
         "outcomeSide",
         "price",
+        "principal",
         "quantity",
         "side",
         "state",
@@ -1954,26 +2016,29 @@ _OBSERVED_WIRE_ORDER_KEYS = frozenset(
 )
 
 
-def test_wire_order_keys_literal_is_the_24_observed_keys() -> None:
-    """WP0 note section 3 S-3: the wire Order carries 24 keys (additive pin)."""
+def test_wire_order_keys_literal_is_the_27_observed_keys() -> None:
+    """WP0 S-3's 24 keys plus the three 2026-10-28 names (additive pin)."""
     assert reports_module.WIRE_ORDER_KEYS == _OBSERVED_WIRE_ORDER_KEYS
-    assert len(reports_module.WIRE_ORDER_KEYS) == 24
+    assert len(reports_module.WIRE_ORDER_KEYS) == 27
     assert isinstance(reports_module.WIRE_ORDER_KEYS, frozenset)
 
 
-def test_wire_order_keys_is_the_snapshot_keys_plus_the_four_drift_keys() -> None:
+def test_wire_order_keys_is_the_snapshot_keys_plus_the_drift_keys() -> None:
     assert reports_module.WIRE_ORDER_KEYS == (
         reports_module._ORDER_KEYS | reports_module._ORDER_DRIFT_ALLOWED_KEYS
     )
 
 
-def test_order_drift_allowlist_stays_exactly_four_keys() -> None:
-    """[CHAR] P11: no change to the order drift allowlist."""
+def test_order_drift_allowlist_stays_exactly_seven_keys() -> None:
+    """Declared-but-unread: the 2026-09-11 four plus the 2026-10-28 three."""
     assert reports_module._ORDER_DRIFT_ALLOWED_KEYS == {
         "action",
+        "estimatedAmount",
+        "estimatedCommission",
         "lastTransactTime",
         "manualOrderIndicator",
         "outcomeSide",
+        "principal",
     }
 
 

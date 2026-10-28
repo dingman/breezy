@@ -102,7 +102,7 @@ from typing import Any, Final
 
 import pytest
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import CancelAllOrders, CancelOrder
+from nautilus_trader.execution.messages import CancelAllOrders, CancelOrder, QueryOrder
 from nautilus_trader.model.enums import OrderSide
 
 from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
@@ -212,6 +212,80 @@ def _payload(rig: _Rig, n: int) -> dict[str, Any]:
 
 def _set_state(rig: _Rig, n: int, state: str, cum: int = 0) -> None:
     _payload(rig, n).update({"state": state, "cumQuantity": cum})
+
+
+#: The 24 wire keys a resting GET carried before 2026-10-28, plus the three
+#: null drift names (``ORDER_SHAPE_DRIFT_2026-10-28``). A tolerant cancel read
+#: accepts this body; the strict mapper accepts it only because those three
+#: names are declared-but-unread.
+_PRIOR_WIRE_ORDER_KEYS: Final[tuple[str, ...]] = (
+    "action",
+    "avgPx",
+    "cashOrderQty",
+    "commissionNotionalTotalCollected",
+    "commissionsBasisPoints",
+    "createTime",
+    "cumQuantity",
+    "goodTillTime",
+    "id",
+    "insertTime",
+    "intent",
+    "lastTransactTime",
+    "leavesQuantity",
+    "makerCommissionsBasisPoints",
+    "manualOrderIndicator",
+    "marketMetadata",
+    "marketSlug",
+    "outcomeSide",
+    "price",
+    "quantity",
+    "side",
+    "state",
+    "tif",
+    "type",
+)
+_NULL_DRIFT_KEYS: Final[tuple[str, ...]] = (
+    "estimatedAmount",
+    "estimatedCommission",
+    "principal",
+)
+
+
+def _fail_polls(client: Any, venue_id: str, n: int = 3) -> None:
+    for _ in range(n):
+        client._note_resting_poll(venue_id, readable=False)
+
+
+def _refusal_reasons(client: Any) -> list[str]:
+    return [r.reason for r in client._trading_refusals]
+
+
+def _install_wire27(rig: _Rig, n: int, *, state: str, cum: int) -> dict[str, Any]:
+    """Replace rest ``n``'s GET body with the 27-key order, three drift keys null."""
+    current = _payload(rig, n)
+    body: dict[str, Any] = {key: current.get(key) for key in _PRIOR_WIRE_ORDER_KEYS}
+    body["state"] = state
+    body["cumQuantity"] = cum
+    body["leavesQuantity"] = 0 if cum == 0 else current.get("leavesQuantity")
+    for key in _NULL_DRIFT_KEYS:
+        body[key] = None
+    assert set(body) == set(_PRIOR_WIRE_ORDER_KEYS) | set(_NULL_DRIFT_KEYS)
+    assert len(body) == 27
+    path = submit_chain.order_by_id_path(_id_n(n))
+    rig.client._private_read._payloads[path] = {"order": body}
+    return body
+
+
+def _query_cmd(rig: _Rig, command: Any) -> QueryOrder:
+    return QueryOrder(
+        trader_id=TRADER_ID,
+        strategy_id=STRATEGY_ID,
+        instrument_id=command.order.instrument_id,
+        client_order_id=command.order.client_order_id,
+        venue_order_id=None,
+        command_id=UUID4(),
+        ts_init=rig.client._clock.timestamp_ns(),
+    )
 
 
 def _fill_payload(rig: _Rig, n: int) -> None:
@@ -857,6 +931,223 @@ async def test_three_failed_polls_latch_resting_query_unreadable_and_a_read_clea
     assert _names(rig).count("OrderCanceled") == 1
     client._note_resting_poll(_id_n(0), readable=True)
     assert client._trading_refusals == []
+    await client._disconnect()
+
+
+async def _latched_rest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[_Rig, Any]:
+    rig = await _rig(tmp_path, monkeypatch)
+    command = await _submit_rest(rig, 0)
+    _fail_polls(rig.client, _id_n(0))
+    assert _refusal_reasons(rig.client) == [submit_chain.RESTING_QUERY_UNREADABLE_REASON]
+    return rig, command
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_clears_when_the_gtd_cancel_reads_the_latched_rest_expired_zero_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A GTD cancel whose GET is EXPIRED with cumQuantity 0 is the terminal read.
+
+    That read ends ``resting_query_unreadable`` for the id, so the refusal set
+    is empty and a new rest is not denied. The body is the 27-key wire order
+    (24 prior keys plus the three null drift names).
+    """
+    rig, command = await _latched_rest(tmp_path, monkeypatch)
+    client = rig.client
+    _install_wire27(rig, 0, state="ORDER_STATE_EXPIRED", cum=0)
+    await client._cancel_order(_cancel_cmd(rig, command))
+    assert _names(rig).count("OrderExpired") == 1
+    assert client._trading_refusals == []
+    denied = _names(rig).count("OrderDenied")
+    await _submit_rest(rig, 1)
+    assert _names(rig).count("OrderDenied") == denied
+    assert _id_n(1) in client._resting_bookings
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_clears_when_the_cancel_reads_canceled_zero_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same clearing path when the terminal read is CANCELED with nothing filled."""
+    rig, command = await _latched_rest(tmp_path, monkeypatch)
+    client = rig.client
+    _install_wire27(rig, 0, state="ORDER_STATE_CANCELED", cum=0)
+    await client._cancel_order(_cancel_cmd(rig, command))
+    assert _names(rig).count("OrderCanceled") == 1
+    assert client._trading_refusals == []
+    denied = _names(rig).count("OrderDenied")
+    await _submit_rest(rig, 1)
+    assert _names(rig).count("OrderDenied") == denied
+    assert _id_n(1) in client._resting_bookings
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_stays_when_the_cancel_reads_a_fill_the_mapper_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cumQuantity 1 plus an undeclared key: the strict mapper refuses, the
+    confirm verdict is UNREADABLE, and the poll latch stays."""
+    rig, _command = await _latched_rest(tmp_path, monkeypatch)
+    client = rig.client
+    body = _install_wire27(rig, 0, state="ORDER_STATE_FILLED", cum=1)
+    body["futureKey"] = None
+    pending = await client._cancel_resting_order((_id_n(0),), max_passes=1)
+    assert pending == frozenset({_id_n(0)})
+    assert _refusal_reasons(client) == [submit_chain.RESTING_QUERY_UNREADABLE_REASON]
+    assert _id_n(0) in client._unreadable_resting_ids
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_stays_when_the_cancel_reads_a_fill_that_cannot_be_booked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FILLED 27-key read whose booking fails leaves the row bound.
+
+    Both latches stay: the poll latch from the three failed polls, and
+    ``resting_cancel_unconfirmed`` once the unbooked read is still not terminal.
+    """
+    rig, command = await _latched_rest(tmp_path, monkeypatch)
+    client = rig.client
+    _fill_payload(rig, 0)
+    _install_wire27(rig, 0, state="ORDER_STATE_FILLED", cum=1)
+    writes = {"n": 0}
+
+    def refuse_write(*_args: Any, **_kwargs: Any) -> None:
+        writes["n"] += 1
+        raise OSError("durable store write failed")
+
+    monkeypatch.setattr(client, "record_fill", refuse_write)
+    rig.sender.on_cancel = lambda _order_id: client.advance(90_000)
+    task = asyncio.ensure_future(client._cancel_order(_cancel_cmd(rig, command)))
+    try:
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            if submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON in _refusal_reasons(client):
+                break
+        reasons = _refusal_reasons(client)
+        assert submit_chain.RESTING_QUERY_UNREADABLE_REASON in reasons
+        assert submit_chain.RESTING_CANCEL_UNCONFIRMED_REASON in reasons
+        assert _id_n(0) in client._unreadable_resting_ids
+        assert json.loads(client._store_get(_INDEX_KEY)) == [_id_n(0)]
+        assert writes["n"] >= 1
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_stays_while_one_of_two_latched_ids_is_not_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal read of one latched id does not drop the unscoped refusal
+    while another latched id is still not terminal."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    first = await _submit_rest(rig, 0)
+    await _submit_rest(rig, 1)
+    _fail_polls(client, _id_n(0))
+    _fail_polls(client, _id_n(1))
+    assert _refusal_reasons(client) == [submit_chain.RESTING_QUERY_UNREADABLE_REASON]
+    _install_wire27(rig, 0, state="ORDER_STATE_EXPIRED", cum=0)
+    await client._cancel_order(_cancel_cmd(rig, first))
+    assert _id_n(1) in client._unreadable_resting_ids
+    assert submit_chain.RESTING_QUERY_UNREADABLE_REASON in _refusal_reasons(client)
+    await client._submit_order(_rest_command(client))
+    denied = [e for e in rig.events if type(e).__name__ == "OrderDenied"]
+    assert denied
+    assert "resting_query_unreadable" in denied[-1].reason
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_stays_when_the_cancel_read_omits_cumquantity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An otherwise-terminal body with no cumQuantity proves nothing."""
+    rig, _command = await _latched_rest(tmp_path, monkeypatch)
+    client = rig.client
+    body = _install_wire27(rig, 0, state="ORDER_STATE_EXPIRED", cum=0)
+    del body["cumQuantity"]
+    pending = await client._cancel_resting_order((_id_n(0),), max_passes=1)
+    assert pending == frozenset({_id_n(0)})
+    assert _id_n(0) in client._unreadable_resting_ids
+    assert submit_chain.RESTING_QUERY_UNREADABLE_REASON in _refusal_reasons(client)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_latch_stays_when_the_cancel_read_echoes_another_id_or_slug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body that echoes a different id or marketSlug is not a read of this rest."""
+    for label, key, echoed in (
+        ("id", "id", "ABCDEF999999"),
+        ("slug", "marketSlug", "tc-temp-not-the-bound-slug"),
+    ):
+        sub = tmp_path / label
+        sub.mkdir()
+        rig, _command = await _latched_rest(sub, monkeypatch)
+        client = rig.client
+        body = _install_wire27(rig, 0, state="ORDER_STATE_EXPIRED", cum=0)
+        body[key] = echoed
+        pending = await client._cancel_resting_order((_id_n(0),), max_passes=1)
+        assert pending == frozenset({_id_n(0)}), label
+        assert _id_n(0) in client._unreadable_resting_ids, label
+        assert submit_chain.RESTING_QUERY_UNREADABLE_REASON in _refusal_reasons(client), label
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_mapping_failure_warn_names_the_offending_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll that the strict mapper refuses names the undeclared key, not its value."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    _payload(rig, 0)["notAWireKey"] = "SECRET_VALUE_42"
+    await client._query_order(_query_cmd(rig, command))
+    warnings = client.log_lines("warning", "the read did not map")
+    assert len(warnings) == 1
+    assert "ExecutionReportMappingError" in warnings[0]
+    assert "notAWireKey" in warnings[0]
+    assert "SECRET_VALUE_42" not in warnings[0]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_poll_mapping_failure_warn_omits_values_for_non_mapper_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ValueError inside the poll maps as a class name only, never its message."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    command = await _submit_rest(rig, 0)
+    sentinel = "RAW_WIRE_SENTINEL_9f3c"
+
+    def boom(_target: Any, _body: Any) -> Any:
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr(client, "_parse_resting_read", boom)
+    await client._query_order(_query_cmd(rig, command))
+    warnings = client.log_lines("warning", "the read did not map")
+    assert len(warnings) == 1
+    assert "ValueError" in warnings[0]
+    assert sentinel not in warnings[0]
     await client._disconnect()
 
 

@@ -9062,14 +9062,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
 
     def _clear_resting_cancel_latch(self, venue_order_id: str) -> None:
-        """A terminal read of ``venue_order_id`` drops its alert and, when it was the
-        last latched id, the ``resting_cancel_unconfirmed`` refusal."""
+        """A terminal read of the id ends both resting latches for it.
+
+        Drops this id's cancel alert and, when it was the last latched id, the
+        ``resting_cancel_unconfirmed`` refusal. The same read clears
+        ``resting_query_unreadable`` for this id via ``_note_resting_poll``.
+        The clear is evidence-backed: every caller sits behind a tolerant
+        zero-fill terminal verdict or a booked fill, and an id leaves
+        ``resting_index`` only through those two paths, so a latched id that
+        is already unbound was retired on positive evidence.
+        """
         self._resting_cancel_alert_details = {
             k: v for k, v in self._resting_cancel_alert_details.items() if k != venue_order_id
         }
         self._resting_cancel_alert_ns = {
             k: v for k, v in self._resting_cancel_alert_ns.items() if k != venue_order_id
         }
+        self._note_resting_poll(venue_order_id, readable=True)
         if venue_order_id not in self._unconfirmed_cancel_ids:
             return
         self._unconfirmed_cancel_ids = self._unconfirmed_cancel_ids - {venue_order_id}
@@ -9184,7 +9193,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # alone, as the cancel path does: its leaves are the venue's to define.
                 report = self._parse_resting_read(target, body)
         except Exception as exc:  # noqa: BLE001 - one failed poll, never raised
-            self._log.warning(f"resting poll: the read did not map ({exc.__class__.__name__})")
+            # The mapper names keys and our own order fields only. Any other
+            # exception may carry a raw wire value, so log the class alone.
+            detail = (
+                f"{exc.__class__.__name__}: {exc}"
+                if isinstance(exc, ExecutionReportMappingError)
+                else exc.__class__.__name__
+            )
+            self._log.warning(f"resting poll: the read did not map ({detail})")
             self._note_resting_poll(venue_id, readable=False)
             return
         readable = True

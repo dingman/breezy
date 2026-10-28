@@ -278,25 +278,37 @@ _ORDER_KEYS: Final[frozenset[str]] = frozenset(
 #: read does not refuse an otherwise-healthy terminal/PARTIALLY_FILLED body
 #: over a name it has never needed (NOTE: ``_known_order`` is also reached
 #: from :func:`parse_fill_report`'s nested order, so the create-order /
-#: fill classification is widened by the same four unread names), but not
+#: fill classification is widened by the same unread names), but not
 #: merged into :data:`_ORDER_KEYS`
 #: itself -- that set must stay exactly what the snapshot declares, or the
 #: drift check in ``test_polymarket_us_exec_snapshot_drift.py`` goes vacuous.
-#: None of these four is read for money or state by :func:`_known_order`,
+#: None of these is read for money or state by :func:`_known_order`,
 #: :func:`parse_order_status_report` or :func:`parse_fill_report`:
 #: ``outcomeSide`` is a known venue concept (BL-6: NO is a side of the same
 #: book) already unread by every mapper here; ``action``,
 #: ``lastTransactTime`` and ``manualOrderIndicator`` are FIX-style order
-#: fields the mapper has never consumed. A field the venue adds beyond
-#: THESE four is still an unknown key and is still refused.
+#: fields the mapper has never consumed. Three more -- ``estimatedAmount``,
+#: ``estimatedCommission``, ``principal`` -- were null on unfilled GTD rests
+#: on 2026-10-28 (``ORDER_SHAPE_DRIFT_2026-10-28.md``); declared-but-unread.
+#: A field the venue adds beyond THESE seven is still an unknown key and is
+#: still refused.
 _ORDER_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
-    {"action", "lastTransactTime", "manualOrderIndicator", "outcomeSide"}
+    {
+        "action",
+        "estimatedAmount",
+        "estimatedCommission",
+        "lastTransactTime",
+        "manualOrderIndicator",
+        "outcomeSide",
+        "principal",
+    }
 )
 
 #: The ``Order`` object as the venue actually sends it: the 20 keys the pinned
-#: SDK snapshot declares (:data:`_ORDER_KEYS`) plus the four observed-but-unread
-#: names (:data:`_ORDER_DRIFT_ALLOWED_KEYS`) -- 24 keys on a RESTING order
-#: (``MAKER_S4_WP0_VENUE_DISCOVERY_2026-10-13.md`` S-3). ADDITIVE: it is a
+#: SDK snapshot declares (:data:`_ORDER_KEYS`) plus the seven observed-but-unread
+#: names (:data:`_ORDER_DRIFT_ALLOWED_KEYS`) -- 27 keys on a RESTING order
+#: (``MAKER_S4_WP0_VENUE_DISCOVERY_2026-10-13.md`` S-3, plus
+#: ``ORDER_SHAPE_DRIFT_2026-10-28.md``). ADDITIVE: it is a
 #: literal pinned by a test, and it never replaces the 20-key snapshot row
 #: (``test_polymarket_us_exec_snapshot_drift.py``), which must keep matching
 #: the SDK exactly. Nothing at runtime consults it for acceptance; the mapper's
@@ -310,6 +322,8 @@ WIRE_ORDER_KEYS: Final[frozenset[str]] = frozenset(
         "commissionsBasisPoints",
         "createTime",
         "cumQuantity",
+        "estimatedAmount",
+        "estimatedCommission",
         "goodTillTime",
         "id",
         "insertTime",
@@ -322,6 +336,7 @@ WIRE_ORDER_KEYS: Final[frozenset[str]] = frozenset(
         "marketSlug",
         "outcomeSide",
         "price",
+        "principal",
         "quantity",
         "side",
         "state",

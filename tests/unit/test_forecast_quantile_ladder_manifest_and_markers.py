@@ -43,7 +43,8 @@ _EXEC_CLIENT_PATH = (
 # ONE constant is the home of this pin for three tests: this file's byte-identity test,
 # test_autonomy_envelope::test_exec_client_never_edited (reads it by AST) and the
 # positive control of test_aut1_wp0_closure_premises::test_submit_chain_is_not_byte_pinned_in_tests.
-_EXEC_CLIENT_SHA256 = "f44830077501040a76a1823345e24aca2eefcc3f090d718c6d7db03ff03af17d"
+# re-pinned 2026-10-28: LATCH-RECOVERY (terminal read clears resting_query_unreadable via _clear_resting_cancel_latch) + poll refusal WARN carries the mapper message (key names + own-order fields); prior f44830077501040a76a1823345e24aca2eefcc3f090d718c6d7db03ff03af17d; python-reviewer + prediction-market-reviewer APPROVE, silent-failure-hunter SAFE-WITH-FIXES applied.  # noqa: E501
+_EXEC_CLIENT_SHA256 = "417b4613d5b7db40034922d0c8f1e97e2d1ce974be4fc26fe3313200caf01032"
 _EXEC_CLIENT_SHA256_BEFORE_POSTB2_REPIN = (
     "7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e"
 )
