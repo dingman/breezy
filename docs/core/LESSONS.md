@@ -199,9 +199,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-37 — A swallowed venue-shape error on the create path is a silent-fill hazard (2026-09-11/12)
 **Mistake:** Swallowed shape error locked the account; GET resolver retried 3,615x unbacked.
-**Prevention:** On money-surface shape guards, log the full names-only key tree on refusal, surface swallowed errors into the AMBIGUOUS diagnostic, declare additive drift per surface with evidence (never relax the guard), and back off unbounded venue retries with an age alert.
+**Prevention:** On EVERY venue-shape guard — create, confirm, boot sweep AND the resting poll — log the full names-only key tree on refusal (2026-10-28: `_apply_resting_poll` logged only `exc.__class__.__name__`, so 285 refusals carried no diagnosis while Polymarket.us had added `estimatedAmount`/`estimatedCommission`/`principal` to the Order object — the fourth additive change after balances 09-04/09-19 and order 09-11); treat additive venue fields as a recurring event whose standing response is the declared-but-unread allowlist plus a value-free evidence note, never a relaxed guard; surface swallowed errors into the AMBIGUOUS diagnostic; back off unbounded venue retries with an age alert.
 **Applied:** 2026-09-11
-**Last updated:** 2026-09-14
+**Last updated:** 2026-10-28
 
 ### L-38 — A stop rule whose counter cannot increment is a missing stop, not a running clock (2026-09-12)
 **Mistake:** KILL counter read 0 for eight days; the stop could not fire.
@@ -265,9 +265,9 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-48 — A latch whose only clearing path it blocks is a deadlock, not a safety stop (2026-09-24)
 **Mistake:** AMBIGUOUS intent held the latch OPEN; its clearing path rejected the body.
-**Prevention:** For every blocking latch, name its clearing path and test it end to end with the real stuck shape (venue body verbatim, past-day instrument, boot after the latch was set), and make mapping guards state-aware and field-logging.
+**Prevention:** For every blocking latch, name its clearing path and test it end to end with the real stuck shape (venue body verbatim, past-day instrument, boot after the latch was set), and make mapping guards state-aware and field-logging. The clearing path must not depend on the triggering object staying alive: 2026-10-28 `resting_query_unreadable` clears only on a readable poll of the SAME order id, the three unreadable rests expired and left `resting_index`, so the latch was unreachable for the remaining 6.5 h of the window while the node looked healthy — add the sequence "latch → terminal event on the triggering order → recovery evidence" to every latch's test list.
 **Applied:** 2026-09-24
-**Last updated:** 2026-09-24
+**Last updated:** 2026-10-28
 
 ### L-49 — Low CPU over wall time on a failing unit means a memory ceiling, not a slow job (2026-09-24)
 **Mistake:** `MemoryHigh=4G` on a 90G backlog thrashed in reclaim until timeout.
@@ -356,3 +356,15 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Always invoke the serial gate as `scripts/ci/run_tests_no_egress.sh --basetemp /home/jon/breezy/.pytest-tmp/<name>` and `rm -rf` that directory after reading `GATE_EXIT`; when a gate fails with ≥50 failures, group the `E ` lines by message before reading any single traceback — one environmental cause looks like a hundred bugs.
 **Applied:** 2026-10-27
 **Last updated:** 2026-10-27
+
+### L-67 — Probe the delegation route before the first dispatch, not after (2026-10-28)
+**Mistake:** The cycle opened with three Claude sub-agent dispatches on the assumption that Grok was still 402-exhausted (true the previous day); `~/.claude/bin/grok-check.sh` run afterwards returned 0, so the first stage ran on the third-choice route while the first-choice route was available.
+**Prevention:** The first command of every cycle is `~/.claude/bin/grok-check.sh` (0 = usable, 2 = 402) followed by the one-line Codex probe; route the whole cycle from those two results and state the route in the cycle record before any dispatch. A yesterday's-state assumption about an external route is a premise to verify, never a fact.
+**Applied:** 2026-10-28
+**Last updated:** 2026-10-28
+
+### L-68 — Nautilus LiveClock callbacks run off the kernel thread; hop before touching thread-confined state (2026-10-24, recorded 2026-10-28)
+**Mistake:** On P4 arm day the maker's 30 s `MAKER-POLL` timer read the FQ halt veto from `SqliteStateStore` inside the LiveClock callback; the store's `_check_thread` raised off-thread, the veto failed closed (`fq_halt_veto_unreadable`) and every rest was cancelled each cycle (39 submitted, 81 denied, 0 fills) until the node was stopped. TestClock unit tests never see it. The rule lived only in auto-memory, so 10-28 reviewers could not cite it.
+**Prevention:** Every strategy clock callback that touches thread-confined state (state store, exec-client latches, caches) goes through the `_on_clock` wrapper that hops onto the kernel loop (`loop.call_soon_threadsafe`, loop captured in `on_start`; fix ed888605); any review of a new timer or of exec-client state mutation names the thread it runs on, and the first live minutes after a new timer are checked for thread errors.
+**Applied:** 2026-10-24
+**Last updated:** 2026-10-28
