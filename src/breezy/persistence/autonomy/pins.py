@@ -33,7 +33,9 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # (fixture rows that list it yield); was 63c8031f...6d73
         # re-pin: order-shape drift in exec/reports.py and exec/client.py (97d3fd9e), both in the
         # label_run closure only; was 6ba8a433...aa94
-        "aut2.label": "6fd44dbcba861e36717e7f875199d03f4eca043fb940c3dc2830fde6c9245f88",
+        # re-pin: EXEC-FOREIGN-POS Stage A (exec/client.py, exec/reports.py), label_run
+        # closure only; was 6fd44dbc...5f88
+        "aut2.label": "0221aa565e1df95d83beebb9ddf84925574939688b2bf8f95f23731d40afcba1",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
