@@ -154,14 +154,14 @@ FOREIGN MARKETS (operator ruling 2026-10-29) are the one exception to "refuse
 to trade" above. A FOREIGN MARKET is a usable venue slug outside Breezy's
 weather namespace (``tc-temp-``, compared separator-blind), on a row whose
 ``marketMetadata.slug`` names that same market, for which this client loaded
-no instrument (for an order, Stage B: not marked AUTOMATIC). Positions are
-classified now and ignored. This is NOT the older "foreign" used in this code
+no instrument (for an order: not marked AUTOMATIC). Positions and open orders
+are classified now and ignored. This is NOT the older "foreign" used in this code
 and its tests (an unbound order or an unattributed position on a WEATHER
 market), which still refuses.
 
-Positions are logged once, at the boot reconciliation. Open orders (the
-never-arm gate, the boot sweep and DAY admission) follow in Stage B. A
-classified position is never mapped, netted, sold, cancelled, hidden or
+Positions are logged once, at the boot reconciliation. Open orders are
+classified at every enumeration and logged once per slug. A classified
+position or open order is never mapped, netted, sold, cancelled, hidden or
 allowlisted. "Excluding one was tried and is WRONG" does not apply: no
 instrument is loaded, so no cap, exit or order can address the position.
 Nautilus itself skips such a report (``execution_engine.py:2475-2477``), and
@@ -252,6 +252,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -421,6 +422,7 @@ __all__ = [
     "RESOLVER_CONTEXT_KEY_PREFIX",
     "STARTUP_EVIDENCE_KEY",
     "STARTUP_OPEN_ORDERS_PRESENT_REASON",
+    "STARTUP_OPEN_ORDER_NON_WEATHER_KEY",
     "STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY",
     "VENUE_ORDER_ID_KEY_PREFIX",
     "AmbiguousResolverContext",
@@ -515,6 +517,11 @@ STARTUP_OPEN_ORDERS_PRESENT_REASON: Final[str] = "startup_open_orders_present"
 #: latched ``resting_cancel_unconfirmed`` (an own order whose cancel could not be
 #: confirmed terminal must not let the strategy arm). One spelling for both sides.
 STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY: Final[str] = "resting_cancel_unconfirmed"
+#: S0: FOREIGN MARKET (operator ruling 2026-10-29) = a usable venue slug outside Breezy's weather
+#: namespace (``tc-temp-``, compared separator-blind), on a row whose ``marketMetadata.slug``
+#: names that same market, for which this client loaded no instrument (for an order: not marked
+#: AUTOMATIC); it is ignored. The evidence key, written only when it is exactly True.
+STARTUP_OPEN_ORDER_NON_WEATHER_KEY: Final[str] = "non_weather_market"
 
 #: How many leading characters of a venue order id an ERROR line may carry.
 _ORDER_ID_REDACT_PREFIX: Final[int] = 4
@@ -549,7 +556,7 @@ def _loggable_slug(slug: object) -> str:
 
 
 _FOREIGN_KIND_POSITION: Final[str] = "position"
-_FOREIGN_KIND_OPEN_ORDER: Final[str] = "open_order"  # Stage B; T-B9 asserts this constant
+_FOREIGN_KIND_OPEN_ORDER: Final[str] = "open_order"  # T-B9 asserts this constant
 _QUANTITY_LOG_MAX_CHARS: Final[int] = 32
 
 
@@ -564,6 +571,34 @@ def _loggable_quantity(value: object) -> str:
     if len(text) > _QUANTITY_LOG_MAX_CHARS or not (text.isascii() and text.isprintable()):
         return "<invalid-qty>"
     return text
+
+
+#: L-37: a refused open-orders read logs the exception class and the refused field name
+#: only. The mapper message may quote venue values, so it is never copied onto the line.
+_MAPPER_DETAIL_MAX_CHARS: Final[int] = 200
+_MAPPER_FIELD_RE: Final[re.Pattern[str]] = re.compile(r"\bfield '([A-Za-z_][A-Za-z0-9_.]*)'")
+
+
+def _open_orders_failure_detail(error: BaseException | None) -> str:
+    """``class=<name> field=<name>`` only.
+
+    The field is the identifier the mapper quotes after the word ``field``.
+    Any other exception, and a mapper message with no such token, is
+    ``field=unknown``. The mapper message itself is never copied: it quotes
+    venue values. The line stays inside ``_MAPPER_DETAIL_MAX_CHARS``.
+    """
+    if error is None:
+        return "no result"
+    name = type(error).__name__
+    field = "unknown"
+    if isinstance(error, ExecutionReportMappingError):
+        matched = _MAPPER_FIELD_RE.search(str(error))
+        if matched is not None:
+            field = matched.group(1)
+    detail = f"class={name} field={field}"
+    if len(detail) > _MAPPER_DETAIL_MAX_CHARS:
+        detail = f"{detail[:_MAPPER_DETAIL_MAX_CHARS]}\u2026 (truncated)"
+    return detail
 
 
 #: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
@@ -1547,6 +1582,9 @@ class StartupOpenOrderSnapshot:
     #: gate then ignores it; anything else open still refuses. A record written
     #: before this field decodes ``False`` (unrecorded is never "ours").
     own_resting: bool = False
+    #: EXEC-FOREIGN-POS: True only for a FOREIGN-MARKET open order. Default False, and
+    #: omitted from the bytes unless True, so an older row stays byte-identical.
+    non_weather_market: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1571,7 +1609,8 @@ class StartupPositionEvidence:
     positions: tuple[StartupPositionSnapshot, ...]
     #: RESTING_BID_HUNT Rev 2 section 4.3: the open-order enumeration. The
     #: gate arms only if the read SUCCEEDED (``open_orders_read_refused`` is
-    #: ``False``) AND ``open_orders`` is EMPTY. A record written before these
+    #: ``False``) AND every open order is exempt: ``own_resting`` or
+    #: ``non_weather_market`` exactly ``True``. A record written before these
     #: fields existed decodes as REFUSED (see ``from_bytes``): unrecorded is
     #: UNKNOWN, never "none open".
     open_orders_read_refused: bool = True
@@ -1606,6 +1645,11 @@ class StartupPositionEvidence:
                         "market_slug": o.market_slug,
                         "state": o.state,
                         "own_resting": o.own_resting,
+                        **(
+                            {STARTUP_OPEN_ORDER_NON_WEATHER_KEY: True}
+                            if o.non_weather_market
+                            else {}
+                        ),
                     }
                     for o in self.open_orders
                 ],
@@ -1663,6 +1707,7 @@ class StartupPositionEvidence:
                         market_slug=str(entry["market_slug"]),
                         state=str(entry["state"]),
                         own_resting=entry.get("own_resting") is True,
+                        non_weather_market=entry.get(STARTUP_OPEN_ORDER_NON_WEATHER_KEY) is True,
                     )
                     for entry in raw_open_orders
                 )
@@ -2346,6 +2391,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # EXEC-FOREIGN-POS: dedupe keys for the foreign-market note and its contained
         # warnings. Reassigned, never mutated, event-loop only.
         self._foreign_log_keys: frozenset[tuple[str, str, str]] = frozenset()
+        self._non_weather_open_orders: frozenset[tuple[str, str]] = frozenset()
         # AUD-13b: the durable-record reconciliation's observable state.
         # Latched refusals persist for the process (deduped by latch+subject);
         # counts and fee sources describe the LAST pass only.
@@ -6346,19 +6392,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """FOREIGN MARKET (operator ruling 2026-10-29) = a usable venue slug outside Breezy's
         weather namespace (``tc-temp-``, compared separator-blind), on a row whose
         ``marketMetadata.slug`` names that same market, for which this client loaded no
-        instrument (for an order, Stage B: not marked AUTOMATIC); it is ignored. This is NOT
+        instrument (for an order: not marked AUTOMATIC); it is ignored. This is NOT
         the older "foreign" used in this code and its tests (an unbound order or an
         unattributed position on a WEATHER market), which still refuses.
 
         The namespace and loaded-instrument halves; the caller has already required the row to
-        name itself (and, for an order in Stage B, not AUTOMATIC). Never raises: any error is
+        name itself (and, for an order, not AUTOMATIC). Never raises: any error is
         "not foreign", so the pre-ruling refusal applies.
         """
         try:
             # ORDER IS LOAD-BEARING: the namespace predicate runs first. It admits only slugs
-            # the symbology validator accepts (T-A6, T-A7), so `_find_instrument` -- which
-            # latches the global `_find_instrument#1` refusal on an unusable slug -- is never
-            # reached with one, and classification can never latch (T-A6, T-A7).
+            # the symbology validator accepts, so `_find_instrument` -- which latches the
+            # global `_find_instrument#1` refusal on an unusable slug -- is never reached
+            # with one, and classification can never latch (T-A6, T-A7, T-D5).
             return (
                 isinstance(slug, str)
                 and is_non_weather_market_slug(slug)
@@ -6819,8 +6865,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     def _resting_cancel_evidence(self) -> bool | None:
         """The ``resting_cancel_unconfirmed`` value to RECORD in the startup evidence, or
         ``None`` to omit the key. Written only when it carries information: ``True`` while
-        latched, ``False`` while an open order exists (the arm gate needs the explicit
-        ``False`` to exempt an own order). A flat book with the latch clear omits it, so
+        latched, ``False`` while any open order exists (the arm gate needs the explicit
+        ``False`` to exempt an own or FOREIGN-MARKET order). A flat book with the latch clear
+        omits it, so
         the row is byte-identical to the pre-S4 evidence (the K=1 golden) and the gate's
         verdict is unchanged: an absent key refuses only when an order is open.
         """
@@ -6869,6 +6916,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     market_slug=o.market_slug,
                     state=o.state,
                     own_resting=(o.venue_order_id, o.market_slug) in own_resting,
+                    non_weather_market=(
+                        (o.venue_order_id, o.market_slug) in self._non_weather_open_orders
+                    ),
                 )
                 for o in self._open_orders
             ),
@@ -7084,34 +7134,62 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> None:
         """Record the latest open-order enumeration on this client (the
         state every subsequent evidence row carries) and log it: WARNING for
-        a refused read, ERROR -- ids redacted to a prefix -- when any order
-        is open (``STARTUP_OPEN_ORDERS_PRESENT_REASON``), one bounded
-        WARNING when a row carried undeclared keys.
+        a refused read (exception class and refused field name only), one
+        INFO per foreign open-order slug, ERROR -- ids redacted to a prefix
+        -- when any unexempt order is open
+        (``STARTUP_OPEN_ORDERS_PRESENT_REASON``), one bounded WARNING when a
+        row carried undeclared keys. A missing or unrecognised manual
+        indicator is foreign-eligible; only an explicit AUTOMATIC vetoes,
+        because namespace and identity are checked first.
         """
         if error is not None or records is None:
             self._open_orders_read_refused = True
             self._open_orders = ()
+            self._non_weather_open_orders = frozenset[tuple[str, str]]()
             self._log.warning(
                 "startup evidence: open-orders read failed "
-                f"({type(error).__name__ if error is not None else 'no result'}); "
+                f"({_open_orders_failure_detail(error)}); "
                 "recording open_orders_read_refused=True"
             )
             return
-        self._open_orders_read_refused = False
-        self._open_orders = records
+        # Classify and note before the book is published. A per-row note that
+        # raises must not escape: the resolver refresh would otherwise log
+        # "prior record kept" after this book had already changed.
+        foreign = frozenset(
+            (r.venue_order_id, r.market_slug)
+            for r in records
+            # AUTOMATIC veto: an order the venue marks AUTOMATIC is never foreign.
+            if r.manual is not False
+            and r.names_own_market
+            and self._is_foreign_market(_FOREIGN_KIND_OPEN_ORDER, r.market_slug)
+        )
+        for r in records:
+            if (r.venue_order_id, r.market_slug) not in foreign:
+                continue
+            try:
+                self._note_foreign_market(_FOREIGN_KIND_OPEN_ORDER, r.market_slug, r.quantity)
+            except Exception as exc:  # noqa: BLE001 -- a note must not escape the refresh
+                try:
+                    self._warn_foreign_once(_FOREIGN_KIND_OPEN_ORDER, "note", exc)
+                except Exception:  # noqa: BLE001, S110 -- the warning already failed
+                    pass
         drifted = [r for r in records if r.unknown_keys]
         if drifted:
             self._log.warning(
                 f"startup evidence: {len(drifted)} open order row(s) carry undeclared "
                 f"key(s); first row: {', '.join(drifted[0].unknown_keys)}"
             )
-        if records:
-            ids = ", ".join(_redact_order_id(r.venue_order_id) for r in records)
+        counted = [r for r in records if (r.venue_order_id, r.market_slug) not in foreign]
+        if counted:
+            ids = ", ".join(_redact_order_id(r.venue_order_id) for r in counted)
             self._log.error(
-                f"{STARTUP_OPEN_ORDERS_PRESENT_REASON}: {len(records)} open order(s) on "
+                f"{STARTUP_OPEN_ORDERS_PRESENT_REASON}: {len(counted)} open order(s) on "
                 f"the account ({ids}); the never-arm gate refuses until every one is "
                 "enumerated and adopted or cancelled"
             )
+        self._open_orders_read_refused = False
+        self._open_orders = records
+        self._non_weather_open_orders = foreign
 
     def _mark_budget_restored(self, venue_order_id: str) -> None:
         """D2: durable evidence that a permit slot was restored for

@@ -298,3 +298,50 @@ class TestDocumentedReasonOrderIsComplete:
     ) -> None:
         assert startup_evidence_refusal_reason(payload) == expected_reason
         assert _expected_reason_from_payload(payload) == expected_reason
+
+
+def test_both_parsers_agree_on_a_non_weather_only_book() -> None:
+    """T-H1: a flagged-only book permits arm; the same book with the flag clear refuses."""
+    flagged = StartupOpenOrderSnapshot(
+        venue_order_id="FRGN00000001",
+        market_slug="aec-nfl-lar-den-2026-09-27",
+        state="ORDER_STATE_NEW",
+        non_weather_market=True,
+    )
+    evidence = StartupPositionEvidence(
+        ts_ns=NOW_NS,
+        eof_complete=True,
+        position_read_refused=False,
+        fill_walk_complete=True,
+        positions=(),
+        open_orders_read_refused=False,
+        open_orders=(flagged,),
+        resting_cancel_unconfirmed=False,
+    )
+    raw = evidence.to_bytes()
+    again = StartupPositionEvidence.from_bytes(raw)
+    assert again.open_orders[0].non_weather_market is True
+    payload = json.loads(raw)
+    assert payload["open_orders"][0]["non_weather_market"] is True
+    assert startup_evidence_refusal_reason(payload) is None
+    assert startup_evidence_permits_arm(payload) is True
+    plain = StartupPositionEvidence(
+        ts_ns=NOW_NS,
+        eof_complete=True,
+        position_read_refused=False,
+        fill_walk_complete=True,
+        positions=(),
+        open_orders_read_refused=False,
+        open_orders=(
+            StartupOpenOrderSnapshot(
+                venue_order_id="FRGN00000001",
+                market_slug="aec-nfl-lar-den-2026-09-27",
+                state="ORDER_STATE_NEW",
+            ),
+        ),
+        resting_cancel_unconfirmed=False,
+    )
+    plain_payload = json.loads(plain.to_bytes())
+    assert "non_weather_market" not in plain_payload["open_orders"][0]
+    assert startup_evidence_refusal_reason(plain_payload) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    assert startup_evidence_permits_arm(plain_payload) is False

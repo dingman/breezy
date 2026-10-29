@@ -69,6 +69,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
+    STARTUP_OPEN_ORDER_NON_WEATHER_KEY,
     STARTUP_OPEN_ORDERS_PRESENT_REASON,
     STARTUP_RESTING_CANCEL_UNCONFIRMED_KEY,
     DurableFillRecord,
@@ -1517,12 +1518,17 @@ def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str |
     RESTING_BID_HUNT Rev 2 section 4.3 for the open-order enumeration: the
     exec client's read must have SUCCEEDED (``open_orders_read_refused`` is
     exactly ``False``) AND returned an EMPTY list. A record predating those
-    two keys, a refused read, a malformed list, or ANY open order -- on a
-    configured market or a foreign one -- is a refusal, EXCEPT an order the exec
-    client bound itself (``own_resting`` is exactly ``True``, S4 WP4 4b), and even
-    that only while ``resting_cancel_unconfirmed`` is exactly ``False`` (a present key
-    that is anything else refuses at once; an absent key refuses only when an order
-    is open). Fail closed: an
+    two keys, a refused read, a malformed list, or ANY open order is a refusal,
+    EXCEPT an order the exec client bound itself (``own_resting`` is exactly
+    ``True``, S4 WP4 4b) or a FOREIGN-MARKET order (``non_weather_market`` is
+    exactly ``True``). FOREIGN MARKET (operator ruling 2026-10-29) = a usable
+    venue slug outside Breezy's weather namespace (``tc-temp-``, compared
+    separator-blind), on a row whose ``marketMetadata.slug`` names that same
+    market, for which this client loaded no instrument (for an order: not marked
+    AUTOMATIC); it is ignored. Even an exempt order refuses while
+    ``resting_cancel_unconfirmed`` is not exactly ``False`` (a present key that is
+    anything else refuses at once; an absent key refuses only when an order is
+    open). Fail closed: an
     enumeration error is never an assumed-empty book. Reasons are stable
     tokens; :data:`STARTUP_OPEN_ORDERS_PRESENT_REASON` is the one the exec
     client also logs at ERROR when it writes such a record.
@@ -1542,11 +1548,17 @@ def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str |
     open_orders = evidence.get("open_orders")
     if not isinstance(open_orders, list):
         return "open_orders_malformed"
-    # S4 WP4 (4b, the own-order rule): an order the exec client itself BOUND to a
-    # `resting:` row on the same market (``own_resting`` exactly ``True``) does not
-    # disarm the book; ANY other open order -- unbound, foreign, or recorded before
-    # the key existed -- still refuses.
-    if any(not (isinstance(o, dict) and o.get("own_resting") is True) for o in open_orders):
+    # S4 WP4 (4b) and EXEC-FOREIGN-POS: an order the exec client itself BOUND
+    # (``own_resting`` exactly ``True``) or a FOREIGN-MARKET order
+    # (``non_weather_market`` exactly ``True``) does not disarm the book; ANY
+    # other open order still refuses.
+    if any(
+        not (
+            isinstance(o, dict)
+            and (o.get("own_resting") is True or o.get(STARTUP_OPEN_ORDER_NON_WEATHER_KEY) is True)
+        )
+        for o in open_orders
+    ):
         return STARTUP_OPEN_ORDERS_PRESENT_REASON
     # B5 review G9: an own order whose cancel the client could not confirm terminal must
     # not let the strategy arm. A present key that is not exactly ``False`` (latched, or
@@ -1562,10 +1574,10 @@ def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str |
 
 def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
     """``True`` only when ``evidence`` proves a complete, non-refused startup
-    positions read AND a successful, EMPTY open-order enumeration -- exactly
-    :func:`startup_evidence_refusal_reason` returning ``None``. Any missing
-    or wrong-typed field is a refusal to arm -- fail closed, not a partial
-    read.
+    positions read AND a successful open-order enumeration with no unexempt
+    open order -- exactly :func:`startup_evidence_refusal_reason` returning
+    ``None``. Any missing or wrong-typed field is a refusal to arm -- fail
+    closed, not a partial read.
     """
     return startup_evidence_refusal_reason(evidence) is None
 

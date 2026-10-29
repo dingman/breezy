@@ -33,10 +33,13 @@ from tests.unit.ambig_latch_rig import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 from tests.unit.polymarket_us_exec_shapes import (
+    AEC,
     ASTATC,
     CROSSD,
+    FRGN,
     build_combo_position,
     build_instrument,
+    build_manual_day_open_order,
     build_no_leg_instrument,
 )
 from tests.unit.test_polymarket_us_resting_adopt import _no_id_rest
@@ -518,6 +521,20 @@ def test_a_foreign_order_keeps_its_own_reason_ahead_of_the_latch() -> None:
     assert startup_evidence_refusal_reason(record) == "startup_open_orders_present"
 
 
+def test_a_latched_cancel_still_refuses_when_the_only_open_order_is_foreign() -> None:
+    """A FOREIGN-MARKET exemption does not skip a latched ``resting_cancel_unconfirmed``."""
+    foreign = {
+        "venue_order_id": "B",
+        "market_slug": "s",
+        "state": "N",
+        "own_resting": False,
+        "non_weather_market": True,
+    }
+    record = {**_legacy_evidence([foreign]), "resting_cancel_unconfirmed": True}
+    assert startup_evidence_refusal_reason(record) == "resting_cancel_unconfirmed"
+    assert startup_evidence_permits_arm(record) is False
+
+
 def test_the_latch_key_round_trips_and_a_legacy_record_decodes_unrecorded() -> None:
     legacy = client_module.StartupPositionEvidence.from_bytes(
         json.dumps(_legacy_evidence([])).encode()
@@ -802,4 +819,278 @@ async def test_a_failing_foreign_note_is_contained_and_never_refuses(
     reports = await client.generate_position_status_reports(None)
     assert reports == []
     assert len(attempts) == 2
+    await client._disconnect()
+
+
+def _warn_detail(lines: list[str]) -> str:
+    prefix = "startup evidence: open-orders read failed ("
+    assert lines
+    inner = lines[-1].split("); recording", 1)[0]
+    assert inner.startswith(prefix)
+    return inner[len(prefix) :]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_manual_day_order_logs_info_once_and_leaves_only_own_orders_in_the_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-G1: one INFO for the foreign slug; the ERROR counts only the own order."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = await _submit_rest(rig, 0)
+    client = rig.client
+    client._private_read._payloads[OPEN_ORDERS_PATH] = {
+        "orders": [_open_row(command, 0), build_manual_day_open_order(AEC, FRGN)]
+    }
+    await client._refresh_startup_position_evidence()
+    await client._refresh_startup_position_evidence()
+    evidence: dict[str, Any] = json.loads(client._store_get(_EVIDENCE_KEY))
+    assert evidence["open_orders_read_refused"] is False
+    assert len(evidence["open_orders"]) == 2
+    by_id = {row["venue_order_id"]: row for row in evidence["open_orders"]}
+    assert by_id[_id_n(0)]["own_resting"] is True
+    assert by_id[FRGN].get("non_weather_market") is True
+    notes = client.log_lines("info", "EXEC_FOREIGN_MARKET kind=open_order")
+    assert len(notes) == 1
+    assert "slug='aec-nfl-lar-den-2026-09-27'" in notes[0]
+    errors = client.log_lines("error", "startup_open_orders_present")
+    assert errors
+    assert all("1 open order(s)" in line and "FRGN" not in line for line in errors)
+    assert startup_evidence_permits_arm(evidence) is True
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_the_boot_sweep_leaves_a_manual_day_order_alone_and_latches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-G3: the boot sweep cancel-alls the ledger slug and leaves the foreign DAY order."""
+    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    command = await _submit_rest(rig, 0)
+    src = wire_payloads(rig.client)
+    sender = CancelSender()
+    book: dict[str, Any] = {"orders": [build_manual_day_open_order(AEC, FRGN)]}
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): src[submit_chain.order_by_id_path(_id_n(0))],
+            OPEN_ORDERS_PATH: book,
+        },
+    )
+    sender.on_cancel = lambda oid: _set_state_on(second, 0, "ORDER_STATE_CANCELED")
+    sender.on_cancel_all = lambda slugs: book.__setitem__(
+        "orders", [row for row in book["orders"] if row.get("marketSlug") not in slugs]
+    )
+    await second._connect()
+    slug = submit_chain.build_resting_order_body(command.order, build_no_leg_instrument())[
+        "marketSlug"
+    ]
+    assert second._trading_refusals == []
+    assert sender.cancel_alls == [[slug]]
+    assert _cancel_posts(sender) == [_id_n(0)]
+    assert not second.log_lines("error", "boot_sweep_reread_failed")
+    evidence: dict[str, Any] = json.loads(second._store_get(_EVIDENCE_KEY))
+    listed = [row for row in evidence["open_orders"] if row["venue_order_id"] == FRGN]
+    assert len(listed) == 1
+    assert listed[0].get("non_weather_market") is True
+    notes = second.log_lines("info", "EXEC_FOREIGN_MARKET kind=open_order")
+    assert len(notes) == 1
+    assert startup_evidence_permits_arm(evidence) is True
+    await second._disconnect()
+
+
+class _OpenOrdersRaiser:
+    """Raises on the open-orders path only; every other read uses the inner stub."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    async def __call__(self, path: str, query: object = None) -> Any:
+        if path == OPEN_ORDERS_PATH:
+            raise RuntimeError("SECRET-x")
+        return await self._inner(path, query)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_refused_open_orders_read_names_the_mapper_field_bounded_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-G6: the log carries the class and the refused field, never a venue value."""
+    forever_dir = tmp_path / "forever"
+    forever_dir.mkdir()
+    forever = await _rig(forever_dir, monkeypatch)
+    forever.client._private_read._payloads[OPEN_ORDERS_PATH] = {
+        "orders": [build_manual_day_open_order(AEC, FRGN, tif="TIME_IN_FORCE_FOREVER")]
+    }
+    await forever.client._refresh_startup_position_evidence()
+    forever_detail = _warn_detail(forever.client.log_lines("warning", "open-orders read failed"))
+    assert forever_detail == "class=ExecutionReportMappingError field=unknown"
+    assert "TIME_IN_FORCE_FOREVER" not in forever_detail
+    await forever.client._disconnect()
+
+    leak_dir = tmp_path / "leak"
+    leak_dir.mkdir()
+    leak = await _rig(leak_dir, monkeypatch)
+    leak.client._note_open_orders_outcome(
+        error=client_module.ExecutionReportMappingError(
+            "open order [0] field 'price' quantity=17 price=0.42"
+        )
+    )
+    leak_detail = _warn_detail(leak.client.log_lines("warning", "open-orders read failed"))
+    assert leak_detail == "class=ExecutionReportMappingError field=price"
+    assert "17" not in leak_detail
+    assert "0.42" not in leak_detail
+    await leak.client._disconnect()
+
+    long_dir = tmp_path / "long"
+    long_dir.mkdir()
+    long = await _rig(long_dir, monkeypatch)
+    long.client._private_read._payloads[OPEN_ORDERS_PATH] = {
+        "orders": [build_manual_day_open_order(AEC, FRGN, tif="X" * 10000)]
+    }
+    await long.client._refresh_startup_position_evidence()
+    long_line = _warn_detail(long.client.log_lines("warning", "open-orders read failed"))
+    assert long_line == "class=ExecutionReportMappingError field=unknown"
+    assert "X" * 100 not in long_line
+    marker = "\u2026 (truncated)"
+    long_field = "f" + ("x" * 400)
+    capped = client_module._open_orders_failure_detail(
+        client_module.ExecutionReportMappingError(
+            f"open order [0] field '{long_field}' quantity=17 price=0.42"
+        )
+    )
+    assert capped.endswith(marker)
+    assert len(capped) == client_module._MAPPER_DETAIL_MAX_CHARS + len(marker)
+    assert "17" not in capped
+    assert "0.42" not in capped
+    await long.client._disconnect()
+
+    transport_dir = tmp_path / "transport"
+    transport_dir.mkdir()
+    transport = await _rig(transport_dir, monkeypatch)
+    transport.client._private_read = _OpenOrdersRaiser(transport.client._private_read)
+    await transport.client._refresh_startup_position_evidence()
+    transport_lines = transport.client.log_lines("warning", "open-orders read failed")
+    assert transport_lines
+    assert "class=RuntimeError field=unknown" in transport_lines[-1]
+    assert "SECRET-x" not in transport_lines[-1]
+    await transport.client._disconnect()
+
+    rig = await _rig(tmp_path, monkeypatch, pin=True)
+    await _submit_rest(rig, 0)
+    src = wire_payloads(rig.client)
+    sender = CancelSender()
+    second = await _second_process(
+        tmp_path,
+        monkeypatch,
+        rig.client,
+        rig.client.latch_cm,
+        sender=sender,
+        payloads={
+            submit_chain.order_by_id_path(_id_n(0)): src[submit_chain.order_by_id_path(_id_n(0))],
+            OPEN_ORDERS_PATH: {
+                "orders": [build_manual_day_open_order(AEC, FRGN, tif="TIME_IN_FORCE_FOREVER")]
+            },
+        },
+    )
+    await second._connect()
+    assert second.log_lines("error", "boot_sweep_reread_failed:ExecutionReportMappingError")
+    # Connect records the refused read twice (immediate resolver pass, then the
+    # post-sweep refresh). The sweep itself latches only the exception class.
+    tif_warns = [
+        line
+        for line in second.log_lines("warning", "open-orders read failed")
+        if "class=ExecutionReportMappingError" in line
+    ]
+    assert len(tif_warns) == 2
+    assert all(
+        "field=unknown" in line and "TIME_IN_FORCE_FOREVER" not in line
+        for line in tif_warns
+    )
+    await second._disconnect()
+
+
+def _snapshot_open_ids(client: Any) -> list[str]:
+    raw = client._store_get(_EVIDENCE_KEY)
+    assert raw is not None
+    evidence: dict[str, Any] = json.loads(raw)
+    orders = evidence["open_orders"]
+    assert isinstance(orders, list)
+    assert evidence["open_orders_read_refused"] is False
+    assert any(
+        isinstance(row, dict)
+        and row.get("non_weather_market") is True
+        and row.get("venue_order_id") == FRGN
+        for row in orders
+    )
+    return [row["venue_order_id"] for row in orders if isinstance(row, dict)]
+
+
+async def _resolver_refresh_one_foreign(client: Any) -> None:
+    client._private_read._payloads[OPEN_ORDERS_PATH] = {
+        "orders": [build_manual_day_open_order(AEC, FRGN)]
+    }
+    client._private_read._payloads[client_module.PORTFOLIO_POSITIONS_PATH] = {
+        "positions": {},
+        "eof": True,
+    }
+    client._last_evidence_write_ns = 0
+    await client._resolve_ambiguous_intents(first_pass_immediate=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_resolver_refresh_records_one_foreign_open_order_on_the_outcome_and_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The age-gated resolver refresh notes one foreign open order onto the book and the row."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await _resolver_refresh_one_foreign(client)
+    assert client._open_orders_read_refused is False
+    assert (FRGN, AEC) in client._non_weather_open_orders
+    assert _snapshot_open_ids(client) == [r.venue_order_id for r in client._open_orders]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_raising_open_order_note_leaves_the_refresh_and_the_snapshot_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logger that raises inside the foreign-order note cannot split the book from the row."""
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    _ = client._log
+    inner = client.__dict__["_recording_log"]
+    attempts: list[str] = []
+
+    class _RaisingNote(_RecordingLog):
+        def _raise_if_note(self, message: object) -> None:
+            text = str(message)
+            if "EXEC_FOREIGN_MARKET" in text:
+                attempts.append(text)
+                raise RuntimeError("note-boom")
+
+        def info(self, message: object, *args: object, **kwargs: object) -> object:
+            self._raise_if_note(message)
+            return self._wrap("info")(message, *args, **kwargs)
+
+        def warning(self, message: object, *args: object, **kwargs: object) -> object:
+            self._raise_if_note(message)
+            return self._wrap("warning")(message, *args, **kwargs)
+
+    client.__dict__["_recording_log"] = _RaisingNote(inner._inner, inner._records)
+    await _resolver_refresh_one_foreign(client)
+    assert attempts
+    assert not client.log_lines("warning", "prior record kept")
+    assert client._open_orders_read_refused is False
+    assert (FRGN, AEC) in client._non_weather_open_orders
+    assert _snapshot_open_ids(client) == [r.venue_order_id for r in client._open_orders]
     await client._disconnect()

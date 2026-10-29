@@ -99,14 +99,19 @@ from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from tests.unit.polymarket_us_exec_shapes import (
     ACCOUNT_ID,
+    AEC,
     CLIENT_ID,
+    FRGN,
     RAW,
     REPORT_ID,
     TS_EVENT_NANOS,
     TS_EVENT_TEXT,
     TS_INIT,
+    UNLOADED,
+    UNPARSEABLE_W,
     build_execution,
     build_instrument,
+    build_manual_day_open_order,
     build_order,
     build_position,
 )
@@ -2135,3 +2140,111 @@ def test_recognised_commission_passes_the_raw_sign_once_verified() -> None:
 def test_recognised_commission_never_returns_a_negative_zero_or_a_rebate_when_unverified() -> None:
     clamped = reports_module.recognised_commission(Decimal("-0"), sign_verified=False)
     assert clamped == 0 and not clamped.is_signed()
+
+
+# ---------------------------------------------------------------------------
+# EXEC-FOREIGN-POS Stage B -- DAY admission on a self-identifying non-weather row
+# ---------------------------------------------------------------------------
+
+
+def test_parse_open_orders_enumerates_a_manual_day_order_on_a_self_identifying_non_weather_market() -> (  # noqa: E501
+    None
+):
+    """T-R1: a MANUAL DAY order that names its own non-weather market is enumerated."""
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    row = build_manual_day_open_order(AEC, FRGN)
+    (record,) = parse_open_orders({"orders": [row]})
+    assert set(row) == set(reports_module.WIRE_ORDER_KEYS)
+    assert record.tif == "TIME_IN_FORCE_DAY"
+    assert record.manual is True
+    assert record.names_own_market is True
+    assert record.unknown_keys == ()
+
+
+def test_parse_order_status_report_still_refuses_a_day_tif(instrument: BinaryOption) -> None:
+    """T-R2 [CHAR]: the native report mapper still refuses DAY. Mutation: add DAY to
+    ``_TIME_IN_FORCE``."""
+    order = build_order(str(instrument.raw_symbol))
+    order["tif"] = "TIME_IN_FORCE_DAY"
+    with pytest.raises(
+        ExecutionReportMappingError, match=r"field 'tif' carries 'TIME_IN_FORCE_DAY'"
+    ):
+        parse_order_status_report(
+            order,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_the_open_order_tif_drift_set_is_exactly_day_outside_the_sdk_row_and_venue_documented() -> (
+    None
+):
+    """T-R3: DAY is the open-order drift set, disjoint from the SDK row, and venue-documented."""
+    allowed = reports_module._OPEN_ORDER_TIF_DRIFT_ALLOWED
+    assert allowed == frozenset({"TIME_IN_FORCE_DAY"})
+    assert allowed.isdisjoint(reports_module._TIME_IN_FORCE)
+    doc = RAW.parent / "docs_snapshots" / "api-reference_orders_get-open-orders_2026-10-13.md"
+    assert "- TIME_IN_FORCE_DAY" in doc.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "weather",
+        "unparseable-weather",
+        "bad-slug",
+        "metadata-other",
+        "no-metadata",
+        "slug-none",
+    ],
+)
+def test_a_day_order_still_refuses_the_whole_read_unless_it_names_its_own_non_weather_market(
+    case: str,
+) -> None:
+    """T-R4 [CHAR]: weather, unusable and non-self-identifying DAY rows refuse the read.
+
+    Mutations: (a) drop the namespace clause; (b) drop the identity clause.
+    """
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    if case == "weather":
+        row = build_manual_day_open_order(UNLOADED, FRGN)
+    elif case == "unparseable-weather":
+        row = build_manual_day_open_order(UNPARSEABLE_W, FRGN)
+    elif case == "bad-slug":
+        row = build_manual_day_open_order("bad.slug", FRGN)
+    elif case == "metadata-other":
+        row = build_manual_day_open_order(AEC, FRGN)
+        row["marketMetadata"] = {**row["marketMetadata"], "slug": UNLOADED}
+    elif case == "no-metadata":
+        row = build_manual_day_open_order(AEC, FRGN)
+        row.pop("marketMetadata")
+    else:
+        row = build_manual_day_open_order(AEC, FRGN)
+        row["marketMetadata"] = {"slug": None}
+    with pytest.raises(ExecutionReportMappingError, match=r"\.tif"):
+        parse_open_orders({"orders": [row]})
+
+
+def test_metadata_slug_matches_is_total_and_exact_and_the_record_defaults_to_false() -> None:
+    """T-R5: identity is total and exact, and a parsed row defaults to not naming itself."""
+    from breezy.adapters.polymarket_us.exec.reports import OpenOrderRecord, parse_open_orders
+
+    matches = reports_module.metadata_slug_matches
+    assert matches({"marketMetadata": {"slug": AEC}}, AEC) is True
+    for payload in ("x", None, ["x"]):
+        assert matches(payload, AEC) is False
+    metadata_values: tuple[object, ...] = (None, ["x"], "slug", {})
+    for metadata in metadata_values:
+        assert matches({"marketMetadata": metadata}, AEC) is False
+    assert matches({}, AEC) is False
+    for named in (None, "", 7, "other"):
+        assert matches({"marketMetadata": {"slug": named}}, AEC) is False
+    order = _resting_order()
+    order.pop("marketMetadata", None)
+    (record,) = parse_open_orders({"orders": [order]})
+    assert record.names_own_market is False
+    assert OpenOrderRecord._field_defaults["names_own_market"] is False

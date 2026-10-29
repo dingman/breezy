@@ -29,6 +29,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     _POSITION_LAG_PENDING_TTL_NS,
     FILL_INDEX_KEY_PREFIX,
     STARTUP_EVIDENCE_KEY,
+    STARTUP_OPEN_ORDER_NON_WEATHER_KEY,
     PolymarketUSExecutionClient,
     StartupPositionEvidence,
     StartupPositionSnapshot,
@@ -40,7 +41,14 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.runtime.sqlite_store import SqliteStateStore
-from tests.unit.polymarket_us_exec_shapes import build_position
+from tests.unit.polymarket_us_exec_shapes import (
+    AEC,
+    FRGN,
+    UNLOADED,
+    UNPARSEABLE_W,
+    build_manual_day_open_order,
+    build_position,
+)
 from tests.unit.test_polymarket_us_exec_client import (
     ACCOUNT_NUMBER,
     CLIENT_ID,
@@ -762,4 +770,244 @@ async def test_r7_a_raising_match_pass_is_contained_and_evidence_stays_correct(
     assert evidence.eof_complete is True
     assert evidence.position_read_refused is False
     assert evidence.positions == (StartupPositionSnapshot(slug=slug, net_position="3"),)
+    await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# EXEC-FOREIGN-POS Stage B -- a non-weather open order is flagged, not a refusal
+# ---------------------------------------------------------------------------
+
+
+def _gate_reason(evidence: StartupPositionEvidence) -> str | None:
+    from breezy.strategy.current_rung_hold.trial_day_latch import startup_evidence_refusal_reason
+
+    decoded: dict[str, object] = json.loads(evidence.to_bytes())
+    return startup_evidence_refusal_reason(decoded)
+
+
+def _flagged(evidence: StartupPositionEvidence) -> bool:
+    decoded: dict[str, object] = json.loads(evidence.to_bytes())
+    orders = decoded["open_orders"]
+    assert isinstance(orders, list)
+    return any(isinstance(row, dict) and row.get("non_weather_market") is True for row in orders)
+
+
+async def _connect_open_order(
+    tmp_path: Path, row: dict[str, Any]
+) -> tuple[Any, StartupPositionEvidence]:
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [row]}
+    await rig.client._connect()
+    evidence = rig.client.read_startup_position_evidence()
+    assert evidence is not None
+    return rig, evidence
+
+
+@pytest.mark.asyncio
+async def test_a_manual_day_order_on_a_non_weather_market_is_flagged_and_does_not_refuse_the_gate(
+    tmp_path: Path,
+) -> None:
+    """T-D1: a MANUAL DAY order on a self-identifying non-weather market is flagged."""
+    rig, evidence = await _connect_open_order(tmp_path, build_manual_day_open_order(AEC, FRGN))
+    assert evidence.open_orders_read_refused is False
+    assert len(evidence.open_orders) == 1
+    assert evidence.open_orders[0].non_weather_market is True
+    assert _flagged(evidence) is True
+    assert _gate_reason(evidence) is None
+    assert rig.client.trading_refusals == ()
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_weather_namespace_open_order_is_never_flagged_even_when_it_does_not_parse(
+    tmp_path: Path,
+) -> None:
+    """T-D2 [CHAR]: a weather-namespace order is never flagged. Mutation: namespace via
+    ``parse_weather_slug``."""
+    from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+    row = build_manual_day_open_order(UNPARSEABLE_W, FRGN, tif="TIME_IN_FORCE_GOOD_TILL_CANCEL")
+    rig, evidence = await _connect_open_order(tmp_path, row)
+    assert evidence.open_orders_read_refused is False
+    assert _flagged(evidence) is False
+    assert _gate_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    await rig.client._disconnect()
+
+
+def test_startup_evidence_round_trips_the_non_weather_flag_and_omits_it_when_false() -> None:
+    """T-D3: the flag round-trips only when it is exactly True, and the key is pinned."""
+    from breezy.adapters.polymarket_us.exec.client import StartupOpenOrderSnapshot
+
+    assert STARTUP_OPEN_ORDER_NON_WEATHER_KEY == "non_weather_market"
+
+    def _row(*, non_weather: bool) -> StartupPositionEvidence:
+        return StartupPositionEvidence(
+            ts_ns=123,
+            eof_complete=True,
+            position_read_refused=False,
+            fill_walk_complete=True,
+            positions=(),
+            open_orders_read_refused=False,
+            resting_cancel_unconfirmed=False,
+            open_orders=(
+                StartupOpenOrderSnapshot(
+                    venue_order_id=FRGN,
+                    market_slug=AEC,
+                    state="ORDER_STATE_NEW",
+                    non_weather_market=non_weather,
+                ),
+            ),
+        )
+
+    flagged = _row(non_weather=True)
+    raw = flagged.to_bytes()
+    body = json.loads(raw)
+    assert body["open_orders"][0][STARTUP_OPEN_ORDER_NON_WEATHER_KEY] is True
+    assert StartupPositionEvidence.from_bytes(raw) == flagged
+    plain = _row(non_weather=False)
+    plain_body = json.loads(plain.to_bytes())
+    assert STARTUP_OPEN_ORDER_NON_WEATHER_KEY not in plain_body["open_orders"][0]
+    decoded_plain = StartupPositionEvidence.from_bytes(plain.to_bytes())
+    assert decoded_plain.open_orders[0].non_weather_market is False
+
+
+@pytest.mark.asyncio
+async def test_an_open_order_classification_error_keeps_the_gate_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-D4: a raising namespace predicate keeps the gate refusing and never flags."""
+    import sys
+
+    from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+    def _boom(_slug: object) -> bool:
+        raise RuntimeError("SECRET")
+
+    module = sys.modules[PolymarketUSExecutionClient.__module__]
+    monkeypatch.setattr(module, "is_non_weather_market_slug", _boom)
+    rig, evidence = await _connect_open_order(tmp_path, build_manual_day_open_order(AEC, FRGN))
+    assert evidence.open_orders_read_refused is False
+    assert _flagged(evidence) is False
+    assert _gate_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    assert rig.client.trading_refusals == ()
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slug", ["bad.slug", "CROSSD-AB", "crossd-x^no"])
+async def test_an_unusable_open_order_slug_never_latches_trading_and_is_never_flagged(
+    tmp_path: Path, slug: str
+) -> None:
+    """T-D5 [CHAR]: an unusable slug is never flagged and never latches. Mutation: look the
+    instrument up before the grammar test."""
+    from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+    row = build_manual_day_open_order(slug, FRGN, tif="TIME_IN_FORCE_GOOD_TILL_CANCEL")
+    rig, evidence = await _connect_open_order(tmp_path, row)
+    assert rig.client.trading_refusals == ()
+    assert evidence.open_orders_read_refused is False
+    assert _flagged(evidence) is False
+    assert _gate_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_automatic_order_on_a_non_weather_market_is_never_flagged(tmp_path: Path) -> None:
+    """T-D6 [CHAR]: AUTOMATIC is never foreign. Mutation: drop ``manual is not False``."""
+    from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+    row = build_manual_day_open_order(
+        AEC,
+        FRGN,
+        tif="TIME_IN_FORCE_GOOD_TILL_CANCEL",
+        manualOrderIndicator="MANUAL_ORDER_INDICATOR_AUTOMATIC",
+    )
+    rig, evidence = await _connect_open_order(tmp_path, row)
+    assert evidence.open_orders_read_refused is False
+    assert _flagged(evidence) is False
+    assert _gate_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tif", "drop_metadata"),
+    [
+        ("TIME_IN_FORCE_GOOD_TILL_CANCEL", False),
+        ("TIME_IN_FORCE_GOOD_TILL_CANCEL", True),
+        ("TIME_IN_FORCE_DAY", False),
+        ("TIME_IN_FORCE_DAY", True),
+    ],
+    ids=["gtc-other-slug", "gtc-no-metadata", "day-other-slug", "day-no-metadata"],
+)
+async def test_an_open_order_that_does_not_name_its_own_market_is_never_flagged_and_a_day_one_still_refuses_the_read(  # noqa: E501
+    tmp_path: Path, tif: str, drop_metadata: bool
+) -> None:
+    """T-D7 [CHAR]: a row that does not name itself is never flagged; a DAY one refuses.
+
+    Mutations: drop identity from the flag; drop identity from the DAY admission.
+    """
+    from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+    row = build_manual_day_open_order(AEC, FRGN, tif=tif)
+    if drop_metadata:
+        row.pop("marketMetadata")
+    else:
+        row["marketMetadata"] = {**row["marketMetadata"], "slug": UNLOADED}
+    rig, evidence = await _connect_open_order(tmp_path, row)
+    assert rig.client.trading_refusals == ()
+    if tif == "TIME_IN_FORCE_DAY":
+        assert evidence.open_orders_read_refused is True
+    else:
+        assert evidence.open_orders_read_refused is False
+        assert _flagged(evidence) is False
+        assert _gate_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tif", "indicator"),
+    [
+        ("TIME_IN_FORCE_DAY", "MANUAL_ORDER_INDICATOR_UNDEFINED"),
+        ("TIME_IN_FORCE_GOOD_TILL_CANCEL", "MANUAL_ORDER_INDICATOR_UNDEFINED"),
+        ("TIME_IN_FORCE_DAY", None),
+    ],
+    ids=["day-undefined", "gtc-undefined", "day-absent"],
+)
+async def test_a_non_weather_order_with_an_undefined_or_absent_indicator_is_flagged(
+    tmp_path: Path, tif: str, indicator: str | None
+) -> None:
+    """T-D8: undefined or absent is not AUTOMATIC, so the order is flagged."""
+    row = build_manual_day_open_order(AEC, FRGN, tif=tif)
+    if indicator is None:
+        row.pop("manualOrderIndicator")
+    else:
+        row["manualOrderIndicator"] = indicator
+    rig, evidence = await _connect_open_order(tmp_path, row)
+    assert evidence.open_orders_read_refused is False
+    assert _flagged(evidence) is True
+    assert evidence.open_orders[0].non_weather_market is True
+    assert _gate_reason(evidence) is None
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_read_failure_after_a_flagged_read_drops_the_flag_with_the_book(
+    tmp_path: Path,
+) -> None:
+    """T-D9: a later read failure drops the flag together with the book."""
+    rig, evidence = await _connect_open_order(tmp_path, build_manual_day_open_order(AEC, FRGN))
+    assert evidence.open_orders_read_refused is False
+    assert len(evidence.open_orders) == 1
+    assert evidence.open_orders[0].non_weather_market is True
+    assert _flagged(evidence) is True
+    rig.read.raises[OPEN_ORDERS_PATH] = RuntimeError("x")
+    await rig.client._refresh_startup_position_evidence()
+    failed = rig.client.read_startup_position_evidence()
+    assert failed is not None
+    assert failed.open_orders_read_refused is True
+    assert failed.open_orders == ()
+    assert _flagged(failed) is False
+    assert rig.client._non_weather_open_orders == frozenset()
     await rig.client._disconnect()

@@ -275,6 +275,53 @@ def build_non_weather_instrument(slug: str) -> BinaryOption:
     return parse_binary_option(payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
 
 
+def build_manual_day_open_order(slug: str, order_id: str, **overrides: Any) -> dict[str, Any]:
+    """A synthetic 27-key open order: DAY, MANUAL, and self-identifying.
+
+    Every value is synthetic. ``quantity`` is the float literal the 10-28
+    activities page carried. Overrides replace tif, the indicator or metadata.
+    """
+    row: dict[str, Any] = {
+        "action": "ORDER_ACTION_BUY",
+        "avgPx": {"currency": "USD", "value": "0.000"},
+        "cashOrderQty": None,
+        "commissionNotionalTotalCollected": {"currency": "USD", "value": "0.000"},
+        "commissionsBasisPoints": "0",
+        "createTime": TS_EVENT_TEXT,
+        "cumQuantity": 0,
+        "estimatedAmount": None,
+        "estimatedCommission": None,
+        "goodTillTime": None,
+        "id": order_id,
+        "insertTime": TS_EVENT_TEXT,
+        "intent": "ORDER_INTENT_BUY_LONG",
+        "lastTransactTime": TS_EVENT_TEXT,
+        "leavesQuantity": 0,
+        "makerCommissionsBasisPoints": "0",
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_MANUAL",
+        "marketMetadata": {
+            "eventId": "evt-synthetic",
+            "eventSlug": "evt-synthetic",
+            "icon": "syn-icon",
+            "outcome": "Yes",
+            "slug": slug,
+            "subject": "synthetic",
+            "title": "Synthetic market",
+        },
+        "marketSlug": slug,
+        "outcomeSide": "OUTCOME_SIDE_YES",
+        "price": {"currency": "USD", "value": "0.625"},
+        "principal": None,
+        "quantity": 3.69,
+        "side": "ORDER_SIDE_BUY",
+        "state": "ORDER_STATE_NEW",
+        "tif": "TIME_IN_FORCE_DAY",
+        "type": "ORDER_TYPE_LIMIT",
+    }
+    row.update(overrides)
+    return row
+
+
 def balances_body(literal: str) -> bytes:
     """A ``GetAccountBalancesResponse`` body with ``literal`` as a bare float."""
     return (

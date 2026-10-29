@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from nautilus_trader.model.instruments import BinaryOption
 
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -105,3 +106,75 @@ def test_a_record_without_open_order_fields_refuses_to_arm(tmp_path: Path) -> No
     del legacy["open_orders_read_refused"]
     del legacy["open_orders"]
     _assert_refused_at_boot(_start(tmp_path, legacy))
+
+
+def _flagged_order(**extra: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "venue_order_id": "FRGN00000001",
+        "market_slug": "aec-nfl-lar-den-2026-09-27",
+        "state": "ORDER_STATE_NEW",
+        "own_resting": False,
+        "non_weather_market": True,
+    }
+    row.update(extra)
+    return row
+
+
+def test_a_non_weather_market_open_order_does_not_refuse_to_arm(tmp_path: Path) -> None:
+    """T-E1: a flagged non-weather order, with the cancel latch clear, does not refuse."""
+    evidence = _evidence(
+        open_orders=[_flagged_order()],
+        resting_cancel_unconfirmed=False,
+    )
+    assert startup_evidence_refusal_reason(evidence) is None
+    strategy = _start(tmp_path, evidence)
+    missing = strategy.position_events.count("startup_evidence_missing")  # type: ignore[attr-defined]
+    assert missing == 0
+    assert strategy._latch is not None  # type: ignore[attr-defined]
+    assert strategy._run_never_arm_walk() is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["true", 1, "yes", None, "absent"],
+    ids=["string-true", "one", "yes", "none", "absent"],
+)
+def test_a_non_weather_flag_that_is_not_exactly_true_still_refuses(flag: object) -> None:
+    """T-E2 [CHAR]: only the boolean True exempts. Mutation: replace ``is True`` with truthiness."""
+    order: dict[str, object] = {
+        "venue_order_id": "FRGN00000001",
+        "market_slug": "aec-nfl-lar-den-2026-09-27",
+        "state": "ORDER_STATE_NEW",
+        "own_resting": False,
+    }
+    if flag != "absent":
+        order["non_weather_market"] = flag
+    evidence = _evidence(open_orders=[order], resting_cancel_unconfirmed=False)
+    assert startup_evidence_refusal_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+
+def test_a_non_weather_order_does_not_mask_a_weather_order() -> None:
+    """T-E3 [CHAR]: a flagged row does not exempt the weather row after it.
+
+    Mutation: check only the first row.
+    """
+    weather: dict[str, object] = {
+        "venue_order_id": "WTHR00000001",
+        "market_slug": "tc-temp-miahigh-2026-09-16-gte91lt92f",
+        "state": "ORDER_STATE_NEW",
+        "own_resting": False,
+    }
+    evidence = _evidence(
+        open_orders=[_flagged_order(market_slug="crossd-ba05d7244fbd670a"), weather],
+        resting_cancel_unconfirmed=False,
+    )
+    assert startup_evidence_refusal_reason(evidence) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+
+def test_a_non_weather_only_book_still_honours_the_resting_cancel_latch() -> None:
+    """T-E4: a flagged-only book still refuses when the cancel latch is set or unrecorded."""
+    latched = _evidence(open_orders=[_flagged_order()], resting_cancel_unconfirmed=True)
+    assert startup_evidence_refusal_reason(latched) == "resting_cancel_unconfirmed"
+    absent = _evidence(open_orders=[_flagged_order()])
+    absent.pop("resting_cancel_unconfirmed", None)
+    assert startup_evidence_refusal_reason(absent) == "resting_cancel_unconfirmed"

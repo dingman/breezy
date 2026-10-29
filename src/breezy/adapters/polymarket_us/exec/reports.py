@@ -488,6 +488,15 @@ _TIME_IN_FORCE: Final[Mapping[str, TimeInForce]] = {
     "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL": TimeInForce.IOC,
 }
 
+#: EXEC-FOREIGN-POS (``docs/evidence/venue/polymarket_us/OPEN_ORDER_TIF_DRIFT_2026-10-29.md``):
+#: the venue's open-orders doc declares ``TIME_IN_FORCE_DAY``; the pinned SDK snapshot does not.
+#: The first VALUE-level sibling of the key-level DECLARED-BUT-UNREAD sets above: accepted by
+#: membership ONLY in :func:`parse_open_orders`, ONLY on a row that names its own non-weather
+#: market, never mapped to a native enum. ``_TIME_IN_FORCE`` stays the SDK row, so
+#: :func:`parse_order_status_report` still refuses DAY, and a DAY row on a weather, unusable or
+#: non-self-identifying market still refuses the whole enumeration.
+_OPEN_ORDER_TIF_DRIFT_ALLOWED: Final[frozenset[str]] = frozenset({"TIME_IN_FORCE_DAY"})
+
 #: Every ``OrderState`` the snapshot declares (``types/orders.py:21-33``),
 #: mapped to the Nautilus ``OrderStatus`` a reconciler should read it as.
 #: PUBLIC so the test suite can assert this table against the snapshot itself
@@ -1805,13 +1814,13 @@ _VENUE_MARKET_SLUG_RE: Final[re.Pattern[str]] = re.compile(
 def is_non_weather_market_slug(slug: object) -> bool:
     """FOREIGN MARKET (operator ruling 2026-10-29) = a usable venue slug outside Breezy's weather
     namespace (``tc-temp-``, compared separator-blind), on a row whose ``marketMetadata.slug``
-    names that same market, for which this client loaded no instrument (for an order, Stage B:
-    not marked AUTOMATIC); it is ignored. This is NOT the older "foreign" used in this code and
-    its tests (an unbound order or an unattributed position on a WEATHER market), which still
-    refuses.
+    names that same market, for which this client loaded no instrument (for an order: not marked
+    AUTOMATIC); it is ignored. This is NOT the older "foreign" used in this code and its tests
+    (an unbound order or an unattributed position on a WEATHER market), which still refuses.
 
-    This is its NAMESPACE half; the self-identification, loaded-instrument and AUTOMATIC-veto
-    halves are applied by the exec client. Total and fail-closed: a non-string, non-ASCII or
+    This is its NAMESPACE half only. Self-identification, the loaded-instrument check, and the
+    AUTOMATIC veto (an order the venue marks AUTOMATIC is never foreign) are applied by the exec
+    client, which calls this predicate. Total and fail-closed: a non-string, non-ASCII or
     unusable slug, and every separator-blind spelling of the namespace, is False. Adding a
     non-tc-temp market family to Breezy invalidates this predicate; extend the namespace first.
     """
@@ -1872,6 +1881,11 @@ class OpenOrderRecord(NamedTuple):
     #: anything else (absent, null, unrecognised). ``None`` is NOT own: an
     #: attribution join may only claim an order the venue marks AUTOMATIC.
     manual: bool | None = None
+    #: True only when ``marketMetadata.slug`` is exactly ``market_slug``
+    #: (:func:`metadata_slug_matches`). Never a refusal by itself; the exec client's
+    #: FOREIGN-MARKET flag and the DAY admission both require it. Default ``False``: a
+    #: record not built by :func:`parse_open_orders` never names itself.
+    names_own_market: bool = False
 
 
 def _manual_indicator_flag(payload: Mapping[str, Any]) -> bool | None:
@@ -1910,8 +1924,17 @@ def _open_order_record(
     if side not in _ORDER_SIDES:
         raise ExecutionReportMappingError(f"{context}.side {side!r} is not a declared OrderSide")
     tif = _require_text(payload, "tif", context=context)
+    names_itself = metadata_slug_matches(payload, market_slug)
     if tif not in _TIME_IN_FORCE:
-        raise ExecutionReportMappingError(f"{context}.tif {tif!r} is not a declared TimeInForce")
+        if tif not in _OPEN_ORDER_TIF_DRIFT_ALLOWED:
+            raise ExecutionReportMappingError(
+                f"{context}.tif {tif!r} is not a declared TimeInForce"
+            )
+        if not (names_itself and is_non_weather_market_slug(market_slug)):
+            raise ExecutionReportMappingError(
+                f"{context}.tif {tif!r} is enumerated only on a non-weather market whose "
+                "marketMetadata.slug names it (EXEC-FOREIGN-POS)"
+            )
 
     quantity = _to_decimal(
         payload["quantity"], field=f"{context}.quantity", error=ExecutionReportMappingError
@@ -1950,6 +1973,7 @@ def _open_order_record(
         create_time=create_time,
         unknown_keys=tuple(unknown[:OPEN_ORDER_UNKNOWN_KEYS_MAX]),
         manual=_manual_indicator_flag(payload),
+        names_own_market=names_itself,
     )
 
 
@@ -1959,7 +1983,9 @@ def parse_open_orders(payload: object) -> tuple[OpenOrderRecord, ...]:
     Drift-TOLERANT on purpose, and the only mapper here that is: the boot
     never-arm gate consumes this to decide whether ANY order is open, so an
     order whose shape moved must still be enumerable (its unknown keys are
-    recorded, bounded). Strict everywhere that matters for the decision: a
+    recorded, bounded). ``TIME_IN_FORCE_DAY`` is enumerated only on a row that
+    names its own non-weather market; every other DAY row still refuses the
+    whole read. Strict everywhere that matters for the decision: a
     missing ``orders`` list, a non-list, a non-object row, an undeclared
     enum member, a negative/inconsistent quantity, a non-USD or out-of-range
     price, or a missing required field REFUSES THE WHOLE READ -- the caller
