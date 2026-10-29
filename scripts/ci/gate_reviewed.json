@@ -298,6 +298,12 @@
     "tests/unit/test_unit_execstart_imports.py",
     "tests/unit/test_wp11b_active_family_registry.py"
    ]
+  },
+  {
+   "reason": "e7fcec7c @settings(max_examples=500, deadline=None) disables the hypothesis per-example deadline on a pure-function property test; it does not read wall-clock timing",
+   "paths": [
+    "tests/unit/test_polymarket_us_resting_order_shape.py"
+   ]
   }
  ],
  "env_skips": [
