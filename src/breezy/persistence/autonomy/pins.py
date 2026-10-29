@@ -35,7 +35,10 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # label_run closure only; was 6ba8a433...aa94
         # re-pin: EXEC-FOREIGN-POS Stage A (exec/client.py, exec/reports.py), label_run
         # closure only; was 6fd44dbc...5f88
-        "aut2.label": "0221aa565e1df95d83beebb9ddf84925574939688b2bf8f95f23731d40afcba1",
+        # re-pin: EXEC-FOREIGN-POS Stage B (exec/client.py, exec/reports.py,
+        # current_rung_hold/trial_day_latch.py; label_run closure only);
+        # was 0221aa56...cba1
+        "aut2.label": "564ca11f87d0ef86f673010509ccbb0f8af68080a5d95f4b4f93beafd1a634fb",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
