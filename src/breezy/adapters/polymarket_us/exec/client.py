@@ -150,6 +150,24 @@ guarantee that no Breezy order is ever sized, priced or exited against it.
 Dropping the position would have made the quantity wrong too -- and a wrong
 quantity is the one that trades.
 
+FOREIGN MARKETS (operator ruling 2026-10-29) are the one exception to "refuse
+to trade" above. A FOREIGN MARKET is a usable venue slug outside Breezy's
+weather namespace (``tc-temp-``, compared separator-blind), on a row whose
+``marketMetadata.slug`` names that same market, for which this client loaded
+no instrument (for an order, Stage B: not marked AUTOMATIC). Positions are
+classified now and ignored. This is NOT the older "foreign" used in this code
+and its tests (an unbound order or an unattributed position on a WEATHER
+market), which still refuses.
+
+Positions are logged once, at the boot reconciliation. Open orders (the
+never-arm gate, the boot sweep and DAY admission) follow in Stage B. A
+classified position is never mapped, netted, sold, cancelled, hidden or
+allowlisted. "Excluding one was tried and is WRONG" does not apply: no
+instrument is loaded, so no cap, exit or order can address the position.
+Nautilus itself skips such a report (``execution_engine.py:2475-2477``), and
+such a position never reached Nautilus before the ruling either. A
+weather-namespace slug is never foreign.
+
 A **FLAT** venue report is the one exception, and it is not forwarded.
 ``position_check_interval_secs=None`` is a REQUIRED half of that refusal: with
 it set, ``_create_flat_position_report`` (``execution_engine.py:1022``, called
@@ -238,7 +256,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, Protocol, Self
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import (
@@ -304,6 +322,8 @@ from breezy.adapters.polymarket_us.exec.reports import (
     assert_commission_bps_inert,
     build_execution_mass_status,
     derive_position_cost_basis,
+    is_non_weather_market_slug,
+    metadata_slug_matches,
     parse_account_balances,
     parse_open_orders,
     parse_order_status_report,
@@ -517,12 +537,33 @@ def _loggable_order_id(venue_order_id: object) -> str:
     return "<invalid-id>"
 
 
+#: `_note_foreign_market` logs a FOREIGN-MARKET slug VERBATIM (``!r``) on purpose: only a slug
+#: `is_non_weather_market_slug` admits reaches it (ASCII ``[a-z0-9_-]``, at most 128 chars), so
+#: it cannot inject; routing it through `_loggable_slug` would blank the acceptance line.
 def _loggable_slug(slug: object) -> str:
     """A market slug as a log line or alert detail may carry it: a valid daily-high slug
     verbatim, anything else replaced (B5 review G14)."""
     if isinstance(slug, str) and submit_chain.is_daily_high_slug(slug):
         return slug
     return "<invalid-slug>"
+
+
+_FOREIGN_KIND_POSITION: Final[str] = "position"
+_FOREIGN_KIND_OPEN_ORDER: Final[str] = "open_order"  # Stage B; T-B9 asserts this constant
+_QUANTITY_LOG_MAX_CHARS: Final[int] = 32
+
+
+def _loggable_quantity(value: object) -> str:
+    """A quantity reduced to a short printable ASCII value for a log line."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        return "<invalid-qty>"
+    try:
+        text = str(value)
+    except ValueError:  # an int past the interpreter's str-conversion digit limit
+        return "<invalid-qty>"
+    if len(text) > _QUANTITY_LOG_MAX_CHARS or not (text.isascii() and text.isprintable()):
+        return "<invalid-qty>"
+    return text
 
 
 #: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
@@ -552,11 +593,12 @@ DURABLE_REPORTS_BUILD_FAILED: Final[str] = "durable_reports_build_failed"
 RESOLVER_FILL_NOT_BOOKED: Final[str] = "resolver_fill_not_booked"
 
 #: What `_map_position` did with one venue position (AUD-13b). Anything that
-#: is not one of the first three -- a mapping error, a non-long side -- is
+#: is not one of the first four -- a mapping error, a non-long side -- is
 #: `_MAP_UNPARSEABLE`, which fails the WHOLE read for the durable reports.
 _MAP_OPEN: Final[str] = "open"
 _MAP_GATED_OUT: Final[str] = "gated_out"
 _MAP_INSTRUMENT_ABSENT: Final[str] = "instrument_absent"
+_MAP_FOREIGN: Final[str] = "foreign"
 _MAP_UNPARSEABLE: Final[str] = "unparseable"
 
 #: The FIXED enum ``detail`` per latch (never an id, a date or exception text).
@@ -590,6 +632,7 @@ _RECONCILIATION_COUNT_FIELDS: Final[tuple[str, ...]] = (
     "records_considered",
     "gated_out",
     "instrument_absent",
+    "foreign",
     "refusals",
     f"refusals_{POSITIONS_READ_FAILED}",
     f"refusals_{RECORD_VENUE_DISAGREEMENT}",
@@ -2300,6 +2343,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # cannot GET. REFUSED until the first read succeeds: fail closed.
         self._open_orders_read_refused: bool = True
         self._open_orders: tuple[OpenOrderRecord, ...] = ()
+        # EXEC-FOREIGN-POS: dedupe keys for the foreign-market note and its contained
+        # warnings. Reassigned, never mutated, event-loop only.
+        self._foreign_log_keys: frozenset[tuple[str, str, str]] = frozenset()
         # AUD-13b: the durable-record reconciliation's observable state.
         # Latched refusals persist for the process (deduped by latch+subject);
         # counts and fee sources describe the LAST pass only.
@@ -5723,15 +5769,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> tuple[tuple[PositionStatusReport, ...], tuple[str, ...]]:
         """Map every venue position, in slug order, ONCE.
 
-        Returns the forwarded reports and, per slug, the outcome
-        :meth:`_map_position` recorded (``open`` / ``gated_out`` /
-        ``instrument_absent`` / ``unparseable``).
+        Returns the forwarded reports and, per slug, the outcome recorded.
+        ``open`` / ``gated_out`` / ``instrument_absent`` / ``unparseable`` come
+        from :meth:`_map_position`. ``foreign`` is recorded in ``_map_positions``
+        itself, not by :meth:`_map_position`.
         """
         reports: list[PositionStatusReport] = []
         outcomes: list[str] = []
         for slug in sorted(positions):
+            payload = positions[slug]
+            if metadata_slug_matches(payload, slug) and self._is_foreign_market(
+                _FOREIGN_KIND_POSITION, slug
+            ):
+                self._note_foreign_market(_FOREIGN_KIND_POSITION, slug, payload.get("netPosition"))
+                outcomes.append(_MAP_FOREIGN)
+                continue
             self._position_map_outcome = _MAP_UNPARSEABLE
-            report = self._map_position(slug, positions[slug])
+            report = self._map_position(slug, payload)
             outcomes.append(self._position_map_outcome)
             if report is not None:
                 reports.append(report)
@@ -5767,7 +5821,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
         An instrument absent from the Nautilus cache is skipped by the engine
         anyway (``live/execution_engine.py:3056-3062``); it is COUNTED as its
-        own field, never folded into ``gated_out`` (evidence F8).
+        own field, never folded into ``gated_out`` (evidence F8). A
+        FOREIGN-MARKET position is counted as ``foreign``, never
+        ``instrument_absent``, and is never latched and never a refusal.
         """
         counts: dict[str, int] = dict.fromkeys(_RECONCILIATION_COUNT_FIELDS, 0)
         position_reports: tuple[PositionStatusReport, ...] = ()
@@ -5794,6 +5850,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # refusal, and `_durable_reports_for_position` already logs a
         # WARNING for each occurrence.
         counts["instrument_absent"] = outcomes.count(_MAP_INSTRUMENT_ABSENT)
+        # EXEC-FOREIGN-POS: never latched, never a refusal.
+        counts["foreign"] = outcomes.count(_MAP_FOREIGN)
         if error is not None or _MAP_UNPARSEABLE in outcomes:
             self._latch_reconciliation_refusal(POSITIONS_READ_FAILED, "")
             counts[f"refusals_{POSITIONS_READ_FAILED}"] = 1
@@ -6283,6 +6341,68 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if found is not None:
             return found
         return self._cache.instrument(instrument_id)
+
+    def _is_foreign_market(self, kind: str, slug: object) -> bool:
+        """FOREIGN MARKET (operator ruling 2026-10-29) = a usable venue slug outside Breezy's
+        weather namespace (``tc-temp-``, compared separator-blind), on a row whose
+        ``marketMetadata.slug`` names that same market, for which this client loaded no
+        instrument (for an order, Stage B: not marked AUTOMATIC); it is ignored. This is NOT
+        the older "foreign" used in this code and its tests (an unbound order or an
+        unattributed position on a WEATHER market), which still refuses.
+
+        The namespace and loaded-instrument halves; the caller has already required the row to
+        name itself (and, for an order in Stage B, not AUTOMATIC). Never raises: any error is
+        "not foreign", so the pre-ruling refusal applies.
+        """
+        try:
+            # ORDER IS LOAD-BEARING: the namespace predicate runs first. It admits only slugs
+            # the symbology validator accepts (T-A6, T-A7), so `_find_instrument` -- which
+            # latches the global `_find_instrument#1` refusal on an unusable slug -- is never
+            # reached with one, and classification can never latch (T-A6, T-A7).
+            return (
+                isinstance(slug, str)
+                and is_non_weather_market_slug(slug)
+                and self._find_instrument(slug) is None
+            )
+        except Exception as exc:  # noqa: BLE001 - never foreign-by-exception
+            self._warn_foreign_once(kind, "classification", exc)
+            return False
+
+    def _warn_foreign_once(
+        self, kind: str, stage: Literal["classification", "note"], exc: Exception
+    ) -> None:
+        """One WARNING per (stage, kind, exception class) per process; class name only."""
+        key = (stage, kind, type(exc).__name__)
+        if key in self._foreign_log_keys:
+            return
+        consequence = (
+            "treated as not foreign, so the refusal that applies without the ruling stands"
+            if stage == "classification"
+            else "the market is still ignored; only its INFO line was lost"
+        )
+        self._log.warning(
+            f"EXEC_FOREIGN_MARKET {stage} failed kind={kind} ({key[2]}); {consequence}"
+        )
+        self._foreign_log_keys = self._foreign_log_keys | {key}
+
+    def _note_foreign_market(self, kind: str, slug: str, quantity: object) -> None:
+        """ONE INFO line per (kind, slug) per process (operator ruling 2026-10-29)."""
+        try:
+            key = ("info", kind, slug)
+            if key in self._foreign_log_keys:
+                return
+            self._log.info(
+                f"EXEC_FOREIGN_MARKET kind={kind} slug={slug!r} "
+                f"qty={_loggable_quantity(quantity)!r}: "
+                "outside the weather slug namespace and not loaded, so not Breezy's; ignored -- "
+                "never netted, sold, cancelled or allowlisted (operator ruling 2026-10-29)"
+            )
+            # Recorded only after INFO returns, so a failed line is not lost for the process.
+            self._foreign_log_keys = self._foreign_log_keys | {key}
+        # The broad except exists so that logging can never refuse an order,
+        # not that logging never fails.
+        except Exception as exc:  # noqa: BLE001 - logging can never refuse an order
+            self._warn_foreign_once(kind, "note", exc)
 
     def _entry_price(
         self,

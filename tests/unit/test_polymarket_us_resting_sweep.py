@@ -24,6 +24,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 from tests.unit.ambig_latch_rig import (
     OPEN_ORDERS_PATH,
+    _RecordingLog,
     client_module,
     gate_env,  # noqa: F401 -- used via usefixtures
     reboot_client,
@@ -31,7 +32,13 @@ from tests.unit.ambig_latch_rig import (
     wire_payloads,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
-from tests.unit.polymarket_us_exec_shapes import build_instrument, build_no_leg_instrument
+from tests.unit.polymarket_us_exec_shapes import (
+    ASTATC,
+    CROSSD,
+    build_combo_position,
+    build_instrument,
+    build_no_leg_instrument,
+)
 from tests.unit.test_polymarket_us_resting_adopt import _no_id_rest
 from tests.unit.test_polymarket_us_resting_cancel import CancelSender, _rig
 from tests.unit.test_polymarket_us_resting_submit import (
@@ -696,3 +703,103 @@ async def test_sweep_missing_eof_counts_complete(
     assert second._trading_refusals == [], "a certified re-read with no eof key is complete"
     assert json.loads(second._store_get(_INDEX_KEY)) == []
     await second._disconnect()
+
+
+def _foreign_position_body(*slugs: str) -> dict[str, Any]:
+    return {"positions": {slug: build_combo_position(slug) for slug in slugs}, "eof": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_each_foreign_position_is_noted_once_per_process_and_counted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    client._private_read._payloads[client_module.PORTFOLIO_POSITIONS_PATH] = _foreign_position_body(
+        CROSSD,
+        ASTATC,
+    )
+    await client._connect()
+    await client.generate_mass_status()
+    await client.generate_mass_status()
+    assert client._trading_refusals == []
+    notes = client.log_lines("info", "EXEC_FOREIGN_MARKET kind=position")
+    assert len(notes) == 2
+    assert any("slug='crossd-ba05d7244fbd670a'" in line for line in notes)
+    assert any("slug='astatc-nba-gs-min-2026-10-28-ast-ayodos-gte10'" in line for line in notes)
+    rendered = client_module._loggable_quantity(build_combo_position(CROSSD)["netPosition"])
+    assert all(f"qty={rendered!r}" in line for line in notes)
+    counted = client.log_lines("info", "durable reconciliation:")
+    assert counted
+    assert "instrument_absent=0 foreign=2" in counted[-1]
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_classification_error_warns_by_class_name_only_once_and_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(_slug: object) -> bool:
+        raise RuntimeError("SECRET-x")
+
+    monkeypatch.setattr(client_module, "is_non_weather_market_slug", _raise)
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    client._private_read._payloads[client_module.PORTFOLIO_POSITIONS_PATH] = _foreign_position_body(
+        CROSSD,
+    )
+    await client._connect()
+    await client.generate_mass_status()
+    await client.generate_mass_status()
+    warnings = client.log_lines(
+        "warning",
+        "EXEC_FOREIGN_MARKET classification failed kind=position (RuntimeError)",
+    )
+    assert len(warnings) == 1
+    assert "SECRET-x" not in warnings[0]
+    assert any(CROSSD in refusal.reason for refusal in client._trading_refusals)
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_failing_foreign_note_is_contained_and_never_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = await _rig(tmp_path, monkeypatch)
+    client = rig.client
+    await client._connect()
+    inner = client.__dict__["_recording_log"]
+    attempts: list[str] = []
+
+    class _RaisingInfo(_RecordingLog):
+        def info(self, message: object, *args: object, **kwargs: object) -> object:
+            text = str(message)
+            if "EXEC_FOREIGN_MARKET" in text:
+                attempts.append(text)
+                raise RuntimeError("contained")
+            return self._wrap("info")(message, *args, **kwargs)
+
+    client.__dict__["_recording_log"] = _RaisingInfo(inner._inner, inner._records)
+    client._private_read._payloads[client_module.PORTFOLIO_POSITIONS_PATH] = _foreign_position_body(
+        CROSSD,
+    )
+    await client.generate_mass_status()
+    assert client._trading_refusals == []
+    assert client.reconciliation_counts["foreign"] == 1
+    assert ("info", "position", CROSSD) not in client._foreign_log_keys
+    assert len(attempts) == 1
+    warnings = client.log_lines(
+        "warning",
+        "EXEC_FOREIGN_MARKET note failed kind=position (RuntimeError)",
+    )
+    assert len(warnings) == 1
+    reports = await client.generate_position_status_reports(None)
+    assert reports == []
+    assert len(attempts) == 2
+    await client._disconnect()

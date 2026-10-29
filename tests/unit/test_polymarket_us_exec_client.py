@@ -38,6 +38,7 @@ import asyncio
 import dataclasses
 import inspect
 import json
+import textwrap
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -155,10 +156,16 @@ from breezy.runtime.submit_intent import (
 )
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
+    AEC,
+    CROSSD,
     RAW,
     TS_EVENT_TEXT,
+    UNLOADED,
+    UNPARSEABLE_W,
+    build_combo_position,
     build_execution,
     build_instrument,
+    build_non_weather_instrument,
     build_order,
     build_position,
     build_second_instrument,
@@ -1338,10 +1345,11 @@ async def test_a_position_in_an_unknown_market_is_refused_not_mapped(
     tmp_path: Path,
 ) -> None:
     """No instrument, no mapping. The position is real risk we cannot describe,
-    so the node starts, alerts and denies."""
+    so the node starts, alerts and denies. The slug stays in the weather
+    namespace (operator ruling 2026-10-29)."""
     rig = _build_rig(
         tmp_path,
-        positions={"a-market-we-never-loaded": build_position("a-market-we-never-loaded")},
+        positions={UNLOADED: build_position(UNLOADED)},
         instrument_loaded=False,
     )
     await rig.client._connect()
@@ -1350,7 +1358,7 @@ async def test_a_position_in_an_unknown_market_is_refused_not_mapped(
 
     assert mass_status is not None
     assert mass_status.position_reports == {}
-    assert any("a-market-we-never-loaded" in reason for reason in rig.client.trading_refusals), (
+    assert any(UNLOADED in reason for reason in rig.client.trading_refusals), (
         rig.client.trading_refusals
     )
     await rig.client._disconnect()
@@ -5489,6 +5497,282 @@ async def test_accept_fill_after_midnight_sell_does_not_latch_fill_unbudgeted(
         assert after.state is SubmitIntentState.RETIRED
         assert client_module._RESOLVER_FILL_UNBUDGETED not in rig.client.trading_refusals
         await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# EXEC-FOREIGN-POS: a self-naming non-weather position is ignored, not refused
+# ---------------------------------------------------------------------------
+
+
+def _assert_foreign_position_ignored(rig: _Rig, mass: ExecutionMassStatus, *, net: str) -> None:
+    """The ignore outcome. Refusals are asserted before the new counts key."""
+    assert mass.position_reports == {}
+    assert rig.client.trading_refusals == ()
+    assert rig.client.is_degraded is False
+    assert rig.client.settled_positions == ()
+    counts = rig.client.reconciliation_counts
+    assert counts["foreign"] == 1
+    assert counts["instrument_absent"] == 0
+    assert counts["refusals"] == 0
+    evidence = rig.client.read_startup_position_evidence()
+    assert evidence is not None
+    recorded = [row for row in evidence.positions if row.slug == CROSSD]
+    assert len(recorded) == 1
+    assert recorded[0].net_position == net
+    assert (CROSSD in rig.client.held_position_slugs) is (net != "0")
+
+
+async def _foreign_mass(
+    tmp_path: Path,
+    positions: dict[str, Any],
+    *,
+    start: bool,
+) -> tuple[_Rig, ExecutionMassStatus]:
+    rig = _build_rig(tmp_path, positions=positions)
+    if start:
+        rig.client.start()
+    await rig.client._connect()
+    mass = await rig.client.generate_mass_status()
+    assert mass is not None
+    return rig, mass
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_market_position_does_not_refuse_latch_or_degrade_and_stays_recorded(
+    tmp_path: Path,
+) -> None:
+    rig, mass = await _foreign_mass(tmp_path, {CROSSD: build_combo_position(CROSSD)}, start=True)
+    _assert_foreign_position_ignored(rig, mass, net="963")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("net", ["963", "-5", "0"])
+@pytest.mark.parametrize("expired", [False, True])
+async def test_a_foreign_position_is_ignored_whatever_its_sign_size_or_settlement(
+    tmp_path: Path,
+    net: str,
+    expired: bool,
+) -> None:
+    """Flat nets are recorded and are not held; a non-zero net is held either way."""
+    payload = build_combo_position(CROSSD)
+    payload["netPosition"] = net
+    payload["expired"] = expired
+    rig, mass = await _foreign_mass(tmp_path, {CROSSD: payload}, start=True)
+    _assert_foreign_position_ignored(rig, mass, net=net)
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_weather_position_without_a_loaded_instrument_still_refuses_beside_a_foreign_one(
+    tmp_path: Path,
+) -> None:
+    rig, _mass = await _foreign_mass(
+        tmp_path,
+        {UNLOADED: build_position(UNLOADED), CROSSD: build_combo_position(CROSSD)},
+        start=False,
+    )
+    refusals = [
+        reason
+        for reason in rig.client.trading_refusals
+        if "for which no instrument is loaded" in reason
+    ]
+    assert len(rig.client.trading_refusals) == 1
+    assert len(refusals) == 1
+    assert UNLOADED in refusals[0]
+    assert CROSSD not in refusals[0]
+    counts = rig.client.reconciliation_counts
+    assert counts["instrument_absent"] == 1
+    assert counts["foreign"] == 1
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slug", [UNPARSEABLE_W, "tc_temp_nychigh-2026-08-25-lt79f"])
+async def test_an_unparseable_or_near_miss_weather_position_still_refuses(
+    tmp_path: Path,
+    slug: str,
+) -> None:
+    rig, _mass = await _foreign_mass(tmp_path, {slug: build_position(slug)}, start=False)
+    assert any(
+        slug in reason and "for which no instrument is loaded" in reason
+        for reason in rig.client.trading_refusals
+    ), rig.client.trading_refusals
+    assert rig.client.reconciliation_counts.get("foreign", 0) == 0
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_non_weather_market_with_a_loaded_instrument_is_mapped_never_ignored(
+    tmp_path: Path,
+) -> None:
+    sports = build_non_weather_instrument(AEC)
+    rig = _build_rig(tmp_path, positions={AEC: _position(AEC)})
+    rig.cache.add_instrument(sports)
+    rig.client._instrument_provider.add(sports)
+    await rig.client._connect()
+
+    mass_status = await rig.client.generate_mass_status()
+
+    assert mass_status is not None
+    reports = mass_status.position_reports[sports.id]
+    assert len(reports) == 1
+    assert any("no durable fill record" in reason for reason in rig.client.trading_refusals), (
+        rig.client.trading_refusals
+    )
+    assert any(str(sports.id) in reason for reason in rig.client.trading_refusals)
+    assert rig.client.reconciliation_counts.get("foreign", 0) == 0
+    await rig.client._disconnect()
+
+
+def _crossd_that_does_not_name_itself(case: str) -> Any:
+    if case == "row-string":
+        return "x"
+    row = build_combo_position(CROSSD)
+    if case == "other-slug":
+        row["marketMetadata"]["slug"] = UNLOADED
+    elif case == "metadata-list":
+        row["marketMetadata"] = ["x"]
+    elif case == "no-metadata":
+        del row["marketMetadata"]
+    elif case == "empty-metadata":
+        row["marketMetadata"] = {}
+    elif case == "slug-none":
+        row["marketMetadata"]["slug"] = None
+    elif case == "slug-empty":
+        row["marketMetadata"]["slug"] = ""
+    elif case == "slug-int":
+        row["marketMetadata"]["slug"] = 7
+    else:
+        raise AssertionError(case)
+    return row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "other-slug",
+        "metadata-list",
+        "row-string",
+        "no-metadata",
+        "empty-metadata",
+        "slug-none",
+        "slug-empty",
+        "slug-int",
+    ],
+)
+async def test_a_non_weather_row_that_does_not_name_itself_still_refuses(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    rig, _mass = await _foreign_mass(
+        tmp_path,
+        {CROSSD: _crossd_that_does_not_name_itself(case)},
+        start=False,
+    )
+    assert any(
+        CROSSD in reason and "for which no instrument is loaded" in reason
+        for reason in rig.client.trading_refusals
+    ), rig.client.trading_refusals
+    counts = rig.client.reconciliation_counts
+    assert counts.get("foreign", 0) == 0
+    assert counts["instrument_absent"] == 1
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_classification_error_refuses_never_ignores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(_slug: object) -> bool:
+        raise RuntimeError("classification boom")
+
+    monkeypatch.setattr(client_module, "is_non_weather_market_slug", _raise)
+    rig, _mass = await _foreign_mass(tmp_path, {CROSSD: build_combo_position(CROSSD)}, start=False)
+    assert any(
+        CROSSD in reason and "for which no instrument is loaded" in reason
+        for reason in rig.client.trading_refusals
+    ), rig.client.trading_refusals
+    counts = rig.client.reconciliation_counts
+    assert counts["foreign"] == 0
+    assert counts["instrument_absent"] == 1
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_retained_weather_refusal_clears_on_the_next_boot_once_the_position_is_gone(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    boot1 = _build_rig(
+        tmp_path,
+        positions={UNLOADED: build_position(UNLOADED)},
+        store_path=store_path,
+    )
+    await boot1.client._connect()
+    mass1 = await boot1.client.generate_mass_status()
+    assert mass1 is not None
+    assert any(
+        UNLOADED in reason and "for which no instrument is loaded" in reason
+        for reason in boot1.client.trading_refusals
+    ), boot1.client.trading_refusals
+    await boot1.client._disconnect()
+
+    boot2 = _build_rig(tmp_path, positions={}, store_path=store_path)
+    await boot2.client._connect()
+    mass2 = await boot2.client.generate_mass_status()
+    assert mass2 is not None
+    assert boot2.client.trading_refusals == ()
+    await boot2.client._disconnect()
+
+
+def test_the_foreign_note_is_value_safe_and_bounded() -> None:
+    """Existence is an assertion (the method lives on the class, the helper on the module)."""
+    assert hasattr(client_module.PolymarketUSExecutionClient, "_note_foreign_market")
+    assert hasattr(client_module, "_loggable_quantity")
+    assert client_module._FOREIGN_KIND_POSITION == "position"
+    assert client_module._FOREIGN_KIND_OPEN_ORDER == "open_order"
+    source = inspect.getsource(client_module.PolymarketUSExecutionClient._note_foreign_market)
+    tree = ast.parse(textwrap.dedent(source))
+    info_calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "info"
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "_log"
+    ]
+    assert len(info_calls) == 1
+    rendered = ast.unparse(info_calls[0])
+    assert "$" not in rendered
+    assert MAX_DAILY_BUDGET_USD_ENV_VAR not in rendered
+    assert MAX_POSITION_COST_USD_ENV_VAR not in rendered
+    conversions = [
+        node
+        for node in ast.walk(info_calls[0])
+        if isinstance(node, ast.FormattedValue) and node.conversion == ord("r")
+    ]
+    assert any(isinstance(node.value, ast.Name) and node.value.id == "slug" for node in conversions)
+    assert any(
+        isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_loggable_quantity"
+        for node in conversions
+    )
+    quantity = client_module._loggable_quantity
+    assert quantity("963") == "963"
+    assert quantity(Decimal("963.04")) == "963.04"
+    invalid = "<invalid-qty>"
+    assert quantity("9" * 33) == invalid
+    assert quantity("x" * 1_000_000) == invalid
+    assert quantity({"a": 1}) == invalid
+    assert quantity(True) == invalid
+    assert quantity(None) == invalid
+    assert quantity("96\n3") == invalid
+    assert quantity(10**5000) == invalid
 
 
 #: EXEC-PAR WP4: names other test modules (``exec_par_rig``) reach through this

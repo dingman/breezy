@@ -65,13 +65,15 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.parsing import parse_binary_option, parse_binary_option_pair
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
-from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, slug_to_instrument_id
 from breezy.runtime.node_config import build_trade_node_config
 from breezy.runtime.sqlite_store import SqliteStateStore
 from tests.unit.polymarket_us_exec_shapes import (
+    CROSSD,
     RAW,
     TS_EVENT_TEXT,
     TS_INIT,
+    build_combo_position,
     build_position,
     build_second_instrument,
 )
@@ -416,6 +418,57 @@ async def test_an_instrument_absent_from_the_cache_is_counted_not_silently_dropp
     await rig.client._disconnect()
 
 
+@pytest.mark.asyncio
+async def test_a_foreign_market_position_counts_foreign_not_absent_never_refused(
+    tmp_path: Path,
+) -> None:
+    """A self-naming non-weather position is not a refusal and not instrument_absent."""
+    yes, _ = _pair()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yes,))
+    await rig.client._connect()
+    rig.client.record_fill(_record(yes, venue_order_id="V-FGN-1", client_order_id="O-FGN-1"))
+    rig.hold(_slug(yes), 1)
+    rig.positions[CROSSD] = build_combo_position(CROSSD)
+
+    assert await rig.reconcile() is True
+    assert rig.client.trading_refusals == ()
+    assert rig.client.reconciliation_refusals == ()
+    counts = rig.client.reconciliation_counts
+    assert counts["foreign"] == 1
+    assert counts["instrument_absent"] == 0
+    assert counts["refusals"] == 0
+    foreign_id = slug_to_instrument_id(CROSSD)
+    positions = await rig.client.generate_position_status_reports(None)
+    position_ids = {report.instrument_id for report in positions}
+    assert foreign_id not in position_ids
+    assert yes.id in position_ids
+    orders = await rig.client.generate_order_status_reports(None)
+    assert yes.id in {report.instrument_id for report in orders}
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_weather_instrument_absent_from_the_cache_still_counts_beside_a_foreign_position(
+    tmp_path: Path,
+) -> None:
+    """F8's cache miss stays instrument_absent 1 beside one foreign position."""
+    yes, _ = _pair()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(), provided=(yes,))
+    await rig.client._connect()
+    rig.client.record_fill(_record(yes, venue_order_id="V-ABS-1", client_order_id="O-ABS-1"))
+    rig.hold(_slug(yes), 1)
+    rig.positions[CROSSD] = build_combo_position(CROSSD)
+
+    order_reports = await rig.client.generate_order_status_reports(None)
+
+    assert order_reports == []
+    counts = rig.client.reconciliation_counts
+    assert counts["instrument_absent"] == 1
+    assert counts["foreign"] == 1
+    assert counts["gated_out"] == 0
+    await rig.client._disconnect()
+
+
 # ---------------------------------------------------------------------------
 # §7 13b step 1b/1c -- the ruling-mandated tests
 # ---------------------------------------------------------------------------
@@ -702,6 +755,7 @@ def test_the_reconciliation_counts_line_distinguishes_zero_records_from_zero_rep
         "records_considered": 0,
         "gated_out": 0,
         "instrument_absent": 0,
+        "foreign": 0,
         "refusals": 0,
         "refusals_positions_read_failed": 0,
         "refusals_record_venue_disagreement": 0,
@@ -712,7 +766,7 @@ def test_the_reconciliation_counts_line_distinguishes_zero_records_from_zero_rep
     regressed = format_reconciliation_counts_line({**base, "records_considered": 3})
     assert nothing == (
         "durable reconciliation: order_reports=0 fill_reports=0 records_considered=0 "
-        "gated_out=0 instrument_absent=0 refusals=0 refusals_positions_read_failed=0 "
+        "gated_out=0 instrument_absent=0 foreign=0 refusals=0 refusals_positions_read_failed=0 "
         "refusals_record_venue_disagreement=0 refusals_fee_coefficient_ambiguous=0 "
         "refusals_durable_reports_build_failed=0"
     )

@@ -64,6 +64,14 @@ ACCOUNT_ID: Final[AccountId] = AccountId("POLYMARKET_US-001")
 CLIENT_ID: Final[ClientId] = ClientId("POLYMARKET_US")
 REPORT_ID: Final[UUID4] = UUID4()
 
+#: EXEC-FOREIGN-POS. Real slug spellings; every other field on the builders below is synthetic.
+CROSSD: Final[str] = "crossd-ba05d7244fbd670a"
+ASTATC: Final[str] = "astatc-nba-gs-min-2026-10-28-ast-ayodos-gte10"
+AEC: Final[str] = "aec-nfl-lar-den-2026-09-27"
+UNLOADED: Final[str] = "tc-temp-laxhigh-2026-08-24-gte80lt81f"
+UNPARSEABLE_W: Final[str] = "tc-temp-lax-2026-08-25-gte70lt71f"
+FRGN: Final[str] = "FRGN00000001"  # Stage B uses this synthetic venue order id
+
 
 def build_instrument() -> BinaryOption:
     """The instrument every exec suite maps onto, from a real captured market."""
@@ -159,6 +167,112 @@ def build_position(slug: str) -> dict[str, Any]:
         "qtyAvailable": "4",
         "marketMetadata": {"slug": slug},
     }
+
+
+def _combo_leg(label: str) -> dict[str, Any]:
+    """One synthetic parlay leg: the 17 observed keys, including ``team``."""
+    team: dict[str, Any] = {
+        "abbreviation": "syn",
+        "alias": "syn",
+        "awayIcon": "syn-away",
+        "color": {"dark": "000000", "light": "ffffff"},
+        "colorPrimary": "000000",
+        "displayAbbreviation": "SYN",
+        "homeIcon": "syn-home",
+        "id": 1,
+        "imageDisplayType": "SYNTHETIC",
+        "league": "syn",
+        "logo": "syn-logo",
+        "longIcon": "syn-long",
+        "longIconDark": "syn-long-dark",
+        "name": "Synthetic",
+        "ordering": "home",
+        "providerId": 1,
+        "providerIds": [{"provider": "synthetic", "providerId": "p1"}],
+        "record": "0-0",
+        "safeName": "synthetic",
+        "shortIcon": "syn-short",
+        "shortIconDark": "syn-short-dark",
+    }
+    return {
+        "eventGroupTitle": "Synthetic event",
+        "eventId": "evt-synthetic",
+        "eventSlug": "evt-synthetic",
+        "eventStartTime": TS_EVENT_TEXT,
+        "icon": "syn-icon",
+        "indicativePrice": {"currency": "USD", "value": "0.50"},
+        "label": label,
+        "live": False,
+        "outcome": "Yes",
+        "outcomeSide": "OUTCOME_SIDE_YES",
+        "pick": "yes",
+        "showNoBadge": False,
+        "slug": f"syn-leg-{label}",
+        "state": "MARKET_STATE_OPEN",
+        "team": team,
+        "teamId": 1,
+        "title": "Synthetic leg",
+    }
+
+
+def build_combo_position(slug: str) -> dict[str, Any]:
+    """A synthetic parlay ``UserPosition``: 22 top-level keys, self-naming metadata.
+
+    The key tree matches the 2026-10-28 parlay row. Every value is synthetic.
+    ``netPosition`` is ``"963"`` and ``expired`` is false. The foreign path
+    never parses this row; a row that does not name itself still refuses
+    before the strict mapper.
+    """
+    money = {"currency": "USD", "value": "1.00"}
+    return {
+        "avgPx": dict(money),
+        "baseCost": None,
+        "bodPosition": "0",
+        "bodPositionDecimal": "0.0000",
+        "cashValue": dict(money),
+        "comboLegDetails": [_combo_leg("a"), _combo_leg("b")],
+        "cost": dict(money),
+        "costPerShare": None,
+        "expired": False,
+        "fees": None,
+        "marketMetadata": {
+            "eventId": "evt-synthetic",
+            "eventSlug": "evt-synthetic",
+            "icon": "syn-icon",
+            "outcome": "Yes",
+            "slug": slug,
+            "title": "Synthetic parlay",
+        },
+        "netPosition": "963",
+        "netPositionDecimal": "963.0000",
+        "positionId": "00000000-0000-4000-8000-000000000001",
+        "qtyAvailable": "963",
+        "qtyAvailableDecimal": "963.0000",
+        "qtyBought": "963",
+        "qtyBoughtDecimal": "963.0000",
+        "qtySold": "0",
+        "qtySoldDecimal": "0.0000",
+        "realized": dict(money),
+        "updateTime": TS_EVENT_TEXT,
+    }
+
+
+def build_non_weather_instrument(slug: str) -> BinaryOption:
+    """The 510636 capture with the slug, side identifiers and category replaced.
+
+    ``category`` is not climate and the slug does not parse as weather, so
+    ``parse_binary_option`` records UNKNOWN weather facts (parsing.py:1316-1325)
+    and still builds an instrument. No parser change.
+    """
+    payload: dict[str, Any] = json.loads(
+        (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
+    )
+    market: dict[str, Any] = payload["market"]
+    market["slug"] = slug
+    market["category"] = "sports"
+    for side in market["marketSides"]:
+        side["identifier"] = slug
+    return parse_binary_option(payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
 
 
 def balances_body(literal: str) -> bytes:

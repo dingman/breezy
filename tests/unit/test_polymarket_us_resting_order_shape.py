@@ -19,6 +19,8 @@ from typing import Any, Final
 
 import pandas as pd
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
@@ -28,8 +30,14 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.exec import endpoints, submit_chain
-from breezy.adapters.polymarket_us.exec.reports import parse_order_status_report
+from breezy.adapters.polymarket_us.exec.reports import (
+    WEATHER_SLUG_NAMESPACE,
+    is_non_weather_market_slug,
+    metadata_slug_matches,
+    parse_order_status_report,
+)
 from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
+from tests.unit.polymarket_us_exec_shapes import AEC, ASTATC, CROSSD, UNLOADED, UNPARSEABLE_W
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
@@ -187,6 +195,146 @@ def test_non_daily_high_slug_is_refused(slug: str) -> None:
 @pytest.mark.parametrize("bad", [None, 7, b"tc-temp-nychigh-2026-08-25-lt79f", ["x"]])
 def test_slug_admission_refuses_non_strings(bad: object) -> None:
     assert submit_chain.is_daily_high_slug(bad) is False
+
+
+# --------------------------------------------------------------------------
+# EXEC-FOREIGN-POS: the non-weather slug predicate (namespace half)
+# --------------------------------------------------------------------------
+
+_OBSERVED_NON_WEATHER: Final[tuple[str, ...]] = (
+    CROSSD,
+    ASTATC,
+    AEC,
+    "asc-cfb-minnst-wash-2026-09-26-neg-1pt5",
+    "a" * 128,
+)
+_WEATHER_NAMESPACE_SPELLINGS: Final[tuple[str, ...]] = (
+    UNLOADED,
+    "tc-temp-nychigh-2026-08-25-lt79f",
+    "tc-temp-laxlow-2026-08-24-gte50lt51f",
+    "tc-temp-laxhigh-2026-02-31-gte80lt81f",
+    "tc-temp-laxhigh-2026-08-25-banana",
+    UNPARSEABLE_W,
+    "tc-temp",
+    "tc_temp_nychigh-2026-08-25-lt79f",
+    "tc-temps-x",
+    "tc-temperature-nyc",
+    "tctemp-x",
+    "tc--temp-x",
+    "tc-temp-nychigh-2026-08-25-lt79f\n",
+)
+_UNUSABLE_SLUGS: Final[tuple[object, ...]] = (
+    "",
+    "bad.slug",
+    "crossd-x^no",
+    "CROSSD-AB",
+    "TC-TEMP-NYCHIGH-2026-08-25-LT79F",
+    "a" * 129,
+    "crossd-x\n",
+    "\uff11",
+    "-crossd",
+    "_x",
+    None,
+    7,
+    b"crossd-x",
+    ["x"],
+)
+_NON_WEATHER_TEXT = st.text(
+    alphabet=st.sampled_from(
+        list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.^ \n\x00")
+        + ["\uff11"]
+    ),
+    max_size=140,
+)
+_NON_WEATHER_REGEX = st.from_regex(r"[a-z0-9][a-z0-9_-]{0,135}", fullmatch=True)
+
+
+@pytest.mark.parametrize("slug", _OBSERVED_NON_WEATHER)
+def test_is_non_weather_market_slug_is_true_for_the_accounts_observed_non_weather_slugs(
+    slug: str,
+) -> None:
+    assert is_non_weather_market_slug(slug) is True
+
+
+@pytest.mark.parametrize("slug", _WEATHER_NAMESPACE_SPELLINGS)
+def test_is_non_weather_market_slug_is_false_for_every_weather_namespace_spelling(
+    slug: str,
+) -> None:
+    assert is_non_weather_market_slug(slug) is False
+
+
+@pytest.mark.parametrize("slug", _UNUSABLE_SLUGS)
+def test_is_non_weather_market_slug_is_false_for_an_unusable_or_non_string_slug(
+    slug: object,
+) -> None:
+    assert is_non_weather_market_slug(slug) is False
+
+
+def test_every_send_and_parse_grammar_begins_with_the_weather_namespace() -> None:
+    from breezy.adapters.polymarket_us import symbology, write_transport
+
+    assert submit_chain._DAILY_HIGH_SLUG_RE.pattern.startswith(WEATHER_SLUG_NAMESPACE)
+    assert write_transport._DAILY_SLUG_RE.pattern.startswith(WEATHER_SLUG_NAMESPACE)
+    weather = symbology._WEATHER_SLUG_RE.pattern.removeprefix("^")
+    assert weather.startswith(WEATHER_SLUG_NAMESPACE)
+
+
+def test_no_market_the_discovery_weather_discriminator_selects_is_non_weather() -> None:
+    """The namespace claim rests on this test, on T-A4, and on discovery raising
+    for an off-grammar weather market (provider.py:250-262)."""
+    from breezy.adapters.polymarket_us.provider import _weather_city_name_from_payload
+
+    selected = 0
+
+    def walk(node: Any) -> None:
+        nonlocal selected
+        if isinstance(node, dict):
+            if _weather_city_name_from_payload(node) is not None:
+                slug = node.get("slug")
+                assert isinstance(slug, str)
+                assert is_non_weather_market_slug(slug) is False
+                selected += 1
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for path in sorted(RAW.glob("*.json")):
+        walk(json.loads(path.read_text(encoding="utf-8")))
+    assert selected > 100
+
+
+def test_every_observed_non_weather_slug_passes_the_symbology_validator() -> None:
+    from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
+
+    for slug in _OBSERVED_NON_WEATHER:
+        assert is_non_weather_market_slug(slug) is True
+        slug_to_instrument_id(slug)
+
+
+@settings(max_examples=500, deadline=None)
+@example("a" * 128)
+@example("a" * 129)
+@given(slug=st.one_of(_NON_WEATHER_TEXT, _NON_WEATHER_REGEX))
+def test_a_non_weather_slug_always_passes_the_symbology_validator(slug: str) -> None:
+    """Predicate True binds the validators ``_find_instrument`` actually calls."""
+    from breezy.adapters.polymarket_us.symbology import no_leg_instrument_id, slug_to_instrument_id
+
+    foreign = is_non_weather_market_slug(slug)
+    if slug == "a" * 128:
+        assert foreign is True
+    elif slug == "a" * 129:
+        assert foreign is False
+    if not foreign:
+        return
+    slug_to_instrument_id(slug)
+    no_leg_instrument_id(slug)
+
+
+def test_metadata_slug_matches_is_false_for_an_empty_key_and_an_empty_named_slug() -> None:
+    """A row whose key and ``marketMetadata.slug`` are both empty is not a match."""
+    assert metadata_slug_matches({"marketMetadata": {"slug": ""}}, "") is False
 
 
 # --------------------------------------------------------------------------

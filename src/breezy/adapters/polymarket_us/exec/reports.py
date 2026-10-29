@@ -125,6 +125,7 @@ because this is the module whose output reaches that code path.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -1786,6 +1787,56 @@ _OPEN_ORDER_REQUIRED_KEYS: Final[tuple[str, ...]] = (
 
 _MANUAL_ORDER_INDICATOR_MANUAL: Final[str] = "MANUAL_ORDER_INDICATOR_MANUAL"
 _MANUAL_ORDER_INDICATOR_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
+
+#: Breezy's ONLY market namespace on this venue (operator ruling 2026-10-29): every grammar it
+#: discovers, rests, takes or cancels under begins with it (bound by T-A4 and T-A5).
+WEATHER_SLUG_NAMESPACE: Final[str] = "tc-temp-"
+_WEATHER_NAMESPACE_COMPACT: Final[str] = WEATHER_SLUG_NAMESPACE.replace("-", "")
+#: A usable venue market slug, restated independently of the frozen symbology validator (its
+#: ``$``/``match`` admits a trailing newline): ASCII, ``fullmatch``, 1-128 characters of
+#: ``[a-z0-9_-]`` with a leading ``[a-z0-9]`` -- never ``.`` or ``^``. T-A6/T-A7 bind it inside
+#: that validator.
+_VENUE_MARKET_SLUG_RE: Final[re.Pattern[str]] = re.compile(
+    r"[a-z0-9][a-z0-9_-]{0,127}",
+    re.ASCII,
+)
+
+
+def is_non_weather_market_slug(slug: object) -> bool:
+    """FOREIGN MARKET (operator ruling 2026-10-29) = a usable venue slug outside Breezy's weather
+    namespace (``tc-temp-``, compared separator-blind), on a row whose ``marketMetadata.slug``
+    names that same market, for which this client loaded no instrument (for an order, Stage B:
+    not marked AUTOMATIC); it is ignored. This is NOT the older "foreign" used in this code and
+    its tests (an unbound order or an unattributed position on a WEATHER market), which still
+    refuses.
+
+    This is its NAMESPACE half; the self-identification, loaded-instrument and AUTOMATIC-veto
+    halves are applied by the exec client. Total and fail-closed: a non-string, non-ASCII or
+    unusable slug, and every separator-blind spelling of the namespace, is False. Adding a
+    non-tc-temp market family to Breezy invalidates this predicate; extend the namespace first.
+    """
+    if not isinstance(slug, str) or not slug.isascii():
+        return False
+    if _VENUE_MARKET_SLUG_RE.fullmatch(slug) is None:
+        return False
+    return not slug.replace("-", "").replace("_", "").startswith(_WEATHER_NAMESPACE_COMPACT)
+
+
+def metadata_slug_matches(payload: object, slug: str) -> bool:
+    """True only when ``payload`` is an object whose ``marketMetadata`` is an object whose
+    ``slug`` is exactly ``slug`` -- the row names its own market. Total, never raises. This
+    module's rule that two venue identifiers which disagree are a contradiction
+    (:func:`parse_position_status_report`), read as a FACT, never a refusal: an absent, null,
+    empty or non-string ``slug`` is no match, so a row that does not name itself is never a
+    FOREIGN MARKET (EXEC-FOREIGN-POS).
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    metadata = payload.get("marketMetadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    named = metadata.get("slug")
+    return isinstance(named, str) and bool(named) and named == slug
 
 
 class OpenOrderRecord(NamedTuple):
