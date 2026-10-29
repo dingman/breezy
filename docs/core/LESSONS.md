@@ -374,3 +374,9 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Before every node launch or relaunch run the read-only positions probe (`GET /v1/portfolio/positions` via the shipped client) and treat any slug outside `tc-temp-*` as a launch blocker to SURFACE to the operator, never to work around: do not sell, hide or allowlist the position and do not weaken the guard. Record the operator's standing decision (no manual trading on the bot's account, or accept refused windows) in PROGRESS.md and re-check it whenever a boot logs `instrument_absent>0`.
 **Applied:** 2026-10-28
 **Last updated:** 2026-10-28
+
+### L-70 — A cycle that waits on an external event must arm its own re-entry (2026-10-29)
+**Mistake:** Two cycles (10-27, 10-28) ended correctly on "external event pending" but nothing re-entered the loop: the bot's systemd timers run the bot, not the orchestrator, and no session cron, wakeup or host timer existed. The loop only resumed when the operator re-pasted the brief. In the same cycles the main session issued 109 Bash calls and 26 Monitors itself, which drove two auto-compactions (≈386k and ≈362k tokens) whose summaries then misreported state.
+**Prevention:** Before ending any cycle on a pending event, schedule the re-entry at the event time (CronCreate in-session, or the host timer), verify it with CronList/`systemctl --user list-timers`, and write the wake time in PROGRESS.md; a cycle end without a scheduled resumption or an explicit operator stop is a defect (CLAUDE.md "Cycle Lifecycle"). Inside a cycle, delegate gate runs, log reads and watches as single units with ≤15-line returns; main never runs Monitor or diagnostic Bash beyond one lookup.
+**Applied:** 2026-10-29
+**Last updated:** 2026-10-29

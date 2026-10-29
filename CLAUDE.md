@@ -51,7 +51,9 @@ genuinely unusable, evidenced by one of:
   (writing briefs, merging agent findings, plan/spec authoring).
 
 Report the fallback and its trigger — never fall back silently, and never let
-"the CLI was busy" become an excuse to do the work inline.
+"the CLI was busy" become an excuse to do the work inline. Probe the route once
+per cycle before the first dispatch; a stale verdict from a previous cycle is
+not evidence.
 
 ### Grok delegation guardrails (BINDING)
 
@@ -84,12 +86,37 @@ The main session may:
 * Decompose objectives into tasks.
 * Assign work to appropriate agents.
 * Provide context and constraints.
-* Review and synthesize agent results.
+* Review and synthesize agent results. Returns are capped and structured; a
+  return longer than its brief is sent back for a summary.
 * Resolve conflicts between findings.
 * Coordinate sequencing and integration.
 * Maintain architectural consistency.
 
 The main session must **never perform non-coordinator work itself**, even when the task appears trivial.
+
+## Cycle Lifecycle (long-running operation)
+
+The goal brief lives at `docs/prompts/GOAL_ORCHESTRATOR.md`. A cycle is one
+pass of Observe → Hypothesis → Act → Verify → Challenge → Decide.
+
+1. **Start** from `docs/core/PROGRESS.md` "Next action", never from chat
+   history or a compaction summary. First act: `~/.claude/bin/grok-check.sh`
+   and the Codex probe; record the route once in PROGRESS.md.
+2. **State lives on disk.** Anything the next cycle needs is in PROGRESS.md,
+   `docs/evidence/`, LESSONS.md or memory before the turn ends.
+3. **End** only on: acceptance met, budget exhausted, external event pending,
+   or an evidenced operator blocker. State which. When the condition is an
+   external event, arm the re-entry at the event time (session cron or the
+   host timer), verify it is scheduled, and write the wake time in PROGRESS.md.
+   A cycle that ends without a scheduled resumption or an operator stop is
+   a defect.
+4. **Context budget.** Main issues no diagnostic Bash beyond one lookup. A
+   gate run, its readout and pin check are ONE delegation returning ≤ 15
+   lines. Raw logs and JSON go to the scratchpad; only tails return. Monitor
+   is run by a delegated watcher, never by main. Prefer foreground agents for
+   sequential stages; background only for parallel seams.
+5. **One cycle per session** when run headless via the host timer; the
+   in-session cron is the bridge, not the design.
 
 ## Engineering Priority
 
