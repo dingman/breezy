@@ -235,18 +235,26 @@ class AlertOutbox:
     def read_backoff(self) -> tuple[int, int, int] | None:
         """``(failures, next_attempt_ns, last_status)``, or ``None`` when the file is absent.
 
-        A symlink is not followed (``O_NOFOLLOW``). Malformed contents raise; the caller
-        fails open. This method does not write.
+        A symlink is not followed (``O_NOFOLLOW``). A non-regular file is refused after
+        ``fstat`` (``S_ISREG``) on an ``O_NONBLOCK`` open, so a fifo cannot block the read.
+        ``RecursionError`` fails open (``None``) and logs the exception type once. Malformed
+        contents raise; the caller fails open. This method does not write.
         """
         path = self.root / _BACKOFF_NAME
         if not os.path.lexists(path):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
-            raw = os.read(fd, 4096)
-        finally:
-            os.close(fd)
-        body = json.loads(raw.decode("utf-8"))
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(errno.EINVAL, "webhook.backoff")
+                raw = os.read(fd, 4096)
+            finally:
+                os.close(fd)
+            body = json.loads(raw.decode("utf-8"))
+        except RecursionError as exc:
+            _LOG.error("alert_backoff_unreadable exception_type=%s", type(exc).__name__)
+            return None
         if not isinstance(body, dict):
             raise TypeError("backoff body")
         failures, nxt, last = body["failures"], body["next_attempt_ns"], body["last_status"]

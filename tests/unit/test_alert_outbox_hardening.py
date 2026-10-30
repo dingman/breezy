@@ -6,6 +6,8 @@ import errno
 import json
 import logging
 import os
+import stat
+import threading
 import time
 from pathlib import Path
 from typing import Final
@@ -321,3 +323,41 @@ def test_an_oversized_entry_is_rejected_and_long_fields_are_truncated(root: Path
     assert summary.delivered == 1 and summary.failures == 1
     assert [b["event"] for b in bodies] == ["LONG"]
     assert 0 < len(bodies[0]["detail"]) <= 512  # AlertPayload itself caps detail further
+
+
+def test_read_backoff_recursion_error_fails_open(
+    root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P5: RecursionError returns None and logs the exception type once."""
+    outbox = AlertOutbox(root)
+    (root / "webhook.backoff").write_text("[]", encoding="utf-8")
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(alert_outbox.json, "loads", _boom)
+    caplog.set_level(logging.ERROR, logger="breezy.runtime.alert_outbox")
+    assert outbox.read_backoff() is None
+    errors = [rec.message for rec in caplog.records if rec.levelno == logging.ERROR]
+    assert errors == ["alert_backoff_unreadable exception_type=RecursionError"]
+    assert str(root) not in errors[0]
+
+
+def test_read_backoff_refuses_non_regular_file(root: Path) -> None:
+    """P5: a fifo is refused via fstat after a non-blocking open, and the read never blocks."""
+    os.mkfifo(root / "webhook.backoff")
+    outbox = AlertOutbox(root)
+    box: list[object] = []
+
+    def _run() -> None:
+        try:
+            box.append(outbox.read_backoff())
+        except OSError as exc:
+            box.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(0.5)
+    assert not worker.is_alive()
+    assert box and isinstance(box[0], OSError)
+    assert stat.S_ISFIFO(os.lstat(root / "webhook.backoff").st_mode)

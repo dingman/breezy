@@ -592,3 +592,82 @@ def test_dedupe_failure_still_emits(monkeypatch: pytest.MonkeyPatch) -> None:
     h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
     assert len(resolved) == 1
     assert emitted[0][0] == "webhook-sink"
+
+
+def test_dedupe_key_exception_logs_the_exception_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1: the dedupe-key except logs the exception type, then still posts."""
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    read_logs = capture_nautilus_logs()
+
+    def _boom_key(*_args: object, **_kwargs: object) -> tuple[str, str, dt.date]:
+        raise RuntimeError("clock")
+
+    monkeypatch.setattr(strategy_module, "_alert_dedupe_key", _boom_key)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    logged = wait_for_logged(read_logs, "exception_type=RuntimeError")
+    assert logged.count("exception_type=RuntimeError") == 1
+    assert len(resolved) == 1
+    assert emitted[0][0] == "webhook-sink"
+
+
+def test_alerted_keys_clear_on_utc_date_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P2: the dedupe set keeps only the current UTC date."""
+    h, resolved, _emitted = _alert_spies(monkeypatch)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    h.strategy._alert("MAKER_ORDER_EXPIRED", "INST-B", "c2", "INFO")
+    assert len(h.strategy._alerted_keys) == 2
+    h.clock.set_time(int(dt.datetime(2026, 9, 18, 0, 0, 1, tzinfo=dt.UTC).timestamp()) * NS)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c3", "WARN")
+    assert len(h.strategy._alerted_keys) == 1
+    assert len(resolved) == 3
+
+
+def test_maker_order_filled_is_exempt_from_dedupe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3: each fill posts. Other non-CRITICAL kinds stay one post per instrument-day."""
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    h.strategy._alert("MAKER_ORDER_FILLED", "INST-A", "c1", "INFO")
+    h.strategy._alert("MAKER_ORDER_FILLED", "INST-A", "c2", "INFO")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c3", "WARN")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c4", "WARN")
+    assert [sink for sink, _payload in emitted[:2]] == ["webhook-sink", "webhook-sink"]
+    assert emitted[3][0] is strategy_module._REPEAT_ALERT_SINK
+    assert len(resolved) == 3
+
+
+def test_non_critical_webhook_posts_capped_per_utc_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P6: 80 non-CRITICAL webhook posts per UTC day; the next ones log locally, once."""
+    assert strategy_module._NON_CRITICAL_WEBHOOK_POSTS_PER_DAY == 80
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    read_logs = capture_nautilus_logs()
+    for index in range(80):
+        h.strategy._alert("MAKER_ORDER_DENIED", f"INST-{index}", "c", "WARN")
+    assert len(resolved) == 80
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-OVER-1", "c", "WARN")
+    h.strategy._alert("MAKER_ORDER_EXPIRED", "INST-OVER-2", "c", "INFO")
+    assert len(resolved) == 80
+    assert emitted[-1][0] is strategy_module._REPEAT_ALERT_SINK
+    assert emitted[-2][0] is strategy_module._REPEAT_ALERT_SINK
+    logged = wait_for_logged(read_logs, "non-critical webhook ceiling")
+    assert logged.count("non-critical webhook ceiling") == 1
+    h.clock.set_time(int(dt.datetime(2026, 9, 18, 0, 0, 1, tzinfo=dt.UTC).timestamp()) * NS)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-NEXT", "c", "WARN")
+    assert len(resolved) == 81
+
+
+def test_critical_and_filled_bypass_daily_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P6: CRITICAL and MAKER_ORDER_FILLED are neither counted nor capped."""
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    for index in range(80):
+        h.strategy._alert("MAKER_ORDER_EXPIRED", f"INST-{index}", "c", "INFO")
+    assert len(resolved) == 80
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "CRITICAL")
+    h.strategy._alert("MAKER_ORDER_FILLED", "INST-A", "c2", "INFO")
+    h.strategy._alert("MAKER_ORDER_FILLED", "INST-A", "c3", "INFO")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-B", "c4", "WARN")
+    assert len(resolved) == 83
+    assert [sink for sink, _payload in emitted[-4:-1]] == [
+        "webhook-sink",
+        "webhook-sink",
+        "webhook-sink",
+    ]
+    assert emitted[-1][0] is strategy_module._REPEAT_ALERT_SINK

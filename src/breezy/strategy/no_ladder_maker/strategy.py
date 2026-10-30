@@ -150,6 +150,8 @@ _VENUE: Final[str] = "polymarket_us"
 _NS: Final[int] = 10**9
 #: Repeat non-CRITICAL alerts stay on the node log. One sink for the process; no socket.
 _REPEAT_ALERT_SINK: Final[LoggingAlertSink] = LoggingAlertSink()
+#: Per-process, per-UTC-day ceiling on non-CRITICAL webhook posts. Not an operator control.
+_NON_CRITICAL_WEBHOOK_POSTS_PER_DAY: Final[int] = 80
 _POLL_TIMER: Final[str] = "MAKER-POLL"
 _HARD_PREFIX: Final[str] = "MAKER-HARD"
 _NBP_PREFIX: Final[str] = "MAKER-NBP"
@@ -249,8 +251,11 @@ class NoLadderMakerStrategy(Strategy):
         #: (no running loop), which keeps every clock callback inline.
         self._kernel_loop: asyncio.AbstractEventLoop | None = None
         self._kernel_thread: int | None = None
-        #: Non-CRITICAL alerts already posted this boot, keyed (event, instrument, UTC date).
+        #: Non-CRITICAL alerts already posted this UTC day, keyed (event, instrument, UTC date).
         self._alerted_keys: set[tuple[str, str, dt.date]] = set()
+        self._alerted_utc_day: dt.date | None = None
+        self._noncritical_webhook_posts = 0
+        self._noncritical_cap_warned = False
 
     def _log_failure(self, message: str, exc: Exception) -> None:
         """Log a swallowed handler failure with its traceback (L-16)."""
@@ -982,22 +987,42 @@ class NoLadderMakerStrategy(Strategy):
     ) -> None:
         detail = f"instrument={instrument_id} client_order_id={client_order_id}"
         self.log.info(f"{event_name} {detail}")
-        payload = AlertPayload(
-            severity=severity, event=event_name, site=_CLASS_NAME, detail=detail
-        )
+        payload = AlertPayload(severity=severity, event=event_name, site=_CLASS_NAME, detail=detail)
         if severity == "CRITICAL":
             emit_alert(resolve_alert_sink(), payload)
             return
         try:
             key = _alert_dedupe_key(event_name, instrument_id, self.clock.timestamp_ns())
-        except Exception:  # noqa: BLE001 - a bad key must not drop the post
+        except Exception as exc:  # noqa: BLE001 - a bad key must not drop the post
+            self.log.error(
+                f"{_CLASS_NAME}: alert dedupe key failed exception_type={type(exc).__name__}"
+            )
             emit_alert(resolve_alert_sink(), payload)
             return
-        if key in self._alerted_keys:
-            emit_alert(_REPEAT_ALERT_SINK, payload)
-            return
+        day = key[2]
+        if day != self._alerted_utc_day:
+            self._alerted_keys.clear()
+            self._alerted_utc_day = day
+            self._noncritical_webhook_posts = 0
+            self._noncritical_cap_warned = False
+        if event_name != "MAKER_ORDER_FILLED":
+            if key in self._alerted_keys:
+                emit_alert(_REPEAT_ALERT_SINK, payload)
+                return
+            if self._noncritical_webhook_posts >= _NON_CRITICAL_WEBHOOK_POSTS_PER_DAY:
+                if not self._noncritical_cap_warned:
+                    self.log.warning(
+                        f"{_CLASS_NAME}: non-critical webhook ceiling "
+                        f"{_NON_CRITICAL_WEBHOOK_POSTS_PER_DAY} reached; "
+                        "further repeats log locally"
+                    )
+                    self._noncritical_cap_warned = True
+                emit_alert(_REPEAT_ALERT_SINK, payload)
+                return
         emit_alert(resolve_alert_sink(), payload)
-        self._alerted_keys.add(key)
+        if event_name != "MAKER_ORDER_FILLED":
+            self._noncritical_webhook_posts += 1
+            self._alerted_keys.add(key)
 
 
 def _alert_dedupe_key(

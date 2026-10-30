@@ -183,8 +183,9 @@ def drain_outbox(
     attempted and named in ``abandoned``. The record writer id is the drainer, not the originator.
 
     A global backoff in the future claims nothing (the dead-man uses this same list). When the
-    backoff is due, the oldest entry is the one probe; a 2xx, 5xx, transport or payload 4xx
-    clears it and the pass continues, and a 5xx or transport probe costs one full pass.
+    backoff is due, the oldest entry is the one probe. 2xx, 5xx, transport and payload 4xx clear
+    it and the pass continues (a 5xx or transport probe costs one full pass). 3xx and
+    not_configured leave it unchanged. Only 429, 401, 403, 404 and 410 set or extend it.
     """
     validate_ids(drainer, "drain")
     started = monotonic()
@@ -271,6 +272,8 @@ def drain_outbox(
                 base_failures = new_failures
                 episode_open = False
                 return True
+            return False
+        if status_class in {"3xx", "not_configured"}:
             return False
         outbox.clear_backoff()
         base_failures = 0

@@ -260,7 +260,7 @@ def _due(
 
 def _drain(
     root: Path,
-    sink: TeeAlertSink,
+    sink: object,
     *,
     now: int = _NOW,
     min_age_s: int = 60,
@@ -284,9 +284,7 @@ def _drain(
 def _plant(root: Path, *, failures: int, next_ns: int, last_status: int) -> Path:
     path = root / _BACKOFF
     path.write_text(
-        json.dumps(
-            {"failures": failures, "next_attempt_ns": next_ns, "last_status": last_status}
-        ),
+        json.dumps({"failures": failures, "next_attempt_ns": next_ns, "last_status": last_status}),
         encoding="utf-8",
     )
     os.chmod(path, 0o600)
@@ -389,6 +387,65 @@ def test_5xx_probe_clears_backoff_and_one_pass_continues(root: Path) -> None:
     assert seen == [500, 500]
     assert summary.probe == 1
     assert not (root / _BACKOFF).exists()
+
+
+def _outcome_sink(outcome: str) -> tuple[object, list[int]]:
+    """One probe response for the R3 backoff matrix. ``not_configured`` has no webhook branch."""
+    if outcome == "not_configured":
+        return LoggingAlertSink(), []
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        if outcome == "transport":
+            raise httpx.ConnectError("down")
+        code = {"2xx": 204, "5xx": 500, "3xx": 302, "payload_4xx": 400}.get(outcome)
+        if code is None:
+            code = int(outcome)
+        seen.append(code)
+        return httpx.Response(code)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return TeeAlertSink(LoggingAlertSink(), WebhookAlertSink(_URL, client=client)), seen
+
+
+@pytest.mark.parametrize(
+    ("outcome", "effect"),
+    [
+        ("2xx", "clear"),
+        ("5xx", "clear"),
+        ("transport", "clear"),
+        ("payload_4xx", "clear"),
+        ("3xx", "unchanged"),
+        ("not_configured", "unchanged"),
+        ("429", "set"),
+        ("401", "set"),
+        ("403", "set"),
+        ("404", "set"),
+        ("410", "set"),
+    ],
+)
+def test_r3_backoff_outcome_matrix(root: Path, outcome: str, effect: str) -> None:
+    """R3 matrix: clear on 2xx/5xx/transport/payload-4xx; unchanged on 3xx and not_configured;
+    set only on 429/401/403/404/410.
+    """
+    outbox = AlertOutbox(root)
+    _due(outbox, "PROBE", 300)
+    planted = _plant(root, failures=1, next_ns=_NOW, last_status=429)
+    before = planted.read_text(encoding="utf-8")
+    sink, _seen = _outcome_sink(outcome)
+    _drain(root, sink)
+    path = root / _BACKOFF
+    if effect == "clear":
+        assert not path.exists()
+        return
+    if effect == "unchanged":
+        assert path.read_text(encoding="utf-8") == before
+        return
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert body["failures"] == 2
+    assert body["last_status"] == int(outcome)
+    assert body["next_attempt_ns"] == _NOW + 600 * _NS
 
 
 def test_new_critical_attempted_when_older_due_noncritical_entries_exist(root: Path) -> None:
