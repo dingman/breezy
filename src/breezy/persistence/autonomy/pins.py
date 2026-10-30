@@ -38,7 +38,7 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin: EXEC-FOREIGN-POS Stage B (exec/client.py, exec/reports.py,
         # current_rung_hold/trial_day_latch.py; label_run closure only);
         # was 0221aa56...cba1
-        "aut2.label": "5623b408cae9e80bb46140184f476075ac602791b498c698903cfb33a6f67fe2",
+        "aut2.label": "8e49a377551bf3fecba0f09b4bd7e10d40716a71ce3592f1defcdbe5235bb5b1",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
@@ -46,7 +46,7 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin at p4/arm (health_dropins.DROPIN_ALLOWLIST emptied; orders-off row
         # removed); was caa4d114...c832
         # re-pin: same table.py residual yield (shared with aut2.label); was 8a4723a0...e5ac
-        "aut6.health": "4e881f89f8380d0b7afe53957d6950e568b299e9f8be41ddea4363b31b7f2779",
+        "aut6.health": "456a5307677ebdaeb69aa8b8a6b25cee620e683879fdb350eb1c85f6b444121b",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()

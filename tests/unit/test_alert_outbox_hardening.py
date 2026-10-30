@@ -335,7 +335,7 @@ def test_read_backoff_recursion_error_fails_open(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("maximum recursion depth exceeded")
 
-    monkeypatch.setattr(alert_outbox.json, "loads", _boom)
+    monkeypatch.setattr(json, "loads", _boom)
     caplog.set_level(logging.ERROR, logger="breezy.runtime.alert_outbox")
     assert outbox.read_backoff() is None
     errors = [rec.message for rec in caplog.records if rec.levelno == logging.ERROR]

@@ -147,7 +147,7 @@ def _delay_s(failures: int) -> int:
     shift = failures - 1
     if shift >= 6:
         return _BACKOFF_CAP_S
-    return min(_BACKOFF_BASE_S * (2**shift), _BACKOFF_CAP_S)
+    return int(min(_BACKOFF_BASE_S * (2**shift), _BACKOFF_CAP_S))
 
 
 def _r4(work: list[tuple[Path, bool]]) -> list[tuple[Path, bool]]:

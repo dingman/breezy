@@ -22,6 +22,7 @@ from breezy.runtime.alert_delivery import (
     drain_outbox,
     run_deadman_drain,
 )
+from breezy.runtime.alert_drain import DrainSummary
 from breezy.runtime.alert_redeliver_cli import main
 from breezy.runtime.health import LoggingAlertSink, TeeAlertSink, WebhookAlertSink
 
@@ -266,7 +267,7 @@ def _drain(
     min_age_s: int = 60,
     budget_s: int = 40,
     monotonic: object | None = None,
-) -> object:
+) -> DrainSummary:
     kwargs: dict[str, object] = {
         "drainer": "redeliver",
         "outbox": AlertOutbox(root),
