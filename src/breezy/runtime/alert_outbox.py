@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import json
+import logging
 import os
 import re
 import stat
@@ -35,6 +37,8 @@ _ARMED_SCHEMA: Final[str] = "alerts_armed/v1"
 _ARMED_MODE: Final[int] = 0o444
 _ARMED_MAX_BYTES: Final[int] = 4096
 _ATTEMPTS: Final[frozenset[str]] = frozenset({"alert", "retry", "canary", "drain"})
+_BACKOFF_NAME: Final[str] = "webhook.backoff"
+_LOG = logging.getLogger(__name__)
 
 
 def default_alerts_root() -> Path:
@@ -228,6 +232,91 @@ class AlertOutbox:
             return None
         return bad
 
+    def read_backoff(self) -> tuple[int, int, int] | None:
+        """``(failures, next_attempt_ns, last_status)``, or ``None`` when the file is absent.
+
+        A symlink is not followed (``O_NOFOLLOW``). Malformed contents raise; the caller
+        fails open. This method does not write.
+        """
+        path = self.root / _BACKOFF_NAME
+        if not os.path.lexists(path):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            raw = os.read(fd, 4096)
+        finally:
+            os.close(fd)
+        body = json.loads(raw.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise TypeError("backoff body")
+        failures, nxt, last = body["failures"], body["next_attempt_ns"], body["last_status"]
+        if type(failures) is not int or type(nxt) is not int or type(last) is not int:
+            raise ValueError("backoff field")
+        if failures < 0 or nxt < 0:
+            raise ValueError("backoff range")
+        return failures, nxt, last
+
+    def set_backoff(self, *, failures: int, next_attempt_ns: int, last_status: int) -> bool:
+        """Atomically replace ``<root>/webhook.backoff`` (mode 0600). False on OSError.
+
+        A symlink is refused and left in place. The exception text is not logged: it can
+        carry a path. Only the type and the basename are.
+        """
+        path = self.root / _BACKOFF_NAME
+        tmp: Path | None = None
+        try:
+            if os.path.lexists(path) and not is_regular(path):
+                raise OSError(errno.ELOOP, "webhook.backoff")
+            _mkdir(self.root)
+            body = {
+                "failures": failures,
+                "last_status": last_status,
+                "next_attempt_ns": next_attempt_ns,
+            }
+            fd, tmp_name = tempfile.mkstemp(prefix=".", suffix=".partial", dir=self.root)
+            tmp = Path(tmp_name)
+            try:
+                os.fchmod(fd, _FILE_MODE)
+                data = memoryview(json.dumps(body, sort_keys=True).encode())
+                while data:
+                    data = data[os.write(fd, data) :]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            tmp = None
+            _fsync_dir(self.root)
+            return True
+        except OSError as exc:
+            _LOG.error(
+                "alert_backoff_unwritable exception_type=%s basename=webhook.backoff",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            if tmp is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+
+    def clear_backoff(self) -> bool:
+        """Remove ``webhook.backoff``. Missing is success. A symlink is left in place."""
+        path = self.root / _BACKOFF_NAME
+        try:
+            if not os.path.lexists(path):
+                return True
+            if not is_regular(path):
+                raise OSError(errno.ELOOP, "webhook.backoff")
+            os.unlink(path)
+            if self.root.is_dir():
+                _fsync_dir(self.root)
+            return True
+        except OSError as exc:
+            _LOG.error(
+                "alert_backoff_unwritable exception_type=%s basename=webhook.backoff",
+                type(exc).__name__,
+            )
+            return False
+
 
 class DeliveryRecordWriter:
     """One ``<ts>_<writer>_<d|f>.json`` per attempt. Collision bumps ``ts_ns`` by 1."""
@@ -249,6 +338,7 @@ class DeliveryRecordWriter:
         site: str,
         outbox_entry: str,
         outbox_write_failed: bool = False,
+        http_status: int | None = None,
     ) -> Path:
         validate_ids(writer, attempt_kind)
         stamp = ts_ns
@@ -266,6 +356,8 @@ class DeliveryRecordWriter:
                 "site": site,
                 "outbox_entry": outbox_entry,
             }
+            if type(http_status) is int:
+                body["http_status"] = http_status
             if outbox_write_failed:
                 body["outbox_write_failed"] = True
             directory = self.root / _day(stamp)

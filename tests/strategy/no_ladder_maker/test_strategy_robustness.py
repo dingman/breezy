@@ -47,6 +47,7 @@ from tests.strategy.no_ladder_maker.maker_strategy_support import (
     no_id,
     want,
 )
+from tests.support.nautilus_log_capture import capture_nautilus_logs, wait_for_logged
 
 BAND = "gte72lt73f"
 
@@ -482,3 +483,112 @@ def test_an_alert_sink_failure_never_raises(monkeypatch: pytest.MonkeyPatch) -> 
     h = Harness()
     monkeypatch.setattr(strategy_module, "emit_alert", _boom)
     h.strategy._alert("X", "i", "c", "INFO")
+
+
+def _alert_spies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Harness, list[object], list[tuple[object, Any]]]:
+    """One strategy; ``resolve_alert_sink`` and ``emit_alert`` are recorded.
+
+    ``Logger.info`` is a read-only Cython method and stdout is frozen at WARNING, so the local
+    line is counted from the session INFO log file, not by replacing ``log.info``.
+    """
+    h = Harness()
+    resolved: list[object] = []
+    emitted: list[tuple[object, Any]] = []
+
+    def resolve(env: object = None) -> str:
+        resolved.append(env)
+        return "webhook-sink"
+
+    def emit(sink: object, payload: object) -> None:
+        emitted.append((sink, payload))
+
+    monkeypatch.setattr(strategy_module, "resolve_alert_sink", resolve)
+    monkeypatch.setattr(strategy_module, "emit_alert", emit)
+    return h, resolved, emitted
+
+
+def _local_lines(text: str, event: str) -> list[str]:
+    return [line for line in text.splitlines() if f"{event} instrument=" in line]
+
+
+def test_noncritical_alert_posts_once_per_event_instrument_and_utc_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First denial posts; the repeat stays on the local sink. A second instrument still posts."""
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    read_logs = capture_nautilus_logs()
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c2", "WARN")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-B", "c3", "WARN")
+    logged = wait_for_logged(
+        read_logs,
+        "MAKER_ORDER_DENIED instrument=INST-A client_order_id=c1",
+        "MAKER_ORDER_DENIED instrument=INST-A client_order_id=c2",
+        "MAKER_ORDER_DENIED instrument=INST-B client_order_id=c3",
+    )
+    logs = _local_lines(logged, "MAKER_ORDER_DENIED")
+    assert len(resolved) == 2
+    assert len(emitted) == 3
+    assert emitted[0][0] == "webhook-sink"
+    assert emitted[1][0] is strategy_module._REPEAT_ALERT_SINK
+    assert emitted[2][0] == "webhook-sink"
+    assert len(logs) == 3
+
+
+def test_maker_order_expired_emits_once_per_instrument_day_and_repeat_logs_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    read_logs = capture_nautilus_logs()
+    h.strategy._alert("MAKER_ORDER_EXPIRED", "INST-A", "c1", "INFO")
+    h.strategy._alert("MAKER_ORDER_EXPIRED", "INST-A", "c2", "INFO")
+    logged = wait_for_logged(
+        read_logs,
+        "MAKER_ORDER_EXPIRED instrument=INST-A client_order_id=c1",
+        "MAKER_ORDER_EXPIRED instrument=INST-A client_order_id=c2",
+    )
+    logs = _local_lines(logged, "MAKER_ORDER_EXPIRED")
+    assert len(resolved) == 1
+    assert emitted[1][0] is strategy_module._REPEAT_ALERT_SINK
+    assert len(logs) == 2
+
+
+def test_distinct_events_on_one_instrument_day_both_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, resolved, _emitted = _alert_spies(monkeypatch)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    h.strategy._alert("MAKER_ORDER_EXPIRED", "INST-A", "c2", "INFO")
+    assert len(resolved) == 2
+
+
+def test_critical_alert_is_never_deduped(monkeypatch: pytest.MonkeyPatch) -> None:
+    h, resolved, emitted = _alert_spies(monkeypatch)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "CRITICAL")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c2", "CRITICAL")
+    assert len(resolved) == 2
+    assert [sink for sink, _payload in emitted] == ["webhook-sink", "webhook-sink"]
+
+
+def test_utc_rollover_emits_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    h, resolved, _emitted = _alert_spies(monkeypatch)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c2", "WARN")
+    assert len(resolved) == 1
+    h.clock.set_time(int(dt.datetime(2026, 9, 18, 0, 0, 1, tzinfo=dt.UTC).timestamp()) * NS)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c3", "WARN")
+    assert len(resolved) == 2
+
+
+def test_dedupe_failure_still_emits(monkeypatch: pytest.MonkeyPatch) -> None:
+    h, resolved, emitted = _alert_spies(monkeypatch)
+
+    def _boom_key(*_args: object, **_kwargs: object) -> tuple[str, str, dt.date]:
+        raise RuntimeError("clock")
+
+    monkeypatch.setattr(strategy_module, "_alert_dedupe_key", _boom_key)
+    h.strategy._alert("MAKER_ORDER_DENIED", "INST-A", "c1", "WARN")
+    assert len(resolved) == 1
+    assert emitted[0][0] == "webhook-sink"

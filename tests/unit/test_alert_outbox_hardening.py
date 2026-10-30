@@ -232,6 +232,16 @@ def alert_outbox_failures() -> int:
 # -- C1 ---------------------------------------------------------------------------------------
 
 
+def test_occupancy_ignores_webhook_backoff(root: Path) -> None:
+    outbox = AlertOutbox(root)
+    (root / "webhook.backoff").write_text("{}", encoding="utf-8")
+    assert outbox.occupancy() == 0
+    out = root / "outbox"
+    out.mkdir(parents=True)
+    (out / "1_KEPT.json").write_text("{}", encoding="utf-8")
+    assert outbox.occupancy() == 1
+
+
 def test_symlinked_entries_are_never_followed(root: Path) -> None:
     outbox = AlertOutbox(root)
     secret = root / "secret.json"

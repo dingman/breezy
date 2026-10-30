@@ -290,6 +290,30 @@ def test_alert_delivery_keys_on_producer_intraday_demand_line_and_record(root: P
 # --------------------------------------------------------------------------- counters and root
 
 
+def test_webhook_backoff_file_is_ignored(root: Path) -> None:
+    """The global backoff file is not an outbox entry and not a delivery record."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "webhook.backoff").write_text("{}", encoding="utf-8")
+    assert judge(root, at("09:00")).outcome == "PASS"
+
+
+def test_http4xx_and_skipped_backoff_are_not_fail_kinds(root: Path) -> None:
+    """A quota outage reports http4xx and skipped_backoff. Neither is a FAIL kind."""
+    line = ["AUTONOMY_REDELIVER delivered=0 skipped_backoff=4 http4xx=9 probe=1 failures=0"]
+    result = judge(root, at("09:00"), summary_lines=line)
+    assert result.outcome == "PASS"
+    assert "http4xx" not in kinds(result)
+    assert "skipped_backoff" not in kinds(result)
+
+
+def test_summary_markers_include_backoff_tokens() -> None:
+    from breezy.runtime.monitor_watch import _SUMMARY_MARKERS
+
+    assert "skipped_backoff=" in _SUMMARY_MARKERS
+    assert "http4xx=" in _SUMMARY_MARKERS
+    assert "probe=" in _SUMMARY_MARKERS
+
+
 @pytest.mark.parametrize(
     "counter",
     ["journal_write_failures", "outbox_write_failures", "integrity_demand_write_failures"],

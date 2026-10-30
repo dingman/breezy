@@ -110,6 +110,7 @@ class _Attempt:
         status: StatusClass,
         entry: str = "",
         outbox_write_failed: bool = False,
+        http_status: int | None = None,
     ) -> DeliveryProof:
         """Write the record; a failure is counted and logged, and never blocks delivery."""
         used, recorded = ts_ns, True
@@ -126,6 +127,7 @@ class _Attempt:
                 site=self.payload.site,
                 outbox_entry=entry,
                 outbox_write_failed=outbox_write_failed,
+                http_status=http_status,
             )
         except OSError:
             COUNTERS.journal_write_failures += 1
@@ -167,8 +169,12 @@ def _status_of(code: int) -> StatusClass:
     return "transport"
 
 
-def _post(sink: object, payload: AlertPayload) -> StatusClass:
-    """POST the webhook branch directly. 3xx is not delivery. Never log the exception text."""
+def _post(sink: object, payload: AlertPayload) -> tuple[StatusClass, int | None]:
+    """POST the webhook branch directly. 3xx is not delivery. Never log the exception text.
+
+    The int is present for 2xx/3xx/4xx/5xx only. 1xx is classed ``transport`` and the int is
+    omitted with it.
+    """
     for branch in _branches(sink):
         if not isinstance(branch, WebhookAlertSink):
             continue
@@ -176,9 +182,12 @@ def _post(sink: object, payload: AlertPayload) -> StatusClass:
             response = branch._client.post(branch._url, json=payload.to_dict())
         except (httpx.HTTPError, ssl.SSLError, OSError) as exc:
             _LOG.error("alert delivery transport failure exception_type=%s", type(exc).__name__)
-            return "transport"
-        return _status_of(response.status_code)
-    return "not_configured"
+            return "transport", None
+        status = _status_of(response.status_code)
+        if status == "transport":
+            return status, None
+        return status, response.status_code
+    return "not_configured", None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +233,7 @@ def deliver_with_proof(
     now_ns: Callable[[], int] = time.time_ns,
     outbox: AlertOutbox | None = None,
     claimed: Path | None = None,
+    http_statuses: list[int | None] | None = None,
 ) -> DeliveryProof:
     """Record one attempt.
 
@@ -248,13 +258,16 @@ def deliver_with_proof(
         queued = made
     if queued.claimed is not None and not store.restamp(queued.claimed):
         return DeliveryProof(False, "transport", payload.event, ts_ns, False)
-    status = _post(sink, payload)
+    status, http_status = _post(sink, payload)
+    if http_statuses is not None:
+        http_statuses.append(http_status)
     proof = attempt.record(
         records,
         ts_ns=ts_ns,
         status=status,
         entry=queued.entry,
         outbox_write_failed=queued.write_failed,
+        http_status=http_status,
     )
     if proof.delivered and proof.recorded and queued.claimed is not None:
         store.complete(queued.claimed)

@@ -98,7 +98,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"reclaims={summary.reclaims} failures={summary.failures} "
         f"abandoned={len(summary.abandoned)} "
         f"journal_write_failures={COUNTERS.journal_write_failures} "
-        f"outbox_write_failures={COUNTERS.outbox_write_failures}"
+        f"outbox_write_failures={COUNTERS.outbox_write_failures} "
+        f"skipped_backoff={summary.skipped_backoff} "
+        f"http4xx={summary.http_4xx} probe={summary.probe}"
     )
     for name in summary.abandoned:
         print(f"AUTONOMY_REDELIVER abandoned_entry={name}")

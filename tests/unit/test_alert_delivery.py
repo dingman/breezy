@@ -58,6 +58,7 @@ _RECORD_KEYS = frozenset(
         "schema",
         "site",
         "outbox_entry",
+        "http_status",
     }
 )
 
@@ -172,6 +173,9 @@ def test_check_alerts_reports_not_delivered_through_the_production_tee(
     assert code == EXIT_DELIVERY_FAILED
     assert "not delivered" in text.lower()
     assert "alerts.example.test" not in text
+    assert "skipped_backoff=0" in text
+    assert "http4xx=0" in text
+    assert "probe=0" in text
     _path, body = _one_record(alerts_root)
     assert body["delivered"] is False
     assert body["status_class"] == "5xx"
@@ -188,12 +192,46 @@ def test_deliver_with_proof_reports_non_2xx_through_tee(alerts_root: Path) -> No
     assert _path.name.endswith("_f.json")
 
 
+def test_live_deliver_does_not_write_webhook_backoff(alerts_root: Path) -> None:
+    _proof(_tee(_client(429)), _payload(), alerts_root)
+    assert not (alerts_root / "webhook.backoff").exists()
+
+
+def test_journal_row_records_http_status_on_429(alerts_root: Path) -> None:
+    """A real 429 is status_class 4xx and carries the exact code. The body has no URL."""
+    proof = _proof(_tee(_client(429)), _payload(), alerts_root)
+    assert proof.status_class == "4xx"
+    path, body = _one_record(alerts_root)
+    assert body["status_class"] == "4xx"
+    assert body["http_status"] == 429
+    assert body["schema"] == "alert_delivery/v1"
+    assert "://" not in path.read_text(encoding="utf-8")
+
+
+def test_transport_row_omits_http_status(alerts_root: Path) -> None:
+    proof = _proof(
+        _tee(_client(exc=httpx.ConnectError("down"))), _payload(), alerts_root
+    )
+    assert proof.status_class == "transport"
+    _path, body = _one_record(alerts_root)
+    assert "http_status" not in body
+
+
+def test_1xx_is_transport_and_omits_http_status(alerts_root: Path) -> None:
+    """``_status_of`` classes 1xx as transport, and that wins: no ``http_status`` key."""
+    proof = _proof(_tee(_client(100)), _payload(), alerts_root)
+    assert proof.status_class == "transport"
+    _path, body = _one_record(alerts_root)
+    assert "http_status" not in body
+
+
 def test_deliver_with_proof_treats_3xx_as_not_delivered(alerts_root: Path) -> None:
     proof = _proof(_tee(_client(302)), _payload(), alerts_root)
     assert proof.delivered is False
     assert proof.status_class == "3xx"
-    _path, _body = _one_record(alerts_root)
+    _path, body = _one_record(alerts_root)
     assert _path.name.endswith("_f.json")
+    assert body["http_status"] == 302
 
 
 def test_deliver_with_proof_reports_transport_failure_without_the_url(

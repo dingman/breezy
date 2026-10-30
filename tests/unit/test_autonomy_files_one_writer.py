@@ -303,6 +303,13 @@ def test_allowlist_rows_for_code_that_has_not_landed_are_accepted_while_absent()
 # ---------------------------------------------------------------------------
 
 
+def test_webhook_backoff_row_is_replace_atomic() -> None:
+    rows = {row.path: row for row in AUTONOMY_FILE_WRITERS}
+    row = rows["evidence/alerts/webhook.backoff"]
+    assert row.mechanism == "replace_atomic"
+    assert "set_backoff" in row.writers and "clear_backoff" in row.writers
+
+
 def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None:
     assert {row.mechanism for row in AUTONOMY_FILE_WRITERS} <= WRITE_MECHANISMS
     paths = [row.path for row in AUTONOMY_FILE_WRITERS]
@@ -316,7 +323,8 @@ def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None
     # 35: AUT-6 WP3 S3 adds the unit health rows (records, replaced state, MemAvailable samples).
     # 36: AUT-6 WP3 S4 adds the build-side restart marker row (the --mark-buildside-restart CLI).
     # 37: AUT-6 WP3 S6 adds the write-once fold_export_seen latch row (X-12).
-    assert len(paths) == len(set(paths)) == 37
+    # 38: ALERT-4XX adds the global webhook backoff row (evidence/alerts/webhook.backoff).
+    assert len(paths) == len(set(paths)) == 38
 
 
 def test_the_aut6_alert_rows_name_the_outbox_and_record_writers() -> None:

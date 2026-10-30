@@ -237,6 +237,12 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "alert_outbox.write_armed_marker; never rewritten and never deleted by any code",
         "write_once",
     ),
+    FileWriter(
+        "evidence/alerts/webhook.backoff",
+        "alert_outbox.AlertOutbox.set_backoff and clear_backoff only; drain_outbox is the "
+        "only caller and live emit never touches it",
+        "replace_atomic",
+    ),
     # AUT-6 WP3 S3 (plan r15 sections 3.9 and 3.11): the unit health pass. One writer, the
     # breezy-autonomy-health pass (unit_health_store), under evidence/unit_health/.health.lock.
     FileWriter(
@@ -360,5 +366,15 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
         "breezy.analysis.capture_audit_host",
         "_run_template",
         "audit unit: the three literal journalctl argvs, read-only (closure lint row argvs)",
+    ),
+    WriteSiteRule(
+        "breezy.runtime.alert_outbox",
+        "AlertOutbox.set_backoff",
+        "global webhook.backoff os.replace; drain_outbox is the only caller",
+    ),
+    WriteSiteRule(
+        "breezy.runtime.alert_outbox",
+        "AlertOutbox.clear_backoff",
+        "global webhook.backoff os.unlink; drain_outbox is the only caller",
     ),
 )

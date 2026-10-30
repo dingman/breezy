@@ -46,6 +46,8 @@ _OUTBOX_WRITE_SCOPES: Final[tuple[str, ...]] = (
     "AlertOutbox.restamp",
     "AlertOutbox.complete",
     "AlertOutbox.quarantine",
+    "AlertOutbox.set_backoff",
+    "AlertOutbox.clear_backoff",
     "write_armed_marker",  # AUT-6 WP2: the write-once arming marker (via _publish)
 )
 

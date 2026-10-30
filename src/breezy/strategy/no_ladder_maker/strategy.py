@@ -98,7 +98,12 @@ from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.normalize.climate_day import local_standard_date
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
-from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.runtime.health import (
+    AlertPayload,
+    LoggingAlertSink,
+    emit_alert,
+    resolve_alert_sink,
+)
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.ladder_ev.quantile_density import Rung as DensityRung
 from breezy.strategy.no_ladder_maker import rule
@@ -143,6 +148,8 @@ _log = logging.getLogger(__name__)
 _CLASS_NAME: Final[str] = "NoLadderMakerStrategy"
 _VENUE: Final[str] = "polymarket_us"
 _NS: Final[int] = 10**9
+#: Repeat non-CRITICAL alerts stay on the node log. One sink for the process; no socket.
+_REPEAT_ALERT_SINK: Final[LoggingAlertSink] = LoggingAlertSink()
 _POLL_TIMER: Final[str] = "MAKER-POLL"
 _HARD_PREFIX: Final[str] = "MAKER-HARD"
 _NBP_PREFIX: Final[str] = "MAKER-NBP"
@@ -242,6 +249,8 @@ class NoLadderMakerStrategy(Strategy):
         #: (no running loop), which keeps every clock callback inline.
         self._kernel_loop: asyncio.AbstractEventLoop | None = None
         self._kernel_thread: int | None = None
+        #: Non-CRITICAL alerts already posted this boot, keyed (event, instrument, UTC date).
+        self._alerted_keys: set[tuple[str, str, dt.date]] = set()
 
     def _log_failure(self, message: str, exc: Exception) -> None:
         """Log a swallowed handler failure with its traceback (L-16)."""
@@ -973,7 +982,27 @@ class NoLadderMakerStrategy(Strategy):
     ) -> None:
         detail = f"instrument={instrument_id} client_order_id={client_order_id}"
         self.log.info(f"{event_name} {detail}")
-        emit_alert(
-            resolve_alert_sink(),
-            AlertPayload(severity=severity, event=event_name, site=_CLASS_NAME, detail=detail),
+        payload = AlertPayload(
+            severity=severity, event=event_name, site=_CLASS_NAME, detail=detail
         )
+        if severity == "CRITICAL":
+            emit_alert(resolve_alert_sink(), payload)
+            return
+        try:
+            key = _alert_dedupe_key(event_name, instrument_id, self.clock.timestamp_ns())
+        except Exception:  # noqa: BLE001 - a bad key must not drop the post
+            emit_alert(resolve_alert_sink(), payload)
+            return
+        if key in self._alerted_keys:
+            emit_alert(_REPEAT_ALERT_SINK, payload)
+            return
+        emit_alert(resolve_alert_sink(), payload)
+        self._alerted_keys.add(key)
+
+
+def _alert_dedupe_key(
+    event_name: str, instrument_id: object, now_ns: int
+) -> tuple[str, str, dt.date]:
+    """(event, instrument, UTC date). A raise here must reach ``_alert``, not ``@_guarded``."""
+    day = dt.datetime.fromtimestamp(now_ns / _NS, tz=dt.UTC).date()
+    return (event_name, str(instrument_id), day)

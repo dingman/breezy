@@ -185,18 +185,25 @@ def _deliver_with_proof(
     except Exception as exc:  # noqa: BLE001 - the failure IS the answer
         print(
             f"{_PROG}: NOT DELIVERED -- {type(exc).__name__} "
-            f"(message withheld: it can embed the webhook URL).",
+            f"(message withheld: it can embed the webhook URL). "
+            f"skipped_backoff=0 http4xx=0 probe=0",
             file=err,
         )
         return EXIT_DELIVERY_FAILED
     finally:
         _close_quietly(sink)
     if not proof.delivered:
-        print(f"{_PROG}: NOT DELIVERED -- status_class={proof.status_class}", file=err)
+        http4xx = 1 if proof.status_class == "4xx" else 0
+        print(
+            f"{_PROG}: NOT DELIVERED -- status_class={proof.status_class} "
+            f"skipped_backoff=0 http4xx={http4xx} probe=0",
+            file=err,
+        )
         return EXIT_DELIVERY_FAILED
     print(
         f"{_PROG}: delivered -- event={CHECK_ALERT_EVENT} "
-        f"severity={payload.severity} detail={CheckAlertDetail.OPERATOR_CHANNEL_TEST.value}",
+        f"severity={payload.severity} detail={CheckAlertDetail.OPERATOR_CHANNEL_TEST.value} "
+        f"skipped_backoff=0 http4xx=0 probe=0",
         file=out,
     )
     return EXIT_OK

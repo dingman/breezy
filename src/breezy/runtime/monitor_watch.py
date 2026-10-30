@@ -163,6 +163,9 @@ _SUMMARY_MARKERS: Final = (
     "outbox_write_failures=",
     "integrity_demand_write_failures=",
     "PRODUCER_INTRADAY_DEMAND",
+    "skipped_backoff=",
+    "http4xx=",
+    "probe=",
 )
 
 SummaryReader = Callable[[int, float], Sequence[str]]
