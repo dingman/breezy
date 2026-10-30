@@ -380,3 +380,21 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Before ending any cycle on a pending event, schedule the re-entry at the event time (CronCreate in-session, or the host timer), verify it with CronList/`systemctl --user list-timers`, and write the wake time in PROGRESS.md; a cycle end without a scheduled resumption or an explicit operator stop is a defect (CLAUDE.md "Cycle Lifecycle"). Inside a cycle, delegate gate runs, log reads and watches as single units with ≤15-line returns; main never runs Monitor or diagnostic Bash beyond one lookup.
 **Applied:** 2026-10-29
 **Last updated:** 2026-10-29
+
+### L-71 — Never run a Claude Code hook script by hand; it reads JSON from stdin and hangs (2026-10-30)
+**Mistake:** After the PROGRESS.md size hook blocked a commit, main invoked `.claude/hooks/progress-size-gate.sh` directly to re-check the size. Hooks read their tool-call JSON from stdin, so the Bash call blocked until it was stopped, costing a turn and a TaskStop.
+**Prevention:** Validate a hook's condition with the plain measurement it wraps (`wc -c docs/core/PROGRESS.md` against the 12288 B / 250-line budget), never by executing the hook script; if a hook must be exercised, pipe it the JSON it expects (`echo '{}' | hook.sh`) with a timeout.
+**Applied:** 2026-10-30
+**Last updated:** 2026-10-30
+
+### L-72 — The grok-bridge `runs` phase stays "starting"; it is not a stall signal (2026-10-30)
+**Mistake:** A watcher keyed on the bridge status field reported a Grok build as STALLED while the run was healthy; the `phase` shown by `grok-bridge.mjs runs` never leaves "starting" for the life of the job. The false stall triggered a needless re-check cycle.
+**Prevention:** Watch a Grok run by the grok process pid (`pgrep -f <run-id>` alive) and by the mtimes of the files it is meant to write or of its job log under `~/.claude/plugins/data/grok-build-xai-grok-build/state/<tree>/jobs/<run-id>.log`; declare a stall only when the pid is alive AND no watched mtime has advanced for the agreed window (15 min). Never cite the bridge phase field in a stall verdict.
+**Applied:** 2026-10-30
+**Last updated:** 2026-10-30
+
+### L-73 — Node logs write the level as `[ERROR]` inside ANSI codes; a padded ` ERROR ` grep counts zero (2026-10-30)
+**Mistake:** The Claude boot-log read reported 0 ERROR lines against Grok's 67 because its pattern was space-padded ` ERROR `; the node log emits `[ERROR]` wrapped in colour codes, so the pattern can never match. The disagreement was recorded as a measurement note only after a second read.
+**Prevention:** Count node-log levels with `\[ERROR\]` (or a bare `ERROR` token) and run a positive control on a line known to carry the level before reporting any count; a zero from a log grep without a positive control is a measurement defect, not a finding (same family as L-1's .venv rule).
+**Applied:** 2026-10-30
+**Last updated:** 2026-10-30
