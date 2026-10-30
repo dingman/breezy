@@ -1,0 +1,6 @@
+ALERT-4XX cause decider (journal only, read-only, ~15:20Z 10-30)
+Hourly 2xx: 10-29 00Z:249 (none later); 10-30 00Z:137 01Z:110 (none after 01:59Z). 4xx 10-29: 00:14 01:255 02:217 08-23 rising to 369/h (no rows 03-07); 10-30: 02:100 then 24-48/h.
+Daily 2xx totals 249 vs 247; 100% in the first 2 h; first 4xx within the same minute as the last 2xx; 0 2xx after the first 4xx; attempts after >60 s gaps post-cutoff: 164 (10-30) / 260 (10-29), all 4xx -> NOT per-minute rate limit; successes resume at 00:00Z -> NOT a rotated target; same events (component_degraded, unit_health_unit_failed, MAKER_ORDER_DENIED) 2xx early and 4xx later -> NOT payload rejection.
+Per event 2xx/4xx: MAKER_ORDER_DENIED 10-29 241/731, 10-30 212/85; unit_health_unit_failed 1/548, 6/105; component_degraded 1/0, 1/274.
+Drain rows cluster on :03/:08/... (cadence confirmed).
+VERDICT: DAILY SUCCESS QUOTA (~248/day) at the webhook provider, consumed in the first ~1-2 h of each UTC day, dominated by per-order MAKER_ORDER_DENIED WARNs; the 5-min redeliver drain of CRITICAL entries (~288 passes/day x entries) alone exceeds the quota. Priority: (d) emit dedupe = primary volume cut; (b) drain backoff = required; (a) exact code = diagnostic; (c) cap = secondary. Reserve quota for CRITICAL.
