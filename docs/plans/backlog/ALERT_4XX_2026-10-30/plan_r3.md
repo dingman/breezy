@@ -108,3 +108,13 @@ C6 [LOW] R5 `http4xx=` token: a non-zero value is NOT a monitor_watch FAIL kind 
 C7 [LOW] R3 "other outcomes → clear_backoff" stands; the bounded cost (one full pass after a 5xx/transport probe) is accepted and documented in the drain WARNING text.
 C8 [INFO] Not in scope (moot or out): the two-drainer race (run_deadman_drain has no caller), test_first_denial_after_restart_emits (covered by cold-start restart re-emit in D6).
 Pins: unchanged from D8 — re-pin aut2.label + aut6.health once; no byte pin; no C7 row; table edits only for _OUTBOX_WRITE_SCOPES, the writer table, the write-sites allowlist, _RECORD_KEYS.
+
+## 12. Post-build review deltas (binding; 4 blind reviews of 745ffc76, all APPROVE; 2026-10-30 18:45Z)
+P1 [MED] `_alert` dedupe-key `except Exception` logs the exception type (one line) before falling through to emit.
+P2 [MED] `_alerted_keys` is bounded: keep the current UTC date beside the set; when the date changes, clear the set.
+P3 [MED] MAKER_ORDER_FILLED is EXEMPT from dedupe (a fill is a trading outcome the operator must see each time; ≤ a handful/day). Every other non-CRITICAL kind stays deduped (C3).
+P4 [MED] Backoff is left UNCHANGED (neither set nor cleared) on 3xx and not_configured; cleared on 2xx, 5xx, transport and payload 4xx; set/extended only on {429,401,403,404,410}. Docstring and the R3 test matrix updated.
+P5 [LOW] `read_backoff` fails open on RecursionError and refuses a non-regular file (fstat S_ISREG) without blocking.
+P6 [MED] Quota worst case (two boots touch each UTC day → up to 2 × 5 kinds × 40 instruments = 400 > 248): add a per-process, per-UTC-day ceiling of 80 non-CRITICAL webhook posts in `_alert` (module constant `_NON_CRITICAL_WEBHOOK_POSTS_PER_DAY = 80`, reset with P2's date change; CRITICAL and FILLED never counted or capped); beyond the ceiling repeats go to LoggingAlertSink only, with ONE WARNING log when the ceiling trips. Two boots ⇒ ≤ 160, leaving ≥ 88 for CRITICAL/drain. This is an alert budget, not an operator control. RED: test_non_critical_webhook_posts_capped_per_utc_day; test_critical_and_filled_bypass_daily_cap.
+Accepted as-is (stated): key recorded even if the first emit fails (a quota-dead webhook would not deliver the repeat either); non-atomic set check off the kernel thread (worst case one duplicate post); sustained hold visibility stays with backlog ALERT-NO2XX.
+Then: re-pin aut2.label + aut6.health once (D8), full gate, read EXIT, ff, push, restart the node (the current boot spans 00:00Z, so only a restart today stops tomorrow's quota burn).
