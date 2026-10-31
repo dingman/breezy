@@ -1,7 +1,23 @@
 prereg_path docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_card_a.md
-prereg_sha256 4abc09159e4ea6c30af43e90c356263c78dc2e96decb2d5146f02ca4c5b2fffe
-frozen_at_commit dc5dfda4
-frozen_at_utc 2026-10-31T14:13:25Z
+prereg_sha256 9a2e12b07d95a2f7bc378ab23cfaa4fddae7983436ac72f8d2ad16ee24303ed8
+frozen_at_commit 18e040a4
+frozen_at_utc 2026-10-31T16:00:14Z
 looks_allowed 1
 status FROZEN
-reviews review_card_a_r0.md (r0: pm REVISE K1-K6 + arch REVISE; r1: pm APPROVE-TO-FREEZE, arch REVISE M1; r1.1: M1-M4 verified against the text by the coordinator)
+supersedes r1.1 freeze d9330e3d (sha 4abc0915...) — its D5 refused on the live store before any catalog read; no look was consumed
+reviews review_card_a_r0.md (r0, r1), review_card_a_build_r0.md (build r0 + P1 ruling), r2/r2.1/r2.2 architect reviews (REVISE, REVISE, APPROVE-TO-FREEZE-AFTER-DRYRUN), r2.3/r2.4 coordinator edits verified by git diff (B/F byte-identical to r1.1)
+dryrun_printout_begin
+D5 intents total: 166
+D5 resolved by (i) fill_by_fingerprint: 25
+D5 resolved by (ii) node log: 141
+D5 positive control matched/total: 25/25
+D5 unresolved: 0
+D5 unresolved per UTC created day: none
+D5 log files read: 99
+D5 symlinks followed: 76
+D5 first log timestamp read: 2026-09-05T20:19:49.004928122Z
+D5 last log timestamp read: 2026-10-31T00:02:40.605336852Z
+final denominator station-days: 149
+distinct dates: 37
+rc=0
+dryrun_printout_end
