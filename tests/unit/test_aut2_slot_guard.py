@@ -20,8 +20,8 @@ from breezy.analysis.labeling.slot_guard import (
 
 _REPO = Path(__file__).resolve().parents[2]
 _DEPLOY_DIR = _REPO / "deploy" / "systemd"
-#: the guard reads the STAGED WP6 unit pair: the deployed pair is symlink-installed and untouched
-_UNIT_DIR = _REPO / "tests" / "fixtures" / "aut2_units" / "promote"
+#: the guard reads the deployed (OPS-4 promoted) WP6 unit pair
+_UNIT_DIR = _DEPLOY_DIR
 _TIMER = (_UNIT_DIR / "breezy-score-live-trials.timer").read_text()
 _SERVICE = (_UNIT_DIR / "breezy-score-live-trials.service").read_text()
 _WRAPPER = _DEPLOY_DIR / "slot-guard-run.sh"

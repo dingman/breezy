@@ -48,6 +48,8 @@ from typing import Final
 
 import pytest
 
+from tests.support.systemd_size import parse_systemd_size
+
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DEPLOY_DIR: Final[Path] = _REPO_ROOT / "deploy" / "systemd"
 
@@ -365,22 +367,6 @@ _LOCK_PREAMBLE_WRAPPERS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_SIZE_MULTIPLIERS: Final[dict[str, int]] = {
-    "": 1,
-    "K": 1024,
-    "M": 1024**2,
-    "G": 1024**3,
-    "T": 1024**4,
-}
-_SIZE_RE: Final[re.Pattern[str]] = re.compile(r"^(\d+(?:\.\d+)?)([KMGT]?)$")
-
-
-def _parse_systemd_size(raw: str) -> float:
-    match = _SIZE_RE.match(raw.strip())
-    assert match is not None, f"unparseable systemd size literal: {raw!r}"
-    number, suffix = match.groups()
-    return float(number) * _SIZE_MULTIPLIERS[suffix]
-
 
 def _directive_value(unit_text: str, directive: str) -> str | None:
     prefix = f"{directive}="
@@ -399,7 +385,7 @@ def _discover_heavy_service_paths(search_dir: Path) -> list[Path]:
         memory_high = _directive_value(service_path.read_text(), "MemoryHigh")
         if memory_high is None:
             continue
-        if _parse_systemd_size(memory_high) >= _parse_systemd_size("12G"):
+        if parse_systemd_size(memory_high) >= parse_systemd_size("12G"):
             heavy.append(service_path)
     return heavy
 
@@ -657,7 +643,7 @@ def test_the_studies_slice_declares_its_own_memory_ceiling() -> None:
     memory_max = _directive_value(text, "MemoryMax")
     assert memory_high is not None
     assert memory_max is not None
-    assert _parse_systemd_size(memory_high) < _parse_systemd_size(memory_max)
+    assert parse_systemd_size(memory_high) < parse_systemd_size(memory_max)
 
 
 def test_the_ingest_unit_is_deprioritised_against_the_studies() -> None:

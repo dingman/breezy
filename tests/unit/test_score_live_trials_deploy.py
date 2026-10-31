@@ -1,5 +1,5 @@
 """RED-first suite for I3-deploy of
-`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` -- the new 14:15 UTC
+`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` -- the new 13:55 UTC (14:15 until OPS-4 moved it)
 `breezy-score-live-trials` unit pair + `deploy/systemd/
 score-live-trials-run.sh`. The counter (`structural_dead_stop.py`), the
 scorer (`score_live_trials.py`) and the node-env pre-flight leaf
@@ -693,7 +693,7 @@ def test_score_live_trials_unit_pair_exists_and_wires_to_wrapper() -> None:
 
     timer_text = timer_path.read_text()
     assert "Unit=breezy-score-live-trials.service" in timer_text
-    assert "OnCalendar=*-*-* 14:15:00 UTC" in timer_text
+    assert "OnCalendar=*-*-* 13:55:00 UTC" in timer_text
     assert "Persistent=true" in timer_text
 
 

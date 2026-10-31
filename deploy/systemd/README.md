@@ -962,7 +962,7 @@ ruling, not a deploy step.
 
 **Activation record (coordinator, 2026-09-05 04:19 UTC).** Symlinked both units into
 `~/.config/systemd/user/`, `daemon-reload` (also picks up `breezy-live-tally.service`'s new
-`Environment=` path line), `enable --now breezy-score-live-trials.timer` (next fire 14:15 UTC).
+`Environment=` path line), `enable --now breezy-score-live-trials.timer` (next fire 13:55 UTC).
 Pre-deploy checks: live store 0 fill rows (read-only), node-env pre-flight `MATCH` against the
 running node, full unit suite green through the no-egress gate. Smoke run
 (`systemctl --user start breezy-score-live-trials.service`): `Result=success`, exit 0,
@@ -971,7 +971,7 @@ running node, full unit suite green through the no-egress gate. Smoke run
 Chain evidence: `tests/contract/test_live_fill_scoring_chain_contract.py`; reviews:
 `docs/evidence/codex_fill_chain_review_2026-09-05.md`.
 
-`breezy-score-live-trials.service` + `.timer` run the 14:15 UTC increment of
+`breezy-score-live-trials.service` + `.timer` run the 13:55 UTC increment of
 `docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` (I3) via
 `deploy/systemd/score-live-trials-run.sh`, in the same wrapper-owns-the-work
 style as `live-tally-run.sh`. Each run: (1) a node-env pre-flight (`"$PY" -m
@@ -991,7 +991,7 @@ SOLE writer of that marker anywhere in this repo. Both `breezy-live-tally`
 (14:30 UTC) and `breezy-pm-crh-v2-tally` (17:15 UTC) assert it before
 tallying, so neither can run against a partial or unscored store (BLOCK-2).
 
-Scheduled at **14:15 UTC**, free on the existing schedule and strictly
+Scheduled at **13:55 UTC**, free on the existing schedule and strictly
 before both tallies it gates — pinned by
 `tests/unit/test_deploy_timer_hours.py`. The unit carries one non-secret
 `Environment=POLYMARKET_US_EXEC_STATE_DB=...` path literal, byte-identical
@@ -1025,7 +1025,7 @@ wrapper-owns-the-work style as `score-live-trials-run.sh` /
 `family-tally-v2-run.sh`. Each run invokes
 `scripts/analysis/position_monitor_nightly_report.py`, which joins the
 intra-day position monitor's own summary store (SHADOW-ONLY -- never
-submits, modifies, or cancels an order) against the 14:15 UTC live-fill
+submits, modifies, or cancels an order) against the 13:55 UTC live-fill
 scorer's store on `trial_id`, and writes one dated JSON + Markdown report
 under `~/.local/share/breezy/derived/`
 (`position_monitor_report_<date>.{json,md}`). When an INC-8 corpus summary
@@ -1046,7 +1046,7 @@ catalog root literal (`BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG`) as
 convention (`BREEZY_LIVE_TALLY_OUTPUT_DIR`) as both siblings.
 
 Scheduled at **15:00 UTC** -- free on the existing schedule, strictly after
-`breezy-score-live-trials` (14:15 UTC, the run that populates the
+`breezy-score-live-trials` (13:55 UTC, the run that populates the
 scored-trials store this report joins against), and outside the protected
 LST-union window -- pinned by `tests/unit/test_deploy_timer_hours.py`. The
 unit carries no `Environment=`/`EnvironmentFile=`: it holds no venue
@@ -1241,7 +1241,7 @@ templated `@.service` unit: the repo has no precedent for one, so this is
 a concrete pair per the existing convention.
 
 **I3 (2026-09-05):** the wrapper now asserts `breezy-score-live-trials`'s
-(14:15 UTC) dated success marker before invoking the CLI, exiting non-zero
+(13:55 UTC) dated success marker before invoking the CLI, exiting non-zero
 with one value-free log line when it is absent for today's date — never
 tallying a partial or unscored store (BLOCK-2 above).
 
@@ -1494,7 +1494,7 @@ would SIGTERM the RUNNING job, the exact 2026-09-11 shape this design
 avoids.
 
 **Light-job exemption.** `breezy-pm-crh-v2-tally` (17:15Z), `breezy-live-tally`
-(14:30Z) and `breezy-score-live-trials` (14:15Z) stay outside this scheme --
+(14:30Z) and `breezy-score-live-trials` (13:55Z) stay outside this scheme --
 each is <=1 GB / <=60 s, well under the exemption threshold, and none is
 retimed or wrapped by this item.
 
@@ -2023,3 +2023,22 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
   `systemctl --user enable --now breezy-maker-s2-trigger.timer`. To park again:
   `systemctl --user disable --now breezy-maker-s2-trigger.timer`. Nothing in the commit installs them.
 - **Launch window.** 10:05 is outside 16:30-17:10Z and free of every other timer tick.
+
+## `breezy-label-outcomes` — AUT-2 outcome-label run (OPS-4 promotion, PREPARED, NOT ACTIVATED)
+
+`breezy-label-outcomes.service` + `.timer` run the AUT-2 label pass (`breezy.analysis.labeling.label_run`)
+inside the shared `breezy-autonomy-bwrap` sandbox at **14:15 UTC** (primary) and **05:00 UTC**
+(catch-up), `Persistent=false`. It writes the labels, the run marker
+(`derived/label_outcomes/<day>/marker_<now_ns>.json`) and its own evidence; the portfolio ROI report
+reads that marker, and without it reports `GATED_IDENTITY`.
+
+* Slot: `breezy-score-live-trials.timer` moved 14:15 -> 13:55 UTC to give the scorer a head start (its
+  worst case ends 14:17:30). The scorer takes no studies lock, so the label run's in-process lock wait
+  never waits on it: 13:55 is an ordering margin, not a lock.
+* Memory: `MemoryMax=1G` / `MemoryHigh=966367641` come from the measured cgroup `memory.peak`
+  (the one committed `docs/evidence/OPS4_S1_label_run_peak_*.json`) via `size_from_peak()`; a ceiling above
+  4 GiB would be held by the label slot gate. `test_label_unit_memory_max_from_measured_label_peak` pins it.
+* Binds: the sandbox row also binds `evidence/alerts` (the alert delivery writes there).
+* Not enabled by this change: deployed units are symlinks, so a `daemon-reload` moves the scorer to 13:55
+  at once. Activation links the pair, enables the timer and reloads in one step inside the 04:30-13:55Z
+  window, then confirms `systemctl --user list-timers` and the first scheduled fire.

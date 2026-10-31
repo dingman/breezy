@@ -114,4 +114,5 @@ def test_the_real_deploy_dir_lints_clean_with_the_row() -> None:
         ("breezy-autonomy-alert-redeliver.service", "onfailure_scope"),
         ("breezy-autonomy-canary.service", "onfailure_scope"),
         ("breezy-autonomy-health.service", "onfailure_scope"),  # AUT-6 WP3 S2
+        ("breezy-label-outcomes.service", "onfailure_scope"),  # OPS-4 S1
     ]

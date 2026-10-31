@@ -594,6 +594,7 @@ class MeasureSeams:
     rss_bytes: Callable[[], int]
     proc_cgroup_text: str
     cgroup_root: Path
+    monotonic_ns: Callable[[], int] = time.monotonic_ns
 
 
 def read_cgroup_memory_peak(proc_cgroup_text: str, cgroup_root: Path) -> tuple[int, str]:
@@ -637,7 +638,9 @@ def measure_peak(
         print("LABEL_OUTCOMES MEASURE_ABORTED reason=memavailable")
         return RunResult(_RC_REFUSED, lines=("LABEL_OUTCOMES MEASURE_ABORTED reason=memavailable",))
     output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    started_ns = seams.monotonic_ns()
     result = run_labels(replace(deps, data_root=output_root, dry_run_root=output_root))
+    wall_time_ns = seams.monotonic_ns() - started_ns
     peak, cgroup = read_cgroup_memory_peak(seams.proc_cgroup_text, seams.cgroup_root)
     write_json_once(
         output_root,
@@ -654,6 +657,8 @@ def measure_peak(
             "git_sha": git_sha,
             "memory_max_during_measure": _memory_max(seams, cgroup),
             "measured_at_ns": deps.now_ns,
+            # OPS-4 D16: optional v1 field; int ns, the canonical writer refuses floats
+            "wall_time_ns": wall_time_ns,
         },
     )
     return result

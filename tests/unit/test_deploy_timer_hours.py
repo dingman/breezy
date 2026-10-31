@@ -148,29 +148,28 @@ def test_every_timer_file_is_parsed_by_this_test() -> None:
 
 
 def test_1415_utc_is_owned_by_exactly_one_timer() -> None:
-    # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md): 14:15 UTC is the new
-    # score-live-trials tick, free on the pre-existing schedule (09:00,
-    # 13:30, 14:30, 17:15, 22:30, 22:45, 00/06/12/18:15). This is a targeted
-    # restatement of the collision test above, scoped to the one tick this
-    # increment adds, so a future timer added at 14:15 fails loudly here
-    # even if the general collision test above were ever weakened.
+    # OPS-4: 14:15 UTC is the AUT-2 label run's primary slot (it was the I3
+    # score-live-trials tick until the scorer moved to 13:55). This is a
+    # targeted restatement of the collision test above, scoped to this one
+    # tick, so a future timer added at 14:15 fails loudly here even if the
+    # general collision test above were ever weakened.
     owners = [
         timer_path.name
         for timer_path in _all_timer_files()
         if ("14", "15") in _clock_ticks(timer_path)
     ]
-    assert owners == ["breezy-score-live-trials.timer"]
+    assert owners == ["breezy-label-outcomes.timer"]
 
 
-def test_1355_utc_is_unowned_in_deploy_until_aut2_promotes_the_tally_move() -> None:
-    # AUT-2 WP6 stages the tally's move to 13:55 in tests/fixtures/aut2_units/promote/. The
-    # installed units are symlinks, so nothing may claim 13:55 under deploy/systemd before then.
+def test_1355_utc_is_owned_by_the_score_live_trials_timer_alone() -> None:
+    # OPS-4 promoted the tally's move 14:15 -> 13:55 so its worst case (14:17:30) releases before
+    # the label run's studies-flock wait (14:15 + 600 s) expires.
     owners = [
         timer_path.name
         for timer_path in _all_timer_files()
         if ("13", "55") in _clock_ticks(timer_path)
     ]
-    assert owners == []
+    assert owners == ["breezy-score-live-trials.timer"]
 
 
 def test_a_periodic_timer_is_exempt_only_when_it_shares_a_unit_with_a_sibling(

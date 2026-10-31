@@ -59,6 +59,7 @@ _AUTONOMY_NOTIFIED_UNITS: Final[frozenset[str]] = frozenset(
         "breezy-autonomy-alert-redeliver.service",
         "breezy-autonomy-canary.service",
         "breezy-autonomy-health.service",
+        "breezy-label-outcomes.service",  # OPS-4 S1: the promoted AUT-2 label run
     }
 )
 

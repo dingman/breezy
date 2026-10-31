@@ -1,0 +1,36 @@
+# AUT-2 label run (OPS-4 promotion; plan docs/plans/backlog/OPS4_LABEL_PROMOTION_2026-10-30/plan_r2.md).
+# The studies lock is taken IN PROCESS by label_run (E7_STUDIES_LOCK, LABEL_FLOCK_WAIT_S = 600), so no
+# flock stands in front of the wrapper and the wait cannot age anything. Pre lines 5 + 5 = 10;
+# ExecStart K + T = 5 + 1785 = 1790; 10 + 1790 = 1800 (= TimeoutStartSec). The measured wall time is
+# read from the committed peak artefact's wall_time_ns; the unit test asserts 1800 >= 1.75 x wall.
+#
+# Memory: MemoryHigh/MemoryMax are taken EXACTLY from memory_gate.size_from_peak() over the measured
+# cgroup memory.peak in the one committed docs/evidence/OPS4_S1_label_run_peak_*.json artefact (a
+# re-run replaces it): MemoryMax = ceil_GiB(1.5 x peak) = 1G, MemoryHigh = 0.9 x Max, written as an
+# integer byte literal (966367641). test_label_unit_memory_max_from_measured_label_peak pins both.
+# A MemoryMax above 4 GiB would be held by label_slot_held, so this stays well inside the gate.
+#
+# Ordering margin (not a lock): the scorer runs at 13:55 and its worst case ends 14:17:30, but it takes no
+# studies lock, so label_run's wait never waits on it; 13:55 only gives the scorer a head start.
+# Overlap: breezy-quote-tape-ingest-frequent.timer also fires at 14:15 (ingest 6G) alongside this unit
+# (<= 1G measured) and the scorer's tail (5G, to 14:17:30), plus the live node (~16G of 30G).
+# Never in the launch window [16:30Z, 17:10Z).
+[Unit]
+Description=Breezy AUT-2 label run (user scope, sandboxed)
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Slice=breezy-studies.slice
+UMask=0077
+TimeoutStartSec=1800
+TimeoutStopSec=5
+MemoryHigh=966367641
+MemoryMax=1G
+ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/derived/labels %h/.local/share/breezy/derived/labels_canary %h/.local/share/breezy/derived/label_outcomes %h/.local/share/breezy/derived/canary %h/.local/share/breezy/derived/verdicts %h/.local/share/breezy/evidence/aut2 %h/.local/share/breezy/evidence/aut2_live_proof %h/.local/share/breezy/evidence/alerts %h/.local/share/breezy/cache/label_run_snapshot
+ExecStartPre=-/usr/bin/timeout -k 1 4 /usr/bin/touch %t/breezy-studies.lock
+ExecStart=/usr/bin/timeout -k 5 1785 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-label-outcomes /home/jon/breezy/.venv/bin/python3 -I -m breezy.analysis.labeling.label_run
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-label-outcomes

@@ -5,7 +5,7 @@
 # position-monitor-report-run.sh / family-tally-v2-run.sh: systemd's timer
 # owns the cadence, this script owns only the work.
 #
-# D2: gated on the SAME 14:15 UTC score-live-trials success marker
+# D2: gated on the SAME 13:55 UTC score-live-trials success marker
 # family-tally-v2-run.sh requires -- never on AUD-05's family tally (AUD-05
 # is open and this item must still produce a number while it is failing).
 #
@@ -38,9 +38,9 @@
 # scanned for a currency-shaped token ($, N.NN, USD) before being echoed;
 # a match withholds it in favour of a fixed marker line instead.
 #
-# Exit status: 0 on a completed report (including one whose roi_status is
-# gated -- a detected, reported condition is a success of the detector, per
-# section 6 D9, not a crash); 1 if the score-live-trials marker is absent
+# Exit status: 0 on a completed report (including roi_status
+# GATED_UNSETTLED_CAPITAL, a detected condition: AUD-04 section 6 D9); a label gate
+# or unpriced fill exits 1 (TE-1); 1 if the score-live-trials marker is absent
 # or the report script itself fails (a score-live-trials skip marker with a
 # closed reason is NO_INPUT, exit 0); 75 on lock-infrastructure failure; 0
 # on lock contention (SKIPPED, not a failure). Reported to `systemctl
@@ -91,7 +91,7 @@ flock -n 9                     || { say "SKIPPED -- another study holds the stud
 
 STAMP=$(date -u +%Y-%m-%d)
 
-# D2: the SAME 14:15 UTC score-live-trials success marker
+# D2: the SAME 13:55 UTC score-live-trials success marker
 # family-tally-v2-run.sh requires -- never AUD-05's family tally (open;
 # this item must still produce a number while it is failing).
 # AUT-6 WP3 S1: a by-design upstream skip (score-live-trials writes the

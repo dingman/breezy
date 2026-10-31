@@ -698,6 +698,75 @@ def test_measure_peak_writes_only_the_artefact_under_the_real_stores(tmp_path: P
     assert not list(deps.data_root.rglob("*"))  # the injected data root was never written
 
 
+def test_measure_peak_records_wall_time_of_the_run_labels_call_only(tmp_path: Path) -> None:
+    """OPS-4 D16: ``wall_time_ns`` is a monotonic delta around ``run_labels`` and nothing else."""
+    from breezy.analysis.labeling.label_run import MeasureSeams, measure_peak
+
+    proc_cgroup, root = _cgroup_tree(tmp_path, "1073741824\n")
+    out_root = tmp_path / "out"
+    out_root.mkdir(mode=0o700)
+    ticks = iter([100_000_000_000, 102_500_000_000])  # two reads: before and after run_labels
+    seams = MeasureSeams(
+        meminfo_path=_meminfo(tmp_path, 30 * 1024**2),
+        rss_bytes=lambda: 0,
+        proc_cgroup_text=proc_cgroup,
+        cgroup_root=root,
+        monotonic_ns=lambda: next(ticks),
+    )
+
+    measure_peak(
+        make_deps(tmp_path, deliver=Sink()),
+        output_root=out_root,
+        seams=seams,
+        invocation_id="inv-9",
+        git_sha="g" * 40,
+    )
+
+    (artefact,) = out_root.rglob("label_run_peak_*.json")
+    body = json.loads(artefact.read_text())
+    assert body["wall_time_ns"] == 2_500_000_000
+    assert next(ticks, None) is None  # the clock was read exactly twice
+
+
+def test_measure_peak_artefact_stays_schema_v1_with_wall_time_as_an_added_field(
+    tmp_path: Path,
+) -> None:
+    """Schema decision: v1 plus one optional field. No reader keys on the field set (the sizing
+    consumers read ``memory_peak_bytes`` only), so a v2 bump would break S0 evidence for nothing."""
+    from breezy.analysis.labeling.label_run import MeasureSeams, measure_peak
+
+    proc_cgroup, root = _cgroup_tree(tmp_path, "1073741824\n")
+    out_root = tmp_path / "out"
+    out_root.mkdir(mode=0o700)
+    seams = MeasureSeams(_meminfo(tmp_path, 30 * 1024**2), lambda: 0, proc_cgroup, root)
+
+    measure_peak(
+        make_deps(tmp_path, deliver=Sink()),
+        output_root=out_root,
+        seams=seams,
+        invocation_id=None,
+        git_sha="g" * 40,
+    )
+
+    (artefact,) = out_root.rglob("label_run_peak_*.json")
+    body = json.loads(artefact.read_text())
+    assert body["schema"] == "aut2_memory_peak/v1"
+    assert set(body) == {
+        "schema",
+        "transient_unit",
+        "invocation_id",
+        "memory_peak_bytes",
+        "cgroup_path",
+        "durable_fill_count",
+        "git_sha",
+        "memory_max_during_measure",
+        "measured_at_ns",
+        "wall_time_ns",
+    }
+    wall = body["wall_time_ns"]
+    assert isinstance(wall, int) and not isinstance(wall, bool) and wall >= 0  # real clock
+
+
 def _meminfo(tmp_path: Path, kib: int) -> Path:
     path = tmp_path / "meminfo2"
     path.write_text(f"MemAvailable:   {kib} kB\n")

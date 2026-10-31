@@ -157,6 +157,9 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # STRAT-DESIGN Card A: the `--census-only` evaluator imports the execution package,
     # so source (c) picks it up.
     "scripts.analysis.wp7b_census",
+    # OPS-4 S1: the promoted `breezy-label-outcomes.service` runs `-m ...labeling.label_run`
+    # (WIDENED by this one reviewed row; the meta-test below names it if it is ever dropped).
+    "breezy.analysis.labeling.label_run",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

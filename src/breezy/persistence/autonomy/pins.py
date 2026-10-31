@@ -38,7 +38,9 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin: EXEC-FOREIGN-POS Stage B (exec/client.py, exec/reports.py,
         # current_rung_hold/trial_day_latch.py; label_run closure only);
         # was 0221aa56...cba1
-        "aut2.label": "8e49a377551bf3fecba0f09b4bd7e10d40716a71ce3592f1defcdbe5235bb5b1",
+        # re-pin: OPS-4 S1 (table.py evidence/alerts bind, label_run wall_time_ns; shared with
+        # aut6.health via table.py); was 8e49a377...b5b1
+        "aut2.label": "c0fb987c23ab09e45f2297b421446504ee7d50548125cdc6e0d4ae4ff8607010",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17
         # re-pin on arm/integration (ARM D1: breezy-maker-loss-stop.timer row in
         # monitor_watch.TIMER_MAX_INTERVAL_S); was c615691d...2b9a
@@ -46,7 +48,9 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # re-pin at p4/arm (health_dropins.DROPIN_ALLOWLIST emptied; orders-off row
         # removed); was caa4d114...c832
         # re-pin: same table.py residual yield (shared with aut2.label); was 8a4723a0...e5ac
-        "aut6.health": "456a5307677ebdaeb69aa8b8a6b25cee620e683879fdb350eb1c85f6b444121b",
+        # re-pin: OPS-4 S1 (table.py evidence/alerts bind, monitor_watch label timer row);
+        # was 456a5307...121b
+        "aut6.health": "ac4a7c05b322e839f18cb7f3efe5ec2c55c8ce69d8afe4dd4149fc0852422d8c",
     }
 )
 REVOKED_SOURCE_SHA256: Final[frozenset[str]] = frozenset()

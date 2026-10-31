@@ -304,8 +304,9 @@ _CAPTURE_ROWS: Final[tuple[BwrapRow, ...]] = (
 #: AUT-2 WP6 (E-15; AUT-1 ``_CAPTURE_ROWS`` precedent): the label run. It writes the C2 labels,
 #: their canary twin, the run marker, the verdicts and its own evidence, and reads the exec store
 #: only through a snapshot copy in its cache bind (``exec_snapshot(take_flock=False)``). Egress is
-#: declared (DNS and network) for the injected delivery seam; it binds no ``evidence/alerts``
-#: before AUT-6.
+#: declared (DNS and network) for the injected delivery seam; it binds ``evidence/alerts`` (OPS-4,
+#: after AUT-6): the delivery writes the alert outbox there. The dry-run delivery of
+#: ``--measure-peak`` never exercises the bind, so only the first live fire proves it.
 #:
 #: Accepted exception (security review, WP6): the row combines a read-only bind of the whole data
 #: root with declared egress, and carries no credentials (``credential_names`` and
@@ -323,6 +324,7 @@ _LABEL_OUTCOMES_ROW: Final = BwrapRow(
         "derived/verdicts",
         "evidence/aut2",
         "evidence/aut2_live_proof",
+        "evidence/alerts",
         "cache/label_run_snapshot",
     ),
     entry_modules=("breezy.analysis.labeling.label_run",),

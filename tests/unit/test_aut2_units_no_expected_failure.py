@@ -23,7 +23,6 @@ from tests.support.aut2_run_fixtures import FQ_KIND, Sink, make_deps
 from tests.unit.test_aut2_label_run import _Lock
 
 _DEPLOY = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
-_FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "aut2_units"
 _WP9 = "AUT-2 WP9 lands the reconcile units"
 
 
@@ -111,8 +110,8 @@ def test_every_aut2_unit_exits_nonzero_on_genuine_failure(unit: str, tmp_path: P
     assert "SuccessExitStatus" not in service and "ExecStartPost" not in service
 
 
-def test_the_label_fixture_unit_masks_no_exit_status() -> None:
-    service = (_FIXTURES / f"{LABEL_UNIT}.service").read_text()
+def test_the_label_unit_masks_no_exit_status() -> None:
+    service = (_DEPLOY / f"{LABEL_UNIT}.service").read_text()
 
     assert "SuccessExitStatus" not in service and "|| true" not in service
     assert FQ_KIND  # keep the shared import honest: the label unit is the FQ family's

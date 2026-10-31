@@ -1,20 +1,24 @@
-"""AUT-2 r7 WP6 / section 3.10: the label unit fixtures, its bwrap row and the tally timer move.
+"""AUT-2 r7 WP6 / section 3.10 and OPS-4 S1: the label unit, its bwrap row and the tally timer move.
 
-The label unit is a FIXTURE under ``tests/fixtures/aut2_units/`` (AUT-1 stage-3 precedent: it is
-promoted into ``deploy/systemd/`` only once AUT-6's notifier row and ``deliver_with_proof`` exist).
-Nothing here installs, enables or starts a unit.
+The label unit pair and the 13:55 scorer pair live in ``deploy/systemd/`` (OPS-4 promoted them out
+of the retired AUT-2 unit fixture directory). Nothing here installs, enables or starts a unit:
+deployed units are symlinks, so activation is a separate host step.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 
+import pytest
+
 from breezy.analysis.labeling import constants as c
+from breezy.analysis.labeling.memory_gate import MemorySizing, size_from_peak
 from breezy.runtime.autonomy_sandbox.table import AUTONOMY_BWRAP_TABLE, BwrapRow
 from breezy.runtime.autonomy_sandbox.unit_lint import (
     WRAPPER_PATH,
@@ -22,13 +26,13 @@ from breezy.runtime.autonomy_sandbox.unit_lint import (
     parse_unit,
     start_phase_bound_s,
 )
+from tests.support.systemd_size import parse_systemd_size
 
 _REPO = Path(__file__).resolve().parents[2]
-FIXTURES = _REPO / "tests" / "fixtures" / "aut2_units"
+RETIRED_FIXTURES = _REPO / "tests" / "fixtures" / "aut2_units"  # retired by OPS-4 S1; stays absent
 DEPLOY = _REPO / "deploy" / "systemd"
-#: The WP6 versions of the score-live-trials unit pair, staged until promotion: the deployed pair is
-#: installed by symlink, so an edit to it goes live on the next daemon-reload.
-PROMOTE = FIXTURES / "promote"
+EVIDENCE = _REPO / "docs" / "evidence"
+PEAK_ARTEFACT_GLOB = "OPS4_S1_label_run_peak_*.json"
 LABEL = "breezy-label-outcomes"
 SCORE = "breezy-score-live-trials"
 STAND_IN = BwrapRow(
@@ -107,37 +111,33 @@ def _meets_window(start: dt.datetime, end: dt.datetime) -> bool:
 # -- the fixture set and lint ----------------------------------------------------------------------
 
 
-def test_fixture_set_is_exactly_the_label_pair_and_the_staged_promote_directory() -> None:
-    assert sorted(p.name for p in FIXTURES.iterdir()) == [
-        f"{LABEL}.service",
-        f"{LABEL}.timer",
-        "promote",
-    ]
-    assert sorted(p.name for p in PROMOTE.iterdir()) == [
-        "README.md",
-        f"{SCORE}.service",
-        f"{SCORE}.timer",
-    ]
+def test_label_pair_is_deployed_and_the_fixture_directory_is_gone() -> None:
+    assert (DEPLOY / f"{LABEL}.service").is_file() and (DEPLOY / f"{LABEL}.timer").is_file()
+    assert not RETIRED_FIXTURES.exists()  # every reader points at deploy/systemd/ (OPS-4 section 3)
 
 
 def test_label_unit_lints_clean_against_a_standin_notifier_row() -> None:
-    assert lint_units(FIXTURES, _table(STAND_IN)) == ()
+    errors = lint_units(DEPLOY, _table(STAND_IN))
+
+    assert [e for e in errors if e.unit.startswith(LABEL)] == []
 
 
-def test_label_unit_fails_lint_only_on_aut6_onfailure_scope() -> None:
-    errors = lint_units(FIXTURES, AUTONOMY_BWRAP_TABLE)
+def test_label_unit_fails_real_tree_lint_only_on_aut6_onfailure_scope() -> None:
+    errors = lint_units(DEPLOY, AUTONOMY_BWRAP_TABLE)
 
-    assert [(e.unit, e.rule) for e in errors] == [(f"{LABEL}.service", "onfailure_scope")]
+    assert [(e.unit, e.rule) for e in errors if e.unit.startswith(LABEL)] == [
+        (f"{LABEL}.service", "onfailure_scope")
+    ]
 
 
 def test_the_unit_text_already_carries_the_autonomy_failed_onfailure() -> None:
-    assert _values(_text(FIXTURES, LABEL, "service"), "Unit", "OnFailure") == [
+    assert _values(_text(DEPLOY, LABEL, "service"), "Unit", "OnFailure") == [
         "breezy-autonomy-failed@%n.service"
     ]
 
 
 def test_execstart_runs_through_the_bwrap_wrapper_with_the_label_run_module() -> None:
-    line = _one(_text(FIXTURES, LABEL, "service"), "Service", "ExecStart")
+    line = _one(_text(DEPLOY, LABEL, "service"), "Service", "ExecStart")
     tokens = shlex.split(line)
 
     assert tokens[:2] == ["/usr/bin/timeout", "-k"] and WRAPPER_PATH in tokens
@@ -152,7 +152,9 @@ def test_execstart_runs_through_the_bwrap_wrapper_with_the_label_run_module() ->
 
 
 def test_label_unit_has_no_wrapper_script_in_front_of_the_sandbox() -> None:
-    assert not any(p.suffix == ".sh" for p in FIXTURES.iterdir())
+    service = _text(DEPLOY, LABEL, "service")
+
+    assert not any(".sh" in token for token in shlex.split(_one(service, "Service", "ExecStart")))
 
 
 # -- the bwrap row (E-15) --------------------------------------------------------------------------
@@ -180,13 +182,14 @@ def test_label_row_binds_exactly_the_label_writers_and_the_snapshot_cache() -> N
         "derived/verdicts",
         "evidence/aut2",
         "evidence/aut2_live_proof",
+        "evidence/alerts",
         "cache/label_run_snapshot",
     }
-    assert not any("alerts" in b or b.startswith("state") for b in row.binds)
+    assert not any(b.startswith("state") for b in row.binds)
 
 
 def test_the_pre_install_line_creates_exactly_the_row_binds() -> None:
-    text = _text(FIXTURES, LABEL, "service")
+    text = _text(DEPLOY, LABEL, "service")
     install = next(p for p in _values(text, "Service", "ExecStartPre") if "/usr/bin/install" in p)
     made = {
         t.removeprefix("%h/.local/share/breezy/")
@@ -202,27 +205,27 @@ def test_the_pre_install_line_creates_exactly_the_row_binds() -> None:
 
 def test_no_aut2_oneshot_sets_runtime_max_sec() -> None:
     for kind in ("service", "timer"):
-        assert "RuntimeMaxSec" not in _text(FIXTURES, LABEL, kind)
+        assert "RuntimeMaxSec" not in _text(DEPLOY, LABEL, kind)
 
 
 def test_the_runtime_max_sec_scan_has_a_positive_control() -> None:
-    planted = _text(FIXTURES, LABEL, "service") + "\nRuntimeMaxSec=600\n"
+    planted = _text(DEPLOY, LABEL, "service") + "\nRuntimeMaxSec=600\n"
 
     assert _values(planted, "Service", "RuntimeMaxSec") == ["600"]
-    assert _values(_text(FIXTURES, LABEL, "service"), "Service", "RuntimeMaxSec") == []
+    assert _values(_text(DEPLOY, LABEL, "service"), "Service", "RuntimeMaxSec") == []
 
 
 def test_aut2_oneshots_set_timeout_start_sec_equal_to_constants() -> None:
-    service = _text(FIXTURES, LABEL, "service")
+    service = _text(DEPLOY, LABEL, "service")
 
     assert _seconds(_one(service, "Service", "TimeoutStartSec")) == c.LABEL_TIMEOUT_START_S == 1800
-    pre = start_phase_bound_s(FIXTURES / f"{LABEL}.service")
+    pre = start_phase_bound_s(DEPLOY / f"{LABEL}.service")
     k_plus_t = sum(int(t) for t in shlex.split(_one(service, "Service", "ExecStart"))[2:4])
     assert pre + k_plus_t == c.LABEL_TIMEOUT_START_S  # E-9: P + X <= S, exactly on the bound
 
 
 def test_aut2_oneshots_set_timeout_stop_sec_5() -> None:
-    service = _text(FIXTURES, LABEL, "service")
+    service = _text(DEPLOY, LABEL, "service")
 
     assert _one(service, "Service", "TimeoutStopSec") == "5" and c.TIMEOUT_STOP_S == 5
     planted = service.replace("TimeoutStopSec=5\n", "")
@@ -230,7 +233,7 @@ def test_aut2_oneshots_set_timeout_stop_sec_5() -> None:
 
 
 def test_aut2_timers_accuracy_1s_no_random_delay_not_persistent() -> None:
-    timer = _text(FIXTURES, LABEL, "timer")
+    timer = _text(DEPLOY, LABEL, "timer")
 
     assert _values(timer, "Timer", "AccuracySec") == ["1s"]
     assert _values(timer, "Timer", "RandomizedDelaySec") == ["0"]
@@ -240,11 +243,11 @@ def test_aut2_timers_accuracy_1s_no_random_delay_not_persistent() -> None:
 
 
 def test_label_timer_fires_at_1415_and_0500_utc() -> None:
-    assert _calendar_times(_text(FIXTURES, LABEL, "timer")) == [dt.time(14, 15), dt.time(5, 0)]
+    assert _calendar_times(_text(DEPLOY, LABEL, "timer")) == [dt.time(14, 15), dt.time(5, 0)]
 
 
 def test_label_slots_clear_launch_window() -> None:
-    timer, service = _text(FIXTURES, LABEL, "timer"), _text(FIXTURES, LABEL, "service")
+    timer, service = _text(DEPLOY, LABEL, "timer"), _text(DEPLOY, LABEL, "service")
 
     for start in _calendar_times(timer):
         begin = dt.datetime.combine(DAY, start, tzinfo=dt.UTC)
@@ -261,7 +264,7 @@ def test_label_slots_clear_launch_window() -> None:
 
 
 def test_window_arithmetic_reads_accuracy_from_timer_file() -> None:
-    timer, service = _text(FIXTURES, LABEL, "timer"), _text(FIXTURES, LABEL, "service")
+    timer, service = _text(DEPLOY, LABEL, "timer"), _text(DEPLOY, LABEL, "service")
     slower = timer.replace("AccuracySec=1s", "AccuracySec=2h")
 
     assert _worst_end(dt.time(14, 15), slower, service) > _worst_end(
@@ -274,7 +277,7 @@ def test_window_arithmetic_reads_accuracy_from_timer_file() -> None:
 
 
 def test_window_arithmetic_includes_timeout_stop_sec() -> None:
-    timer, service = _text(FIXTURES, LABEL, "timer"), _text(FIXTURES, LABEL, "service")
+    timer, service = _text(DEPLOY, LABEL, "timer"), _text(DEPLOY, LABEL, "service")
     no_stop = service.replace("TimeoutStopSec=5\n", "")
 
     assert (
@@ -283,7 +286,7 @@ def test_window_arithmetic_includes_timeout_stop_sec() -> None:
 
 
 def test_score_live_trials_tally_releases_before_label_flock_wait_expires() -> None:
-    timer, service = _text(PROMOTE, SCORE, "timer"), _text(PROMOTE, SCORE, "service")
+    timer, service = _text(DEPLOY, SCORE, "timer"), _text(DEPLOY, SCORE, "service")
     (tally,) = _calendar_times(timer)
 
     end = _worst_end(tally, timer, service)
@@ -297,7 +300,7 @@ def test_score_live_trials_tally_releases_before_label_flock_wait_expires() -> N
 
 
 def test_score_live_trials_slot_clears_launch_window() -> None:
-    timer, service = _text(PROMOTE, SCORE, "timer"), _text(PROMOTE, SCORE, "service")
+    timer, service = _text(DEPLOY, SCORE, "timer"), _text(DEPLOY, SCORE, "service")
     (tally,) = _calendar_times(timer)
 
     assert not _meets_window(
@@ -319,47 +322,43 @@ def _ticks_of(directory: Path, *, skip: set[str] | None = None) -> dict[str, set
     return found
 
 
-def test_the_staged_set_shares_no_tick_with_any_deployed_timer_it_does_not_replace() -> None:
-    """The label timer (14:15, 05:00) and the staged tally timer (13:55) must each be free in the
-    deployed schedule once the deployed tally timer, which the staged one replaces, is set aside."""
-    staged = {t for ticks in _ticks_of(FIXTURES).values() for t in ticks} | {dt.time(13, 55)}
-    deployed = _ticks_of(DEPLOY, skip={f"{SCORE}.timer"})
+def test_the_label_and_tally_timers_share_no_tick_with_any_other_deployed_timer() -> None:
+    """The label timer (14:15, 05:00) and the tally timer (13:55) own their ticks outright."""
+    ticks = _ticks_of(DEPLOY)
+    mine = {f"{LABEL}.timer", f"{SCORE}.timer"}
+    owned = ticks[f"{LABEL}.timer"] | ticks[f"{SCORE}.timer"]
 
-    assert [name for name, ticks in deployed.items() if ticks & staged] == []
-
-
-def test_the_staged_tally_timer_replaces_exactly_the_deployed_1415_tick() -> None:
-    assert _ticks_of(DEPLOY)[f"{SCORE}.timer"] == {dt.time(14, 15)}
-    assert _ticks_of(PROMOTE)[f"{SCORE}.timer"] == {dt.time(13, 55)}
+    assert [name for name, t in ticks.items() if name not in mine and t & owned] == []
 
 
-# -- the installed units stay untouched until promotion ------------------------------------------
+def test_the_deployed_tally_timer_owns_1355_and_the_label_timer_owns_1415() -> None:
+    ticks = _ticks_of(DEPLOY)
+
+    assert ticks[f"{SCORE}.timer"] == {dt.time(13, 55)}
+    assert ticks[f"{LABEL}.timer"] == {dt.time(14, 15), dt.time(5, 0)}
 
 
-def test_deployed_score_live_trials_pair_is_the_pre_aut2_version() -> None:
-    """Installed by symlink: an edit goes live at the next daemon-reload, before the label unit
-    exists. The WP6 versions live only in the promote fixture directory."""
+# -- the promoted tally pair ----------------------------------------------------------------------
+
+
+def test_deployed_score_live_trials_pair_is_the_promoted_wp6_version() -> None:
     service = _text(DEPLOY, SCORE, "service")
     timer = _text(DEPLOY, SCORE, "timer")
-
-    assert _values(service, "Service", "ExecCondition") == []
-    assert "slot-guard" not in service and "slot-guard" not in timer
-    assert _values(timer, "Timer", "OnCalendar") == ["*-*-* 14:15:00 UTC"]
-
-
-def test_the_promote_fixtures_are_the_wp6_versions() -> None:
-    service = _text(PROMOTE, SCORE, "service")
-    timer = _text(PROMOTE, SCORE, "timer")
 
     assert _values(service, "Service", "ExecCondition") == [
         "/home/jon/breezy/deploy/systemd/slot-guard-run.sh --unit breezy-score-live-trials"
     ]
     assert _values(service, "Unit", "OnFailure") == ["breezy-study-failed@%n.service"]
+    assert _values(service, "Service", "MemoryHigh") == ["4G"]
+    assert _values(service, "Service", "MemoryMax") == ["5G"]
     assert _values(timer, "Timer", "OnCalendar") == ["*-*-* 13:55:00 UTC"]
     assert _values(timer, "Timer", "Persistent") == ["true"]
+    assert "14:15" not in "\n".join(
+        ln for ln in service.splitlines() + timer.splitlines() if not ln.startswith("#")
+    )
 
 
-def test_no_deployed_file_references_slot_guard_run_until_promotion() -> None:
+def test_the_scorer_service_is_the_only_referrer_of_slot_guard_run() -> None:
     offenders = [
         path.name
         for path in sorted(DEPLOY.rglob("*"))
@@ -367,7 +366,13 @@ def test_no_deployed_file_references_slot_guard_run_until_promotion() -> None:
         and path.name != "slot-guard-run.sh"
         and "slot-guard-run" in _safe_text(path)
     ]
-    assert offenders == []
+    assert offenders == [f"{SCORE}.service"]
+
+
+def test_the_scorer_service_names_slot_guard_run_in_exactly_one_line() -> None:
+    lines = [ln for ln in _text(DEPLOY, SCORE, "service").splitlines() if "slot-guard-run" in ln]
+
+    assert len(lines) == 1 and lines[0].startswith("ExecCondition=")
 
 
 def _safe_text(path: Path) -> str:
@@ -377,15 +382,91 @@ def _safe_text(path: Path) -> str:
         return ""
 
 
-# -- WP6-size is deferred ---------------------------------------------------------------------
+# -- the measured label sizing (OPS-4 S0 artefact; plan D1, D12, D16, D17) -------------------------
 
 
-def test_label_unit_memory_lines_are_deferred_to_the_measured_sizing_commit() -> None:
-    """The coordinator measures the label run's own cgroup peak and adds ``MemoryHigh``/
-    ``MemoryMax`` with the evidence artefact in one reviewed commit (plan WP6, Q1/V9)."""
-    service = _text(FIXTURES, LABEL, "service")
+def _sole_peak_artefact(directory: Path) -> Path:
+    """The ONE committed S0 artefact: zero or several matches both fail (a re-run replaces it)."""
+    matches = sorted(directory.glob(PEAK_ARTEFACT_GLOB))
+    assert len(matches) == 1, f"expected exactly one {PEAK_ARTEFACT_GLOB}, found {matches}"
+    return matches[0]
 
-    assert "WP6-SIZE" in service
-    assert _values(service, "Service", "MemoryMax") == []
-    assert _values(service, "Service", "MemoryHigh") == []
+
+def _artefact() -> dict[str, object]:
+    return json.loads(_sole_peak_artefact(EVIDENCE).read_text(encoding="utf-8"))
+
+
+def _peak_bytes() -> int:
+    peak = _artefact()["memory_peak_bytes"]
+    assert isinstance(peak, int) and not isinstance(peak, bool) and peak > 0
+    return peak
+
+
+def _declared_limits(service: str) -> tuple[int, int]:
+    high = int(parse_systemd_size(_one(service, "Service", "MemoryHigh")))
+    return high, int(parse_systemd_size(_one(service, "Service", "MemoryMax")))
+
+
+def _memory_max_satisfies_measured_ceiling(declared_bytes: int, peak_bytes: int) -> bool:
+    """D1/D12: MemoryMax is exactly ``size_from_peak(peak)`` and inside the 4 GiB label gate."""
+    sizing = size_from_peak(peak_bytes)
+    return (
+        isinstance(sizing, MemorySizing)
+        and declared_bytes == sizing.memory_max_bytes
+        and declared_bytes <= c.LABEL_MEMORY_TARGET_GIB * 1024**3
+    )
+
+
+def test_exactly_one_peak_artefact_is_committed_and_zero_or_two_fail(tmp_path: Path) -> None:
+    assert _sole_peak_artefact(EVIDENCE).name.startswith("OPS4_S1_label_run_peak_")
+    with pytest.raises(AssertionError):  # positive control: none
+        _sole_peak_artefact(tmp_path)
+    (tmp_path / "OPS4_S1_label_run_peak_1.json").write_text("{}")
+    assert _sole_peak_artefact(tmp_path).name == "OPS4_S1_label_run_peak_1.json"
+    (tmp_path / "OPS4_S1_label_run_peak_2.json").write_text("{}")
+    with pytest.raises(AssertionError):  # positive control: two
+        _sole_peak_artefact(tmp_path)
+
+
+def test_the_committed_peak_artefact_is_a_measured_label_run_with_a_wall_time() -> None:
+    body = _artefact()
+    peak = body["memory_peak_bytes"]
+
+    assert body["schema"] == "aut2_memory_peak/v1"
+    assert isinstance(peak, int) and not isinstance(peak, bool) and peak > 0
+    assert isinstance(body["git_sha"], str) and body["git_sha"] not in ("", "unknown")
+    wall_ns = body["wall_time_ns"]
+    assert isinstance(wall_ns, int) and not isinstance(wall_ns, bool) and wall_ns > 0
+    wall = wall_ns / 1e9
+    # D16: the first-measurement bound (RuntimeMaxSec=1800) is the unit's TimeoutStartSec
+    timeout = _seconds(_one(_text(DEPLOY, LABEL, "service"), "Service", "TimeoutStartSec"))
+    assert timeout >= 1.75 * wall
+
+
+def test_label_unit_memory_max_from_measured_label_peak() -> None:
+    sizing = size_from_peak(_peak_bytes())
+    service = _text(DEPLOY, LABEL, "service")
+    declared_high, declared_max = _declared_limits(service)
+
+    assert isinstance(sizing, MemorySizing)  # D1: not SizingExceedsCap
+    assert _memory_max_satisfies_measured_ceiling(declared_max, _peak_bytes())
+    assert declared_high == sizing.memory_high_bytes
+    assert declared_max == 1024**3 and declared_high == 966367641
+
+
+def test_a_planted_too_low_memory_max_fails_the_measured_ceiling_check() -> None:
+    service = _text(DEPLOY, LABEL, "service")
+    planted = re.sub(r"(?m)^MemoryMax=.*$", "MemoryMax=256M", service)
+    _high, planted_max = _declared_limits(planted)
+
+    assert planted_max == 256 * 1024**2
+    assert _memory_max_satisfies_measured_ceiling(_declared_limits(service)[1], _peak_bytes())
+    assert not _memory_max_satisfies_measured_ceiling(planted_max, _peak_bytes())  # the real check
+
+
+def test_label_unit_keeps_the_studies_slice_and_carries_no_stale_markers() -> None:
+    service = _text(DEPLOY, LABEL, "service")
+
     assert _values(service, "Service", "Slice") == ["breezy-studies.slice"]
+    assert "WP6-SIZE" not in service
+    assert "slot-guard-run" not in service  # D18
