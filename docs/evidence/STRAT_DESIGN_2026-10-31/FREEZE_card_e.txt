@@ -1,0 +1,6 @@
+FREEZE Card E run 1 — 2026-10-31T04:43:02Z
+prereg: docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_r2_1.md
+prereg_sha256: 4f490f4b255ab34b214251f19500f66ed487bb68a4e780a7e8c3108c09d34070
+stations_sha256: 89c6ed6a867078ff2fc5cc1eef58fc20e91c1c1ffff9f1445833b4bb1718ccba
+frozen_at_commit: 011603ff
+looks_allowed: 1 (L-34)
