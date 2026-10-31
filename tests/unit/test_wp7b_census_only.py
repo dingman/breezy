@@ -19,6 +19,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts" / "analysis").as_posix())
 
+import forecast_cheap_screen_wp7 as fcs  # type: ignore[import-not-found]
 import wp7b_census as census  # type: ignore[import-not-found]
 from h4_preliminary_economic_read import parse_rung  # type: ignore[import-not-found]
 from nautilus_trader.core.uuid import UUID4
@@ -174,6 +175,55 @@ def _fill(instrument_id: str) -> bytes:
 
 def _listing(root: Path) -> list[str]:
     return sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+
+
+CAT_LOW = "tc-temp-nychigh-2026-09-22-lt80f.POLYMARKET_US"
+CAT_HIGH = "tc-temp-nychigh-2026-09-22-gte80f.POLYMARKET_US"
+_NO_OWN = census.OwnSet(instrument_ids=(), first_ns={})
+
+
+def _refuses(call: object, capsys: pytest.CaptureFixture[str], needle: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        call()  # type: ignore[operator]
+    assert exc.value.code == 2
+    assert needle in capsys.readouterr().err
+
+
+def _make_catalog(root: Path, ids: tuple[str, ...] = (CAT_LOW, CAT_HIGH)) -> Path:
+    depth = root / "data" / "order_book_depths"
+    depth.mkdir(parents=True, exist_ok=True)
+    for instrument_id in ids:
+        (depth / instrument_id).mkdir(exist_ok=True)
+    return root
+
+
+def _instants(ask_size: float = 5.0) -> list[object]:
+    return [
+        fcs.RungInstant(
+            ts_ns=_ns(stamp),
+            local_date=DAY,
+            hour_lst=13,
+            ask=0.4,
+            ask_size=ask_size,
+            bid=0.3,
+            bid_size=ask_size,
+        )
+        for stamp in ("2026-09-21T16:00:00", "2026-09-21T18:00:00")
+    ]
+
+
+def _stub_world(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: Path,
+    *,
+    tape: object = None,
+    fees: dict[str, str] | None = None,
+) -> None:
+    """A two-rung catalog, a canned tape reader and fee map. No real store, no network."""
+    _make_catalog(catalog)
+    monkeypatch.setattr(fcs, "read_rung_tape", tape or (lambda *_a, **_k: (_instants(), 2)))
+    fee_map = {CAT_LOW: "0.0695", CAT_HIGH: "0.0695"} if fees is None else fees
+    monkeypatch.setattr(census, "_load_fee_map", lambda _catalog: dict(fee_map))
 
 
 def test_sha_mismatch_refuses_exit_2(
@@ -422,14 +472,18 @@ def test_atomic_emit_and_same_sha_refusal(tmp_path: Path) -> None:
     assert (out / "card_a_census.md").read_bytes() == before
 
 
-def test_dry_run_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dry_run_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolated_logs: Path
+) -> None:
     def _refuse(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("network")
 
     monkeypatch.setattr(socket, "create_connection", _refuse)
-    store = tmp_path / "exec.sqlite"
-    _empty_store(store)
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
     digest = _arm(tmp_path, monkeypatch, store=store)
+    _stub_world(monkeypatch, census.CATALOG)
     root = tmp_path / "out"
     before = _listing(tmp_path)
     assert (
@@ -578,9 +632,8 @@ def test_ro_percent_quotes_the_path(tmp_path: Path) -> None:
     odd.mkdir()
     store = odd / "exec.sqlite"
     _empty_store(store)
-    own = census.read_own_orders(store)
-    assert own.instrument_ids == ()
-    assert own.never_filled == 0
+    with pytest.raises(census.OwnOrderError, match="intent history is empty"):
+        census.read_own_orders(store)
 
 
 def test_lone_parquet_is_a_prior_look_and_parquet_is_replaced_before_markdown(
@@ -620,16 +673,22 @@ def test_render_prints_the_real_slugless_count() -> None:
 def test_low_directory_match_is_anchored(tmp_path: Path) -> None:
     root = tmp_path / "order_book_depths"
     root.mkdir()
-    for name in (
-        "tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US",
-        "x-tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US",
-    ):
-        (root / name).mkdir()
+    low = "tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US"
+    (root / low).mkdir()
+    (root / CAT_LOW).mkdir()
     notes: list[str] = []
     grouped, _impossible = census._walk_dirs(root, notes)
-    assert grouped == {}
-    assert "skipped low dir: tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US" in notes
-    assert "skipped unparsed dir: x-tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US" in notes
+    assert list(grouped) == [("NYC", DAY)]
+    assert f"skipped low dir: {low}" in notes
+
+
+def test_unanchored_low_lookalike_directory_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "order_book_depths"
+    (root / CAT_LOW).mkdir(parents=True)
+    (root / "x-tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US").mkdir()
+    _refuses(lambda: census._walk_dirs(root, []), capsys, "unparsable catalog directory")
 
 
 def test_off_tick_price_is_refused_not_rounded() -> None:
@@ -698,9 +757,9 @@ def test_size_zero_on_a_present_side_blocks_that_leg() -> None:
     assert bid_zero.leg1_clear is False
 
 
-def test_intent_slug_branch_builds_the_own_set(tmp_path: Path) -> None:
-    store = tmp_path / "exec.sqlite"
-    _empty_store(store)
+def test_intent_slug_branch_builds_the_own_set(tmp_path: Path, _isolated_logs: Path) -> None:
+    _write_log(_isolated_logs, "breezy-trade-a.log", _CTL)
+    store = _store_with(tmp_path, _CONTROL_ORDER, fill_id=NO_ID, intent_id=_CONTROL_INTENT_ID)
     _insert(store, [(history_key(INTENT_ID), _intent(slug=BASE))])
     own = census.read_own_orders(store)
     assert own.instrument_ids == (BASE,)
@@ -772,6 +831,11 @@ def _log_line(order: object, stamp: str = _STAMP_A) -> str:
     )
 
 
+_CONTROL_ORDER = _limit(NO_ID, TimeInForce.IOC, coid="O-CTL", px="0.50")
+_CONTROL_INTENT_ID = "ef" * 16
+_CTL = [_log_line(_CONTROL_ORDER)]
+
+
 def _write_log(logs: Path, name: str, lines: list[str]) -> Path:
     logs.mkdir(exist_ok=True)
     path = logs / name
@@ -785,6 +849,7 @@ def _store_with(
     *,
     fill_id: str | None = None,
     intent_id: str = INTENT_ID,
+    control: bool = False,
 ) -> Path:
     """A store with one slug-less intent whose fingerprint is the real one of ``order``."""
     store = tmp / "exec.sqlite"
@@ -806,6 +871,23 @@ def _store_with(
             (f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{fingerprint}", b"vid-9"),
             (f"{FILL_KEY_PREFIX}vid-9", _fill(fill_id)),
         ]
+    if control:
+        ctl_fp = intent_fingerprint(_CONTROL_ORDER)
+        ctl_intent = SubmitIntent(
+            intent_id=_CONTROL_INTENT_ID,
+            fingerprint=ctl_fp,
+            created_ns=CREATED_NS,
+            state=SubmitIntentState.OPEN,
+            retired_ns=None,
+            retirement_reason=None,
+            slug=None,
+        ).to_bytes()
+        day = utc_day_for_ns(CREATED_NS).isoformat()
+        rows += [
+            (history_key(_CONTROL_INTENT_ID), ctl_intent),
+            (f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{ctl_fp}", b"vid-ctl"),
+            (f"{FILL_KEY_PREFIX}vid-ctl", _fill(NO_ID)),
+        ]
     _insert(store, rows)
     return store
 
@@ -814,15 +896,15 @@ def test_limit_ioc_line_resolves_by_log_and_counts_print(
     tmp_path: Path, _isolated_logs: Path
 ) -> None:
     order = _limit(NO_ID, TimeInForce.IOC)
-    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
-    own = census.read_own_orders(_store_with(tmp_path, order))
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), *_CTL])
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
     assert own.instrument_ids == (BASE,)
     assert own.first_ns == {BASE: CREATED_NS}
     report = "\n".join(own.report)
-    assert "intents total: 1" in report
-    assert "resolved by (i) fill_by_fingerprint: 0" in report
+    assert "intents total: 2" in report
+    assert "resolved by (i) fill_by_fingerprint: 1" in report
     assert "resolved by (ii) node log: 1" in report
-    assert "positive control matched/total: 0/0" in report
+    assert "positive control matched/total: 1/1" in report
     assert "unresolved: 0" in report
     assert "log files read: 1" in report
     assert "symlinks followed: 0" in report
@@ -832,16 +914,17 @@ def test_limit_ioc_line_resolves_by_log_and_counts_print(
 
 def test_market_order_line_hashes_the_empty_price(tmp_path: Path, _isolated_logs: Path) -> None:
     order = _market(LOW_ID)
-    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
-    own = census.read_own_orders(_store_with(tmp_path, order))
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), *_CTL])
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
     assert own.instrument_ids == (BASE,)
 
 
 def test_gtd_expiry_token_is_ignored(tmp_path: Path, _isolated_logs: Path) -> None:
     order = _limit(NO_ID, TimeInForce.GTD, expiry_ns=CREATED_NS + 3_600 * _NS)
     assert "GTD 20" in repr(order)
-    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
-    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), *_CTL])
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
+    assert own.instrument_ids == (BASE,)
 
 
 def test_ansi_stripped_and_thousands_separator_removed(
@@ -851,20 +934,25 @@ def test_ansi_stripped_and_thousands_separator_removed(
     assert "1_000" in repr(order) and "1_000" not in str(order.quantity)
     line = _log_line(order)
     assert "\x1b[" in line
-    _write_log(_isolated_logs, "breezy-trade-a.log", [line])
-    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [line, *_CTL])
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
+    assert own.instrument_ids == (BASE,)
 
 
 def test_duplicate_lines_and_symlinked_file_count_as_one_resolution(
     tmp_path: Path, _isolated_logs: Path
 ) -> None:
     order = _limit(NO_ID, TimeInForce.IOC)
-    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), _log_line(order, _STAMP_B)])
+    _write_log(
+        _isolated_logs,
+        "breezy-trade-a.log",
+        [_log_line(order), _log_line(order, _STAMP_B), *_CTL],
+    )
     archive = tmp_path / "archive"
     target = _write_log(archive, "moved.log", [_log_line(order, _STAMP_B)])
     (_isolated_logs / "breezy-trade-b.log").symlink_to(target)
     (_isolated_logs / "breezy-trade-c.log.try2").write_text("not matched\n", encoding="utf-8")
-    own = census.read_own_orders(_store_with(tmp_path, order))
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
     assert own.instrument_ids == (BASE,)
     report = "\n".join(own.report)
     assert "resolved by (ii) node log: 1" in report
@@ -877,9 +965,10 @@ def test_non_text_bytes_in_a_log_do_not_drop_the_file(tmp_path: Path, _isolated_
     order = _limit(NO_ID, TimeInForce.IOC)
     _isolated_logs.mkdir()
     (_isolated_logs / "breezy-trade-a.log").write_bytes(
-        b"\xff\xfe\x00 binary junk\n" + _log_line(order).encode("utf-8")
+        b"\xff\xfe\x00 binary junk\n" + "".join([_log_line(order), *_CTL]).encode("utf-8")
     )
-    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+    own = census.read_own_orders(_store_with(tmp_path, order, control=True))
+    assert own.instrument_ids == (BASE,)
 
 
 def test_two_base_slugs_for_one_fingerprint_refuse(
@@ -980,21 +1069,43 @@ def test_h7_dry_run_stops_before_any_leg_label_or_prize(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     order = _limit(NO_ID, TimeInForce.IOC)
-    store = _store_with(tmp_path, order)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
     _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
     digest = _arm(tmp_path, monkeypatch, store=store)
+    _stub_world(monkeypatch, census.CATALOG)
+    reads: list[str] = []
+    real_select = census.select_frame
+
+    def _spy_select(**kwargs: object) -> census.FrameSelection:
+        reads.append("select")
+        return real_select(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(census, "select_frame", _spy_select)
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("scoring reached in a dry-run")
 
-    for name in ("evaluate_book", "_label", "_prize_lines", "_render", "leg1_slack_cents"):
+    for name in (
+        "evaluate_book",
+        "SumAskRow",
+        "fee_on_ask",
+        "leg1_slack_cents",
+        "leg2_slack_cents",
+        "_label",
+        "_prize_lines",
+        "_render",
+    ):
         monkeypatch.setattr(census, name, _boom)
     before = _listing(tmp_path)
     assert main(["--census-only", "--dry-run", "--prereg-sha", digest]) == 0
     out = capsys.readouterr().out
-    assert "D5 resolved by (ii) node log: 1" in out
-    assert "final denominator station-days: 0" in out
-    assert "distinct dates: 0" in out
+    assert reads == ["select"], "the frame_only branch must actually run"
+    lines = out.strip().splitlines()
+    assert len(lines) == 12
+    assert all(line.startswith("D5 ") for line in lines[:10])
+    assert lines[10] == "final denominator station-days: 1"
+    assert lines[11] == "distinct dates: 1"
+    assert "D5 resolved by (ii) node log: 0" in out
     lowered = out.lower()
     for token in ("leg 1", "leg 2", "label", "prize", "slack", "inconclusive", "sufficient"):
         assert token not in lowered
@@ -1014,3 +1125,310 @@ def test_every_registry_city_has_a_key_the_tape_reader_accepts() -> None:
         january = dt.datetime(2026, 1, 15, 12, tzinfo=zone).utcoffset()
         assert january is not None
         assert january.total_seconds() / 3600.0 == float(spec.std_utc_offset_hours)
+
+
+# ---- infrastructure failures refuse (exit 2, before any write), never degrade ----------------
+
+
+def test_stubbed_world_scores_one_frame(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat")
+    _notes, records, denoms, unit_ok, _sums, _imp = census._score(tmp_path / "cat", _NO_OWN)
+    assert [row["status"] for row in records] == ["FRAME"]
+    assert len(denoms) == 1 and unit_ok is True
+
+
+def test_catalog_data_dir_absent_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "cat").mkdir()
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "data directory is absent")
+
+
+def test_order_book_depths_absent_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "cat" / "data").mkdir(parents=True)
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "order_book_depths")
+
+
+def test_zero_rung_directories_refuse_not_denominator_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "cat" / "data" / "order_book_depths").mkdir(parents=True)
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "no rung directory")
+    monkeypatch.setattr(census, "CATALOG", tmp_path / "cat")
+    _refuses(lambda: census._dry_run_stop(_NO_OWN), capsys, "no rung directory")
+
+
+def test_rungs_only_outside_the_window_refuse(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    late = "tc-temp-nychigh-2026-12-01-lt80f.POLYMARKET_US"
+    _make_catalog(tmp_path / "cat", (late,))
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "no rung directory")
+
+
+def test_unparsable_catalog_directory_refuses_in_a_full_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat")
+    _make_catalog(tmp_path / "cat", ("not-a-rung",))
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "unparsable")
+
+
+@pytest.mark.parametrize(
+    "error", [OSError("io"), ValueError("bad parquet"), KeyError("no zone")], ids=str
+)
+def test_tape_read_error_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    def _tape(*_a: object, **_k: object) -> None:
+        raise error
+
+    _stub_world(monkeypatch, tmp_path / "cat", tape=_tape)
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "tape read failed")
+
+
+def test_station_missing_from_the_reader_zone_table_refuses_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The REAL reader raises KeyError for a station absent from STATION_TIME_ZONES."""
+    _make_catalog(tmp_path / "cat")
+    monkeypatch.setattr(census, "_load_fee_map", lambda _c: {CAT_LOW: "0.0695", CAT_HIGH: "0.0695"})
+    monkeypatch.setattr(census, "reader_key", lambda _city: "ZZZ")
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "tape read failed")
+
+
+def test_rung_with_zero_tape_instants_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat", tape=lambda *_a, **_k: ([], 0))
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "no tape instants")
+
+
+def test_fee_read_failure_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import nautilus_trader.persistence.catalog.parquet as parquet_catalog
+
+    class _Broken:
+        def __init__(self, _path: str) -> None:
+            raise OSError("unreadable catalog")
+
+    monkeypatch.setattr(parquet_catalog, "ParquetDataCatalog", _Broken)
+    _refuses(lambda: census._load_fee_map(tmp_path), capsys, "instrument fee read failed")
+
+
+def test_rung_without_a_fee_entry_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat", fees={CAT_LOW: "0.0695"})
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "fee entry missing")
+
+
+def test_unparseable_fee_entry_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat", fees={CAT_LOW: "0.0695", CAT_HIGH: "n/a"})
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "not a number")
+
+
+def test_present_fee_coefficient_that_differs_stays_inconclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat", fees={CAT_LOW: "0.0695", CAT_HIGH: "0.07"})
+    _n, records, denoms, _u, _s, _i = census._score(tmp_path / "cat", _NO_OWN)
+    assert [row["status"] for row in records] == ["INCONCLUSIVE"]
+    assert denoms == []
+
+
+def test_load_sites_failure_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import settlement_alignment_study as study  # type: ignore[import-not-found]
+
+    def _broken() -> None:
+        raise RuntimeError("registry")
+
+    _stub_world(monkeypatch, tmp_path / "cat")
+    monkeypatch.setattr(study, "load_sites", _broken)
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "site metadata")
+
+
+def test_station_without_an_offset_refuses_not_mass_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import settlement_alignment_study as study
+
+    _stub_world(monkeypatch, tmp_path / "cat")
+    monkeypatch.setattr(study, "load_sites", lambda: ())
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "no site metadata")
+
+
+def test_fixed_scalar_failure_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _broken() -> None:
+        raise RuntimeError("scalars")
+
+    _stub_world(monkeypatch, tmp_path / "cat")
+    monkeypatch.setattr(fcs, "_fixed_scalars", _broken)
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "unit scalars")
+
+
+def test_all_zero_ask_sizes_stay_an_inconclusive_unit_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_world(monkeypatch, tmp_path / "cat", tape=lambda *_a, **_k: (_instants(ask_size=0.0), 2))
+    notes, _records, _d, unit_ok, _s, _i = census._score(tmp_path / "cat", _NO_OWN)
+    assert unit_ok is False
+    assert "unit line could not be printed" in notes
+
+
+def test_nonintegral_nonzero_ask_size_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_world(
+        monkeypatch,
+        tmp_path / "cat",
+        tape=lambda *_a, **_k: (_instants(ask_size=0.5 / fcs._fixed_scalars()[1]), 2),
+    )
+    _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "unit line")
+
+
+def test_infrastructure_failure_through_main_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_logs: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    digest = _arm(tmp_path, monkeypatch, store=store)
+
+    def _tape(*_a: object, **_k: object) -> None:
+        raise OSError("disk")
+
+    _stub_world(monkeypatch, census.CATALOG, tape=_tape)
+    before = _listing(tmp_path)
+    _refuses(
+        lambda: main(["--census-only", "--prereg-sha", digest, "--output", str(tmp_path / "i.md")]),
+        capsys,
+        "tape read failed",
+    )
+    assert _listing(tmp_path) == before
+
+
+def test_positive_control_with_zero_controls_refuses(tmp_path: Path, _isolated_logs: Path) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    with pytest.raises(census.OwnOrderError, match="positive control") as caught:
+        census.read_own_orders(_store_with(tmp_path, order))
+    assert "positive control matched/total: 0/0" in "\n".join(caught.value.report)
+
+
+@pytest.mark.parametrize("index", [b"", b"  \n", b"\xff\xfe"], ids=["empty", "blank", "non-utf8"])
+def test_broken_fill_index_refuses(tmp_path: Path, index: bytes) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
+    day = utc_day_for_ns(CREATED_NS).isoformat()
+    key = f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent_fingerprint(order)}"
+    connection = sqlite3.connect(store)
+    connection.execute("UPDATE state SET value = ? WHERE key = ?", (index, key))
+    connection.commit()
+    connection.close()
+    with pytest.raises(census.OwnOrderError, match="fill_by_fingerprint index"):
+        census.read_own_orders(store)
+
+
+@pytest.mark.parametrize("fill_row", [None, b"", b"  "], ids=["absent", "empty", "blank"])
+def test_index_without_a_readable_fill_row_refuses(tmp_path: Path, fill_row: bytes | None) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
+    connection = sqlite3.connect(store)
+    if fill_row is None:
+        connection.execute("DELETE FROM state WHERE key = ?", (f"{FILL_KEY_PREFIX}vid-9",))
+    else:
+        connection.execute(
+            "UPDATE state SET value = ? WHERE key = ?", (fill_row, f"{FILL_KEY_PREFIX}vid-9")
+        )
+    connection.commit()
+    connection.close()
+    with pytest.raises(census.OwnOrderError, match="fill_by_fingerprint index"):
+        census.read_own_orders(store)
+
+
+def test_empty_intent_history_exits_2_with_a_constant_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "exec.sqlite"
+    _empty_store(store)
+    digest = _arm(tmp_path, monkeypatch, store=store)
+    _refuses(
+        lambda: main(["--census-only", "--prereg-sha", digest, "--output", str(tmp_path / "i.md")]),
+        capsys,
+        "own-order set cannot be built: intent history is empty",
+    )
+    assert _listing(tmp_path / "out") == []
+
+
+def test_unreadable_existing_markdown_refuses_not_false(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "card_a_census.md").write_bytes(b"\xff\xfe\x00 not utf-8")
+    _refuses(lambda: census._carries_sha(tmp_path, "a" * 64), capsys, "markdown is unreadable")
+
+
+def test_unparseable_existing_parquet_refuses_not_false(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "card_a_census.parquet").write_bytes(b"this is not parquet")
+    _refuses(lambda: census._carries_sha(tmp_path, "a" * 64), capsys, "parquet is unreadable")
+
+
+def test_unreadable_freeze_file_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    digest = _arm(tmp_path, monkeypatch)
+    census.FREEZE_PATH.write_bytes(b"\xff\xfe\x00")
+    _refuses(lambda: census._check_freeze(digest), capsys, "freeze record unreadable")
+
+
+def test_unreadable_prereg_file_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    digest = _arm(tmp_path, monkeypatch)
+    real = Path.read_bytes
+
+    def _read(self: Path) -> bytes:
+        if self == census.PREREG_PATH:
+            raise PermissionError("denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    _refuses(lambda: census._check_freeze(digest), capsys, "prereg unreadable")
+
+
+def test_catalog_construction_creates_nothing(tmp_path: Path) -> None:
+    present = tmp_path / "present"
+    (present / "data").mkdir(parents=True)
+    missing = tmp_path / "missing"
+    before = _listing(tmp_path)
+    assert census._load_fee_map(present) == {}
+    assert census._load_fee_map(missing) == {}
+    assert _listing(tmp_path) == before
+
+
+def test_unknown_order_side_name_is_refused_before_the_native_parser(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    bad = _log_line(order).replace("LimitOrder(BUY ", "LimitOrder(BOGUS ")
+    assert bad != _log_line(order)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [bad])
+    with pytest.raises(census.OwnOrderError, match="side"):
+        census.read_own_orders(_store_with(tmp_path, order))

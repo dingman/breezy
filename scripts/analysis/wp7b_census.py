@@ -375,6 +375,10 @@ def _base_of(instrument_or_slug: str) -> str:
     return base_symbol_of(symbol_of_instrument_id(instrument_or_slug))
 
 
+_FILL_INDEX_BROKEN: Final[str] = (
+    "own-order set cannot be built: a fill_by_fingerprint index has no readable fill row"
+)
+_EMPTY_HISTORY: Final[str] = "own-order set cannot be built: intent history is empty"
 _ANSI: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _SUBMIT_MARK: Final[str] = "[Risk] SubmitOrder("
 _STAMP: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z")
@@ -526,11 +530,17 @@ def _base_by_fill(
 
     day = utc_day_for_ns(created_ns).isoformat()
     index = get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{fingerprint}")
-    if index is None or not index.decode("utf-8").strip():
+    if index is None:
         return None
-    fill_raw = get(f"{FILL_KEY_PREFIX}{index.decode('utf-8').strip()}")
-    if fill_raw is None:
-        return None
+    try:
+        vid = index.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise OwnOrderError(_FILL_INDEX_BROKEN) from None
+    if not vid:
+        raise OwnOrderError(_FILL_INDEX_BROKEN)
+    fill_raw = get(f"{FILL_KEY_PREFIX}{vid}")
+    if fill_raw is None or not fill_raw.strip():
+        raise OwnOrderError(_FILL_INDEX_BROKEN)
     try:
         record = DurableFillRecord.from_bytes(fill_raw)
     except (ValueError, TypeError):
@@ -578,6 +588,8 @@ def read_own_orders(path: Path) -> OwnSet:
             intents.extend(table.open)
             if table.last is not None:
                 intents.append(table.last)
+            if not intents:
+                raise OwnOrderError(_EMPTY_HISTORY)
 
             def _get(key: str) -> bytes | None:
                 found = connection.execute(
@@ -629,12 +641,21 @@ def read_own_orders(path: Path) -> OwnSet:
             "unresolved by fill and node log",
             report,
         )
+    if controls == 0:
+        raise OwnOrderError(
+            "own-order set cannot be built: positive control has no intent resolved by fill",
+            report,
+        )
     return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first, report=report)
 
 
 def _parse_freeze(path: Path) -> dict[str, str]:
     fields: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        refuse("freeze record unreadable")
+    for line in text.splitlines():
         if not line.strip():
             continue
         key, _sep, value = line.partition(" ")
@@ -654,7 +675,10 @@ def _check_freeze(prereg_sha: str) -> None:
         problems.append(f"freeze status is {status or 'absent'}")
     if status == "FROZEN" and fields.get("looks_allowed", "").strip() != "1":
         problems.append("looks_allowed is not 1")
-    live = hashlib.sha256(PREREG_PATH.read_bytes()).hexdigest()
+    try:
+        live = hashlib.sha256(PREREG_PATH.read_bytes()).hexdigest()
+    except OSError:
+        refuse("prereg unreadable")
     recorded = fields.get("prereg_sha256", "").strip().lower()
     given = prereg_sha.strip().lower()
     if recorded != given or recorded != live or given != live:
@@ -668,7 +692,11 @@ def _carries_sha(out: Path, sha: str) -> bool:
     markdown = out / "card_a_census.md"
     parquet = out / "card_a_census.parquet"
     if markdown.is_file():
-        header = "".join(markdown.read_text(encoding="utf-8").splitlines(keepends=True)[:30])
+        try:
+            text = markdown.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            refuse("existing census markdown is unreadable")
+        header = "".join(text.splitlines(keepends=True)[:30])
         if f"prereg_sha256: {sha}" in header:
             return True
     if not parquet.is_file():
@@ -678,7 +706,7 @@ def _carries_sha(out: Path, sha: str) -> bool:
 
         meta = pq.read_schema(parquet).metadata or {}
     except (OSError, ValueError):
-        return False
+        refuse("existing census parquet is unreadable")
     return meta.get(b"prereg_sha256") == sha.encode()
 
 
@@ -830,21 +858,33 @@ def _quote_from_instant(instant: object) -> Quote:
     )
 
 
-def _fee_ok(fee_map: Mapping[str, str] | None, instrument_id: str) -> bool:
-    if fee_map is None:
-        return False
+def _fee_raw(fee_map: Mapping[str, str], instrument_id: str) -> str | None:
     raw = fee_map.get(instrument_id)
     if raw is None:
         raw = fee_map.get(symbol_of_instrument_id(instrument_id))
-    if raw is None:
-        return False
-    try:
-        return Decimal(raw) == FEE_COEFFICIENT
-    except ArithmeticError:
-        return False
+    return raw
 
 
-def _load_fee_map(catalog: Path) -> dict[str, str] | None:
+def _fee_ok(fee_map: Mapping[str, str], instrument_id: str) -> bool:
+    """A PRESENT coefficient equal to the frozen one. Absent or garbled never reaches here."""
+    raw = _fee_raw(fee_map, instrument_id)
+    return raw is not None and Decimal(raw) == FEE_COEFFICIENT
+
+
+def _require_fee_entries(fee_map: Mapping[str, str], rung_ids: Iterable[str]) -> None:
+    """Only a PRESENT coefficient that differs stays INCONCLUSIVE; absent or garbled refuses."""
+    for instrument_id in rung_ids:
+        raw = _fee_raw(fee_map, instrument_id)
+        if raw is None:
+            refuse("instrument fee entry missing for a listed rung")
+        try:
+            Decimal(raw)
+        except ArithmeticError:
+            refuse("instrument fee entry is not a number")
+
+
+def _load_fee_map(catalog: Path) -> dict[str, str]:
+    """Refuses (exit 2) when the instrument read fails. Constructing the catalog creates nothing."""
     try:
         from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
@@ -859,7 +899,7 @@ def _load_fee_map(catalog: Path) -> dict[str, str] | None:
             found[str(instrument.id)] = str(raw)
         return found
     except (OSError, RuntimeError, TypeError, ValueError, ImportError):
-        return None
+        refuse("instrument fee read failed")
 
 
 def _walk_dirs(
@@ -869,8 +909,7 @@ def _walk_dirs(
     highs: list[tuple[str, dt.date, int | None]] = []
     lows: list[tuple[str, dt.date, int | None]] = []
     if not depth_root.is_dir():
-        notes.append("order_book_depths directory is absent")
-        return grouped, 0
+        refuse("order_book_depths directory is absent")
     for child in sorted(depth_root.iterdir()):
         if not child.is_dir():
             continue
@@ -881,7 +920,7 @@ def _walk_dirs(
             try:
                 rung = parse_rung(alias)
             except ValueError:
-                notes.append(f"skipped unparsed dir: {name}")
+                notes.append(f"skipped low dir (unparsed): {name}")
                 continue
             notes.append(f"skipped low dir: {name}")
             lows.append((rung.city, rung.climate_day, rung.lower_f))
@@ -889,11 +928,12 @@ def _walk_dirs(
         try:
             rung = parse_rung(name)
         except ValueError:
-            notes.append(f"skipped unparsed dir: {name}")
-            continue
+            refuse("an unparsable catalog directory name was found")
         highs.append((rung.city, rung.climate_day, rung.upper_f))
         if WINDOW_START <= rung.climate_day <= WINDOW_END:
             grouped.setdefault((rung.city, rung.climate_day), []).append(child)
+    if not highs or not grouped:
+        refuse("no rung directory found in the census window")
     impossible = 0
     low_by: dict[tuple[str, dt.date], list[int | None]] = {}
     for city, day, lower in lows:
@@ -924,9 +964,7 @@ def _score(
     """Returns notes, records, denominator frames, unit_ok, sum-ask count, impossible pairs."""
     notes: list[str] = []
     if not (catalog / "data").is_dir():
-        notes.append("catalog data directory is absent")
-        buyer = _buyer_lines(catalog)
-        return notes + buyer, [], [], False, 0, 0
+        refuse("catalog data directory is absent")
     from forecast_cheap_screen_wp7 import (
         _fixed_scalars,
         read_rung_tape,
@@ -936,38 +974,24 @@ def _score(
     try:
         price_scalar, size_scalar = _fixed_scalars()
     except (OSError, RuntimeError, TypeError, ValueError, ImportError):
-        notes.append("unit scalars could not be read")
-        return notes, [], [], False, 0, 0
+        refuse("unit scalars could not be read")
     try:
         offsets = {spec.city: float(spec.std_utc_offset_hours) for spec in load_sites()}
     except (OSError, RuntimeError, TypeError, ValueError, ImportError):
-        notes.append("site metadata could not be read")
-        offsets = {}
-    fee_map = _load_fee_map(catalog)
-    if fee_map is None:
-        notes.append("instrument fee read failed")
+        refuse("site metadata could not be read")
     grouped, impossible = _walk_dirs(catalog / "data" / "order_book_depths", notes)
+    if any(city not in offsets for city, _day in grouped):
+        refuse("a listed station has no site metadata")
+    fee_map = _load_fee_map(catalog)
+    _require_fee_entries(fee_map, (path.name for paths in grouped.values() for path in paths))
     records: list[dict[str, str]] = []
     denoms: list[_Denom] = []
     unit_raw: int | None = None
     unit_failed = False
     sum_rows = 0
     for (city, day), paths in sorted(grouped.items()):
-        offset = offsets.get(city)
-        if offset is None:
-            notes.append(f"{city} {day.isoformat()}: no site metadata")
-            records.append(
-                {
-                    "station": city,
-                    "climate_day": day.isoformat(),
-                    "status": "MISSING",
-                    "leg1": "",
-                    "leg2": "",
-                }
-            )
-            continue
+        offset = offsets[city]
         quotes: dict[str, tuple[Quote, ...]] = {}
-        failed = False
         for path in sorted(paths, key=lambda item: item.name):
             try:
                 instants, _nrows = read_rung_tape(
@@ -977,24 +1001,13 @@ def _score(
                     size_scalar=size_scalar,
                     city=reader_key(city),
                 )
-            except (OSError, ValueError):
-                notes.append(f"{city} {day.isoformat()}: tape read failed")
-                failed = True
-                break
+            except (OSError, ValueError, KeyError):
+                refuse(f"{city} {day.isoformat()}: tape read failed")
+            if not instants:
+                refuse(f"{city} {day.isoformat()}: a listed rung has no tape instants")
             if unit_raw is None and not unit_failed:
                 unit_raw, unit_failed = _recover_unit(instants, size_scalar)
             quotes[path.name] = tuple(_quote_from_instant(instant) for instant in instants)
-        if failed:
-            records.append(
-                {
-                    "station": city,
-                    "climate_day": day.isoformat(),
-                    "status": "MISSING",
-                    "leg1": "",
-                    "leg2": "",
-                }
-            )
-            continue
         frame = select_frame(climate_day=day, quotes=quotes)
         if frame.kind != "FRAME":
             records.append(
@@ -1020,9 +1033,7 @@ def _score(
                 }
             )
             continue
-        fees_ok = fee_map is not None and all(
-            _fee_ok(fee_map, instrument_id) for instrument_id in rung_ids
-        )
+        fees_ok = all(_fee_ok(fee_map, instrument_id) for instrument_id in rung_ids)
         if not fees_ok:
             records.append(
                 {
@@ -1080,7 +1091,9 @@ def _score(
                 "leg2": "clear" if book.leg2_clear else "no",
             }
         )
-    unit_ok = unit_raw is not None and not unit_failed
+    if unit_failed:
+        refuse("unit line could not be recovered from a nonzero ask size")
+    unit_ok = unit_raw is not None
     records = list(scrub_legs_without_unit(records, unit_ok))
     notes.append(
         f"unit scalars price={price_scalar} size={size_scalar} raw_ask_size_0={unit_raw} contracts"
