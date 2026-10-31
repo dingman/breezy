@@ -18,6 +18,8 @@ under ``--scratch-dir``. The only evidence files are
 ``card_e_cli_vs_twc.md`` and ``card_e_cli_vs_twc.parquet`` in ``--out-dir``.
 An existing pair is a finished look and is not overwritten unless
 ``--force-new-look`` carries a reason, which is recorded (L-34).
+``--prereg`` and ``--prereg-sha`` are required. Thresholds, sides, and the
+climate window are frozen. A dry-run cannot write the evidence directory.
 """
 
 from __future__ import annotations
@@ -28,19 +30,25 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scipy.stats import beta, binom
 
-from breezy.ingest.http import TransportError
+from breezy.ingest.http import (
+    RateLimitedError,
+    ServerError,
+    TransportError,
+    TransportTimeoutError,
+)
 from breezy.normalize.classify import (
     ClassificationError,
     classify_issuance,
@@ -72,16 +80,61 @@ KALSHI_MIN_INTERVAL_S: Final[float] = 0.25  # at most 4 requests/second
 IEM_MIN_INTERVAL_NS: Final[int] = 1_000_000_000  # at most 1 request/second
 KALSHI_USER_AGENT: Final[str] = "breezy-research/1.0 (Card E CLI vs TWC; public GET; no auth)"
 IEM_USER_AGENT: Final[str] = "breezy-research/1.0 (Card E CLI vs TWC; read-only AFOS)"
-# One series or city must not abort the others. These are the errors the
-# public clients raise (HTTP/URL/timeout, JSON, our own parsers, IEM transport).
-_PULL_ERRORS: Final[tuple[type[BaseException], ...]] = (
+# Frozen in prereg_r2_1.md §3 and §5. Not flags.
+P0: Final[float] = 0.01
+ALPHA_T1: Final[float] = 0.025
+ALPHA_T2: Final[float] = 0.025
+SAME_SIGN_SHARE: Final[float] = 0.80
+KILL_UCB: Final[float] = 0.02
+SIDES: Final[tuple[str, ...]] = ("high", "low")
+FROZEN_START: Final[dt.date] = dt.date(2026, 7, 5)
+FROZEN_END: Final[dt.date] = dt.date(2026, 10, 30)
+FROZEN_PREREG: Final[str] = "docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_r2_1.md"
+FROZEN_PREREG_SHA: Final[str] = "4f490f4b255ab34b214251f19500f66ed487bb68a4e780a7e8c3108c09d34070"
+# Kalshi historical client serves days before this date (k1_kalshi_prior).
+HISTORICAL_CUTOFF: Final[dt.date] = dt.date(2026, 7, 4)
+IEM_MAX_ATTEMPTS: Final[int] = 5
+IEM_BACKOFF_S: Final[float] = 1.0
+MIN_PRODUCTS_PER_SIDE: Final[int] = 1
+PAIRED_CAP_FRACTION: Final[float] = 0.50
+# Prereg §3: 18 stations share n ≤ 91. The six named cities differ.
+_CAP_91_CITIES: Final[frozenset[str]] = frozenset(
+    {
+        "ATL",
+        "AUS",
+        "BOS",
+        "MDW",
+        "DFW",
+        "DEN",
+        "HOU",
+        "LAS",
+        "LAX",
+        "MIA",
+        "MSY",
+        "NYC",
+        "OKC",
+        "PHL",
+        "SAT",
+        "SFO",
+        "SEA",
+        "DCA",
+    }
+)
+_NAMED_CAPS: Final[Mapping[str, int]] = {
+    "PHX": 89,
+    "MSP": 90,
+    "SAN": 71,
+    "EWR": 65,
+    "TTN": 65,
+    "SDF": 63,
+}
+# Retryable transport failures only. Programming errors propagate (B7).
+_PULL_ERRORS: Final[tuple[type[BaseException], ...]] = (OSError, TransportError)
+_IEM_RETRY: Final[tuple[type[BaseException], ...]] = (
     OSError,
-    RuntimeError,
-    ValueError,
-    TypeError,
-    AttributeError,
-    KeyError,
-    TransportError,
+    RateLimitedError,
+    ServerError,
+    TransportTimeoutError,
 )
 
 _MONTHS: Final[Mapping[str, int]] = {
@@ -190,10 +243,15 @@ class CliLabelParse:
 
 @dataclass(frozen=True, slots=True)
 class CliTextIndex:
-    """Latest product per climate date. Later text wins; an amendment stays out."""
+    """Latest product per climate date. Later text wins; an amendment stays out.
+
+    ``overwrites`` counts dates replaced by a later product. A later non-final
+    product does not replace a final integer (S10).
+    """
 
     days: Mapping[dt.date, CliLabelParse]
     undated_exclusions: Mapping[str, int]
+    overwrites: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +288,8 @@ class DayRow:
     outcome: Outcome
     exclusion: str | None
     half: int
+    kalshi_reason: str | None = None
+    cli_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +314,6 @@ class SideStat:
     negative: int
     sign_ok: bool
     upper: float | None
-    killed: bool
     outcome: VerdictWord
     day_exclusions: Mapping[str, int]
 
@@ -587,10 +646,16 @@ def split_iem_products(raw_text: str) -> tuple[str, ...]:
     return tuple(products)
 
 
+def _keeps_final(previous: CliLabelParse, incoming: CliLabelParse) -> bool:
+    """A later non-final product must not replace the last final integer."""
+    return previous.value_f is not None and incoming.exclusion == "not_final"
+
+
 def cli_days_from_text(text: str, side: str) -> CliTextIndex:
-    """Index one station's raw text. The later product for a date replaces it."""
+    """Index one station's raw text. The last final integer is kept (S10)."""
     chosen: dict[dt.date, CliLabelParse] = {}
     undated: Counter[str] = Counter()
+    overwrites = 0
     products = split_iem_products(text)
     if not products and text.strip():
         products = (text,)
@@ -599,8 +664,13 @@ def cli_days_from_text(text: str, side: str) -> CliTextIndex:
         if label.climate_date is None:
             undated[label.exclusion or "unparsed"] += 1
             continue
+        previous = chosen.get(label.climate_date)
+        if previous is not None and _keeps_final(previous, label):
+            continue
+        if previous is not None:
+            overwrites += 1
         chosen[label.climate_date] = label
-    return CliTextIndex(days=chosen, undated_exclusions=dict(undated))
+    return CliTextIndex(days=chosen, undated_exclusions=dict(undated), overwrites=overwrites)
 
 
 def classify_mismatch(kalshi_int: int, cli_int: int) -> Mismatch:
@@ -960,11 +1030,23 @@ def _day_row(
     block = blocked.get((station.city, side))
     slot = cli_by_side.get((station.city, side))
     kalshi_day = _kalshi_day(series, block, kalshi, station.city, side, day)
-    exclusion = _reason_for_day(series, block, slot, kalshi_day, day)
+    kalshi_reason = _kalshi_reason(series, block, kalshi_day)
+    cli_reason = _cli_reason(slot, day)
+    exclusion = _combined_reason(kalshi_reason, cli_reason)
     cli_value = _cli_value(slot, day)
     kalshi_value = None if kalshi_day is None else kalshi_day.expiration_f
     if exclusion is not None:
-        return _excluded_row(station.city, side, day, half, kalshi_value, cli_value, exclusion)
+        return _excluded_row(
+            station.city,
+            side,
+            day,
+            half,
+            kalshi_value,
+            cli_value,
+            exclusion,
+            kalshi_reason,
+            cli_reason,
+        )
     assert kalshi_value is not None and cli_value is not None
     judged = classify_mismatch(kalshi_value, cli_value)
     return DayRow(
@@ -1001,6 +1083,8 @@ def _excluded_row(
     kalshi_value: int | None,
     cli_value: int | None,
     exclusion: str,
+    kalshi_reason: str | None,
+    cli_reason: str | None,
 ) -> DayRow:
     return DayRow(
         station=station,
@@ -1012,6 +1096,8 @@ def _excluded_row(
         outcome="excluded",
         exclusion=exclusion,
         half=half,
+        kalshi_reason=kalshi_reason,
+        cli_reason=cli_reason,
     )
 
 
@@ -1024,37 +1110,38 @@ def _cli_value(slot: CliTextIndex | str | None, day: dt.date) -> int | None:
     return label.value_f
 
 
-def _reason_for_day(
-    series: str | None,
-    block: str | None,
-    slot: CliTextIndex | str | None,
-    kalshi_day: KalshiDay | None,
-    day: dt.date,
+def _kalshi_reason(
+    series: str | None, block: str | None, kalshi_day: KalshiDay | None
 ) -> str | None:
-    """Why this day is out of the denominator. None means both labels are usable."""
+    """Why the Kalshi label is unusable. None means the integer is usable."""
     if series is None:
         return "missing_series"
     if block is not None:
         return block
+    if kalshi_day is None:
+        return "missing_kalshi"
+    return kalshi_day.exclusion
+
+
+def _cli_reason(slot: CliTextIndex | str | None, day: dt.date) -> str | None:
+    """Why the CLI label is unusable. None means the integer is usable."""
     if isinstance(slot, str):
         return slot
     if not isinstance(slot, CliTextIndex):
         return "cli_not_loaded"
-    return _label_reason(slot.days.get(day), kalshi_day)
-
-
-def _label_reason(label: CliLabelParse | None, kalshi_day: KalshiDay | None) -> str | None:
-    if kalshi_day is not None and kalshi_day.exclusion is not None:
-        return kalshi_day.exclusion
-    if label is not None and label.exclusion is not None:
-        return label.exclusion
-    if kalshi_day is None and (label is None or label.value_f is None):
-        return "missing_both"
-    if kalshi_day is None:
-        return "missing_kalshi"
+    label = slot.days.get(day)
     if label is None or label.value_f is None:
-        return "missing_cli"
+        return label.exclusion if label is not None and label.exclusion else "missing_cli"
     return None
+
+
+def _combined_reason(kalshi_reason: str | None, cli_reason: str | None) -> str | None:
+    """Single gate reason. Both labels missing stays ``missing_both``."""
+    if kalshi_reason is None and cli_reason is None:
+        return None
+    if kalshi_reason == "missing_kalshi" and cli_reason == "missing_cli":
+        return "missing_both"
+    return kalshi_reason or cli_reason
 
 
 def side_id(station: str, side: str) -> str:
@@ -1081,11 +1168,15 @@ def _day_exclusion_counts(rows: Sequence[DayRow]) -> dict[str, int]:
     return dict(counts)
 
 
-def _side_outcome(flagged: bool, sign_ok: bool, killed: bool) -> VerdictWord:
-    """PASS only for a Holm flag that also meets the sign rule. Not via pooled T1."""
+def _side_outcome(flagged: bool, sign_ok: bool, card_kill: bool) -> VerdictWord:
+    """PASS only for a Holm flag that also meets the sign rule.
+
+    KILL iff this side is not a PASS and the card itself is KILL (prereg §6).
+    The per-side Clopper-Pearson bound is not a label.
+    """
     if flagged and sign_ok:
         return "PASS"
-    if killed:
+    if card_kill:
         return "KILL"
     return "INCONCLUSIVE"
 
@@ -1097,14 +1188,13 @@ def _one_side(
     flagged: frozenset[str],
     p0: float,
     share: float,
-    kill_ucb: float,
 ) -> SideStat:
+    """Counts and a provisional outcome. Card KILL is applied afterwards."""
     k, n = _mismatch_counts(rows)
     deltas = _deltas(rows)
     positive = sum(1 for delta in deltas if delta > 0)
     negative = sum(1 for delta in deltas if delta < 0)
     sign_ok = same_sign_rule(deltas, share)
-    killed = kill_rule(k, n, UCB_LEVEL, kill_ucb)
     upper = None if n <= 0 else clopper_pearson_upper(k, n, UCB_LEVEL)
     sid = side_id(station, side)
     is_flagged = sid in flagged
@@ -1120,8 +1210,7 @@ def _one_side(
         negative=negative,
         sign_ok=sign_ok,
         upper=upper,
-        killed=killed,
-        outcome=_side_outcome(is_flagged, sign_ok, killed),
+        outcome=_side_outcome(is_flagged, sign_ok, False),
         day_exclusions=_day_exclusion_counts(rows),
     )
 
@@ -1131,9 +1220,8 @@ def side_statistics(
     p0: float,
     alpha: float,
     share: float,
-    kill_ucb: float,
 ) -> tuple[tuple[SideStat, ...], tuple[str, ...]]:
-    """Every station-side in ``rows``, including n = 0. Holm family is that set."""
+    """Every station-side in ``rows``, including n = 0. Holm family is 48."""
     order: list[tuple[str, str]] = []
     grouped: dict[tuple[str, str], list[DayRow]] = defaultdict(list)
     for row in rows:
@@ -1141,6 +1229,8 @@ def side_statistics(
         if key not in grouped:
             order.append(key)
         grouped[key].append(row)
+    if len(order) != REFERENCE_FAMILY:
+        raise ValueError(f"Holm family size must be {REFERENCE_FAMILY}, found {len(order)}")
     counts = {
         side_id(station, side): _mismatch_counts(grouped[(station, side)])
         for station, side in order
@@ -1148,10 +1238,18 @@ def side_statistics(
     flags = t2_holm(counts, p0, alpha)
     flagged = frozenset(flags)
     stats = tuple(
-        _one_side(station, side, grouped[(station, side)], flagged, p0, share, kill_ucb)
+        _one_side(station, side, grouped[(station, side)], flagged, p0, share)
         for station, side in order
     )
     return stats, flags
+
+
+def apply_side_outcomes(stats: Sequence[SideStat], card_kill: bool) -> tuple[SideStat, ...]:
+    """Stamp per-side labels from the card-level kill. Computed after the card."""
+    return tuple(
+        replace(stat, outcome=_side_outcome(stat.flagged, stat.sign_ok, card_kill))
+        for stat in stats
+    )
 
 
 def evaluate_card(
@@ -1187,11 +1285,12 @@ def evaluate_card(
 
 @dataclass(frozen=True, slots=True)
 class HalfStat:
-    """One calendar half. ``sign`` is the sign of the summed paired deltas."""
+    """One matched-day half of one side. ``sign`` is the summed paired deltas."""
 
     half: int
-    start: dt.date
-    end: dt.date
+    side_id: str
+    start: dt.date | None
+    end: dt.date | None
     n: int
     k: int
     mean_delta: float | None
@@ -1208,25 +1307,80 @@ def _half_sign(total: int, n: int) -> str:
     return "zero"
 
 
-def _one_half(rows: Sequence[DayRow], half: int, bounds: tuple[dt.date, dt.date]) -> HalfStat:
+def assign_matched_halves(rows: Sequence[DayRow]) -> tuple[DayRow, ...]:
+    """First floor(n/2) matched days per side are half 1. Excluded days are 0.
+
+    Prereg §5. Not the calendar split ``half_bounds`` still documents.
+    """
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        if row.outcome != "excluded" and row.delta is not None:
+            groups[(row.station, row.side)].append(index)
+    halves = _matched_half_index(rows, groups)
+    return tuple(replace(row, half=halves[index]) for index, row in enumerate(rows))
+
+
+def _matched_half_index(
+    rows: Sequence[DayRow], groups: Mapping[tuple[str, str], Sequence[int]]
+) -> dict[int, int]:
+    halves = dict.fromkeys(range(len(rows)), 0)
+    for indexes in groups.values():
+        ordered = sorted(indexes, key=lambda index: rows[index].climate_date)
+        cut = len(ordered) // 2
+        for index in ordered[:cut]:
+            halves[index] = 1
+        for index in ordered[cut:]:
+            halves[index] = 2
+    return halves
+
+
+def _one_half(rows: Sequence[DayRow], half: int, sid: str) -> HalfStat:
     paired = [row for row in rows if row.half == half and row.delta is not None]
     deltas = [row.delta for row in paired if row.delta is not None]
     total = sum(deltas)
     n = len(deltas)
     mismatches = sum(1 for row in paired if row.outcome == "mismatch")
     mean = None if n == 0 else total / n
-    return HalfStat(half, bounds[0], bounds[1], n, mismatches, mean, _half_sign(total, n))
+    start = min((row.climate_date for row in paired), default=None)
+    end = max((row.climate_date for row in paired), default=None)
+    return HalfStat(half, sid, start, end, n, mismatches, mean, _half_sign(total, n))
 
 
-def half_statistics(
-    rows: Sequence[DayRow], start: dt.date, end: dt.date
-) -> tuple[HalfStat, HalfStat, bool]:
-    """Stability when both halves are non-zero and the same sign. Not a gate."""
-    bounds = half_bounds(start, end)
-    first = _one_half(rows, 1, bounds[0])
-    second = _one_half(rows, 2, bounds[1])
-    stable = first.sign == second.sign and first.sign in {"positive", "negative"}
-    return first, second, stable
+def _halves_stable(stats: Sequence[HalfStat]) -> bool:
+    """True when every side with two signed halves agrees, and at least one does."""
+    by_side: dict[str, dict[int, str]] = defaultdict(dict)
+    for stat in stats:
+        by_side[stat.side_id][stat.half] = stat.sign
+    saw = False
+    for signs in by_side.values():
+        first, second = signs.get(1, "empty"), signs.get(2, "empty")
+        if first not in {"positive", "negative"} or second not in {"positive", "negative"}:
+            continue
+        if first != second:
+            return False
+        saw = True
+    return saw
+
+
+def half_statistics(rows: Sequence[DayRow]) -> tuple[tuple[HalfStat, ...], bool]:
+    """Per-side matched-day halves. A stability table, never a gate."""
+    order: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (row.station, row.side)
+        if key not in seen:
+            seen.add(key)
+            order.append(key)
+    found = [
+        _one_half(
+            [row for row in rows if row.station == station and row.side == side],
+            half,
+            side_id(station, side),
+        )
+        for station, side in order
+        for half in (1, 2)
+    ]
+    return tuple(found), _halves_stable(found)
 
 
 def _strike(row: Mapping[str, Any], key: str) -> float | None:
@@ -1278,19 +1432,26 @@ class RunConfig:
     """Validated CLI inputs. The live pull is the only network path."""
 
     stations_file: Path
+    prereg: Path
+    prereg_sha: str
     start: dt.date
     end: dt.date
     sides: tuple[str, ...]
-    cli_pull_ts: str
     scratch_dir: Path
     out_dir: Path
     dry_run: bool
-    p0: float
-    alpha_t1: float
-    alpha_t2: float
-    same_sign_share: float
-    kill_ucb: float
     force_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class KalshiCopyReport:
+    """Overlap of the historical and live Kalshi market copies (S6)."""
+
+    overlap: int
+    conflicts: int
+    historical_rows: int
+    historical_not_finalized: int
+    cutoff: dt.date
 
 
 @dataclass(frozen=True, slots=True)
@@ -1299,17 +1460,23 @@ class Report:
 
     config: RunConfig
     stations_sha256: str
+    prereg_sha256: str
     stations: tuple[Station, ...]
     kalshi_pull_ts: str
+    iem_pull_ts: str
     rows: tuple[DayRow, ...]
     side_stats: tuple[SideStat, ...]
     card: CardResult
-    halves: tuple[HalfStat, HalfStat]
+    halves: tuple[HalfStat, ...]
     stable: bool
     buckets: BucketTally
     market_exclusions: Mapping[tuple[str, str], Mapping[str, int]]
     undated: Mapping[str, Mapping[str, int]]
     requests: RequestCounts
+    cli_body_sha256: Mapping[str, str]
+    cli_overwrites: Mapping[str, int]
+    copies: KalshiCopyReport
+    statuses: Mapping[str, int]
 
 
 def _fmt(value: float | None) -> str:
@@ -1346,27 +1513,27 @@ def _section_frozen(report: Report) -> list[str]:
     lines = [
         "## Frozen inputs",
         "",
+        f"- prereg: `{cfg.prereg}`",
+        f"- prereg sha256: `{report.prereg_sha256}`",
         f"- stations file: `{cfg.stations_file}`",
         f"- stations sha256: `{report.stations_sha256}`",
-        f"- cli_pull_ts: `{cfg.cli_pull_ts}`",
+        f"- iem_pull_ts: `{report.iem_pull_ts}`",
         f"- kalshi_pull_ts: `{report.kalshi_pull_ts}`",
+        f"- verdict: {card.name}",
         f"- climate dates: {cfg.start.isoformat()} .. {cfg.end.isoformat()}",
         f"- sides: {', '.join(cfg.sides)}",
-        f"- p0: {cfg.p0}",
-        f"- alpha_t1: {cfg.alpha_t1}",
-        f"- alpha_t2: {cfg.alpha_t2}",
-        f"- same_sign_share: {cfg.same_sign_share}",
-        f"- kill_ucb: {cfg.kill_ucb}",
+        f"- p0: {P0}",
+        f"- alpha_t1: {ALPHA_T1}",
+        f"- alpha_t2: {ALPHA_T2}",
+        f"- same_sign_share: {SAME_SIGN_SHARE}",
+        f"- kill_ucb: {KILL_UCB}",
         f"- ucb_level: {UCB_LEVEL} (fixed, not a flag)",
         f"- force-new-look: {force}",
         (
             f"- planning N={PLANNING_N} pooled threshold k={card.planning_threshold} "
-            f"at p0={cfg.p0}, alpha={cfg.alpha_t1}"
+            f"at p0={P0}, alpha={ALPHA_T1}"
         ),
-        (
-            f"- Bonferroni first step over {REFERENCE_FAMILY} sides "
-            f"at alpha {cfg.alpha_t2}: {reference}"
-        ),
+        f"- Bonferroni first step over {REFERENCE_FAMILY} sides at alpha {ALPHA_T2}: {reference}",
         "",
     ]
     return lines
@@ -1459,18 +1626,27 @@ def _section_sign(report: Report) -> list[str]:
 
 def _section_halves(report: Report) -> list[str]:
     body = [
-        (half.half, half.start, half.end, half.n, half.k, _fmt(half.mean_delta), half.sign)
+        (
+            half.side_id,
+            half.half,
+            half.start if half.start is not None else "n/a",
+            half.end if half.end is not None else "n/a",
+            half.n,
+            half.k,
+            _fmt(half.mean_delta),
+            half.sign,
+        )
         for half in report.halves
     ]
-    headers = ("half", "start", "end", "n", "k", "mean_delta", "sign")
+    headers = ("side", "half", "start", "end", "n", "k", "mean_delta", "sign")
     stable = "yes" if report.stable else "no"
     return [
         "## Half-split stability",
         "",
-        "Calendar halves, not a sample median. Not a gate.",
+        "First floor(n/2) matched days per side, chronological. Not a gate.",
         "",
         *_md_table(headers, body),
-        f"Stable (both halves non-zero and the same sign): {stable}.",
+        f"Stable (every two-signed side agrees, and at least one does): {stable}.",
         "",
     ]
 
@@ -1487,9 +1663,15 @@ def _section_buckets(report: Report) -> list[str]:
     ]
 
 
+def _named_counts(values: Sequence[str | None]) -> list[tuple[str, int]]:
+    counts: Counter[str] = Counter(value for value in values if value)
+    return sorted(counts.items()) or [("none", 0)]
+
+
 def _section_exclusions(report: Report) -> list[str]:
-    day_counts: Counter[str] = Counter(row.exclusion for row in report.rows if row.exclusion)
-    day_body = sorted(day_counts.items()) or [("none", 0)]
+    day_body = _named_counts([row.exclusion for row in report.rows])
+    kalshi_body = _named_counts([row.kalshi_reason for row in report.rows])
+    cli_body = _named_counts([row.cli_reason for row in report.rows])
     market_body = [
         (side_id(station, side), reason, count)
         for (station, side), counts in sorted(report.market_exclusions.items())
@@ -1501,10 +1683,17 @@ def _section_exclusions(report: Report) -> list[str]:
         for reason, count in sorted(counts.items())
         if count
     ] or [("none", "none", 0)]
+    overwrite_body = sorted(report.cli_overwrites.items()) or [("none", 0)]
     return [
         "## Day-row exclusions",
         "",
         *_md_table(("reason", "n"), day_body),
+        "## Day-row kalshi_reason",
+        "",
+        *_md_table(("reason", "n"), kalshi_body),
+        "## Day-row cli_reason",
+        "",
+        *_md_table(("reason", "n"), cli_body),
         "## Kalshi market-row exclusions",
         "",
         *_md_table(("side", "reason", "n"), market_body),
@@ -1513,6 +1702,40 @@ def _section_exclusions(report: Report) -> list[str]:
         "Counted once per city, not once per side.",
         "",
         *_md_table(("city", "reason", "n"), undated_body),
+        "## CLI final overwrites",
+        "",
+        "Times a later product replaced the stored product for a date. Per side.",
+        "",
+        *_md_table(("side", "overwrites"), overwrite_body),
+    ]
+
+
+def _section_bodies(report: Report) -> list[str]:
+    body = sorted(report.cli_body_sha256.items()) or [("none", "n/a")]
+    return [
+        "## CLI raw body sha256",
+        "",
+        "SHA-256 of the raw IEM body, one per city.",
+        "",
+        *_md_table(("city", "sha256"), body),
+    ]
+
+
+def _section_copies(report: Report) -> list[str]:
+    copies = report.copies
+    statuses = ", ".join(f"{name}={count}" for name, count in sorted(report.statuses.items()))
+    status_text = statuses if statuses else "none"
+    return [
+        "## Kalshi historical and live copies",
+        "",
+        f"Client cutoff: {copies.cutoff.isoformat()} (days before it are historical).",
+        "",
+        f"- overlap tickers: {copies.overlap}",
+        f"- expiration conflicts: {copies.conflicts}",
+        f"- historical rows: {copies.historical_rows}",
+        f"- historical rows not status finalized: {copies.historical_not_finalized}",
+        f"- status counts: {status_text}",
+        "",
     ]
 
 
@@ -1549,6 +1772,8 @@ def render_report(report: Report) -> str:
         _section_halves,
         _section_buckets,
         _section_exclusions,
+        _section_bodies,
+        _section_copies,
         _section_verdict,
     ):
         parts.extend(section(report))
@@ -1568,38 +1793,91 @@ def assert_one_look(out_dir: Path, force_reason: str | None) -> None:
     raise SystemExit(f"refusing to overwrite {names}; pass --force-new-look with a reason")
 
 
-def write_parquet(rows: Sequence[DayRow], path: Path) -> None:
-    """Direct write of the per (station, side, date) rows. No temporary sibling."""
+def _column_values(rows: Sequence[DayRow]) -> dict[str, list[Any]]:
+    return {
+        "station": [row.station for row in rows],
+        "side": [row.side for row in rows],
+        "outcome": [row.outcome for row in rows],
+        "exclusion": [row.exclusion for row in rows],
+        "kalshi_reason": [row.kalshi_reason for row in rows],
+        "cli_reason": [row.cli_reason for row in rows],
+    }
+
+
+def write_parquet(rows: Sequence[DayRow], path: Path, metadata: Mapping[str, str]) -> None:
+    """Write rows plus schema metadata. The caller publishes the file atomically."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    table = pa.table(
-        {
-            "station": [row.station for row in rows],
-            "side": [row.side for row in rows],
-            "climate_date": pa.array([row.climate_date for row in rows], type=pa.date32()),
-            "kalshi_f": pa.array([row.kalshi_f for row in rows], type=pa.int32()),
-            "cli_f": pa.array([row.cli_f for row in rows], type=pa.int32()),
-            "delta": pa.array([row.delta for row in rows], type=pa.int32()),
-            "outcome": [row.outcome for row in rows],
-            "exclusion": [row.exclusion for row in rows],
-            "half": pa.array([row.half for row in rows], type=pa.int8()),
-        }
-    )
-    pq.write_table(table, path)
+    columns: dict[str, Any] = _column_values(rows)
+    columns["climate_date"] = pa.array([row.climate_date for row in rows], type=pa.date32())
+    columns["kalshi_f"] = pa.array([row.kalshi_f for row in rows], type=pa.int32())
+    columns["cli_f"] = pa.array([row.cli_f for row in rows], type=pa.int32())
+    columns["delta"] = pa.array([row.delta for row in rows], type=pa.int32())
+    columns["half"] = pa.array([row.half for row in rows], type=pa.int8())
+    encoded = {key.encode("utf-8"): value.encode("utf-8") for key, value in metadata.items()}
+    pq.write_table(pa.table(columns).replace_schema_metadata(encoded), path)
 
 
-def emit_outputs(out_dir: Path, rows: Sequence[DayRow], markdown: str) -> None:
-    """Write the parquet and the markdown. Nowhere else."""
+def _write_temps(
+    parquet_tmp: Path,
+    markdown_tmp: Path,
+    rows: Sequence[DayRow],
+    markdown: str,
+    metadata: Mapping[str, str],
+) -> None:
+    try:
+        write_parquet(rows, parquet_tmp, metadata)
+        markdown_tmp.write_text(markdown, encoding="utf-8")
+    except Exception:
+        parquet_tmp.unlink(missing_ok=True)
+        markdown_tmp.unlink(missing_ok=True)
+        raise
+
+
+def _publish_temps(
+    parquet_tmp: Path, parquet_path: Path, markdown_tmp: Path, markdown_path: Path
+) -> None:
+    """Replace both finals only after both temps exist. Roll back a half publish."""
+    os.replace(parquet_tmp, parquet_path)
+    try:
+        os.replace(markdown_tmp, markdown_path)
+    except Exception:
+        parquet_path.unlink(missing_ok=True)
+        markdown_tmp.unlink(missing_ok=True)
+        raise
+
+
+def emit_outputs(
+    out_dir: Path, rows: Sequence[DayRow], markdown: str, metadata: Mapping[str, str]
+) -> None:
+    """Write parquet and markdown to temps in ``out_dir``, then replace both."""
     out_dir.mkdir(parents=True, exist_ok=True)
     markdown_path, parquet_path = output_paths(out_dir)
-    write_parquet(rows, parquet_path)
-    markdown_path.write_text(markdown, encoding="utf-8")
+    markdown_tmp = out_dir / f".{MARKDOWN_NAME}.tmp"
+    parquet_tmp = out_dir / f".{PARQUET_NAME}.tmp"
+    _write_temps(parquet_tmp, markdown_tmp, rows, markdown, metadata)
+    _publish_temps(parquet_tmp, parquet_path, markdown_tmp, markdown_path)
+
+
+def _http_code(exc: BaseException) -> int | None:
+    """HTTP status when the exception carries one. Never the message text."""
+    if isinstance(exc, RateLimitedError):
+        return 429
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    return None
 
 
 def _note_fetch_error(kind: str, label: str, exc: BaseException) -> None:
-    """Type name only. Exception text can carry a URL; credentials are never printed."""
-    print(f"{kind} {label} {type(exc).__name__}", file=sys.stderr)
+    """Type name and HTTP code only. Exception text can carry a URL."""
+    code = _http_code(exc)
+    suffix = f" http_{code}" if code is not None else ""
+    print(f"{kind} {label} {type(exc).__name__}{suffix}", file=sys.stderr)
 
 
 def _write_markets(path: Path, markets: Sequence[Mapping[str, Any]]) -> None:
@@ -1609,17 +1887,20 @@ def _write_markets(path: Path, markets: Sequence[Mapping[str, Any]]) -> None:
 
 
 class _CountedKalshi:
-    """Counts ``get_json``. ``list_series_markets`` stays the unmodified method."""
+    """Counts ``get_json`` and keeps each page so the two copies can be compared."""
 
     def __init__(self, inner: Any) -> None:
         self.calls = 0
+        self.pages: list[tuple[str, Any]] = []
         self._inner = inner
         self._original = inner.get_json
         inner.get_json = self._counted
 
     def _counted(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
         self.calls += 1
-        return self._original(path, params)
+        payload = self._original(path, params)
+        self.pages.append((path, payload))
+        return payload
 
     def list_series_markets(self, series: str) -> list[Mapping[str, Any]]:
         found = self._inner.list_series_markets(series)
@@ -1638,23 +1919,105 @@ def _counting_kalshi() -> _MarketClient:
     return _CountedKalshi(inner)
 
 
-def _pull_kalshi(
-    scratch: Path, owners: Mapping[str, tuple[str, str]]
-) -> tuple[dict[tuple[str, str], str], int, int]:
-    """Public GETs only, via ``list_series_markets``. Failures stay per series."""
+@dataclass(frozen=True, slots=True)
+class _SeriesPull:
+    raw: tuple[Mapping[str, Any], ...]
+    annotated: tuple[dict[str, Any], ...]
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _KalshiPull:
+    blocked: Mapping[tuple[str, str], str]
+    markets: tuple[dict[str, Any], ...]
+    calls: int
+    errors: int
+    copies: KalshiCopyReport
+    statuses: Mapping[str, int]
+    by_series: Mapping[str, tuple[Mapping[str, Any], ...]]
+    pulled_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchedCity:
+    reason: str | None
+    text: str | None
+    sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _IemPull:
+    blocked: Mapping[tuple[str, str], str]
+    fetches: int
+    errors: int
+    texts: Mapping[str, str]
+    sha256: Mapping[str, str]
+    cli: Mapping[tuple[str, str], CliTextIndex | str]
+    overwrites: Mapping[str, int]
+    pulled_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScratchPending:
+    markets_by_series: Mapping[str, tuple[Mapping[str, Any], ...]]
+    texts: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _Inputs:
+    """What ``execute`` may score. ``scratch`` is written only after the B6 gate."""
+
+    markets: tuple[Mapping[str, Any], ...]
+    blocked: Mapping[tuple[str, str], str]
+    cli: Mapping[tuple[str, str], CliTextIndex | str]
+    counts: RequestCounts
+    kalshi_pull_ts: str
+    iem_pull_ts: str
+    cli_body_sha256: Mapping[str, str]
+    cli_overwrites: Mapping[str, int]
+    copies: KalshiCopyReport
+    statuses: Mapping[str, int]
+    scratch: _ScratchPending | None
+
+
+def _pull_one_series(client: _MarketClient, series: str, owner: tuple[str, str]) -> _SeriesPull:
+    """One series. Programming errors propagate; transport errors become a reason."""
+    try:
+        markets = client.list_series_markets(series)
+    except _PULL_ERRORS as exc:
+        _note_fetch_error("kalshi", series, exc)
+        return _SeriesPull((), (), "kalshi_fetch_error")
+    raw = tuple(market for market in markets if isinstance(market, Mapping))
+    return _SeriesPull(raw, tuple(_annotate(raw, owner[0], owner[1])), None)
+
+
+def _pull_kalshi(owners: Mapping[str, tuple[str, str]]) -> _KalshiPull:
+    """Public GETs only. Nothing is written; the caller commits after B6."""
+    pulled_at = _stamp()
     client = _counting_kalshi()
     blocked: dict[tuple[str, str], str] = {}
+    annotated: list[dict[str, Any]] = []
+    by_series: dict[str, tuple[Mapping[str, Any], ...]] = {}
     errors = 0
     for series, owner in owners.items():
-        try:
-            markets = client.list_series_markets(series)
-        except _PULL_ERRORS as exc:
+        pulled = _pull_one_series(client, series, owner)
+        if pulled.reason is not None:
             errors += 1
-            _note_fetch_error("kalshi", series, exc)
-            blocked[owner] = "kalshi_fetch_error"
+            blocked[owner] = pulled.reason
             continue
-        _write_markets(scratch / "kalshi" / f"{series}.json", markets)
-    return blocked, client.calls, errors
+        by_series[series] = pulled.raw
+        annotated.extend(pulled.annotated)
+    copies = compare_kalshi_copies(*_split_copies(_client_pages(client)))
+    return _KalshiPull(
+        blocked,
+        tuple(annotated),
+        client.calls,
+        errors,
+        copies,
+        status_counts(annotated),
+        by_series,
+        pulled_at,
+    )
 
 
 def _iem_modules() -> tuple[Any, Any, Any]:
@@ -1682,7 +2045,7 @@ def _iem_runtime(city_count: int) -> tuple[Any, Any]:
 
     transport_cls, url_for, pacer_cls = _iem_modules()
     transport = transport_cls(
-        budget=RequestBudget(limit=max(1, city_count * 5)),
+        budget=RequestBudget(limit=max(1, city_count * IEM_MAX_ATTEMPTS)),
         pacer=pacer_cls(clock=time.time_ns, min_interval_ns=IEM_MIN_INTERVAL_NS),
         user_agent=IEM_USER_AGENT,
         clock=time.time_ns,
@@ -1690,93 +2053,252 @@ def _iem_runtime(city_count: int) -> tuple[Any, Any]:
     return transport, url_for
 
 
+def _stamp() -> str:
+    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+
+
+def retry_delay_s(attempt: int) -> float:
+    """Backoff before retry ``attempt`` (1-based). At most one request per second."""
+    if attempt < 1:
+        raise ValueError("attempt must be positive")
+    return IEM_BACKOFF_S * float(2 ** (attempt - 1))
+
+
+def products_in_window(text: str, side: str, start: dt.date, end: dt.date) -> int:
+    """Parsed CLI products whose climate date falls inside the frozen window."""
+    index = cli_days_from_text(text, side)
+    return sum(1 for day in index.days if start <= day <= end)
+
+
+def _short_sides(text: str, sides: Sequence[str], start: dt.date, end: dt.date) -> tuple[str, ...]:
+    return tuple(
+        side for side in sides if products_in_window(text, side, start, end) < MIN_PRODUCTS_PER_SIDE
+    )
+
+
+def station_cap(city: str) -> int:
+    """Per-side cap from prereg §3. The same cap applies to high and low."""
+    named = _NAMED_CAPS.get(city)
+    if named is not None:
+        return named
+    if city in _CAP_91_CITIES:
+        return 91
+    raise ValueError(f"no frozen per-side cap for {city}")
+
+
+def paired_cap() -> int:
+    """Sum of the per-side caps. 48 sides: each station cap counts twice."""
+    cities = (*_CAP_91_CITIES, *_NAMED_CAPS)
+    return sum(station_cap(city) for city in cities) * len(SIDES)
+
+
+def status_counts(markets: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counter: Counter[str] = Counter(
+        str(market.get("status") or "").strip().lower() or "missing" for market in markets
+    )
+    return dict(counter)
+
+
+def _by_ticker(rows: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    found: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        ticker = row.get("ticker")
+        if isinstance(ticker, str) and ticker:
+            found[ticker] = row
+    return found
+
+
+def compare_kalshi_copies(
+    historical: Sequence[Mapping[str, Any]], live: Sequence[Mapping[str, Any]]
+) -> KalshiCopyReport:
+    """Overlap and expiration conflicts. Historical rows must be status finalized."""
+    hist = _by_ticker(historical)
+    live_map = _by_ticker(live)
+    shared = set(hist) & set(live_map)
+    conflicts = sum(
+        1
+        for key in shared
+        if hist[key].get("expiration_value") != live_map[key].get("expiration_value")
+    )
+    not_final = sum(
+        1 for row in historical if str(row.get("status") or "").strip().lower() != "finalized"
+    )
+    return KalshiCopyReport(
+        overlap=len(shared),
+        conflicts=conflicts,
+        historical_rows=len(historical),
+        historical_not_finalized=not_final,
+        cutoff=HISTORICAL_CUTOFF,
+    )
+
+
+def _markets_of(payload: object) -> list[Mapping[str, Any]]:
+    markets = payload.get("markets") if isinstance(payload, dict) else None
+    if not isinstance(markets, list):
+        return []
+    return [market for market in markets if isinstance(market, dict)]
+
+
+def _split_copies(
+    pages: Sequence[tuple[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    historical: list[Mapping[str, Any]] = []
+    live: list[Mapping[str, Any]] = []
+    for path, payload in pages:
+        target = historical if path.startswith("historical/") else live
+        target.extend(_markets_of(payload))
+    return historical, live
+
+
+def _client_pages(client: _MarketClient) -> tuple[tuple[str, Any], ...]:
+    pages = getattr(client, "pages", ())
+    if not isinstance(pages, list):
+        return ()
+    return tuple(pages)
+
+
+def _empty_copies() -> KalshiCopyReport:
+    return KalshiCopyReport(0, 0, 0, 0, HISTORICAL_CUTOFF)
+
+
+async def _one_attempt(
+    transport: Any, url_for: Any, station: Station, start: dt.date, end: dt.date
+) -> tuple[Any | None, str | None, bool]:
+    """One GET. The bool is whether another attempt is allowed."""
+    try:
+        fetched = await transport.fetch_cli_text(url_for(station.cli_id, start, end))
+    except _IEM_RETRY as exc:
+        _note_fetch_error("iem", station.city, exc)
+        return None, "iem_fetch_error", True
+    except TransportError as exc:
+        _note_fetch_error("iem", station.city, exc)
+        return None, "iem_fetch_error", False
+    if fetched.status_code == 200:
+        return fetched, None, False
+    print(f"iem {station.city} http_{fetched.status_code}", file=sys.stderr)
+    return None, f"iem_http_{fetched.status_code}", True
+
+
+async def _fetch_with_retry(
+    transport: Any, url_for: Any, station: Station, start: dt.date, end: dt.date
+) -> tuple[Any | None, str | None]:
+    """429, 5xx, other non-200, and transport errors. Cap ``IEM_MAX_ATTEMPTS``."""
+    last = "iem_fetch_error"
+    for attempt in range(IEM_MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(retry_delay_s(attempt))
+        fetched, reason, retryable = await _one_attempt(transport, url_for, station, start, end)
+        if fetched is not None:
+            return fetched, None
+        last = reason or last
+        if not retryable:
+            break
+    return None, last
+
+
+def _classify_body(
+    city: str, sides: Sequence[str], start: dt.date, end: dt.date, text: str
+) -> _FetchedCity:
+    """Require one parsed in-window product per side. A short body is a fetch failure."""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    short = _short_sides(text, sides, start, end)
+    if not short:
+        return _FetchedCity(None, text, digest)
+    print(
+        f"iem {city} iem_short_body sha256={digest} sides={','.join(short)}",
+        file=sys.stderr,
+    )
+    return _FetchedCity("iem_short_body", None, digest)
+
+
 async def _fetch_one_city(
     transport: Any,
     url_for: Any,
-    scratch: Path,
     station: Station,
+    sides: Sequence[str],
     start: dt.date,
     end: dt.date,
-) -> str | None:
-    """Write the raw body on any HTTP answer. Return an exclusion, or None."""
-    try:
-        fetched = await transport.fetch_cli_text(url_for(station.cli_id, start, end))
-    except _PULL_ERRORS as exc:
-        _note_fetch_error("iem", station.city, exc)
-        return "iem_fetch_error"
-    path = scratch / "iem" / f"{station.city}.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(fetched.text, encoding="utf-8")
-    if fetched.status_code != 200:
-        print(f"iem {station.city} http_{fetched.status_code}", file=sys.stderr)
-        return f"iem_http_{fetched.status_code}"
-    return None
+) -> _FetchedCity:
+    """Fetch one city into memory. No file is written here."""
+    fetched, failure = await _fetch_with_retry(transport, url_for, station, start, end)
+    if fetched is None:
+        return _FetchedCity(failure or "iem_fetch_error", None, None)
+    body = fetched.text if isinstance(fetched.text, str) else ""
+    return _classify_body(station.city, sides, start, end, body)
 
 
-async def _pull_iem_async(
-    scratch: Path, stations: Sequence[Station], sides: Sequence[str], start: dt.date, end: dt.date
-) -> tuple[dict[tuple[str, str], str], int, int]:
-    blocked: dict[tuple[str, str], str] = {}
-    try:
-        transport, url_for = _iem_runtime(len(stations))
-    except _PULL_ERRORS as exc:
-        _note_fetch_error("iem", "transport", exc)
-        for station in stations:
-            for side in sides:
-                blocked[(station.city, side)] = "iem_fetch_error"
-        return blocked, 0, len(stations)
-    errors = 0
-    fetches = 0
+def _cli_from_texts(
+    texts: Mapping[str, str], stations: Sequence[Station], sides: Sequence[str]
+) -> tuple[dict[tuple[str, str], CliTextIndex | str], dict[str, int]]:
+    cli: dict[tuple[str, str], CliTextIndex | str] = {}
+    overwrites: dict[str, int] = {}
     for station in stations:
-        fetches += 1
-        reason = await _fetch_one_city(transport, url_for, scratch, station, start, end)
-        if reason is None:
+        text = texts.get(station.city)
+        indexed = _index_cli_by_side(text, sides) if text is not None else {}
+        for side in sides:
+            slot = indexed.get(side)
+            if slot is None:
+                cli[(station.city, side)] = "cli_not_loaded"
+                continue
+            cli[(station.city, side)] = slot
+            overwrites[side_id(station.city, side)] = slot.overwrites
+    return cli, overwrites
+
+
+def _iem_transport_failure(
+    stations: Sequence[Station], sides: Sequence[str], exc: BaseException, pulled_at: str
+) -> _IemPull:
+    _note_fetch_error("iem", "transport", exc)
+    blocked = {(station.city, side): "iem_fetch_error" for station in stations for side in sides}
+    cli = {(station.city, side): "iem_fetch_error" for station in stations for side in sides}
+    return _IemPull(blocked, 0, len(stations), {}, {}, cli, {}, pulled_at)
+
+
+async def _pull_iem_cities(
+    transport: Any,
+    url_for: Any,
+    stations: Sequence[Station],
+    sides: Sequence[str],
+    start: dt.date,
+    end: dt.date,
+    pulled_at: str,
+) -> _IemPull:
+    blocked: dict[tuple[str, str], str] = {}
+    texts: dict[str, str] = {}
+    shas: dict[str, str] = {}
+    errors = 0
+    for station in stations:
+        city = await _fetch_one_city(transport, url_for, station, sides, start, end)
+        if city.sha256 is not None:
+            shas[station.city] = city.sha256
+        if city.reason is None and city.text is not None:
+            texts[station.city] = city.text
             continue
         errors += 1
         for side in sides:
-            blocked[(station.city, side)] = reason
-    return blocked, fetches, errors
+            blocked[(station.city, side)] = city.reason or "iem_fetch_error"
+    cli, overwrites = _cli_from_texts(texts, stations, sides)
+    for key, reason in blocked.items():
+        cli[key] = reason
+    return _IemPull(blocked, len(stations), errors, texts, shas, cli, overwrites, pulled_at)
+
+
+async def _pull_iem_async(
+    stations: Sequence[Station], sides: Sequence[str], start: dt.date, end: dt.date
+) -> _IemPull:
+    pulled_at = _stamp()
+    try:
+        transport, url_for = _iem_runtime(len(stations))
+    except _PULL_ERRORS as exc:
+        return _iem_transport_failure(stations, sides, exc, pulled_at)
+    return await _pull_iem_cities(transport, url_for, stations, sides, start, end, pulled_at)
 
 
 def _pull_iem(
-    scratch: Path, stations: Sequence[Station], sides: Sequence[str], start: dt.date, end: dt.date
-) -> tuple[dict[tuple[str, str], str], int, int]:
-    """At most one IEM request per second, inside ``IemPacer``."""
-    return asyncio.run(_pull_iem_async(scratch, stations, sides, start, end))
-
-
-_Loaded = tuple[
-    list[dict[str, Any]],
-    dict[tuple[str, str], str],
-    dict[tuple[str, str], CliTextIndex | str],
-    RequestCounts,
-    str,
-]
-
-
-def _pull_live(
-    config: RunConfig, stations: Sequence[Station], owners: Mapping[str, tuple[str, str]]
-) -> _Loaded:
-    """Read-only pulls. Raw bodies land only under ``config.scratch_dir``."""
-    kalshi_pull_ts = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
-    kalshi_blocked, kalshi_calls, kalshi_errors = _pull_kalshi(config.scratch_dir, owners)
-    cli_blocked, iem_fetches, iem_errors = _pull_iem(
-        config.scratch_dir, stations, config.sides, config.start, config.end
-    )
-    markets, blocked = _load_dry_markets(config.scratch_dir, owners, kalshi_blocked)
-    cli = _load_dry_cli(config.scratch_dir, stations, config.sides, cli_blocked)
-    counts = RequestCounts("live", kalshi_calls, iem_fetches, kalshi_errors, iem_errors)
-    return markets, blocked, cli, counts, kalshi_pull_ts
-
-
-def _load_inputs(
-    config: RunConfig, stations: Sequence[Station], owners: Mapping[str, tuple[str, str]]
-) -> _Loaded:
-    if config.dry_run:
-        markets, blocked = _load_dry_markets(config.scratch_dir, owners)
-        cli = _load_dry_cli(config.scratch_dir, stations, config.sides)
-        return markets, blocked, cli, RequestCounts("dry-run", 0, 0, 0, 0), "dry-run"
-    return _pull_live(config, stations, owners)
+    stations: Sequence[Station], sides: Sequence[str], start: dt.date, end: dt.date
+) -> _IemPull:
+    """At most one IEM request per second, inside ``IemPacer``, plus backoff."""
+    return asyncio.run(_pull_iem_async(stations, sides, start, end))
 
 
 def _undated_by_city(
@@ -1795,36 +2317,219 @@ def _undated_by_city(
     return found
 
 
-def execute(config: RunConfig) -> None:
-    """One look. The overwrite check happens before any read of the venues."""
-    assert_one_look(config.out_dir, config.force_reason)
-    stations = load_stations(config.stations_file)
-    digest = file_sha256(config.stations_file)
-    owners = _owners(stations, config.sides)
-    markets, blocked, cli, counts, kalshi_pull_ts = _load_inputs(config, stations, owners)
-    settled = parse_kalshi_settled(markets)
-    rows = build_rows(stations, config.sides, config.start, config.end, settled, cli, blocked)
-    stats, flags = side_statistics(
-        rows, config.p0, config.alpha_t2, config.same_sign_share, config.kill_ucb
+def _overwrite_map(cli: Mapping[tuple[str, str], CliTextIndex | str]) -> dict[str, int]:
+    return {
+        side_id(station, side): slot.overwrites
+        for (station, side), slot in cli.items()
+        if isinstance(slot, CliTextIndex)
+    }
+
+
+def _dry_body_sha(scratch: Path, stations: Sequence[Station]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for station in stations:
+        path = scratch / "iem" / f"{station.city}.txt"
+        if path.is_file():
+            found[station.city] = file_sha256(path)
+    return found
+
+
+def _inputs_from_live(kalshi: _KalshiPull, iem: _IemPull) -> _Inputs:
+    counts = RequestCounts("live", kalshi.calls, iem.fetches, kalshi.errors, iem.errors)
+    scratch = _ScratchPending(kalshi.by_series, iem.texts)
+    return _Inputs(
+        kalshi.markets,
+        kalshi.blocked,
+        iem.cli,
+        counts,
+        kalshi.pulled_at,
+        iem.pulled_at,
+        iem.sha256,
+        iem.overwrites,
+        kalshi.copies,
+        kalshi.statuses,
+        scratch,
     )
-    card = evaluate_card(stats, flags, config.p0, config.alpha_t1, config.alpha_t2, config.kill_ucb)
-    first, second, stable = half_statistics(rows, config.start, config.end)
-    report = Report(
+
+
+def _inputs_from_dry(
+    config: RunConfig, stations: Sequence[Station], owners: Mapping[str, tuple[str, str]]
+) -> _Inputs:
+    markets, blocked = _load_dry_markets(config.scratch_dir, owners)
+    cli = _load_dry_cli(config.scratch_dir, stations, config.sides)
+    return _Inputs(
+        tuple(markets),
+        blocked,
+        cli,
+        RequestCounts("dry-run", 0, 0, 0, 0),
+        "dry-run",
+        "dry-run",
+        _dry_body_sha(config.scratch_dir, stations),
+        _overwrite_map(cli),
+        _empty_copies(),
+        status_counts(markets),
+        None,
+    )
+
+
+def _load_inputs(
+    config: RunConfig, stations: Sequence[Station], owners: Mapping[str, tuple[str, str]]
+) -> _Inputs:
+    if config.dry_run:
+        return _inputs_from_dry(config, stations, owners)
+    return _inputs_from_live(
+        _pull_kalshi(owners),
+        _pull_iem(stations, config.sides, config.start, config.end),
+    )
+
+
+def _failure_table(loaded: _Inputs) -> dict[tuple[str, str], str]:
+    """Kalshi blocks plus CLI error strings. Fixture gaps are included."""
+    found = dict(loaded.blocked)
+    for key, slot in loaded.cli.items():
+        if not isinstance(slot, str):
+            continue
+        prior = found.get(key)
+        found[key] = slot if prior is None else f"{prior}+{slot}"
+    return found
+
+
+def _abort_if_partial(loaded: _Inputs) -> None:
+    """Live fetch failure raises before any scratch or evidence file is written."""
+    if loaded.counts.mode == "dry-run":
+        return
+    failed = loaded.counts.kalshi_errors > 0 or loaded.counts.iem_errors > 0
+    table = _failure_table(loaded)
+    if not failed and not table:
+        return
+    print("side\treason", file=sys.stderr)
+    for (station, side), reason in sorted(table.items()):
+        print(f"{station}:{side}\t{reason}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _commit_pending(scratch: Path, pending: _ScratchPending | None) -> None:
+    if pending is None:
+        return
+    for series, markets in pending.markets_by_series.items():
+        _write_markets(scratch / "kalshi" / f"{series}.json", markets)
+    for city, text in pending.texts.items():
+        path = scratch / "iem" / f"{city}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def assert_paired_fraction(paired: int, statuses: Mapping[str, int]) -> None:
+    """Abort when paired days fall below half the frozen per-side cap (P7)."""
+    cap = paired_cap()
+    if paired >= PAIRED_CAP_FRACTION * cap:
+        return
+    rendered = ", ".join(f"{name}={count}" for name, count in sorted(statuses.items()))
+    print(f"card_e: status counts: {rendered}", file=sys.stderr)
+    print(
+        f"card_e: paired {paired} is below {PAIRED_CAP_FRACTION:.0%} of per-side cap {cap}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _score_rows(
+    stations: Sequence[Station], config: RunConfig, loaded: _Inputs
+) -> tuple[
+    tuple[DayRow, ...],
+    tuple[SideStat, ...],
+    CardResult,
+    tuple[HalfStat, ...],
+    bool,
+    KalshiSettled,
+]:
+    settled = parse_kalshi_settled(loaded.markets)
+    rows = assign_matched_halves(
+        build_rows(
+            stations,
+            config.sides,
+            config.start,
+            config.end,
+            settled,
+            loaded.cli,
+            loaded.blocked,
+        )
+    )
+    stats, flags = side_statistics(rows, P0, ALPHA_T2, SAME_SIGN_SHARE)
+    card = evaluate_card(stats, flags, P0, ALPHA_T1, ALPHA_T2, KILL_UCB)
+    halves, stable = half_statistics(rows)
+    return rows, apply_side_outcomes(stats, card.kill), card, halves, stable, settled
+
+
+def _assemble_report(
+    config: RunConfig,
+    stations: tuple[Station, ...],
+    stations_sha: str,
+    prereg_sha: str,
+    loaded: _Inputs,
+    scored: tuple[
+        tuple[DayRow, ...],
+        tuple[SideStat, ...],
+        CardResult,
+        tuple[HalfStat, ...],
+        bool,
+        KalshiSettled,
+    ],
+) -> Report:
+    rows, stats, card, halves, stable, settled = scored
+    return Report(
         config=config,
-        stations_sha256=digest,
+        stations_sha256=stations_sha,
+        prereg_sha256=prereg_sha,
         stations=stations,
-        kalshi_pull_ts=kalshi_pull_ts,
+        kalshi_pull_ts=loaded.kalshi_pull_ts,
+        iem_pull_ts=loaded.iem_pull_ts,
         rows=rows,
         side_stats=stats,
         card=card,
-        halves=(first, second),
+        halves=halves,
         stable=stable,
-        buckets=tally_buckets(markets, cli, config.start, config.end),
+        buckets=tally_buckets(loaded.markets, loaded.cli, config.start, config.end),
         market_exclusions=settled.exclusion_counts,
-        undated=_undated_by_city(cli, stations, config.sides),
-        requests=counts,
+        undated=_undated_by_city(loaded.cli, stations, config.sides),
+        requests=loaded.counts,
+        cli_body_sha256=loaded.cli_body_sha256,
+        cli_overwrites=loaded.cli_overwrites,
+        copies=loaded.copies,
+        statuses=loaded.statuses,
     )
-    emit_outputs(config.out_dir, rows, render_report(report))
+
+
+def _parquet_metadata(report: Report) -> dict[str, str]:
+    return {
+        "iem_pull_ts": report.iem_pull_ts,
+        "kalshi_pull_ts": report.kalshi_pull_ts,
+        "stations_sha256": report.stations_sha256,
+        "prereg_sha256": report.prereg_sha256,
+        "verdict": report.card.name,
+    }
+
+
+def execute(config: RunConfig) -> None:
+    """One look. Prereg is checked before the overwrite guard and before any pull."""
+    prereg_sha = assert_prereg(config.prereg, config.prereg_sha)
+    assert_dry_run_not_evidence(config.out_dir, config.dry_run)
+    assert_one_look(config.out_dir, config.force_reason)
+    stations = load_stations(config.stations_file)
+    loaded = _load_inputs(config, stations, _owners(stations, config.sides))
+    _abort_if_partial(loaded)
+    _commit_pending(config.scratch_dir, loaded.scratch)
+    report = _assemble_report(
+        config,
+        stations,
+        file_sha256(config.stations_file),
+        prereg_sha,
+        loaded,
+        _score_rows(stations, config, loaded),
+    )
+    if loaded.counts.mode != "dry-run":
+        assert_paired_fraction(len(_paired(report.rows)), loaded.statuses)
+    emit_outputs(config.out_dir, report.rows, render_report(report), _parquet_metadata(report))
 
 
 def parse_sides(raw: str) -> tuple[str, ...]:
@@ -1837,14 +2542,6 @@ def parse_sides(raw: str) -> tuple[str, ...]:
     return parts
 
 
-def _parse_timestamp(raw: str) -> str:
-    text = raw.strip()
-    if not text or "\n" in raw or "\r" in raw:
-        raise ValueError("cli-pull-ts must be one ISO timestamp")
-    dt.datetime.fromisoformat(text)
-    return text
-
-
 def _force_reason(raw: str) -> str:
     text = raw.strip()
     if not text or "\n" in raw or "\r" in raw:
@@ -1852,44 +2549,65 @@ def _force_reason(raw: str) -> str:
     return text
 
 
-def _open_unit(name: str, raw: object) -> float:
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise TypeError(f"{name} must be a number")
-    number = float(raw)
-    if not math.isfinite(number) or not 0 < number < 1:
-        raise ValueError(f"{name} must be in (0, 1)")
-    return number
+_PREREG_PENDING_RULE: Final[str] = "while the sha256 line says PENDING"
 
 
-def _closed_unit(name: str, raw: object) -> float:
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise TypeError(f"{name} must be a number")
-    number = float(raw)
-    if not math.isfinite(number) or not 0 < number <= 1:
-        raise ValueError(f"{name} must be in (0, 1]")
-    return number
+def _prereg_still_pending(text: str) -> bool:
+    """True when PENDING is an unfilled digest, not the sentence that names the rule."""
+    return "PENDING" in text.replace(_PREREG_PENDING_RULE, "")
+
+
+def assert_prereg(path: Path, expected: str) -> str:
+    """Refuse a sha mismatch or a prereg whose sha line is still PENDING."""
+    digest = file_sha256(path)
+    problems: list[str] = []
+    if digest != expected.strip().lower():
+        problems.append("prereg sha256 mismatch")
+    if _prereg_still_pending(path.read_text(encoding="utf-8")):
+        problems.append("prereg still contains PENDING")
+    if problems:
+        print("card_e: " + "; ".join(problems), file=sys.stderr)
+        raise SystemExit(2)
+    return digest
+
+
+def evidence_dir() -> Path:
+    return (_REPO_ROOT / DEFAULT_OUT_DIR).resolve()
+
+
+def assert_dry_run_not_evidence(out_dir: Path, dry_run: bool) -> None:
+    """A dry-run must not consume the one evidence-directory look."""
+    if dry_run and out_dir.resolve() == evidence_dir():
+        print(
+            "card_e: dry-run refused because --out-dir is the evidence directory",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
+def _frozen_dates(start: object, end: object) -> tuple[dt.date, dt.date]:
+    found_start = FROZEN_START if start is None else dt.date.fromisoformat(str(start))
+    found_end = FROZEN_END if end is None else dt.date.fromisoformat(str(end))
+    if (found_start, found_end) != (FROZEN_START, FROZEN_END):
+        raise ValueError(
+            f"window is frozen at {FROZEN_START.isoformat()}..{FROZEN_END.isoformat()}"
+        )
+    return found_start, found_end
 
 
 def _config_from_args(args: argparse.Namespace) -> RunConfig:
-    start = dt.date.fromisoformat(str(args.start))
-    end = dt.date.fromisoformat(str(args.end))
-    if end < start:
-        raise ValueError("end before start")
+    start, end = _frozen_dates(args.start, args.end)
     force = None if args.force_new_look is None else _force_reason(str(args.force_new_look))
     return RunConfig(
         stations_file=Path(str(args.stations_file)),
+        prereg=Path(str(args.prereg)),
+        prereg_sha=str(args.prereg_sha).strip().lower(),
         start=start,
         end=end,
-        sides=parse_sides(str(args.sides)),
-        cli_pull_ts=_parse_timestamp(str(args.cli_pull_ts)),
+        sides=SIDES,
         scratch_dir=Path(str(args.scratch_dir)),
         out_dir=Path(str(args.out_dir)),
         dry_run=bool(args.dry_run),
-        p0=_open_unit("p0", args.p0),
-        alpha_t1=_open_unit("alpha-t1", args.alpha_t1),
-        alpha_t2=_open_unit("alpha-t2", args.alpha_t2),
-        same_sign_share=_closed_unit("same-sign-share", args.same_sign_share),
-        kill_ucb=_open_unit("kill-ucb", args.kill_ucb),
         force_reason=force,
     )
 
@@ -1897,18 +2615,13 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Card E: CLI versus Kalshi expiration value")
     parser.add_argument("--stations-file", type=Path, required=True)
-    parser.add_argument("--start", required=True, help="climate date YYYY-MM-DD")
-    parser.add_argument("--end", required=True, help="climate date YYYY-MM-DD")
-    parser.add_argument("--sides", required=True, help="high, low, or high,low")
-    parser.add_argument("--cli-pull-ts", required=True, help="frozen ISO timestamp")
+    parser.add_argument("--prereg", type=Path, required=True)
+    parser.add_argument("--prereg-sha", required=True)
+    parser.add_argument("--start", default=None, help="optional; must be the frozen start")
+    parser.add_argument("--end", default=None, help="optional; must be the frozen end")
     parser.add_argument("--scratch-dir", type=Path, required=True)
-    parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
+    parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true", help="fixtures only; no network")
-    parser.add_argument("--p0", type=float, default=0.01)
-    parser.add_argument("--alpha-t1", type=float, default=0.025)
-    parser.add_argument("--alpha-t2", type=float, default=0.025)
-    parser.add_argument("--same-sign-share", type=float, default=0.80)
-    parser.add_argument("--kill-ucb", type=float, default=0.02)
     parser.add_argument("--force-new-look", default=None, help="reason required to overwrite")
     return parser
 
