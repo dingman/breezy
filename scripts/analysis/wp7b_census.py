@@ -1,0 +1,998 @@
+"""Card A one-look census. Called only from ``--census-only``, before ``collect``.
+
+No network, no truth loader, no ``RungEvent``. Writes nothing except the two
+artefacts, and only when not a dry-run and not a refusal.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN, Decimal
+from pathlib import Path
+from typing import Final, NoReturn, cast
+
+from h4_preliminary_economic_read import parse_rung  # type: ignore[import-not-found]
+from wp7b_market_as_forecaster import (  # type: ignore[import-not-found]
+    IncompleteLadderError,
+    SumAskRow,
+    assert_complete_partition,
+)
+
+from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
+from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
+from breezy.strategy.current_rung_hold.decision import fee_on_ask
+
+_NS: Final[int] = 1_000_000_000
+_EPOCH: Final[dt.datetime] = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+
+WINDOW_START: Final[dt.date] = dt.date(2026, 9, 21)
+WINDOW_END: Final[dt.date] = dt.date(2026, 10, 30)
+TARGET_CLOCK: Final[dt.time] = dt.time(18, 0, 0)
+OFFSET_START: Final[dt.time] = dt.time(17, 30, 0)
+OFFSET_END: Final[dt.time] = dt.time(18, 30, 0)
+AGE_CAP_S: Final[int] = 60
+FIRST_COMPLETE_LEAD_MIN: Final[int] = 60
+FEE_COEFFICIENT: Final[Decimal] = Decimal("0.0695")
+TICK: Final[Decimal] = Decimal("0.01")
+HURDLE: Final[Decimal] = Decimal("0.01")
+FLOOR_STATION_DAYS: Final[int] = 30
+FLOOR_DATES: Final[int] = 7
+Q_GRID: Final[tuple[int, ...]] = (1, 5, 10, 25)
+NORMALIZER_DAYS: Final[int] = 30
+WINDOW_DAYS: Final[int] = 40
+
+_FROZEN: Final[tuple[object, ...]] = (
+    WINDOW_START,
+    WINDOW_END,
+    TARGET_CLOCK,
+    OFFSET_START,
+    OFFSET_END,
+    AGE_CAP_S,
+    FIRST_COMPLETE_LEAD_MIN,
+    FEE_COEFFICIENT,
+    TICK,
+    HURDLE,
+    FLOOR_STATION_DAYS,
+    FLOOR_DATES,
+    Q_GRID,
+    NORMALIZER_DAYS,
+    WINDOW_DAYS,
+)
+
+_REPO: Final[Path] = Path(__file__).resolve().parents[2]
+PREREG_PATH: Path = _REPO / "docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_card_a.md"
+FREEZE_PATH: Path = _REPO / "docs/evidence/STRAT_DESIGN_2026-10-31/FREEZE_card_a.txt"
+OUTPUT_DIR: Path = _REPO / "docs/evidence/STRAT_DESIGN_2026-10-31"
+CATALOG: Path = Path.home() / ".local/share/breezy/catalog/quote_tape/polymarket_us"
+
+_FAMILY_FILES: Final[tuple[str, ...]] = (
+    "pm_us_crh_cont.json",
+    "pm_us_crh_exit_v4.json",
+    "pm_us_crh_fq_v1.json",
+    "pm_us_crh_v2.json",
+    "pm_us_crh_v4.json",
+    "pm_us_no_maker_sharp_v1.json",
+)
+_COLUMNS: Final[tuple[str, ...]] = ("station", "climate_day", "status", "leg1", "leg2")
+_RAW_TOLERANCE: Final[Decimal] = Decimal("0.000001")
+
+
+class OwnOrderError(Exception):
+    """The own-order set cannot be built. The message is the one-line refusal."""
+
+
+@dataclass(frozen=True, slots=True)
+class Quote:
+    ts_ns: int
+    ask: Decimal | None
+    ask_size: Decimal
+    bid: Decimal | None
+    bid_size: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class FrameSelection:
+    kind: str
+    reason: str
+    chosen: tuple[tuple[str, Quote], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BookEval:
+    crossed: bool
+    leg1_clear: bool
+    leg2_clear: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OwnSet:
+    instrument_ids: tuple[str, ...]
+    first_ns: Mapping[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _Denom:
+    day: dt.date
+    asks: tuple[Decimal, ...]
+    ask_sizes: tuple[Decimal, ...]
+    bids: tuple[Decimal, ...]
+    bid_sizes: tuple[Decimal, ...]
+    leg1: bool
+    leg2: bool
+
+
+def refuse(reason: str) -> NoReturn:
+    """Exit 2 with one stderr line. No write has happened yet on this path."""
+    print(reason.replace("\n", " "), file=sys.stderr)
+    raise SystemExit(2)
+
+
+def assert_constants() -> None:
+    """The frozen tuple is not a CLI flag. A drift refuses before any frame."""
+    window_days = (WINDOW_END - WINDOW_START).days + 1
+    actual: tuple[object, ...] = (
+        WINDOW_START,
+        WINDOW_END,
+        TARGET_CLOCK,
+        OFFSET_START,
+        OFFSET_END,
+        AGE_CAP_S,
+        FIRST_COMPLETE_LEAD_MIN,
+        FEE_COEFFICIENT,
+        TICK,
+        HURDLE,
+        FLOOR_STATION_DAYS,
+        FLOOR_DATES,
+        Q_GRID,
+        NORMALIZER_DAYS,
+        window_days,
+    )
+    if actual != _FROZEN or window_days != WINDOW_DAYS:
+        refuse("census constant mismatch")
+
+
+def _ns_of(moment: dt.datetime) -> int:
+    utc = moment.astimezone(dt.UTC)
+    delta = utc - _EPOCH
+    return delta.days * 86_400 * _NS + delta.seconds * _NS + delta.microseconds * 1_000
+
+
+def _target_ns(climate_day: dt.date) -> int:
+    moment = dt.datetime.combine(climate_day - dt.timedelta(days=1), TARGET_CLOCK, tzinfo=dt.UTC)
+    return _ns_of(moment)
+
+
+def _offset_bounds_ns(climate_day: dt.date) -> tuple[int, int]:
+    day = climate_day - dt.timedelta(days=1)
+    start = dt.datetime.combine(day, OFFSET_START, tzinfo=dt.UTC)
+    end = dt.datetime.combine(day, OFFSET_END, tzinfo=dt.UTC)
+    return _ns_of(start), _ns_of(end)
+
+
+def _nearest(series: Sequence[Quote], target: int, start: int, end: int) -> Quote | None:
+    cap = AGE_CAP_S * _NS
+    qualifying = [
+        quote for quote in series if start <= quote.ts_ns < end and abs(quote.ts_ns - target) <= cap
+    ]
+    if not qualifying:
+        return None
+    return min(qualifying, key=lambda quote: (abs(quote.ts_ns - target), quote.ts_ns))
+
+
+def _is_crossed(quote: Quote) -> bool:
+    return quote.ask is not None and quote.bid is not None and quote.bid >= quote.ask
+
+
+def select_frame(*, climate_day: dt.date, quotes: Mapping[str, Sequence[Quote]]) -> FrameSelection:
+    """Time-only nearest row per rung. Never the first row. Missing stays missing."""
+    if not quotes:
+        return FrameSelection("MISSING", "missing rung", ())
+    target = _target_ns(climate_day)
+    start, end = _offset_bounds_ns(climate_day)
+    chosen: list[tuple[str, Quote]] = []
+    firsts: list[int] = []
+    for instrument_id, series in quotes.items():
+        if not series:
+            return FrameSelection("MISSING", "missing rung", ())
+        firsts.append(min(quote.ts_ns for quote in series))
+        pick = _nearest(series, target, start, end)
+        if pick is None:
+            return FrameSelection("MISSING", "missing rung", ())
+        chosen.append((instrument_id, pick))
+    try:
+        assert_complete_partition([parse_rung(instrument_id) for instrument_id, _q in chosen])
+    except (IncompleteLadderError, ValueError):
+        return FrameSelection("MISSING", "partition check failed", ())
+    frame_ns = max(quote.ts_ns for _instrument_id, quote in chosen)
+    lead = FIRST_COMPLETE_LEAD_MIN * 60 * _NS
+    if frame_ns < max(firsts) + lead:
+        return FrameSelection(
+            "MISSING",
+            "frame is not 60 minutes after the first complete partition",
+            (),
+        )
+    if any(_is_crossed(quote) for _instrument_id, quote in chosen):
+        return FrameSelection("MISSING", "crossed rung", ())
+    return FrameSelection("FRAME", "", tuple(chosen))
+
+
+def _cents(amount: Decimal) -> int:
+    quantized = amount.quantize(TICK, rounding=ROUND_HALF_EVEN)
+    return int(quantized * 100)
+
+
+def rounded_fill_fee(price: Decimal, q: int) -> Decimal:
+    """q=1 is ``fee_on_ask``. q>1 is one rounded fee for the whole fill, not q times it."""
+    if q == 1:
+        return fee_on_ask(price, FEE_COEFFICIENT)
+    from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
+
+    money = taker_fee_at_fill(
+        quantity=Decimal(q),
+        price=price,
+        ts_event_ns=1,
+        fee_coefficient_at_fill=FEE_COEFFICIENT,
+    )
+    if money is None:
+        raise RuntimeError("q-fill fee is unavailable")
+    return cast(Decimal, money.as_decimal())
+
+
+def leg1_slack_cents(asks: Sequence[Decimal]) -> int:
+    """Integer cents: ``(100 - 2n) - (sum ask cents + sum fee cents)``. Clears at >= 0."""
+    n = len(asks)
+    total = sum(_cents(price) + _cents(fee_on_ask(price, FEE_COEFFICIENT)) for price in asks)
+    return (100 - 2 * n) - total
+
+
+def leg2_slack_cents(bids: Sequence[Decimal]) -> int:
+    """Integer cents: bid cents minus fee_1(1-bid), against ``100 + 2n``."""
+    n = len(bids)
+    net = 0
+    for bid in bids:
+        net += _cents(bid) - _cents(fee_on_ask(Decimal(1) - bid, FEE_COEFFICIENT))
+    return net - (100 + 2 * n)
+
+
+def _slack_at_q(prices: Sequence[Decimal], q: int, *, side: str) -> int:
+    n = len(prices)
+    if side == "ask":
+        total = sum(_cents(price) + _cents(rounded_fill_fee(price, q)) for price in prices)
+        return (100 - 2 * n) - total
+    net = 0
+    for bid in prices:
+        net += _cents(bid) - _cents(rounded_fill_fee(Decimal(1) - bid, q))
+    return net - (100 + 2 * n)
+
+
+def evaluate_book(
+    rows: Sequence[tuple[Decimal | None, Decimal, Decimal | None, Decimal]],
+) -> BookEval:
+    """One hand-built partition. Empty is not a clear. A crossed rung clears neither leg."""
+    if not rows:
+        return BookEval(crossed=False, leg1_clear=False, leg2_clear=False)
+    crossed = any(
+        ask is not None and bid is not None and bid >= ask for ask, _asz, bid, _bsz in rows
+    )
+    if crossed:
+        return BookEval(crossed=True, leg1_clear=False, leg2_clear=False)
+    asks = [ask for ask, _asz, _bid, _bsz in rows if ask is not None]
+    bids = [bid for _ask, _asz, bid, _bsz in rows if bid is not None]
+    leg1 = (
+        len(asks) == len(rows)
+        and all(size >= 1 for _ask, size, _bid, _bsz in rows)
+        and leg1_slack_cents(asks) >= 0
+    )
+    leg2 = (
+        len(bids) == len(rows)
+        and all(size >= 1 for _ask, _asz, _bid, size in rows)
+        and leg2_slack_cents(bids) >= 0
+    )
+    return BookEval(crossed=False, leg1_clear=leg1, leg2_clear=leg2)
+
+
+def frame_excluded(frame_ns: int, rung_ids: Sequence[str], first_ns: Mapping[str, int]) -> bool:
+    """Drop the frame when any rung's base slug was ours at or before the frame time."""
+    for rung_id in rung_ids:
+        base = base_symbol_of(symbol_of_instrument_id(rung_id))
+        started = first_ns.get(base)
+        if started is not None and frame_ns >= started:
+            return True
+    return False
+
+
+def format_own_set(own: OwnSet) -> str:
+    """Instrument ids and a count. Never an order id, intent id, or fingerprint."""
+    lines = [f"own-order instrument count: {len(own.instrument_ids)}", *own.instrument_ids]
+    return "\n".join(lines)
+
+
+def _as_bytes(value: object) -> bytes:
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, bytes):
+        return value
+    raise OwnOrderError("own-order set cannot be built: unreadable slot row")
+
+
+@contextmanager
+def _ro(path: Path) -> Iterator[sqlite3.Connection]:
+    """mode=ro plus query_only. Never ``SqliteStateStore`` (that one creates and commits)."""
+    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5.0)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        yield connection
+    finally:
+        connection.close()
+
+
+def _remember(first: dict[str, int], base: str, created_ns: int) -> None:
+    previous = first.get(base)
+    if previous is None or created_ns < previous:
+        first[base] = created_ns
+
+
+def _base_of(instrument_or_slug: str) -> str:
+    return base_symbol_of(symbol_of_instrument_id(instrument_or_slug))
+
+
+def read_own_orders(path: Path) -> OwnSet:
+    """Scan intent history and the current slot table. Slug-less and unreadable refuse."""
+    from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+    from breezy.domain.exec_intent import (
+        FILL_BY_FINGERPRINT_KEY_PREFIX,
+        FILL_KEY_PREFIX,
+        utc_day_for_ns,
+    )
+    from breezy.runtime.exec_par_durable_sources import HISTORY_KEY_PREFIX
+    from breezy.runtime.submit_intent import (
+        CURRENT_INTENT_KEY,
+        SubmitIntent,
+        SubmitIntentCorrupt,
+        decode_slot_table,
+    )
+
+    first: dict[str, int] = {}
+    never_filled = 0
+    try:
+        with _ro(path) as connection:
+            history = connection.execute(
+                "SELECT value FROM state WHERE substr(key, 1, ?) = ?",
+                (len(HISTORY_KEY_PREFIX), HISTORY_KEY_PREFIX),
+            ).fetchall()
+            current = connection.execute(
+                "SELECT value FROM state WHERE key = ?",
+                (CURRENT_INTENT_KEY,),
+            ).fetchone()
+            intents: list[SubmitIntent] = []
+            for (value,) in history:
+                try:
+                    intents.append(SubmitIntent.from_bytes(_as_bytes(value)))
+                except (SubmitIntentCorrupt, ValueError, TypeError, OwnOrderError):
+                    raise OwnOrderError(
+                        "own-order set cannot be built: history row did not decode"
+                    ) from None
+            raw = None if current is None else _as_bytes(current[0])
+            try:
+                table = decode_slot_table(raw)
+            except SubmitIntentCorrupt:
+                raise OwnOrderError("own-order set cannot be built: unreadable slot row") from None
+            if table.unreadable:
+                raise OwnOrderError("own-order set cannot be built: unreadable slot row")
+            intents.extend(table.open)
+            if table.last is not None:
+                intents.append(table.last)
+
+            def _get(key: str) -> bytes | None:
+                found = connection.execute(
+                    "SELECT value FROM state WHERE key = ?", (key,)
+                ).fetchone()
+                return None if found is None else _as_bytes(found[0])
+
+            for intent in intents:
+                if intent.slug:
+                    _remember(first, _base_of(intent.slug), intent.created_ns)
+                    continue
+                day = utc_day_for_ns(intent.created_ns).isoformat()
+                index = _get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent.fingerprint}")
+                if index is None or not index.decode("utf-8").strip():
+                    never_filled += 1
+                    continue
+                fill_raw = _get(f"{FILL_KEY_PREFIX}{index.decode('utf-8').strip()}")
+                if fill_raw is None:
+                    never_filled += 1
+                    continue
+                try:
+                    record = DurableFillRecord.from_bytes(fill_raw)
+                except (ValueError, TypeError):
+                    raise OwnOrderError(
+                        "own-order set cannot be built: unreadable fill record"
+                    ) from None
+                _remember(first, _base_of(record.instrument_id), intent.created_ns)
+    except sqlite3.Error:
+        raise OwnOrderError("own-order set cannot be built: store is unreadable") from None
+    if never_filled:
+        raise OwnOrderError(
+            f"own-order set cannot be built: {never_filled} slug-less intent(s) never filled"
+        )
+    return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first)
+
+
+def _parse_freeze(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        key, _sep, value = line.partition(" ")
+        fields[key] = value.strip()
+    return fields
+
+
+def _check_freeze(prereg_sha: str) -> None:
+    if not FREEZE_PATH.is_file():
+        refuse("freeze record missing")
+    if not PREREG_PATH.is_file():
+        refuse("prereg sha256 mismatch")
+    fields = _parse_freeze(FREEZE_PATH)
+    problems: list[str] = []
+    status = fields.get("status", "").strip()
+    if status != "FROZEN":
+        problems.append(f"freeze status is {status or 'absent'}")
+    if status == "FROZEN" and fields.get("looks_allowed", "").strip() != "1":
+        problems.append("looks_allowed is not 1")
+    live = hashlib.sha256(PREREG_PATH.read_bytes()).hexdigest()
+    recorded = fields.get("prereg_sha256", "").strip().lower()
+    given = prereg_sha.strip().lower()
+    if recorded != given or recorded != live or given != live:
+        problems.append("prereg sha256 mismatch")
+    if problems:
+        refuse("; ".join(problems))
+
+
+def _carries_sha(out: Path, sha: str) -> bool:
+    markdown = out / "card_a_census.md"
+    parquet = out / "card_a_census.parquet"
+    if not markdown.is_file() or not parquet.is_file():
+        return False
+    header = "".join(markdown.read_text(encoding="utf-8").splitlines(keepends=True)[:30])
+    if f"prereg_sha256: {sha}" not in header:
+        return False
+    try:
+        import pyarrow.parquet as pq
+
+        meta = pq.read_schema(parquet).metadata or {}
+    except (OSError, ValueError):
+        return False
+    return meta.get(b"prereg_sha256") == sha.encode()
+
+
+def emit_census(
+    out: Path,
+    markdown: str,
+    records: Sequence[Mapping[str, object]],
+    sha: str,
+    dry_run: bool = False,
+) -> None:
+    """Temp file in ``out``, then ``os.replace``. A prior look with this sha refuses."""
+    if dry_run:
+        return
+    if _carries_sha(out, sha):
+        refuse("prior look already carries this prereg sha256")
+    out.mkdir(parents=True, exist_ok=True)
+    md_tmp = out / f".card_a_census.md.{os.getpid()}.tmp"
+    pq_tmp = out / f".card_a_census.parquet.{os.getpid()}.tmp"
+    try:
+        md_tmp.write_text(markdown, encoding="utf-8")
+        _write_parquet(pq_tmp, records, sha)
+        os.replace(pq_tmp, out / "card_a_census.parquet")
+        os.replace(md_tmp, out / "card_a_census.md")
+    finally:
+        md_tmp.unlink(missing_ok=True)
+        pq_tmp.unlink(missing_ok=True)
+
+
+def _write_parquet(path: Path, records: Sequence[Mapping[str, object]], sha: str) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def _cell(row: Mapping[str, object], name: str) -> str:
+        value = row.get(name, "")
+        return "" if value is None else str(value)
+
+    schema = pa.schema(
+        [(name, pa.string()) for name in _COLUMNS],
+        metadata={b"prereg_sha256": sha.encode("ascii")},
+    )
+    columns = {
+        name: pa.array([_cell(row, name) for row in records], type=pa.string()) for name in _COLUMNS
+    }
+    pq.write_table(pa.table(columns, schema=schema), path)
+
+
+def _label(clears: int, denominator: int, dates: int, unit_ok: bool) -> str:
+    if not unit_ok or denominator < FLOOR_STATION_DAYS or dates < FLOOR_DATES:
+        return "INCONCLUSIVE"
+    if clears >= 1:
+        return "PASS"
+    return "KILL"
+
+
+def _recover_raw(scaled: float, size_scalar: float) -> int | None:
+    product = Decimal(str(size_scalar)) * Decimal(str(scaled))
+    nearest = product.to_integral_value(rounding=ROUND_HALF_EVEN)
+    if abs(product - nearest) > _RAW_TOLERANCE:
+        return None
+    return int(nearest)
+
+
+def bands_impossible(high_upper_f: int | None, low_lower_f: int | None) -> bool:
+    """A high band that ends below a low band's floor cannot both settle."""
+    if high_upper_f is None or low_lower_f is None:
+        return False
+    return high_upper_f < low_lower_f
+
+
+def _family_lines() -> list[str]:
+    lines = [
+        "## Family manifest cross-check",
+        "",
+        "Manifests are a cross-check only. The store scan is the superset.",
+    ]
+    root = _REPO / "deploy" / "families"
+    for name in _FAMILY_FILES:
+        path = root / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            lines.append(f"- {name}: unreadable")
+            continue
+        prefix = payload.get("trial_id_prefix") if isinstance(payload, dict) else None
+        lines.append(f"- {name}: trial_id_prefix {prefix}")
+    return lines
+
+
+def _buyer_lines(catalog: Path) -> list[str]:
+    """Count is not taken. ``CatalogSession.read`` mkdir's a scratch catalog (H3 forbids it)."""
+    trade_root = catalog / "data" / "trade_tick"
+    if not trade_root.is_dir():
+        return [
+            "## BUYER prints",
+            "",
+            (
+                "trade_tick stream absent; CatalogSession not invoked "
+                "because it writes a scratch catalog."
+            ),
+        ]
+    return [
+        "## BUYER prints",
+        "",
+        (
+            "trade_tick stream present; CatalogSession not invoked "
+            "because it writes a scratch catalog."
+        ),
+        "BUYER print counts were not taken.",
+    ]
+
+
+def _quote_from_instant(instant: object) -> Quote:
+    from forecast_cheap_screen_wp7 import RungInstant  # type: ignore[import-not-found]
+
+    if not isinstance(instant, RungInstant):
+        raise TypeError("depth row is not a rung instant")
+    return Quote(
+        ts_ns=instant.ts_ns,
+        ask=None if instant.ask is None else Decimal(str(instant.ask)),
+        ask_size=Decimal(str(instant.ask_size)),
+        bid=None if instant.bid is None else Decimal(str(instant.bid)),
+        bid_size=Decimal(str(instant.bid_size)),
+    )
+
+
+def _fee_ok(fee_map: Mapping[str, str] | None, instrument_id: str) -> bool:
+    if fee_map is None:
+        return False
+    raw = fee_map.get(instrument_id)
+    if raw is None:
+        raw = fee_map.get(symbol_of_instrument_id(instrument_id))
+    if raw is None:
+        return False
+    try:
+        return Decimal(raw) == FEE_COEFFICIENT
+    except ArithmeticError:
+        return False
+
+
+def _load_fee_map(catalog: Path) -> dict[str, str] | None:
+    try:
+        from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+        found: dict[str, str] = {}
+        for instrument in ParquetDataCatalog(str(catalog)).instruments():
+            info = instrument.info
+            if not isinstance(info, dict):
+                continue
+            raw = info.get("fee_coefficient")
+            if raw is None:
+                continue
+            found[str(instrument.id)] = str(raw)
+        return found
+    except (OSError, RuntimeError, TypeError, ValueError, ImportError):
+        return None
+
+
+def _walk_dirs(
+    depth_root: Path, notes: list[str]
+) -> tuple[dict[tuple[str, dt.date], list[Path]], int]:
+    grouped: dict[tuple[str, dt.date], list[Path]] = {}
+    highs: list[tuple[str, dt.date, int | None]] = []
+    lows: list[tuple[str, dt.date, int | None]] = []
+    if not depth_root.is_dir():
+        notes.append("order_book_depths directory is absent")
+        return grouped, 0
+    for child in sorted(depth_root.iterdir()):
+        if not child.is_dir():
+            continue
+        name = child.name
+        if "low-" in name:
+            alias = name.replace("low-", "high-", 1)
+            try:
+                rung = parse_rung(alias)
+            except ValueError:
+                notes.append(f"skipped unparsed dir: {name}")
+                continue
+            notes.append(f"skipped low dir: {name}")
+            lows.append((rung.city, rung.climate_day, rung.lower_f))
+            continue
+        try:
+            rung = parse_rung(name)
+        except ValueError:
+            notes.append(f"skipped unparsed dir: {name}")
+            continue
+        highs.append((rung.city, rung.climate_day, rung.upper_f))
+        if WINDOW_START <= rung.climate_day <= WINDOW_END:
+            grouped.setdefault((rung.city, rung.climate_day), []).append(child)
+    impossible = 0
+    low_by: dict[tuple[str, dt.date], list[int | None]] = {}
+    for city, day, lower in lows:
+        low_by.setdefault((city, day), []).append(lower)
+    for city, day, upper in highs:
+        for lower in low_by.get((city, day), ()):
+            if bands_impossible(upper, lower):
+                impossible += 1
+    return grouped, impossible
+
+
+def _score(
+    catalog: Path, own: OwnSet
+) -> tuple[list[str], list[dict[str, str]], list[_Denom], bool, int, int]:
+    """Returns notes, records, denominator frames, unit_ok, sum-ask count, impossible pairs."""
+    notes: list[str] = []
+    if not (catalog / "data").is_dir():
+        notes.append("catalog data directory is absent")
+        buyer = _buyer_lines(catalog)
+        return notes + buyer, [], [], False, 0, 0
+    from forecast_cheap_screen_wp7 import (
+        _fixed_scalars,
+        read_rung_tape,
+    )
+    from settlement_alignment_study import load_sites  # type: ignore[import-not-found]
+
+    try:
+        price_scalar, size_scalar = _fixed_scalars()
+    except (OSError, RuntimeError, TypeError, ValueError, ImportError):
+        notes.append("unit scalars could not be read")
+        return notes, [], [], False, 0, 0
+    try:
+        offsets = {spec.city: float(spec.std_utc_offset_hours) for spec in load_sites()}
+    except (OSError, RuntimeError, TypeError, ValueError, ImportError):
+        notes.append("site metadata could not be read")
+        offsets = {}
+    fee_map = _load_fee_map(catalog)
+    if fee_map is None:
+        notes.append("instrument fee read failed")
+    grouped, impossible = _walk_dirs(catalog / "data" / "order_book_depths", notes)
+    records: list[dict[str, str]] = []
+    denoms: list[_Denom] = []
+    unit_raw: int | None = None
+    unit_failed = False
+    sum_rows = 0
+    for (city, day), paths in sorted(grouped.items()):
+        offset = offsets.get(city)
+        if offset is None:
+            notes.append(f"{city} {day.isoformat()}: no site metadata")
+            records.append(
+                {
+                    "station": city,
+                    "climate_day": day.isoformat(),
+                    "status": "MISSING",
+                    "leg1": "",
+                    "leg2": "",
+                }
+            )
+            continue
+        quotes: dict[str, tuple[Quote, ...]] = {}
+        failed = False
+        for path in sorted(paths, key=lambda item: item.name):
+            try:
+                instants, _nrows = read_rung_tape(
+                    path,
+                    std_utc_offset_hours=offset,
+                    price_scalar=price_scalar,
+                    size_scalar=size_scalar,
+                    city=city,
+                )
+            except (OSError, ValueError):
+                notes.append(f"{city} {day.isoformat()}: tape read failed")
+                failed = True
+                break
+            for instant in instants:
+                if unit_raw is None and not unit_failed:
+                    recovered = _recover_raw(float(instant.ask_size), size_scalar)
+                    if recovered is None:
+                        unit_failed = True
+                    else:
+                        unit_raw = recovered
+            quotes[path.name] = tuple(_quote_from_instant(instant) for instant in instants)
+        if failed:
+            records.append(
+                {
+                    "station": city,
+                    "climate_day": day.isoformat(),
+                    "status": "MISSING",
+                    "leg1": "",
+                    "leg2": "",
+                }
+            )
+            continue
+        frame = select_frame(climate_day=day, quotes=quotes)
+        if frame.kind != "FRAME":
+            records.append(
+                {
+                    "station": city,
+                    "climate_day": day.isoformat(),
+                    "status": "MISSING",
+                    "leg1": "",
+                    "leg2": "",
+                }
+            )
+            continue
+        rung_ids = [instrument_id for instrument_id, _quote in frame.chosen]
+        frame_ns = max(quote.ts_ns for _instrument_id, quote in frame.chosen)
+        if frame_excluded(frame_ns, rung_ids, own.first_ns):
+            records.append(
+                {
+                    "station": city,
+                    "climate_day": day.isoformat(),
+                    "status": "EXCLUDED",
+                    "leg1": "",
+                    "leg2": "",
+                }
+            )
+            continue
+        fees_ok = fee_map is not None and all(
+            _fee_ok(fee_map, instrument_id) for instrument_id in rung_ids
+        )
+        if not fees_ok:
+            records.append(
+                {
+                    "station": city,
+                    "climate_day": day.isoformat(),
+                    "status": "INCONCLUSIVE",
+                    "leg1": "",
+                    "leg2": "",
+                }
+            )
+            continue
+        rows = tuple(
+            (quote.ask, quote.ask_size, quote.bid, quote.bid_size) for _iid, quote in frame.chosen
+        )
+        book = evaluate_book(rows)
+        asks = tuple(quote.ask for _iid, quote in frame.chosen if quote.ask is not None)
+        bids = tuple(quote.bid for _iid, quote in frame.chosen if quote.bid is not None)
+        ask_sizes = tuple(quote.ask_size for _iid, quote in frame.chosen)
+        bid_sizes = tuple(quote.bid_size for _iid, quote in frame.chosen)
+        if book.leg1_clear and len(asks) == len(frame.chosen):
+            SumAskRow(
+                station=city,
+                climate_day=day,
+                n_rungs=len(asks),
+                sum_ask=float(sum(asks, Decimal(0))),
+                sum_fee=float(sum((fee_on_ask(ask, FEE_COEFFICIENT) for ask in asks), Decimal(0))),
+                min_ask_size=float(min(ask_sizes)),
+                total_ask_size=float(sum(ask_sizes, Decimal(0))),
+            )
+            sum_rows += 1
+        denoms.append(
+            _Denom(
+                day=day,
+                asks=asks,
+                ask_sizes=ask_sizes,
+                bids=bids,
+                bid_sizes=bid_sizes,
+                leg1=book.leg1_clear,
+                leg2=book.leg2_clear,
+            )
+        )
+        records.append(
+            {
+                "station": city,
+                "climate_day": day.isoformat(),
+                "status": "FRAME",
+                "leg1": "clear" if book.leg1_clear else "no",
+                "leg2": "clear" if book.leg2_clear else "no",
+            }
+        )
+    unit_ok = unit_raw is not None and not unit_failed
+    notes.append(
+        f"unit scalars price={price_scalar} size={size_scalar} raw_ask_size_0={unit_raw} contracts"
+        if unit_ok
+        else "unit line could not be printed"
+    )
+    notes.extend(_buyer_lines(catalog))
+    return notes, records, denoms, unit_ok, sum_rows, impossible
+
+
+def _prize_lines(label: str, frames: Sequence[_Denom], *, side: str) -> list[str]:
+    if label != "PASS":
+        return [f"prize not printed for this leg ({label}); a prize is not a PASS or a KILL."]
+    lines: list[str] = []
+    for q in Q_GRID:
+        count = 0
+        for frame in frames:
+            prices = frame.asks if side == "ask" else frame.bids
+            sizes = frame.ask_sizes if side == "ask" else frame.bid_sizes
+            cleared = frame.leg1 if side == "ask" else frame.leg2
+            if (
+                cleared
+                and prices
+                and sizes
+                and min(sizes) >= q
+                and _slack_at_q(prices, q, side=side) >= 0
+            ):
+                count += 1
+        normalized = Decimal(count) * Decimal(NORMALIZER_DAYS) / Decimal(WINDOW_DAYS)
+        lines.append(f"q={q} frames={count} normalized_30d={format(normalized, 'f')}")
+    return lines
+
+
+def _assumptions() -> list[str]:
+    return [
+        (
+            "Assumptions: full-size simultaneous taker fills; no leg risk; the two legs "
+            "are never both executed; voids are out of scope; the executable NO price "
+            "may differ from 1 minus the YES bid under the SELL or BUY_SHORT representation."
+        ),
+        (
+            "The q grid is a report index, never an order quantity. "
+            "No budget and no per-position size are read or set."
+        ),
+        "Two ticks per rung (one tick of slippage plus one tick of hurdle) are applied once.",
+        "A q-fill fee is one rounded fee per fill, not q times the one-contract fee.",
+        "A frame counts for q only when min L0 size is at least q and the margin still clears.",
+        f"The 30-day normalizer is count * {NORMALIZER_DAYS}/{WINDOW_DAYS}.",
+    ]
+
+
+def _render(
+    sha: str,
+    own: OwnSet,
+    *,
+    notes: Sequence[str],
+    denoms: Sequence[_Denom],
+    sum_rows: int,
+    impossible: int,
+    leg1: str,
+    leg2: str,
+) -> str:
+    dates = len({frame.day for frame in denoms})
+    lines = [
+        "# Card A census",
+        "",
+        f"prereg_sha256: {sha}",
+        "",
+        "## Constants",
+        "",
+        f"window {WINDOW_START.isoformat()}..{WINDOW_END.isoformat()} ({WINDOW_DAYS} dates)",
+        (
+            f"target {TARGET_CLOCK.isoformat()}Z "
+            f"offset [{OFFSET_START.isoformat()}, {OFFSET_END.isoformat()})"
+        ),
+        f"age cap {AGE_CAP_S}s first-complete lead {FIRST_COMPLETE_LEAD_MIN} min",
+        f"tick {TICK} hurdle {HURDLE} fee coefficient {FEE_COEFFICIENT}",
+        f"floors {FLOOR_STATION_DAYS} station-days and {FLOOR_DATES} dates",
+        f"q grid {Q_GRID} normalizer {NORMALIZER_DAYS} over {WINDOW_DAYS}",
+        "No CLI override.",
+        "",
+        "## Unit line",
+        "",
+        next(
+            (note for note in notes if note.startswith("unit ")),
+            "unit line could not be printed",
+        ),
+        "",
+        "## Own-order set",
+        "",
+        format_own_set(own),
+        "slug-less never-filled intents: 0",
+        "",
+        "## Legs",
+        "",
+        f"leg 1: {leg1}",
+        f"leg 2: {leg2}",
+        f"denominator station-days: {len(denoms)}",
+        f"distinct dates: {dates}",
+        f"n_sum_ask_rows: {sum_rows}",
+        "SumAskRow is counted and is not the comparator.",
+        "",
+        "## Prize",
+        "",
+        *_prize_lines(leg1, denoms, side="ask"),
+        *_prize_lines(leg2, denoms, side="bid"),
+        *_assumptions(),
+        "",
+        "## Impossible pairs",
+        "",
+        f"impossible pairs: {impossible}",
+        "",
+        "## Node journal",
+        "",
+        "node journal cross-check: not performed",
+        "",
+        *_family_lines(),
+        "",
+        "## Notes",
+        "",
+        *[note for note in notes if not note.startswith("unit ")],
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def run_census(*, prereg_sha: str | None, tape_supplied: bool, dry_run: bool) -> int:
+    """Freeze, own orders, then the catalog. Refusals exit 2 before any write."""
+    assert_constants()
+    if not prereg_sha:
+        refuse("census mode requires --prereg-sha")
+    if tape_supplied:
+        refuse("--tape is refused with --census-only")
+    _check_freeze(prereg_sha)
+    sha = prereg_sha.strip().lower()
+    if _carries_sha(OUTPUT_DIR, sha):
+        refuse("prior look already carries this prereg sha256")
+    try:
+        store = resolve_store_path(os.environ)
+    except ExecStateDbNotConfiguredError as exc:
+        refuse(str(exc))
+    if not store.is_file():
+        refuse("own-order set cannot be built: store is unreadable")
+    try:
+        own = read_own_orders(store)
+    except OwnOrderError as exc:
+        refuse(str(exc))
+    notes, records, denoms, unit_ok, sum_rows, impossible = _score(CATALOG, own)
+    dates = {frame.day for frame in denoms}
+    leg1 = _label(sum(1 for frame in denoms if frame.leg1), len(denoms), len(dates), unit_ok)
+    leg2 = _label(sum(1 for frame in denoms if frame.leg2), len(denoms), len(dates), unit_ok)
+    markdown = _render(
+        sha,
+        own,
+        notes=notes,
+        denoms=denoms,
+        sum_rows=sum_rows,
+        impossible=impossible,
+        leg1=leg1,
+        leg2=leg2,
+    )
+    if dry_run:
+        print(markdown)
+        return 0
+    emit_census(OUTPUT_DIR, markdown, records, sha, dry_run=False)
+    return 0

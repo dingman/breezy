@@ -72,7 +72,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 _SCRIPTS_ANALYSIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPTS_ANALYSIS_DIR.parents[1]
@@ -1285,6 +1285,7 @@ def render(collected: Collected) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    supplied = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="WP-7b -- score the market as a forecaster")
     parser.add_argument("--tape", type=Path, default=DEFAULT_QUOTE_TAPE_CATALOG)
     parser.add_argument("--corpus-json", type=Path, default=DEFAULT_CORPUS_JSON)
@@ -1308,7 +1309,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             "inclusive. Requires --since."
         ),
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--census-only",
+        action="store_true",
+        help="Card A one-look census. Branches before collect and refuses --tape.",
+    )
+    parser.add_argument("--prereg-sha", default=None)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --census-only, read the catalog and the mode=ro store and write nothing.",
+    )
+    args = parser.parse_args(supplied)
+    if args.census_only:
+        # Before collect: this path must not build a rung event or load truth.
+        import wp7b_census  # type: ignore[import-not-found]
+
+        tape_supplied = any(arg == "--tape" or arg.startswith("--tape=") for arg in supplied)
+        return cast(
+            int,
+            wp7b_census.run_census(
+                prereg_sha=args.prereg_sha,
+                tape_supplied=tape_supplied,
+                dry_run=args.dry_run,
+            ),
+        )
 
     if args.until is not None and args.since is None:
         parser.error("--until requires --since")
