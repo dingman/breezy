@@ -166,3 +166,17 @@ These are properties of the harness and the tape, not of a new strategy.
 10. **Paper replay is the wrong object for a maker.** It builds a current-rung strategy, one station-day, IOC-style hold. Pointing it at a resting NO rule would be a new strategy inside an old driver, which is still the same engine, but the fill would ignore the queue (caveat 1). The maker's own driver is the Stage 0 pass, and its verdict ledger is one-shot.
 
 11. **Kalshi is not a harness input.** Historical JSON for five HIGH series is not a `ParquetDataCatalog` of depth. `k1_kalshi_prior.py` is frozen by the WA-2 draft. There is no `add_venue` for Kalshi in `build_backtest_engine`.
+
+## 5. r1 declarations — not entry points
+
+Added with `design_r1.md`. Nothing in this section is a runner, and none of it was executed.
+
+Do not point Cards A–D or LOW at `current_rung_hold_paper_replay.py`. Its `main` writes `settlement_prices` from the final climate day (lines 1249–1277). That read is not outcome-blind, so r1 adds no `--strategy` choice and does not touch the dynamic-import pin.
+
+Do not point those cards at `wp7b_market_as_forecaster.py` `main` (truth via `_load_corpus`, line 893), `maker_design_nobid.py` (truth at line 423), `maker_stage0_replay.py` (`--truth` is required), `market_calibration_scan.py`, or `p2_nbp_ask_murphy.py`.
+
+`sum_ask_row` (`wp7b_market_as_forecaster.py` line 537) and `queue_sizes` (`maker_stage0_fill_pass.py` line 79) do not open truth. `maker_stage0_catalog_read.py` reads `OrderBookDepth10` and `TradeTick` and does not import the truth loader.
+
+Exception requested, not built: one truth-free driver with two modes and separate outputs. Mode 1 calls `sum_ask_row` for Card A and, as a second invocation, Card LOW. Mode 2 calls `queue_sizes` plus BUYER-print counts from the catalog reader for Card B. Cards C and D each request their own exception in `design_r1.md` because neither function is their estimand. Card E requests none: it is a public Kalshi-vs-CLI read, not a tape census.
+
+`trade_execution` and `queue_position` stay false. The catalog now has `trade_tick` directories, so the "no trade tape" sentence in `docs/specs/BACKTEST_VENUE_CONFIG.md` lines 59–62 is stale, but r1 does not amend that spec: the print unit is unresolved and the maker-fee sign is not wire-observed.
