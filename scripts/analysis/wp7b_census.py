@@ -21,6 +21,12 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Final, NoReturn, cast
 
+_SCRIPTS_ANALYSIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_ANALYSIS_DIR.parents[1]
+for _entry in (str(_SCRIPTS_ANALYSIS_DIR), str(_REPO_ROOT / "src")):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
 from h4_preliminary_economic_read import parse_rung  # type: ignore[import-not-found]
 from wp7b_market_as_forecaster import (  # type: ignore[import-not-found]
     IncompleteLadderError,

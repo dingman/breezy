@@ -154,6 +154,9 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # LAT-1: the real-data loader reads quote-tape gaps through `breezy.runtime.quote_tape_gaps`
     # (the sanctioned loader), so source (c) picks it up. Offline analysis only.
     "scripts.analysis.nbp_revision_latency_io",
+    # STRAT-DESIGN Card A: the `--census-only` evaluator imports the execution package,
+    # so source (c) picks it up.
+    "scripts.analysis.wp7b_census",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

@@ -12,6 +12,7 @@ import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
+from types import ModuleType
 
 import pyarrow.parquet as pq
 import pytest
@@ -197,9 +198,19 @@ def _make_catalog(root: Path, ids: tuple[str, ...] = (CAT_LOW, CAT_HIGH)) -> Pat
     return root
 
 
+def _live_fcs() -> ModuleType:
+    """The ``forecast_cheap_screen_wp7`` module that ``wp7b_census`` will import at call time.
+
+    Sibling tests re-exec that script and rebind ``sys.modules["forecast_cheap_screen_wp7"]``,
+    so the module imported at the top of this file can be a stale object once the whole suite
+    has run. ``_score`` imports lazily, so patches must land on whatever ``sys.modules`` holds.
+    """
+    return sys.modules[fcs.__name__]
+
+
 def _instants(ask_size: float = 5.0) -> list[object]:
     return [
-        fcs.RungInstant(
+        _live_fcs().RungInstant(
             ts_ns=_ns(stamp),
             local_date=DAY,
             hour_lst=13,
@@ -221,7 +232,7 @@ def _stub_world(
 ) -> None:
     """A two-rung catalog, a canned tape reader and fee map. No real store, no network."""
     _make_catalog(catalog)
-    monkeypatch.setattr(fcs, "read_rung_tape", tape or (lambda *_a, **_k: (_instants(), 2)))
+    monkeypatch.setattr(_live_fcs(), "read_rung_tape", tape or (lambda *_a, **_k: (_instants(), 2)))
     fee_map = {CAT_LOW: "0.0695", CAT_HIGH: "0.0695"} if fees is None else fees
     monkeypatch.setattr(census, "_load_fee_map", lambda _catalog: dict(fee_map))
 
@@ -655,7 +666,7 @@ def test_lone_parquet_is_a_prior_look_and_parquet_is_replaced_before_markdown(
 
     def spy(src: object, dst: object) -> None:
         order.append(Path(str(dst)).name)
-        real(src, dst)  # type: ignore[arg-type]
+        real(src, dst)
 
     monkeypatch.setattr(census.os, "replace", spy)
     census.emit_census(fresh, f"prereg_sha256: {sha}\n", [], sha)
@@ -1078,7 +1089,7 @@ def test_h7_dry_run_stops_before_any_leg_label_or_prize(
 
     def _spy_select(**kwargs: object) -> census.FrameSelection:
         reads.append("select")
-        return real_select(**kwargs)  # type: ignore[arg-type]
+        return real_select(**kwargs)
 
     monkeypatch.setattr(census, "select_frame", _spy_select)
 
@@ -1115,7 +1126,7 @@ def test_h7_dry_run_stops_before_any_leg_label_or_prize(
 
 def test_every_registry_city_has_a_key_the_tape_reader_accepts() -> None:
     """The census must pass exactly the station key read_rung_tape accepts (NYC crashed it)."""
-    from forecast_cheap_screen_wp7 import station_time_zone  # type: ignore[import-not-found]
+    from forecast_cheap_screen_wp7 import station_time_zone
     from settlement_alignment_study import load_sites  # type: ignore[import-not-found]
 
     sites = load_sites()
@@ -1248,7 +1259,7 @@ def test_present_fee_coefficient_that_differs_stays_inconclusive(
 def test_load_sites_failure_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import settlement_alignment_study as study  # type: ignore[import-not-found]
+    import settlement_alignment_study as study
 
     def _broken() -> None:
         raise RuntimeError("registry")
@@ -1275,7 +1286,7 @@ def test_fixed_scalar_failure_refuses(
         raise RuntimeError("scalars")
 
     _stub_world(monkeypatch, tmp_path / "cat")
-    monkeypatch.setattr(fcs, "_fixed_scalars", _broken)
+    monkeypatch.setattr(_live_fcs(), "_fixed_scalars", _broken)
     _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "unit scalars")
 
 
@@ -1294,7 +1305,7 @@ def test_nonintegral_nonzero_ask_size_refuses(
     _stub_world(
         monkeypatch,
         tmp_path / "cat",
-        tape=lambda *_a, **_k: (_instants(ask_size=0.5 / fcs._fixed_scalars()[1]), 2),
+        tape=lambda *_a, **_k: (_instants(ask_size=0.5 / _live_fcs()._fixed_scalars()[1]), 2),
     )
     _refuses(lambda: census._score(tmp_path / "cat", _NO_OWN), capsys, "unit line")
 

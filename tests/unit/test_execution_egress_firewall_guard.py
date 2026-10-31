@@ -4066,6 +4066,10 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # of its sibling exec suites and opens no socket;
         # `test_c2_max_rungs_suite_is_inside_x1_and_carries_no_marker` plants the marker.
         "tests/unit/test_no_ladder_maker_max_rungs.py",
+        # STRAT-DESIGN Card A: `test_wp7b_census_only.py` exercises the census evaluator, which
+        # imports `exec_intent.intent_fingerprint` and reads the exec store read-only. WIDENED, not
+        # relaxed (L-6/L-12): the comparison is still `==`; the module opens no socket.
+        "tests/unit/test_wp7b_census_only.py",
     }
 
 

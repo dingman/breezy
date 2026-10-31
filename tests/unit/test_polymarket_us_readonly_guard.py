@@ -2363,6 +2363,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # and touches no operator control; `test_d1_maker_producer_reads_the_intent_...`
         # below pins that import set and plants the violation.
         "scripts/analysis/maker_loss_stop_producer.py",
+        # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; old -> new added exactly
+        # this one path. STRAT-DESIGN Card A: the offline `--census-only` evaluator imports
+        # `submit_intent` names in a function-scoped read-only decode of the exec store; it opens
+        # no latch, takes no flock and touches no operator control.
+        "scripts/analysis/wp7b_census.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",
