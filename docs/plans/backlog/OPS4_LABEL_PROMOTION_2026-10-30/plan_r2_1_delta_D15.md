@@ -31,3 +31,15 @@ the production condition (14:15Z label slot overlaps ingest too).
 
 Measured 13:42Z 10-31: MemAvailable 16.76 GiB, node RSS 448 MiB, / 610 G free, /mnt/storage 3.0 T free.
 First candidate: 18:01Z 2026-10-31 (inside the 17:08Z cycle).
+
+## r2.2 note (2026-10-31 19:45Z, architect-endorsed at S2 review) — one same-day re-run allowed
+
+S0 on 10-31 measured 0.245 GiB / 2.154 s (artefact `label_run_peak_1793469666471718616.json`, `docs/evidence/OPS4_S0_2026-10-31.md`).
+S1 adds `wall_time_ns` to the `aut2_memory_peak/v1` writer (D16) and D12 asserts it, so the artefact must be
+re-produced by the committed writer. One re-run is permitted on 10-31 OUTSIDE the 18:01–18:05Z window under the
+same flags and checks (`-p MemoryMax=8G`, MemAvailable ≥ 16 GiB read by hand, lock + disk ≥ 10 GB checks,
+`-E BREEZY_GIT_SHA=<committed HEAD that contains the writer change>`), launched clear of `CATCHUP_DENY`
+16:07:30–17:10Z, the 20:15/20:45Z slots, 22:30/22:45Z and 02:05Z, and with the ids of any overlapping ingest
+runs recorded beside the artefact (D15 r3). Rationale: overlap can only lengthen wall time, which yields a false
+STOP, never a false PASS; 2.2 s against the 1028 s limit (1800/1.75) leaves no realistic failure mode. The daily
+window text above remains binding for every later measurement.
