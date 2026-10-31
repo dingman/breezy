@@ -399,3 +399,9 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Count node-log levels with `\[ERROR\]` (or a bare `ERROR` token) and run a positive control on a line known to carry the level before reporting any count; a zero from a log grep without a positive control is a measurement defect, not a finding (same family as L-1's .venv rule).
 **Applied:** 2026-10-30
 **Last updated:** 2026-10-30
+
+### L-74 — Agent Glob listings skip symlinks; two blind reviews "measured" 22 log files when the shell saw 95 (2026-10-31)
+**Mistake:** Two architect reviews independently reported the node-log archive as 22 files starting 10-14 and ruled a prereg clause false; the directory holds 95 `breezy-trade-*.log` entries, 73 of them symlinks into `/mnt/storage/breezy/logs-archive/` (rotated 10-19). The sub-agents' Glob/Read listing does not follow or list symlinks, so a shell `ls -la` and an agent listing of the same directory disagree, and the agent one looks authoritative because it is reproducible across agents.
+**Prevention:** Any count of files or coverage that decides a ruling is measured with `ls -la` (symlinks show as `l`) plus a positive control opened by path (one file read, one grep count) in the shell, never with Glob; when two agents agree on a listing that contradicts a shell count, suspect the tool, not the shell. Code that reads such a directory opens by path so symlinks are followed, and prints "files read" and "symlinks followed" separately.
+**Applied:** 2026-10-31
+**Last updated:** 2026-10-31
