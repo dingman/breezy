@@ -1,0 +1,7 @@
+prereg_path docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_card_a.md
+prereg_sha256 4abc09159e4ea6c30af43e90c356263c78dc2e96decb2d5146f02ca4c5b2fffe
+frozen_at_commit dc5dfda4
+frozen_at_utc 2026-10-31T14:13:25Z
+looks_allowed 1
+status FROZEN
+reviews review_card_a_r0.md (r0: pm REVISE K1-K6 + arch REVISE; r1: pm APPROVE-TO-FREEZE, arch REVISE M1; r1.1: M1-M4 verified against the text by the coordinator)
