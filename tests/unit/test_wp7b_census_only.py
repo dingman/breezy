@@ -21,6 +21,11 @@ sys.path.insert(0, (REPO_ROOT / "scripts" / "analysis").as_posix())
 
 import wp7b_census as census  # type: ignore[import-not-found]
 from h4_preliminary_economic_read import parse_rung  # type: ignore[import-not-found]
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, StrategyId, TraderId
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.orders import LimitOrder, MarketOrder
 from wp7b_market_as_forecaster import (  # type: ignore[import-not-found]
     assert_complete_partition,
     main,
@@ -30,6 +35,7 @@ from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
 from breezy.domain.exec_intent import (
     FILL_BY_FINGERPRINT_KEY_PREFIX,
     FILL_KEY_PREFIX,
+    intent_fingerprint,
     utc_day_for_ns,
 )
 from breezy.runtime.submit_intent import (
@@ -351,19 +357,13 @@ def test_fee_rounding_q1_per_contract_and_q25_once_per_fill() -> None:
     assert once != per_contract * 25
 
 
-def test_own_order_normalizes_no_leg_and_excludes_at_or_after(tmp_path: Path) -> None:
-    store = tmp_path / "exec.sqlite"
-    _empty_store(store)
-    day = utc_day_for_ns(CREATED_NS).isoformat()
-    venue_id = "vid-1"
-    _insert(
-        store,
-        [
-            (history_key(INTENT_ID), _intent(slug=None)),
-            (f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{FINGERPRINT}", venue_id.encode()),
-            (f"{FILL_KEY_PREFIX}{venue_id}", _fill(NO_ID)),
-        ],
-    )
+def test_own_order_normalizes_no_leg_and_excludes_at_or_after(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    # r2.3 D5: a fill-path resolution must also resolve by the node log (positive control).
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order, fill_id=NO_ID)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
     own = census.read_own_orders(store)
     assert own.instrument_ids == (BASE,)
     assert VENUE_ORDER_ID not in census.format_own_set(own)
@@ -706,3 +706,311 @@ def test_intent_slug_branch_builds_the_own_set(tmp_path: Path) -> None:
     assert own.instrument_ids == (BASE,)
     assert own.first_ns == {BASE: CREATED_NS}
     assert own.never_filled == 0
+
+
+# ---- r2.3 D5 (ii) node-log fingerprint rebuild and H7 dry-run stop -----------------------------
+
+_STAMP_A = "2026-10-30T20:19:49.004928122Z"
+_STAMP_B = "2026-10-31T01:02:03.000000000Z"
+_ANSI_OPEN = "\x1b[1m"
+_ANSI_CLOSE = "\x1b[0m"
+_OTHER_ID = "tc-temp-nychigh-2026-09-22-gte80f.POLYMARKET_US"
+_OTHER_BASE = "tc-temp-nychigh-2026-09-22-gte80f"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Never read the live node logs: point the constant at a per-test directory."""
+    logs = tmp_path / "nodelogs"
+    monkeypatch.setattr(census, "LOG_DIR", logs)
+    return logs
+
+
+def _limit(
+    instrument_id: str,
+    tif: TimeInForce,
+    *,
+    coid: str = "O-1",
+    qty: str = "1",
+    px: str = "0.89",
+    side: OrderSide = OrderSide.BUY,
+    expiry_ns: int = 0,
+) -> LimitOrder:
+    return LimitOrder(
+        TraderId("T-1"),
+        StrategyId("S-1"),
+        InstrumentId.from_str(instrument_id),
+        ClientOrderId(coid),
+        side,
+        Quantity.from_str(qty),
+        Price.from_str(px),
+        UUID4(),
+        0,
+        time_in_force=tif,
+        expire_time_ns=expiry_ns,
+    )
+
+
+def _market(instrument_id: str, *, coid: str = "O-2") -> MarketOrder:
+    return MarketOrder(
+        TraderId("T-1"),
+        StrategyId("S-1"),
+        InstrumentId.from_str(instrument_id),
+        ClientOrderId(coid),
+        OrderSide.BUY,
+        Quantity.from_str("1"),
+        UUID4(),
+        0,
+        time_in_force=TimeInForce.IOC,
+    )
+
+
+def _log_line(order: object, stamp: str = _STAMP_A) -> str:
+    return (
+        f"{_ANSI_OPEN}{stamp}{_ANSI_CLOSE} [INFO] BREEZY-L001.Strat: [CMD]--> "
+        f"[Risk] SubmitOrder(order={order!r}, position_id=None){_ANSI_CLOSE}\n"
+    )
+
+
+def _write_log(logs: Path, name: str, lines: list[str]) -> Path:
+    logs.mkdir(exist_ok=True)
+    path = logs / name
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _store_with(
+    tmp: Path,
+    order: object,
+    *,
+    fill_id: str | None = None,
+    intent_id: str = INTENT_ID,
+) -> Path:
+    """A store with one slug-less intent whose fingerprint is the real one of ``order``."""
+    store = tmp / "exec.sqlite"
+    _empty_store(store)
+    fingerprint = intent_fingerprint(order)
+    intent = SubmitIntent(
+        intent_id=intent_id,
+        fingerprint=fingerprint,
+        created_ns=CREATED_NS,
+        state=SubmitIntentState.OPEN,
+        retired_ns=None,
+        retirement_reason=None,
+        slug=None,
+    ).to_bytes()
+    rows = [(history_key(intent_id), intent)]
+    if fill_id is not None:
+        day = utc_day_for_ns(CREATED_NS).isoformat()
+        rows += [
+            (f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{fingerprint}", b"vid-9"),
+            (f"{FILL_KEY_PREFIX}vid-9", _fill(fill_id)),
+        ]
+    _insert(store, rows)
+    return store
+
+
+def test_limit_ioc_line_resolves_by_log_and_counts_print(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    own = census.read_own_orders(_store_with(tmp_path, order))
+    assert own.instrument_ids == (BASE,)
+    assert own.first_ns == {BASE: CREATED_NS}
+    report = "\n".join(own.report)
+    assert "intents total: 1" in report
+    assert "resolved by (i) fill_by_fingerprint: 0" in report
+    assert "resolved by (ii) node log: 1" in report
+    assert "positive control matched/total: 0/0" in report
+    assert "unresolved: 0" in report
+    assert "log files read: 1" in report
+    assert "symlinks followed: 0" in report
+    assert f"first log timestamp read: {_STAMP_A}" in report
+    assert f"last log timestamp read: {_STAMP_A}" in report
+
+
+def test_market_order_line_hashes_the_empty_price(tmp_path: Path, _isolated_logs: Path) -> None:
+    order = _market(LOW_ID)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    own = census.read_own_orders(_store_with(tmp_path, order))
+    assert own.instrument_ids == (BASE,)
+
+
+def test_gtd_expiry_token_is_ignored(tmp_path: Path, _isolated_logs: Path) -> None:
+    order = _limit(NO_ID, TimeInForce.GTD, expiry_ns=CREATED_NS + 3_600 * _NS)
+    assert "GTD 20" in repr(order)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+
+
+def test_ansi_stripped_and_thousands_separator_removed(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.GTC, qty="1000", side=OrderSide.SELL)
+    assert "1_000" in repr(order) and "1_000" not in str(order.quantity)
+    line = _log_line(order)
+    assert "\x1b[" in line
+    _write_log(_isolated_logs, "breezy-trade-a.log", [line])
+    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+
+
+def test_duplicate_lines_and_symlinked_file_count_as_one_resolution(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), _log_line(order, _STAMP_B)])
+    archive = tmp_path / "archive"
+    target = _write_log(archive, "moved.log", [_log_line(order, _STAMP_B)])
+    (_isolated_logs / "breezy-trade-b.log").symlink_to(target)
+    (_isolated_logs / "breezy-trade-c.log.try2").write_text("not matched\n", encoding="utf-8")
+    own = census.read_own_orders(_store_with(tmp_path, order))
+    assert own.instrument_ids == (BASE,)
+    report = "\n".join(own.report)
+    assert "resolved by (ii) node log: 1" in report
+    assert "log files read: 2" in report
+    assert "symlinks followed: 1" in report
+    assert f"last log timestamp read: {_STAMP_B}" in report
+
+
+def test_non_text_bytes_in_a_log_do_not_drop_the_file(tmp_path: Path, _isolated_logs: Path) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _isolated_logs.mkdir()
+    (_isolated_logs / "breezy-trade-a.log").write_bytes(
+        b"\xff\xfe\x00 binary junk\n" + _log_line(order).encode("utf-8")
+    )
+    assert census.read_own_orders(_store_with(tmp_path, order)).instrument_ids == (BASE,)
+
+
+def test_two_base_slugs_for_one_fingerprint_refuse(
+    tmp_path: Path, _isolated_logs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _limit(NO_ID, TimeInForce.IOC)
+    second = _limit(_OTHER_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, first)
+    # A collision cannot be forged with sha256, so pin the one reused hash for both lines.
+    monkeypatch.setattr(census, "intent_fingerprint", lambda _order: intent_fingerprint(first))
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(first), _log_line(second)])
+    with pytest.raises(census.OwnOrderError, match="two slugs"):
+        census.read_own_orders(store)
+
+
+def test_unknown_order_shape_on_a_submit_line_exits_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_logs: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order)
+    digest = _arm(tmp_path, monkeypatch, store=store)
+    odd = "[Risk] SubmitOrder(order=StopMarketOrder(BUY 1 X.Y STOP_MARKET @ 0.5 GTC, status=X)"
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order), odd + "\n"])
+    with pytest.raises(SystemExit) as exc:
+        main(["--census-only", "--prereg-sha", digest, "--output", str(tmp_path / "i.md")])
+    assert exc.value.code == 2
+    assert "unknown SubmitOrder shape" in capsys.readouterr().err
+    assert _listing(tmp_path / "out") == []
+
+
+def test_unknown_time_in_force_name_is_refused_before_the_native_parser(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    bad = _log_line(order).replace("LIMIT @ 0.89 IOC", "LIMIT @ 0.89 BOGUS")
+    _write_log(_isolated_logs, "breezy-trade-a.log", [bad])
+    with pytest.raises(census.OwnOrderError, match="time in force"):
+        census.read_own_orders(_store_with(tmp_path, order))
+
+
+def test_positive_control_matches_when_both_paths_agree(
+    tmp_path: Path, _isolated_logs: Path
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    own = census.read_own_orders(_store_with(tmp_path, order, fill_id=NO_ID))
+    report = "\n".join(own.report)
+    assert "resolved by (i) fill_by_fingerprint: 1" in report
+    assert "resolved by (ii) node log: 0" in report
+    assert "positive control matched/total: 1/1" in report
+
+
+def test_positive_control_mismatch_refuses(tmp_path: Path, _isolated_logs: Path) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    store = _store_with(tmp_path, order, fill_id=_OTHER_ID)
+    with pytest.raises(census.OwnOrderError, match="positive control") as caught:
+        census.read_own_orders(store)
+    assert "positive control matched/total: 0/1" in "\n".join(caught.value.report)
+
+
+def test_positive_control_with_no_log_line_refuses(tmp_path: Path) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    with pytest.raises(census.OwnOrderError, match="positive control"):
+        census.read_own_orders(_store_with(tmp_path, order, fill_id=NO_ID))
+
+
+def test_residual_unresolved_exits_2_with_counts_and_no_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_logs: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    other = _limit(_OTHER_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(other)])
+    digest = _arm(tmp_path, monkeypatch, store=store)
+    before = _listing(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["--census-only", "--prereg-sha", digest, "--output", str(tmp_path / "i.md")])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "slug-less intent(s) unresolved" in captured.err
+    expected_day = utc_day_for_ns(CREATED_NS).isoformat()
+    assert f"unresolved per UTC created day: {expected_day}: 1" in captured.out
+    assert intent_fingerprint(order) not in captured.out + captured.err
+    assert _listing(tmp_path) == before
+
+
+def test_h7_dry_run_stops_before_any_leg_label_or_prize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_logs: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = _limit(NO_ID, TimeInForce.IOC)
+    store = _store_with(tmp_path, order)
+    _write_log(_isolated_logs, "breezy-trade-a.log", [_log_line(order)])
+    digest = _arm(tmp_path, monkeypatch, store=store)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("scoring reached in a dry-run")
+
+    for name in ("evaluate_book", "_label", "_prize_lines", "_render", "leg1_slack_cents"):
+        monkeypatch.setattr(census, name, _boom)
+    before = _listing(tmp_path)
+    assert main(["--census-only", "--dry-run", "--prereg-sha", digest]) == 0
+    out = capsys.readouterr().out
+    assert "D5 resolved by (ii) node log: 1" in out
+    assert "final denominator station-days: 0" in out
+    assert "distinct dates: 0" in out
+    lowered = out.lower()
+    for token in ("leg 1", "leg 2", "label", "prize", "slack", "inconclusive", "sufficient"):
+        assert token not in lowered
+    assert intent_fingerprint(order) not in out
+    assert _listing(tmp_path) == before
+
+
+def test_every_registry_city_has_a_key_the_tape_reader_accepts() -> None:
+    """The census must pass exactly the station key read_rung_tape accepts (NYC crashed it)."""
+    from forecast_cheap_screen_wp7 import station_time_zone  # type: ignore[import-not-found]
+    from settlement_alignment_study import load_sites  # type: ignore[import-not-found]
+
+    sites = load_sites()
+    assert "NYC" in {spec.city for spec in sites}
+    for spec in sites:
+        zone = station_time_zone(census.reader_key(spec.city))
+        january = dt.datetime(2026, 1, 15, 12, tzinfo=zone).utcoffset()
+        assert january is not None
+        assert january.total_seconds() / 3600.0 == float(spec.std_utc_offset_hours)

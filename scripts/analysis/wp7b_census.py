@@ -13,9 +13,10 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Final, NoReturn, cast
@@ -27,6 +28,7 @@ from wp7b_market_as_forecaster import (  # type: ignore[import-not-found]
     assert_complete_partition,
 )
 
+from breezy.domain.exec_intent import intent_fingerprint, utc_day_for_ns
 from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.strategy.current_rung_hold.decision import fee_on_ask
@@ -73,6 +75,8 @@ PREREG_PATH: Path = _REPO / "docs/plans/backlog/STRAT_DESIGN_2026-10-31/prereg_c
 FREEZE_PATH: Path = _REPO / "docs/evidence/STRAT_DESIGN_2026-10-31/FREEZE_card_a.txt"
 OUTPUT_DIR: Path = _REPO / "docs/evidence/STRAT_DESIGN_2026-10-31"
 CATALOG: Path = Path.home() / ".local/share/breezy/catalog/quote_tape/polymarket_us"
+LOG_DIR: Path = Path.home() / ".local/share/breezy/logs"
+LOG_GLOB: Final[str] = "breezy-trade-*.log"
 
 _FAMILY_FILES: Final[tuple[str, ...]] = (
     "pm_us_crh_cont.json",
@@ -95,6 +99,10 @@ class OffTickError(ValueError):
 
 class OwnOrderError(Exception):
     """The own-order set cannot be built. The message is the one-line refusal."""
+
+    def __init__(self, message: str, report: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.report = tuple(report)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +133,7 @@ class OwnSet:
     instrument_ids: tuple[str, ...]
     first_ns: Mapping[str, int]
     never_filled: int = 0
+    report: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,14 +375,171 @@ def _base_of(instrument_or_slug: str) -> str:
     return base_symbol_of(symbol_of_instrument_id(instrument_or_slug))
 
 
+_ANSI: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_SUBMIT_MARK: Final[str] = "[Risk] SubmitOrder("
+_STAMP: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z")
+_HEAD: Final[str] = r"(?P<side>[A-Z_]+) (?P<qty>[0-9_.]+) (?P<iid>\S+) "
+_TAIL: Final[str] = r", status=[^,]*, client_order_id=(?P<coid>[^,)\s]+)"
+_LIMIT_SHAPE: Final[re.Pattern[str]] = re.compile(
+    r"order=LimitOrder\("
+    + _HEAD
+    + r"LIMIT @ (?P<price>[0-9_.]+) (?P<tif>[A-Z_]+)(?: [^\s,]+)?"
+    + _TAIL
+)
+_MARKET_SHAPE: Final[re.Pattern[str]] = re.compile(
+    r"order=MarketOrder\(" + _HEAD + r"MARKET (?P<tif>[A-Z_]+)" + _TAIL
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PrintedOrder:
+    """The six attributes ``intent_fingerprint`` reads, already in their ``str()`` forms."""
+
+    instrument_id: str
+    side: str
+    quantity: str
+    price: str
+    time_in_force: str
+    client_order_id: str
+
+
+@dataclass(slots=True)
+class _LogScan:
+    bases_by_digest: dict[str, set[str]] = field(default_factory=dict)
+    files: int = 0
+    symlinks: int = 0
+    first_stamp: str = ""
+    last_stamp: str = ""
+
+
+def parse_submit_order(raw_line: str) -> tuple[str, str] | None:
+    """(instrument_id, fingerprint digest) of a ``[Risk] SubmitOrder(`` line, else None.
+
+    An unknown order shape, or a side / time-in-force name outside Nautilus' closed member set,
+    is a refusal (the existing membership-guarded ``_enum_forms`` raises before the native
+    parser can abort the interpreter).
+    """
+    from breezy.persistence.autonomy.capture_reader import (
+        CaptureProjectionError,
+        _enum_forms,
+    )
+
+    text = _ANSI.sub("", raw_line)
+    at = text.find(_SUBMIT_MARK)
+    if at < 0:
+        return None
+    body = text[at + len(_SUBMIT_MARK) :]
+    found = _LIMIT_SHAPE.match(body) or _MARKET_SHAPE.match(body)
+    if found is None:
+        raise OwnOrderError("own-order set cannot be built: unknown SubmitOrder shape in a log")
+    fields_ = found.groupdict()
+    try:
+        side, tif = _enum_forms({"order_side": fields_["side"], "time_in_force": fields_["tif"]})
+    except CaptureProjectionError:
+        raise OwnOrderError(
+            "own-order set cannot be built: unknown side or time in force in a log"
+        ) from None
+    printed = _PrintedOrder(
+        instrument_id=fields_["iid"],
+        side=side,
+        quantity=fields_["qty"].replace("_", ""),
+        price=fields_.get("price", "").replace("_", ""),
+        time_in_force=tif,
+        client_order_id=fields_["coid"],
+    )
+    return printed.instrument_id, intent_fingerprint(printed)
+
+
+def _scan_node_logs(wanted: frozenset[str]) -> _LogScan:
+    """Read every node log as bytes (symlinks followed by opening the path). Read-only."""
+    scan = _LogScan()
+    for path in sorted(LOG_DIR.glob(LOG_GLOB)):
+        try:
+            with path.open("rb") as handle:
+                lines: Iterable[bytes] = handle
+                for chunk in lines:
+                    if b"SubmitOrder(" not in chunk:
+                        continue
+                    line = chunk.decode("utf-8", errors="replace")
+                    parsed = parse_submit_order(line)
+                    if parsed is None:
+                        continue
+                    stamp = _STAMP.match(_ANSI.sub("", line))
+                    if stamp is not None:
+                        moment = stamp.group(0)
+                        scan.first_stamp = min(scan.first_stamp or moment, moment)
+                        scan.last_stamp = max(scan.last_stamp, moment)
+                    instrument_id, digest = parsed
+                    if digest in wanted:
+                        scan.bases_by_digest.setdefault(digest, set()).add(_base_of(instrument_id))
+        except OSError:
+            raise OwnOrderError("own-order set cannot be built: a node log is unreadable") from None
+        scan.files += 1
+        scan.symlinks += 1 if path.is_symlink() else 0
+    return scan
+
+
+def _resolve_by_logs(
+    slugless: Sequence[tuple[str, int, str | None]],
+) -> tuple[dict[str, str], _LogScan]:
+    """fingerprint -> base slug by the node logs; two bases for one fingerprint refuse."""
+    scan = _scan_node_logs(frozenset(fingerprint for fingerprint, _ns, _base in slugless))
+    resolved: dict[str, str] = {}
+    for digest, bases in scan.bases_by_digest.items():
+        if len(bases) > 1:
+            raise OwnOrderError("own-order set cannot be built: a fingerprint matches two slugs")
+        resolved[digest] = next(iter(bases))
+    return resolved, scan
+
+
+def _d5_report(
+    *,
+    total: int,
+    by_fill: int,
+    by_log: int,
+    control: tuple[int, int],
+    unresolved: Counter[str],
+    scan: _LogScan,
+) -> tuple[str, ...]:
+    """D5 counts only: never an id, a fingerprint or an order id."""
+    per_day = ", ".join(f"{day}: {count}" for day, count in sorted(unresolved.items())) or "none"
+    return (
+        f"D5 intents total: {total}",
+        f"D5 resolved by (i) fill_by_fingerprint: {by_fill}",
+        f"D5 resolved by (ii) node log: {by_log}",
+        f"D5 positive control matched/total: {control[0]}/{control[1]}",
+        f"D5 unresolved: {sum(unresolved.values())}",
+        f"D5 unresolved per UTC created day: {per_day}",
+        f"D5 log files read: {scan.files}",
+        f"D5 symlinks followed: {scan.symlinks}",
+        f"D5 first log timestamp read: {scan.first_stamp or 'none'}",
+        f"D5 last log timestamp read: {scan.last_stamp or 'none'}",
+    )
+
+
+def _base_by_fill(
+    created_ns: int, fingerprint: str, get: Callable[[str], bytes | None]
+) -> str | None:
+    """Resolution (i): fill_by_fingerprint to fill to the base slug, or None."""
+    from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+    from breezy.domain.exec_intent import FILL_BY_FINGERPRINT_KEY_PREFIX, FILL_KEY_PREFIX
+
+    day = utc_day_for_ns(created_ns).isoformat()
+    index = get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{fingerprint}")
+    if index is None or not index.decode("utf-8").strip():
+        return None
+    fill_raw = get(f"{FILL_KEY_PREFIX}{index.decode('utf-8').strip()}")
+    if fill_raw is None:
+        return None
+    try:
+        record = DurableFillRecord.from_bytes(fill_raw)
+    except (ValueError, TypeError):
+        raise OwnOrderError("own-order set cannot be built: unreadable fill record") from None
+    return _base_of(record.instrument_id)
+
+
 def read_own_orders(path: Path) -> OwnSet:
     """Scan intent history and the current slot table. Slug-less and unreadable refuse."""
-    from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
-    from breezy.domain.exec_intent import (
-        FILL_BY_FINGERPRINT_KEY_PREFIX,
-        FILL_KEY_PREFIX,
-        utc_day_for_ns,
-    )
     from breezy.runtime.exec_par_durable_sources import HISTORY_KEY_PREFIX
     from breezy.runtime.submit_intent import (
         CURRENT_INTENT_KEY,
@@ -383,7 +549,7 @@ def read_own_orders(path: Path) -> OwnSet:
     )
 
     first: dict[str, int] = {}
-    never_filled = 0
+    slugged = 0
     try:
         with _ro(path) as connection:
             history = connection.execute(
@@ -419,33 +585,51 @@ def read_own_orders(path: Path) -> OwnSet:
                 ).fetchone()
                 return None if found is None else _as_bytes(found[0])
 
+            slugless: list[tuple[str, int, str | None]] = []
             for intent in intents:
                 if intent.slug:
+                    slugged += 1
                     _remember(first, _base_of(intent.slug), intent.created_ns)
                     continue
-                day = utc_day_for_ns(intent.created_ns).isoformat()
-                index = _get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent.fingerprint}")
-                if index is None or not index.decode("utf-8").strip():
-                    never_filled += 1
-                    continue
-                fill_raw = _get(f"{FILL_KEY_PREFIX}{index.decode('utf-8').strip()}")
-                if fill_raw is None:
-                    never_filled += 1
-                    continue
-                try:
-                    record = DurableFillRecord.from_bytes(fill_raw)
-                except (ValueError, TypeError):
-                    raise OwnOrderError(
-                        "own-order set cannot be built: unreadable fill record"
-                    ) from None
-                _remember(first, _base_of(record.instrument_id), intent.created_ns)
+                base = _base_by_fill(intent.created_ns, intent.fingerprint, _get)
+                slugless.append((intent.fingerprint, intent.created_ns, base))
     except sqlite3.Error:
         raise OwnOrderError("own-order set cannot be built: store is unreadable") from None
-    if never_filled:
+    resolved, scan = _resolve_by_logs(slugless) if slugless else ({}, _LogScan())
+    by_fill = by_log = matched = controls = 0
+    unresolved: Counter[str] = Counter()
+    for fingerprint, created_ns, fill_base in slugless:
+        log_base = resolved.get(fingerprint)
+        if fill_base is not None:
+            by_fill += 1
+            controls += 1
+            matched += 1 if log_base == fill_base else 0
+            _remember(first, fill_base, created_ns)
+        elif log_base is not None:
+            by_log += 1
+            _remember(first, log_base, created_ns)
+        else:
+            unresolved[utc_day_for_ns(created_ns).isoformat()] += 1
+    report = _d5_report(
+        total=len(slugless) + slugged,
+        by_fill=by_fill,
+        by_log=by_log,
+        control=(matched, controls),
+        unresolved=unresolved,
+        scan=scan,
+    )
+    if matched != controls:
         raise OwnOrderError(
-            f"own-order set cannot be built: {never_filled} slug-less intent(s) never filled"
+            "own-order set cannot be built: positive control mismatch (fill path vs node log)",
+            report,
         )
-    return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first, never_filled=never_filled)
+    if unresolved:
+        raise OwnOrderError(
+            f"own-order set cannot be built: {sum(unresolved.values())} slug-less intent(s) "
+            "unresolved by fill and node log",
+            report,
+        )
+    return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first, report=report)
 
 
 def _parse_freeze(path: Path) -> dict[str, str]:
@@ -721,8 +905,21 @@ def _walk_dirs(
     return grouped, impossible
 
 
+#: ``read_rung_tape`` only accepts a station key present in ``STATION_TIME_ZONES`` (the four
+#: pool cities) and refuses to guess a zone. NYC is on the catalog but absent there. The census
+#: reads only ts/ask/bid, never the local date or hour, so NYC borrows MIA's key: the same
+#: IANA zone (America/New_York), and the reader's standard-offset cross-check still runs
+#: against NYC's own registry offset.
+_READER_KEY: Final[Mapping[str, str]] = {"NYC": "MIA"}
+
+
+def reader_key(city: str) -> str:
+    """The station key ``read_rung_tape`` accepts for a catalog city."""
+    return _READER_KEY.get(city, city)
+
+
 def _score(
-    catalog: Path, own: OwnSet
+    catalog: Path, own: OwnSet, *, frame_only: bool = False
 ) -> tuple[list[str], list[dict[str, str]], list[_Denom], bool, int, int]:
     """Returns notes, records, denominator frames, unit_ok, sum-ask count, impossible pairs."""
     notes: list[str] = []
@@ -778,7 +975,7 @@ def _score(
                     std_utc_offset_hours=offset,
                     price_scalar=price_scalar,
                     size_scalar=size_scalar,
-                    city=city,
+                    city=reader_key(city),
                 )
             except (OSError, ValueError):
                 notes.append(f"{city} {day.isoformat()}: tape read failed")
@@ -835,6 +1032,13 @@ def _score(
                     "leg1": "",
                     "leg2": "",
                 }
+            )
+            continue
+        if frame_only:
+            denoms.append(
+                _Denom(
+                    day=day, asks=(), ask_sizes=(), bids=(), bid_sizes=(), leg1=False, leg2=False
+                )
             )
             continue
         rows = tuple(
@@ -969,6 +1173,7 @@ def _render(
         "",
         format_own_set(own),
         f"slug-less never-filled intents: {own.never_filled}",
+        *own.report,
         "",
         "## Legs",
         "",
@@ -1003,6 +1208,18 @@ def _render(
     return "\n".join(lines)
 
 
+def _dry_run_stop(own: OwnSet) -> int:
+    """H7: D5 counts, final denominator and distinct dates ONLY. Never a leg, label or prize."""
+    print("\n".join(own.report), flush=True)
+    try:
+        _notes, _records, denoms, _unit, _sums, _impossible = _score(CATALOG, own, frame_only=True)
+    except OffTickError as exc:
+        refuse(f"off-tick price refused: {exc}")
+    print(f"final denominator station-days: {len(denoms)}")
+    print(f"distinct dates: {len({frame.day for frame in denoms})}")
+    return 0
+
+
 def run_census(*, prereg_sha: str | None, tape_supplied: bool, dry_run: bool) -> int:
     """Freeze, own orders, then the catalog. Refusals exit 2 before any write."""
     assert_constants()
@@ -1023,7 +1240,10 @@ def run_census(*, prereg_sha: str | None, tape_supplied: bool, dry_run: bool) ->
     try:
         own = read_own_orders(store)
     except OwnOrderError as exc:
+        print("\n".join(exc.report))
         refuse(str(exc))
+    if dry_run:
+        return _dry_run_stop(own)
     try:
         notes, records, denoms, unit_ok, sum_rows, impossible = _score(CATALOG, own)
     except OffTickError as exc:
@@ -1041,8 +1261,5 @@ def run_census(*, prereg_sha: str | None, tape_supplied: bool, dry_run: bool) ->
         leg1=leg1,
         leg2=leg2,
     )
-    if dry_run:
-        print(markdown)
-        return 0
     emit_census(OUTPUT_DIR, markdown, records, sha, dry_run=False)
     return 0
