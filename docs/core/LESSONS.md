@@ -391,7 +391,8 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Mistake:** A watcher keyed on the bridge status field reported a Grok build as STALLED while the run was healthy; the `phase` shown by `grok-bridge.mjs runs` never leaves "starting" for the life of the job. The false stall triggered a needless re-check cycle.
 **Prevention:** Watch a Grok run by the grok process pid (`pgrep -f <run-id>` alive) and by the mtimes of the files it is meant to write or of its job log under `~/.claude/plugins/data/grok-build-xai-grok-build/state/<tree>/jobs/<run-id>.log`; declare a stall only when the pid is alive AND no watched mtime has advanced for the agreed window (15 min). Never cite the bridge phase field in a stall verdict.
 **Applied:** 2026-10-30
-**Last updated:** 2026-10-30
+**Addendum 10-31:** a watcher that greps for the run id also matches its OWN launcher shell and the Claude Bash wrapper whose command line contains the id, producing a false STALL/alive reading; match on the `grok` binary and `run-worker` pids and exclude the poll script's own pid.
+**Last updated:** 2026-10-31
 
 ### L-73 — Node logs write the level as `[ERROR]` inside ANSI codes; a padded ` ERROR ` grep counts zero (2026-10-30)
 **Mistake:** The Claude boot-log read reported 0 ERROR lines against Grok's 67 because its pattern was space-padded ` ERROR `; the node log emits `[ERROR]` wrapped in colour codes, so the pattern can never match. The disagreement was recorded as a measurement note only after a second read.
