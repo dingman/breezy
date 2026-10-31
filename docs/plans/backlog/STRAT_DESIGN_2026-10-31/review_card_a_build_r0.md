@@ -26,3 +26,19 @@ Root cause: `arm_slot` stores `slug=None` whenever K=1 (`submit_intent.py:1005,1
 Options rejected: (b) drop days with unresolved intents = the L-65 date cut and misses D+1 markets; (c) prefix over-exclusion = denominator ≈ 0; (a) by intent id = no log line carries it.
 **RULING = (d):** rebuild `intent_fingerprint` (`exec_intent.py:38-49`: instrument_id, side, quantity, price, TIF, client_order_id) from the node-log `[Risk] SubmitOrder(...)` lines and match the sha256; positive control = the 25 fill-resolved intents must also resolve by logs to the same base slug; any residual unresolved / double-matched / unreadable → exit 2. Thresholds, window, B and F untouched → new sha + new freeze after review.
 Coverage CORRECTION (coordinator measurement 16:10Z; the architect's "first log 10-14" was a listing artefact): `~/.local/share/breezy/logs/breezy-trade-*.log` = 95 files since 2026-09-04, all 40 window dates present, 2411 SubmitOrder lines (09-21..09-23: 4; 10-01..10-05: 32; 10-24..10-30: 2411 total incl.); the journal carries 0 SubmitOrder lines (files only).
+
+---
+# Build r1 (f9e1c085: D5(ii) resolver + H7 stop + NYC alias) — merged blind review (python-reviewer APPROVE-TO-GATE, silent-failure-hunter REVISE; 2026-10-31 ~16:00Z)
+
+Live dry-run (recorded in `FREEZE_card_a.txt`): 166/166 intents resolved (25 by fill, 141 by log), positive control 25/25, unresolved 0, 99 files read / 76 symlinks followed, denominator 149 station-days / 37 dates, rc=0, 0 writes. Parser, enum guard, fingerprint payload, log scan, leakage and NYC alias: CONFORMANT (python). Gate run on f9e1c085 was STOPPED at ~16:01Z pending the fixes below (re-gate after).
+
+## Blockers (silent-failure-hunter) → hardening pass F1–F12
+- F1 catalog root / `order_book_depths` / `data/` absent or zero rung dirs → was an empty denominator (dry-run "denominator 0"), must REFUSE (`:871-873`, `:926-929`).
+- F2 unparsable catalog dir → was skipped-and-noted, must REFUSE except the anchored LOW-dir skip (`:884`, `:892`).
+- F3 tape read OSError/ValueError or zero instants → was MISSING, must REFUSE; KeyError (station absent from `STATION_TIME_ZONES`) → exit 2 not traceback (`:980-986`).
+- F4 `_load_fee_map` failure or rung without a fee entry → was INCONCLUSIVE, must REFUSE; only a present coefficient ≠ 0.0695 stays INCONCLUSIVE (`:861-862`, `:1023-1036`).
+- F5 `load_sites` failure / station without offset → was mass-MISSING, must REFUSE; `_fixed_scalars` failure stays the allowed unit-unprintable INCONCLUSIVE only when no nonzero size exists (`:936-968`).
+## Should
+- F6 positive control requires controls > 0 (`:621`); F7 dangling `fill_by_fingerprint` index or undecodable index → REFUSE (`:529-533`); F8 empty intent history → REFUSE (`:598-599`, `:632`); F9 `_carries_sha` unreadable artefact / prereg / freeze read errors → REFUSE not False/traceback (`:671-682`); F10 prove `ParquetDataCatalog(...)` creates no directories on the census path (`:849-852`); F11 H7 test never reaches the `frame_only` branch (no catalog fixture) → add a two-rung fixture (python S7); F12 side-name negative test.
+## Notes accepted
+- Parser anchoring fails closed (`:428-436`); first/last timestamps from SubmitOrder lines only (label imprecision); ~13 min dry-run cost is the catalog parquet reads, not the log scan; `dry_run` arg to `emit_census` is dead.
