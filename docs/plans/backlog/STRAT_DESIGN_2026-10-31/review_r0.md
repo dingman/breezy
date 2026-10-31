@@ -72,3 +72,12 @@ The blanket "Cards A–D do not read settlement" is FALSE: `market_calibration_s
 each card names its truth-free path explicitly.
 
 Accepted as-is: §0 closed-cell table; §1 map structure; cheap-kill ordering principle; harness line citations (all VERIFIED).
+
+## R8 RESOLVED (coordinator, 04:55Z, independent read of https://docs.polymarket.us/fees fetched 2026-10-31)
+Schedule effective 2026-10-19 13:00 ET: taker θ = 0.0695 on p(1−p); **maker Tier 1 (< $10M prior-month maker volume) pays 0 and
+receives no rebate**; rebates −0.0035…−0.0104 start at Tier 2. The −0.0125 rebate comes from the stale 08-25 snapshot
+(`docs/evidence/venue/polymarket_us/docs_snapshots/fees_2026-08-25.md`). Binding for r1/r2: maker fee = 0 for every maker cell;
+never credit a rebate; charging +θ·b(1−b) is a conservative bound only. Defect for the backlog (not this design): the repo fee model
+`src/breezy/adapters/polymarket_us/fees.py` charges makers +θ by default (:267-289) and credits −0.0125 with `allow_maker=True`
+(:356-376, `MAKER_FEE_COEFFICIENT` :83 "DOCUMENTED-NOT-WIRE-OBSERVED"); `expected_fee_for` (:446) returns −0.0125; the snapshot
+needs refreshing. No live maker fill exists to observe the wire value (all 34 fills TAKER, fees ≥ 0).
