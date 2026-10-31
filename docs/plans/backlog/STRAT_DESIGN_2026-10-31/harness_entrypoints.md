@@ -167,16 +167,16 @@ These are properties of the harness and the tape, not of a new strategy.
 
 11. **Kalshi is not a harness input.** Historical JSON for five HIGH series is not a `ParquetDataCatalog` of depth. `k1_kalshi_prior.py` is frozen by the WA-2 draft. There is no `add_venue` for Kalshi in `build_backtest_engine`.
 
-## 5. r1 declarations — not entry points
+## 5. r2 declarations — not entry points
 
-Added with `design_r1.md`. Nothing in this section is a runner, and none of it was executed.
+Replaces the r1 text that used to sit here. Nothing in this section is a runner, and none of it was executed. Thresholds for the first two runs are in `prereg_r2.md`. The card text is `design_r2.md`.
 
-Do not point Cards A–D or LOW at `current_rung_hold_paper_replay.py`. Its `main` writes `settlement_prices` from the final climate day (lines 1249–1277). That read is not outcome-blind, so r1 adds no `--strategy` choice and does not touch the dynamic-import pin.
+Do not point any card at `current_rung_hold_paper_replay.py`. Its `main` writes `settlement_prices` from the final climate day (lines 1249–1277). r2 adds no `--strategy` choice and does not touch the dynamic-import pin.
 
-Do not point those cards at `wp7b_market_as_forecaster.py` `main` (truth via `_load_corpus`, line 893), `maker_design_nobid.py` (truth at line 423), `maker_stage0_replay.py` (`--truth` is required), `market_calibration_scan.py`, or `p2_nbp_ask_murphy.py`.
+Do not point a card at today's `wp7b_market_as_forecaster.py` `main` (`collect` → `_load_corpus`, line 893), `maker_design_nobid.py` (truth at line 423), `maker_stage0_replay.py` (a verdict run and `--bench` both require `--truth`; `_require` lines 130–136), `market_calibration_scan.py`, or `p2_nbp_ask_murphy.py`. Do not append `verdict_ledger.jsonl`.
 
-`sum_ask_row` (`wp7b_market_as_forecaster.py` line 537) and `queue_sizes` (`maker_stage0_fill_pass.py` line 79) do not open truth. `maker_stage0_catalog_read.py` reads `OrderBookDepth10` and `TradeTick` and does not import the truth loader.
+`sum_ask_row` (line 537) still requires a `RungEvent`, and `RungEvent` requires `p_fc` and `settled`. `SumAskRow` has ask fields only. Card A and Card LOW are one new `--census-only` flag on that existing `main`: it must not call `_load_corpus` and must not shim a `RungEvent`. The flag is not in the tree. Card B is one new `--queue-census` flag on `maker_stage0_catalog_read.py` (no CLI today). That module already reads `OrderBookDepth10` and `TradeTick` and does not import the truth loader. `queue_sizes` is `maker_stage0_fill_pass.py` line 79.
 
-Exception requested, not built: one truth-free driver with two modes and separate outputs. Mode 1 calls `sum_ask_row` for Card A and, as a second invocation, Card LOW. Mode 2 calls `queue_sizes` plus BUYER-print counts from the catalog reader for Card B. Cards C and D each request their own exception in `design_r1.md` because neither function is their estimand. Card E requests none: it is a public Kalshi-vs-CLI read, not a tape census.
+NEW EVALUATOR exceptions, not built, one each: Card E (public Kalshi `expiration_value` joined to IEM CLI; r1's "not requested" is withdrawn), Card D (`--g0-only` first; a subset is not a partition), Card C (cluster mean of a signed mid, not a queue and not a ladder sum).
 
-`trade_execution` and `queue_position` stay false. The catalog now has `trade_tick` directories, so the "no trade tape" sentence in `docs/specs/BACKTEST_VENUE_CONFIG.md` lines 59–62 is stale, but r1 does not amend that spec: the print unit is unresolved and the maker-fee sign is not wire-observed.
+`trade_execution` and `queue_position` stay false in this round. `design_r2.md` §3 records the verdict: the harness already allowlists `TradeTick`, and both flags would have to flip together in `add_venue` (lines 747 and 752) and in `docs/specs/BACKTEST_VENUE_CONFIG.md` lines 59 and 62 before a print can walk a queue. No card in r2 calls `backtest()` for that. Maker Tier 1 fee is 0 (R8 RESOLVED); the post-only refusal now rests on `fees.py`, which still prices makers at +θ or at −0.0125.
