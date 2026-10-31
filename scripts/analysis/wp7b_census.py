@@ -10,6 +10,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections.abc import Iterator, Mapping, Sequence
@@ -83,6 +84,13 @@ _FAMILY_FILES: Final[tuple[str, ...]] = (
 )
 _COLUMNS: Final[tuple[str, ...]] = ("station", "climate_day", "status", "leg1", "leg2")
 _RAW_TOLERANCE: Final[Decimal] = Decimal("0.000001")
+# Any timestamp pins theta: ``fee_coefficient_at_fill`` is always passed, so this is inert.
+_FEE_PROBE_TS_NS: Final[int] = 1
+_LOW_DIR: Final[re.Pattern[str]] = re.compile(r"^(tc-temp-[a-z]+)low(-\d{4}-\d{2}-\d{2}-.*)$")
+
+
+class OffTickError(ValueError):
+    """A quoted price is not on the tick. Rounding it would hide an off-tick quote."""
 
 
 class OwnOrderError(Exception):
@@ -116,6 +124,7 @@ class BookEval:
 class OwnSet:
     instrument_ids: tuple[str, ...]
     first_ns: Mapping[str, int]
+    never_filled: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +234,16 @@ def select_frame(*, climate_day: dt.date, quotes: Mapping[str, Sequence[Quote]])
 
 
 def _cents(amount: Decimal) -> int:
+    """Fee cents: the venue rounds fees half-even, so this one rounds."""
     quantized = amount.quantize(TICK, rounding=ROUND_HALF_EVEN)
+    return int(quantized * 100)
+
+
+def _price_cents(price: Decimal) -> int:
+    """Price cents. A price off the tick is refused, never rounded."""
+    quantized = price.quantize(TICK, rounding=ROUND_HALF_EVEN)
+    if quantized != price:
+        raise OffTickError(f"price {price} is not on the {TICK} tick")
     return int(quantized * 100)
 
 
@@ -238,7 +256,7 @@ def rounded_fill_fee(price: Decimal, q: int) -> Decimal:
     money = taker_fee_at_fill(
         quantity=Decimal(q),
         price=price,
-        ts_event_ns=1,
+        ts_event_ns=_FEE_PROBE_TS_NS,
         fee_coefficient_at_fill=FEE_COEFFICIENT,
     )
     if money is None:
@@ -249,7 +267,7 @@ def rounded_fill_fee(price: Decimal, q: int) -> Decimal:
 def leg1_slack_cents(asks: Sequence[Decimal]) -> int:
     """Integer cents: ``(100 - 2n) - (sum ask cents + sum fee cents)``. Clears at >= 0."""
     n = len(asks)
-    total = sum(_cents(price) + _cents(fee_on_ask(price, FEE_COEFFICIENT)) for price in asks)
+    total = sum(_price_cents(price) + _cents(fee_on_ask(price, FEE_COEFFICIENT)) for price in asks)
     return (100 - 2 * n) - total
 
 
@@ -258,19 +276,22 @@ def leg2_slack_cents(bids: Sequence[Decimal]) -> int:
     n = len(bids)
     net = 0
     for bid in bids:
-        net += _cents(bid) - _cents(fee_on_ask(Decimal(1) - bid, FEE_COEFFICIENT))
+        net += _price_cents(bid) - _cents(fee_on_ask(Decimal(1) - bid, FEE_COEFFICIENT))
     return net - (100 + 2 * n)
 
 
 def _slack_at_q(prices: Sequence[Decimal], q: int, *, side: str) -> int:
+    """Whole-fill cents. Leg 1: ``q*(100-2n) - (q*sum ask + sum fee_q)``.
+
+    Leg 2: ``(q*sum bid - sum fee_q on the NO price) - q*(100+2n)``. Clears at >= 0.
+    """
     n = len(prices)
+    price_cents = q * sum(_price_cents(price) for price in prices)
     if side == "ask":
-        total = sum(_cents(price) + _cents(rounded_fill_fee(price, q)) for price in prices)
-        return (100 - 2 * n) - total
-    net = 0
-    for bid in prices:
-        net += _cents(bid) - _cents(rounded_fill_fee(Decimal(1) - bid, q))
-    return net - (100 + 2 * n)
+        fees = sum(_cents(rounded_fill_fee(price, q)) for price in prices)
+        return q * (100 - 2 * n) - (price_cents + fees)
+    fees = sum(_cents(rounded_fill_fee(Decimal(1) - bid, q)) for bid in prices)
+    return (price_cents - fees) - q * (100 + 2 * n)
 
 
 def evaluate_book(
@@ -326,7 +347,8 @@ def _as_bytes(value: object) -> bytes:
 @contextmanager
 def _ro(path: Path) -> Iterator[sqlite3.Connection]:
     """mode=ro plus query_only. Never ``SqliteStateStore`` (that one creates and commits)."""
-    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5.0)
+    uri = f"{path.absolute().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=5.0)
     try:
         connection.execute("PRAGMA query_only=ON")
         yield connection
@@ -423,7 +445,7 @@ def read_own_orders(path: Path) -> OwnSet:
         raise OwnOrderError(
             f"own-order set cannot be built: {never_filled} slug-less intent(s) never filled"
         )
-    return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first)
+    return OwnSet(instrument_ids=tuple(sorted(first)), first_ns=first, never_filled=never_filled)
 
 
 def _parse_freeze(path: Path) -> dict[str, str]:
@@ -458,12 +480,14 @@ def _check_freeze(prereg_sha: str) -> None:
 
 
 def _carries_sha(out: Path, sha: str) -> bool:
+    """Either artefact carrying the sha is a prior look (a lone parquet is a half-emitted one)."""
     markdown = out / "card_a_census.md"
     parquet = out / "card_a_census.parquet"
-    if not markdown.is_file() or not parquet.is_file():
-        return False
-    header = "".join(markdown.read_text(encoding="utf-8").splitlines(keepends=True)[:30])
-    if f"prereg_sha256: {sha}" not in header:
+    if markdown.is_file():
+        header = "".join(markdown.read_text(encoding="utf-8").splitlines(keepends=True)[:30])
+        if f"prereg_sha256: {sha}" in header:
+            return True
+    if not parquet.is_file():
         return False
     try:
         import pyarrow.parquet as pq
@@ -481,7 +505,10 @@ def emit_census(
     sha: str,
     dry_run: bool = False,
 ) -> None:
-    """Temp file in ``out``, then ``os.replace``. A prior look with this sha refuses."""
+    """Temp files in ``out``, then ``os.replace``: parquet first, markdown LAST.
+
+    A prior look with this sha refuses.
+    """
     if dry_run:
         return
     if _carries_sha(out, sha):
@@ -490,8 +517,8 @@ def emit_census(
     md_tmp = out / f".card_a_census.md.{os.getpid()}.tmp"
     pq_tmp = out / f".card_a_census.parquet.{os.getpid()}.tmp"
     try:
-        md_tmp.write_text(markdown, encoding="utf-8")
         _write_parquet(pq_tmp, records, sha)
+        md_tmp.write_text(markdown, encoding="utf-8")
         os.replace(pq_tmp, out / "card_a_census.parquet")
         os.replace(md_tmp, out / "card_a_census.md")
     finally:
@@ -523,6 +550,29 @@ def _label(clears: int, denominator: int, dates: int, unit_ok: bool) -> str:
     if clears >= 1:
         return "PASS"
     return "KILL"
+
+
+def _recover_unit(instants: Sequence[object], size_scalar: float) -> tuple[int | None, bool]:
+    """First nonzero ``ask_size`` fixes the unit. A zero pad proves nothing.
+
+    Returns ``(raw, failed)``: ``(None, False)`` when every size is zero.
+    """
+    for instant in instants:
+        size = float(getattr(instant, "ask_size"))  # noqa: B009
+        if size == 0:
+            continue
+        recovered = _recover_raw(size, size_scalar)
+        return recovered, recovered is None
+    return None, False
+
+
+def scrub_legs_without_unit(
+    records: Sequence[dict[str, str]], unit_ok: bool
+) -> list[dict[str, str]]:
+    """No per-record leg verdict is written when the unit line failed."""
+    if unit_ok:
+        return list(records)
+    return [{**row, "leg1": "", "leg2": ""} for row in records]
 
 
 def _recover_raw(scaled: float, size_scalar: float) -> int | None:
@@ -641,8 +691,9 @@ def _walk_dirs(
         if not child.is_dir():
             continue
         name = child.name
-        if "low-" in name:
-            alias = name.replace("low-", "high-", 1)
+        low_match = _LOW_DIR.match(name)
+        if low_match is not None:
+            alias = f"{low_match.group(1)}high{low_match.group(2)}"
             try:
                 rung = parse_rung(alias)
             except ValueError:
@@ -733,13 +784,8 @@ def _score(
                 notes.append(f"{city} {day.isoformat()}: tape read failed")
                 failed = True
                 break
-            for instant in instants:
-                if unit_raw is None and not unit_failed:
-                    recovered = _recover_raw(float(instant.ask_size), size_scalar)
-                    if recovered is None:
-                        unit_failed = True
-                    else:
-                        unit_raw = recovered
+            if unit_raw is None and not unit_failed:
+                unit_raw, unit_failed = _recover_unit(instants, size_scalar)
             quotes[path.name] = tuple(_quote_from_instant(instant) for instant in instants)
         if failed:
             records.append(
@@ -831,6 +877,7 @@ def _score(
             }
         )
     unit_ok = unit_raw is not None and not unit_failed
+    records = list(scrub_legs_without_unit(records, unit_ok))
     notes.append(
         f"unit scalars price={price_scalar} size={size_scalar} raw_ask_size_0={unit_raw} contracts"
         if unit_ok
@@ -921,7 +968,7 @@ def _render(
         "## Own-order set",
         "",
         format_own_set(own),
-        "slug-less never-filled intents: 0",
+        f"slug-less never-filled intents: {own.never_filled}",
         "",
         "## Legs",
         "",
@@ -977,7 +1024,10 @@ def run_census(*, prereg_sha: str | None, tape_supplied: bool, dry_run: bool) ->
         own = read_own_orders(store)
     except OwnOrderError as exc:
         refuse(str(exc))
-    notes, records, denoms, unit_ok, sum_rows, impossible = _score(CATALOG, own)
+    try:
+        notes, records, denoms, unit_ok, sum_rows, impossible = _score(CATALOG, own)
+    except OffTickError as exc:
+        refuse(f"off-tick price refused: {exc}")
     dates = {frame.day for frame in denoms}
     leg1 = _label(sum(1 for frame in denoms if frame.leg1), len(denoms), len(dates), unit_ok)
     leg2 = _label(sum(1 for frame in denoms if frame.leg2), len(denoms), len(dates), unit_ok)

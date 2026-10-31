@@ -447,3 +447,262 @@ def test_dry_run_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     )
     assert _listing(tmp_path) == before
     assert _listing(root) == []
+
+
+# ---- review r0 code items C1-C7 -------------------------------------------------------------
+
+
+def _c(value: int) -> Decimal:
+    return Decimal(value) / 100
+
+
+def _fee_cents(price: Decimal, q: int) -> int:
+    """Independent once-rounded q-fill fee in cents (q=1 is the per-contract gate)."""
+    from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
+    from breezy.strategy.current_rung_hold.decision import fee_on_ask
+
+    if q == 1:
+        return int(fee_on_ask(price, Decimal("0.0695")) * 100)
+    money = taker_fee_at_fill(
+        quantity=Decimal(q),
+        price=price,
+        ts_event_ns=1,
+        fee_coefficient_at_fill=Decimal("0.0695"),
+    )
+    assert money is not None
+    return int(money.as_decimal() * 100)
+
+
+def _expected_slack(prices: tuple[Decimal, ...], q: int, *, side: str) -> int:
+    n = len(prices)
+    cents = q * sum(int(price * 100) for price in prices)
+    if side == "ask":
+        return q * (100 - 2 * n) - (cents + sum(_fee_cents(price, q) for price in prices))
+    return (cents - sum(_fee_cents(Decimal(1) - price, q) for price in prices)) - q * (100 + 2 * n)
+
+
+def _pairs() -> list[tuple[Decimal, Decimal]]:
+    return [(_c(a), _c(b)) for a in range(1, 50) for b in range(40, 100)]
+
+
+def _denom(prices: tuple[Decimal, ...], *, side: str, size: int = 100) -> census._Denom:
+    sizes = tuple(Decimal(size) for _ in prices)
+    ask = side == "ask"
+    return census._Denom(
+        day=DAY,
+        asks=prices if ask else (),
+        ask_sizes=sizes if ask else (),
+        bids=() if ask else prices,
+        bid_sizes=() if ask else sizes,
+        leg1=ask,
+        leg2=not ask,
+    )
+
+
+@pytest.mark.parametrize("q", census.Q_GRID)
+@pytest.mark.parametrize("side", ["ask", "bid"])
+def test_slack_at_q_is_whole_fill_cents_and_boundary_exact(q: int, side: str) -> None:
+    on_boundary: list[tuple[Decimal, ...]] = []
+    short: list[tuple[int, tuple[Decimal, ...]]] = []
+    for pair in _pairs():
+        got = census._slack_at_q(pair, q, side=side)
+        assert got == _expected_slack(pair, q, side=side)
+        if q == 1:
+            per_contract = (
+                census.leg1_slack_cents(pair) if side == "ask" else census.leg2_slack_cents(pair)
+            )
+            assert got == per_contract
+        if got == 0:
+            on_boundary.append(pair)
+        elif got < 0:
+            short.append((got, pair))
+    assert on_boundary, "the grid must hit the exact boundary"
+    closest = max(short)[1]
+    clearing = _prize_count(on_boundary[0], q, side)
+    failing = _prize_count(closest, q, side)
+    assert clearing == 1
+    assert failing == 0
+
+
+def _prize_count(prices: tuple[Decimal, ...], q: int, side: str) -> int:
+    lines = census._prize_lines("PASS", [_denom(prices, side=side)], side=side)
+    line = next(item for item in lines if item.startswith(f"q={q} "))
+    return int(line.split("frames=")[1].split()[0])
+
+
+def test_slack_at_q_pinned_literal_q5_boundary() -> None:
+    assert census._slack_at_q((_c(5), _c(90)), 5, side="ask") == 0
+    assert census._slack_at_q((_c(6), _c(90)), 5, side="ask") < 0
+    assert census._slack_at_q((_c(10), _c(95)), 5, side="bid") == 0
+    assert census._slack_at_q((_c(10), _c(94)), 5, side="bid") < 0
+
+
+def test_zero_pad_does_not_satisfy_the_unit_line() -> None:
+    from types import SimpleNamespace
+
+    def inst(size: float) -> SimpleNamespace:
+        return SimpleNamespace(ask_size=size)
+
+    assert census._recover_unit([inst(0.0), inst(0.0)], 100.0) == (None, False)
+    assert census._recover_unit([inst(0.0), inst(0.05)], 100.0) == (5, False)
+    assert census._recover_unit([inst(0.0), inst(0.0123)], 100.0) == (None, True)
+    assert census._label(5, 40, 10, False) == "INCONCLUSIVE"
+    rows = [
+        {"station": "NYC", "climate_day": "d", "status": "FRAME", "leg1": "clear", "leg2": "no"}
+    ]
+    scrubbed = census.scrub_legs_without_unit(rows, False)
+    assert scrubbed[0]["leg1"] == "" and scrubbed[0]["leg2"] == ""
+    assert scrubbed[0]["status"] == "FRAME"
+    assert census.scrub_legs_without_unit(rows, True) == rows
+    assert rows[0]["leg1"] == "clear"
+
+
+@pytest.mark.parametrize(
+    ("clears", "denominator", "dates", "expected"),
+    [
+        (5, 30, 7, "PASS"),
+        (5, 29, 7, "INCONCLUSIVE"),
+        (5, 30, 6, "INCONCLUSIVE"),
+        (0, 30, 7, "KILL"),
+        (0, 29, 7, "INCONCLUSIVE"),
+        (0, 30, 6, "INCONCLUSIVE"),
+        (1, 29, 6, "INCONCLUSIVE"),
+    ],
+)
+def test_label_floors(clears: int, denominator: int, dates: int, expected: str) -> None:
+    assert census._label(clears, denominator, dates, True) == expected
+
+
+def test_ro_percent_quotes_the_path(tmp_path: Path) -> None:
+    odd = tmp_path / "a?b#c d"
+    odd.mkdir()
+    store = odd / "exec.sqlite"
+    _empty_store(store)
+    own = census.read_own_orders(store)
+    assert own.instrument_ids == ()
+    assert own.never_filled == 0
+
+
+def test_lone_parquet_is_a_prior_look_and_parquet_is_replaced_before_markdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = "b" * 64
+    out = tmp_path / "out"
+    out.mkdir()
+    census._write_parquet(out / "card_a_census.parquet", [], sha)
+    assert census._carries_sha(out, sha) is True
+    with pytest.raises(SystemExit) as exc:
+        census.emit_census(out, f"prereg_sha256: {sha}\n", [], sha)
+    assert exc.value.code == 2
+    assert not (out / "card_a_census.md").exists()
+
+    fresh = tmp_path / "fresh"
+    order: list[str] = []
+    real = census.os.replace
+
+    def spy(src: object, dst: object) -> None:
+        order.append(Path(str(dst)).name)
+        real(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(census.os, "replace", spy)
+    census.emit_census(fresh, f"prereg_sha256: {sha}\n", [], sha)
+    assert order == ["card_a_census.parquet", "card_a_census.md"]
+
+
+def test_render_prints_the_real_slugless_count() -> None:
+    own = census.OwnSet(instrument_ids=(BASE,), first_ns={BASE: 1}, never_filled=3)
+    text = census._render(
+        "c" * 64, own, notes=[], denoms=[], sum_rows=0, impossible=0, leg1="X", leg2="Y"
+    )
+    assert "slug-less never-filled intents: 3" in text
+
+
+def test_low_directory_match_is_anchored(tmp_path: Path) -> None:
+    root = tmp_path / "order_book_depths"
+    root.mkdir()
+    for name in (
+        "tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US",
+        "x-tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US",
+    ):
+        (root / name).mkdir()
+    notes: list[str] = []
+    grouped, _impossible = census._walk_dirs(root, notes)
+    assert grouped == {}
+    assert "skipped low dir: tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US" in notes
+    assert "skipped unparsed dir: x-tc-temp-mdwlow-2026-10-15-gte52lt53f.POLYMARKET_US" in notes
+
+
+def test_off_tick_price_is_refused_not_rounded() -> None:
+    off = Decimal("0.075")
+    with pytest.raises(census.OffTickError):
+        census._slack_at_q((off, _c(90)), 1, side="ask")
+    with pytest.raises(census.OffTickError):
+        census.leg2_slack_cents((off, _c(90)))
+    with pytest.raises(census.OffTickError):
+        census.evaluate_book(((off, Decimal(1), _c(5), Decimal(1)),))
+
+
+def _two_rungs(
+    low_rows: tuple[census.Quote, ...], high_rows: tuple[census.Quote, ...]
+) -> census.FrameSelection:
+    return census.select_frame(climate_day=DAY, quotes={LOW_ID: low_rows, HIGH_ID: high_rows})
+
+
+def test_bid_equal_ask_is_crossed_via_select_frame() -> None:
+    early = _quote("2026-09-21T16:00:00+00:00", "0.20", "0.10")
+    equal = _quote("2026-09-21T18:00:00+00:00", "0.20", "0.20")
+    fine = _quote("2026-09-21T18:00:00+00:00", "0.20", "0.19")
+    crossed = _two_rungs((early, equal), (early, fine))
+    assert (crossed.kind, crossed.reason) == ("MISSING", "crossed rung")
+    assert _two_rungs((early, fine), (early, fine)).kind == "FRAME"
+
+
+def test_age_cap_is_inclusive_at_60s_and_closed_at_60_001s() -> None:
+    early = _quote("2026-09-21T16:00:00+00:00", "0.20", "0.10")
+    at_cap = _quote("2026-09-21T18:01:00+00:00", "0.20", "0.10")
+    past = _quote("2026-09-21T18:01:00.001000+00:00", "0.20", "0.10")
+    assert _two_rungs((early, at_cap), (early, at_cap)).kind == "FRAME"
+    over = _two_rungs((early, past), (early, past))
+    assert (over.kind, over.reason) == ("MISSING", "missing rung")
+
+
+def test_stale_only_rung_is_missing() -> None:
+    early = _quote("2026-09-21T16:00:00+00:00", "0.20", "0.10")
+    now = _quote("2026-09-21T18:00:00+00:00", "0.20", "0.10")
+    stale = _quote("2026-09-21T18:02:00+00:00", "0.20", "0.10")
+    result = _two_rungs((early, now), (stale,))
+    assert (result.kind, result.reason) == ("MISSING", "missing rung")
+
+
+def test_lead_boundary_is_exactly_60_minutes() -> None:
+    now = _quote("2026-09-21T18:00:00+00:00", "0.20", "0.10")
+    on = _quote("2026-09-21T17:00:00+00:00", "0.20", "0.10")
+    late = _quote("2026-09-21T17:00:01+00:00", "0.20", "0.10")
+    assert _two_rungs((on, now), (on, now)).kind == "FRAME"
+    short = _two_rungs((on, now), (late, now))
+    assert short.kind == "MISSING" and "60 minutes" in short.reason
+
+
+def test_size_zero_on_a_present_side_blocks_that_leg() -> None:
+    one, zero = Decimal(1), Decimal(0)
+    ok = census.evaluate_book(
+        ((_c(7), one, _c(6), one), (_c(88), one, _c(87), one)),
+    )
+    ask_zero = census.evaluate_book(
+        ((_c(7), zero, _c(6), one), (_c(88), one, _c(87), one)),
+    )
+    assert ok.leg1_clear is True and ask_zero.leg1_clear is False
+    bids_ok = census.evaluate_book(((_c(99), one, _c(6), one), (_c(99), one, _c(98), one)))
+    bid_zero = census.evaluate_book(((_c(99), one, _c(6), one), (_c(99), one, _c(98), zero)))
+    assert bids_ok.leg2_clear is True and bid_zero.leg2_clear is False
+    assert bid_zero.leg1_clear is False
+
+
+def test_intent_slug_branch_builds_the_own_set(tmp_path: Path) -> None:
+    store = tmp_path / "exec.sqlite"
+    _empty_store(store)
+    _insert(store, [(history_key(INTENT_ID), _intent(slug=BASE))])
+    own = census.read_own_orders(store)
+    assert own.instrument_ids == (BASE,)
+    assert own.first_ns == {BASE: CREATED_NS}
+    assert own.never_filled == 0
