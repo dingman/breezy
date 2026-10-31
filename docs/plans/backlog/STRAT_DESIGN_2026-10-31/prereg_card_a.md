@@ -1,4 +1,4 @@
-# Card A pre-registration r2.3 (2026-10-31)
+# Card A pre-registration r2.4 (2026-10-31)
 
 YES ask-sum lock (leg 1) and the long-only NO basket (leg 2). Authority: design_r2.md 4.0 (118-149), 4.A (244-287), section 5 row 3 (414). Deltas: design_r2_1_deltas.md 26-33 and 62. Binding review: review_card_a_r0.md. This file is the frozen rule for the one look. The flag is not built here. Nautilus Trader is immutable. allow_short stays False (wp7b_market_as_forecaster.py:239).
 
@@ -55,6 +55,7 @@ Depth rows are per instrument (forecast_cheap_screen_wp7.py:895-923). Do not use
 4. Listing at this writing: 2085 instrument directories, 216 names contain "low", 64 distinct YYYY-MM-DD tokens from 2026-08-30 through 2026-11-02. All 40 climate dates from 2026-09-21 through 2026-10-30 occur in at least one directory name. Directory dates are not ts_event (design_r2.md:436).
 5. Id grammar: h4_preliminary_economic_read.py:159-167 and parse_rung 209-253. High example: "tc-temp-nychigh-2026-09-06-gte75lt76f.POLYMARKET_US". _INSTRUMENT_RE requires the literal high (159-162). A low name does not parse. Low directories are skipped and noted (forecast_cheap_screen_wp7.py:1011-1015) and do not refuse a high station-day. Closed (J2).
 6. The census must not call collect (wp7b_market_as_forecaster.py:888), _load_corpus (the call at 893), or decision_instant_ns (forecast_cheap_screen_wp7.py:248-257). It must not apply POOL_CITIES (forecast_cheap_screen_wp7.py:201).
+7. Implementation note (r2.4, not a rule): forecast_cheap_screen_wp7.STATION_TIME_ZONES names only LAX, MDW, MIA and SFO; read_rung_tape refuses NYC. The census maps NYC to the MIA reader key (same IANA zone, America/New_York) only to satisfy that reader; it reads ts_event, ask and bid only and never a local date or hour; the registry offset check still runs against NYC itself. Nothing is added to src/. NYC station-days therefore enter the denominator as prereg E item 1 already requires.
 
 ## F. PASS, KILL, and constants
 
@@ -111,6 +112,7 @@ Same artefact, separate sections, never a gate. These produce no PASS and no KIL
 8. r2.1 (2026-10-31, architect review of r2): D5 gains the _enum_forms name map, the one-token time-in-force rule, ANSI stripping, both order shapes, the duplicate-line rule, and coverage proven by dry-run counts before freeze; H2 gains the enum map, utc_day_for_ns and the key prefixes; H7 defines the dry-run stop so it is never a look; title r2.1. Sections B and F and every constant are byte-identical to r1.1.
 9. r2.2 (2026-10-31, architect review of r2.1): underscore separator normalization; log coverage restated with the symlink fact and a positive control; dry-run printout limited to D5 counts, final denominator and distinct dates, copied into the freeze record. git diff dc5dfda4..HEAD on this file touches only D5, D9, H2, H7, J4 and section L; B (lines 16-28), F (lines 59-68) and every constant are byte-identical to r1.1.
 10. r2.3 (2026-10-31, verification of r2.2: APPROVE-TO-FREEZE-AFTER-DRYRUN): count list gains symlinks followed; logs read as bytes with non-text tolerance; nonzero unresolved needs a new revision, never a flag; K lists the dry-run printout among the freeze fields. B, F and every constant byte-identical to r1.1.
+11. r2.4 (2026-10-31): E gains the NYC reader-key implementation note after the first complete dry-run (D5 166/166 resolved, positive control 25/25, unresolved 0; denominator 149 station-days, 37 distinct dates). No rule, threshold, window, frame or PASS/KILL change; B and F byte-identical to r1.1. This is the freeze text.
 
 ## K. Freeze line
 
