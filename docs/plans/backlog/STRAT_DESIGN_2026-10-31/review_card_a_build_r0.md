@@ -18,3 +18,11 @@ Evidence (python-reviewer, bwrap no-net): `11 passed in 0.28s`; wrong sha → rc
 - N1 Leg inequalities (`:249-262`), fee routing (`:235-246`, no maker branch), frame selector (`:180-222`), one-sided/crossed (`:289-298`), own-order normalization (`:302-309`), constants (`:138-159`), atomic emit + same-sha refusal (`:487`, `:968`): CONFORMANT.
 - N2 G1 BUYER counts omitted: RULED legitimate (H3) — `CatalogSession.read` → `_catalog` mkdirs + converts a scratch catalog (`maker_stage0_catalog_read.py:145-179`); artefact states counts not taken.
 - N3 Builder's F2/F3 remark is correct: legs are decided alone; a 2-rung uncrossed book cannot clear both.
+
+---
+# P1 ruling (architect, 2026-10-31 ~16:05Z) — own-order resolution amendment → prereg r2
+
+Root cause: `arm_slot` stores `slug=None` whenever K=1 (`submit_intent.py:1005,1013`) and production `EXEC_PAR_MAX_CONCURRENT_INTENTS = 1` (`exec_par_constants.py:15`) → NO intent ever carries a slug (r1.1's "older records" premise was wrong). No other store key family maps a never-filled intent to an instrument (`venue_id/*` = client order id only; `resting/*` only bound maker rests since 10-25; `resolver/*` only AMBIGUOUS).
+Options rejected: (b) drop days with unresolved intents = the L-65 date cut and misses D+1 markets; (c) prefix over-exclusion = denominator ≈ 0; (a) by intent id = no log line carries it.
+**RULING = (d):** rebuild `intent_fingerprint` (`exec_intent.py:38-49`: instrument_id, side, quantity, price, TIF, client_order_id) from the node-log `[Risk] SubmitOrder(...)` lines and match the sha256; positive control = the 25 fill-resolved intents must also resolve by logs to the same base slug; any residual unresolved / double-matched / unreadable → exit 2. Thresholds, window, B and F untouched → new sha + new freeze after review.
+Coverage CORRECTION (coordinator measurement 16:10Z; the architect's "first log 10-14" was a listing artefact): `~/.local/share/breezy/logs/breezy-trade-*.log` = 95 files since 2026-09-04, all 40 window dates present, 2411 SubmitOrder lines (09-21..09-23: 4; 10-01..10-05: 32; 10-24..10-30: 2411 total incl.); the journal carries 0 SubmitOrder lines (files only).
