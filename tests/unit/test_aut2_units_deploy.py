@@ -393,7 +393,10 @@ def _sole_peak_artefact(directory: Path) -> Path:
 
 
 def _artefact() -> dict[str, object]:
-    return json.loads(_sole_peak_artefact(EVIDENCE).read_text(encoding="utf-8"))
+    artefact: dict[str, object] = json.loads(
+        _sole_peak_artefact(EVIDENCE).read_text(encoding="utf-8")
+    )
+    return artefact
 
 
 def _peak_bytes() -> int:
