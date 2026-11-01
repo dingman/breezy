@@ -408,6 +408,6 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 
 ### L-75 — A machine-written evidence artefact is produced by its writer, never edited by hand (2026-10-31)
 **Mistake:** A builder sub-agent hand-added `wall_time_s` to the OPS-4 S0 `label_run_peak_<ns>.json` because the plan required the field; the value was true, but the artefact no longer matched the writer's output and named a `git_sha` its bytes did not come from.
-**Prevention:** Before committing any `docs/evidence/*.json` produced by a writer, `sha256sum` it against the writer's output file and confirm the `git_sha` it names is the commit that wrote it; a required new field means change the writer and re-run the measurement with the committed writer, never edit the artefact.
+**Prevention:** Before committing any writer-produced `docs/evidence/*` file (`.json`, `.md`, `.parquet` alike — architect ruling 2026-11-01: a coordinator note goes in a separate sidecar file, never appended to the artefact) produced by a writer, `sha256sum` it against the writer's output file and confirm the `git_sha` it names is the commit that wrote it; a required new field means change the writer and re-run the measurement with the committed writer, never edit the artefact.
 **Applied:** 2026-10-31
-**Last updated:** 2026-10-31
+**Last updated:** 2026-11-01

@@ -1,6 +1,6 @@
 # Card D — G0 folded into the bid pre-registration, amendment r1 (2026-11-01)
 
-Status: PROPOSAL r1 for blind peer review. Not frozen. **Zero looks used** (`prereg_r2_1.md:3`: "Run 2 is not registered").
+Status: r1 PEER-REVIEWED 2026-11-01 (architect + prediction-market-reviewer: APPROVE CLOSE-WITHOUT-RUN; text fixes applied below). Card status: **CLOSED-UNRUN (expected KILL, prize ≈ 0, BLOCKER-H)**. Not frozen. **Zero looks used** (`prereg_r2_1.md:3`: "Run 2 is not registered").
 Revises `card_d_g0_amendment_r0.md` (c30e57f5) against `review_card_d_g0_amendment_r0.md` (verdict REVISE, blockers 1–5).
 Invariants: Nautilus is immutable; `allow_short` stays False; no operator cap is read or set; `iem_cli_fetch.fetch` is never
 called; zero network; no order ids or fingerprints in any artefact; nothing in the holdout is fitted, folded or scored.
@@ -30,8 +30,9 @@ Authorship: planner agent text, landed verbatim by the coordinator (planner has 
 - **Block F (forward data, cl.2): 2026-10-02..2026-10-30, 29 dates.** **The ONE look's verdict is computed on Block F only.**
   The test fits no model, so using forward data here spends no AUT-4 α. Card D outputs never become a feature, threshold or
   selection input to any model scored on dates ≥ 07-01.
-- Both blocks are read in the same invocation, so there is one look. Block H rows are labelled `descriptive_cl3` and are excluded from P0, the median and the floors.
-- Card E's disclosure line has already been added (`card_e_cli_vs_twc.md:513-516`), so that follow-up is closed. See the note in §8.
+- Both blocks are read in the same invocation, so there is one look (L-34), provided Block H is rendered after the frozen verdict and can never feed it. Block H rows are labelled `descriptive_cl3` and are excluded from P0, the median and the floors.
+- **Block F bids were already read by Card A leg 2** (every rung, 09-21..10-30, 18:00Z ± 30 min, `wp7b_census.py:45-49`), so Block F is forward data (cl.2) but not unseen. On revival the verdict block is the fresh post-freeze block of §7, never 10-02..10-30; the §4 denominator follows from that block.
+- Card E's disclosure: the hand-appended lines (df6a92b0) violated L-75 (architect ruling: L-75 covers any writer-produced `docs/evidence/*`, `.md` included); reverted and moved to the sidecar `card_e_cli_vs_twc.disclosure.md`. The Card E writer was not re-run.
 
 ## 3. Corrected data facts
 
@@ -114,11 +115,11 @@ The Card A `--census-only` precedent was one flag in front of a new module of mo
 
 - Expected outcome: KILL (`design_r2.md:235-236`).
 - Prize: **≈ $0 at qty 1.** `design_r2.md:49` gives "D dead band: $0".
-  - At a YES bid of 0.03 the NO costs 0.97. Gross 0.03, minus 0.01 rounded θ = 0.0695 fee, minus Card A's two-tick convention 0.02, leaves ≈ 0.
-  - Even the 0.10 PASS nets about 0.09/contract on a few station-days a month (review :33-37).
+  - At a YES bid of 0.03 the NO costs 0.97. Fee θ·p·(1−p) = 0.0695 × 0.97 × 0.03 = 0.0020, which banker's rounding (`fees.py:218`, `:353`) takes to $0.00 at qty 1; gross 0.03 − 0.02 slippage ≈ +0.01/contract, and that case is a KILL anyway.
+  - At the 0.10 PASS edge the NO costs 0.90, fee 0.0063 (≈ 0.01 after rounding), so the net is < 0.09/contract before slippage, on a few station-days a month (review :33-37). The NO price = 1 − YES bid identity is the Card A assumption (`card_a_census.md:130`) and is unverified under SELL/BUY_SHORT.
   - A PASS places nothing anyway (`design_r2.md:239-242`).
-- Execution caveat: a NO buy goes to the venue as SELL/BUY_SHORT, and `allow_short` is False. So even a PASS would need a later note before any order path exists.
-- Corroboration: Card A's NO-basket leg (Σ YES bid) was KILLED on 149 station-days (`card_a_census.md:119-122`). Card E was KILLED.
+- Execution caveat: a NO buy goes to the venue as SELL/BUY_SHORT and `allow_short` is False; whether the merged NO-side path (S5) covers this bid is NOT verified here. A PASS writes a later note anyway.
+- Consistent with (not corroborating; different estimand, whole-ladder Σ YES bid at 18:00Z): Card A's NO-basket leg was KILLED on 149 station-days (`card_a_census.md:119-122`). Card E was KILLED. The KILL expectation rests on the dead-band bid being near 0 and on the `design_r2.md:49` prize of $0.
 - Value of a run: it would only confirm an expected KILL on a cell already priced at $0. It cannot reach the size question even on a PASS.
   It would also cost an evaluator exception (§6) plus a review loop.
 - **Decision:** CLOSE Card D without running it. The status is `CLOSED-UNRUN (expected KILL, prize ≈ 0, BLOCKER-H)`. No look is consumed.
@@ -126,12 +127,12 @@ The Card A `--census-only` precedent was one flag in front of a new module of mo
   - (a) the operator answers the size question with q materially above 1 for PM.us;
   - (b) BLOCKER-H is lifted by operator exception or by an existing harness path;
   - (c) the venue fee or tick changes so that a NO at ≥ 0.97 nets > 0.
-- On revival, this §4 text is frozen as written. F1 is re-recorded if more than 30 days old. The look runs on a fresh forward block that starts after the freeze.
+- On revival, this §4 text is frozen as written, plus two additions the PM review requires: a frozen bid-SIZE floor (a 1-lot 0.10 bid must not PASS) and a date-clustering note (4 stations share dates, so "≥ 7 dates" is a weak independence floor). F1 is re-recorded if more than 30 days old. The look runs on a fresh forward block that starts after the freeze.
 
 ## 8. Notes for reviewers
 
-- Contradiction: review :38 ("cheap, one flag") versus §6. The architect should rule on which holds.
-- L-75: the Card E disclosure was appended by hand to a writer-produced `.md`. L-75 names `docs/evidence/*.json`, so the architect should decide whether it extends to `.md`.
+- Contradiction: review :38 ("cheap, one flag") versus §6 — RULED 11-01: §6 holds (`design_r2.md:209, :413` already named D a NEW EVALUATOR); review :38 is void.
+- L-75 — RULED 11-01: extends to any writer-produced `docs/evidence/*` including `.md`; Card E lines reverted to a sidecar (see §2).
 - Open follow-up: `DEFAULT_SPLITS` still lacks cl.1's `holdout_end_exclusive` (`nbp_calibration.py:273-278`). This is an architect change under cl.4.
 
 ## 9. Cited but not verified by the author
@@ -140,4 +141,4 @@ The Card A `--census-only` precedent was one flag in front of a new module of mo
 - `prereg_r2_1.md:3`, `wp7b_census.py` being over 800 lines, and `nbp_calibration.py:273-278` were taken from r0, the review and grep context; not opened line by line.
 - The fee arithmetic in §7 follows the review and Card A conventions; not recomputed through `fees.py`.
 
-**Peer review required: architect + prediction-market-reviewer.**
+**Peer review: DONE 2026-11-01 — architect APPROVE CLOSE-WITHOUT-RUN (BLOCKER-H verified at file:line; no RUN route), prediction-market-reviewer APPROVE CLOSE-WITHOUT-RUN (close is consistent with the 10-21 directive: no look spent, no winner foregone).**
