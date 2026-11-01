@@ -19,3 +19,8 @@ D-2 (`s0` + `census` exception) gates S3 and is the first ruling needed. D-4 (si
 
 ## R3-5 (prediction-market r3) no q anywhere in GAP-6
 S6 drops the q grid and reports H1/H2/H3 only. D_gate is FIXED at 1 (the qty-1 proving stance) with the {1, 10, 100} depth grid reported; the r1 "D_gate = max(1, q)" clause (lines 10, 165) is struck. No q is read or proposed anywhere in GAP-6.
+
+## R3-6 (architect r3)
+- R3-1 first sentence is REPLACED by: "S1 (B-8 ruling + D-2 + PREREG) → S2 → S3 come first in the whole backlog, in parallel with GAP-1." S4 starts after S2 AND after S3's fetch has finished (not its verdict); if they must overlap, both run at `min_interval_s=0.5` so the host stays ≤ 4 rps (r1 §7, one-heavy-job rule).
+- R3-3: `ADAPTER_DECISION` depends only on the S3 and S5 verdicts. On S3 KILL the `s0` script itself writes `ADAPTER_DECISION: NO-GO` into `S0_<date>.md`; capture still INCONCLUSIVE after its one re-arm (N-0) → NO-GO; S5 PASS → GO. θ is attached later at S6, never part of the GO line.
+- R3-4: S3 is gated by the S1 B-8 ruling together with D-2; neither alone. D_gate is frozen at S1 = 1 (R3-5; no q is recorded before S1).
