@@ -1,6 +1,6 @@
 # K-2a/K-2b plan r3 — delta over r2 (ROI re-audit 2026-11-01: backlog item KALSHI-ADAPTER)
 
-Applies on top of `K-2a_kalshi_plan_r2.md`; where they differ this delta wins. Status: r3 under review — R3-6/R3-7/R3-8 applied in place; architect + prediction-market confirmation pending.
+Applies on top of `K-2a_kalshi_plan_r2.md`; where they differ this delta wins. Status: r3 APPROVED (architect + prediction-market, 2026-11-01); R3-6/R3-7/R3-8 applied in place.
 
 ## R3-1 Gate replaced: GAP-6 GO, not "programme KILL"
 r2 §0 "K-2b starts only on programme KILL [A1]" and §7 "K-2b (gated: KILL, then N-S START)" are REPLACED by: **K-2b starts when GAP-6 writes `ADAPTER_DECISION: GO`** (`docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r3_delta.md` R3-3: S0 ≠ KILL and census PASS S × H ≥ n_req). The PM.us programme state is irrelevant to the gate: the operator's single objective is portfolio ROI, and the P4 maker has 0 fills since 10-24, so waiting for its day-21 STOP buys nothing. Node N-S (§8) still runs, within 7 days of GO, and may only DEFER with a stated reason. A GAP-6 NO-GO leaves K-2b unstarted and the parked branch parked (§6 unchanged).
