@@ -832,10 +832,10 @@ def _warn_detail(lines: list[str]) -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("gate_env")
-async def test_a_manual_day_order_logs_info_once_and_leaves_only_own_orders_in_the_error(
+async def test_a_manual_day_order_logs_info_once_and_no_error_for_bound_own_orders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T-G1: one INFO for the foreign slug; the ERROR counts only the own order."""
+    """T-G1: one INFO for the foreign slug; a BOUND own rest is not counted, so no ERROR."""
     rig = await _rig(tmp_path, monkeypatch)
     command = await _submit_rest(rig, 0)
     client = rig.client
@@ -853,10 +853,32 @@ async def test_a_manual_day_order_logs_info_once_and_leaves_only_own_orders_in_t
     notes = client.log_lines("info", "EXEC_FOREIGN_MARKET kind=open_order")
     assert len(notes) == 1
     assert "slug='aec-nfl-lar-den-2026-09-27'" in notes[0]
+    assert client.log_lines("error", "startup_open_orders_present") == []
+    assert startup_evidence_permits_arm(evidence) is True
+    await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_env")
+async def test_a_stale_own_order_still_appears_in_the_startup_open_orders_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup signal is preserved: an own order that is no longer BOUND with open
+    exposure (stale) is counted in the ERROR, while the foreign DAY order is not."""
+    rig = await _rig(tmp_path, monkeypatch)
+    command = await _submit_rest(rig, 0)
+    client = rig.client
+    intent_id = client._resting_bookings[_id_n(0)][0]
+    client._ledger.abandon_open_exposure(intent_id)
+    client._private_read._payloads[OPEN_ORDERS_PATH] = {
+        "orders": [_open_row(command, 0), build_manual_day_open_order(AEC, FRGN)]
+    }
+    await client._refresh_startup_position_evidence()
     errors = client.log_lines("error", "startup_open_orders_present")
     assert errors
     assert all("1 open order(s)" in line and "FRGN" not in line for line in errors)
-    assert startup_evidence_permits_arm(evidence) is True
+    evidence: dict[str, Any] = json.loads(client._store_get(_EVIDENCE_KEY))
+    assert startup_evidence_permits_arm(evidence) is False
     await client._disconnect()
 
 

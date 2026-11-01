@@ -74,7 +74,7 @@ BANNED_MODULES: dict[str, tuple[str, int, str]] = {
     ),
     "breezy.exec": (
         "src/breezy/adapters/polymarket_us/exec/client.py",
-        7950,
+        7966,
         "self._order_sender.post_order",
     ),
 }
