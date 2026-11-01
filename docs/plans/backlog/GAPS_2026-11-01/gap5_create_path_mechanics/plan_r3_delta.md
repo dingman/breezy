@@ -14,3 +14,8 @@ GAP-5a's value is diagnostic: it decides whether the live maker's 0 fills are a 
 
 ## R3-4 (security r3: required wording) durable-store hygiene for 5a
 The durable store is opened read-only (SQLite `mode=ro`, or a copy in the session scratch). Raw bodies and raw journal lines stay in the scratchpad; `docs/evidence/gap5/` holds ordinals and counts only, with the r1 S-3 regex scan (ids, `Bearer`, key material, account numbers) passing before commit.
+
+## R3-5 (architect r3: corrections to R3-1)
+- The 5b scope line is REPLACED by: "GAP-5b = steps 4–6 (one fix per CONFIRMED H1–H4/H5a, the step-5 churn fix when its precondition holds, the step-6 pins/gate/merge). X1–X3 dominance, UNEXPLAINED and H5b mean build nothing: stop and report."
+- The 5a source line is REPLACED by: "read-only census over the 10-31 and 11-01 trade-node journal (r1 §4-1/§5 denominator) and the durable store, read from a copy, with S-3 hygiene applied to both."
+- Condition (ii) gains a third way to be met: "or GAP-4 live-small reaches its build stage" (r1 §2).
