@@ -217,8 +217,7 @@ def test_the_unit_context_cgroup_check_fails_closed_under_a_cgroup_namespace() -
 
     # inside a cgroup namespace /proc/self/cgroup shows a path relative to the namespace root
     # ("0::/"), whose leaf is empty: it can never equal breezy-label-outcomes.service
-    assert UnitContext.from_environment({"INVOCATION_ID": "i"}, "0::/\n").is_label_unit() is False
-    assert (
-        UnitContext.from_environment({"INVOCATION_ID": "i"}, "0::/../..\n").is_label_unit() is False
-    )
-    assert UnitContext.from_environment({"INVOCATION_ID": "i"}, "").is_label_unit() is False
+    env = {"INVOCATION_ID": "0123456789abcdef0123456789abcdef"}
+    assert UnitContext.from_environment(env, "0::/\n").is_label_unit() is False
+    assert UnitContext.from_environment(env, "0::/../..\n").is_label_unit() is False
+    assert UnitContext.from_environment(env, "").is_label_unit() is False

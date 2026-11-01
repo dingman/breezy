@@ -37,7 +37,8 @@ from tests.support.aut2_run_fixtures import (
     verdict_wires,
 )
 
-_IN_UNIT = UnitContext(invocation_id="inv-1", cgroup_path=f"/user.slice/{LABEL_UNIT}.service")
+_INV = "0123456789abcdef0123456789abcdef"
+_IN_UNIT = UnitContext(invocation_id=_INV, cgroup_path=f"/user.slice/{LABEL_UNIT}.service")
 
 
 def _summary(lines: tuple[str, ...]) -> str:
@@ -775,12 +776,12 @@ def _meminfo(tmp_path: Path, kib: int) -> Path:
 
 def test_unit_context_reads_env_and_proc_cgroup() -> None:
     ctx = UnitContext.from_environment(
-        {"INVOCATION_ID": "i"}, "0::/user.slice/breezy-label-outcomes.service\n"
+        {"INVOCATION_ID": _INV}, "0::/user.slice/breezy-label-outcomes.service\n"
     )
 
-    assert ctx == UnitContext("i", "/user.slice/breezy-label-outcomes.service")
+    assert ctx == UnitContext(_INV, "/user.slice/breezy-label-outcomes.service")
     assert ctx.is_label_unit() is True
-    assert UnitContext("i", "/user.slice/x-breezy-label-outcomes.service").is_label_unit() is False
+    assert UnitContext(_INV, "/user.slice/x-breezy-label-outcomes.service").is_label_unit() is False
     assert UnitContext("", f"/a/{LABEL_UNIT}.service").is_label_unit() is False
 
 
@@ -865,3 +866,68 @@ def test_the_transient_unit_name_pattern(leaf: str, ok: bool) -> None:
     ctx = UnitContext("inv", f"/user.slice/{leaf}")
 
     assert ctx.is_measure_unit() is ok
+
+
+# -- S3b: the sandboxed deployed unit (cgroup namespace root + wrapper-attested row) ----
+
+_ROOT = "/"
+_FOREIGN = "/user.slice/user-1000.slice/session-1.scope"
+_REAL_LEAF = f"/user.slice/{LABEL_UNIT}.service"
+_BAD_IDS = ["abc", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcde"]
+
+
+def test_is_label_unit_accepts_inside_sandbox_with_row_and_invocation() -> None:
+    assert UnitContext(_INV, _ROOT, LABEL_UNIT).is_label_unit() is True
+
+
+def test_is_label_unit_refuses_row_var_under_visible_foreign_cgroup() -> None:
+    assert UnitContext(_INV, _FOREIGN, LABEL_UNIT).is_label_unit() is False
+
+
+def test_is_label_unit_refuses_row_var_without_invocation_id() -> None:
+    assert UnitContext(None, _ROOT, LABEL_UNIT).is_label_unit() is False
+
+
+@pytest.mark.parametrize("bad", _BAD_IDS)
+@pytest.mark.parametrize("path,row", [(_ROOT, LABEL_UNIT), (_REAL_LEAF, None)])
+def test_is_label_unit_refuses_malformed_invocation_id(
+    bad: str, path: str, row: str | None
+) -> None:
+    assert UnitContext(bad, path, row).is_label_unit() is False
+
+
+def test_is_label_unit_refuses_root_cgroup_with_other_row() -> None:
+    assert UnitContext(_INV, _ROOT, "breezy-score-live-trials").is_label_unit() is False
+
+
+def test_is_label_unit_refuses_root_cgroup_without_row() -> None:
+    assert UnitContext(_INV, _ROOT, None).is_label_unit() is False
+
+
+def test_root_cgroup_accepts_only_with_all_three() -> None:
+    assert UnitContext(_INV, _ROOT, LABEL_UNIT).is_label_unit() is True
+    assert UnitContext(_INV, "", LABEL_UNIT).is_label_unit() is False
+    assert UnitContext(_INV, _ROOT, None).is_label_unit() is False
+    assert UnitContext(None, _ROOT, LABEL_UNIT).is_label_unit() is False
+
+
+def test_real_leaf_still_accepted_outside_sandbox() -> None:
+    assert UnitContext(_INV, _REAL_LEAF).is_label_unit() is True
+
+
+def test_from_environment_reads_row_var_inside_sandbox() -> None:
+    ctx = UnitContext.from_environment(
+        {"INVOCATION_ID": _INV, "BREEZY_AUTONOMY_BWRAP_ROW": LABEL_UNIT}, "0::/\n"
+    )
+    assert ctx == UnitContext(_INV, "/", LABEL_UNIT) and ctx.is_label_unit() is True
+
+
+def test_is_measure_unit_ignores_row_var() -> None:
+    assert UnitContext(_INV, _ROOT, LABEL_UNIT).is_measure_unit() is False
+
+
+def test_local_row_constant_equals_bwrap_ROW_VAR() -> None:
+    from breezy.analysis.labeling import label_run
+    from breezy.runtime.autonomy_sandbox.bwrap import ROW_VAR
+
+    assert label_run._BWRAP_ROW_VAR == ROW_VAR

@@ -1020,3 +1020,28 @@ def test_unexpected_exception_prints_internal_and_exits_78(
     err = capsys.readouterr().err
     assert status == 78 and not spy.calls
     assert "internal" in err and "/secret" not in err and "Traceback" not in err
+
+
+def test_wrapper_exports_row_var_only_after_unit_check(world: SandboxRoots, tmp_path: Path) -> None:
+    """S3b: the label guard trusts ROW_VAR as wrapper-attested, so a refused unit check must
+    neither set it nor reach ``execv`` (which would forward an inherited value)."""
+    env = {"PATH": "/usr/bin:/bin"}
+    status, spy = _run(
+        ["breezy-autonomy-selftest", "/usr/bin/true"],
+        world,
+        tmp_path,
+        leaf="breezy-other.service",
+        environ=env,
+    )
+    assert status == 78 and not spy.calls
+    assert bwrap.ROW_VAR not in env
+
+    inherited = {"PATH": "/usr/bin:/bin", bwrap.ROW_VAR: "breezy-label-outcomes"}
+    status, spy = _run(
+        ["breezy-autonomy-selftest", "/usr/bin/true"],
+        world,
+        tmp_path,
+        leaf="breezy-other.service",
+        environ=inherited,
+    )
+    assert status == 78 and not spy.calls

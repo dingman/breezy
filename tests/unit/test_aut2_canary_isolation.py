@@ -254,7 +254,8 @@ def test_portfolio_roi_never_reads_canary() -> None:
 # -- the CLI ----------------------------------------------------------------------------------
 
 _IN_UNIT = UnitContext(
-    invocation_id="inv-1", cgroup_path="/user.slice/breezy-label-outcomes.service"
+    invocation_id="0123456789abcdef0123456789abcdef",
+    cgroup_path="/user.slice/breezy-label-outcomes.service",
 )
 
 

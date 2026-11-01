@@ -397,12 +397,18 @@ def _evidence_fields(ev: DayEvidence) -> dict[str, object]:
 # -- unit context, paths and the snapshot read -----------------------------------------------------
 
 
+# Local copy of ``breezy.runtime.autonomy_sandbox.bwrap.ROW_VAR`` (analysis must not import
+# runtime); a unit test pins the two equal.
+_BWRAP_ROW_VAR: Final = "BREEZY_AUTONOMY_BWRAP_ROW"
+
+
 @dataclass(frozen=True)
 class UnitContext:
     """Whether this process runs inside ``breezy-label-outcomes.service`` (plan Q1)."""
 
     invocation_id: str | None
     cgroup_path: str
+    bwrap_row: str | None = None
 
     @staticmethod
     def from_environment(env: Mapping[str, str], proc_cgroup_text: str) -> UnitContext:
@@ -410,7 +416,7 @@ class UnitContext:
         for line in proc_cgroup_text.splitlines():
             if line.startswith("0::"):
                 path = line[3:].strip()
-        return UnitContext(env.get("INVOCATION_ID") or None, path)
+        return UnitContext(env.get("INVOCATION_ID") or None, path, env.get(_BWRAP_ROW_VAR) or None)
 
     @staticmethod
     def current() -> UnitContext:
@@ -421,11 +427,20 @@ class UnitContext:
         return UnitContext.from_environment(os.environ, text)
 
     def is_label_unit(self) -> bool:
-        """Fails closed under a cgroup namespace: there ``/proc/self/cgroup`` shows a path relative
-        to the namespace root, whose leaf is empty and can never be the label unit's name."""
-        return bool(self.invocation_id) and (
-            PurePosixPath(self.cgroup_path).name == f"{LABEL_UNIT}.service"
-        )
+        """True in the label unit's own cgroup, or in its bwrap sandbox.
+
+        Inside the sandbox (``--unshare-cgroup-try``) ``/proc/self/cgroup`` shows the namespace
+        root ``/``, whose leaf is empty. There the wrapper-attested row variable stands in: the
+        wrapper sets it only after verifying the real cgroup leaf against the row's units, and the
+        label row lists only the label unit. Any visible non-matching path still refuses.
+
+        Threat model: this stops an accidental stray shell, not a same-uid adversary (who can
+        ``unshare -Ur -C`` and set both variables, or simply start the unit). Not spoof-proof.
+        """
+        well_formed_id = re.fullmatch(r"[0-9a-f]{32}", self.invocation_id or "") is not None
+        leaf_ok = PurePosixPath(self.cgroup_path).name == f"{LABEL_UNIT}.service"
+        sandboxed = self.cgroup_path == "/" and self.bwrap_row == LABEL_UNIT
+        return well_formed_id and (leaf_ok or sandboxed)
 
     def is_measure_unit(self) -> bool:
         """``--measure-peak`` reads its OWN cgroup's ``memory.peak``, which is the measurement only

@@ -105,7 +105,10 @@ from tests.support.te1_fixtures import (
 from tests.support.te1_real_ledger import FQ_RUNG_IDS, REAL_FILLS, REAL_TMAX
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_IN_UNIT = UnitContext(invocation_id="inv-1", cgroup_path=f"/user.slice/{LABEL_UNIT}.service")
+_IN_UNIT = UnitContext(
+    invocation_id="0123456789abcdef0123456789abcdef",
+    cgroup_path=f"/user.slice/{LABEL_UNIT}.service",
+)
 _VENUE = "polymarket_us"
 _FQ_KIND = "forecast_quantile_ladder"
 _GIB = 1024**3
