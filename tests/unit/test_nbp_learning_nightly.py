@@ -355,6 +355,19 @@ def test_holdout_path_is_off_by_default_and_refuses_without_flag() -> None:
         )
 
 
+def test_final_rows_for_report_bounds_the_holdout_at_the_end_date() -> None:
+    inside = _row(dt.date(2026, 10, 1))
+    first_forward = _row(dt.date(2026, 10, 2))
+    before = _row(dt.date(2026, 6, 30))
+
+    kept = nbp_learning_nightly.final_rows_for_report(
+        (before, inside, first_forward), include_holdout=True, holdout_authorized=True
+    )
+
+    assert first_forward not in kept
+    assert inside in kept and before in kept
+
+
 def test_alerts_go_through_the_sender() -> None:
     sink = _FakeAlertSink()
 

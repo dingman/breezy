@@ -261,6 +261,7 @@ class _CoverageCountsJson(TypedDict):
     validate_comparator_events: int
     holdout_version_rows_filtered: int
     holdout_comparator_events_filtered: int
+    forward_rows_filtered: int
     gate_climate_day_min: str | None
     gate_climate_day_max: str | None
 
@@ -1902,11 +1903,20 @@ def run_validate_gates_from_rows(
     # `split` tag alone -- a row mistagged e.g. "validate" but dated on or
     # after the holdout start is dropped and counted here, before it can
     # reach the fit or any gate input.
+    # The fit exclusion stays `>= holdout_start` (forward days remain behind the
+    # interim barrier); only the REPORTED count is split at the holdout end.
     holdout_start = DEFAULT_SPLITS.holdout_start
+    holdout_end = DEFAULT_SPLITS.holdout_end_exclusive
     pre_holdout_rows = [row for row in version_rows if row.climate_day < holdout_start]
-    holdout_version_rows = [row for row in version_rows if row.climate_day >= holdout_start]
+    holdout_version_rows = [
+        row for row in version_rows if holdout_start <= row.climate_day < holdout_end
+    ]
+    forward_version_rows = [row for row in version_rows if row.climate_day >= holdout_end]
     pre_holdout_events = [event for event in comparator_events if event.climate_day < holdout_start]
-    holdout_events = [event for event in comparator_events if event.climate_day >= holdout_start]
+    holdout_events = [
+        event for event in comparator_events if holdout_start <= event.climate_day < holdout_end
+    ]
+    forward_events = [event for event in comparator_events if event.climate_day >= holdout_end]
 
     validate_rows = [row for row in pre_holdout_rows if row.split == "validate"]
     validate_events_source = [event for event in pre_holdout_events if event.split == "validate"]
@@ -1960,6 +1970,7 @@ def run_validate_gates_from_rows(
         "validate_comparator_events": len(validate_events_source),
         "holdout_version_rows_filtered": len(holdout_version_rows),
         "holdout_comparator_events_filtered": len(holdout_events),
+        "forward_rows_filtered": len(forward_version_rows) + len(forward_events),
         "gate_climate_day_min": min(gate_days).isoformat() if gate_days else None,
         "gate_climate_day_max": max(gate_days).isoformat() if gate_days else None,
     }

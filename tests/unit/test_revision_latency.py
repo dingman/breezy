@@ -374,6 +374,7 @@ def test_guard_5_reads_default_splits_and_fails_when_they_move(
             validate=SplitBounds("validate", dt.date(2025, 1, 1), dt.date(2026, 5, 3)),
             v5_fit_slice=SplitBounds("v5_fit_slice", dt.date(2026, 5, 4), dt.date(2026, 9, 17)),
             holdout_start=dt.date(2026, 9, 18),
+            holdout_end_exclusive=dt.date(2026, 10, 2),
         ),
     )
     with pytest.raises(LeakGuardError) as raised:

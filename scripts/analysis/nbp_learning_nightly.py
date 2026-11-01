@@ -34,6 +34,7 @@ from settlement_truth_dataset import (  # type: ignore[import-not-found]
 
 from breezy.analysis.brier_decomposition import bin_by_value, murphy_decomposition
 from breezy.analysis.nbp_calibration import (
+    DEFAULT_SPLITS,
     FIT_STATUS_OK,
     G20_MONTH_MIN_DATES,
     G20_MONTH_N,
@@ -215,7 +216,12 @@ def final_rows_for_report(
             "--include-holdout requires --coordinator-authorized; the holdout is sealed"
         )
     if include_holdout:
-        return tuple(row for row in rows if row.label_status == LABEL_STATUS_FINAL)
+        return tuple(
+            row
+            for row in rows
+            if row.label_status == LABEL_STATUS_FINAL
+            and row.climate_day < DEFAULT_SPLITS.holdout_end_exclusive
+        )
     return final_pre_holdout_rows(rows)
 
 

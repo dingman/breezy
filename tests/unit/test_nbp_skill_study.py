@@ -1076,6 +1076,31 @@ def test_validate_gate_runner_filters_holdout_rows_before_any_gate() -> None:
     assert result["coverage_counts"]["gate_climate_day_max"] < DEFAULT_SPLITS.holdout_start.isoformat()
 
 
+def test_skill_study_counts_forward_rows_separately() -> None:
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _version_row(split="holdout", climate_day=dt.date(2026, 10, 1)),
+            _version_row(split="forward", climate_day=dt.date(2026, 10, 2)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _comparator_event(split="holdout", climate_day=dt.date(2026, 10, 1)),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    counts = result["coverage_counts"]
+    assert counts["holdout_version_rows_filtered"] == 1
+    assert counts["holdout_comparator_events_filtered"] == 1
+    assert counts["forward_rows_filtered"] == 1
+    assert counts["fit_rows"] == 2
+
+
 def test_validate_gate_runner_filters_mistagged_holdout_climate_day_before_fit_and_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

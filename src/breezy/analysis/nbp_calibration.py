@@ -235,14 +235,17 @@ class SplitBounds:
 
 @dataclass(frozen=True, slots=True)
 class Splits:
-    """Four time-ordered splits. ``holdout_start`` is open-ended -- the
-    holdout "grows forward as labels accrue" (plan S3.2 item 6), so it
-    carries no end date."""
+    """Four time-ordered splits plus the sealed holdout window
+    ``[holdout_start, holdout_end_exclusive)``. Days on or after
+    ``holdout_end_exclusive`` are ``"forward"`` days (ruling
+    RULING_holdout_freeze_and_forward_window_2026-10-03 cl.1/cl.4): outside
+    the sealed holdout, but still behind the interim date barriers."""
 
     train: SplitBounds
     validate: SplitBounds
     v5_fit_slice: SplitBounds
     holdout_start: dt.date
+    holdout_end_exclusive: dt.date
 
     def __post_init__(self) -> None:
         ordered = (self.train, self.validate, self.v5_fit_slice)
@@ -257,17 +260,34 @@ class Splits:
                 f"v5_fit_slice ends {self.v5_fit_slice.end} on or after "
                 f"the holdout starts {self.holdout_start}"
             )
+        if self.holdout_end_exclusive <= self.holdout_start:
+            raise SplitOrderError(
+                f"holdout end {self.holdout_end_exclusive} is not after "
+                f"the holdout start {self.holdout_start}"
+            )
 
     def split_for_date(self, day: dt.date) -> str:
+        if isinstance(day, dt.datetime):
+            raise TypeError(f"split_for_date takes a date, not a datetime: {day!r}")
         if self.train.contains(day):
             return "train"
         if self.validate.contains(day):
             return "validate"
         if self.v5_fit_slice.contains(day):
             return "v5_fit_slice"
-        if day >= self.holdout_start:
+        if self.in_holdout(day):
             return "holdout"
+        if self.is_forward(day):
+            return "forward"
         raise SplitOrderError(f"{day} falls in no declared split")
+
+    def in_holdout(self, day: dt.date) -> bool:
+        """``day`` lies inside the sealed ``[holdout_start, holdout_end_exclusive)``."""
+        return self.holdout_start <= day < self.holdout_end_exclusive
+
+    def is_forward(self, day: dt.date) -> bool:
+        """``day`` is on or after ``holdout_end_exclusive`` (a forward day)."""
+        return day >= self.holdout_end_exclusive
 
 
 DEFAULT_SPLITS: Final[Splits] = Splits(
@@ -275,6 +295,7 @@ DEFAULT_SPLITS: Final[Splits] = Splits(
     validate=SplitBounds("validate", dt.date(2025, 1, 1), dt.date(2026, 5, 3)),
     v5_fit_slice=SplitBounds("v5_fit_slice", dt.date(2026, 5, 4), dt.date(2026, 6, 30)),
     holdout_start=dt.date(2026, 7, 1),
+    holdout_end_exclusive=dt.date(2026, 10, 2),
 )
 
 
@@ -473,7 +494,7 @@ class VersionRow:
     """One station-day's NBP percentile bulletin versus CLI truth, tagged to
     the NBM version whose bulletin produced it and to the split it falls in.
     ``split`` is one of ``"train"``, ``"validate"``, ``"v5_fit_slice"``, or
-    ``"holdout"`` (see :meth:`Splits.split_for_date`).
+    ``"holdout"``, or ``"forward"`` (see :meth:`Splits.split_for_date`).
 
     Carries the FULL ``Percentiles`` (not just ``q50``/``sd``) -- review item
     2 requires CRPS to be scored against the actual chosen

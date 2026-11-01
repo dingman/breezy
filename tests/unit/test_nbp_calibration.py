@@ -52,6 +52,7 @@ def test_split_order_violation_raises() -> None:
             validate=calib.SplitBounds("validate", dt.date(2024, 12, 31), dt.date(2026, 5, 3)),
             v5_fit_slice=calib.SplitBounds("v5_fit_slice", dt.date(2026, 5, 4), dt.date(2026, 6, 30)),
             holdout_start=dt.date(2026, 7, 1),
+            holdout_end_exclusive=dt.date(2026, 10, 2),
         )
 
 
@@ -62,6 +63,7 @@ def test_v5_fit_slice_overlapping_the_holdout_start_raises() -> None:
             validate=calib.SplitBounds("validate", dt.date(2025, 1, 1), dt.date(2026, 5, 3)),
             v5_fit_slice=calib.SplitBounds("v5_fit_slice", dt.date(2026, 5, 4), dt.date(2026, 7, 1)),
             holdout_start=dt.date(2026, 7, 1),
+            holdout_end_exclusive=dt.date(2026, 10, 2),
         )
 
 
@@ -76,6 +78,78 @@ def test_default_splits_construct_without_error_and_classify_dates() -> None:
 def test_a_date_before_every_split_raises() -> None:
     with pytest.raises(calib.SplitOrderError):
         calib.DEFAULT_SPLITS.split_for_date(dt.date(2020, 1, 1))
+
+
+def test_default_splits_pin_the_ruling_window() -> None:
+    splits = calib.DEFAULT_SPLITS
+    assert (splits.holdout_start, splits.holdout_end_exclusive) == (
+        dt.date(2026, 7, 1),
+        dt.date(2026, 10, 2),
+    )
+
+
+def test_split_for_date_tags_forward_after_the_freeze() -> None:
+    splits = calib.DEFAULT_SPLITS
+    assert splits.split_for_date(dt.date(2026, 6, 30)) == "v5_fit_slice"
+    assert splits.split_for_date(dt.date(2026, 7, 1)) == "holdout"
+    assert splits.split_for_date(dt.date(2026, 10, 1)) == "holdout"
+    assert splits.split_for_date(dt.date(2026, 10, 2)) == "forward"
+    assert splits.split_for_date(dt.date(2027, 1, 1)) == "forward"
+    assert splits.in_holdout(dt.date(2026, 10, 1)) and not splits.in_holdout(dt.date(2026, 10, 2))
+    assert splits.is_forward(dt.date(2026, 10, 2)) and not splits.is_forward(dt.date(2026, 10, 1))
+    assert not splits.in_holdout(dt.date(2026, 6, 30))
+
+
+def test_split_for_date_rejects_datetime() -> None:
+    with pytest.raises(TypeError):
+        calib.DEFAULT_SPLITS.split_for_date(dt.datetime(2026, 10, 1, 12, 0, tzinfo=dt.UTC))
+
+
+@pytest.mark.parametrize("end", [dt.date(2026, 7, 1), dt.date(2026, 6, 1)])
+def test_splits_reject_end_not_after_start(end: dt.date) -> None:
+    with pytest.raises(calib.SplitOrderError):
+        dataclasses.replace(calib.DEFAULT_SPLITS, holdout_end_exclusive=end)
+
+
+def test_no_fitter_reads_a_frozen_row() -> None:
+    row = _version_row("v5.0", "holdout", dt.date(2026, 8, 1), "LAX", 70.0, 3.0, 70.0)
+    with pytest.raises(calib.PrimaryHoldoutLeakError):
+        calib._assert_no_holdout_rows({"v5.0": [row]})
+
+
+def test_forward_label_passes_the_frozen_row_guard() -> None:
+    row = _version_row("v5.0", "forward", dt.date(2026, 10, 2), "LAX", 70.0, 3.0, 70.0)
+    calib._assert_no_holdout_rows({"v5.0": [row]})
+
+
+def test_interim_date_barrier_still_stops_forward_rows() -> None:
+    def _rows(extra: float) -> list[calib.CorrectionFitRow]:
+        base = [
+            calib.CorrectionFitRow(
+                split="validate",
+                climate_day=dt.date(2025, 1, i + 1),
+                residual_f=(-1.0) ** i,
+                day_length_hours=10.0,
+                scale_f=2.0,
+            )
+            for i in range(10)
+        ]
+        if extra:
+            # tagged validate but dated on the first forward day: label-independent barrier.
+            base.append(
+                calib.CorrectionFitRow(
+                    split="validate",
+                    climate_day=dt.date(2026, 10, 2),
+                    residual_f=extra,
+                    day_length_hours=14.0,
+                    scale_f=2.0,
+                )
+            )
+        return base
+
+    assert calib.select_correction_form(_rows(99.0)).validation_scores == (
+        calib.select_correction_form(_rows(0.0)).validation_scores
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """Leakage assertions for forward evaluation (AUT-4 r11 §3.1, §3.5). Pure; each raises on breach.
 
-The frozen holdout window (ARCH C4.1) is consumed by name from the caller and never restated here.
+The first forward day is consumed by name from ``DEFAULT_SPLITS.holdout_end_exclusive``
+(ARCH C4.1; ruling 2026-10-03 cl.1/cl.4) and never restated here.
 """
 
 from __future__ import annotations
@@ -8,10 +9,11 @@ from __future__ import annotations
 import datetime as dt
 from typing import Final
 
+from breezy.analysis.nbp_calibration import DEFAULT_SPLITS
 from breezy.analysis.stats.scoring_core import LeakageError
 
 #: Forward screening and shadow evaluation use climate days on or after this date (§3.5).
-FIRST_FORWARD_DAY: Final[dt.date] = dt.date(2026, 10, 2)
+FIRST_FORWARD_DAY: Final[dt.date] = DEFAULT_SPLITS.holdout_end_exclusive
 
 
 class LeakageViolation(LeakageError):
