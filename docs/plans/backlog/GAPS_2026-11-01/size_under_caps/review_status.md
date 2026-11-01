@@ -1,0 +1,4 @@
+# SIZE-UNDER-CAPS review status (2026-11-01)
+- plan_r1.md — architect: APPROVE; prediction-market-reviewer: APPROVE. Peer review CLOSED at r1 (r0 reviews at session scratch; all 5 HIGH + 6 MEDIUM resolved).
+- Gate before any code: S0 two-option §6.2.1 ruling (architect + prediction-market co-sign) landing as an L-12 delta to TRADING_SYSTEM_ARCHITECTURE.md; S0 also rules whether `B_eff` is gross or net of cost basis and names §6.4.1 for the limit-price approximation.
+- LOW build notes: (1) AUD-04 follow-up delta moves `read_roi_for_decision` into its own module so the import-linter contract (sizing/serializer may not import `portfolio_roi_report` or `accounting`) is enforceable; (2) serializer moves out of `persistence/` (it writes nothing) or the plan says why it stays; (3) depth/cap monotonicity property test holds the fee callable and θ fixed; (4) sizing is $0 until a family passes — operator still owns q.
