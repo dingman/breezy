@@ -18,3 +18,8 @@ Applies on top of `plan_r1.md`; where they differ the delta wins. Status: r2 —
 The S1 B-8 successor ruling also answers K-2a open question P4 (`:211`): new-station price history < 07-01 becomes SEARCH-spent by S0, consistent with the comparator corpus at K-2a `:116`.
 
 ## R2-5 (PM LOW) the δ=0.02 / σ=0.14 label is restated as "lenient bound (σ at 0.97 would be 0.17; gross edge ≤ 3¢)"; no numeric change.
+
+## R2-6 (architect r2 confirmation, two LOW wording fixes; PM r2: APPROVE)
+- R2-2 bootstrap: "reuses the existing cluster-bootstrap helper already used by the scan family" is REPLACED by "reuses `breezy.analysis.stats.scoring_core.bootstrap_cluster_draws` (`:216`), with 2000 resamples and a frozen seed passed in; if that helper does not fit, the plan says so and no new bootstrap is written." The identity test also covers this helper (PM build note).
+- R2-2 identity test: the `is` check targets `k1_cheap_open_settlement`, the module that owns `break_even_probability`, `wilson_interval`, `summarize_stratum`; S0 imports them from there, as `k1_kalshi_prior.py:134-148` does. `summarize_stratum` is called with θ=0 explicitly (PM build note).
+- R2-3: 0.25→0.5 s is the 429/5xx ladder; the transport ladder is 1→2 s (`:906, :935-936`).
