@@ -37,25 +37,32 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ---
 
-## BACKLOG — the six gaps to the single objective (operator 2026-11-01: "the bot executes winning trades"; replaced the audit-path table 11-01)
+## BACKLOG — portfolio-level ROI, nothing else (operator 2026-11-01; re-audited by trading-bot-architect + prediction-market-reviewer, merged; replaced the six-gap table 11-01 ~23:50Z)
 
-Objective: realised win rate > price + fee, proven (operator preference ≥ 70% where price allows; size q operator-owned). Plans + `review_status.md` per gap under `docs/plans/backlog/GAPS_2026-11-01/`; every plan carries two APPROVE verdicts (architect + domain reviewer); where a `plan_r2_delta.md` exists it wins over `plan_r1.md`. Order = dependency order. **Binding on every item:** Nautilus immutable; `allow_short=False`; never weaken a safety/settlement/contract/pin/NO-SEND test; never set an operator cap; existing harness only except the exceptions named below; PREREG frozen before any run, ONE look (L-34).
+Every item states its ROI mechanism: it earns dollars, or it is a named precondition for an item that does. Plans: `docs/plans/backlog/` (paths below); where a later `plan_rN_delta.md` exists it WINS over earlier revisions; each dir carries a `review_status.md` with two APPROVE verdicts. **Binding on every item:** Nautilus immutable; `allow_short=False`; never weaken a safety/settlement/contract/pin/NO-SEND test; never set, raise or propose a cap or q (Kelly BANNED, TSA §6.1); existing harness only except the exceptions named; PREREG frozen before any run, ONE look (L-34); FQ-R14 (SEARCH is never confirmatory).
 
-| # | Gap | Improves | Plan (reviewed) | Status |
+| # | Item | ROI mechanism | Plan (reviewed) | Status / gate |
 |---|---|---|---|---|
-| 1 | GAP-1 SOURCE-RESOLUTION | Does any source (LAMP/PFM/GFS-MOS blends via F13 J2+J3) out-resolve NBP on < 07-01 OOF rows; KILL stops the forecast programme | `gap1_source_resolution/plan_r1.md` + `plan_r2_delta.md` (architect+PM APPROVE r2) | READY — needs S0 PREREG_GAP1 + operator D1 (one read-only reader `gap1_oof_murphy.py`) |
-| 2 | GAP-2 FORWARD-P-EMITTER | Per-rung forward p_yes CSV for [10-02, T), look-ahead strict, GAP-3 contract | `gap2_forward_p_emitter/plan_r1.md` + `plan_r2_delta.md` (architect+python APPROVE r2) | BLOCKED-ON-OPERATOR — §8 exception to the 10-21 ruling (§3 items 1–6 only); after GAP-1 PASS |
-| 3 | GAP-3 CONFIDENCE-BINNED-BACKTEST | `market_calibration_scan.py --forecast-p` edge bins; default byte-pinned; explore gate `p_one_sided × K_cum ≤ 0.05` AND LB > m | `gap3_confidence_binned_backtest/plan_r1.md` (architect+python APPROVE r1) | READY-AFTER-2 (pin commit first) |
-| 4 | GAP-4 REGISTERED-FAMILY | PREREG v2 centred score, LD-OBF α=0.025 looks/10 fills, `LadderEvConfig` override, one forward look → ready-to-arm qty 1 | `gap4_registered_family/plan_r1.md` (PM+architect APPROVE r1) | READY-AFTER-3 (+5 for mechanics) |
-| 5 | GAP-5 CREATE-PATH-MECHANICS | Evidence-first census of H1–H5 (AMBIGUOUS latch on resting creates, 46% denied 11-01); X1–X3 exits; H5a client backoff only, latch out of scope | `gap5_create_path_mechanics/plan_r1.md` + `plan_r2_delta.md` (security+architect APPROVE r2) | READY — parallel; step 0 citation closure, then census |
-| 6 | GAP-6 SAMPLE-AND-SIZE | Kalshi S0 tail-band history gate (fee-free excess) → 14-day depth census → n_req 385 vs S×H; θ verification; size math illustrative only | `gap6_sample_and_size/plan_r1.md` + `plan_r2_delta.md` (PM+architect APPROVE r2) | READY — parallel; needs S1 B-8 ruling + operator D-2 (`s0`+`census` exception), D-3 (θ source) |
+| 1 | GAP-6 S1→S3 KALSHI S0 kill screen | Only remaining step that can find a positive edge without a forecast (tail-band NO on settled history) | `GAPS_2026-11-01/gap6_sample_and_size/` r1+r2+r3 deltas | READY — needs S1 B-8 ruling + operator D-2; parallel with #2 |
+| 2 | GAP-1 forecast kill screen | One pre-registered OOF Murphy run; KILL frees weeks of forecast work | `GAPS_2026-11-01/gap1_source_resolution/` r1+r2 delta | READY — needs PREREG_GAP1 + operator D1; parallel with #1 |
+| 3 | GAP-5a create-path census | Diagnostic: is the maker's 0 fills a mechanics defect or regime fact (≈ 1 h, read-only) | `GAPS_2026-11-01/gap5_create_path_mechanics/` r1+r2+r3 deltas | READY now; 5b conditional (R3-1/R3-5) |
+| 4 | ROI-LEDGER | Denominator for sizing, retire and scorecard; fail-closed `read_roi_for_decision` + additive schema 6 | `AUDIT_2026-09-21/AUD-04-ROI-LEDGER-delta-2026-11-01_r2.md` (r2.1) | READY now; no dependency |
+| 5 | SIZE-UNDER-CAPS (+ compound within caps) | Turns a proven edge into dollars: cap-and-depth size proposal, zero at ≤ break-even, bankroll-following under both caps; operator still owns q | `GAPS_2026-11-01/size_under_caps/plan_r0.md` | r0 UNDER REVIEW; build after #4 |
+| 6 | GAP-6 S4/S5 depth capture + census → `ADAPTER_DECISION` | Supply measurement that gates the only scale lever | same dir as #1 | after #1 ≠ KILL (capture starts after build) |
+| 7 | AUTO-PROMOTE-RETIRE (replaces GAP-4 S3–S7) | Stops losers bleeding; removes the human bottleneck on winners; PROMOTE-ELIGIBLE never arms | `GAPS_2026-11-01/auto_promote_retire/plan_r0.md` (delta over AUT-5 r7 + GAP-4 r1) | r0 UNDER REVIEW; build after #4 |
+| 8 | KALSHI-ADAPTER (K-2b) | Only station-day multiplier; upper bound only, EV unproven | `K-2a_2026-10-08/K-2a_kalshi_plan_r3_delta.md` | after #6 GO; WB-3→WB-6→WB-4 ‖ WB-1→WB-5→WB-7; KC-n arms only after power REGISTERED + both-ledger α test |
+| 9 | STRATEGY-SEARCH (standing intake) | Edge-discovery throughput; PASS → SHADOW in #7's registry | `STRATEGY_ITERATION_2026-11-01/plan_r2_delta.md` | r2 UNDER REVIEW; after #4, #7 |
+| 10 | GAP-2 → GAP-3 → GAP-4 PREREG (forecast path) | Preconditions for a forecast family; only if #2 PASS | `gap2_forward_p_emitter/` r1+r2, `gap3_confidence_binned_backtest/` r1, `gap4_registered_family/` r1 | CONDITIONAL on #2 PASS; GAP-2 needs the §8 exception then |
+| — | GAP-5b fixes | Realised only through a family that would otherwise be denied fills | `gap5_create_path_mechanics/` R3-1/R3-5 | CONDITIONAL (confirmed signature AND a live family) |
 
-**Operator decisions open:** (a) GAP-2 §8 exception; (b) GAP-1 D1; (c) GAP-6 D-2/D-3; (d) size q (never proposed by the bot); (e) P4 maker: let it STOP at day 21 (≈ 11-14) or disarm now; (f) literal 70% floor vs break-even = price + fee.
+**Operator decisions that gate ROI:** (a) size q (every dollar; stays yours — #5 only proposes); (b) GAP-1 D1 and GAP-6 D-2 read-only exceptions (unblock #1/#2; rule first). **Defaulted unless you object:** GAP-2 exception waits for a #2 PASS; θ source = published fee schedule verified at GAP-6 S6; 70% floor = break-even price + fee; P4 maker disarm now (0 fills since 10-24) — disarm is enablement-adjacent so it stays yours to say.
+**If #1 and #2 both KILL:** honest end state = "no edge on either venue"; the backlog stops there and reports.
 
 ### Live state (no build owed; OPERATOR PAUSE 11-01 19:55Z — wakes read-only until directed)
-- P4 `pm_us_no_maker_sharp_v1` ARMED since 10-24, 0 fills; 11-01: 80 posts, 46 denied (AMBIGUOUS latch), 34/34 creates 200/empty-executions → GAP-5. EXEC-FOREIGN-POS A+B LIVE (10-30). HOLDOUT-END DONE d1f7e120 (pushed 19:21Z 11-01). STRAT-DESIGN: Cards A/E KILL, D CLOSED-UNRUN; PM.us prize ≈ $0 at qty 1.
-- OPS-4: S1 PUSHED, S3 enabled 05:08Z 11-01, first fire FAILED `not_under_unit` → S3b 40dec67b PUSHED 16:48Z; next fire 05:00Z 11-02 checked at wake `c8f0b6e2` 05:13Z (record MemoryPeak; acceptance `n_labels_gated=0` at the 17:40Z ROI run). Routing: Grok 402, Codex `model_not_found` → Claude sub-agents.
-- **Next action:** operator rules (a)–(f); then GAP-1 S0/S1 and GAP-5 step 0 in parallel. Wakes: `c8f0b6e2` 05:13Z 11-02, daily `db1e44f2`/`fc4d504c` 13:07Z, `c45d8c0a`/`bb2925bd` 17:08Z (session-only).
+- P4 `pm_us_no_maker_sharp_v1` ARMED since 10-24, 0 fills; 11-01: 80 posts, 46 denied (AMBIGUOUS latch) → #3. EXEC-FOREIGN-POS A+B LIVE. HOLDOUT-END DONE d1f7e120. STRAT-DESIGN: Cards A/E KILL, D CLOSED-UNRUN.
+- OPS-4: S3b 40dec67b PUSHED; next label fire 05:00Z 11-02 checked at wake `c8f0b6e2` 05:13Z (MemoryPeak; acceptance `n_labels_gated=0` at the 17:40Z ROI run).
+- **Routing (operator 11-01): Codex FIRST** — bridge FIXED 23:10Z (codex-cli 0.166.0, model `gpt-6.1-sol`, stale brokers killed; memory `codex-model-not-found-2026-10-27`); Grok 402; Claude sub-agents = reviewers + fallback.
+- **Next action:** operator rules (a)–(b); then #1 S1/S2, #2 S0/S1, #3, #4 in parallel (Codex builds, Claude reviews + gate). Wakes: `c8f0b6e2` 05:13Z 11-02, daily 13:07Z `db1e44f2`/`fc4d504c`, 17:08Z `c45d8c0a`/`bb2925bd` (session-only).
 
 ### Calendar obligations
 | When | What |
