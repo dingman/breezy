@@ -509,8 +509,3 @@ Pooled one-sided upper bound: 0.000914414.
 - iem_fetches: 24
 - kalshi_errors: 0
 - iem_errors: 0
-
-Holdout disclosure (added 2026-10-31 19:55Z per `RULING_holdout_freeze_and_forward_window_2026-10-03.md` cl.3): this
-study read NWS CLI and Kalshi settlement values for 2026-07-05..10-01 inside the frozen holdout [07-01, 10-02) as
-DESCRIPTIVE evidence only (settlement-source agreement); no fitter, screener or scorer consumed them, and this result
-is never a confirmatory input to any model scored on that window. Dates ≥ 10-02 are forward data (cl.2).
