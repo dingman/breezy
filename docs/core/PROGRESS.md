@@ -37,7 +37,7 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ---
 
-## BACKLOG — portfolio-level ROI, nothing else (operator 2026-11-01; re-audited by trading-bot-architect + prediction-market-reviewer, merged; replaced the six-gap table 11-01 ~23:50Z)
+## BACKLOG — portfolio-level ROI, nothing else (operator 2026-11-01; re-audited by trading-bot-architect + prediction-market-reviewer, merged; replaced the six-gap table 11-01; ALL 10 items peer-reviewed 2× APPROVE by 11-02 ~01:30Z)
 
 Every item states its ROI mechanism: it earns dollars, or it is a named precondition for an item that does. Plans: `docs/plans/backlog/` (paths below); where a later `plan_rN_delta.md` exists it WINS over earlier revisions; each dir carries a `review_status.md` with two APPROVE verdicts. **Binding on every item:** Nautilus immutable; `allow_short=False`; never weaken a safety/settlement/contract/pin/NO-SEND test; never set, raise or propose a cap or q (Kelly BANNED, TSA §6.1); existing harness only except the exceptions named; PREREG frozen before any run, ONE look (L-34); FQ-R14 (SEARCH is never confirmatory).
 
@@ -47,11 +47,11 @@ Every item states its ROI mechanism: it earns dollars, or it is a named precondi
 | 2 | GAP-1 forecast kill screen | One pre-registered OOF Murphy run; KILL frees weeks of forecast work | `GAPS_2026-11-01/gap1_source_resolution/` r1+r2 delta | READY — needs PREREG_GAP1 + operator D1; parallel with #1 |
 | 3 | GAP-5a create-path census | Diagnostic: is the maker's 0 fills a mechanics defect or regime fact (≈ 1 h, read-only) | `GAPS_2026-11-01/gap5_create_path_mechanics/` r1+r2+r3 deltas | READY now; 5b conditional (R3-1/R3-5) |
 | 4 | ROI-LEDGER | Denominator for sizing, retire and scorecard; fail-closed `read_roi_for_decision` + additive schema 6 | `AUDIT_2026-09-21/AUD-04-ROI-LEDGER-delta-2026-11-01_r2.md` (r2.1) | READY now; no dependency |
-| 5 | SIZE-UNDER-CAPS (+ compound within caps) | Turns a proven edge into dollars: cap-and-depth size proposal, zero at ≤ break-even, bankroll-following under both caps; operator still owns q | `GAPS_2026-11-01/size_under_caps/plan_r0.md` | r0 UNDER REVIEW; build after #4 |
+| 5 | SIZE-UNDER-CAPS (+ compound within caps) | Turns a proven edge into dollars: cap-and-depth size proposal, zero at ≤ break-even, bankroll-following under both caps; operator still owns q | `GAPS_2026-11-01/size_under_caps/plan_r1.md` | READY — S0 §6.2.1 ruling first; build after #4 |
 | 6 | GAP-6 S4/S5 depth capture + census → `ADAPTER_DECISION` | Supply measurement that gates the only scale lever | same dir as #1 | after #1 ≠ KILL (capture starts after build) |
-| 7 | AUTO-PROMOTE-RETIRE (replaces GAP-4 S3–S7) | Stops losers bleeding; removes the human bottleneck on winners; PROMOTE-ELIGIBLE never arms | `GAPS_2026-11-01/auto_promote_retire/plan_r0.md` (delta over AUT-5 r7 + GAP-4 r1) | r0 UNDER REVIEW; build after #4 |
+| 7 | AUTO-PROMOTE-RETIRE (replaces GAP-4 S3–S7) | Stops losers bleeding; removes the human bottleneck on winners; PROMOTE-ELIGIBLE never arms | `GAPS_2026-11-01/auto_promote_retire/plan_r1.md` + `plan_r2_delta.md` (over AUT-5 r7 + GAP-4 r1) | READY — S0 with-guards power PASS/KILL first; build after #4 |
 | 8 | KALSHI-ADAPTER (K-2b) | Only station-day multiplier; upper bound only, EV unproven | `K-2a_2026-10-08/K-2a_kalshi_plan_r3_delta.md` | after #6 GO; WB-3→WB-6→WB-4 ‖ WB-1→WB-5→WB-7; KC-n arms only after power REGISTERED + both-ledger α test |
-| 9 | STRATEGY-SEARCH (standing intake) | Edge-discovery throughput; PASS → SHADOW in #7's registry | `STRATEGY_ITERATION_2026-11-01/plan_r2_delta.md` | r2 UNDER REVIEW; after #4, #7 |
+| 9 | STRATEGY-SEARCH (standing intake) | Edge-discovery throughput; PASS → SHADOW in #7's registry | `STRATEGY_ITERATION_2026-11-01/plan_r3_delta.md` | READY — after #4, #7; X-SEARCH-INTAKE grant merge starts the 28-day clock |
 | 10 | GAP-2 → GAP-3 → GAP-4 PREREG (forecast path) | Preconditions for a forecast family; only if #2 PASS | `gap2_forward_p_emitter/` r1+r2, `gap3_confidence_binned_backtest/` r1, `gap4_registered_family/` r1 | CONDITIONAL on #2 PASS; GAP-2 needs the §8 exception then |
 | — | GAP-5b fixes | Realised only through a family that would otherwise be denied fills | `gap5_create_path_mechanics/` R3-1/R3-5 | CONDITIONAL (confirmed signature AND a live family) |
 

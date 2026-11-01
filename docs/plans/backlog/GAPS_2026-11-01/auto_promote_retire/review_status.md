@@ -1,0 +1,4 @@
+# AUTO-PROMOTE-RETIRE review status (2026-11-01)
+- plan_r1.md + plan_r2_delta.md (delta wins). Verdicts: prediction-market-reviewer APPROVE r1 (LOWs folded r2) and APPROVE r2; trading-bot-architect REVISE r1 (3 MEDIUM) → APPROVE r2. Peer review CLOSED at r2 (r0 was BLOCK on n-basis/residuals and the Wilson stop; both removed/resolved).
+- Supersedes GAP-4 r1 steps S3–S7 (GAP-4 S0–S2 PREREG/boundary artefact remain the per-family input).
+- S0 PREREG pins (non-blocking nits, binding at freeze): (1) freeze the hunt-window-overlap reporting format (no after-the-fact argument); (2) a `TERMINAL_NO_INFORMATION` look consumes the look; voided/cancelled fills dropped from P_k do not count toward the every-10-fills boundary; (3) security-reviewer sign-off on the permit `None` pass is a named S4 gate.
