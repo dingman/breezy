@@ -14,3 +14,8 @@ Applies on top of `plan_r1.md`; where they differ the delta wins. Status: r2 —
 ## R2-4 (A-LOW-4 + security LOW-1) Step 0 (new, read-only, before step 4): close the five open citations — `client.py:8099` bind-raised exit; `submit_chain.py:85-92` WAIT semantics; the venue-state → `OrderStatus` mapping in `parse_order_status_report`; the supervisor watchdog/heartbeat interval vs the ≤ 15 s deadline ceiling; X1 `:685` superset vs set-equality. Output: a 5-line note in the census `.md`.
 
 ## R2-5 (security LOW-2/3) `UNCONFIRMED_GUARD_S` = census p95 of create→OrderAccepted, capped at 60 s; the chosen value and its citation go in the pin commit message. The "34/34 vs 23+18" denominator is reconciled by the census before any threshold is applied.
+
+## R2-6 (architect r2 confirmation) r1 text struck so an implementer cannot follow it
+- r1 §3 line 47: the phrase "or slot-serving order" is DELETED; slot-serving order is out of scope.
+- r1 §4-H5 line 81 is REPLACED by: "H5a only: change the backoff in `_resolve_ambiguous_intents` (`client.py:3290-3298`) with plain comparisons; H5b → stop and report."
+- r1 §6 line 109: `test_resolver_serves_resting_context_first` is REPLACED by `test_resolver_backoff_fix_does_not_delay_ioc_resolution` plus a zero-delta assertion on `EXEC_RESOLVER_PERMITTED_CALLEES`.
