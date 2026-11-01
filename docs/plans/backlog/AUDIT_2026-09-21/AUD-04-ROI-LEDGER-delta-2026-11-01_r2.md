@@ -1,4 +1,4 @@
-# AUD-04 ROI-LEDGER delta r2.1 (2026-11-01) — supersedes r1; python APPROVE r2.1; prediction-market confirmation pending (r2.1 items applied in place)
+# AUD-04 ROI-LEDGER delta r2.1 (2026-11-01) — supersedes r1; APPROVED r2.1 by python-reviewer + prediction-market-reviewer (2026-11-01); peer review CLOSED
 
 Code facts verified by the python reviewer: `PORTFOLIO_ROI_SCHEMA_VERSION = 5` (`portfolio_roi_report.py:2129`); v5 writer emits `fill_pnl`, `family_pnl`, `disclosures` (:2873-2875); `capital_deployed_total` is a scalar (:2710); reader `read_portfolio_roi_report` (:3068) returns `PortfolioRoiReportView.family_pnl` = `tuple[accounting.FamilyPnlRow, ...]` with `.net .fee .cost .n_booked .n_wins`; pure derivation `accounting.family_pnl(rows)` (`accounting.py:703`); fee = venue-reported `fill.cumulative_fee` (:691) with `fee_unverified = not fill.fee_reconciled` (:693); `Disclosures.n_labels_gated` (:368, set :766). The report never computes θ.
 
