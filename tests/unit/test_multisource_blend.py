@@ -33,7 +33,12 @@ _NBP_MODULE = REPO_ROOT / "src" / "breezy" / "analysis" / "nbp_calibration.py"
 #: imports from breezy.strategy.ladder_ev.{location_correction,quantile_density} to the moved
 #: breezy.domain.* modules. Imports-only; behaviour unchanged (identity test below). Previous value:
 #: e126e1b49217467cbef0c4c767a48e8ae8a317e4f7abd2ca733ed4cbed7033a0
-_NBP_MODULE_SHA256 = "5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6"
+#: Reviewed row (HOLDOUT-END plan r2 s2.7a, 2026-11-01; RULING_holdout_freeze_and_forward_window_
+#: 2026-10-03 cl.1/cl.4): Splits gains holdout_end_exclusive (2026-10-02); split_for_date tags
+#: "forward"; in_holdout/is_forward added; the label guard still refuses "holdout" only. A
+#: widening: no date barrier relaxed (label guard widened per cl.2). Previous value:
+#: 5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6
+_NBP_MODULE_SHA256 = "eb5322a9530d1f6c574b7f290c51b7134bfeefe814f4ad75e741ec14b11fd89e"
 
 
 # ------------------------------------------------------------------ helpers
@@ -959,3 +964,16 @@ def test_phase_a_refuses_to_score_until_c1_has_14_days_of_measured_lags() -> Non
 def test_feature_row_json_round_trips() -> None:
     row = make_rows(days=1, stations=("NYC",), horizons=("D0",))[0]
     assert msb.feature_row_from_json(msb.feature_row_to_json(row)) == row
+
+
+@pytest.mark.parametrize("first_forward", [dt.date(2026, 10, 2), dt.date(2026, 10, 3)])
+def test_date_barrier_stops_forward_rows_at_each_label_only_site(first_forward: dt.date) -> None:
+    """A forward-dated row is refused by the DATE barrier (``>= holdout_start``), independent of
+    the label ``split_for_date`` now assigns it ("forward", not "holdout")."""
+    ok = make_rows(days=40, start=dt.date(2026, 5, 1), stations=("NYC",), horizons=("D-1",))
+    bad = [*ok, *make_rows(days=1, start=first_forward, stations=("NYC",), horizons=("D-1",))]
+    assert calib.DEFAULT_SPLITS.split_for_date(first_forward) == "forward"
+    with pytest.raises(msb.HoldoutLeakError):
+        msb.build_folds(msb.days_by_version(bad), source_breaks=())
+    with pytest.raises(msb.HoldoutLeakError):
+        msb.fit_blend(bad, level=0, settings=_settings())

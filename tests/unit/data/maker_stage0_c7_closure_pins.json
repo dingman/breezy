@@ -103,7 +103,7 @@
   "src/breezy/analysis/labeling/instrument_facts.py": "2fffa04b4871d9de3d53f8d06316e0bf4b858f184a5d9e275d05a20368c821cc",
   "src/breezy/analysis/maker_search_declarations.py": "7e844d9a6f69c2ea803ba4fc10c34f1ef03e6ddf08a341e4553235d4096b0888",
   "src/breezy/analysis/maker_tape_census.py": "472f8d2387fe6319ce8ffef018f98c82690cf9cc0effe6365351c83709162b89",
-  "src/breezy/analysis/nbp_calibration.py": "5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6",
+  "src/breezy/analysis/nbp_calibration.py": "eb5322a9530d1f6c574b7f290c51b7134bfeefe814f4ad75e741ec14b11fd89e",
   "src/breezy/analysis/stats/__init__.py": "9485c70302529d09b2d9df34d1abb2786e4f915ba5209f435f9e43db2da1ff08",
   "src/breezy/analysis/stats/scoring_core.py": "d126218c2d6c803bd8396bdb044e0087e6826a5d9b57ab7d934bab18e9064988",
   "src/breezy/analysis/trade_quantity_unit.py": "12f2d5a57c5a9338d1fbd2344836996c5acf7c170cc9d26fb0cca712bb88d419",
