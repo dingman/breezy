@@ -7126,6 +7126,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         wanted = frozenset(slugs)
         return tuple(r for r in records if r.market_slug in wanted)
 
+    def _counted_open_orders(
+        self,
+        records: tuple[OpenOrderRecord, ...],
+        foreign: frozenset[tuple[str, str]],
+    ) -> list[OpenOrderRecord]:
+        """The open orders the ``startup_open_orders_present`` line counts: neither a
+        foreign-market order nor one of this client's own BOUND resting orders
+        (``_own_resting_pairs``, fail-closed to none, so an unprovable order still counts)."""
+        own = self._own_resting_pairs()
+        return [
+            r
+            for r in records
+            if (r.venue_order_id, r.market_slug) not in foreign
+            and (r.venue_order_id, r.market_slug) not in own
+        ]
+
     def _note_open_orders_outcome(
         self,
         *,
@@ -7179,7 +7195,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"startup evidence: {len(drifted)} open order row(s) carry undeclared "
                 f"key(s); first row: {', '.join(drifted[0].unknown_keys)}"
             )
-        counted = [r for r in records if (r.venue_order_id, r.market_slug) not in foreign]
+        counted = self._counted_open_orders(records, foreign)
         if counted:
             ids = ", ".join(_redact_order_id(r.venue_order_id) for r in counted)
             self._log.error(
@@ -8477,6 +8493,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             except TimeoutError:
                 self._log.warning("resting confirm: the GET timed out; holding")
                 return submit_chain.RESTING_CONFIRM_HOLD
+            except PrivateReadRefused as exc:
+                self._log.warning(
+                    f"resting confirm: GET refused (HTTP status {exc.status}); retrying"
+                )
             except Exception as exc:  # noqa: BLE001 - an unreadable GET is retried to the deadline
                 self._log.warning(
                     f"resting confirm: GET did not map ({exc.__class__.__name__}); retrying"

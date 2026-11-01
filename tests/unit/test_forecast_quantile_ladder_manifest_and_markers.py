@@ -45,7 +45,8 @@ _EXEC_CLIENT_PATH = (
 # positive control of test_aut1_wp0_closure_premises::test_submit_chain_is_not_byte_pinned_in_tests.
 # re-pinned 2026-10-28: LATCH-RECOVERY (terminal read clears resting_query_unreadable via _clear_resting_cancel_latch) + poll refusal WARN carries the mapper message (key names + own-order fields); prior f44830077501040a76a1823345e24aca2eefcc3f090d718c6d7db03ff03af17d; python-reviewer + prediction-market-reviewer APPROVE, silent-failure-hunter SAFE-WITH-FIXES applied.  # noqa: E501
 # re-pinned 2026-10-29: EXEC-FOREIGN-POS Stage A+B (Stage A: positions classified in _map_positions; reports slug match. Stage B: non-weather open-order snapshot key, foreign open-order kind, and boot admission of self-identifying non-weather DAY orders). prior 9e5a6fb9c773f32d4ded67e89ae9a6df0aca1bcc5617da181099aa547672cd7e.  # noqa: E501
-_EXEC_CLIENT_SHA256 = "f39740cda9514aa75ec65927e409e79da9d866e93ec7eb8a972c0a9e534d87c2"
+# re-pinned 2026-11-01: D-A (startup_open_orders_present excludes own bound rests via _counted_open_orders) + D-B (resting-confirm PrivateReadRefused logs HTTP status only). prior f39740cda9514aa75ec65927e409e79da9d866e93ec7eb8a972c0a9e534d87c2.  # noqa: E501
+_EXEC_CLIENT_SHA256 = "391171c2974f87a79bc38bbb56083bab7a670e1e8680e53cf4aa52a73b33a127"
 _EXEC_CLIENT_SHA256_BEFORE_POSTB2_REPIN = (
     "7ff6a77534d934fabcbf48a6f36e455e32e2b0b3a26b221f53a5562a533ed05e"
 )

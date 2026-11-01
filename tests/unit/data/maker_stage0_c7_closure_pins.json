@@ -70,7 +70,7 @@
   "src/breezy/adapters/polymarket_us/env.py": "4df7fab8a663d7592f4f709722479aa0f44610085ac7542db53ab6ab33bba9ab",
   "src/breezy/adapters/polymarket_us/errors.py": "ef6f140989744465f6ea643cce7d72b5724c5698de76b5da61f1ee1d240d6521",
   "src/breezy/adapters/polymarket_us/exec/__init__.py": "a3e67fa5612e9b47d756ab0aac9c440256d93615bff609af345c143cb6c4b16d",
-  "src/breezy/adapters/polymarket_us/exec/client.py": "f39740cda9514aa75ec65927e409e79da9d866e93ec7eb8a972c0a9e534d87c2",
+  "src/breezy/adapters/polymarket_us/exec/client.py": "391171c2974f87a79bc38bbb56083bab7a670e1e8680e53cf4aa52a73b33a127",
   "src/breezy/adapters/polymarket_us/exec/endpoints.py": "9fe3d42e42bd9e03b2cf85606e429ca76329ab6a83214f822f1071391b122126",
   "src/breezy/adapters/polymarket_us/exec/no_side_keys.py": "b2eb029b617a6b45ae8167f41920d4836ff86309204f5c4b25f1d80281a207a6",
   "src/breezy/adapters/polymarket_us/exec/refusals.py": "7d436b1615b549dc5455cb3b282733f17e374f2060f4ce1686f2c376f63b4b52",

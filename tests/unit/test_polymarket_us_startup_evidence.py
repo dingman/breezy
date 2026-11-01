@@ -11,6 +11,7 @@ here must be exactly right, because nothing downstream double-checks it.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from pathlib import Path
@@ -1011,3 +1012,117 @@ async def test_a_read_failure_after_a_flagged_read_drops_the_flag_with_the_book(
     assert _flagged(failed) is False
     assert rig.client._non_weather_open_orders == frozenset()
     await rig.client._disconnect()
+
+
+# --- D-A / D-B (EXEC-OWN-REST-NOISE, resting-confirm refusal status) -------------------------
+def _open_record(venue_order_id: str, slug: str) -> Any:
+    from decimal import Decimal
+
+    from breezy.adapters.polymarket_us.exec.reports import OpenOrderRecord
+
+    return OpenOrderRecord(
+        venue_order_id=venue_order_id,
+        market_slug=slug,
+        state="ORDER_STATE_NEW",
+        side="ORDER_SIDE_BUY",
+        quantity=Decimal(1),
+        cum_quantity=Decimal(0),
+        price=Decimal("0.40"),
+        tif="TIME_IN_FORCE_GOOD_TILL_DATE",
+        create_time="",
+        unknown_keys=(),
+        manual=None,
+        names_own_market=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_own_bound_rests_are_not_counted_for_the_startup_open_orders_error(
+    tmp_path: Path,
+) -> None:
+    """D-A: a bound own rest never reaches the ``startup_open_orders_present`` line; an
+    unknown (foreign) order still does."""
+    rig = _build_rig(tmp_path)
+    slug = "tc-temp-sfohigh-2026-09-16-gte70lt71f"
+    own = _open_record("OWNREST0001", slug)
+    other = _open_record("OTHER00001", slug)
+    setattr(rig.client, "_own_resting_pairs", lambda: frozenset({("OWNREST0001", slug)}))  # noqa: B010
+    counted = rig.client._counted_open_orders((own, other), frozenset())
+    assert [r.venue_order_id for r in counted] == ["OTHER00001"]
+    assert rig.client._counted_open_orders((own,), frozenset()) == []
+
+
+@pytest.mark.asyncio
+async def test_with_no_own_rests_every_non_foreign_market_order_is_still_counted(
+    tmp_path: Path,
+) -> None:
+    rig = _build_rig(tmp_path)
+    slug = "tc-temp-sfohigh-2026-09-16-gte70lt71f"
+    a, b = _open_record("A0000000001", slug), _open_record("B0000000001", slug)
+    setattr(rig.client, "_own_resting_pairs", frozenset)  # noqa: B010
+    assert rig.client._counted_open_orders((a, b), frozenset({("B0000000001", slug)})) == [a]
+
+
+def test_the_open_orders_error_line_counts_only_the_unowned_orders() -> None:
+    """The error line is fed by ``_counted_open_orders`` (log capture is not possible on the
+    Rust-backed logger, so this is a source-level proof)."""
+    import inspect
+    import textwrap
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(PolymarketUSExecutionClient._note_open_orders_outcome))
+    )
+    assigned = [
+        ast.unparse(n.value)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "counted"
+    ]
+    assert assigned == ["self._counted_open_orders(records, foreign)"]
+
+
+@pytest.mark.asyncio
+async def test_the_resting_confirm_refusal_path_logs_the_http_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-B: a ``PrivateReadRefused`` GET is retried and its HTTP status is logged (the body
+    never is). Drives the unbound method with a probe (``_log`` is a Rust-backed attribute
+    of the real client, so the probe carries the fake)."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    from breezy.adapters.polymarket_us.exec import submit_chain
+    from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    warnings: list[str] = []
+    paths: list[str] = []
+    ticks = iter(range(0, 10_000_000_000_000, 2_000_000_000))
+
+    async def _refusing_read(path: str, query: object = None) -> Any:
+        paths.append(path)
+        raise PrivateReadRefused(status=503, path=path, body=b"SECRET-BODY")
+
+    probe = SimpleNamespace(
+        _log=SimpleNamespace(
+            warning=warnings.append, error=warnings.append, debug=lambda message: None
+        ),
+        _clock=SimpleNamespace(timestamp_ns=lambda: next(ticks)),
+        _private_read=_refusing_read,
+        _issued_account_id=None,
+    )
+
+    verdict = await PolymarketUSExecutionClient._confirm_resting_order(
+        cast("Any", probe), "RESTING0001A", {}, None
+    )
+
+    assert verdict == submit_chain.RESTING_CONFIRM_HOLD
+    assert len(paths) > 1
+    refused = [w for w in warnings if "refused" in w]
+    assert refused
+    assert all("503" in w and "SECRET-BODY" not in w for w in refused)
