@@ -7,3 +7,4 @@
   4. §4.3(iv)/(v): `Observation` (`:176-185`) gains no field; `key_fn` is a closure over a `(rung, window) → p` map; default `key_fn` untouched.
   5. §6: the whole `test_market_calibration_scan_forecast_p.py` module patches the git helper through one shared fixture; the helper uses `subprocess` with a list argv and adds no module matching the `:259` guard words.
   6. §4.3(vii): `write_outputs(exclusive=True)` leaves the default call byte-identical (`exist_ok=True`, mode `"w"` default, covered by the pin).
+- 2026-11-01 later: STRATEGY-SEARCH r3 delta supersedes GAP-3 r1's run-file location: flagged runs write to r1 D4 `~/.local/share/breezy/derived/strategy_iteration/<run_id>/` (create-exclusive), never into `docs/evidence/`; evidence is committed only by coordinator action. GAP-3 A-1(a)–(c) otherwise unchanged.

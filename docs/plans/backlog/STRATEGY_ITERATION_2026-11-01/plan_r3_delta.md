@@ -119,6 +119,3 @@ Review IDs below refer to `/tmp/claude-1000/-home-jon-breezy/83eea2b1-e18b-40bb-
 - Implemented GAP dependencies, extra-source/Kalshi scoring routes and AUTO-PROMOTE-RETIRE family/manifest consumer.
 - Measured nine-cell runtime/memory capacity, installed timer/slice/lock behaviour and remaining eligible-cell count.
 - Proposed RED/GREEN/gate results and statistical calibration; no implementation, tests, deployment or file writes occurred here.
-
-Codex session ID: 01a19978-b925-7d70-aef1-2aad9f05ad1c
-Resume in Codex: codex resume 01a19978-b925-7d70-aef1-2aad9f05ad1c
