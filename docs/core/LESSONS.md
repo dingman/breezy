@@ -411,3 +411,9 @@ Archived 2026-10-20 (mechanised): L-5, L-57, L-61 → docs/core/archive/LESSONS-
 **Prevention:** Before committing any writer-produced `docs/evidence/*` file (`.json`, `.md`, `.parquet` alike — architect ruling 2026-11-01: a coordinator note goes in a separate sidecar file, never appended to the artefact) produced by a writer, `sha256sum` it against the writer's output file and confirm the `git_sha` it names is the commit that wrote it; a required new field means change the writer and re-run the measurement with the committed writer, never edit the artefact.
 **Applied:** 2026-10-31
 **Last updated:** 2026-11-01
+
+### L-76 — A generated brief input is verified by size and content before any dispatch cites it (2026-11-01)
+**Mistake:** Twice in one day a coordinator script that merged reviewer returns into a file for the next agent silently produced "MISSING" bodies (a mis-scoped variable; then a JSONL walk that found no `VERDICT:` string), and three Codex revision tasks were launched against 65-byte files. The first time a planner noticed and refused; the second time the tasks had to be cancelled and relaunched.
+**Prevention:** After writing any file that a brief will cite, `wc -c` it and grep for the marker the consumer needs (`VERDICT:`, `WRITE TO:`) in the SAME command, and refuse to dispatch when the size is under a sane floor or the marker is absent; prefer pasting review text the coordinator already holds in context over re-parsing agent transcripts.
+**Applied:** 2026-11-01
+**Last updated:** 2026-11-01
