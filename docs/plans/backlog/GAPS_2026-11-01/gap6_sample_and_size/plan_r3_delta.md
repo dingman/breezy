@@ -16,3 +16,6 @@ S5 PASS (S × H ≥ n_req) → the plan's output is a **KALSHI-ADAPTER go** with
 
 ## R3-4 Operator decisions restated
 D-2 (`s0` + `census` exception) gates S3 and is the first ruling needed. D-4 (size q) moves to SIZE-UNDER-CAPS. D-3 defaults as above. Everything else in r1/r2 is unchanged.
+
+## R3-5 (prediction-market r3) no q anywhere in GAP-6
+S6 drops the q grid and reports H1/H2/H3 only. D_gate is FIXED at 1 (the qty-1 proving stance) with the {1, 10, 100} depth grid reported; the r1 "D_gate = max(1, q)" clause (lines 10, 165) is struck. No q is read or proposed anywhere in GAP-6.
