@@ -33,3 +33,6 @@ All r2 invariants, the null-hypothesis section (§2: no native Kalshi adapter in
 6. LOW: WB-6 acceptance uses a read-path latch class (parse-REFUSE / schema-drift count) plus the quote-count floor; the `resting_query_unreadable` criterion moves to WB-8.
 7. LOW: R3-4 (as replaced in R3-6) reads "119 PM.us markets listed incl. LOW (10-21 correction); recorder captures 84" instead of "5 × HIGH", and cites the tail-excess source as Card E / K1 SEARCH artefacts (`docs/evidence/STRAT_DESIGN_2026-10-31/`).
 8. LOW: the §9 "KILL on 2027-01-25" risk row is struck; new risk row: "earlier start shortens the confirmatory window [max(07-01, F_K), F_H) — power re-check per R3-6 item 1 is mandatory".
+
+## R3-8 (prediction-market confirmation: reconcile R3-6 with R3-7 item 4)
+R3-6 items 1–2 and R3-3 are re-read with **KC-n (the tail band) as the armed PREREG family**, not WB-7. WB-7 produces only the SEARCH comparator and the power result (REGISTERED or UNDERPOWERED_NOT_REGISTERED). The KC-n PREREG is frozen before any confirmatory-window data is read. The shared-totals α draw happens at KC-n registration, after the WB-4 both-ledger test is green.
