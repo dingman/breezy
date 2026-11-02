@@ -745,7 +745,10 @@ def write_verdict(raw: Path, evidence: Path, date: str) -> None:
     payloads = load_sealed(raw)
     evidence.mkdir(parents=True, exist_ok=True)
     _refuse_prior_look(evidence)
-    (evidence / LOOK_DIR).mkdir()  # atomic reservation, before any `result` access
+    try:
+        (evidence / LOOK_DIR).mkdir()  # atomic reservation, before any `result` access
+    except FileExistsError as exc:
+        raise FileExistsError("S0 look already exists") from exc
     rows = [row for p in payloads for row in p["rows"]]
     audit_rows([audit_projection(row) for row in rows])
     result = verdict([o for row in rows for o in observations(row)])

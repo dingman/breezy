@@ -740,6 +740,15 @@ def test_h1_verdict_on_date_a_then_date_b_refused(tmp_path: Path, monkeypatch: A
     assert sorted(p.name for p in out.glob("S0_*")) == ["S0_2026-11-02.json", "S0_2026-11-02.md"]
 
 
+def test_h1_mkdir_race_raises_named_error(tmp_path: Path, monkeypatch: Any) -> None:
+    raw = seal(tmp_path, monkeypatch, [row()])
+    out = tmp_path / "evidence"
+    (out / EVIDENCE_FIXED).mkdir(parents=True)
+    monkeypatch.setattr(s, "_refuse_prior_look", lambda evidence: None)
+    with pytest.raises(FileExistsError, match="S0 look already exists"):
+        s.write_verdict(raw, out, "2026-11-02")
+
+
 def test_h1_audit_report_does_not_count_as_a_look(tmp_path: Path, monkeypatch: Any) -> None:
     raw = seal(tmp_path, monkeypatch, [row()])
     out = tmp_path / "evidence"
