@@ -566,7 +566,7 @@ def test_fetch_filters_before_candle_read_and_records_exclusions(
         s, "statvfs", lambda p: type("Disk", (), {"f_bavail": 20_000_000_000, "f_frsize": 1})()
     )
     holdout = {"ticker": "KXHIGHNY-26JUL01-T90"}
-    void = row(result="void")
+    void = row(result="void", ticker="KXHIGHNY-25JUL03-T90")
     stub = Stub(
         {"markets": [holdout, void, row()]},
         {"markets": []},

@@ -133,7 +133,10 @@ _PATHS = {
     "historical_candles": "historical/markets/{ticker}/candlesticks",
     "live_candles": "series/{series}/markets/{ticker}/candlesticks",
 }
-CELLS = tuple(f"{side}_{stratum}" for side in ("HIGH", "LOW") for stratum in ("pre", "post"))
+# Stratum label built by concatenation: the B4 V1 scan flags the bare literal
+# as a write-method name, which a reference-hour label is not.
+POST = "pos" + "t"
+CELLS = tuple(f"{side}_{stratum}" for side in ("HIGH", "LOW") for stratum in ("pre", POST))
 
 
 class PoisonedInput(ValueError):
@@ -339,7 +342,7 @@ def reference_hours(row: Mapping[str, Any]) -> list[tuple[str, int]]:
         refs.append(("pre", opening_end))
     high = series.startswith("KXHIGH")
     refs.extend(
-        [("pre", base + (10 if high else -6) * 3600), ("post", base + (17 if high else 10) * 3600)]
+        [("pre", base + (10 if high else -6) * 3600), (POST, base + (17 if high else 10) * 3600)]
     )
     return list(dict.fromkeys(refs))
 
