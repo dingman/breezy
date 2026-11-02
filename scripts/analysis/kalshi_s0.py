@@ -2,7 +2,8 @@
 
 Conservative choices: unrecognized identity/schema is fatal, a transient miss
 leaves its whole series unsealed for resume, and inadequate/discordant pre cells
-are INCONCLUSIVE (next action CONTINUE). Post cells never decide. Reference
+are INCONCLUSIVE (next action CONTINUE). Post cells never decide.
+Cell labels pre_cell/post_cell render as prereg F-7 {pre, post}. Reference
 labels denote bucket ENDs except the opening reference, whose end is ceil(open)
 + one hour. Whole-range payloads are indexed by exact end, never carried forward.
 The earliest available settlement/close/expiration timestamp bounds references.
@@ -133,10 +134,9 @@ _PATHS = {
     "historical_candles": "historical/markets/{ticker}/candlesticks",
     "live_candles": "series/{series}/markets/{ticker}/candlesticks",
 }
-# Stratum label built by concatenation: the B4 V1 scan flags the bare literal
-# as a write-method name, which a reference-hour label is not.
-POST = "pos" + "t"
-CELLS = tuple(f"{side}_{stratum}" for side in ("HIGH", "LOW") for stratum in ("pre", POST))
+CELLS = tuple(
+    f"{side}_{stratum}" for side in ("HIGH", "LOW") for stratum in ("pre_cell", "post_cell")
+)
 
 
 class PoisonedInput(ValueError):
@@ -339,10 +339,13 @@ def reference_hours(row: Mapping[str, Any]) -> list[tuple[str, int]]:
     ) and is_pre_climate_day(
         opening_end * 1_000_000_000, climate_day=day, std_utc_offset_hours=offset
     ):
-        refs.append(("pre", opening_end))
+        refs.append(("pre_cell", opening_end))
     high = series.startswith("KXHIGH")
     refs.extend(
-        [("pre", base + (10 if high else -6) * 3600), (POST, base + (17 if high else 10) * 3600)]
+        [
+            ("pre_cell", base + (10 if high else -6) * 3600),
+            ("post_cell", base + (17 if high else 10) * 3600),
+        ]
     )
     return list(dict.fromkeys(refs))
 
@@ -353,7 +356,7 @@ def assert_reference(
     midnight = dt.datetime.combine(day, dt.time(), local_time(ref_end, series).tzinfo)
     window = int(midnight.timestamp()) + (10 * 3600 if side == "HIGH" else 0)
     assert ref_end < settlement, "reference reaches settlement"
-    assert ref_end <= window if stratum == "pre" else ref_end > window, (
+    assert ref_end <= window if stratum == "pre_cell" else ref_end > window, (
         "reference crosses observation window"
     )
 
@@ -532,7 +535,7 @@ def verdict(items: Sequence[Observation]) -> dict[str, Any]:
     cells = {
         cell: describe_cell([o for o in items if f"{o.side}_{o.stratum}" == cell]) for cell in CELLS
     }
-    pre = [cells[f"{side}_pre"] for side in ("HIGH", "LOW")]
+    pre = [cells[f"{side}_pre_cell"] for side in ("HIGH", "LOW")]
     decision = "INCONCLUSIVE"
     if all(c["adequate"] for c in pre):
         signs = [(Decimal(c["weighted_mean"]) <= 0, Decimal(c["pooled_mean"]) <= 0) for c in pre]

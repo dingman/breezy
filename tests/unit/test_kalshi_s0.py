@@ -72,7 +72,12 @@ def row(**changes: Any) -> dict[str, Any]:
 def population(excess: str = "-0.98", n: int = 30, days: int = 5) -> list[Any]:
     return [
         s.Observation(
-            side, "pre", f"S{i}", f"2025-07-{i % days + 1:02}", Decimal(excess), excess == "0.02"
+            side,
+            "pre_cell",
+            f"S{i}",
+            f"2025-07-{i % days + 1:02}",
+            Decimal(excess),
+            excess == "0.02",
         )
         for side in ("HIGH", "LOW")
         for i in range(n)
@@ -344,7 +349,7 @@ def test_l5_l6_open_hour_and_midnight_exclusion(opened: str, valid: bool) -> Non
     refs = s.reference_hours(r)
     opening = s.timestamp(opened)
     ceiling = ((opening + 3599) // 3600) * 3600 + 3600
-    assert (("pre", ceiling) in refs) == valid
+    assert (("pre_cell", ceiling) in refs) == valid
 
 
 @pytest.mark.parametrize("delta,expected", [(-3600, None), (0, "0.98"), (3600, "raise")])
@@ -414,21 +419,21 @@ def test_x6_holdout_dropped_before_any_nonidentity_read() -> None:
 
 def test_x7_lookahead_and_x8_both_schemas() -> None:
     for ref, settlement, side, stratum in [
-        (100, 100, "HIGH", "pre"),
-        (1751468401, 1751547600, "HIGH", "pre"),
-        (1751468400, 1751547600, "HIGH", "post"),
+        (100, 100, "HIGH", "pre_cell"),
+        (1751468401, 1751547600, "HIGH", "pre_cell"),
+        (1751468400, 1751547600, "HIGH", "post_cell"),
     ]:
         with pytest.raises(AssertionError):
             s.assert_reference(ref, settlement, dt.date(2025, 7, 2), "KXHIGHNY", side, stratum)
     for schema in ("close", "close_dollars"):
         assert s.no_ask({"yes_bid": {schema: "0.0300"}}) == Decimal("0.9700")
     report = s.audit_rows([row()])
-    assert report["cells"]["HIGH_pre"]["n"] == 1
-    assert report["stations"]["HIGH_pre"]["KNYC"] == 1
-    assert report["cells"]["HIGH_pre"]["misses"] == 0
+    assert report["cells"]["HIGH_pre_cell"]["n"] == 1
+    assert report["stations"]["HIGH_pre_cell"]["KNYC"] == 1
+    assert report["cells"]["HIGH_pre_cell"]["misses"] == 0
     r = row()
     r["candlesticks"].pop(1)
-    assert s.audit_rows([r])["cells"]["HIGH_pre"]["misses"] == 1
+    assert s.audit_rows([r])["cells"]["HIGH_pre_cell"]["misses"] == 1
 
 
 @pytest.mark.parametrize(
@@ -442,33 +447,33 @@ def test_v1_v2_decisions(excess: str, expected: str) -> None:
 def test_v3_v5_adequacy_is_station_days(n: int, days: int) -> None:
     obs = population(n=n, days=days)
     assert s.verdict(obs * 3)["decision"] == "INCONCLUSIVE"
-    assert s.verdict(obs * 3)["cells"]["HIGH_pre"]["n"] == n
+    assert s.verdict(obs * 3)["cells"]["HIGH_pre_cell"]["n"] == n
 
 
 def test_v4_positive_post_never_rescues_pre() -> None:
     obs = population()
-    obs += [s.Observation("HIGH", "post", "S", "2025-07-01", Decimal(1), True)] * 100
+    obs += [s.Observation("HIGH", "post_cell", "S", "2025-07-01", Decimal(1), True)] * 100
     assert s.verdict(obs)["decision"] == "KILL"
 
 
 def test_v6_weighted_pooled_disagreement() -> None:
     obs = population("0.02")
-    obs += [s.Observation("HIGH", "pre", "S0", "2025-07-01", Decimal("-0.98"), False)] * 10
+    obs += [s.Observation("HIGH", "pre_cell", "S0", "2025-07-01", Decimal("-0.98"), False)] * 10
     report = s.verdict(obs)
-    assert Decimal(report["cells"]["HIGH_pre"]["weighted_mean"]) < 0
-    assert Decimal(report["cells"]["HIGH_pre"]["pooled_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["weighted_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) < 0
     obs = population("0.02")
-    obs += [s.Observation("HIGH", "pre", "S0", "2025-07-01", Decimal("-0.98"), False)] * 2
+    obs += [s.Observation("HIGH", "pre_cell", "S0", "2025-07-01", Decimal("-0.98"), False)] * 2
     report = s.verdict(obs)
-    assert Decimal(report["cells"]["HIGH_pre"]["weighted_mean"]) < 0
-    assert Decimal(report["cells"]["HIGH_pre"]["pooled_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["weighted_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) < 0
     # One losing day repeated enough to dominate pooled, but 29 winning days
     # dominate the equal-weight station-day statistic.
     obs = population("0.03", n=60)
-    obs += [s.Observation("HIGH", "pre", "S0", "2025-07-01", Decimal("-0.97"), False)] * 10
+    obs += [s.Observation("HIGH", "pre_cell", "S0", "2025-07-01", Decimal("-0.97"), False)] * 10
     report = s.verdict(obs)
-    assert Decimal(report["cells"]["HIGH_pre"]["weighted_mean"]) > 0
-    assert Decimal(report["cells"]["HIGH_pre"]["pooled_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["weighted_mean"]) > 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) < 0
     assert report["decision"] == "INCONCLUSIVE"
 
 
@@ -487,7 +492,7 @@ def test_v7_v10_bootstrap_empty_shortcircuit_and_explicit_constants(monkeypatch:
     assert calls == []
     result = s.verdict(population())
     assert len(calls) == 2
-    assert result["cells"]["HIGH_pre"]["wilson"] == k1.wilson_interval(0, 30)
+    assert result["cells"]["HIGH_pre_cell"]["wilson"] == k1.wilson_interval(0, 30)
     assert result["decision"] == "KILL"
 
 
@@ -530,7 +535,7 @@ def test_b1_b2_audit_never_reads_result() -> None:
 
     r = Blind(row())
     assert "result" not in s.audit_projection(r)
-    assert s.audit_rows([r])["cells"]["HIGH_pre"]["n"] == 1
+    assert s.audit_rows([r])["cells"]["HIGH_pre_cell"]["n"] == 1
 
 
 def test_b3_b4_exclusive_raw_resume_and_manifest(tmp_path: Path, monkeypatch: Any) -> None:
@@ -600,19 +605,23 @@ def test_synthetic_fixture_labels_and_cases() -> None:
 
 def test_open_hour_rounds_up_fractional_seconds() -> None:
     refs = s.reference_hours(row(open_time="2025-07-01T14:00:00.001Z"))
-    assert ("pre", 1751385600) in refs
-    assert ("pre", 1751382000) not in refs
+    assert ("pre_cell", 1751385600) in refs
+    assert ("pre_cell", 1751382000) not in refs
 
 
 def test_low_reference_ends_and_window_boundary() -> None:
     r = row(series_ticker="KXLOWTNYC")
-    assert s.reference_hours(r) == [("pre", 1751382000), ("pre", 1751410800), ("post", 1751468400)]
+    assert s.reference_hours(r) == [
+        ("pre_cell", 1751382000),
+        ("pre_cell", 1751410800),
+        ("post_cell", 1751468400),
+    ]
     s.assert_reference(
-        1751432400, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre"
+        1751432400, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre_cell"
     )
     with pytest.raises(AssertionError):
         s.assert_reference(
-            1751432401, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre"
+            1751432401, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre_cell"
         )
 
 
@@ -680,3 +689,25 @@ def test_failed_verdict_reserves_look_before_outcome_access(
         s.write_verdict(raw, evidence, "2026-11-02")
     with pytest.raises(FileExistsError):
         s.write_verdict(raw, evidence, "2026-11-02")
+
+
+def test_no_string_constant_equals_write_method_name_after_strip_upper() -> None:
+    tree = ast.parse((ROOT / "scripts/analysis/kalshi_s0.py").read_text())
+    flagged = [
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant)
+        and isinstance(n.value, str)
+        and n.value.strip().upper() in {"POST", "PUT", "PATCH", "DELETE"}
+    ]
+    assert flagged == []
+    folded = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.BinOp)
+        and isinstance(n.op, ast.Add)
+        and isinstance(n.left, ast.Constant)
+        and isinstance(n.right, ast.Constant)
+        and isinstance(n.left.value, str)
+    ]
+    assert folded == [], "runtime-built literal evades the guard"
