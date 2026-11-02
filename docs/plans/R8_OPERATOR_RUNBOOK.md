@@ -273,11 +273,11 @@ no `breezy-trade-2026-09-08*.log` was ever created, and nothing would have launc
 §7 still bans a unit for **the trade node**. This unit is for the **supervisor**. Operator ruling
 2026-09-10: a reboot of this unit RESUMES supervision **and** order capability.
 
-- The **two durable caps** reach it only by *reference* to your gitignored `/operator.env`, which §6
-  already permits to hold exactly those two values at rest. The unit never reads or echoes them,
+- The **three durable caps** reach it only by *reference* to your gitignored `/operator.env`, which §6
+  already permits to hold exactly those three values at rest. The unit never reads or echoes them,
   and the build never writes them.
 - The **build-side session constants** (enablement flags and operator identity) are `Environment=`
-  lines in the unit. The three numeric session ceilings are derived at permit mint from the two
+  lines in the unit. The three numeric session ceilings are derived at permit mint from the three
   caps when absent. There is no `import-environment` step.
 
 ### Standing note: no memory cap, deliberately

@@ -341,6 +341,18 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-11-01
 **Last updated:** 2026-11-01
 
+### L-77 — Never allowlist a frequently edited ledger in an exact-set prose guard (2026-11-02)
+**Mistake:** docs/core/PROGRESS.md was added to the operator-control prose-census allowlist; a routine ledger edit then removed the only control mention and the binding gate went red on the merged tree.
+**Prevention:** Never allowlist a frequently edited ledger (PROGRESS.md, LESSONS.md) in an exact-set prose guard; allowlist only stable plan and review artefacts, and re-run the guard on the MERGED tree before push.
+**Applied:** 2026-11-02
+**Last updated:** 2026-11-02
+
+### L-78 — Poll a CLI forwarder's job from its launch cwd; NOT FOUND is a cwd mismatch first (2026-11-02)
+**Mistake:** A watcher polled the Codex companion from the primary tree and reported the worktree-launched job as NOT FOUND.
+**Prevention:** Poll a forwarder's job from the exact cwd it was launched with (or pass that cwd), and treat NOT FOUND as a cwd mismatch before concluding the job never ran.
+**Applied:** 2026-11-02
+**Last updated:** 2026-11-02
+
 ## Absorbed index
 
 Every removed L-number resolves to its surviving entry above.
