@@ -303,11 +303,12 @@ def render(payload: Row) -> tuple[str, str]:
         k: payload[k] for k in ("git_sha", "citations", "logs", "counts", "verdict") if k in payload
     }
     public["rows"] = [{k: r[k] for k in PUBLIC if k in r} for r in payload["rows"]]
+    public = json.loads(json.dumps(public), parse_float=lambda f: round(float(f), 3))
     machine = json.dumps(public, indent=2, sort_keys=True) + "\n"
     md = [f"# GAP-5a create-path census\n\ngit_sha: {payload['git_sha']}", NOTES]
     md.append("Window: 2026-10-31T00:00Z to 2026-11-02T00:00Z, end exclusive.")
-    md.append("Counts/input sha256s: " + json.dumps(public["logs"], sort_keys=True))
-    md.append("Citations: " + json.dumps(public["citations"], sort_keys=True))
+    md += ["Counts/input sha256s: " + json.dumps(public["logs"], sort_keys=True)]
+    md += ["Citations: " + json.dumps(public["citations"], sort_keys=True)]
     counts = [("window", _counts(payload["rows"]))]
     counts += [(log["filename"], log["counts"]) for log in public["logs"]]
     for label, count in counts:
@@ -376,8 +377,7 @@ def main() -> None:
         paths.update(p for p in listing.paths if requested.is_dir() or p == requested)
         if not requested.is_dir() and requested not in listing.paths:
             raise ValueError("input not a node log")
-    start, end = ts_ns(START), ts_ns(END)
-    assert start is not None and end is not None
+    start, end = ts_ns(START) or 0, ts_ns(END) or 0
     logs = [log for p in sorted(paths) if (log := _scan_log(p, start, end)) is not None]
     if not logs:
         raise ValueError("no input overlaps window")

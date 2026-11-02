@@ -363,3 +363,33 @@ def test_writer_has_no_adapter_imports_and_respects_size_limits() -> None:
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
+
+
+def test_render_rounds_nanosecond_floats_so_hygiene_does_not_false_positive() -> None:
+    row = segment_creates([anchor(), accepted()])[0]
+    payload: dict[str, Any] = {
+        "git_sha": "a" * 40,
+        "citations": {},
+        "logs": [
+            {"filename": "x.log", "counts": {"signatures": {}}, "first_relative_s": 60037.002612239}
+        ],
+        "rows": [row],
+        "verdict": {},
+    }
+    payload["logs"][0]["counts"]["signatures"] = {
+        s: 1
+        for s in (
+            "SIG_NEW",
+            "SIG_H1_404_DEADLINE",
+            "SIG_H2_ECHO",
+            "SIG_H3_NONNEW",
+            "SIG_X_TIMEOUT",
+            "SIG_X_ALLOWLIST",
+            "SIG_X_BIND_RAISED",
+            "SIG_DIDNOTMAP",
+            "SIG_NO_EXIT",
+            "UNKNOWN",
+        )
+    }
+    machine, _ = render(payload)
+    assert "60037.003" in machine and "60037.002612239" not in machine
