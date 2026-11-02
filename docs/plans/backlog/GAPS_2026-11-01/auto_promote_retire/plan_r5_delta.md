@@ -1,0 +1,14 @@
+# AUTO-PROMOTE-RETIRE plan r5 — delta over r4 (trading-bot-architect re-review 2026-11-02: 3 open items; security r4: APPROVE with one S0 contract folded)
+
+Applies on top of `plan_r1.md` + `plan_r2_delta.md` + `plan_r4_delta.md`; where they differ this delta wins. Status: r5 — trading-bot-architect confirmation pending.
+
+## R5-1 P4 absent-row path
+`validate_ii.bootstrap` (`validate_ii.py:192-198`) allows BOOTSTRAP only at genesis (`head_venue_seq == 0`) for a pair in `pins.BOOTSTRAP_SEED`, so `BOOTSTRAP(None→RETIRED)` is illegal on the existing chain. Step 0 for `pm_us_no_maker_sharp_v1`: if a row exists → `HALT` then `RETIRE` (HALTED→RETIRED), both DAILY; if no row exists → `MINT(None→SHADOW)` then `RETIRE(SHADOW→RETIRED)`, both DAILY (`transitions.py:71,89`). The P4 test matrix gains the HALTED→RETIRE branch and the no-row branch; the actual registry state is read first (security LOW-c).
+
+## R5-2 Halt-latch writer named
+`family_halt_submit_veto` (`composition.py:221`) reads `TrialDayLatch.is_family_halted()` under the intent-latch flock the running node holds exclusively, so neither the decision command nor the supervisor can write it. The writer is an **in-node poller of restrictive registry demand** that sets the family-halt latch on the kernel loop (memory `liveclock-callbacks-run-off-kernel-thread`); the veto reads it synchronously. Order for DISARM: demand written (decision pass) → in-node poller sets the latch → node-side owned-order cancel → supervisor restores the drop-in / reloads / restarts. RED test `test_out_of_process_retired_demand_refuses_next_submit_without_taking_flock`.
+
+## R5-3 Veto coverage for every ARM-eligible kind
+The veto is built per composition (`_open_halt_latch_preamble` in `trade.py`; FQ and maker compositions). §6 tests the veto for every ARM-eligible family kind, and ARM REFUSES any kind whose composition has no `submit_veto` (test `test_arm_refuses_family_kind_without_submit_veto`). The PROMOTE→CHAMPION then pending-head/partner/ACTIVATE sequence is pinned by a test that also checks `fold_pairs.py` pending-head semantics (architect "not verified" item).
+
+## R5-4 (security S0 contract) S0 freezes the exact ARM and DISARM drop-in bytes; `_ALLOWED_DIRECTIVES` (`health_dropins.py:49-51`) is extended by exactly `Environment=BREEZY_ORDERS_ENABLED=1` plus the family-selector line, nothing else; a drop-in carrying any `*_MAX_*` cap or `BREEZY_TRADING_ENABLED` directive stays CRITICAL (test). `trade.py` mint lines (1464/1510) and `safety.py:552` are confirmed at S0.
