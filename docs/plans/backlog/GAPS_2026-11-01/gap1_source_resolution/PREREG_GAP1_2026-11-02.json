@@ -1,0 +1,309 @@
+{
+  "baselines": {
+    "M0n": {
+      "cdf": "champion_cdf(spec)",
+      "role": "Reported only; no gating"
+    },
+    "M0prime": {
+      "cdf": "blend_cdf(arm_predictions[\"M0prime\"])",
+      "role": "Same ladder and Student-t family; D0 source-credit comparison",
+      "source": "src/breezy/analysis/multisource_blend_folds.py:185-186"
+    },
+    "M0t": {
+      "cdf": "student_t_cdf(m_star, s, nu)",
+      "derivation": "champion_cdf(spec) = apply_emos(build_cdf(NORMAL), percentiles, params) has Normal location m_star and scale s; swap only its kernel to Student-t",
+      "m_star": "champion.percentiles.q50 + champion.a - s * (champion.percentiles.q50 - champion.percentiles.mean) / champion.percentiles.sd",
+      "refuse": "champion.method != \"NORMAL\"; non-positive sd or scale; non-finite parameters",
+      "s": "exp(champion.gamma + champion.delta * ln(champion.percentiles.sd))",
+      "scale_rule": "Use exactly the EMOS Normal scale s as the Student-t scale; no variance matching",
+      "sources": [
+        "src/breezy/analysis/multisource_blend_folds.py:177-182",
+        "src/breezy/domain/quantile_density.py:291-292",
+        "src/breezy/domain/quantile_density.py:300-332"
+      ]
+    },
+    "f9_clause_quote": {
+      "source": "docs/plans/backlog/GAPS_2026-11-01/gap1_source_resolution/plan_r2_delta.md:12-13",
+      "text": "If `oof_rows.jsonl` carries an M0 `arm_predictions` entry (unverified #1), M0 is scored from it with its own nu. Otherwise the M0 baseline is scored from the champion spec under BOTH the Normal CDF and the same Student-t family as the arms; ΔRES is reported against both and the PASS rule uses the t-family baseline. The choice is settled at S1 (first RED test pins the schema) and frozen in PREREG_GAP1 before D1 text is frozen."
+    },
+    "plan_search": "Searched plan_r1.md and plan_r2_delta.md for variance, scale, M0t, Student; neither specifies variance matching or a scale conversion. Same-scale is this conservative S0 choice.",
+    "schema_resolution": "ARM_NAMES is exactly [M0prime, M1, M2, M3]; no M0 prediction entry. Rebuild M0t and M0n from champion; do not add an M0 arm key."
+  },
+  "c1_evidence": {
+    "path": "docs/evidence/f13/c1_lag_evidence_2026-10-21.json",
+    "sha256": "792ff2a8417debefc0e0df9e6b4171b52e1e9b20a9b2c4d391ec050c72746d3b"
+  },
+  "cells": {
+    "anchors": {
+      "D-1": "18:00Z on the preceding day",
+      "D0": "10:00 LST (fixed standard time)"
+    },
+    "arms": [
+      "M1",
+      "M2",
+      "M3"
+    ],
+    "horizons": [
+      "D0",
+      "D-1"
+    ],
+    "m": 6,
+    "sensitivity": "D0_sensitivity at 12:00 LST is reported only; never a seventh gating cell",
+    "source": "src/breezy/analysis/multisource_blend_features.py:26-28"
+  },
+  "census_rule": {
+    "artifact": "Commit counts.json after J2 and before J3",
+    "command": "--counts-only over J2 f.jsonl",
+    "go_no_go": "If every cell's upper-bound count < prior_floor, architect + prediction-market-reviewer go/no-go before J3",
+    "no_outcomes": "Outcome-blind; never access observed_f, cli_tmax_f, numeric source forecasts, champion, arm scores or stage_a.json",
+    "prior_floor": 914,
+    "read_only_fields": [
+      "station",
+      "climate_day",
+      "version",
+      "horizon",
+      "lamp.missing",
+      "null-ness of pfm_mu_f",
+      "null-ness of mos_mu_f"
+    ],
+    "upper_bound": "Per cell, distinct pre-cutoff (station, climate_day) keys at that horizon, before fold/champion exclusions; include missing-source/fallback candidates under intention-to-treat; report missing-prefix counts separately"
+  },
+  "ci": {
+    "B": 5000,
+    "B_choice_rule": "10000 unless the S0 benchmark projects more than 4 hours for 10000 x 6 cells x 2 clusterings; then 5000; never below 2000",
+    "alpha": "0.05/6",
+    "benchmark_artifact": "docs/plans/backlog/GAPS_2026-11-01/gap1_source_resolution/S0_bootstrap_benchmark_2026-11-02.md",
+    "benchmark_projection_B10000_hours": 5.47928107297048,
+    "benchmark_projection_chosen_B_hours": 2.73964053648524,
+    "cluster_keys": {
+      "climate_day": [
+        "climate_day"
+      ],
+      "station_day": [
+        "station",
+        "climate_day"
+      ]
+    },
+    "clusterings": [
+      "station_day",
+      "climate_day"
+    ],
+    "gating_lower": "min(station_day.lower, climate_day.lower)",
+    "gating_upper": "max(station_day.upper, climate_day.upper)",
+    "high_index": "min(B-1, ceil((1-alpha/2)*B)-1)",
+    "low_index": "floor(alpha/2 * B)",
+    "minimum_B": 2000,
+    "resampling": "Paired whole-cluster resampling; retain all three rungs and both probabilities together in every draw",
+    "seed": 20260929,
+    "seed_note": "F13 pins.bootstrap_seed (20261006) is NOT used; scoring_core is never imported"
+  },
+  "constants": {
+    "BOOTSTRAP_SEED": {
+      "source": "src/breezy/analysis/nbp_calibration.py:472",
+      "value": 20260929
+    },
+    "G22_TARGET_DIFFERENCE_X": {
+      "source": "src/breezy/analysis/nbp_calibration.py:314",
+      "value": 0.0152
+    },
+    "RELIABILITY_BUCKET_EDGES": {
+      "source": "src/breezy/analysis/nbp_calibration.py:2025",
+      "value": [
+        0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1
+      ]
+    },
+    "Z_POWER_080": {
+      "source": "src/breezy/analysis/nbp_calibration.py:310",
+      "value": 0.8416212335729143
+    },
+    "cluster_bootstrap_draws": {
+      "source": "src/breezy/analysis/nbp_calibration.py:1713-1739"
+    },
+    "percentile_interval": {
+      "source": "src/breezy/analysis/nbp_calibration.py:1742-1747"
+    }
+  },
+  "constants_source": "nbp_calibration (G2.3 verbatim)",
+  "disclosures": [
+    "Brier-sigma_d power floor is applied to a dRES test",
+    "Report bootstrap-implied dRES SD for each clustering, non-gating",
+    "Six nested correlated cells; Bonferroni m=6 is conservative",
+    "Predicted n per cell cannot be frozen before J2; freeze the census RULE and prior floor now and commit counts.json before J3",
+    "No scoring_core import; no source, frozen F13 prereg, look-tool or nbp_calibration changes",
+    "frozen via UNFROZEN draft commit then a stamp-only commit setting frozen_sha to the draft commit's sha",
+    "S1/S2 reader and D1 prerequisites remain future work before any J3 look"
+  ],
+  "envelopes": {
+    "J2": {
+      "LimitNOFILE": 524288,
+      "MemoryMax": "12G",
+      "RuntimeMaxSec": 3000
+    },
+    "J3": {
+      "LimitNOFILE": 524288,
+      "MemoryMax": "12G",
+      "RuntimeMaxSec": 14400,
+      "max_memory_gib": 3.5,
+      "stall_watch": true
+    }
+  },
+  "estimand": {
+    "call": "resolution_difference(p_arm, p_M0t, outcomes, bin_by_edges(RELIABILITY_BUCKET_EDGES))",
+    "dRES": "RES_arm - RES_M0t",
+    "pooling": "Pool all three rung events of all included rows within each arm x horizon cell; paired and identical events for every baseline",
+    "source": "src/breezy/analysis/brier_decomposition.py:232-268",
+    "uncertainty_rule": "Compute and report UNC for every arm and baseline; refuse unless UNC is equal across arms in each cell"
+  },
+  "events": {
+    "outcome": "lo <= observed_f <= hi inclusive; an open bound means infinity",
+    "p": "rung_probabilities(cdf, ladder): F(hi + 0.5) - F(lo - 0.5); open lower CDF = 0, open upper CDF = 1",
+    "refuse": "Non-integral or non-finite observed_f is refused",
+    "rungs": [
+      "lt",
+      "mid",
+      "gte"
+    ],
+    "source": "src/breezy/domain/quantile_density.py:370-390"
+  },
+  "f13_prereg": {
+    "content_sha256": "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7",
+    "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
+    "path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13_prereg_blend_v1.json"
+  },
+  "frozen_sha": "UNFROZEN",
+  "inclusion": {
+    "ARM_NAMES": [
+      "M0prime",
+      "M1",
+      "M2",
+      "M3"
+    ],
+    "arm_keys": "set(arm_predictions) == set(ARM_NAMES), exactly; refuse missing or extra keys",
+    "champion": "Must be set; champion None excluded and counted",
+    "cutoff": "climate_day < 2026-07-01; refuse post-cutoff rows",
+    "fallback": "fell_back and LAMP-MISSING rows INCLUDED, intention-to-treat; count per arm",
+    "fold_id": "Must be set (zero is valid); fold_id None excluded and counted",
+    "lamp_missing_count": "Read the LAMP-missing flag from matched J2 features; key by (station, climate_day, horizon); report it and fell_back separately per arm, with their overlap",
+    "nu_rule": "Assert nu == 5 (F13 pins.student_t_nu) on every arm row, including M0prime and fallbacks",
+    "nu_source": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13_prereg_blend_v1.json:63",
+    "sensitivity": "Report a version excluding fell_back/LAMP-MISSING rows as a non-gating sensitivity; no extra PASS cells",
+    "source": "src/breezy/analysis/multisource_blend_features.py:26-28; src/breezy/analysis/multisource_blend_io.py:72-100",
+    "start": "2021-01-01"
+  },
+  "j3_out_dir": "~/.local/share/breezy/derived/gap1_source_resolution/gap1_j3_2026-11-02/j3",
+  "k_cum": {
+    "added": "6 cells + 1 F13 primary; +1 per burned primary",
+    "after": 8,
+    "before": 1
+  },
+  "ladder": {
+    "bounds": {
+      "gte": [
+        "c+2",
+        null
+      ],
+      "lt": [
+        null,
+        "c-1"
+      ],
+      "mid": [
+        "c",
+        "c+1"
+      ]
+    },
+    "centre": "c = round(champion.percentiles.q50); Python half-even, round(72.5) == 72",
+    "common": "One champion-centred ladder per OOF row, identical for every arm and all baselines",
+    "copy": [
+      "Rung(\"lt\", None, center_f - 1),",
+      "Rung(\"mid\", center_f, center_f + 1),",
+      "Rung(\"gte\", center_f + 2, None),"
+    ],
+    "source": "scripts/analysis/nbp_skill_study.py:1092-1102"
+  },
+  "nu": 5,
+  "oof_header_expect": {
+    "content_sha256": "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7",
+    "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
+    "schema": "f13_oof_rows_v1"
+  },
+  "overall": {
+    "KILL": "All six cells are FAIL or OBS_DRIVEN; D1 must be granted and the frozen prereg and reader prerequisites satisfied",
+    "PASS": ">=1 PASS cell",
+    "UNRESOLVED": "Otherwise; includes no PASS with UNDERPOWERED or RES_ONLY_MISCALIBRATED, or D1 not granted",
+    "f13_verdict": "Report result.json's F13 verdict as-is, or NOT WRITTEN if result.json is absent; it never overrides GAP-1",
+    "look_rule": "Single J3 run plus reader in one look window; S0 synthetic benchmark is not a data look",
+    "pass_labels": {
+      "above": "CI lower > 0.0228: beats ask (indicative)",
+      "disclosure": "The ask-minus-NBP gap was measured on venue rungs, a different event set; indicative comparison only",
+      "otherwise": "beats NBP",
+      "threshold": 0.0228
+    }
+  },
+  "power": {
+    "compute_n_min": {
+      "role": "Reported only, non-gating; N_MIN_CEILING is not applied",
+      "source": "src/breezy/analysis/nbp_calibration.py:330-347"
+    },
+    "degenerate_sigma_rule": "For sigma_d=0, n_min_adj=0 by the formula; report compute_n_min as undefined (it refuses non-positive sigma). Empty cells are UNDERPOWERED with no verdict statistic.",
+    "disclosure": "The prior sigma is reconstructed from the 2026-09-30 G2.2 NBS-MOS M2-M1 Brier statistic's n_min=592; this is a different statistic from dRES. The source's measured sigma_d=0.13195862875714462 is not the reconstructed prior.",
+    "n": "Number of distinct (station, climate_day) clusters in the cell, not rung-event count",
+    "n_min_adj": "ceil(((z_b + Z_POWER_080) * sigma_d / G22_TARGET_DIFFERENCE_X)^2)",
+    "prior_constants_source": [
+      "src/breezy/analysis/nbp_calibration.py:309-314",
+      "docs/evidence/NBP_S2_VALIDATE_RESULT_2026-09-30.md:10"
+    ],
+    "prior_floor": 914,
+    "prior_floor_formula": "ceil(((z_b + Z_POWER_080) * prior_sigma_d / G22_TARGET_DIFFERENCE_X)^2)",
+    "prior_sigma_d": 0.13200811749139565,
+    "prior_sigma_d_formula": "G22_TARGET_DIFFERENCE_X * sqrt(592) / (round(Z_ALPHA_TWO_SIDED_095, 6) + round(Z_POWER_080, 6)) = 0.0152*sqrt(592)/(1.959964 + 0.841621)",
+    "sigma_d": "pstdev of per-(station, climate_day) mean over the three rungs of ((p_arm-o)^2 - (p_M0t-o)^2)",
+    "z_b": 2.638257273476751,
+    "z_b_formula": "NormalDist().inv_cdf(1 - 0.05/12); 16 significant digits"
+  },
+  "precedence": [
+    "UNDERPOWERED (n < n_min_adj)",
+    "FAIL (CI lower <= 0 or point < 0.0152)",
+    "RES_ONLY_MISCALIBRATED (REL_arm > REL_M0t)",
+    "OBS_DRIVEN (D0 only: RES_arm - RES_M0prime <= 0; counts as FAIL)",
+    "PASS"
+  ],
+  "root": "~/.local/share/breezy/derived/gap1_source_resolution",
+  "run_id": "gap1_j3_2026-11-02",
+  "successor": {
+    "accounting": "Retain and cite the burned primary; add one K_cum look per burned primary; at most this one successor is allowed",
+    "allowed_only_if": [
+      "Primary has neither oof_rows.jsonl nor result.json",
+      "Journal proves an infrastructure kill: OOM, RuntimeMaxSec, or MemoryError from the address-space cap",
+      "Prereg digest, both feature-file sha256 digests checked against build.json, code SHA, and C1 digest are identical"
+    ],
+    "enforcement": "Reader and S6 enforce these rules; the primary path is the only ordinary accepted --j3-dir, with the sole conditional exception above",
+    "mutable_only_upward": [
+      "MemoryMax",
+      "RuntimeMaxSec",
+      "--max-memory-gib"
+    ],
+    "only_dir": "~/.local/share/breezy/derived/gap1_source_resolution/gap1_j3_2026-11-02-s2/j3",
+    "primary_stage_a": "NOT outcome-blind: m0_fold_crps uses truth; arm-blind. The successor never reads the primary's stage_a.json, which remains unread until the successor completes",
+    "refusal": [
+      "More than one directory has either oof_rows.jsonl or result.json",
+      "A successor exists while primary oof_rows.jsonl exists",
+      "Any J3 directory other than the registered primary and this sole conditional successor",
+      "Unchanged-input evidence or infrastructure journal evidence is missing"
+    ],
+    "stage_a_source": "scripts/analysis/multisource_blend_skill.py:518-531",
+    "write_once_source": "scripts/analysis/multisource_blend_skill.py:324-333,448-470"
+  },
+  "test_plan": {
+    "T8b": "scipy.stats.t(df=5, loc=m_star, scale=s).cdf agrees with student_t_cdf(m_star, s, 5) at the ladder edges (lo-0.5, hi+0.5) within 1e-12"
+  }
+}
