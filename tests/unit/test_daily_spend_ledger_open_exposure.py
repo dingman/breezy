@@ -11,7 +11,7 @@ import ast
 import inspect
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Final
 
@@ -24,6 +24,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
     COST_BUDGET_BUCKET_ABOVE_SENTINEL,
     COST_BUDGET_BUCKET_ORDER,
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailyBudgetExhausted,
     DailySpendLedger,
@@ -50,12 +51,180 @@ ZERO: Final = Decimal(0)
 
 
 @contextmanager
-def _budget(*, daily: str = "1000.00", position: str = "1000.00") -> Iterator[None]:
+def _budget(
+    *, daily: str = "1000.00", position: str = "1000.00", monthly: str = "1000000.00"
+) -> Iterator[None]:
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, monthly),
     ):
         yield
+
+
+@pytest.mark.parametrize("realized,expected", [(None, "0"), ("1.001", "1.01")])
+def test_month_public_release_and_true_up(realized: str | None, expected: str) -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        if realized is None:
+            ledger.release_booking(booking, now_ns=D1_MIDDAY)
+        else:
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal(realized), now_ns=D1_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D1_MIDDAY) == Decimal(expected)
+        assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal(expected)
+
+
+@pytest.mark.parametrize("realized,expected", [(None, "1"), ("2.00", "3")])
+def test_same_month_earlier_day_settlement_adjusts_only_month(
+    realized: str | None, expected: str
+) -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        _register(ledger, "prior", "5.00", booking=booking)
+        _auth(ledger, "1.00", D2_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(6)
+        assert _settle(
+            ledger,
+            "prior",
+            booking=booking,
+            realized=realized,
+            fill_ts_ns=D1_MIDDAY,
+            now_ns=D2_MIDDAY,
+        )
+        assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(expected)
+        assert ledger.spent_today_usd(now_ns=D2_MIDDAY) == Decimal(1)
+        with pytest.raises(LiveTradingPermissionError, match="unregistered"):
+            _settle(ledger, "prior", booking=booking, realized=realized, now_ns=D2_MIDDAY)
+        assert not _settle(ledger, "prior", now_ns=D2_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(expected)
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_open_or_ambiguous_exposure_counts_across_month(ambiguous: bool) -> None:
+    before, after = _ns(2026, 10, 1) - 1, _ns(2026, 10, 1)
+    with _budget(monthly="5.00"):
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "4.00", before)
+        _register(ledger, "open", "4.00", booking=booking, now_ns=before)
+        if ambiguous:
+            ledger.mark_ambiguous("open")
+        _auth(ledger, "1.00", after)
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted):
+            _auth(ledger, "0.01", after)
+        assert ledger.spent_this_month_usd(now_ns=after) == Decimal(1)
+        assert _settle(
+            ledger, "open", booking=booking, realized="2.00", fill_ts_ns=after, now_ns=after
+        )
+        assert ledger.spent_this_month_usd(now_ns=after) == Decimal(3)
+        _auth(ledger, "2.00", after)
+        assert ledger.spent_this_month_usd(now_ns=after) == Decimal(5)
+
+
+def test_month_unknown_exposure_refuses_without_debit() -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        _register(ledger, "unknown", None)
+        ledger.mark_ambiguous("unknown")
+        with pytest.raises(OpenExposureBoundExceeded):
+            _auth(ledger, "1.00", D1_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D1_MIDDAY) == 0
+
+
+@pytest.mark.parametrize("daily_partial", ["0", "2.00"])
+def test_month_seeded_partials_independent_of_daily_partials(daily_partial: str) -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        ledger.seed_month_spent({date(2026, 9, 2): Decimal(2)}, D2_MIDDAY)
+        ledger.seed_spent(day=date(2026, 9, 3), spent_usd=Decimal(daily_partial), now_ns=D2_MIDDAY)
+        ledger.register_open_exposure(
+            "partial",
+            Decimal(5) - Decimal(daily_partial),
+            booking=None,
+            seeded_partial_usd=Decimal(daily_partial),
+            seeded_month_partial_usd=Decimal(2),
+            side="BUY",
+            now_ns=D2_MIDDAY,
+        )
+        assert _settle(ledger, "partial", realized="4.00", fill_ts_ns=D2_MIDDAY, now_ns=D2_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(4)
+        assert ledger.spent_today_usd(now_ns=D2_MIDDAY) == Decimal(4)
+        assert not _settle(ledger, "partial", now_ns=D2_MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(4)
+
+
+def test_seeded_partial_open_risk_is_not_forgotten_at_month_roll() -> None:
+    before, after = _ns(2026, 10, 1) - 1, _ns(2026, 10, 1)
+    with _budget(monthly="5.00"):
+        ledger = DailySpendLedger()
+        ledger.seed_month_spent({date(2026, 9, 30): Decimal(2)}, before)
+        ledger.register_open_exposure(
+            "partial",
+            Decimal(3),
+            booking=None,
+            seeded_partial_usd=Decimal(2),
+            seeded_month_partial_usd=Decimal(2),
+            side="BUY",
+            now_ns=before,
+        )
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted):
+            _auth(ledger, "0.01", after)
+        assert _settle(ledger, "partial", realized="4.00", fill_ts_ns=after, now_ns=after)
+        assert ledger.spent_this_month_usd(now_ns=after) == Decimal(4)
+
+
+def test_month_partial_requires_recovered_spend_and_cannot_claim_it_twice() -> None:
+    ledger = DailySpendLedger()
+
+    def register(key: str) -> None:
+        ledger.register_open_exposure(
+            key,
+            Decimal(5),
+            booking=None,
+            seeded_partial_usd=Decimal(0),
+            seeded_month_partial_usd=Decimal(2),
+            side="BUY",
+            now_ns=D2_MIDDAY,
+        )
+
+    with pytest.raises(LiveTradingPermissionError, match="monthly seed"):
+        register("unseeded")
+    assert not ledger.has_open_exposure("unseeded")
+    ledger.seed_month_spent({date(2026, 9, 2): Decimal(2)}, D2_MIDDAY)
+    register("first")
+    with pytest.raises(LiveTradingPermissionError, match="monthly seed"):
+        register("duplicate")
+    assert not ledger.has_open_exposure("duplicate")
+    assert ledger.spent_this_month_usd(now_ns=D2_MIDDAY) == Decimal(2)
+
+
+def test_month_settlement_failure_is_atomic_then_valid_retry_succeeds() -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        _register(ledger, "atomic", "5.00", booking=booking)
+        ledger.mark_ambiguous("atomic")
+        with pytest.raises(LiveTradingPermissionError, match="more than authorized"):
+            _settle(ledger, "atomic", booking=booking, realized="5.01")
+        assert ledger.spent_this_month_usd(now_ns=D1_MIDDAY) == Decimal(5)
+        assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal(5)
+        assert ledger.ambiguous_open_total() == Decimal(5)
+        assert ledger.has_open_exposure("atomic")
+        assert _settle(ledger, "atomic", booking=booking, realized="2.00")
+        assert ledger.spent_this_month_usd(now_ns=D1_MIDDAY) == Decimal(2)
+
+
+def test_invalid_cross_day_settlement_does_not_roll_or_change_month() -> None:
+    with _budget():
+        ledger = DailySpendLedger()
+        booking = _auth(ledger, "5.00", D1_MIDDAY)
+        _register(ledger, "atomic", "5.00", booking=booking)
+        with pytest.raises(LiveTradingPermissionError, match="does not match"):
+            _settle(ledger, "atomic", realized="2.00", now_ns=D2_MIDDAY)
+        assert ledger.spent_today_usd(now_ns=D1_MIDDAY) == Decimal(5)
+        assert ledger.spent_this_month_usd(now_ns=D1_MIDDAY) == Decimal(5)
+        assert ledger.has_open_exposure("atomic")
 
 
 def _auth(ledger: DailySpendLedger, cost: str, now_ns: int) -> SpendBooking:
@@ -740,7 +909,11 @@ def test_operator_caps_never_assigned() -> None:
         and isinstance(c.value, str)
         and c.value.startswith("BREEZY_MAX")
     }
-    assert controls == {MAX_DAILY_BUDGET_USD_ENV_VAR, MAX_POSITION_COST_USD_ENV_VAR}
+    assert controls == {
+        MAX_DAILY_BUDGET_USD_ENV_VAR,
+        MAX_POSITION_COST_USD_ENV_VAR,
+        MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+    }
 
 
 def test_inlock_refuses_while_unknown_notional_key_present() -> None:

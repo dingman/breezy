@@ -1,10 +1,10 @@
 (
-    """The two operator-reserved controls, as MECHANISM ONLY (EXEC SPINE R-6e).
+    """The three operator-reserved controls, as MECHANISM ONLY (EXEC SPINE R-6e).
 
 WHAT THIS MODULE IS
 -------------------
 
-Two controls, and only the operator sets them:
+Three controls, and only the operator sets them:
 
 * :data:`MAX_DAILY_BUDGET_USD_ENV_VAR` -- a rolling **calendar-day USD
   notional** ceiling, accumulated across every order the process authorises in
@@ -14,6 +14,8 @@ Two controls, and only the operator sets them:
   position IS its premium: ``price x quantity``. Contracts are the wrong unit
   for a loss ceiling because the same 250 contracts cost $12.50 at $0.05 and
   $237.50 at $0.95.
+* :data:`MAX_MONTHLY_BUDGET_USD_ENV_VAR` -- a UTC-calendar-month gross-entry
+  premium admission ceiling, accumulated under the daily ledger's lock.
 
 **This is NOT** :attr:`breezy.strategy.weather_common.risk.RiskLimits.
 max_position_contracts`. That is a per-strategy sizing tunable in CONTRACTS,
@@ -22,10 +24,10 @@ carried in a config object, and nothing here reads, widens or replaces it.
 THE ARRIVAL PATH, AND THE ONE RULE
 ----------------------------------
 
-The operator exports both variables in the shell that launches
-``breezy-trade``. The operator MAY keep the two values in the gitignored root
+The operator exports all three variables in the shell that launches
+``breezy-trade``. The operator MAY keep the values in the gitignored root
 ``operator.env`` and source it from THEIR shell; repo Python still never loads
-or assigns it. **No value for either control is assigned anywhere in this
+or assigns it. **No value for any control is assigned anywhere in this
 repository** -- not in ``src/``, ``scripts/``, ``tests/``, a fixture, a
 ``conftest``, a committed ``.env``, a systemd unit, a default argument, or an
 ``os.environ.get(NAME, <fallback>)``. That is not a convention: it is scanned
@@ -40,8 +42,8 @@ environment write from ``src/`` and ``scripts/``, name-agnostic, plus
 -- where a default actually creeps in, as a fixture -- and the READ-with-a-
 default form, which that scan passes untouched because it is not a write.
 
-**Absence FAILS CLOSED.** Both controls are read on EVERY authorisation, so
-with either unset every order is refused, forever, with no cached grant to go
+**Absence FAILS CLOSED.** All three controls are read on EVERY authorisation, so
+with any unset every order is refused, forever, with no cached grant to go
 stale. The refusal names the missing control and NEVER its value -- the
 precedent is ``safety._refuse``, which emits only ``type(value).__name__``.
 
@@ -53,7 +55,7 @@ environment and refuses on absence or blankness, and
 ``safety._read_operator_money`` layers the USD form check, the decimal parse
 and the positivity check on top of it -- calling it, so there is still exactly
 ONE reader and ONE refusal policy for every operator control in this package.
-Both controls are USD amounts, so they are read through that same function.
+All three controls are USD amounts, so they are read through that same function.
 Building a second reader would fork the refusal policy, which is the defect
 that function exists to prevent.
 
@@ -106,7 +108,7 @@ from __future__ import annotations
 
 import itertools
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_UP, Decimal
@@ -126,6 +128,10 @@ from breezy.adapters.polymarket_us.safety import (
 #: neither means the day's dollar ceiling was reached.
 class DailyBudgetExhausted(LiveTradingPermissionError):
     """The daily USD budget was reached; today's remaining orders are denied."""
+
+
+class MonthlyBudgetExhausted(LiveTradingPermissionError):
+    """The monthly USD budget refuses admission without marking daily exhaustion."""
 
 
 class OpenExposureBoundExceeded(LiveTradingPermissionError):
@@ -149,12 +155,17 @@ MAX_DAILY_BUDGET_USD_ENV_VAR: Final = "BREEZY_MAX_DAILY_BUDGET_USD"
 #: Operator-reserved: this repo never assigns it a value.
 MAX_POSITION_COST_USD_ENV_VAR: Final = "BREEZY_MAX_POSITION_COST_USD"
 
+#: The operator's UTC-calendar-month gross-entry premium admission ceiling.
+#: Operator-reserved: this repo never assigns it a value.
+MAX_MONTHLY_BUDGET_USD_ENV_VAR: Final = "BREEZY_MAX_MONTHLY_BUDGET_USD"
+
 #: The complete inventory of operator-reserved controls introduced by R-6e.
 #: The assignment scan derives its search tokens from THIS tuple, so a third
 #: control added here is covered by the scan without editing the scan.
 OPERATOR_RESERVED_CONTROL_ENV_VARS: Final = (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
 )
 
 #: USD are quantised to the cent, and costs round UP: a fraction of a cent of
@@ -215,6 +226,15 @@ def operator_max_position_cost_usd() -> Decimal:
         LiveTradingPermissionError: naming the control, never its value.
     """
     return _read_operator_money(MAX_POSITION_COST_USD_ENV_VAR)
+
+
+def operator_max_monthly_budget_usd() -> Decimal:
+    """Read the operator's UTC-calendar-month USD ceiling without a default.
+
+    Raises:
+        LiveTradingPermissionError: naming the control, never its value.
+    """
+    return _read_operator_money(MAX_MONTHLY_BUDGET_USD_ENV_VAR)
 
 
 def cost_budget_bucket_label() -> str:
@@ -324,6 +344,10 @@ class _OpenExposure:
     booking: SpendBooking | None
     seeded_partial: Decimal
     charged: bool
+    #: Monthly accounting is independent of the daily charge and seed.
+    month_key: tuple[int, int]
+    month_charge: Decimal
+    month_seeded_partial: Decimal
     ambiguous: bool = False
     #: A roll converted this entry from charged to uncharged.
     crossed: bool = False
@@ -386,7 +410,7 @@ def _checked_filled_cost(booking: SpendBooking, filled_cost_usd: object) -> Deci
 
 
 class DailySpendLedger:
-    """A UTC-calendar-day accumulator of USD notional spent.
+    """UTC-calendar-day and month accumulators of USD entry premium spent.
 
     Breezy-owned because ``RiskLimits`` has no time dimension at all: it caps
     position, event and location notional, but nothing there knows what a day
@@ -408,6 +432,9 @@ class DailySpendLedger:
         "_f_breaker",
         "_last_ns",
         "_lock",
+        "_month_key",
+        "_month_seeded",
+        "_month_spent_usd",
         "_open",
         "_record_marks",
         "_registry_last_ns",
@@ -450,6 +477,9 @@ class DailySpendLedger:
         self._lock = threading.Lock()
         self._day: date | None = None
         self._spent_usd = Decimal(0)
+        self._month_key: tuple[int, int] | None = None
+        self._month_spent_usd = Decimal(0)
+        self._month_seeded = False
         self._last_ns = 0
         self._bookings: dict[int, SpendBooking] = {}
         self._released_ids: set[int] = set()
@@ -459,6 +489,44 @@ class DailySpendLedger:
         #: process must not double-book, so every call after the first is a
         #: no-op regardless of the figure it carries.
         self._seeded = False
+
+    def seed_month_spent(self, buckets: Mapping[date, Decimal], now_ns: int) -> None:
+        """Recover dated month spend once, independently of the daily seed.
+
+        Buckets must be non-negative finite Decimal costs for elapsed days of
+        the effective UTC month. Invalid input never consumes the one-shot
+        seed. Recovery never lowers current spend or rewinds the clock.
+        """
+        day = utc_day_for_ns(now_ns)
+        month = (day.year, day.month)
+        if not isinstance(buckets, Mapping):
+            raise LiveTradingPermissionError("month buckets must be a mapping")
+        total = Decimal(0)
+        for bucket_day, value in buckets.items():
+            if (
+                type(bucket_day) is not date
+                or (bucket_day.year, bucket_day.month) != month
+                or bucket_day > day
+            ):
+                raise LiveTradingPermissionError("month bucket must be an elapsed UTC month day")
+            total += _round_cost_up_to_cent(_require_exact_decimal(value, "month bucket spend"))
+        with self._lock:
+            if self._month_seeded:
+                return
+            if now_ns < max(self._last_ns, self._registry_last_ns):
+                raise LiveTradingPermissionError("the injected clock moved backwards")
+            self._roll_month_locked(month)
+            self._month_spent_usd = max(self._month_spent_usd, total)
+            self._month_seeded = True
+            self._last_ns = max(self._last_ns, now_ns)
+
+    def spent_this_month_usd(self, *, now_ns: int) -> Decimal:
+        """Accumulated spend for the queried UTC month; zero outside it, without mutation."""
+        day = utc_day_for_ns(now_ns)
+        with self._lock:
+            if self._month_key != (day.year, day.month):
+                return Decimal(0)
+            return self._month_spent_usd
 
     def seed_spent(self, *, day: date, spent_usd: Decimal, now_ns: int) -> None:
         """Book prior spend into the ledger exactly once per process (S0).
@@ -508,9 +576,9 @@ class DailySpendLedger:
         quantity: Decimal,
         now_ns: int,
     ) -> SpendBooking:
-        """Refuse or record the cost of one order against both controls.
+        """Refuse or record the cost of one order against all three controls.
 
-        Both controls are read FIRST, before either is applied, so an absent
+        All three controls are read FIRST, before any is applied, so an absent
         control refuses regardless of which ceiling the order would have
         breached. Spend is recorded only on a grant, and the whole
         read-check-record sequence is under one lock.
@@ -526,19 +594,20 @@ class DailySpendLedger:
             the USD amount recorded against the day's budget.
 
         Raises:
-            LiveTradingPermissionError: if either control is unset or
+            LiveTradingPermissionError: if any control is unset or
                 malformed, if the cost exceeds the per-position ceiling, if it
-                would carry the day past the daily budget, or if the clock
+                would carry the day or month past its budget, or if the clock
                 moved backwards. Every message names the control, never its
                 value or the amounts involved.
         """
         day = utc_day_for_ns(now_ns)
         cost = order_cost_usd(price_usd=price_usd, quantity=quantity)
 
-        # Read BOTH before applying EITHER: absence must refuse identically
+        # Read all three before any comparison: absence must refuse identically
         # whichever ceiling the order would have hit first.
         daily_budget = operator_max_daily_budget_usd()
         position_cap = operator_max_position_cost_usd()
+        monthly_budget = operator_max_monthly_budget_usd()
 
         if cost > position_cap:
             raise LiveTradingPermissionError(
@@ -556,17 +625,28 @@ class DailySpendLedger:
                     f"{MAX_DAILY_BUDGET_USD_ENV_VAR} refuses this order: the injected "
                     f"clock moved backwards, and spent budget is never resurrected"
                 )
+            # A refusal can still roll the calendar; that roll must never be rewound.
+            self._last_ns = now_ns
             if self._day != day:
                 self._roll_locked(day)
+            else:
+                self._roll_month_locked((day.year, day.month))
             if self._spent_usd + cost > daily_budget:
                 raise DailyBudgetExhausted(
                     f"{MAX_DAILY_BUDGET_USD_ENV_VAR} refuses this order: it would carry "
                     f"today's USD notional past the operator's daily budget"
                 )
             self._require_exposure_headroom_locked(cost, daily_budget, rolled=False)
+            month_exposure = self._uncharged_month_exposure_locked()
+            if self._month_spent_usd + month_exposure + cost > monthly_budget:
+                raise MonthlyBudgetExhausted(
+                    f"{MAX_MONTHLY_BUDGET_USD_ENV_VAR} refuses this order: spent budget plus "
+                    f"unsettled open exposure would pass the operator's monthly budget"
+                )
             booking = SpendBooking(cost=cost, day=day, booking_id=next(_BOOKING_IDS))
             self._bookings[booking.booking_id] = booking
             self._spent_usd = self._spent_usd + cost
+            self._month_spent_usd += cost
             self._last_ns = now_ns
             return booking
 
@@ -628,7 +708,10 @@ class DailySpendLedger:
         granted = self._require_open_booking(booking, now_ns=eff_now, action="released")
         if self._spent_usd < granted.cost:
             raise LiveTradingPermissionError("spent would go negative")
+        if self._month_spent_usd < granted.cost:
+            raise LiveTradingPermissionError("month spend would go negative")
         self._spent_usd = self._spent_usd - granted.cost
+        self._month_spent_usd -= granted.cost
         self._released_ids.add(granted.booking_id)
         self._last_ns = eff_now
 
@@ -667,9 +750,10 @@ class DailySpendLedger:
         granted = self._require_open_booking(booking, now_ns=eff_now, action="trued up")
         if self._spent_usd < granted.cost:
             raise LiveTradingPermissionError("spent would go negative")
+        if self._month_spent_usd < granted.cost:
+            raise LiveTradingPermissionError("month spend would go negative")
         self._spent_usd = self._spent_usd - granted.cost + realized
-        if self._spent_usd < Decimal(0):
-            raise LiveTradingPermissionError("spent would go negative")
+        self._month_spent_usd = self._month_spent_usd - granted.cost + realized
         self._trued_up_ids.add(granted.booking_id)
         self._last_ns = eff_now
         return realized
@@ -693,6 +777,7 @@ class DailySpendLedger:
         Surviving OPEN registry entries are NOT dropped: their charge is gone
         with the day's spend, so they convert to uncharged exposure.
         """
+        self._roll_month_locked((day.year, day.month))
         self._bookings = {
             booking_id: booking
             for booking_id, booking in self._bookings.items()
@@ -707,6 +792,32 @@ class DailySpendLedger:
             if entry.charged:
                 entry.crossed = True
             entry.charged = False
+
+    def _roll_month_locked(self, month: tuple[int, int]) -> None:
+        """Roll only forward; unresolved exposure survives without a monthly charge."""
+        if self._month_key is not None and month <= self._month_key:
+            return
+        self._month_key = month
+        self._month_spent_usd = Decimal(0)
+        for entry in self._open.values():
+            if entry.month_key != month:
+                entry.month_key = month
+                entry.month_charge = Decimal(0)
+                entry.month_seeded_partial = Decimal(0)
+
+    def _uncharged_month_exposure_locked(self) -> Decimal:
+        """Only amounts not already in the month total consume additional headroom."""
+        total = Decimal(0)
+        for entry in self._open.values():
+            if entry.notional is None:
+                # The existing daily exposure check refuses unknown risk first.
+                raise OpenExposureBoundExceeded("open exposure has an unknown notional")
+            if entry.month_charge == 0:
+                total += max(
+                    entry.notional + entry.seeded_partial - entry.month_seeded_partial,
+                    Decimal(0),
+                )
+        return total
 
     def _totals_locked(self, *, rolled: bool) -> tuple[Decimal, Decimal]:
         """``(uncharged, ambiguous)`` known-notional totals, BUY entries only.
@@ -755,6 +866,7 @@ class DailySpendLedger:
         seeded_partial_usd: Decimal,
         side: str,
         now_ns: int,
+        seeded_month_partial_usd: Decimal = Decimal(0),
     ) -> None:
         """Register one open BUY order's exposure under ``key``.
 
@@ -776,6 +888,7 @@ class DailySpendLedger:
         if notional_usd is not None:
             _require_exact_decimal(notional_usd, "notional_usd")
         partial = _require_exact_decimal(seeded_partial_usd, "seeded_partial_usd")
+        month_partial = _require_exact_decimal(seeded_month_partial_usd, "seeded_month_partial_usd")
         if booking is not None:
             _require_booking_type(booking)
         with self._lock:
@@ -783,11 +896,37 @@ class DailySpendLedger:
                 raise LiveTradingPermissionError("exposure key is already registered")
             eff_now = max(now_ns, self._last_ns, self._registry_last_ns)
             eff_day = utc_day_for_ns(eff_now)
+            month = (eff_day.year, eff_day.month)
+            if month_partial:
+                claimed = sum(
+                    (e.month_seeded_partial for e in self._open.values() if e.month_key == month),
+                    Decimal(0),
+                )
+                if (
+                    not self._month_seeded
+                    or self._month_key != month
+                    or claimed + month_partial > self._month_spent_usd
+                ):
+                    raise LiveTradingPermissionError("monthly seed does not cover this partial")
             charged = booking is not None and booking.day == eff_day and self._day == booking.day
             if charged and booking is not None:  # narrows ``booking`` for the type checker
                 self._require_open_booking(booking, now_ns=eff_now, action="registered")
+            month_charge = Decimal(0)
+            if (
+                booking is not None
+                and (booking.day.year, booking.day.month) == month == self._month_key
+            ):
+                if not charged:
+                    raise LiveTradingPermissionError("prior-day booking must already be registered")
+                month_charge = booking.cost
             self._open[key] = _OpenExposure(
-                notional=notional_usd, booking=booking, seeded_partial=partial, charged=charged
+                notional=notional_usd,
+                booking=booking,
+                seeded_partial=partial,
+                charged=charged,
+                month_key=month,
+                month_charge=month_charge,
+                month_seeded_partial=month_partial,
             )
             if notional_usd is None:
                 self._unknown_keys.add(key)
@@ -882,13 +1021,40 @@ class DailySpendLedger:
             if booking is not None and entry.charged and self._day == eff_day:
                 self._settle_live_locked(booking, realized, eff_now)
             else:
+                month_spent = self._settled_month_total_locked(entry, realized, fill_day, eff_day)
                 self._settle_uncharged_locked(entry, realized, fill_day, eff_day)
+                self._month_spent_usd = month_spent
                 if entry.crossed or (booking is not None and booking.day != eff_day):
                     self._cross_day_settles += 1
             del self._open[key]
             self._unknown_keys.discard(key)
             self._registry_last_ns = eff_now
             return True
+
+    def _settled_month_total_locked(
+        self, entry: _OpenExposure, realized: Decimal | None, fill_day: date | None, eff_day: date
+    ) -> Decimal:
+        """Validate and compute the month replacement before either accumulator mutates.
+
+        A prior-day charge in the same month is replaced here, independently
+        of the public daily-booking restriction. At a month boundary only a
+        fill attributed to the new month adds spend to its new accumulator.
+        """
+        month = (eff_day.year, eff_day.month)
+        spent = self._month_spent_usd if self._month_key == month else Decimal(0)
+        charge = entry.month_charge if entry.month_key == month else Decimal(0)
+        if charge:
+            if spent < charge:
+                raise LiveTradingPermissionError("month spend would go negative")
+            return spent - charge + (Decimal(0) if realized is None else realized)
+        if (
+            realized is not None
+            and fill_day is not None
+            and (fill_day.year, fill_day.month) == month
+        ):
+            partial = entry.month_seeded_partial if entry.month_key == month else Decimal(0)
+            spent += max(realized - partial, Decimal(0))
+        return spent
 
     def _settle_live_locked(
         self, booking: SpendBooking, realized: Decimal | None, eff_now: int
@@ -904,6 +1070,8 @@ class DailySpendLedger:
         """Prior-day booking or uncharged entry: roll forward, then add once."""
         if self._day is None or eff_day > self._day:
             self._roll_locked(eff_day)
+        else:
+            self._roll_month_locked((eff_day.year, eff_day.month))
         if realized is None or fill_day != eff_day or self._day != eff_day:
             return
         self._spent_usd += max(realized - entry.seeded_partial, Decimal(0))

@@ -19,6 +19,7 @@ fires.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from typing import Final
 
 import pytest
 
+from breezy.adapters.polymarket_us import operator_controls
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
@@ -56,13 +58,196 @@ MIDDAY: Final[int] = _ns(2026, 9, 2, 12)
 
 
 @contextmanager
-def _budget(*, daily: str, position: str) -> Iterator[None]:
+def _budget(*, daily: str, position: str, monthly: str = "1000000.00") -> Iterator[None]:
     """Both controls set for the duration of a ``with`` block, then restored."""
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, monthly),
     ):
         yield
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", "not-money", "-1.00", "0.00"])
+def test_invalid_month_refuses_before_position_or_day_comparison(raw: str | None) -> None:
+    ledger = DailySpendLedger()
+    name = operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR
+    binding = operator_control_unset(name) if raw is None else operator_control_env(name, raw)
+    with _budget(daily="1.00", position="1.00"), binding:
+        with pytest.raises(LiveTradingPermissionError) as exc:
+            ledger.authorize_order_cost(price_usd=Decimal(2), quantity=Decimal(1), now_ns=MIDDAY)
+        assert name in str(exc.value)
+        assert not isinstance(exc.value, DailyBudgetExhausted)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == 0
+        assert ledger.spent_this_month_usd(now_ns=MIDDAY) == 0
+
+
+def test_month_reader_inventory_signature_and_value_redaction() -> None:
+    reader = operator_controls.operator_max_monthly_budget_usd
+    name = operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR
+    assert operator_controls.OPERATOR_RESERVED_CONTROL_ENV_VARS == (
+        MAX_DAILY_BUDGET_USD_ENV_VAR,
+        MAX_POSITION_COST_USD_ENV_VAR,
+        name,
+    )
+    assert not inspect.signature(reader).parameters
+    with operator_control_env(name, "17.31"):
+        assert reader() == Decimal("17.31")
+    with _budget(daily="100.00", position="100.00", monthly="17.31"):
+        ledger = DailySpendLedger()
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted) as exc:
+            ledger.authorize_order_cost(price_usd=Decimal(18), quantity=Decimal(1), now_ns=MIDDAY)
+        assert name in str(exc.value)
+        assert "17.31" not in str(exc.value) and "18" not in str(exc.value)
+        assert not isinstance(exc.value, DailyBudgetExhausted)
+
+
+def test_month_exactly_at_cap_allowed_over_cap_not_debited() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="100.00", monthly="5.00"):
+        ledger.authorize_order_cost(price_usd=Decimal(5), quantity=Decimal(1), now_ns=MIDDAY)
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted):
+            ledger.authorize_order_cost(
+                price_usd=Decimal("0.001"), quantity=Decimal(1), now_ns=MIDDAY
+            )
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(5)
+        assert ledger.spent_this_month_usd(now_ns=MIDDAY) == Decimal(5)
+
+
+def test_day_plus_month_breach_day_wins() -> None:
+    with _budget(daily="5.00", position="100.00", monthly="5.00"):
+        ledger = DailySpendLedger()
+        ledger.authorize_order_cost(price_usd=Decimal(5), quantity=Decimal(1), now_ns=MIDDAY)
+        with pytest.raises(DailyBudgetExhausted):
+            ledger.authorize_order_cost(price_usd=Decimal(1), quantity=Decimal(1), now_ns=MIDDAY)
+        assert ledger.spent_this_month_usd(now_ns=MIDDAY) == Decimal(5)
+
+
+def test_concurrent_month_admission_is_atomic() -> None:
+    ledger = DailySpendLedger()
+    barrier = threading.Barrier(8)
+    granted: list[object] = []
+    denied: list[Exception] = []
+
+    def attempt() -> None:
+        barrier.wait()
+        try:
+            granted.append(
+                ledger.authorize_order_cost(
+                    price_usd=Decimal(1), quantity=Decimal(1), now_ns=MIDDAY
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- assert every worker outcome
+            denied.append(exc)
+
+    with _budget(daily="100.00", position="100.00", monthly="3.00"):
+        workers = [threading.Thread(target=attempt) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+        assert all(not worker.is_alive() for worker in workers)
+    assert len(granted) == 3 and len(denied) == 5
+    assert all(type(exc) is operator_controls.MonthlyBudgetExhausted for exc in denied)
+    assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(3)
+    assert ledger.spent_this_month_usd(now_ns=MIDDAY) == Decimal(3)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        _ns(2026, 2, 1),
+        _ns(2024, 3, 1),
+        _ns(2027, 1, 1),
+    ],
+)
+def test_month_rolls_at_utc_midnight_of_the_first(boundary: int) -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="100.00", monthly="5.00"):
+        ledger.authorize_order_cost(price_usd=Decimal(5), quantity=Decimal(1), now_ns=boundary - 1)
+        assert ledger.spent_this_month_usd(now_ns=boundary - 1) == Decimal(5)
+        assert ledger.spent_this_month_usd(now_ns=boundary) == 0
+        # The accessor has not rolled or erased the accumulating month.
+        assert ledger.spent_this_month_usd(now_ns=boundary - 1) == Decimal(5)
+        ledger.authorize_order_cost(price_usd=Decimal(1), quantity=Decimal(1), now_ns=boundary)
+        assert ledger.spent_this_month_usd(now_ns=boundary) == Decimal(1)
+        assert ledger.spent_this_month_usd(now_ns=boundary - 1) == 0
+        with pytest.raises(LiveTradingPermissionError, match="clock moved backwards"):
+            ledger.authorize_order_cost(
+                price_usd=Decimal(1), quantity=Decimal(1), now_ns=boundary - 1
+            )
+        assert ledger.spent_this_month_usd(now_ns=boundary) == Decimal(1)
+
+
+def test_day_rollover_within_leap_february_preserves_month() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="5.00", position="100.00", monthly="6.00"):
+        for now in (_ns(2024, 2, 28, 12), _ns(2024, 2, 29, 12)):
+            ledger.authorize_order_cost(price_usd=Decimal(3), quantity=Decimal(1), now_ns=now)
+        assert ledger.spent_today_usd(now_ns=now) == Decimal(3)
+        assert ledger.spent_this_month_usd(now_ns=now) == Decimal(6)
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted):
+            ledger.authorize_order_cost(price_usd=Decimal(1), quantity=Decimal(1), now_ns=now)
+
+
+def test_denied_admission_at_next_month_cannot_rewind_the_clock() -> None:
+    boundary = _ns(2026, 10, 1)
+    with _budget(daily="100.00", position="100.00", monthly="5.00"):
+        ledger = DailySpendLedger()
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal(5), quantity=Decimal(1), now_ns=boundary - 1
+        )
+        ledger.register_open_exposure(
+            "open",
+            Decimal(5),
+            booking=booking,
+            seeded_partial_usd=Decimal(0),
+            side="BUY",
+            now_ns=boundary - 1,
+        )
+        with pytest.raises(operator_controls.MonthlyBudgetExhausted):
+            ledger.authorize_order_cost(price_usd=Decimal(1), quantity=Decimal(1), now_ns=boundary)
+        with pytest.raises(LiveTradingPermissionError, match="clock moved backwards"):
+            ledger.authorize_order_cost(
+                price_usd=Decimal(1), quantity=Decimal(1), now_ns=boundary - 1
+            )
+        assert ledger.has_open_exposure("open")
+        assert ledger.spent_this_month_usd(now_ns=boundary) == 0
+
+
+def test_seed_month_spent_once_max_and_independent_of_daily_seed() -> None:
+    ledger = DailySpendLedger()
+    today = date(2026, 9, 2)
+    ledger.seed_spent(day=today, spent_usd=Decimal(3), now_ns=MIDDAY)
+    ledger.seed_month_spent({date(2026, 9, 1): Decimal(4), today: Decimal(3)}, MIDDAY)
+    ledger.seed_month_spent({today: Decimal(99)}, MIDDAY)
+    assert ledger.spent_this_month_usd(now_ns=MIDDAY) == Decimal(7)
+    assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(3)
+    with _budget(daily="100.00", position="100.00"):
+        other = DailySpendLedger()
+        other.authorize_order_cost(price_usd=Decimal(9), quantity=Decimal(1), now_ns=MIDDAY)
+        other.seed_month_spent({today: Decimal(3)}, MIDDAY)
+        assert other.spent_this_month_usd(now_ns=MIDDAY) == Decimal(9)
+
+
+@pytest.mark.parametrize(
+    "buckets",
+    [
+        {date(2026, 9, 1): Decimal(-1)},
+        {date(2026, 9, 1): Decimal("NaN")},
+        {date(2026, 9, 1): 1.0},
+        {"2026-09-01": Decimal(1)},
+        {date(2026, 8, 31): Decimal(1)},
+        {date(2026, 9, 3): Decimal(1)},
+    ],
+)
+def test_seed_month_spent_invalid_is_atomic_and_retryable(buckets: dict) -> None:
+    ledger = DailySpendLedger()
+    with pytest.raises(LiveTradingPermissionError):
+        ledger.seed_month_spent(buckets, MIDDAY)
+    assert ledger.spent_this_month_usd(now_ns=MIDDAY) == 0
+    ledger.seed_month_spent({date(2026, 9, 1): Decimal(2)}, MIDDAY)
+    assert ledger.spent_this_month_usd(now_ns=MIDDAY) == Decimal(2)
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +452,7 @@ def test_daily_budget_exhaustion_raises_the_typed_subclass() -> None:
         _budget(daily="100.00", position="200.00"),
         pytest.raises(DailyBudgetExhausted) as excinfo,
     ):
-        ledger.authorize_order_cost(
-            price_usd=Decimal("0.50"), quantity=Decimal(300), now_ns=MIDDAY
-        )
+        ledger.authorize_order_cost(price_usd=Decimal("0.50"), quantity=Decimal(300), now_ns=MIDDAY)
     assert isinstance(excinfo.value, LiveTradingPermissionError)
     assert MAX_DAILY_BUDGET_USD_ENV_VAR in str(excinfo.value)
 
