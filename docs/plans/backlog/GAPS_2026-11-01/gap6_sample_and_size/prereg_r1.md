@@ -114,7 +114,7 @@ Use only the hourly candle with end == ref_end; end < ref_end ⇒ miss (counted 
 
 ## F-12 Look-ahead asserts
 
-ref_end < settlement; pre-cell ref_end < r1 observation-window start; violation raises.
+**F-12 Look-ahead asserts.** Let D be the climate day and W the observation-window start, in LST using the F-9 fixed offset. HIGH: W = D 10:00 LST, the start of the daytime heating period in which the day's maximum forms. LOW: W = D 00:00 LST, the start of the climate day and of the overnight-minimum period. Asserts, each raising on violation: (a) ref_end < settlement; (b) for every pre-cell reference, ref_end ≤ W, so the candle ending at W is the latest admissible, which gives D-1 open-hour and D 10:00 for HIGH, and D-1 open-hour and D-1 18:00 for LOW; (c) for every post-cell reference, ref_end > W (reported only). Post cells never gate. Rule (b) is '≤' because the HIGH D 10:00 pre reference has ref_end exactly equal to W.
 
 ## F-13 Fetch is not a look
 
@@ -126,11 +126,13 @@ n = distinct station-days per cell with ≥5 distinct climate days; cell statist
 
 ## F-15 Decision and descriptive intervals
 
-KILL iff both pre cells adequate and both satisfy F-14 concordance (futility rule on point means); CONTINUE iff any pre cell mean > 0 or INCONCLUSIVE; descriptive only: day-cluster bootstrap (iterations=2000, seed=20261102 literal) and wilson_interval on NO-win counts.
+KILL iff both pre cells adequate and both satisfy F-14 concordance (futility rule on point means); CONTINUE iff either the weighted or pooled mean > 0 in any pre cell, or INCONCLUSIVE; descriptive only: day-cluster bootstrap (iterations=2000, seed=20261102 literal) and wilson_interval on NO-win counts.
 
 ## F-16 Post cells
 
 Post cells never enter the gate; summarize_stratum is not used; no verdict string reaches the gate.
+
+k1 `break_even_probability`, `wilson_interval`, `summarize_stratum` are imported and identity-tested only; `summarize_stratum` is not called in the gate.
 
 ## F-17 Adequacy
 
@@ -153,5 +155,7 @@ One-sided α 0.025, z 1.96 + 0.84, σ 0.14, δ 0.02, n_req 385, H 120 d, D_gate 
 ## F-21 Output
 
 On KILL the script writes `ADAPTER_DECISION: NO-GO` into S0_<date>.md, only on KILL; coordinator notes go in a separate sidecar; the prereg's sha256 is pinned in the script as FROZEN_PREREG_SHA (no sidecar sha file).
+
+Verdict outputs are written to docs/evidence/kalshi_depth/S0_<date>.{md,json}; the audit to docs/evidence/kalshi_depth/S0_<date>_audit.md.
 
 S3 procedure: S3a fetch+seal (one-series timing probe first; RuntimeMaxSec ≥ 1.75× projection; MemoryMax=2G; LimitNOFILE=524288; stall watch) → S3b outcome-blind audit (audit_projection drops `result`; reports per-cell/per-station n, misses, exclusions, F-19 consistency) → S3c verdict from sealed raw only.
