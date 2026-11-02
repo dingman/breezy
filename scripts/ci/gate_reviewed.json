@@ -36,6 +36,7 @@
   "tests/unit/test_registry_resolver.py",
   "tests/unit/test_replay_sufficiency_census.py",
   "tests/unit/test_strategy_module_gate.py",
+  "tests/unit/test_supervisor_operator_caps_spawn_seam.py",
   "tests/unit/test_trade_cli.py",
   "tests/unit/test_trade_supervisor.py",
   "tests/unit/test_unit_health.py",

@@ -43,6 +43,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -306,6 +307,7 @@ async def test_the_create_path_books_to_the_orders_own_instrument(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await fixture.client._submit_order(command)
     record = _reopened_fill_record(fixture.store_path, "ord-no-create-1")

@@ -106,9 +106,9 @@ lowered, no post-hoc screen.
 Ordering rule: PREREG committed, then enablement, then the node. A PREREG written after a fill is not
 a pre-registration.
 
-## 6. Enablement — the two operator caps (amended 2026-09-10)
+## 6. Enablement — the three operator caps (amended 2026-09-10; monthly cap added 2026-11-02)
 
-Operator ruling 2026-09-10: the only operator-controlled variables are the two durable caps.
+Operator ruling 2026-09-10: the only operator-controlled variables are the durable caps (three since 2026-11-02).
 Every other value the live path currently demands is BUILD-SIDE and is supplied by the
 trade-supervisor unit (or derived in code at permit mint) on every launch, including after a reboot.
 
@@ -121,15 +121,18 @@ never read by repo Python):
    ≤4 orders ≈ $3.80 pre-fee — is the binding cross-restart limit);
 2. the **maximum per position** — a USD *cost* ceiling (price × quantity, rounded up to the cent),
    not a contract count, and **pre-fee**. With quantity 1 and asks strictly below 0.95, a
-   whole-dollar cap admits the entire band; a cap below $0.95 refuses its top.
+   whole-dollar cap admits the entire band; a cap below $0.95 refuses its top;
+3. the **maximum monthly budget** — a UTC-calendar-month ceiling on gross-entry premium admission,
+   accumulated under the daily ledger's lock; its refusal is distinct from the daily one and does not
+   mark the day exhausted.
 
-Unknown keys in `operator.env` are still rejected. Absence of either cap still fails closed at
+Unknown keys in `operator.env` are still rejected. Absence of any of the three caps still fails closed at
 permit issue and at every authorization.
 
 **Build-side session values** — not operator knobs. The trade-supervisor unit assigns the
 enablement flags and operator identity (`Environment=` lines; `%u` expands to the unit user).
 The three numeric session ceilings (per-order notional, session notional, session order count)
-are derived at `issue_live_trading_permit` from the two caps when those env vars are absent:
+are derived at `issue_live_trading_permit` from the daily and position caps when those env vars are absent:
 per-order := position cost; session notional := daily budget; session order count :=
 floor(daily / position), minimum 1. An explicit session env var still wins if present.
 Enablement still requires exactly `"1"`. `src/` and `scripts/` remain structurally incapable of
@@ -146,11 +149,11 @@ Operator flow (from the repo root):
 3. Restart the supervisor as §10(a) says. The unit references `operator.env`; the build-side
    constants travel with the unit; the three numeric ceilings derive at permit mint.
 
-Accepted residual: the two caps at rest in `/operator.env` are readable by any same-UID process,
+Accepted residual: the three caps at rest in `/operator.env` are readable by any same-UID process,
 survive the shell, and enter backups. The build-side `Environment=` values are world-readable via
 `systemctl cat` and `/proc/<pid>/environ` (same class as any other non-secret unit env).
 
-Absence fails closed: both caps are re-read on **every** authorization
+Absence fails closed: all three caps are re-read on **every** authorization
 (`operator_controls.py:147-166`, `:333-337`) and raise on absence, blankness, malformation or
 non-positivity — with a message naming the control and never its value. There is no cached grant to go
 stale, so an unset control refuses every order forever.
@@ -164,14 +167,14 @@ contract"); the build side neither suggests nor defaults them.
 ## 7. First run
 
 **Superseded 2026-09-10.** The 2026-09-04 rule that the launch shell exports seven values (enablement,
-the two caps, the three numeric session ceilings, and the operator identity), and that enablement
+the caps, the three numeric session ceilings, and the operator identity), and that enablement
 must never appear in a file, is revoked. Reason: the operator ruled that the only operator-controlled
-variables are the two durable caps; every other live-path value is build-side and must be supplied
+variables are the durable caps; every other live-path value is build-side and must be supplied
 by the build on every launch, including after a reboot. GO_LIVE_PLAN §5's "No agent, and no
 automation in this repo, may set D4" and safety.py's former "No default, never inferred" for the
 three numerics encoded that old policy.
 
-What remains binding: the two caps are never written by the build; unknown keys in `operator.env`
+What remains binding: the three caps are never written by the build; unknown keys in `operator.env`
 are still rejected; the permit still fails closed when the caps are absent; the boot-time permit
 line stays the only proof of order capability. Enablement still requires exactly `"1"`.
 
@@ -209,8 +212,8 @@ state store — the shared `SqliteStateStore` under the runtime state dir, holdi
 `current_rung_hold/trial/{station}/{climate_day}`.
 
 Wrong observations: more than one order per station-day → stop the node, the latch is not doing its
-job. Any SELL, any modify, any second contract → stop the node immediately. **Exit seam status (2026-09-16):** the exit authorization path EXISTS but is UNARMED — live family `pm_us_crh_cont` has no `exit_rule`, and the v4 successor family `pm_us_crh_exit_v4` is `DRAFT_NOT_REGISTERED` pending §4 step 3 positive control; thus any live SELL is STILL a defect. The seam enters logs when `exit_decider` refuses (plan POSITION_EXIT_EXECUTION_2026-09-16 INC-E3), with reason codes: `family_not_exit_registered`, `missing_stop_no_order`, `no_exit_condition`, `book_not_executable`, `book_stale`, `expected_settlement_undefined`, `exit_rate_limited`, `station_day_exit_cap`, `r_threat_insufficient_proceeds`, `r_dead_nonpositive_proceeds`. An AMBIGUOUS or rejected exit halts the family; the durable halt is cleared only by `clear_family_halt_cli.py` (requires approval and evidence). Arming checklist (PREREG v4 §11): steps 0/0b/1 RETIRED (2026-09-16); steps 2–4 open. Nightly exit-window study (15:20Z, path `~/.local/share/breezy/derived/exit_window_study/<stamp>/exit_window_study.md`). **Exits never debit the daily budget and never replenish entry headroom** — the two-caps rule unchanged. A refusal naming a
-missing operator control → the two caps in `operator.env` did not reach the process.
+job. Any SELL, any modify, any second contract → stop the node immediately. **Exit seam status (2026-09-16):** the exit authorization path EXISTS but is UNARMED — live family `pm_us_crh_cont` has no `exit_rule`, and the v4 successor family `pm_us_crh_exit_v4` is `DRAFT_NOT_REGISTERED` pending §4 step 3 positive control; thus any live SELL is STILL a defect. The seam enters logs when `exit_decider` refuses (plan POSITION_EXIT_EXECUTION_2026-09-16 INC-E3), with reason codes: `family_not_exit_registered`, `missing_stop_no_order`, `no_exit_condition`, `book_not_executable`, `book_stale`, `expected_settlement_undefined`, `exit_rate_limited`, `station_day_exit_cap`, `r_threat_insufficient_proceeds`, `r_dead_nonpositive_proceeds`. An AMBIGUOUS or rejected exit halts the family; the durable halt is cleared only by `clear_family_halt_cli.py` (requires approval and evidence). Arming checklist (PREREG v4 §11): steps 0/0b/1 RETIRED (2026-09-16); steps 2–4 open. Nightly exit-window study (15:20Z, path `~/.local/share/breezy/derived/exit_window_study/<stamp>/exit_window_study.md`). **Exits never debit the daily budget and never replenish entry headroom** — the caps rule unchanged. A refusal naming a
+missing operator control → the three caps in `operator.env` did not reach the process.
 
 ## 8. Crash and recovery
 
@@ -312,7 +315,7 @@ systemd-analyze --user verify ~/.config/systemd/user/breezy-trade-supervisor.ser
 `verify` prints **nothing** when the unit is clean — treat any output as a failure (it exits 0 either
 way, so read the output, not the status). `daemon-reload` starts nothing.
 
-Ensure `operator.env` holds the two caps, then:
+Ensure `operator.env` holds the three caps, then:
 
 ```
 /home/jon/breezy/.venv/bin/python -m breezy.runtime.autonomy_health_cli --mark-buildside-restart breezy-trade-supervisor.service --reason "<why>" --commit <sha>
@@ -379,7 +382,7 @@ grep -n 'order submission permit not issued' "$NODE_LOG"
 grep -n 'trading node failed'                "$NODE_LOG"
 ```
 
-A `permit not issued` line means a §6 precondition was missing — most often one of the two caps is
+A `permit not issued` line means a §6 precondition was missing — most often one of the three caps is
 absent from `operator.env`. Correct the file and restart the unit; the node exits 1 on that refusal
 and is **never** relaunched automatically ([E4]: the supervisor's env is fixed for its lifetime, so a
 relaunch could not change the outcome).

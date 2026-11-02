@@ -130,7 +130,33 @@ REVIEWED_PROSE_MENTIONS: Final[frozenset[str]] = frozenset(
         ),
         "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
         "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
+        # 2026-11-02: the GAPS_2026-11-01 plans and the progress ledger name controls
+        # (the MONTH control's plan, and GAP-6's survey of the two original caps).
+        # Names only, never a value; each is markdown and cannot assign.
+        "docs/core/PROGRESS.md",
+        "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r0.md",
+        "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r1.md",
+        "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r0.md",
+        "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r1.md",
+        "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/review_status.md",
     }
+)
+
+#: The rows whose basename is unique to them, so a bare basename mention in Python
+#: is meaningful. The 2026-11-02 rows are excluded: ``PROGRESS.md`` and ``plan_r1.md``
+#: are named in comments all over the tree.
+_BASENAME_UNIQUE_ROWS: Final[frozenset[str]] = frozenset(
+    {
+        row
+        for row in REVIEWED_PROSE_MENTIONS
+        if row.startswith("docs/plans/backlog/AUDIT_2026-09-21/")
+    }
+)
+
+#: (python file, prose row) pairs where the Python reads the markdown as TEXT to
+#: scan its phrasing. Reading a document cannot assign a control; the pair is exact.
+_REVIEWED_TEXT_READERS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("tests/unit/test_settlement_conservatism_prose_guard.py", "docs/core/PROGRESS.md")}
 )
 
 #: A6: the ONLY callables that may be handed a control's NAME as an argument
@@ -410,6 +436,17 @@ _PLANTED: Final[dict[str, str]] = {
         'import subprocess\nsubprocess.run(["true"], env={"<POSITION>": "25.00"})\n'
     ),
     "environ_update": ('import os\nos.environ.update({"<DAILY>": "100.00"})\n'),
+    "monthly_subscript_assignment": ('import os\nos.environ["<MONTH>"] = "3000.00"\n'),
+    "monthly_fallback_in_environ_get": (
+        'import os\nCAP = os.environ.get("<MONTH>", "3000.00")\n'
+    ),
+    "monthly_monkeypatch_setenv_in_a_test": (
+        "from breezy.adapters.polymarket_us.operator_controls import (\n"
+        "    MAX_MONTHLY_BUDGET_USD_ENV_VAR,\n"
+        ")\n"
+        "def test_something(monkeypatch):\n"
+        '    monkeypatch.setenv(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "3000.00")\n'
+    ),
     "local_alias_of_the_constant": (
         "import os\n"
         "from breezy.adapters.polymarket_us.operator_controls import (\n"
@@ -458,8 +495,10 @@ def _plant(template: str) -> str:
     a test fixture spelling the name would have to be exempted from the very
     check it is proving.
     """
-    return template.replace("<DAILY>", operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR).replace(
-        "<POSITION>", operator_controls.MAX_POSITION_COST_USD_ENV_VAR
+    return (
+        template.replace("<DAILY>", operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR)
+        .replace("<POSITION>", operator_controls.MAX_POSITION_COST_USD_ENV_VAR)
+        .replace("<MONTH>", operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR)
     )
 
 
@@ -639,6 +678,15 @@ def test_only_the_definition_module_names_an_operator_reserved_control() -> None
     } | REVIEWED_PROSE_MENTIONS
 
 
+def _string_literals(source: str) -> frozenset[str]:
+    """Every string constant in ``source`` -- a docstring's prose is one whole value."""
+    return frozenset(
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+
 def test_reviewed_prose_mentions_are_one_exact_non_assigning_allowlist() -> None:
     """Import-set and AST pin for the one documentary allowlist.
 
@@ -655,6 +703,15 @@ def test_reviewed_prose_mentions_are_one_exact_non_assigning_allowlist() -> None
             ),
             "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
             "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
+            # 2026-11-02: the GAPS_2026-11-01 plans and the progress ledger name controls
+            # (the MONTH control's plan, and GAP-6's survey of the two original caps).
+            # Names only, never a value; each is markdown and cannot assign.
+            "docs/core/PROGRESS.md",
+            "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r0.md",
+            "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r1.md",
+            "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r0.md",
+            "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r1.md",
+            "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/review_status.md",
         }
     )
     imported_from: list[str] = []
@@ -663,9 +720,19 @@ def test_reviewed_prose_mentions_are_one_exact_non_assigning_allowlist() -> None
             if "__pycache__" in path.parts or path.name == Path(SCAN_MODULE).name:
                 continue
             text = path.read_text(encoding="utf-8")
+            literals = _string_literals(text)
+            path_posix = path.relative_to(REPO_ROOT).as_posix()
             for relative in REVIEWED_PROSE_MENTIONS:
-                if Path(relative).name in text:
-                    imported_from.append(path.relative_to(REPO_ROOT).as_posix())
+                # The 2026-09-21 rows have unique basenames: any mention counts.
+                # The 2026-11-02 rows (PROGRESS.md, plan_r1.md ...) are named in
+                # ordinary code comments, so only a string literal that IS the
+                # path -- the only way Python could open it -- counts.
+                if relative in _BASENAME_UNIQUE_ROWS:
+                    named = Path(relative).name in text
+                else:
+                    named = relative in literals
+                if named and (path_posix, relative) not in _REVIEWED_TEXT_READERS:
+                    imported_from.append(path_posix)
     assert imported_from == []
     for relative in sorted(REVIEWED_PROSE_MENTIONS):
         document = REPO_ROOT / relative
@@ -840,6 +907,10 @@ def test_the_definition_module_never_touches_os_environ_itself() -> None:
             operator_controls.MAX_POSITION_COST_USD_ENV_VAR,
             operator_controls.operator_max_position_cost_usd,
         ),
+        (
+            operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+            operator_controls.operator_max_monthly_budget_usd,
+        ),
     ],
 )
 def test_refusal_names_the_control_not_the_value(env_var: str, read: object) -> None:
@@ -862,6 +933,7 @@ def test_the_ceiling_refusal_names_the_control_not_the_amounts() -> None:
     with (
         operator_control_env(operator_controls.MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
         operator_control_env(operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         pytest.raises(safety.LiveTradingPermissionError) as excinfo,
     ):
         ledger.authorize_order_cost(
@@ -879,6 +951,7 @@ def test_the_daily_refusal_names_the_control_not_the_amounts() -> None:
     with (
         operator_control_env(operator_controls.MAX_POSITION_COST_USD_ENV_VAR, "1000.00"),
         operator_control_env(operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR, "10.00"),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         pytest.raises(safety.LiveTradingPermissionError) as excinfo,
     ):
         ledger.authorize_order_cost(
@@ -900,6 +973,10 @@ def test_an_absent_control_is_refused_by_name() -> None:
         (
             operator_controls.MAX_POSITION_COST_USD_ENV_VAR,
             operator_controls.operator_max_position_cost_usd,
+        ),
+        (
+            operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+            operator_controls.operator_max_monthly_budget_usd,
         ),
     ):
         with (

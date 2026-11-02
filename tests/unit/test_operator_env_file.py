@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from breezy.adapters.polymarket_us.operator_controls import OPERATOR_RESERVED_CONTROL_ENV_VARS
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+    OPERATOR_RESERVED_CONTROL_ENV_VARS,
+)
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 EXAMPLE: Final[Path] = REPO_ROOT / "operator.env.example"
@@ -239,4 +242,21 @@ def test_check_file_accepts_a_well_formed_file(tmp_path: Path) -> None:
     assert completed.returncode == 0
     assert completed.stdout.splitlines() == _expected_report(SET_TOKEN)
     assert completed.stderr == ""
+    _assert_secret_absent(completed)
+
+
+def test_check_file_rejects_a_file_missing_only_the_monthly_key(tmp_path: Path) -> None:
+    names = [n for n in _inventory_names() if n != MAX_MONTHLY_BUDGET_USD_ENV_VAR]
+    assert len(names) == len(_inventory_names()) - 1
+    path = _write_operator_file(tmp_path / "operator.env", names=names)
+    completed = _run_script(["--check-file", str(path)])
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == "missing key"
+    _assert_secret_absent(completed)
+
+
+def test_check_file_reports_the_monthly_key_redacted(tmp_path: Path) -> None:
+    path = _write_operator_file(tmp_path / "operator.env")
+    completed = _run_script(["--check-file", str(path)])
+    assert f"{MAX_MONTHLY_BUDGET_USD_ENV_VAR}={SET_TOKEN}" in completed.stdout.splitlines()
     _assert_secret_absent(completed)

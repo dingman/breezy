@@ -42,6 +42,7 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
     utc_day_for_ns,
@@ -297,7 +298,9 @@ def build_third_instrument() -> Any:
 
 
 @contextmanager
-def caps(daily: str = "1000.00", position: str = "10.00") -> Iterator[None]:
+def caps(
+    daily: str = "1000.00", position: str = "10.00", monthly: str = "100000.00"
+) -> Iterator[None]:
     """The placeholder caps every sibling exec suite wraps its body in.
 
     A test that needs a tight placeholder (to reach an open-exposure bound with a
@@ -306,6 +309,7 @@ def caps(daily: str = "1000.00", position: str = "10.00") -> Iterator[None]:
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, monthly),
     ):
         yield
 

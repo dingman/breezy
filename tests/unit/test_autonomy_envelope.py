@@ -62,7 +62,7 @@ def _plants(findings_fn: ScanFn, cases: dict[str, str], *, path: str = _PLANTED_
 
 def _render(source: str) -> str:
     """Interpolate the operator-control names at runtime so this file never spells them."""
-    daily, position = sorted(CONTROL_ENV_VAR_NAMES)
+    daily, _monthly, position = sorted(CONTROL_ENV_VAR_NAMES)
     return source.replace("<DAILY>", daily).replace("<POSITION>", position)
 
 

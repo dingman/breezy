@@ -41,6 +41,7 @@ from breezy.adapters.polymarket_us.account_activity import PORTFOLIO_ACTIVITIES_
 from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
@@ -211,15 +212,23 @@ class TimedClient(PolymarketUSExecutionClient):
         self.offset_clock.offset_ns += int(seconds * SEC_NS)
 
 
+# 2026-10-27T00:00:00Z: midnight base, month start (2026-10-01) >= the index epoch.
+_RESTING_MORNING_NS: Final[int] = 1_793_059_200_000_000_000
+
+
 def resting_morning_clock() -> Any:
-    """Public Nautilus ``TestClock`` at 2026-08-27T00:00:00Z (``clock_at``).
+    """Public Nautilus ``TestClock`` at 2026-10-27T00:00:00Z (``clock_at``).
+
+    The month starts after ``FILL_BY_DAY_INDEX_EPOCH``: the month-to-date spend
+    seed refuses to arm over a month the day-fill index cannot cover, and these
+    rigs reboot over a durable store.
 
     Pass it into the client builder BEFORE the permit is minted. Escalation
     ``advance`` walks several hours; a midnight base keeps that walk inside one
     UTC day, so ``spent_today_usd`` cannot roll to zero. ``advance`` itself is
     unchanged (it still only adds to the offset).
     """
-    return clock_at()
+    return clock_at(_RESTING_MORNING_NS)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +245,7 @@ def caps() -> Iterator[None]:
             MAX_POSITION_COST_USD_ENV_VAR,
             "10.00",
         ),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         yield
 

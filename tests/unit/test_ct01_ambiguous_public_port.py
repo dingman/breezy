@@ -25,6 +25,7 @@ from nautilus_trader.model.events import OrderDenied
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -98,6 +99,7 @@ async def test_ct01_with_id_empty_executions_refuses_the_second_public_submit(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         # Both commands are scheduled before either POST runs. The first

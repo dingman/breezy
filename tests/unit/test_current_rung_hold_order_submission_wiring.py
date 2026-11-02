@@ -44,6 +44,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -141,6 +142,7 @@ class _CapsAndGate:
         for name, value in (
             (MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
             (MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+            (MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
         ):
             cm = operator_control_env(name, value)
             cm.__enter__()

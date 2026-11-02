@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
@@ -75,6 +75,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 from breezy.adapters.polymarket_us.exec_fault import clear_fatal_exec_fault
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
     utc_day_for_ns,
@@ -146,6 +147,10 @@ _DAILY_REFUSAL: Final[str] = (
 )
 _SESSION_REFUSAL: Final[str] = (
     "order notional exceeds the permit's remaining notional budget" + _REFUSAL_SUFFIX
+)
+_MONTH_REFUSAL: Final[str] = (
+    "refuses this order: spent budget plus unsettled open exposure would pass "
+    "the operator's monthly budget"
 )
 _EXIT_UNREGISTERED: Final[str] = "family does not declare a registered exit rule; refusing"
 _NAKED_SHORT: Final[str] = "only a BUY is mappable (a SELL is a naked short); refusing"
@@ -459,29 +464,27 @@ def _compose(tmp_path: Path, *, permit: Any, family_id: str) -> _Composition:
 
 
 @contextmanager
-def _controls(*, daily: str | None, position: str | None) -> Iterator[None]:
-    """Absence is explicit, then only the ceilings this case needs are set."""
-    with (
-        operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR),
-        operator_control_unset(MAX_POSITION_COST_USD_ENV_VAR),
-    ):
-        if daily is None and position is None:
-            yield
-            return
-        if daily is not None and position is not None:
-            with (
-                operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
-                operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
-            ):
-                yield
-            return
-        if daily is not None:
-            with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily):
-                yield
-            return
-        assert position is not None
-        with operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position):
-            yield
+def _controls(
+    *,
+    daily: str | None,
+    position: str | None,
+    monthly: str | None = _GENEROUS,
+) -> Iterator[None]:
+    """Absence is explicit, then only the ceilings this case needs are set.
+
+    The month ceiling defaults to a generous synthetic figure so every
+    pre-existing day/position case keeps its meaning; a month case passes it.
+    """
+    with ExitStack() as stack:
+        for name, value in (
+            (MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
+            (MAX_POSITION_COST_USD_ENV_VAR, position),
+            (MAX_MONTHLY_BUDGET_USD_ENV_VAR, monthly),
+        ):
+            stack.enter_context(operator_control_unset(name))
+            if value is not None:
+                stack.enter_context(operator_control_env(name, value))
+        yield
 
 
 def _position_reason() -> str:
@@ -490,6 +493,10 @@ def _position_reason() -> str:
 
 def _daily_reason() -> str:
     return f"{MAX_DAILY_BUDGET_USD_ENV_VAR} {_DAILY_REFUSAL}{_REFUSAL_SUFFIX}"
+
+
+def _month_reason() -> str:
+    return f"{MAX_MONTHLY_BUDGET_USD_ENV_VAR} {_MONTH_REFUSAL}{_REFUSAL_SUFFIX}"
 
 
 async def _connected(composition: _Composition) -> None:
@@ -789,6 +796,85 @@ async def test_a_refused_order_leaves_the_daily_counter_unchanged(
         assert len(composition.denials()) == 1
         assert composition.sender.calls == []
         assert composition.spent() == seeded
+    finally:
+        composition.close()
+
+
+@pytest.mark.asyncio
+async def test_a_month_only_breach_denies_without_the_sender_or_the_daily_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+    family_id: str,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    permit = issue_live_trading_permit(clock=LiveClock())
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
+    marker_writes: list[int] = []
+    monkeypatch.setattr(
+        composition.client,
+        "_mark_budget_exhausted",
+        lambda now_ns: marker_writes.append(now_ns),
+    )
+    try:
+        with _controls(daily=_GENEROUS, position=_GENEROUS, monthly=_BELOW_ORDER_COST):
+            await _connected(composition)
+            await composition.client._submit_order(composition.entry())
+            await composition.client._disconnect()
+        denials = composition.denials()
+        assert len(denials) == 1
+        assert denials[0].reason == _month_reason()
+        assert composition.sender.calls == []
+        assert marker_writes == []
+        assert composition.marker() is None
+        assert composition.spent() == Decimal(0)
+    finally:
+        composition.close()
+
+
+@pytest.mark.asyncio
+async def test_spend_exactly_at_the_monthly_budget_is_admitted_through_the_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+    family_id: str,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    permit = issue_live_trading_permit(clock=LiveClock())
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
+    try:
+        with _controls(daily=_GENEROUS, position=_GENEROUS, monthly=_ORDER_PRICE):
+            await _connected(composition)
+            await composition.client._submit_order(composition.entry())
+            await composition.client._disconnect()
+        assert composition.denials() == []
+        assert len(composition.sender.calls) == 1
+        assert composition.spent() == Decimal(_ORDER_PRICE)
+        assert composition.marker() is None
+    finally:
+        composition.close()
+
+
+@pytest.mark.asyncio
+async def test_when_day_and_month_are_both_breached_the_daily_refusal_wins_and_latches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+    family_id: str,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    permit = issue_live_trading_permit(clock=LiveClock())
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
+    try:
+        with _controls(daily=_BELOW_ORDER_COST, position=_GENEROUS, monthly=_BELOW_ORDER_COST):
+            await _connected(composition)
+            await composition.client._submit_order(composition.entry())
+            await composition.client._disconnect()
+        denials = composition.denials()
+        assert len(denials) == 1
+        assert denials[0].reason == _daily_reason()
+        assert composition.sender.calls == []
+        assert composition.marker() == b"1"
     finally:
         composition.close()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print presence of the two operator-reserved caps. Never prints a value.
+"""Print presence of the three operator-reserved caps. Never prints a value.
 
 Two modes, both value-free:
 
@@ -92,7 +92,7 @@ def _check_file(raw_path: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Report presence of the two operator-reserved caps. Never prints a value."
+            "Report presence of the three operator-reserved caps. Never prints a value."
         )
     )
     parser.add_argument(

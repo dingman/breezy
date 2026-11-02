@@ -1522,6 +1522,10 @@ def main() -> int:
             # ``expires_at_ns``) are the only values this line ever logs --
             # never ``operator_id`` or any of the five other repr=False
             # fields (security R2).
+            # ``issue`` read all three operator-reserved caps and refused on
+            # any absent or non-positive one; this line names the controls
+            # only, never an amount.
+            _boot_logger.info("operator caps validated DAY/POSITION/MONTH")
             ttl_s = (permit.expires_at_ns - permit.issued_at_ns) // 1_000_000_000
             _boot_logger.info(
                 "live-trading permit issued issued_at_ns=%d expires_at_ns=%d ttl_s=%d",

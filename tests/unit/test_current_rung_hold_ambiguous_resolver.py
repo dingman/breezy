@@ -84,6 +84,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -576,8 +577,10 @@ async def test_submit_order_passes_response_body_evidence_to_note_ambiguous_open
     `executions: []` (that is `none`, a decided absence, not decode
     failure)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -602,8 +605,10 @@ async def test_resolver_backoff_doubles_on_consecutive_get_failures_and_resets_o
     consecutive GET failures, then a mapped (even non-terminal) GET resets
     the counter and the very next sleep is back at the plain 5s base."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         path = f"/v1/order/{order_id}"
@@ -643,8 +648,10 @@ async def test_a_stale_open_intent_alerts_once_and_resets_on_retirement(
     never a second time for the same intent, and the entry clears on
     retirement so a later intent can surface again."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
 
@@ -703,8 +710,10 @@ async def test_a_get_that_never_returns_terminal_evidence_leaves_the_intent_open
     strategy-side concern outside this module's scope; the client-visible
     half is asserted here: the singleton, the events, the booking)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         # PENDING, not terminal: never wires a terminal response in.
@@ -734,8 +743,10 @@ async def test_a_get_confirmed_terminal_zero_with_no_long_retires_and_trues_up_t
     no LONG -> retires (STATUS_REPORT_ZERO_FILL_TERMINAL), trues the booking
     up to ZERO, and cancels natively."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         client._private_read._payloads[  # type: ignore[attr-defined]
@@ -786,8 +797,10 @@ async def test_a_get_confirmed_expired_zero_fill_with_real_venue_leaves_retires(
     supervisor from launching the node. This proves the resolver now
     RETIRES it as a terminal zero-fill (Resolution D) instead."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         client._private_read._payloads[  # type: ignore[attr-defined]
@@ -850,8 +863,10 @@ async def test_a_stuck_prior_day_instrument_absent_from_cache_is_loaded_and_reti
     discovery cycle for an expired market -- ``load_ids_async``,
     ``provider.py:437-453``) and never subscribed to market data."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -932,8 +947,10 @@ async def test_a_stuck_prior_day_instrument_unobtainable_stays_open_and_escalate
     static source-shape check that the ``self._log.error`` call site is
     gated by membership in that set."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1004,8 +1021,10 @@ async def test_a_load_miss_does_not_rescan_the_catalog_within_the_retry_interval
     every later pass within ``_RESOLVER_INSTRUMENT_LOAD_RETRY_NS`` must
     skip the call entirely."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1060,8 +1079,10 @@ async def test_a_load_miss_engages_the_same_consecutive_failure_backoff_as_a_get
     mapping-error branches already use -- not a separate, unthrottled
     failure mode."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1092,8 +1113,10 @@ async def test_a_load_hit_after_the_retry_interval_retires_the_intent(
     (missed) attempt, a later pass whose loader now returns the definition
     must retire the intent exactly as the happy path does."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1199,8 +1222,10 @@ async def test_a_terminal_zero_resolution_rewrites_the_startup_position_evidence
     used to confirm there is no LONG, distinct from whatever `_connect`
     wrote at startup."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         at_connect = client.read_startup_position_evidence()
@@ -1250,8 +1275,10 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
     the deliberately inert placeholder) -- UPDATED, not deleted, now that
     slice 3 ships the real resolution."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1331,8 +1358,10 @@ async def test_a_resolver_retire_records_the_venue_id_map(
     is suppressed by the fixture below so this test cannot be satisfied by
     A1-a's own write instead)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = (
             await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
@@ -1364,8 +1393,10 @@ async def test_a_resolver_terminal_zero_retire_records_the_venue_id_map(
     drive both (AM-10). The submit-path write is suppressed (see the
     fixture docstring) so this cannot be satisfied by A1-a instead."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = (
             await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
@@ -1399,8 +1430,10 @@ async def test_a_resolver_accept_fill_with_no_same_process_booking_still_records
     MUTATION pair 5 moves the A1-b block to the wrong indent and shows THIS
     test, and only this test, go RED."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = (
             await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
@@ -1441,8 +1474,10 @@ async def test_a_map_write_failure_still_retires_and_fills_on_the_accept_fill_te
     never `return`: `_retire`, the budget true-up/unrestore check and
     `generate_order_filled` must all still run."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1484,8 +1519,10 @@ async def test_a_map_write_failure_still_retires_and_cancels_on_the_terminal_zer
     `_write_startup_position_evidence` and `generate_order_canceled` must
     all still run after a `record_venue_order_id` raise (N2)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1542,8 +1579,10 @@ async def test_resolve_accept_fill_restart_reentry_against_an_already_retired_si
     idempotent -- ``SubmitIntentMismatch`` on a non-OPEN singleton) and must
     still complete its cleanup without raising."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1620,8 +1659,10 @@ async def test_a_get_confirmed_fill_with_no_long_present_never_authorizes_a_fill
     flip this from AMBIGUOUS-no-op to a wrongly-authorized fill, and this
     test would go RED."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1665,8 +1706,10 @@ async def test_resolve_terminal_zero_itself_refuses_to_retire_without_a_this_run
     NEVER stamped into ``_resolved_by_get_ts_ns`` -- if the guard were
     missing, this would retire on the durable context alone."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1714,8 +1757,10 @@ async def test_the_get_call_is_load_bearing_deleting_it_would_go_red(
     alone), this test would go GREEN despite the GET always failing; instead
     it stays OPEN, which is the behaviour this test pins."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1749,8 +1794,10 @@ async def test_a_corrupt_singleton_never_kills_the_resolver_task(
     way ``is_latched()`` does: fail closed (OPEN-unknown, never retire,
     never act), logged at ERROR ONCE, and polling continues."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1789,8 +1836,10 @@ async def test_disconnect_awaits_the_resolver_tasks_cancellation_before_returnin
     returns, so the resolver task is provably still ``not done()`` right
     after -- that is the RED this test pins closed."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         client, _order_events, _permit, _latch_cm = await _build_race_client(
@@ -1836,8 +1885,10 @@ async def test_a_terminal_canceled_with_a_partial_fill_and_a_long_resolves_as_a_
     ``_resolve_accept_fill`` -- same LONG gate, same synthesized TradeId,
     ``fee_reconciled=False`` -- never a silent, forever-AMBIGUOUS wedge."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1891,8 +1942,10 @@ async def test_a_terminal_canceled_with_zero_fill_still_resolves_as_terminal_zer
     proving the widened terminal-status set did not blur the two branches
     together."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1927,8 +1980,10 @@ async def test_partially_filled_never_resolves_and_a_later_terminal_poll_does(
     loop keeps polling. A LATER poll that returns a genuinely terminal
     status (CANCELED, cum > 0) is the one that resolves it."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -1983,8 +2038,10 @@ async def test_a_non_positive_avg_px_never_authorizes_a_synthesized_fill(
     make_price(0)``, which would synthesize a fill at a nonsensical zero
     price."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2024,8 +2081,10 @@ async def test_a_retire_raise_does_not_kill_the_resolver_task_and_counts_the_err
     caught, `resolver_error_count` increments, the intent stays OPEN, and
     the VERY NEXT poll still runs against the real `_retire` again."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
         client._private_read._payloads[  # type: ignore[attr-defined]
@@ -2093,8 +2152,10 @@ async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots
     `app/trade.py`).
     """
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         client, order_events, permit, _latch_cm = await _build_race_client(
@@ -2148,8 +2209,10 @@ async def test_a_policy_halt_veto_denies_wait_class_and_spends_zero_permit_slots
     ``family_halt_submit_veto`` chokepoint, with no new mechanism.
     """
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         client, order_events, permit, _latch_cm = await _build_race_client(
@@ -2205,8 +2268,10 @@ async def test_first_pass_immediate_resolves_a_get_confirmed_fill_with_no_sleep(
     coroutine takes no such argument (``TypeError``) and always sleeps first.
     """
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2260,8 +2325,10 @@ async def test_connect_awaits_the_immediate_pass_before_the_background_task(
     )
     sender = _SlowSender()
     sender.response = VenueResponse(status=200, headers={}, body=b"{}")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_events, _permit, _latch_cm = await _build_race_client(
             tmp_path, sender=sender,
@@ -2352,8 +2419,10 @@ async def test_connect_survives_an_unhandled_exception_in_the_immediate_resolver
     enable_operator_gate(monkeypatch, order_count="2")
     sender = _SlowSender()
     sender.response = VenueResponse(status=200, headers={}, body=b"{}")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         # If `_connect` re-raises, this call itself raises -- the test would
         # fail with the RuntimeError propagating here, which IS the RED
@@ -2423,8 +2492,10 @@ async def test_a_pass_with_no_open_intent_refreshes_stale_startup_evidence(
     with NO OPEN intent -- exactly when the strategy's re-arm gate is
     shopping for fresh evidence."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2467,8 +2538,10 @@ async def test_the_refresh_re_enumerates_open_orders_so_a_post_boot_rest_reaches
     seen by the re-arm gate on the very next refreshed pass, and the written
     record refuses (`startup_open_orders_present`)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2529,8 +2602,10 @@ async def test_a_fresh_evidence_record_is_not_refetched_within_the_refresh_inter
     second pass immediately after the first (well inside the 60s window
     the first pass's OWN write just re-armed) must not re-fetch."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2583,8 +2658,10 @@ async def test_a_failed_refresh_read_leaves_the_prior_evidence_intact_and_the_re
     -- the same reliable check that existing test already uses -- never a
     runtime double."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2717,8 +2794,10 @@ async def test_a_stored_exit_context_with_the_pinned_close_echo_resolves_via_the
     the report maps, and the exit resolves through the SAME
     `_resolve_accept_fill` an entry fill does."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_exit_intent(
             tmp_path,
@@ -2781,8 +2860,10 @@ async def test_the_same_get_body_under_an_entry_context_stays_mapping_error(
     decodes to), must still classify `mapping_error` -- `closing` is derived
     from the context, never from the response body."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -2863,8 +2944,10 @@ async def test_periodic_resolver_task_is_created_only_after_the_immediate_pass_r
     )
     sender = _SlowSender()
     sender.response = VenueResponse(status=200, headers={}, body=b"{}")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_events, _permit, _latch_cm = await _build_race_client(
             tmp_path, sender=sender,
@@ -2900,8 +2983,10 @@ async def test_periodic_resolver_task_exists_after_connect_when_the_immediate_pa
     )
     sender = _SlowSender()
     sender.response = VenueResponse(status=200, headers={}, body=b"{}")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_events, _permit, _latch_cm = await _build_race_client(
             tmp_path, sender=sender,
@@ -3006,8 +3091,10 @@ async def test_an_overlapping_boot_does_not_log_could_not_be_loaded(
     """
     enable_operator_gate(monkeypatch, order_count="2")
     store_path = tmp_path / "exec_state.db"
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         # First "process": arms one with-id AMBIGUOUS intent against
         # `build_instrument()`, then "restarts" -- releasing the exclusive
@@ -3746,8 +3833,10 @@ async def test_no_leg_terminal_get_does_not_raise_on_reserved_separator(
     `VenuePayloadError` on the NO leg's composite id (the reserved `^`
     separator), unwrapped -- the intent never retires."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
         client._private_read._payloads[  # type: ignore[attr-defined]
@@ -3782,8 +3871,10 @@ async def test_no_leg_terminal_fill_with_short_yes_net_resolves_accept_fill(
     deadlock. RED today: the unwrapped raise kills the pass before the fill
     is ever considered, so the intent never retires."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
         no_instrument = build_no_leg_instrument()
@@ -3911,8 +4002,10 @@ async def test_slug_derivation_failure_is_logged_counted_and_resolver_keeps_poll
     because it is a raise this plan does NOT make disappear -- exactly what
     AC3's per-intent guard exists for."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -3959,8 +4052,10 @@ async def test_periodic_resolver_task_survives_a_no_leg_pass(
     whose GET is terminal-zero. RED today: the unwrapped raise ends the
     task, so it is `done()` (with an exception) after exactly one pass."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
         client._private_read._payloads[  # type: ignore[attr-defined]
@@ -4019,8 +4114,10 @@ async def test_zero_fill_before_min_age_stays_ambiguous(
     its own -- a context younger than `_RESOLVER_ZERO_FILL_MIN_AGE_NS` stays
     AMBIGUOUS."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4060,8 +4157,10 @@ async def test_order_trade_activity_requests_page_two_with_next_cursor(
     against `_order_trade_activity`, not the full resolver dispatch. Page 2
     is `eof`, so the join is complete."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4104,8 +4203,10 @@ async def test_order_trade_activity_missing_cursor_without_eof_is_incomplete(
     stops -- never loops, never guesses a next page -- and the join is
     INCOMPLETE, never complete."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4139,8 +4240,10 @@ async def test_order_trade_activity_cap_hit_is_incomplete(
     (not just page 1 -> page 2): query N+1 always carries page N's own
     `nextCursor`."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4176,8 +4279,10 @@ async def test_terminal_zero_requires_complete_activities_with_no_trade_for_orde
     the read simply stops) never authorizes a zero-fill, even with every
     other AC4 condition satisfied."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4213,8 +4318,10 @@ async def test_trade_activity_for_order_id_blocks_zero_fill_and_raises_contradic
     stays AMBIGUOUS and raises the `resolver_evidence_contradiction`
     CRITICAL health-surface entry."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4267,8 +4374,10 @@ async def test_create_fill_evidence_fill_type_blocks_zero_fill(
     even with an otherwise-clean GET and activities join, and raises the
     same contradiction CRITICAL."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4319,8 +4428,10 @@ async def test_unknown_create_fill_evidence_still_requires_activities(
     pairing `unknown` with an INCOMPLETE activities read: must stay
     AMBIGUOUS, exactly like `none` would."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4367,8 +4478,10 @@ async def test_activities_read_failure_stays_ambiguous_and_counts_backoff(
     """AC4(c): a raised exception on the activities GET is a read failure,
     not a completeness signal -- stays AMBIGUOUS, never a contradiction."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4417,8 +4530,10 @@ async def test_min_create_time_below_created_ns_without_eof_is_not_complete(
     implementation would retire here; the coordinator amendment forbids
     that implementation."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4526,8 +4641,10 @@ async def test_eof_non_bool_truthy_is_incomplete(
     is wrongly reported complete for every non-bool case; only the `True`
     control is genuinely complete."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4559,8 +4676,10 @@ async def test_page_without_activities_list_is_refused(
     `complete=True, trade_count=0` (the malformed page silently contributes
     zero rows and the loop pages on to page 2's eof)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4601,8 +4720,10 @@ async def test_page_two_without_activities_list_is_refused(
     loop would let page 2 through unchecked and wrongly report `eof=True`
     as complete."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4664,8 +4785,10 @@ async def test_terminal_zero_with_malformed_eof_never_retires(
     read complete and `_resolve_terminal_zero` retires it as
     `STATUS_REPORT_ZERO_FILL_TERMINAL`."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4707,8 +4830,10 @@ async def test_trade_on_page_one_then_malformed_page_two_still_contradicts(
     branch stays AMBIGUOUS WITHOUT ever raising the CRITICAL -- the trade
     found on page 1 is silently lost."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4826,8 +4951,10 @@ async def test_same_day_prior_durable_holding_does_not_block_true_zero_fill(
     unrelated order on the SAME instrument still retires -- the holding
     cannot wedge it."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4876,8 +5003,10 @@ async def test_same_day_unexplained_holding_blocks_zero_fill(
     """AC4(e) negative: the SAME venue-reported LONG, but with NO durable
     fill record to explain it, must NOT retire as zero-fill."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4912,8 +5041,10 @@ async def test_durable_net_qty_read_failure_stays_ambiguous(
     undetermined, never zero -- stays AMBIGUOUS, counted as a resolver
     error, never retired on evidence it could not read."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -4953,8 +5084,10 @@ async def test_past_day_read_skips_holding_leg(
     never checked for a past-day instrument (D2: a settled market's
     position is meaningless corroboration)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5001,8 +5134,10 @@ async def test_fill_resolves_on_trade_join_when_holding_absent(
     a completed exit) still resolves -- via the activities trade join, not
     the positions leg -- and records the synthesized fill."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5055,8 +5190,10 @@ async def test_mia_0923_past_day_shape_retires_zero_fill_with_empty_trade_join(
     activities with no trade for the id) retires as
     `STATUS_REPORT_ZERO_FILL_TERMINAL`."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5101,8 +5238,10 @@ async def test_mia_0923_past_day_shape_with_trade_row_stays_ambiguous(
     real TRADE row for this venue order id -- CONTRADICTION, stays
     AMBIGUOUS."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5173,8 +5312,10 @@ async def test_uninterpretable_trade_row_blocks_a_false_zero_fill_same_day(
     retires as a false ZERO_FILL. Same-day instrument (default harness) --
     see the past-day sibling below for AC4(e)'s missing backstop."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5230,8 +5371,10 @@ async def test_uninterpretable_trade_row_blocks_a_false_zero_fill_past_day(
     backstop never runs at all -- proving the block does not depend on that
     backstop existing."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5295,8 +5438,10 @@ async def test_stale_alert_carries_activities_uninterpretable_failure_kind(
     actual_last_failure_kind`, `:5664`) -- carrying THIS failure kind, never
     the dict-membership default `"none"` or a stale prior kind."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5358,8 +5503,10 @@ async def test_a_well_formed_foreign_trade_row_still_retires(
     renamed). An ordinary foreign trade must never itself block a true
     zero-fill; only an UNINTERPRETABLE row does."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5411,8 +5558,10 @@ async def test_a_well_formed_foreign_trade_row_still_retires_past_day(
     runs at all. Proves TRADE-ROW-DRIFT did not over-block retirement on
     the path with no holdings backstop to fall back on."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5474,8 +5623,10 @@ async def test_matched_trade_then_uninterpretable_row_same_page_still_contradict
     the evidence-contradiction CRITICAL must still fire, `complete=False`,
     `trade_count=1`, in exactly one query."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5568,8 +5719,10 @@ async def test_a_resolver_contradiction_is_delivered_through_the_installed_watch
     `resolver_evidence_contradictions` alone is not delivery. Negative
     control: no contradiction, no alert, even after the watch polls."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5660,8 +5813,10 @@ async def test_resolver_backoff_caps_after_seven_consecutive_failures(
     existing backoff test (`:569`) only ever reaches 80s and never proves
     the cap itself engages."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5683,8 +5838,10 @@ async def test_no_latch_bound_makes_no_get_and_the_pass_survives(
     resolver task survives the pass rather than crashing on a `None`
     dereference."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         sender.response = VenueResponse(status=200, headers={}, body=b"{}")
@@ -5718,8 +5875,10 @@ async def test_open_intent_without_a_durable_context_makes_no_get_and_stays_open
     all (a no-id AMBIGUOUS, or nothing written yet) makes no GET, and the
     intent stays OPEN."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         sender.response = VenueResponse(status=200, headers={}, body=b"{}")
@@ -5761,8 +5920,10 @@ async def test_malformed_resolver_context_bytes_stays_ambiguous_with_unchanged_f
     GET/instrument paths, not a local decode failure, and this branch never
     reaches the order GET at all."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5797,8 +5958,10 @@ async def test_a_foreign_intent_id_in_the_context_refuses_to_act_with_no_get(
     the key it was stored under (`current.intent_id`) is refused outright --
     no GET is ever made -- and the intent stays OPEN."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5834,8 +5997,10 @@ async def test_stale_alert_carries_the_actual_last_failure_kind(
     `"none"` -- `test_a_stale_open_intent_alerts_once_and_resets_on_
     retirement` (`:608`) never drives a non-default value through it."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -5887,8 +6052,10 @@ async def test_stale_restart_cause_followup_after_the_boot_pass(
     kind flip (R3-3, M12). RED: today no follow-up entry ever appears."""
     enable_operator_gate(monkeypatch, order_count="2")
     store_path = tmp_path / "exec_state.db"
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         # Process A: arm one with-id AMBIGUOUS intent, backdate its context
         # past the stale threshold, then "restart" -- releasing the flock --
@@ -5986,8 +6153,10 @@ async def test_stale_alert_survives_a_crash_loop_faster_than_one_pass(
     sighting)."""
     enable_operator_gate(monkeypatch, order_count="2")
     store_path = tmp_path / "exec_state.db"
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         first_client, order_id, slug, first_latch_cm, _order_events = (
             await _arm_one_ambiguous_intent(tmp_path)
@@ -6046,8 +6215,10 @@ async def test_failure_kind_resets_to_none_after_a_get_that_maps(
     back to "none" -- the guarded reset (ARCH B1). RED: today the kind
     stays `get_exception` forever (no reset exists)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6083,8 +6254,10 @@ async def test_failure_kind_survives_a_join_the_guard_never_re_examines(
     under M8 (an unconditional reset would wipe it to "none" on pass 2,
     even though the join never said the cause went away)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6156,8 +6329,10 @@ async def test_failure_kind_clears_to_none_on_a_clean_but_incomplete_join(
     `activities_uninterpretable` kind. RED under M9 (no clean-join
     clear)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6213,8 +6388,10 @@ async def test_no_followup_when_the_stale_alert_already_carries_the_current_kind
     under M6 (drop the differs-from-first-kind check), which would flap a
     follow-up on every repeated `get_exception`."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6258,8 +6435,10 @@ async def test_no_cause_followup_ever_appears_when_the_last_kind_is_none(
     entry, on that pass or any later one. RED under M7 (drop the not-none
     check)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6312,8 +6491,10 @@ async def test_retire_pops_the_cause_followup_entry(
     the same age must not inherit a dead one's bookkeeping. RED under M5
     (`_retire` does not pop `:cause`)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6381,8 +6562,10 @@ async def test_a_flat_unnested_get_body_resolves_the_same_as_a_nested_one(
     nested `"order"` key) is never otherwise exercised. A flat body must
     resolve identically to the nested shape."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6421,8 +6604,10 @@ async def test_an_unmappable_get_body_neither_increments_nor_resets_the_backoff_
     (a distinct failure mode from those two) nor resets it to zero (unlike
     a body that DID map)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6461,8 +6646,10 @@ async def test_a_positions_read_failure_after_a_mapped_terminal_get_stays_at_zer
     for this intent, since the SAFETY H2 stamp sits strictly after the
     positions read in program order."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6497,8 +6684,10 @@ async def test_long_state_none_end_to_end_stays_ambiguous_before_the_h2_stamp(
     BEFORE the SAFETY H2 stamp and without counting a resolver error, never
     via the zero-fill/contradiction machinery below it."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6540,8 +6729,10 @@ async def test_a_confirmed_long_skips_the_activities_join_entirely(
     read -- the activities join must be skipped ENTIRELY (no activities GET
     is ever made), never merely fetched and ignored."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6578,8 +6769,10 @@ async def test_a_resolve_accept_fill_raise_counts_the_error_and_stays_open(
     test (`:1983`) covers only its terminal-zero sibling
     (`_resolve_terminal_zero`), never this one."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6622,8 +6815,10 @@ async def test_missing_instrument_with_no_loader_wired_skips_the_load_attempt_ga
     and the pass falls straight to the ordinary missing-instrument failure
     path."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6655,8 +6850,10 @@ async def test_open_orders_refresh_failure_still_writes_the_evidence_record(
     via `_note_open_orders_outcome(error=...)`, and the evidence record is
     still written from the positions read that DID succeed."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6707,8 +6904,10 @@ async def test_set_resolver_last_failure_kind_rewrites_the_context_preserving_ev
     RED: `_set_resolver_last_failure_kind` does not exist today
     (`AttributeError`)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6744,8 +6943,10 @@ async def test_a_failing_durable_write_never_raises_out_of_the_helper(
     `_set_resolver_last_failure_kind` does not exist today (`AttributeError`,
     not the raised `RuntimeError` -- there is nothing yet to catch it)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6840,8 +7041,10 @@ async def test_activities_uninterpretable_failure_kind_is_written_to_durable_con
     must show the classified kind, never the default `"none"`. RED: only
     the in-memory dict changes today; the durable context is unaffected."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -6924,8 +7127,10 @@ async def test_restart_stale_alert_uses_durable_activities_uninterpretable_kind(
     membership default `"none"`. RED: today `_resolver_last_failure_kind`
     is process-local only, so process B's first stale alert reads `"none"`."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         order_id, slug, intent_id = (
             await _process_a_records_activities_uninterpretable_then_restarts(tmp_path)
@@ -6958,8 +7163,10 @@ async def test_durable_seed_prevents_a_redundant_cause_followup_for_the_same_kin
     `"none"` and the very next classifying pass DOES add a `:cause`
     follow-up -- the opposite of what this test requires."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         order_id, slug, intent_id = (
             await _process_a_records_activities_uninterpretable_then_restarts(tmp_path)
