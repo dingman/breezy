@@ -24,7 +24,7 @@
     },
     "f9_clause_quote": {
       "source": "docs/plans/backlog/GAPS_2026-11-01/gap1_source_resolution/plan_r2_delta.md:12-13",
-      "text": "If `oof_rows.jsonl` carries an M0 `arm_predictions` entry (unverified #1), M0 is scored from it with its own nu. Otherwise the M0 baseline is scored from the champion spec under BOTH the Normal CDF and the same Student-t family as the arms; ΔRES is reported against both and the PASS rule uses the t-family baseline. The choice is settled at S1 (first RED test pins the schema) and frozen in PREREG_GAP1 before D1 text is frozen."
+      "text": "If `oof_rows.jsonl` carries an M0 `arm_predictions` entry (unverified #1), M0 is scored from it with its own nu. Otherwise the M0 baseline is scored from the champion spec under BOTH the Normal CDF and the same Student-t family as the arms; \u0394RES is reported against both and the PASS rule uses the t-family baseline. The choice is settled at S1 (first RED test pins the schema) and frozen in PREREG_GAP1 before D1 text is frozen."
     },
     "plan_search": "Searched plan_r1.md and plan_r2_delta.md for variance, scale, M0t, Student; neither specifies variance matching or a scale conversion. Same-scale is this conservative S0 choice.",
     "schema_resolution": "ARM_NAMES is exactly [M0prime, M1, M2, M3]; no M0 prediction entry. Rebuild M0t and M0n from champion; do not add an M0 arm key."
@@ -180,7 +180,7 @@
     "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
     "path": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13_prereg_blend_v1.json"
   },
-  "frozen_sha": "UNFROZEN",
+  "frozen_sha": "e648d1812b88369b1db04fb468e1aadf1405cfea",
   "inclusion": {
     "ARM_NAMES": [
       "M0prime",
