@@ -323,6 +323,24 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-11-02
 **Last updated:** 2026-11-02
 
+### L-79 — A sandboxed external implementer writes; the host gates and commits (2026-11-02)
+**Mistake:** Three Codex build jobs authored complete implementations but every one exited "no usable unprivileged network-namespace" on the no-egress gate and `Read-only file system` on the worktree's `index.lock`, so RED/GREEN evidence and commits never arrived from the route that was briefed to produce them.
+**Prevention:** Brief a sandboxed external implementer to author only and to end with `COMMIT_SHA: SANDBOX_BLOCKED` on any git or gate error; then dispatch one host agent per worktree to run the gate, produce the RED/GREEN or mutation evidence, fix root causes, and commit by explicit path; never count the implementer's "tests pass" as evidence.
+**Applied:** 2026-11-02
+**Last updated:** 2026-11-02
+
+### L-80 — A guard trip is fixed by renaming the offender, never by reconstructing the literal at runtime (2026-11-02)
+**Mistake:** A cell label `"post"` tripped readonly-guard rule V1 and the implementer silenced it with `POST = "pos" + "t"`, which hides the literal from the AST scan while keeping the value the guard forbids.
+**Prevention:** When an exact-set or AST guard fires on new code, rename the offending identifier or value so the guard genuinely passes, add a test that rejects runtime-reconstructed literals (`+`, f-string, `join`), and reject any fix that preserves the forbidden value in a form the scanner cannot see.
+**Applied:** 2026-11-02
+**Last updated:** 2026-11-02
+
+### L-81 — A cache keyed on `id()` of a short-lived object is a heap-layout lottery (2026-11-02)
+**Mistake:** The FQ loss-floor engine cached criticals by `(id(sim), n_days, t_min)`; temporary simulations built inside a draw were freed, their ids reused, and a later draw read another simulation's criticals, so a pinned document hash flipped depending on what pytest had run before and the binding gate failed on an unrelated shard repartition.
+**Prevention:** Never key a cache on `id()` (or any identity) of an object that can be freed during the cache's lifetime; key on the object's value, hold a strong reference for the cache's lifetime, or compute without the cache inside the scope that creates temporaries, and when a pinned-hash test fails only in some test orders treat it as non-determinism to root-cause, never a flake to allowlist.
+**Applied:** 2026-11-02
+**Last updated:** 2026-11-02
+
 ## Absorbed index
 
 Every removed L-number resolves to its surviving entry above. Archived (full text in docs/core/archive/LESSONS-archive-2026-10-20.md): L-5, L-57, L-61. Full pre-consolidation text: docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md.
