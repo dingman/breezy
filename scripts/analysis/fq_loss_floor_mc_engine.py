@@ -343,7 +343,9 @@ def run_floor(
             netting=True,
             persist=spec.persist_for(mode),
         )
-        return crit(sim, n_cal, t_min)
+        # Not ``crit``: its cache is keyed by ``id(sim)``, and this sim is freed on return, so a
+        # later sim can reuse the id and be served this one's criticals.
+        return _criticals(sim, n_cal, t_min)
 
     outcome = finish_e2(
         outcome,
