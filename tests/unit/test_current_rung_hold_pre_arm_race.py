@@ -51,6 +51,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -236,6 +237,7 @@ async def test_two_synchronous_submits_in_one_burst_spend_exactly_one_permit_slo
             MAX_POSITION_COST_USD_ENV_VAR,
             "10.00",
         ),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         sender = _SlowSender()
         sender.response = __import__(

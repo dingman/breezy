@@ -54,6 +54,7 @@ from breezy.adapters.polymarket_us.exec.submit_chain import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
@@ -408,6 +409,7 @@ def _caps(daily: str, position: str) -> Iterator[None]:
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         yield
 
@@ -484,7 +486,7 @@ async def test_the_chain_denies_when_either_operator_cap_is_absent(
         if which == "position"
         else operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00")
     )
-    with daily_cm, position_cm:
+    with daily_cm, position_cm, operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"):
         rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
         await rig.client._connect()
         await rig.client._submit_order(rig.limit_buy())

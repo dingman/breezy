@@ -25,6 +25,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.safety import (
@@ -1054,6 +1055,7 @@ def _mint_real_permit(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         return OrderSubmissionPermit.issue(
             settings=settings, live_trading_permit=live_permit, clock=clock,

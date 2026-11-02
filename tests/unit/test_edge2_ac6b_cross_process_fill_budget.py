@@ -66,6 +66,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import PORTFOLIO_POSITIONS_PAT
 from breezy.adapters.polymarket_us.exec_fault import clear_fatal_exec_fault
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
     utc_day_for_ns,
@@ -143,8 +144,10 @@ async def test_same_process_terminal_zero_still_restores_permit(
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -175,8 +178,10 @@ async def test_cross_process_terminal_zero_does_not_restore_current_permit(
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -224,8 +229,10 @@ async def test_cross_process_accept_fill_of_registered_intent_adds_spend_once_no
     the registry: today's spend rises by the realized amount exactly once and
     nothing latches."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -267,8 +274,10 @@ async def test_cross_process_accept_fill_unregistered_intent_latches_unbudgeted_
     genuinely-unbudgeted cross-process BUY fill must latch."""
     monkeypatch.setattr(DailySpendLedger, "register_open_exposure", _registry_failure)
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
             tmp_path,
@@ -308,8 +317,10 @@ async def test_cross_process_no_leg_buy_fill_of_registered_intent_adds_spend_onc
     """D1 on the NO leg: a REGISTERED opening buy settles through the registry
     (classification still uses the RECORDED "BUY", never the venue echo)."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(
             tmp_path,
@@ -351,8 +362,10 @@ async def test_cross_process_no_leg_buy_fill_unregistered_intent_latches_unbudge
     classification uses `context.order_side` (the RECORDED "BUY"), never
     the venue's wire-side echo."""
     enable_operator_gate(monkeypatch, order_count="2")
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(
             tmp_path,
@@ -789,8 +802,10 @@ async def test_boot_pass_resolution_of_prior_process_fill_does_not_refuse_and_is
     provider walk, past-day via `fill_by_day/<today>`)."""
     enable_operator_gate(monkeypatch, order_count="2")
     store_path = tmp_path / "exec_state.db"
-    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
-        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         # "process 1": arms one with-id AMBIGUOUS intent, then "restarts" --
         # releasing the exclusive flock -- leaving the OPEN intent and its

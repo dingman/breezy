@@ -32,6 +32,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.transport import VenueResponse
@@ -105,6 +106,7 @@ async def test_fq_order_denied_when_per_position_cap_is_exceeded(
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         # Cost (0.63) exceeds this ceiling -- the per-position deny path.
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "0.10"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         await rig.client._submit_order(_fq_submit_order(rig))
@@ -130,6 +132,7 @@ async def test_fq_order_denied_when_daily_budget_is_exhausted(
         # Cost (0.63) exceeds this ceiling -- the daily-budget deny path.
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "0.10"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         await rig.client._submit_order(_fq_submit_order(rig))
@@ -181,6 +184,7 @@ async def test_fq_order_resolved_ambiguous_then_the_next_take_is_latch_refused(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         await rig.client._submit_order(_fq_submit_order(rig))
@@ -278,6 +282,7 @@ async def test_terminal_zero_fill_retirement_clears_ambiguous_refusal_and_a_take
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(tmp_path)
         sender = client._order_sender
@@ -313,6 +318,7 @@ async def test_terminal_zero_fill_retirement_keeps_an_unrelated_refusal(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         client._refuse(_UNRELATED_REFUSAL)
@@ -340,6 +346,7 @@ async def test_an_incomplete_positions_read_neither_retires_nor_clears_the_ambig
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         _set_get_evidence(
@@ -374,6 +381,7 @@ async def test_a_non_terminal_get_neither_retires_nor_clears_the_ambiguous_refus
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         _set_get_evidence(client, order_id, slug, state="ORDER_STATE_NEW", cum=0, positions={})
@@ -400,6 +408,7 @@ async def test_a_fill_terminal_retirement_clears_the_ambiguous_refusal(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         _set_get_evidence(
@@ -452,6 +461,7 @@ async def test_a_permit_restore_raise_keeps_the_ambiguous_refusal_and_logs_the_e
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
 
@@ -480,6 +490,7 @@ async def test_a_ledger_true_up_raise_keeps_the_ambiguous_refusal(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
 
@@ -511,6 +522,7 @@ async def test_a_corrupt_latch_read_after_retire_keeps_the_ambiguous_refusal(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
         real_retire = client._retire

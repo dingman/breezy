@@ -46,6 +46,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import PORTFOLIO_POSITIONS_PAT
 from breezy.adapters.polymarket_us.leg_prices import instrument_price_for_leg
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
@@ -124,6 +125,7 @@ async def _drive_no_leg_order(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await fixture.client._submit_order(command)
 
