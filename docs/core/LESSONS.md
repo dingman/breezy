@@ -55,7 +55,7 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-12 — Widen an exact-set barrier, never relax it (absorbs L-46, L-54)
 **Mistake:** An exact-set barrier went red and a shared pytest config edit changed a pinned filter. A module placement disguised a host string to pass a contract test.
-**Prevention:** WIDEN the expected set, never relax the comparison (no `==` to `in`, subset or allowlist); before placing a module or editing shared config, grep `tests/` for each module path, host or exact text, read the matching contract docstrings and every 'deviated' note touching a guard, and revise the plan not the test; change pinned values or a scope guard's EXEMPT/allowlist only in its own reviewed re-pin item that a dated ruling cites, never in the code commit that needs the widening; reject any value assembled, encoded or aliased to evade a scanner; exact-set membership proves existence, not inertness.
+**Prevention:** WIDEN the expected set, never relax the comparison (no `==` to `in`, subset or allowlist); before placing a module or editing shared config, grep `tests/` for each module path, host or exact text, read the matching contract docstrings and every 'deviated' note touching a guard, and revise the plan not the test; change pinned values or a scope guard's EXEMPT/allowlist only in its own reviewed re-pin item that a dated ruling cites, never in the code commit that needs the widening; reject any value assembled, encoded or aliased to evade a scanner; exact-set membership proves existence, not inertness. Pinned-value changes need a safety review, and every 'deviated' note touching a guard is read in full.
 **Applied:** 2026-09-01
 **Last updated:** 2026-11-02
 
@@ -109,7 +109,7 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-24 — A fixture that always satisfies an invariant never tests the driver that must supply it (2026-09-04) (absorbs L-42, L-55)
 **Mistake:** Fixtures pre-satisfied every invariant, and a reader test used hand-built store keys that no production writer used.
-**Prevention:** Add a RED test that each invariant still refuses when the driver's input is absent; run each production default un-injected at least once against a cheap real stand-in; create durable state in reader tests only through the production writer (grep new tests for literal `store.set` or `consume(`), with round-trip tests for key normalisation; and do one real-artefact run before calling it done.
+**Prevention:** Add a RED test that each invariant still refuses when the driver's input is absent; run each production default un-injected at least once against a cheap real stand-in; create durable state in reader tests only through the production writer (grep new tests for literal `store.set` or `consume(`), with round-trip tests for key normalisation, which lives in the reader; and do one real-artefact run before calling it done.
 **Applied:** 2026-09-04
 **Last updated:** 2026-11-02
 
@@ -175,7 +175,7 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 
 ### L-36 — Strict ZERO_FILL is unreachable; a no-fill IOC is AMBIGUOUS until a GET says otherwise (2026-09-10) (absorbs L-52)
 **Mistake:** A no-fill IOC was assumed to return strict ZERO_FILL, and an empty positions page was read as zero fill.
-**Prevention:** Never branch on strict ZERO_FILL; a create body of `200` with `id` and `executions == []` stays KIND_AMBIGUOUS (leave `classify_create_order_outcome` byte-unchanged); resolve with-id intents only via `GET /v1/order/{id}`, fail-closed on any read failure, poller disabled; retire the no-id resolver only on complete reads (`RESOLVER_NO_ID_NO_FILL`); never invoke `clear_submit_intent`; and before any read retires, clears or credits anything, state the outcomes it can distinguish, stay AMBIGUOUS when it cannot, and assert operator-visible lines on the unit's real stream.
+**Prevention:** Never branch on strict ZERO_FILL; a create body of `200` with `id` and `executions == []` stays KIND_AMBIGUOUS (leave `classify_create_order_outcome` byte-unchanged); resolve with-id intents only via `GET /v1/order/{id}`, fail-closed on any read failure, poller disabled; retire the no-id resolver only on complete reads (`RESOLVER_NO_ID_NO_FILL`); never invoke `clear_submit_intent`; and before any read retires, clears or credits anything, state the outcomes it can distinguish, stay AMBIGUOUS when it cannot, and assert operator-visible lines on the unit's real stream, and check the journal after the first live run.
 **Applied:** 2026-09-10
 **Last updated:** 2026-11-02
 
