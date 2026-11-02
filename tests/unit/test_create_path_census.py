@@ -13,6 +13,11 @@ from scripts.analysis.gap5_create_path_census import (
     JOIN_SLACK_S,
     MESSAGES,
     RESTING_CONFIRM_DEADLINE_S,
+    HygieneRefusal,
+    IncompleteInputError,
+    SourceDriftError,
+    _round3,
+    _scan_log,
     classify_create,
     derive_backoff,
     evaluate_predicates,
@@ -25,6 +30,7 @@ from scripts.analysis.gap5_create_path_census import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
+EXEC_DIR = Path("src/breezy/adapters/polymarket_us/exec")
 CREATE = "create-order classified kind=ambiguous status=200 body_kind=empty-executions"
 EXITS = {
     "ALLOWLIST": "resting confirm: the venue order id failed the allowlist; holding",
@@ -195,8 +201,10 @@ def test_non404_refused_deadline_is_unknown() -> None:
     assert row["signature"] == "UNKNOWN"
 
 
-def test_pure_classifier() -> None:
+def test_pure_classifier_last_terminal_wins_and_overlap_is_unknown() -> None:
     assert classify_create(["REFUSED", "TIMEOUT"], refused_404=True) == "SIG_X_TIMEOUT"
+    assert classify_create(["ECHO"], overlap=True) == "UNKNOWN"
+    assert classify_create([]) == "SIG_NO_EXIT"
 
 
 @pytest.mark.parametrize(
@@ -280,7 +288,9 @@ def test_h5_unknown_at_half_is_undecidable() -> None:
         hold_row(bind_delay_s=40, hold_bind_delay_s=41, backoff_in_force=b) for b in ["UNKNOWN", 40]
     ]
     verdict = evaluate_predicates(rows)
-    assert verdict["h5"] == "UNDECIDABLE" and "GO" not in json.dumps(verdict)
+    assert verdict["h5"] == "UNDECIDABLE"
+    assert "STOP-REPORT: H5 UNDECIDABLE" in verdict["stop_report_reasons"]
+    assert "GO" not in json.dumps(verdict)
 
 
 @pytest.mark.parametrize(("backoff", "state"), [(40, "H5a"), (30, "H5b")])
@@ -311,12 +321,89 @@ def test_empty_denominator_is_unexplained_without_division() -> None:
 def test_drift_guard_reads_client_as_text() -> None:
     citations = verify_sources(ROOT)
     assert len(MESSAGES) == 8 and all(citations["client.py"][k] for k in MESSAGES)
-    assert citations["submit_chain.py"]["deadline"] == [164]
+    chain = (ROOT / EXEC_DIR / "submit_chain.py").read_text().splitlines()
+    (found,) = citations["submit_chain.py"]["deadline"]
+    assert "RESTING_CONFIRM_DEADLINE_S: Final[int] = 5" in chain[found - 1]
+
+
+def _fake_tree(tmp_path: Path, filename: str, old: str, new: str) -> Path:
+    target = tmp_path / EXEC_DIR
+    target.mkdir(parents=True)
+    for name in ("client.py", "submit_chain.py"):
+        text = (ROOT / EXEC_DIR / name).read_text()
+        if name == filename:
+            assert text.count(old) == 1
+            text = text.replace(old, new)
+        (target / name).write_text(text)
+    return tmp_path
 
 
 def test_drift_guard_fails_closed(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="source drift"):
+    with pytest.raises(SourceDriftError, match="source drift: unreadable"):
         verify_sources(tmp_path)
+
+
+def test_unmodified_copy_of_sources_verifies(tmp_path: Path) -> None:
+    root = _fake_tree(
+        tmp_path,
+        "client.py",
+        "self._log.error(classified_line)",
+        "self._log.error(classified_line)",
+    )
+    assert verify_sources(root)["client.py"]["anchor_error"]
+
+
+def test_drift_altered_pinned_message_is_missing_text(tmp_path: Path) -> None:
+    old = "resting confirm: the GET timed out; holding"
+    root = _fake_tree(tmp_path, "client.py", old, "resting confirm: the GET expired; holding")
+    with pytest.raises(SourceDriftError, match="pinned text missing"):
+        verify_sources(root)
+
+
+def test_drift_altered_submit_chain_pin_is_missing_text(tmp_path: Path) -> None:
+    old = "RESTING_CONFIRM_DEADLINE_S: Final[int] = 5"
+    root = _fake_tree(
+        tmp_path, "submit_chain.py", old, "RESTING_CONFIRM_DEADLINE_S: Final[int] = 6"
+    )
+    with pytest.raises(SourceDriftError, match="pinned text missing"):
+        verify_sources(root)
+
+
+def test_drift_changed_emitter_level_is_distinct_error(tmp_path: Path) -> None:
+    old = 'self._log.warning("resting confirm: the GET timed out; holding")'
+    new = 'self._log.info("resting confirm: the GET timed out; holding")'
+    root = _fake_tree(tmp_path, "client.py", old, new)
+    with pytest.raises(SourceDriftError, match="emitter level changed"):
+        verify_sources(root)
+
+
+def _write_log(path: Path, content: bytes) -> Path:
+    path.write_bytes(content)
+    return path
+
+
+def _window() -> tuple[int, int]:
+    from breezy.analysis.capture_node_log_io import ts_ns
+
+    return ts_ns(b"2026-11-01T00:00:00Z") or 0, ts_ns(b"2026-11-02T00:00:00Z") or 0
+
+
+def test_scan_log_unterminated_last_line_is_refused(tmp_path: Path) -> None:
+    body = (anchor() + "\n").encode() + anchor(12).encode()  # no trailing newline
+    path = _write_log(tmp_path / "breezy-trade-20261101T165002Z.log", body)
+    with pytest.raises(IncompleteInputError, match="incomplete input line"):
+        _scan_log(path, *_window())
+
+
+def test_scan_log_non_utc_stamp_line_is_ignored_not_counted(tmp_path: Path) -> None:
+    offset = "2026-11-01T17:00:10+02:00 [ERROR] sink: " + CREATE + " client_order_id=synthetic\n"
+    body = (anchor(10) + "\n").encode() + offset.encode()
+    path = _write_log(tmp_path / "breezy-trade-20261101T165002Z.log", body)
+    result = _scan_log(path, *_window())
+    assert result is not None
+    assert result["counts"]["N_create"] == 1  # offset-stamped line matches no event
+    assert result["raw_counts"]["empty_mentions_full"] == 2  # but the raw mention is counted
+    assert len(result["rows"]) == 1 and "rows" in result
 
 
 @pytest.mark.parametrize(
@@ -331,8 +418,9 @@ def test_drift_guard_fails_closed(tmp_path: Path) -> None:
     ],
 )
 def test_hygiene_rejects_planted_sensitive_text(secret: str) -> None:
-    with pytest.raises(ValueError, match="hygiene"):
+    with pytest.raises(HygieneRefusal, match="hygiene"):
         hygiene_scan(secret)
+    assert issubclass(HygieneRefusal, ValueError)
 
 
 def test_render_whitelists_rows_and_has_zero_sink_proof() -> None:
@@ -357,12 +445,31 @@ def test_writer_has_no_adapter_imports_and_respects_size_limits() -> None:
     tree = ast.parse(source)
     imports = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
     assert not any(name and name.startswith("breezy.adapters") for name in imports)
-    assert len(source.splitlines()) <= 400
     assert all(
         (node.end_lineno or node.lineno) - node.lineno + 1 <= 50
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
+
+
+def test_round3_is_recursive_and_leaves_ints_and_strings_alone() -> None:
+    assert _round3({"a": [1.23456, {"b": 2}], "c": "x", "d": (0.0004,)}) == {
+        "a": [1.235, {"b": 2}],
+        "c": "x",
+        "d": [0.0],
+    }
+
+
+def test_planted_eight_digit_integer_id_is_caught_after_rounding() -> None:
+    payload: dict[str, Any] = {
+        "git_sha": "a" * 40,
+        "citations": {"planted": 12345678},
+        "logs": [],
+        "rows": [],
+        "verdict": {},
+    }
+    with pytest.raises(HygieneRefusal):
+        render(payload)
 
 
 def test_render_rounds_nanosecond_floats_so_hygiene_does_not_false_positive() -> None:

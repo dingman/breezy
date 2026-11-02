@@ -55,6 +55,19 @@ Overlap is UNKNOWN; WAITs count OrderDenied once. H4 needs OrderAccepted. Unmatc
 Backoff resets can be unlogged. No DB cross-check. Historical DIDNOTMAP is never relabelled.
 Raw mentions include duplicates/outside-window. Sink: WARN retries, ERROR creates, INFO NEW."""
 Row = dict[str, Any]
+CHUNK_BYTES = 1 << 20
+
+
+class SourceDriftError(ValueError):
+    """A pinned source text or emitter level no longer matches the adapter."""
+
+
+class HygieneRefusal(ValueError):
+    """The output carried text the hygiene scan refuses to publish."""
+
+
+class IncompleteInputError(ValueError):
+    """A log or run precondition is incomplete, truncated, or unusable."""
 
 
 def strip_ansi(text: str) -> str:
@@ -83,7 +96,7 @@ def match_line(text: str, line_no: int = 1) -> Row | None:
     elif backoff:
         kind = "BACKOFF"
     if when is None:
-        raise ValueError("invalid log timestamp")
+        raise IncompleteInputError("invalid log timestamp")
     event: Row = {"ns": when, "kind": kind, "line": line_no, "level": match[2]}
     event.update(_key=key[1] if key else "", refused_404="GET refused (HTTP status 404)" in text)
     event.update(failure_count=int(backoff[1]) if backoff else None)
@@ -91,13 +104,13 @@ def match_line(text: str, line_no: int = 1) -> Row | None:
 
 
 def classify_create(
-    sequence: list[str], *, refused_404: bool = False, overlap: bool = False, new: bool = False
+    sequence: list[str], *, refused_404: bool = False, overlap: bool = False
 ) -> str:
     if overlap:
         return "UNKNOWN"
     terminals = [k for k in sequence if k in TERMINALS or k == "DEADLINE"]
     if not terminals:
-        return "SIG_NEW" if new else "SIG_NO_EXIT"
+        return "SIG_NO_EXIT"
     if terminals[-1] in TERMINALS:
         return TERMINALS[terminals[-1]]
     prefix = sequence[: max(i for i, kind in enumerate(sequence) if kind == "DEADLINE")]
@@ -130,8 +143,7 @@ def segment_creates(lines: Iterable[str]) -> list[Row]:
             abs(e["ns"] - anchor["ns"]) <= WINDOW_NS for j, e in enumerate(anchors) if j != i
         )
         rows.append(_record(i, anchor, exits, events, overlap))
-    _attach_lifecycle(rows, events)
-    return rows
+    return _attach_lifecycle(rows, events)
 
 
 def _record(i: int, anchor: Row, exits: list[Row], events: list[Row], overlap: bool) -> Row:
@@ -157,7 +169,8 @@ def _record(i: int, anchor: Row, exits: list[Row], events: list[Row], overlap: b
     return row
 
 
-def _attach_lifecycle(rows: list[Row], events: list[Row]) -> None:
+def _attach_lifecycle(source: list[Row], events: list[Row]) -> list[Row]:
+    rows = [{**r, "waits": list(r["waits"])} for r in source]
     for event in events:
         pending = [
             r for r in rows if r["_ns"] <= event["ns"] and r["bind_delay_s"] == "never bound"
@@ -186,6 +199,7 @@ def _attach_lifecycle(rows: list[Row], events: list[Row]) -> None:
                 wait = {"line": event["line"], "delay_s": delay}
                 wait["backoff_in_force"] = row["backoff_in_force"]
                 row["waits"].append(wait)
+    return rows
 
 
 def _majority(count: int, total: int) -> bool:
@@ -258,7 +272,7 @@ def hygiene_scan(text: str) -> None:
         r"(?i:private.?key|secret.?key|api.?key|account.?number)"
     )
     if re.search(pattern, text):
-        raise ValueError("hygiene refusal: sensitive output")
+        raise HygieneRefusal("hygiene refusal: sensitive output")
 
 
 def verify_sources(root: Path) -> Row:
@@ -278,14 +292,14 @@ def verify_sources(root: Path) -> Row:
     result: Row = {}
     for filename, needles in (("client.py", pins), ("submit_chain.py", chain)):
         if not (base / filename).is_file():
-            raise ValueError("source drift: unreadable")
+            raise SourceDriftError("source drift: unreadable")
         lines = (base / filename).read_text().splitlines()
         hits = {
             key: [i for i, text in enumerate(lines, 1) if needle in text]
             for key, needle in needles.items()
         }
         if not all(hits.values()):
-            raise ValueError("source drift: pinned text missing")
+            raise SourceDriftError("source drift: pinned text missing")
         result[filename] = hits
         if filename == "client.py":
             for label, needle in {**MESSAGES, "new": NEW_EMITTER}.items():
@@ -293,9 +307,27 @@ def verify_sources(root: Path) -> Row:
                 level = "info" if label == "new" else level
                 pattern = rf"self\._log\.{level}\(\s*f?[\"']{re.escape(needle)}"
                 if not re.search(pattern, "\n".join(lines)):
-                    raise ValueError("source drift: emitter level changed")
+                    raise SourceDriftError("source drift: emitter level changed")
     result["note"] = "RE-CHECKED AGAINST TEXT AT RUN TIME; confirm precedes anchor."
     return result
+
+
+def _round3(obj: Any) -> Any:
+    if isinstance(obj, float):
+        return round(obj, 3)
+    if isinstance(obj, dict):
+        return {k: _round3(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_round3(v) for v in obj]
+    return obj
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def render(payload: Row) -> tuple[str, str]:
@@ -303,7 +335,7 @@ def render(payload: Row) -> tuple[str, str]:
         k: payload[k] for k in ("git_sha", "citations", "logs", "counts", "verdict") if k in payload
     }
     public["rows"] = [{k: r[k] for k in PUBLIC if k in r} for r in payload["rows"]]
-    public = json.loads(json.dumps(public), parse_float=lambda f: round(float(f), 3))
+    public = _round3(public)
     machine = json.dumps(public, indent=2, sort_keys=True) + "\n"
     md = [f"# GAP-5a create-path census\n\ngit_sha: {payload['git_sha']}", NOTES]
     md.append("Window: 2026-10-31T00:00Z to 2026-11-02T00:00Z, end exclusive.")
@@ -329,15 +361,18 @@ def _scan_log(path: Path, start: int, end: int) -> Row | None:
     stamps: list[int] = []
     levels: dict[str, int] = {}
     raw_counts: Counter[str] = Counter()
+    waits = 0
     for raw in read_lines(path):
         if raw.truncated or not raw.terminated:
-            raise ValueError("incomplete input line")
+            raise IncompleteInputError("incomplete input line")
         text = raw.raw.decode("utf-8", "strict")
         event = match_line(text, raw.line_no)
         if event:
             stamps.append(event["ns"])
             levels.setdefault(event["level"], raw.line_no)
         in_window = bool(event and start <= event["ns"] < end)
+        if event and event["kind"] == "WAIT" and start - WINDOW_NS <= event["ns"] < end:
+            waits += 1
         for marker, name in (
             ("body_kind=empty-executions", "empty_mentions"),
             ("resting confirm:", "confirm_lines"),
@@ -348,16 +383,17 @@ def _scan_log(path: Path, start: int, end: int) -> Row | None:
         lines.append(text if event and start - WINDOW_NS <= event["ns"] < end else "")
     if not stamps or stamps[0] >= end or stamps[-1] < start:
         return None
-    rows = [r for r in segment_creates(lines) if start <= r["_ns"] < end]
-    for row in rows:
-        row["log"] = path.name
-    waits = sum(bool((e := match_line(text)) and e["kind"] == "WAIT") for text in lines)
-    result: Row = {"filename": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    rows = [{**r, "log": path.name} for r in segment_creates(lines) if start <= r["_ns"] < end]
+    result: Row = {"filename": path.name, "sha256": _sha256_file(path)}
     result.update(counts=_counts(rows), raw_counts=dict(raw_counts), sink_level_lines=levels)
     result.update(N_WAIT=waits, N_WAIT_unjoined=waits - sum(len(r["waits"]) for r in rows))
     result.update(first_relative_s=(stamps[0] - start) / 1e9)
     result.update(last_relative_s=(stamps[-1] - start) / 1e9, rows=rows)
     return result
+
+
+def _all_rows(logs: list[Row]) -> list[Row]:
+    return [r for log in logs for r in log["rows"]]
 
 
 def main() -> None:
@@ -368,7 +404,7 @@ def main() -> None:
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=root):
-        raise ValueError("writer requires a clean worktree")
+        raise IncompleteInputError("writer requires a clean worktree")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     citations = verify_sources(root)
     paths: set[Path] = set()
@@ -376,14 +412,13 @@ def main() -> None:
         listing = list_node_logs(requested if requested.is_dir() else requested.parent)
         paths.update(p for p in listing.paths if requested.is_dir() or p == requested)
         if not requested.is_dir() and requested not in listing.paths:
-            raise ValueError("input not a node log")
+            raise IncompleteInputError("input not a node log")
     start, end = ts_ns(START) or 0, ts_ns(END) or 0
     logs = [log for p in sorted(paths) if (log := _scan_log(p, start, end)) is not None]
     if not logs:
-        raise ValueError("no input overlaps window")
-    rows = [r for log in logs for r in log.pop("rows")]
-    for i, row in enumerate(rows, 1):
-        row["ordinal"] = f"c{i:03d}"
+        raise IncompleteInputError("no input overlaps window")
+    rows = [{**r, "ordinal": f"c{i:03d}"} for i, r in enumerate(_all_rows(logs), 1)]
+    logs = [{k: v for k, v in log.items() if k != "rows"} for log in logs]
     verdict = evaluate_predicates(rows, n_wait_total=sum(log["N_WAIT"] for log in logs))
     payload: Row = {"git_sha": sha, "citations": citations, "logs": logs, "rows": rows}
     payload["verdict"] = verdict
