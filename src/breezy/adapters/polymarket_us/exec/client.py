@@ -256,6 +256,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, Protocol, Self
 
@@ -385,8 +386,6 @@ from breezy.persistence.exit_tags import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from datetime import date
-
     from nautilus_trader.cache.cache import Cache
     from nautilus_trader.common.component import LiveClock, MessageBus
     from nautilus_trader.common.providers import InstrumentProvider
@@ -467,6 +466,14 @@ FILL_INDEX_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_index/"
 #: this module's own E0-NOSEND-RESOLVER invariant permits no separate
 #: `self._store_set` callee from a scanned resolver coroutine.
 FILL_BY_DAY_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_by_day/"
+
+#: OPERATOR-CONTROLS-MONTHLY-CAP stage C: the first UTC day on which the
+#: `FILL_BY_DAY_KEY_PREFIX` writer existed (EDGE-2 AC6b, committed 2026-09-27).
+#: The store has no prefix scan and `_read_fill_index` collapses an ABSENT index
+#: to ``[]``, so before this day "no index" cannot be told from "no fills" --
+#: a month starting earlier has no demonstrable day-index coverage and the
+#: month-to-date seed refuses to arm rather than treat the gap as zero spend.
+FILL_BY_DAY_INDEX_EPOCH: Final[date] = date(2026, 9, 27)
 
 #: SP-3r: ``<UTC day>:<intent_fingerprint>`` -> the venue order id whose
 #: fill record it names. Written INLINE inside :meth:`record_fill` (never as
@@ -2962,6 +2969,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if context is not None and context.order_side == "SELL":
                 continue
             partial = Decimal(0) if context is None else self._seeded_partial_of(context)
+            month_partial = (
+                Decimal(0) if context is None else self._seeded_month_partial_of(context)
+            )
             notional = None if context is None else max(context.notional_usd - partial, Decimal(0))
             self._ledger.register_open_exposure(
                 intent.intent_id,
@@ -2970,6 +2980,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 seeded_partial_usd=partial,
                 side="BUY",
                 now_ns=now_ns,
+                seeded_month_partial_usd=month_partial,
             )
             self._ledger.mark_ambiguous(intent.intent_id)
 
@@ -2989,22 +3000,40 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     def _seeded_partial_of(self, context: AmbiguousResolverContext) -> Decimal:
         """H6 ``P``: see :meth:`_register_open_intents_at_boot`. Any failure to read
         the record yields ``0`` -- the larger (conservative) uncharged notional."""
-        if context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID or self._seed_day is None:
+        record = self._boot_fill_record_of(context)
+        if record is None or utc_day_for_ns(record.ts_event) != self._seed_day:
             return Decimal(0)
+        return record.cumulative_cost
+
+    def _seeded_month_partial_of(self, context: AmbiguousResolverContext) -> Decimal:
+        """Monthly ``P``: the durable record's ``cumulative_cost`` iff the month
+        seed counted it -- its ``ts_event`` day lies in the seed day's UTC month,
+        on or before the seed day. Tracked apart from the daily partial because a
+        prior-day, same-month record is in the month total but not the day's."""
+        record = self._boot_fill_record_of(context)
+        seed_day = self._seed_day
+        if record is None or seed_day is None:
+            return Decimal(0)
+        fill_day = utc_day_for_ns(record.ts_event)
+        same_month = (fill_day.year, fill_day.month) == (seed_day.year, seed_day.month)
+        if not same_month or fill_day > seed_day:
+            return Decimal(0)
+        return record.cumulative_cost
+
+    def _boot_fill_record_of(self, context: AmbiguousResolverContext) -> DurableFillRecord | None:
+        if context.venue_order_id == submit_chain.NO_VENUE_ORDER_ID or self._seed_day is None:
+            return None
         try:
             raw = self._store_get(f"{FILL_KEY_PREFIX}{context.venue_order_id}")
             if raw is None:
-                return Decimal(0)
-            record = DurableFillRecord.from_bytes(raw)
+                return None
+            return DurableFillRecord.from_bytes(raw)
         except Exception as exc:  # noqa: BLE001 - an unreadable record is P = 0
             self._log.warning(
                 f"boot: fill record for intent {context.intent_id} unreadable "
                 f"({exc.__class__.__name__}); seeded partial taken as 0"
             )
-            return Decimal(0)
-        if utc_day_for_ns(record.ts_event) != self._seed_day:
-            return Decimal(0)
-        return record.cumulative_cost
+            return None
 
     def _seed_candidate_ids(self, today: date) -> list[str]:
         """AC6b/G4 (EDGE-2 plan r3, D9): every venue order id
@@ -3044,10 +3073,50 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         candidate_ids.extend(day_indexed)
         return candidate_ids
 
+    def _month_day_index_ids(self, month_start: date, today: date) -> list[str]:
+        """Venue order ids named by the ``FILL_BY_DAY_KEY_PREFIX`` index of every
+        UTC day from ``month_start`` through ``today`` inclusive.
+
+        An unreadable index of any day raises (``_read_fill_index`` collapses
+        only a genuinely ABSENT key to ``[]``, which is sound here because
+        :meth:`_require_month_index_coverage` has already established that the
+        day index writer existed for every day of this month).
+        """
+        ids: list[str] = []
+        day = month_start
+        while day <= today:
+            index_key = f"{FILL_BY_DAY_KEY_PREFIX}{day.isoformat()}"
+            indexed = self._read_fill_index(index_key)
+            if indexed is None:
+                raise PolymarketUSError(
+                    f"the durable day-fill index at {index_key!r} could not be "
+                    "read; the month-to-date spend seed refuses to arm on an "
+                    "incomplete walk"
+                )
+            ids.extend(indexed)
+            day += timedelta(days=1)
+        return ids
+
+    @staticmethod
+    def _require_month_index_coverage(month_start: date) -> None:
+        """Refuse unless the day index provably covers the whole month.
+
+        The store cannot enumerate keys and an absent day index reads as
+        ``[]``, so absence is never evidence of zero spend. Coverage is
+        demonstrable only for months starting on or after the day the writer
+        shipped (:data:`FILL_BY_DAY_INDEX_EPOCH`); an earlier month is refused,
+        never assumed empty.
+        """
+        if month_start < FILL_BY_DAY_INDEX_EPOCH:
+            raise PolymarketUSError(
+                "the month-to-date spend seed refuses to arm: the durable day-fill "
+                f"index coverage cannot be demonstrated back to {month_start.isoformat()}"
+            )
+
     def _seed_spend_from_durable_fills(self) -> None:
         """S0 (plan rev 3, R3-1): book today's already-spent USD into the
         daily ledger and the permit's session budget before anything can
-        arm.
+        arm -- and the UTC month-to-date BUY spend into the month total.
 
         Walks every instrument this client's provider has loaded, plus
         today's day index (:meth:`_seed_candidate_ids`) -- summing
@@ -3056,6 +3125,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``venue_order_id`` (the create and resolver paths overwrite the same
         key, and an id reachable through both walks is still one order, so
         one order is counted once).
+
+        **Month-to-date (stage C).** The same candidate set is widened with
+        the day index of every UTC day from the month start through today.
+        Each record is attributed whole, by its ``ts_event`` day, to that
+        day's bucket; only non-SELL (entry) records count -- exit proceeds
+        never refill the month. ``seed_month_spent`` is called exactly once,
+        BEFORE the daily seed and with the daily/permit seeds below untouched.
+        **Any coverage gap refuses**: a month starting before the day index
+        existed, a record of the month reachable through a per-instrument
+        index but absent from its day index, an index naming a missing or
+        corrupt record, or a same-month record dated after today. Absence is
+        never treated as zero spend.
 
         **Fails CLOSED.** ``_seed_candidate_ids`` raising -- a per-instrument
         or day-index corruption, not only a wholesale walk exception -- or a
@@ -3070,7 +3151,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         line naming the record count and the UTC day, never a dollar figure.
 
         **Idempotent.** A second ``_connect()`` in the same process re-walks
-        the same records, but :meth:`DailySpendLedger.seed_spent` and
+        the same records, but :meth:`DailySpendLedger.seed_spent`,
+        :meth:`DailySpendLedger.seed_month_spent` and
         :func:`seed_permit_budget_from_prior_spend` are each keyed to apply
         at most once, so re-running this method cannot double-book.
         """
@@ -3079,10 +3161,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         now_ns = self._clock.timestamp_ns()
         today = utc_day_for_ns(now_ns)
         self._seed_day = today
+        month_start = today.replace(day=1)
+        self._require_month_index_coverage(month_start)
+        month_index_ids = self._month_day_index_ids(month_start, today)
+        covered_by_day_index = set(month_index_ids)
         seen: set[str] = set()
         total = Decimal(0)
         count = 0
-        for venue_order_id in self._seed_candidate_ids(today):
+        month_buckets: dict[date, Decimal] = {}
+        for venue_order_id in [*self._seed_candidate_ids(today), *month_index_ids]:
             if venue_order_id in seen:
                 continue
             seen.add(venue_order_id)
@@ -3093,10 +3180,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     "but no record exists for it"
                 )
             record = DurableFillRecord.from_bytes(raw)
-            if utc_day_for_ns(record.ts_event) != today:
+            fill_day = utc_day_for_ns(record.ts_event)
+            if (fill_day.year, fill_day.month) == (today.year, today.month):
+                self._bucket_month_fill(
+                    month_buckets, record, fill_day, today, venue_order_id in covered_by_day_index
+                )
+            if fill_day != today:
                 continue
             total += record.cumulative_cost
             count += 1
+        self._ledger.seed_month_spent(month_buckets, now_ns)
         if count == 0:
             return
         self._ledger.seed_spent(day=today, spent_usd=total, now_ns=now_ns)
@@ -3105,6 +3198,29 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._log.info(
             f"seeded from {count} fill record(s) for {today.isoformat()}"
         )
+
+    @staticmethod
+    def _bucket_month_fill(
+        buckets: dict[date, Decimal],
+        record: DurableFillRecord,
+        fill_day: date,
+        today: date,
+        covered_by_day_index: bool,
+    ) -> None:
+        """Add one in-month record to its ``ts_event`` day bucket, or refuse."""
+        if fill_day > today:
+            raise PolymarketUSError(
+                f"durable fill {record.venue_order_id!r} is dated after today; the "
+                "month-to-date spend seed refuses to arm"
+            )
+        if not covered_by_day_index:
+            raise PolymarketUSError(
+                f"durable fill {record.venue_order_id!r} is missing from its day "
+                "index; month-to-date coverage is incomplete and the seed refuses to arm"
+            )
+        if record.order_side.upper() == "SELL":
+            return
+        buckets[fill_day] = buckets.get(fill_day, Decimal(0)) + record.cumulative_cost
 
     def _reconcile_no_side_first_order_key(self) -> None:
         """NO-SIDE S5 (E3-8/E4-1/E4-5): the equivalent, fail-closed boot

@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import datetime as dt
 import inspect
 import json
 import textwrap
@@ -52,7 +53,7 @@ import pytest
 from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.config import CacheConfig
-from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.common.component import LiveClock, MessageBus, TestClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.common.providers import InstrumentProvider
@@ -125,6 +126,7 @@ from breezy.adapters.polymarket_us.exec_fault import (
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
     utc_day_for_ns,
@@ -372,9 +374,10 @@ def _build_rig(
     spend_ledger: Any = None,
     live_trading_permit: Any = None,
     store_path: Path | None = None,
+    clock: Any = None,
 ) -> _Rig:
     loop = asyncio.get_running_loop()
-    clock = LiveClock()
+    clock = LiveClock() if clock is None else clock
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
 
@@ -2629,6 +2632,7 @@ def _accept_fill_caps() -> Iterator[None]:
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         yield
 
@@ -2662,6 +2666,7 @@ async def test_a_daily_budget_denial_writes_the_utc_day_marker_and_still_denies(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "0.10"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         await rig.client._submit_order(rig.limit_buy())
@@ -2754,6 +2759,7 @@ async def test_a_session_notional_exhaustion_writes_the_same_day_marker(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await client._connect()
         await client._submit_order(command)
@@ -2882,6 +2888,7 @@ async def test_a_session_order_count_exhaustion_writes_no_marker(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await client1._connect()
         await client1._submit_order(_manual_limit_buy(client1, clock1))
@@ -2895,6 +2902,7 @@ async def test_a_session_order_count_exhaustion_writes_no_marker(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await client2._connect()
         await client2._submit_order(_manual_limit_buy(client2, clock2))
@@ -2918,6 +2926,7 @@ async def test_a_per_position_ceiling_denial_writes_no_marker(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "0.10"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         await rig.client._submit_order(rig.limit_buy())
@@ -2987,6 +2996,7 @@ async def test_a_marker_store_write_failure_still_denies_the_order_and_does_not_
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "0.10"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
     ):
         await rig.client._connect()
         monkeypatch.setattr(rig.client, "_store_set", _raise_only_for_the_budget_marker)
@@ -4491,6 +4501,7 @@ async def test_a_relaunch_mid_day_does_not_re_grant_the_spent_budget(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "3.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "3.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "100000.00"),
         pytest.raises(LiveTradingPermissionError, match="daily budget"),
     ):
         ledger2.authorize_order_cost(
@@ -5775,6 +5786,325 @@ def test_the_foreign_note_is_value_safe_and_bounded() -> None:
     assert quantity(10**5000) == invalid
 
 
+# ---------------------------------------------------------------------------
+# OPERATOR-CONTROLS-MONTHLY-CAP stage C -- the boot-time month-to-date seed
+# from the durable fills, and its refusal on any coverage gap.
+# ---------------------------------------------------------------------------
+
+_MONTH_NOW = (2026, 11, 3, 12)
+_UNLOADED_INSTRUMENT_ID = "tc-temp-unloaded-2026-10-02-lt50f.POLYMARKET_US"
+
+
+def _utc_ns(year: int, month: int, day: int, hour: int = 12) -> int:
+    moment = dt.datetime(year, month, day, hour, tzinfo=dt.UTC)
+    return int(moment.timestamp()) * 1_000_000_000
+
+
+def _test_clock_at(year: int, month: int, day: int, hour: int = 12) -> TestClock:
+    clock = TestClock()
+    clock.set_time(_utc_ns(year, month, day, hour))
+    return clock
+
+
+class _MonthSeedSpyLedger(DailySpendLedger):
+    """Records every ``seed_month_spent`` request (the ledger itself is slotted,
+    so the method cannot be patched on an instance)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.month_seed_calls: list[dict[dt.date, Decimal]] = []
+
+    def seed_month_spent(self, buckets: Any, now_ns: int) -> None:
+        self.month_seed_calls.append(dict(buckets))
+        super().seed_month_spent(buckets, now_ns)
+
+
+async def _write_fills(
+    tmp_path: Path,
+    store_path: Path,
+    records: list[tuple[int, dict[str, Any]]],
+) -> None:
+    """Persist durable fills through the real writer (both indexes), then close."""
+    writer = _build_rig(tmp_path, store_path=store_path, spend_ledger=DailySpendLedger())
+    await writer.client._connect()
+    for ts_event, kwargs in records:
+        extra = dict(kwargs)
+        instrument_id = extra.pop("instrument_id", None)
+        record = _record_at(writer, ts_event=ts_event, **extra)
+        if instrument_id is not None:
+            record = dataclasses.replace(record, instrument_id=instrument_id)
+        writer.client.record_fill(record)
+    await writer.client._disconnect()
+
+
+async def _boot_at(
+    tmp_path: Path,
+    store_path: Path,
+    clock: TestClock,
+    *,
+    permit: Any = None,
+) -> tuple[_Rig, DailySpendLedger]:
+    ledger = DailySpendLedger()
+    rig = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=ledger,
+        clock=clock,
+        live_trading_permit=permit,
+    )
+    await rig.client._connect()
+    return rig, ledger
+
+
+@pytest.mark.asyncio
+async def test_the_month_seed_sums_buy_cost_over_the_month_and_counts_today_once(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            (_utc_ns(2026, 11, 1), {"order": "V-M-1", "cost": Decimal("2.00")}),
+            (_utc_ns(2026, 11, 3), {"order": "V-M-TODAY", "cost": Decimal("3.00")}),
+        ],
+    )
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock)
+    now_ns = clock.timestamp_ns()
+
+    # Today's fill is reachable through the per-instrument AND the day index;
+    # it is one order, counted once in the month and once in the day.
+    assert ledger.spent_this_month_usd(now_ns=now_ns) == Decimal("5.00")
+    assert ledger.spent_today_usd(now_ns=now_ns) == Decimal("3.00")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_month_seed_is_requested_exactly_once_per_boot_walk(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [(_utc_ns(2026, 11, 2), {"order": "V-ONCE", "cost": Decimal("1.50")})],
+    )
+    clock = _test_clock_at(*_MONTH_NOW)
+    ledger = _MonthSeedSpyLedger()
+    rig = _build_rig(tmp_path, store_path=store_path, spend_ledger=ledger, clock=clock)
+    await rig.client._connect()
+
+    assert ledger.month_seed_calls == [{dt.date(2026, 11, 2): Decimal("1.50")}]
+    # A second connect re-walks but the ledger's one-shot keeps the total.
+    await rig.client._connect()
+    assert ledger.spent_this_month_usd(now_ns=clock.timestamp_ns()) == Decimal("1.50")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_daily_and_session_seeds_are_unchanged_by_the_month_walk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_operator_gate(monkeypatch, session_notional="12.00", order_count="10")
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            (_utc_ns(2026, 11, 1), {"order": "V-PRIOR", "cost": Decimal("5.00")}),
+            (_utc_ns(2026, 11, 3), {"order": "V-TODAY", "cost": Decimal("4.00")}),
+        ],
+    )
+    permit = _issued_permit(LiveClock())
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock, permit=permit)
+
+    assert ledger.spent_today_usd(now_ns=clock.timestamp_ns()) == Decimal("4.00")
+    assert live_trading_budget_remaining(permit) == (Decimal("8.00"), 10)
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_sell_record_never_adds_to_the_month_spend(tmp_path: Path) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            (_utc_ns(2026, 11, 1), {"order": "V-BUY", "cost": Decimal("2.00")}),
+            (_utc_ns(2026, 11, 2), {"order": "V-EXIT", "cost": Decimal("9.00"), "side": "SELL"}),
+        ],
+    )
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock)
+
+    assert ledger.spent_this_month_usd(now_ns=clock.timestamp_ns()) == Decimal("2.00")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_order_named_twice_across_indexes_is_counted_once(tmp_path: Path) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [(_utc_ns(2026, 11, 1), {"order": "V-DUP", "cost": Decimal("2.00")})],
+    )
+    with SqliteStateStore(store_path) as store:
+        # Repeat the id inside its day index and file it under a second day too.
+        for day in ("2026-11-01", "2026-11-02"):
+            store.set(
+                f"{client_module.FILL_BY_DAY_KEY_PREFIX}{day}",
+                json.dumps(["V-DUP", "V-DUP"]).encode("utf-8"),
+            )
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock)
+
+    assert ledger.spent_this_month_usd(now_ns=clock.timestamp_ns()) == Decimal("2.00")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_fill_of_an_unloaded_historical_instrument_is_counted_via_the_day_index(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            (
+                _utc_ns(2026, 11, 1),
+                {
+                    "order": "V-UNLOADED",
+                    "cost": Decimal("2.50"),
+                    "instrument_id": _UNLOADED_INSTRUMENT_ID,
+                },
+            ),
+        ],
+    )
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock)
+
+    assert ledger.spent_this_month_usd(now_ns=clock.timestamp_ns()) == Decimal("2.50")
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_month_starting_before_the_day_index_existed_refuses_to_arm(
+    tmp_path: Path,
+) -> None:
+    """Pre-AC6b months have no day index: an absent index proves nothing, so
+    the seed refuses -- even with a record sitting under an UNLOADED instrument."""
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            (
+                _utc_ns(2026, 9, 10),
+                {
+                    "order": "V-OLD",
+                    "cost": Decimal("2.00"),
+                    "instrument_id": _UNLOADED_INSTRUMENT_ID,
+                },
+            ),
+        ],
+    )
+    ledger = DailySpendLedger()
+    rig = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=ledger,
+        clock=_test_clock_at(2026, 9, 30),
+    )
+    with pytest.raises(PolymarketUSError, match="coverage"):
+        await rig.client._connect()
+    assert ledger.spent_this_month_usd(now_ns=_utc_ns(2026, 9, 30)) == Decimal(0)
+
+
+@pytest.mark.asyncio
+async def test_a_loaded_instrument_fill_missing_from_its_day_index_refuses_to_arm(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [(_utc_ns(2026, 11, 1), {"order": "V-GAP", "cost": Decimal("2.00")})],
+    )
+    with SqliteStateStore(store_path) as store:
+        store.set(f"{client_module.FILL_BY_DAY_KEY_PREFIX}2026-11-01", json.dumps([]).encode())
+    rig = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=DailySpendLedger(),
+        clock=_test_clock_at(*_MONTH_NOW),
+    )
+    with pytest.raises(PolymarketUSError, match="coverage"):
+        await rig.client._connect()
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_or_missing_fill_record_in_the_month_refuses_to_arm(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [(_utc_ns(2026, 11, 1), {"order": "V-BAD", "cost": Decimal("2.00")})],
+    )
+    with SqliteStateStore(store_path) as store:
+        store.set(f"{client_module.FILL_KEY_PREFIX}V-BAD", b"{not json")
+    rig = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=DailySpendLedger(),
+        clock=_test_clock_at(*_MONTH_NOW),
+    )
+    with pytest.raises((PolymarketUSError, ExecutionReportMappingError)):
+        await rig.client._connect()
+
+    with SqliteStateStore(store_path) as store:
+        store.set(
+            f"{client_module.FILL_BY_DAY_KEY_PREFIX}2026-11-02",
+            json.dumps(["V-NEVER-WRITTEN"]).encode(),
+        )
+        store.set(f"{client_module.FILL_KEY_PREFIX}V-BAD", b"")
+    rig2 = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=DailySpendLedger(),
+        clock=_test_clock_at(*_MONTH_NOW),
+    )
+    with pytest.raises((PolymarketUSError, ExecutionReportMappingError)):
+        await rig2.client._connect()
+
+
+@pytest.mark.asyncio
+async def test_a_cumulative_cost_is_attributed_to_the_month_of_its_ts_event(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.db"
+    await _write_fills(
+        tmp_path,
+        store_path,
+        [
+            # The order began in October; its cumulative record's last event is
+            # 31 Oct, so the whole cost belongs to October.
+            (_utc_ns(2026, 10, 31, 23), {"order": "V-OCT", "cost": Decimal("7.00")}),
+            # This one's last event is 1 Nov: the whole cost belongs to November.
+            (_utc_ns(2026, 11, 1, 0), {"order": "V-NOV", "cost": Decimal("3.00")}),
+        ],
+    )
+    clock = _test_clock_at(*_MONTH_NOW)
+    rig, ledger = await _boot_at(tmp_path, store_path, clock)
+
+    assert ledger.spent_this_month_usd(now_ns=clock.timestamp_ns()) == Decimal("3.00")
+    await rig.client._disconnect()
 #: EXEC-PAR WP4: names other test modules (``exec_par_rig``) reach through this
 #: module on purpose -- barrier X1 pins which test modules import the exec
 #: package, so the rig must not import it directly. Listing them here makes the
