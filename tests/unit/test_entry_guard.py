@@ -188,7 +188,7 @@ def test_fill_index_key_matches_exec_client_writer() -> None:
     assert namespace.value.value == "exec/polymarket_us/"
 
     prefix = _module_assign(tree, "FILL_INDEX_KEY_PREFIX")
-    assert prefix.lineno == 452  # refreshed 2026-10-29 (EXEC-FOREIGN-POS Stage B)
+    assert prefix.lineno == 451  # refreshed 2026-11-02 (MONTH cap, stage C)
     assert isinstance(prefix.value, ast.JoinedStr)
     parts = prefix.value.values
     assert len(parts) == 2

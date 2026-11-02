@@ -25,7 +25,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Final
+from typing import Any, Final
 
 import pytest
 
@@ -241,7 +241,7 @@ def test_seed_month_spent_once_max_and_independent_of_daily_seed() -> None:
         {date(2026, 9, 3): Decimal(1)},
     ],
 )
-def test_seed_month_spent_invalid_is_atomic_and_retryable(buckets: dict) -> None:
+def test_seed_month_spent_invalid_is_atomic_and_retryable(buckets: dict[Any, Any]) -> None:
     ledger = DailySpendLedger()
     with pytest.raises(LiveTradingPermissionError):
         ledger.seed_month_spent(buckets, MIDDAY)

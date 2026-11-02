@@ -26,6 +26,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 from nautilus_trader.common.component import TestClock
@@ -203,7 +204,7 @@ def test_operator_caps_absent_refuses(
         pytest.raises(OperatorCapsNotConfiguredError) as exc,
     ):
         _ISSUE(
-            settings=_FakeSettings(),
+            settings=cast("Any", _FakeSettings()),
             live_trading_permit=live_permit,
             clock=clock,
         )

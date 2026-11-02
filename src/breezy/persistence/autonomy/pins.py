@@ -42,7 +42,7 @@ PRODUCER_SOURCE_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType(
         # aut6.health via table.py); was 8e49a377...b5b1
         # re-pin: D-A/D-B exec/client.py (label_run closure only); was c0fb987c...7010
         # re-pin: OPS-4 S3b (label_run UnitContext sandbox-root guard); was c52d76f7...09ee
-        # re-pin: MONTH cap (operator_controls, order_enablement, exec/client.py; label_run closure
+        # re-pin: MONTH cap (cap reader, order_enablement, exec/client.py; label_run closure
         # only, reviewed); was e2d4412f...3f38
         "aut2.label": "c2c84ab6cdb8ade35bf2cd38b33f98c63444088aa98e47ca384370c1ecb89f69",
         # re-pin after the breezy-maker-s2-trigger.timer row in monitor_watch.TIMER_MAX_INTERVAL_S; was b6df288b...ab17

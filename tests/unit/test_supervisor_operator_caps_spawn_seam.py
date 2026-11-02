@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Final
 
+import pytest
+
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     OPERATOR_RESERVED_CONTROL_ENV_VARS,
@@ -80,7 +82,7 @@ def _operator_file_env_without_the_monthly_cap(path: Path) -> dict[str, str]:
 
 
 def test_child_without_the_monthly_cap_refuses_before_any_dispatch(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 
