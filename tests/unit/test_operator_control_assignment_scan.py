@@ -130,10 +130,9 @@ REVIEWED_PROSE_MENTIONS: Final[frozenset[str]] = frozenset(
         ),
         "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
         "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
-        # 2026-11-02: the GAPS_2026-11-01 plans and the progress ledger name controls
+        # 2026-11-02: the GAPS_2026-11-01 plans name controls
         # (the MONTH control's plan, and GAP-6's survey of the two original caps).
         # Names only, never a value; each is markdown and cannot assign.
-        "docs/core/PROGRESS.md",
         "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r0.md",
         "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r1.md",
         "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r0.md",
@@ -155,9 +154,7 @@ _BASENAME_UNIQUE_ROWS: Final[frozenset[str]] = frozenset(
 
 #: (python file, prose row) pairs where the Python reads the markdown as TEXT to
 #: scan its phrasing. Reading a document cannot assign a control; the pair is exact.
-_REVIEWED_TEXT_READERS: Final[frozenset[tuple[str, str]]] = frozenset(
-    {("tests/unit/test_settlement_conservatism_prose_guard.py", "docs/core/PROGRESS.md")}
-)
+_REVIEWED_TEXT_READERS: Final[frozenset[tuple[str, str]]] = frozenset()
 
 #: A6: the ONLY callables that may be handed a control's NAME as an argument
 #: outside the definition module. Everything here either removes a value
@@ -703,10 +700,9 @@ def test_reviewed_prose_mentions_are_one_exact_non_assigning_allowlist() -> None
             ),
             "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
             "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
-            # 2026-11-02: the GAPS_2026-11-01 plans and the progress ledger name controls
+            # 2026-11-02: the GAPS_2026-11-01 plans name controls
             # (the MONTH control's plan, and GAP-6's survey of the two original caps).
             # Names only, never a value; each is markdown and cannot assign.
-            "docs/core/PROGRESS.md",
             "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r0.md",
             "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/plan_r1.md",
             "docs/plans/backlog/GAPS_2026-11-01/operator_controls_monthly_cap/plan_r0.md",
