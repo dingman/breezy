@@ -1,6 +1,6 @@
 # GAP-5a create-path census
 
-git_sha: 3e9e06daeeeb9b351c78a8cf84cc98c73b9f9001
+git_sha: 2c60e19380a3c7a6236c51dd9e694b7b8b7dde0c
 
 Anchors lack resting flags; delays start at anchor. Late unkeyed binds stay unjoined.
 Overlap is UNKNOWN; WAITs count OrderDenied once. H4 needs OrderAccepted. Unmatched stay unjoined.
