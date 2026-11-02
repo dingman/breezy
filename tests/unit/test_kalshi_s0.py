@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import subprocess
 import sys
+from collections import Counter
 from decimal import Decimal
 from email.message import Message
 from pathlib import Path
@@ -118,13 +119,6 @@ def test_h1_default_pins_host_pacing_and_retries(monkeypatch: Any) -> None:
 def test_h2_templates_full_match(template: str) -> None:
     with pytest.raises(s.PoisonedInput):
         s.HostPinnedKalshi(Stub()).get(template, parts={}, params={})
-    assert all(isinstance(v, re_type()) for v in s.ALLOWED_TEMPLATES.values())
-
-
-def re_type() -> type:
-    import re
-
-    return type(re.compile(""))
 
 
 @pytest.mark.parametrize("value", ["", "../X", "A/../B", "ABC\n", "https://evil", "X" * 65, "a"])
@@ -356,7 +350,7 @@ def test_l5_l6_open_hour_and_midnight_exclusion(opened: str, valid: bool) -> Non
 def test_x1_x3_exact_end(delta: int, expected: str | None) -> None:
     candles = [{"end_period_ts": 10000 + delta, "yes_bid": {"close": "0.02"}}]
     if expected == "raise":
-        with pytest.raises(AssertionError):
+        with pytest.raises(s.LookAhead):
             s.exact_candle(candles, 10000)
     else:
         found = s.exact_candle(candles, 10000)
@@ -423,7 +417,7 @@ def test_x7_lookahead_and_x8_both_schemas() -> None:
         (1751468401, 1751547600, "HIGH", "pre_cell"),
         (1751468400, 1751547600, "HIGH", "post_cell"),
     ]:
-        with pytest.raises(AssertionError):
+        with pytest.raises(s.LookAhead):
             s.assert_reference(ref, settlement, dt.date(2025, 7, 2), "KXHIGHNY", side, stratum)
     for schema in ("close", "close_dollars"):
         assert s.no_ask({"yes_bid": {schema: "0.0300"}}) == Decimal("0.9700")
@@ -457,16 +451,20 @@ def test_v4_positive_post_never_rescues_pre() -> None:
 
 
 def test_v6_weighted_pooled_disagreement() -> None:
-    obs = population("0.02")
-    obs += [s.Observation("HIGH", "pre_cell", "S0", "2025-07-01", Decimal("-0.98"), False)] * 10
+    # Pooled positive (one huge winning station-day) but equal-weight negative.
+    obs = population("-0.98")
+    obs += [s.Observation("HIGH", "pre_cell", "SX", "2025-07-01", Decimal("0.02"), True)] * 2000
     report = s.verdict(obs)
     assert Decimal(report["cells"]["HIGH_pre_cell"]["weighted_mean"]) < 0
-    assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) < 0
+    assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) > 0
+    assert report["decision"] == "INCONCLUSIVE"
+    # Agreement (both negative) in HIGH with a positive LOW cell is CONTINUE.
     obs = population("0.02")
     obs += [s.Observation("HIGH", "pre_cell", "S0", "2025-07-01", Decimal("-0.98"), False)] * 2
     report = s.verdict(obs)
     assert Decimal(report["cells"]["HIGH_pre_cell"]["weighted_mean"]) < 0
     assert Decimal(report["cells"]["HIGH_pre_cell"]["pooled_mean"]) < 0
+    assert report["decision"] == "CONTINUE"
     # One losing day repeated enough to dominate pooled, but 29 winning days
     # dominate the equal-weight station-day statistic.
     obs = population("0.03", n=60)
@@ -619,7 +617,7 @@ def test_low_reference_ends_and_window_boundary() -> None:
     s.assert_reference(
         1751432400, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre_cell"
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(s.LookAhead):
         s.assert_reference(
             1751432401, r["settlement_ts"], dt.date(2025, 7, 2), "KXLOWTNYC", "LOW", "pre_cell"
         )
@@ -711,3 +709,236 @@ def test_no_string_constant_equals_write_method_name_after_strip_upper() -> None
         and isinstance(n.left.value, str)
     ]
     assert folded == [], "runtime-built literal evades the guard"
+
+
+# ---- review-fix tests -------------------------------------------------------
+
+EVIDENCE_FIXED = ".S0.look"
+
+
+@pytest.mark.parametrize("prior", ["S0_2026-11-01.json", "S0_2026-11-01.md", ".S0_2026-11-01.look"])
+def test_h1_second_look_refused_on_any_prior_date(
+    tmp_path: Path, monkeypatch: Any, prior: str
+) -> None:
+    raw = seal(tmp_path, monkeypatch, [row()])
+    out = tmp_path / "evidence"
+    out.mkdir()
+    path = out / prior
+    path.mkdir() if prior.endswith(".look") else path.write_text("{}")
+    with pytest.raises(FileExistsError):
+        s.write_verdict(raw, out, "2026-11-02")
+    assert not (out / "S0_2026-11-02.json").exists()
+
+
+def test_h1_verdict_on_date_a_then_date_b_refused(tmp_path: Path, monkeypatch: Any) -> None:
+    raw = seal(tmp_path, monkeypatch, [row()])
+    out = tmp_path / "evidence"
+    s.write_verdict(raw, out, "2026-11-02")
+    assert (out / EVIDENCE_FIXED).is_dir()
+    with pytest.raises(FileExistsError):
+        s.write_verdict(raw, out, "2026-11-03")
+    assert sorted(p.name for p in out.glob("S0_*")) == ["S0_2026-11-02.json", "S0_2026-11-02.md"]
+
+
+def test_h1_audit_report_does_not_count_as_a_look(tmp_path: Path, monkeypatch: Any) -> None:
+    raw = seal(tmp_path, monkeypatch, [row()])
+    out = tmp_path / "evidence"
+    s.write_audit(raw, out, "2026-11-01")
+    s.write_verdict(raw, out, "2026-11-02")
+    assert (out / "S0_2026-11-02.json").exists()
+
+
+def test_h1_reservation_precedes_first_result_access(tmp_path: Path, monkeypatch: Any) -> None:
+    out = tmp_path / "evidence"
+    seen: list[bool] = []
+
+    class Blind(dict[str, Any]):
+        def __getitem__(self, key: str) -> Any:
+            if key == "result":
+                seen.append((out / EVIDENCE_FIXED).is_dir())
+            return super().__getitem__(key)
+
+        def get(self, key: str, default: Any = None) -> Any:
+            if key == "result":
+                seen.append((out / EVIDENCE_FIXED).is_dir())
+            return super().get(key, default)
+
+    payload = {"rows": [Blind(row())], "exclusions": {}, "prereg_sha": s.FROZEN_PREREG_SHA}
+    monkeypatch.setattr(s, "load_sealed", lambda raw: [payload])
+    s.write_verdict(tmp_path / "unused", out, "2026-11-02")
+    assert seen and all(seen)
+
+
+def test_m1_row_opened_two_days_early_keeps_pre_reference() -> None:
+    r = row(open_time="2025-06-30T14:00:00Z")
+    opening_end = s.timestamp("2025-06-30T14:00:00Z") + 3600
+    assert ("pre_cell", opening_end) in s.reference_hours(r)
+
+
+def _f19_row(first_end: int | None, open_time: str = "2025-07-01T14:00:00Z") -> dict[str, Any]:
+    r = row(open_time=open_time)
+    if first_end is not None:
+        r["candlesticks"][0]["end_period_ts"] = first_end
+    return r
+
+
+def test_m2_first_candle_before_open_plus_hour_halts() -> None:
+    with pytest.raises(s.SemanticsHalt):
+        s.audit_rows([_f19_row(s.timestamp("2025-07-01T14:00:00Z"))])
+
+
+def test_m2_misaligned_bucket_offset_halts() -> None:
+    with pytest.raises(s.SemanticsHalt):
+        s.audit_rows([_f19_row(s.timestamp("2025-07-01T14:00:00Z") + 3600 + 60)])
+
+
+def test_m2_first_candle_gap_is_counted_not_halted() -> None:
+    r = row()
+    r["candlesticks"].pop(0)
+    report = s.audit_rows([r])
+    assert report["first_hour_gap"] == {"KXHIGHNY": 1}
+    assert s.audit_rows([row()])["first_hour_gap"] == {}
+
+
+def test_l1_named_lookahead_survives_optimised_mode() -> None:
+    assert issubclass(s.LookAhead, AssertionError)
+    source = (ROOT / "scripts/analysis/kalshi_s0.py").read_text()
+    assert not any(isinstance(n, ast.Assert) for n in ast.walk(ast.parse(source)))
+    with pytest.raises(s.LookAhead):
+        s.exact_candle([{"end_period_ts": 5}, {"end_period_ts": 5}], 5)
+    with pytest.raises(s.LookAhead):
+        s.StationDay("d", Decimal(0)).cluster_key("station")
+
+
+def test_l2_selection_uses_exact_end_and_tolerates_later_candles() -> None:
+    # Later candles are normal (the payload spans the climate day); only the
+    # exact-end candle is ever used, and exact_candle refuses a future-only list.
+    refs = dict(s.reference_hours(row()))
+    assert refs
+    assert [stratum for stratum, _ in s.selections(row(), Counter())]
+
+
+def _client(*responses: Any) -> Any:
+    return s.HostPinnedKalshi(Stub(*responses))
+
+
+def test_l4_non_list_markets_poisoned() -> None:
+    with pytest.raises(s.PoisonedInput):
+        s.list_markets(_client({"markets": {"a": 1}}), "KXHIGHNY")
+    with pytest.raises(s.PoisonedInput):
+        s.list_markets(_client(["not", "a", "mapping"]), "KXHIGHNY")
+
+
+def test_l5_list_markets_paginates_by_cursor() -> None:
+    second = row(ticker="KXHIGHNY-25JUL03-T90")
+    stub = Stub({"markets": [row()], "cursor": "abc="}, {"markets": [second]}, {"markets": []})
+    rows = s.list_markets(s.HostPinnedKalshi(stub), "KXHIGHNY")
+    assert [r["ticker"] for r in rows] == ["KXHIGHNY-25JUL02-T90", "KXHIGHNY-25JUL03-T90"]
+    assert stub.calls[1][1]["cursor"] == "abc="
+
+
+def test_l5_repeated_cursor_refused() -> None:
+    page = {"markets": [], "cursor": "abc"}
+    with pytest.raises(s.PoisonedInput, match="cursor"):
+        s.list_markets(_client(page, page), "KXHIGHNY")
+
+
+@pytest.mark.parametrize("ticker", ["../x", "a/b", "", 7])
+def test_l5_bad_ticker_poisoned(ticker: Any) -> None:
+    with pytest.raises(s.PoisonedInput):
+        s.list_markets(_client({"markets": [{"ticker": ticker}]}), "KXHIGHNY")
+
+
+class _IterOnly(dict[str, Any]):
+    def __getitem__(self, key: str) -> Any:
+        raise KeyError(key)
+
+
+def test_l5_unknown_series_end_to_end_through_fetch(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(s, "LST_TABLE", _IterOnly({"KXHIGHNY": ("KNYC", -5)}))
+    monkeypatch.setattr(
+        s, "statvfs", lambda p: type("Disk", (), {"f_bavail": 20_000_000_000, "f_frsize": 1})()
+    )
+    stub = Stub({"markets": [row()]}, {"markets": []})
+    with pytest.raises(s.UnknownSeries):
+        s.fetch(s.HostPinnedKalshi(stub), tmp_path / "raw")
+    assert not (tmp_path / "raw/KXHIGHNY.json").exists()
+
+
+def test_l5_assert_reference_high_ten_oclock_boundary() -> None:
+    day = dt.date(2025, 7, 2)
+    window = 1751468400  # D 10:00 LST for KXHIGHNY
+    s.assert_reference(window, window + 7200, day, "KXHIGHNY", "HIGH", "pre_cell")
+    with pytest.raises(s.LookAhead):
+        s.assert_reference(window + 3600, window + 7200, day, "KXHIGHNY", "HIGH", "pre_cell")
+
+
+def test_l5_miss_streak_incomplete_aborts_fetch_with_exit_2(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    table = {f"KXHIGH{i}": ("KNYC", -5) for i in range(5)}
+    monkeypatch.setattr(s, "LST_TABLE", table)
+    monkeypatch.setattr(
+        s, "statvfs", lambda p: type("Disk", (), {"f_bavail": 20_000_000_000, "f_frsize": 1})()
+    )
+    client = s.HostPinnedKalshi(Stub(*(http(503) for _ in range(5))))
+    monkeypatch.setattr(s.HostPinnedKalshi, "default", classmethod(lambda cls: client))
+    monkeypatch.setattr(s, "install_opener", lambda opener: None)
+    code = s.main(["s0", "fetch", "--raw-root", str(tmp_path / "raw")])
+    assert code == 2
+    assert "Incomplete" in capsys.readouterr().out
+    assert not list((tmp_path / "raw").glob("*.json"))
+
+
+_WRITE_NAMES = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _fold(node: ast.AST) -> str | None:
+    """Statically fold constant string constructions; None when not foldable."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = [_fold(v.value if isinstance(v, ast.FormattedValue) else v) for v in node.values]
+        return None if None in parts else "".join(p for p in parts if p is not None)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        return None if left is None or right is None else left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        sep, items = _fold(node.func.value), [_fold(e) for e in node.args[0].elts]
+        return None if sep is None or None in items else sep.join(i for i in items if i is not None)
+    return None
+
+
+def _write_name_reconstructions(tree: ast.AST) -> list[str]:
+    folded = [
+        _fold(n) for n in ast.walk(tree) if isinstance(n, (ast.JoinedStr, ast.BinOp, ast.Call))
+    ]
+    return [f for f in folded if f is not None and f.strip().upper() in _WRITE_NAMES]
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "f'{\"PO\"}ST'",
+        "'PO' + 'ST'",
+        "''.join(['DEL', 'ETE'])",
+        "'-'.join(['PU', 'T'])[0:0] or 'PUT'",
+    ],
+)
+def test_l6_antievasion_checker_has_positive_control(snippet: str) -> None:
+    detected = _write_name_reconstructions(ast.parse(snippet))
+    if snippet.startswith("'-'"):
+        assert detected == []  # not a static reconstruction; plain-constant rule covers it
+    else:
+        assert detected
+
+
+def test_l6_no_runtime_built_write_method_names() -> None:
+    tree = ast.parse((ROOT / "scripts/analysis/kalshi_s0.py").read_text())
+    assert _write_name_reconstructions(tree) == []

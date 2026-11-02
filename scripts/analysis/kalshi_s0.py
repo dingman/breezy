@@ -2,24 +2,20 @@
 
 Conservative choices: unrecognized identity/schema is fatal, a transient miss
 leaves its whole series unsealed for resume, and inadequate/discordant pre cells
-are INCONCLUSIVE (next action CONTINUE). Post cells never decide.
-Cell labels pre_cell/post_cell render as prereg F-7 {pre, post}. Reference
-labels denote bucket ENDs except the opening reference, whose end is ceil(open)
-+ one hour. Whole-range payloads are indexed by exact end, never carried forward.
-The earliest available settlement/close/expiration timestamp bounds references.
-F-19 checks the first returned bucket against the actual open, without rounding.
-Publication uses a temporary file and an atomic no-replace hard-link, followed
-by removal of the temporary name: unlike ordinary rename this cannot clobber
-another writer. No partial per-series file or separate digest is published.
-An exclusive look-directory reservation precedes outcome access; a failed
-calculation retains the reservation, conservatively refusing another look.
+are INCONCLUSIVE (next action CONTINUE). Post cells never decide. Cell labels
+render as prereg F-7 {pre, post}. Reference labels denote bucket ENDs except the
+opening reference, whose end is ceil(open) + one hour. Whole-range payloads are
+indexed by exact end, never carried forward. The earliest available settlement/
+close/expiration timestamp bounds references. F-19 checks the first returned
+bucket against the actual open, without rounding. Publication writes a temporary
+file, hard-links it without replace, then unlinks the temporary name, so it
+cannot clobber another writer. The single look is a fixed `.S0.look` directory
+reserved before outcome access (any date); a failed calculation keeps it.
 
-P-0 provenance: K1's test module explicitly identifies its historical/live
-fixtures as captured venue responses (commit e97f3929). The separate LAX market
-fixture is a full response committed at 780a46b2, without an explicit provenance
-header; its capture provenance is UNVERIFIED. New s0_cases.json is hand-written
-synthetic evidence only. No fixture independently establishes boundary-tick
-inclusion. No network probe was made by S2; resolve that provenance before S3a.
+P-0 provenance: K1's tests label their historical/live fixtures as captured
+venue responses (e97f3929); the LAX market fixture (780a46b2) has no provenance
+header and is UNVERIFIED; s0_cases.json is hand-written synthetic. No fixture
+establishes boundary-tick inclusion; no network probe was made. Resolve before S3a.
 """
 
 from __future__ import annotations
@@ -71,55 +67,36 @@ FROZEN_PREREG = ROOT / "docs/plans/backlog/GAPS_2026-11-01/gap6_sample_and_size/
 FROZEN_PREREG_SHA = "2073860f93d78225928bc44deb3f86c2bdeecad8839e8b1da57aa478a0fdd18f"
 RAW_ROOT = Path("/mnt/storage/breezy/kalshi_depth/s0_raw/")
 EVIDENCE_ROOT = ROOT / "docs/evidence/kalshi_depth"
+_STATIONS = {
+    "KATL": (-5, "KXHIGHTATL", "KXLOWTATL"),
+    "KAUS": (-6, "KXHIGHAUS", "KXLOWTAUS"),
+    "KBOS": (-5, "KXHIGHTBOS", "KXLOWTBOS"),
+    "KDCA": (-5, "KXHIGHTDC", "KXLOWTDC"),
+    "KDEN": (-7, "KXHIGHDEN", "KXLOWTDEN"),
+    "KDFW": (-6, "KXHIGHTDAL", "KXLOWTDAL"),
+    "KEWR": (-5, "KXHIGHTEWR", "KXLOWTEWR"),
+    "KHOU": (-6, "KXHIGHTHOU", "KXLOWTHOU"),
+    "KLAS": (-8, "KXHIGHTLV", "KXLOWTLV"),
+    "KLAX": (-8, "KXHIGHLAX", "KXLOWTLAX"),
+    "KMDW": (-6, "KXHIGHCHI", "KXLOWTCHI"),
+    "KMIA": (-5, "KXHIGHMIA", "KXLOWTMIA"),
+    "KMSP": (-6, "KXHIGHTMIN", "KXLOWTMIN"),
+    "KMSY": (-6, "KXHIGHTNOLA", "KXLOWTNOLA"),
+    "KNYC": (-5, "KXHIGHNY", "KXLOWTNYC"),
+    "KOKC": (-6, "KXHIGHTOKC", "KXLOWTOKC"),
+    "KPHL": (-5, "KXHIGHPHIL", "KXLOWTPHIL"),
+    "KPHX": (-7, "KXHIGHTPHX", "KXLOWTPHX"),
+    "KSAN": (-8, "KXHIGHTSAN", "KXLOWTSAN"),
+    "KSAT": (-6, "KXHIGHTSATX", "KXLOWTSATX"),
+    "KSDF": (-5, "KXHIGHTSDF", "KXLOWTSDF"),
+    "KSEA": (-8, "KXHIGHTSEA", "KXLOWTSEA"),
+    "KSFO": (-8, "KXHIGHTSFO", "KXLOWTSFO"),
+    "KTTN": (-5, "KXHIGHTTTN", "KXLOWTTTN"),
+}
 LST_TABLE = {
-    "KXHIGHTATL": ("KATL", -5),
-    "KXLOWTATL": ("KATL", -5),
-    "KXHIGHAUS": ("KAUS", -6),
-    "KXLOWTAUS": ("KAUS", -6),
-    "KXHIGHTBOS": ("KBOS", -5),
-    "KXLOWTBOS": ("KBOS", -5),
-    "KXHIGHTDC": ("KDCA", -5),
-    "KXLOWTDC": ("KDCA", -5),
-    "KXHIGHDEN": ("KDEN", -7),
-    "KXLOWTDEN": ("KDEN", -7),
-    "KXHIGHTDAL": ("KDFW", -6),
-    "KXLOWTDAL": ("KDFW", -6),
-    "KXHIGHTEWR": ("KEWR", -5),
-    "KXLOWTEWR": ("KEWR", -5),
-    "KXHIGHTHOU": ("KHOU", -6),
-    "KXLOWTHOU": ("KHOU", -6),
-    "KXHIGHTLV": ("KLAS", -8),
-    "KXLOWTLV": ("KLAS", -8),
-    "KXHIGHLAX": ("KLAX", -8),
-    "KXLOWTLAX": ("KLAX", -8),
-    "KXHIGHCHI": ("KMDW", -6),
-    "KXLOWTCHI": ("KMDW", -6),
-    "KXHIGHMIA": ("KMIA", -5),
-    "KXLOWTMIA": ("KMIA", -5),
-    "KXHIGHTMIN": ("KMSP", -6),
-    "KXLOWTMIN": ("KMSP", -6),
-    "KXHIGHTNOLA": ("KMSY", -6),
-    "KXLOWTNOLA": ("KMSY", -6),
-    "KXHIGHNY": ("KNYC", -5),
-    "KXLOWTNYC": ("KNYC", -5),
-    "KXHIGHTOKC": ("KOKC", -6),
-    "KXLOWTOKC": ("KOKC", -6),
-    "KXHIGHPHIL": ("KPHL", -5),
-    "KXLOWTPHIL": ("KPHL", -5),
-    "KXHIGHTPHX": ("KPHX", -7),
-    "KXLOWTPHX": ("KPHX", -7),
-    "KXHIGHTSAN": ("KSAN", -8),
-    "KXLOWTSAN": ("KSAN", -8),
-    "KXHIGHTSATX": ("KSAT", -6),
-    "KXLOWTSATX": ("KSAT", -6),
-    "KXHIGHTSDF": ("KSDF", -5),
-    "KXLOWTSDF": ("KSDF", -5),
-    "KXHIGHTSEA": ("KSEA", -8),
-    "KXLOWTSEA": ("KSEA", -8),
-    "KXHIGHTSFO": ("KSFO", -8),
-    "KXLOWTSFO": ("KSFO", -8),
-    "KXHIGHTTTN": ("KTTN", -5),
-    "KXLOWTTTN": ("KTTN", -5),
+    series: (station, offset)
+    for station, (offset, *serieses) in _STATIONS.items()
+    for series in serieses
 }
 _TOKEN = r"[A-Z0-9][A-Z0-9._-]{0,63}"
 ALLOWED_TEMPLATES = {
@@ -165,6 +142,10 @@ class Incomplete(RuntimeError):
 
 class SealError(ValueError):
     """Frozen inputs failed verification."""
+
+
+class LookAhead(AssertionError):
+    """A reference or candle would use information from after the reference."""
 
 
 class SemanticsHalt(ValueError):
@@ -213,38 +194,8 @@ class HostPinnedKalshi:
     def get(self, template_id: str, *, parts: Mapping[str, str], params: Mapping[str, Any]) -> Any:
         if template_id not in ALLOWED_TEMPLATES:
             raise PoisonedInput("template")
-        required = (
-            {"ticker", "series"}
-            if template_id == "live_candles"
-            else ({"ticker"} if template_id == "historical_candles" else set())
-        )
-        if set(parts) != required or any(
-            not isinstance(v, str) or not re.fullmatch(_TOKEN, v) for v in parts.values()
-        ):
-            raise PoisonedInput("resource identity")
-        clean = dict(params)
-        for key, value in clean.items():
-            if key == "cursor":
-                valid = isinstance(value, str) and bool(
-                    re.fullmatch(r"[A-Za-z0-9+/=_-]{1,1024}", value)
-                )
-            elif key == "series_ticker":
-                valid = isinstance(value, str) and bool(re.fullmatch(_TOKEN, value))
-            elif key in {"limit", "start_ts", "end_ts", "period_interval"}:
-                bounds = {
-                    "limit": (1, 1000),
-                    "start_ts": (0, 4102444800),
-                    "end_ts": (0, 4102444800),
-                    "period_interval": (60, 60),
-                }
-                low, high = bounds[key]
-                valid = type(value) is int and low <= value <= high
-            else:
-                valid = False
-            if not valid:
-                raise PoisonedInput("query parameter")
-        if "start_ts" in clean and "end_ts" in clean and clean["start_ts"] > clean["end_ts"]:
-            raise PoisonedInput("time range")
+        _check_parts(template_id, parts)
+        clean = _check_params(params)
         path = _PATHS[template_id].format(**parts)
         if not ALLOWED_TEMPLATES[template_id].fullmatch(path) or self._getter._base_url != API_BASE:
             raise PoisonedInput("resource path")
@@ -256,14 +207,7 @@ class HostPinnedKalshi:
         except RuntimeError as exc:
             code = exc.__cause__.code if isinstance(exc.__cause__, HTTPError) else None
         except HTTPError as exc:
-            code = exc.code
-            kind = (
-                Absent
-                if code == 404
-                else Miss
-                if code == 429 or 500 <= code < 600
-                else (RedirectRefused if 300 <= code < 400 else KalshiRefused)
-            )
+            code, kind = exc.code, _http_kind(exc.code)
         except (URLError, TimeoutError):
             kind, label = Miss, "transport"
         except Exception as exc:  # noqa: BLE001 - discard transport exception text and chains
@@ -275,6 +219,55 @@ class HostPinnedKalshi:
         error = kind(f"HTTP {code}" if code is not None else label)
         self.streak.observe(error)
         raise error
+
+
+_MAX_TS = 4102444800
+_PARAM_BOUNDS = {
+    "limit": (1, 1000),
+    "start_ts": (0, _MAX_TS),
+    "end_ts": (0, _MAX_TS),
+    "period_interval": (60, 60),
+}
+
+
+def _http_kind(code: int) -> type[KalshiRefused]:
+    if code == 404:
+        return Absent
+    if code == 429 or 500 <= code < 600:
+        return Miss
+    return RedirectRefused if 300 <= code < 400 else KalshiRefused
+
+
+def _check_parts(template_id: str, parts: Mapping[str, str]) -> None:
+    required = (
+        {"ticker", "series"}
+        if template_id == "live_candles"
+        else ({"ticker"} if template_id == "historical_candles" else set())
+    )
+    if set(parts) != required or any(
+        not isinstance(v, str) or not re.fullmatch(_TOKEN, v) for v in parts.values()
+    ):
+        raise PoisonedInput("resource identity")
+
+
+def _param_valid(key: str, value: Any) -> bool:
+    if key == "cursor":
+        return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9+/=_-]{1,1024}", value))
+    if key == "series_ticker":
+        return isinstance(value, str) and bool(re.fullmatch(_TOKEN, value))
+    if key in _PARAM_BOUNDS:
+        low, high = _PARAM_BOUNDS[key]
+        return type(value) is int and low <= value <= high
+    return False
+
+
+def _check_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    clean = dict(params)
+    if not all(_param_valid(key, value) for key, value in clean.items()):
+        raise PoisonedInput("query parameter")
+    if "start_ts" in clean and "end_ts" in clean and clean["start_ts"] > clean["end_ts"]:
+        raise PoisonedInput("time range")
+    return clean
 
 
 def station_offset(series: str) -> tuple[str, int]:
@@ -334,9 +327,7 @@ def reference_hours(row: Mapping[str, Any]) -> list[tuple[str, int]]:
         whole += dt.timedelta(hours=1)
     opening_end = int(whole.timestamp()) + 3600
     refs = []
-    if local_time(opening_end - 3600, series).date() == day - dt.timedelta(
-        days=1
-    ) and is_pre_climate_day(
+    if is_pre_climate_day(
         opening_end * 1_000_000_000, climate_day=day, std_utc_offset_hours=offset
     ):
         refs.append(("pre_cell", opening_end))
@@ -355,10 +346,10 @@ def assert_reference(
 ) -> None:
     midnight = dt.datetime.combine(day, dt.time(), local_time(ref_end, series).tzinfo)
     window = int(midnight.timestamp()) + (10 * 3600 if side == "HIGH" else 0)
-    assert ref_end < settlement, "reference reaches settlement"
-    assert ref_end <= window if stratum == "pre_cell" else ref_end > window, (
-        "reference crosses observation window"
-    )
+    if ref_end >= settlement:
+        raise LookAhead("reference reaches settlement")
+    if not (ref_end <= window if stratum == "pre_cell" else ref_end > window):
+        raise LookAhead("reference crosses observation window")
 
 
 def no_ask(candle: Mapping[str, Any]) -> Decimal | None:
@@ -379,23 +370,18 @@ def no_ask(candle: Mapping[str, Any]) -> Decimal | None:
 
 def exact_candle(candles: Sequence[Mapping[str, Any]], ref_end: int) -> Mapping[str, Any] | None:
     exact = [c for c in candles if c["end_period_ts"] == ref_end]
-    assert len(exact) <= 1, "duplicate candle end"
+    if len(exact) > 1:
+        raise LookAhead("duplicate candle end")
     if exact:
         return exact[0]
-    assert all(c["end_period_ts"] <= ref_end for c in candles), "future candle refused"
+    if any(c["end_period_ts"] > ref_end for c in candles):
+        raise LookAhead("future candle refused")
     return None
 
 
-_AUDIT_KEYS = (
-    "series_ticker",
-    "ticker",
-    "climate_day",
-    "status",
-    "open_time",
-    "settlement_ts",
-    "candlesticks",
-    "candle_status",
-)
+_AUDIT_KEYS = (  # noqa: SIM905 - single-line key list keeps the file under 800 lines
+    "series_ticker ticker climate_day status open_time settlement_ts candlesticks candle_status"
+).split()
 
 
 def audit_projection(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -412,12 +398,23 @@ class Observation:
     no_win: bool
 
 
+def _check_first_hour(row: Mapping[str, Any], counts: Counter[str]) -> None:
+    """F-19: halt on a semantics mismatch; a first candle later than open + 1 h is a gap."""
+    ends = [c["end_period_ts"] for c in row["candlesticks"]]
+    if not ends:
+        return
+    opened = timestamp(row["open_time"])
+    if min(ends) < opened + 3600 or any((end - opened) % 3600 for end in ends):
+        raise SemanticsHalt("HALT: F-19 bucket ends are not whole hours after open")
+    if min(ends) > opened + 3600:
+        counts[f"first_hour_gap:{row['series_ticker']}"] += 1
+
+
 def selections(row: Mapping[str, Any], counts: Counter[str]) -> list[tuple[str, Decimal]]:
     series = row["series_ticker"]
     side = "HIGH" if series.startswith("KXHIGH") else "LOW"
     candles = row["candlesticks"]
-    if candles and min(c["end_period_ts"] for c in candles) != timestamp(row["open_time"]) + 3600:
-        raise SemanticsHalt("HALT: F-19 first candle differs from open + 3600")
+    _check_first_hour(row, counts)
     selected = []
     for stratum, ref in reference_hours(row):
         cell = f"{side}_{stratum}"
@@ -477,6 +474,11 @@ def audit_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "stations": {cell: dict(Counter(station for station, _ in units[cell])) for cell in CELLS},
         "exclusions": {key: counts[key] for key in ("window", "no_bid", "outside_tail")},
         "yes_bid_present": counts["yes_bid_present"],
+        "first_hour_gap": {
+            key.split(":", 1)[1]: value
+            for key, value in sorted(counts.items())
+            if key.startswith("first_hour_gap:")
+        },
         "F19": "consistent (empty series untested)",
     }
 
@@ -487,7 +489,8 @@ class StationDay:
     mean: Decimal
 
     def cluster_key(self, cluster: str) -> object:
-        assert cluster == "day"
+        if cluster != "day":
+            raise LookAhead("cluster key must be the day")
         return self.day
 
 
@@ -497,16 +500,8 @@ def mean(values: Sequence[Decimal]) -> Decimal:
 
 def describe_cell(items: Sequence[Observation]) -> dict[str, Any]:
     if not items:
-        return {
-            "n": 0,
-            "days": 0,
-            "adequate": False,
-            "weighted_mean": None,
-            "pooled_mean": None,
-            "bootstrap": None,
-            "wilson": None,
-            "observations": 0,
-        }
+        empty = dict.fromkeys(("weighted_mean", "pooled_mean", "bootstrap", "wilson"))
+        return {"n": 0, "days": 0, "adequate": False, "observations": 0, **empty}
     grouped: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     for item in items:
         grouped[item.station, item.day].append(item.excess)
@@ -634,7 +629,10 @@ def list_markets(client: HostPinnedKalshi, series: str) -> list[Mapping[str, Any
                 page = client.get(template, parts={}, params=params)
             except Absent:
                 break
-            for row in page["markets"]:
+            markets = page.get("markets") if isinstance(page, Mapping) else None
+            if not isinstance(markets, list):
+                raise PoisonedInput("markets schema")
+            for row in markets:
                 ticker = row["ticker"]
                 if not isinstance(ticker, str) or not re.fullmatch(_TOKEN, ticker):
                     raise PoisonedInput("market identity")
@@ -649,25 +647,36 @@ def list_markets(client: HostPinnedKalshi, series: str) -> list[Mapping[str, Any
     return list(rows.values())
 
 
-def fetch(client: HostPinnedKalshi, raw: Path) -> int:
-    verify_prereg()
-    raw.mkdir(parents=True, exist_ok=True)
-    disk = statvfs(raw)
-    if disk.f_bavail * disk.f_frsize < 10_000_000_000:
-        raise Incomplete("INCOMPLETE: free space below 10 GB")
-    incomplete = False
-    for series in LST_TABLE:
-        target = raw / f"{series}.json"
-        if target.exists():
-            continue
-        exclusions: Counter[str] = Counter()
-        kept = []
-        failed = False
-        try:
-            markets = list_markets(client, series)
-        except Miss:
-            incomplete = True
-            continue
+def _market_row(client: HostPinnedKalshi, market: Mapping[str, Any], series: str) -> dict[str, Any]:
+    """Raw row for one market; Absent candles are recorded, Miss propagates."""
+    row = {key: market[key] for key in ("ticker", "status", "result", "open_time")}
+    if market.get("series_ticker", series) != series:
+        raise PoisonedInput("series identity mismatch")
+    row.update(series_ticker=series, climate_day=climate_day(market).isoformat())
+    times = [
+        timestamp(market[k])
+        for k in ("settlement_time", "close_time", "expiration_time")
+        if market.get(k)
+    ]
+    if market.get("settlement_ts") is not None:
+        times.append(int(market["settlement_ts"]))
+    if not times:
+        raise PoisonedInput("settlement timestamp")
+    row["settlement_ts"] = min(times)
+    try:
+        row["candlesticks"] = market_candles(client, row)["candlesticks"]
+        row["candle_status"] = "success"
+    except Absent:
+        row.update(candlesticks=[], candle_status="Absent")
+    return row
+
+
+def _fetch_series(client: HostPinnedKalshi, series: str, target: Path) -> bool:
+    """Fetch and seal one series; True when it stays unsealed (resumable)."""
+    exclusions: Counter[str] = Counter()
+    kept = []
+    try:
+        markets = list_markets(client, series)
         for market in markets:
             if not in_window(market):
                 exclusions["window"] += 1
@@ -676,39 +685,30 @@ def fetch(client: HostPinnedKalshi, raw: Path) -> int:
             if reason or str(market.get("result")).strip().lower() not in {"yes", "no"}:
                 exclusions[reason or "not_yes_no"] += 1
                 continue
-            row = {key: market[key] for key in ("ticker", "status", "result", "open_time")}
-            if market.get("series_ticker", series) != series:
-                raise PoisonedInput("series identity mismatch")
-            row.update(series_ticker=series, climate_day=climate_day(market).isoformat())
-            times = [
-                timestamp(market[k])
-                for k in ("settlement_time", "close_time", "expiration_time")
-                if market.get(k)
-            ]
-            if market.get("settlement_ts") is not None:
-                times.append(int(market["settlement_ts"]))
-            if not times:
-                raise PoisonedInput("settlement timestamp")
-            row["settlement_ts"] = min(times)
-            try:
-                row["candlesticks"] = market_candles(client, row)["candlesticks"]
-                row["candle_status"] = "success"
-            except Absent:
-                row.update(candlesticks=[], candle_status="Absent")
-            except Miss:
-                failed = True
-                continue
-            kept.append(row)
-        if failed:
-            incomplete = True
-        else:
-            write_exclusive(
-                target,
-                json.dumps(
-                    {"rows": kept, "exclusions": dict(exclusions), "prereg_sha": FROZEN_PREREG_SHA},
-                    sort_keys=True,
-                ),
-            )
+            kept.append(_market_row(client, market, series))
+    except Miss:
+        return True
+    payload = {"rows": kept, "exclusions": dict(exclusions), "prereg_sha": FROZEN_PREREG_SHA}
+    write_exclusive(target, json.dumps(payload, sort_keys=True))
+    return False
+
+
+def fetch(client: HostPinnedKalshi, raw: Path) -> int:
+    """Fetch and seal raw series; not a look (F-13).
+
+    `result` is read only to apply the F-3 finalized/yes-no filter and is stored
+    in sealed raw, per prereg F-3/F-13; no outcome is computed here.
+    """
+    verify_prereg()
+    raw.mkdir(parents=True, exist_ok=True)
+    disk = statvfs(raw)
+    if disk.f_bavail * disk.f_frsize < 10_000_000_000:
+        raise Incomplete("INCOMPLETE: free space below 10 GB")
+    incomplete = False
+    for series in LST_TABLE:
+        target = raw / f"{series}.json"
+        if not target.exists():
+            incomplete = _fetch_series(client, series, target) or incomplete
     if incomplete:
         return 2
     if not (raw / "MANIFEST.sha256").exists():
@@ -731,19 +731,27 @@ def write_audit(raw: Path, evidence: Path, date: str) -> None:
     )
 
 
-def write_verdict(raw: Path, evidence: Path, date: str) -> None:
-    target = evidence / f"S0_{date}.json"
-    if target.exists() or (evidence / f"S0_{date}.md").exists():
+LOOK_DIR = ".S0.look"
+
+
+def _refuse_prior_look(evidence: Path) -> None:
+    """The look is single across all dates (F-13); audits are not looks."""
+    patterns = ("S0_*.json", "S0_*.md", ".S0*.look")
+    if any(not p.name.endswith("_audit.md") for g in patterns for p in evidence.glob(g)):
         raise FileExistsError("S0 look already exists")
+
+
+def write_verdict(raw: Path, evidence: Path, date: str) -> None:
     payloads = load_sealed(raw)
+    evidence.mkdir(parents=True, exist_ok=True)
+    _refuse_prior_look(evidence)
+    (evidence / LOOK_DIR).mkdir()  # atomic reservation, before any `result` access
     rows = [row for p in payloads for row in p["rows"]]
     audit_rows([audit_projection(row) for row in rows])
-    evidence.mkdir(parents=True, exist_ok=True)
-    (evidence / f".S0_{date}.look").mkdir()
     result = verdict([o for row in rows for o in observations(row)])
     result["prereg_sha"] = FROZEN_PREREG_SHA
     content = json.dumps(result, indent=2, sort_keys=True) + "\n"
-    write_exclusive(target, content)
+    write_exclusive(evidence / f"S0_{date}.json", content)
     suffix = "\nADAPTER_DECISION: NO-GO\n" if result["decision"] == "KILL" else ""
     write_exclusive(evidence / f"S0_{date}.md", "# S0 SEARCH verdict\n\n" + content + suffix)
 
@@ -763,8 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     install_opener(build_opener(_NoRedirect(), ProxyHandler({})))
     parser = argparse.ArgumentParser(description=__doc__)
     root = parser.add_subparsers(dest="stage", required=True)
-    s0 = root.add_parser("s0")
-    commands = s0.add_subparsers(dest="command", required=True)
+    commands = root.add_parser("s0").add_subparsers(dest="command", required=True)
     for command in ("fetch", "audit", "verdict"):
         child = commands.add_parser(command)
         child.add_argument("--raw-root", type=Path, default=RAW_ROOT)
