@@ -14,9 +14,9 @@ OPEN items only. Rationale L-5; pre-shrink copy in `docs/core/archive/`.
 
 ---
 
-## Operator control contract (set 2026-08-30) — BINDING
+## Operator control contract (set 2026-08-30; amended 2026-11-02) — BINDING
 
-Two reserved controls: **maximum daily budget** and **maximum per POSITION**.
+Three reserved controls: **maximum daily budget**, **maximum per POSITION** and **maximum per MONTH** (monthly cap = backlog #11, not yet in code).
 They live ONLY in the operator's gitignored `operator.env`, present by NAME in
 the supervisor/node env, enforced per grant by `DailySpendLedger.authorize_order_cost`
 (`operator_controls.py:348`; process-local, re-seeded at boot from durable fills via
@@ -37,7 +37,7 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 
 ---
 
-## BACKLOG — portfolio-level ROI, nothing else (operator 2026-11-01; re-audited by trading-bot-architect + prediction-market-reviewer, merged; replaced the six-gap table 11-01; ALL 10 items peer-reviewed 2× APPROVE by 11-02 ~01:30Z)
+## BACKLOG — portfolio-level ROI, nothing else (operator 2026-11-01; re-audited by trading-bot-architect + prediction-market-reviewer, merged; replaced the six-gap table 11-01; 11 items; #1–#10 peer-reviewed 2× APPROVE; #11 + the enablement deltas for #5/#7/#8 under review 11-02)
 
 Every item states its ROI mechanism: it earns dollars, or it is a named precondition for an item that does. Plans: `docs/plans/backlog/` (paths below); where a later `plan_rN_delta.md` exists it WINS over earlier revisions; each dir carries a `review_status.md` with two APPROVE verdicts. **Binding on every item:** Nautilus immutable; `allow_short=False`; never weaken a safety/settlement/contract/pin/NO-SEND test; never set, raise or propose a cap or q (Kelly BANNED, TSA §6.1); existing harness only except the exceptions named; PREREG frozen before any run, ONE look (L-34); FQ-R14 (SEARCH is never confirmatory).
 
@@ -55,14 +55,16 @@ Every item states its ROI mechanism: it earns dollars, or it is a named precondi
 | 10 | GAP-2 → GAP-3 → GAP-4 PREREG (forecast path) | Preconditions for a forecast family; only if #2 PASS | `gap2_forward_p_emitter/` r1+r2, `gap3_confidence_binned_backtest/` r1, `gap4_registered_family/` r1 | CONDITIONAL on #2 PASS; GAP-2 needs the §8 exception then |
 | — | GAP-5b fixes | Realised only through a family that would otherwise be denied fills | `gap5_create_path_mechanics/` R3-1/R3-5 | CONDITIONAL (confirmed signature AND a live family) |
 
-**Operator decisions that gate ROI:** (a) size q (every dollar; stays yours — #5 only proposes); (b) GAP-1 D1 and GAP-6 D-2 read-only exceptions (unblock #1/#2; rule first). **Defaulted unless you object:** GAP-2 exception waits for a #2 PASS; θ source = published fee schedule verified at GAP-6 S6; 70% floor = break-even price + fee; P4 maker disarm now (0 fills since 10-24) — disarm is enablement-adjacent so it stays yours to say.
+**OPERATOR RULING 2026-11-02 (supersedes every earlier "operator-only" clause except the caps):** the operator decides exactly three numbers — max USD spend per DAY, per POSITION, per MONTH (gitignored operator.env; never assigned, defaulted or proposed by code or agents). **Everything else is the bot's decision**, made by the machinery in this backlog: size within the caps (#5), arm/retire families (#7, incl. retiring the 0-fill P4 maker as #7 step 0), venue enablement (#8), what to test next (#9). Coordinator-owned engineering rulings (harness exceptions D1/D-2/GAP-2 §8, §6.2.1 sizing option, θ source, break-even = price + fee as the only win-rate floor) are decided through the peer loop, not by the operator. Plans #5/#7/#8 are being amended for this ruling (deltas under review); #11 adds the missing monthly cap.
+| 11 | OPERATOR-CONTROLS-MONTHLY-CAP | The operator's monthly loss bound that lets everything else be automated | `GAPS_2026-11-01/operator_controls_monthly_cap/plan_r0.md` | plan under review; build FIRST (before any arm) |
+
 **If #1 and #2 both KILL:** honest end state = "no edge on either venue"; the backlog stops there and reports.
 
 ### Live state (no build owed; OPERATOR PAUSE 11-01 19:55Z — wakes read-only until directed)
 - P4 `pm_us_no_maker_sharp_v1` ARMED since 10-24, 0 fills; 11-01: 80 posts, 46 denied (AMBIGUOUS latch) → #3. EXEC-FOREIGN-POS A+B LIVE. HOLDOUT-END DONE d1f7e120. STRAT-DESIGN: Cards A/E KILL, D CLOSED-UNRUN.
 - OPS-4: S3b 40dec67b PUSHED; next label fire 05:00Z 11-02 checked at wake `c8f0b6e2` 05:13Z (MemoryPeak; acceptance `n_labels_gated=0` at the 17:40Z ROI run).
 - **Routing (operator 11-01): Codex FIRST** — bridge FIXED 23:10Z (codex-cli 0.166.0, model `gpt-6.1-sol`, stale brokers killed; memory `codex-model-not-found-2026-10-27`); Grok 402; Claude sub-agents = reviewers + fallback.
-- **Next action:** operator rules (a)–(b); then #1 S1/S2, #2 S0/S1, #3, #4 in parallel (Codex builds, Claude reviews + gate). Wakes: `c8f0b6e2` 05:13Z 11-02, daily 13:07Z `db1e44f2`/`fc4d504c`, 17:08Z `c45d8c0a`/`bb2925bd` (session-only).
+- **Next action:** land the #11 plan + the #5/#7/#8 enablement deltas (2× APPROVE each), then `/execute-backlog` starts at #11 → #1 … in table order (Codex builds, Claude reviews + gate; Phase-4 approvals are the coordinator's per the 10-03 ruling). Wakes: `c8f0b6e2` 05:13Z 11-02, daily 13:07Z `db1e44f2`/`fc4d504c`, 17:08Z `c45d8c0a`/`bb2925bd` (session-only).
 
 ### Calendar obligations
 | When | What |
