@@ -4,11 +4,19 @@ Conservative conventions where the freeze specifies no wire format: no overall
 PASS/KILL without D1. D1 is absent
 unless d1.json records granted=true and this prereg's frozen_sha. Successor evidence
 is successor_evidence.json (schema gap1_successor_evidence_v1), with an infra_journal
-relative path and identical primary/successor snapshots of prereg_sha256, code_sha,
-c1_sha256, and feature_sha256 (primary/lag). Digests are verified against both runs'
-f.jsonl/fl.jsonl and build.json, the current prereg, C1 and HEAD. Missing evidence
-refuses. The primary stage_a.json is never opened. Only upward resource changes
-are admissible; envelopes in the evidence must contain the three named limits.
+relative path and primary/successor snapshots of prereg_sha256, code_sha, c1_sha256,
+and feature_sha256 (primary/lag).
+
+Run-time provenance: each run records prereg_sha256, c1_sha256 and code_sha when it
+starts (--record-provenance RUNDIR -> run_provenance.json, write-once; build.json holds
+no code sha). The successor check compares those RECORDED values, never a recomputation
+of the current state against itself. Rule: prereg and C1 digests must be equal across
+primary, successor and the current prereg/C1; code must be equal or a git ancestor
+(primary <= successor <= HEAD); feature digests (primary/lag) are verified against each
+run's f.jsonl/fl.jsonl and build.json and must be equal. Missing evidence refuses.
+The primary stage_a.json is never opened.
+Only upward resource changes are admissible; envelopes in the evidence must contain the
+three named limits.
 
 Coarse Murphy bins require W-C for exact Brier reconstruction; report those terms
 alongside the unmodified library REL/RES/UNC. Empty or zero-sigma cells cannot PASS.
@@ -24,11 +32,13 @@ import datetime as dt
 import hashlib
 import json
 import math
+import re
 import statistics
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +50,6 @@ from breezy.analysis.multisource_blend_io import scored_row_from_json
 
 # Frozen module __all__ omits these two identical brier_decomposition objects.
 from breezy.analysis.nbp_calibration import (  # type: ignore[attr-defined]
-    BOOTSTRAP_SEED,
     G22_TARGET_DIFFERENCE_X,
     RELIABILITY_BUCKET_EDGES,
     Z_POWER_080,
@@ -56,6 +65,17 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # Also support python scripts/analysis/gap1_oof_murphy.py.
 BINS = bin_by_edges(RELIABILITY_BUCKET_EDGES)
+# The frozen prereg carries the cutoff (inclusion.cutoff) but no start date; the start of
+# the registered OOF window is therefore the one date constant that stays here.
+START_DATE = dt.date(2021, 1, 1)
+CUTOFF_PATTERN = re.compile(r"<\s*(\d{4}-\d{2}-\d{2})")
+PROVENANCE_FILE = "run_provenance.json"
+PROVENANCE_SCHEMA = "gap1_run_provenance_v1"
+DEFAULT_PREREG = (
+    ROOT / "docs/plans/backlog/GAPS_2026-11-01/gap1_source_resolution/PREREG_GAP1_2026-11-02.json"
+)
+UNKNOWN = "UNKNOWN"
+GIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True)
@@ -68,6 +88,7 @@ class EventRow:
     outcomes: tuple[bool, ...]
     fell_back: tuple[str, ...]
     lamp_missing: bool
+    lamp_unknown: bool = False
 
 
 def forecast_centered_ladder(center_f: int) -> tuple[Rung, ...]:
@@ -100,15 +121,27 @@ def m0t_parameters(spec: ChampionSpec) -> tuple[float, float]:
     return m_star, s
 
 
-def _day(value: str) -> str:
-    day = dt.date.fromisoformat(value)
-    if day >= dt.date(2026, 7, 1) or day < dt.date(2021, 1, 1):
-        raise ValueError("climate_day outside pre-cutoff 2021-01-01..2026-06-30")
+def _cutoff(prereg: Mapping[str, Any]) -> dt.date:
+    match = CUTOFF_PATTERN.search(str(prereg["inclusion"]["cutoff"]))
+    if match is None:
+        raise ValueError("prereg inclusion.cutoff has no 'climate_day < YYYY-MM-DD' date")
+    return dt.date.fromisoformat(match.group(1))
+
+
+def _day(value: str, prereg: Mapping[str, Any]) -> str:
+    day, cutoff = dt.date.fromisoformat(value), _cutoff(prereg)
+    if day >= cutoff or day < START_DATE:
+        raise ValueError(f"climate_day outside pre-cutoff {START_DATE}..{cutoff} (exclusive)")
     return day.isoformat()
 
 
+def _alpha(prereg: Mapping[str, Any]) -> float:
+    numerator, _, denominator = str(prereg["ci"]["alpha"]).partition("/")
+    return float(numerator) / float(denominator or 1)
+
+
 def _row_contract(row: ScoredRow, prereg: Mapping[str, Any]) -> None:
-    _day(row.climate_day.isoformat())
+    _day(row.climate_day.isoformat(), prereg)
     if row.horizon not in (*HORIZONS, "D0_sensitivity"):
         raise ValueError("unregistered horizon")
     if set(row.arm_predictions) != set(ARM_NAMES):
@@ -121,7 +154,7 @@ def _row_contract(row: ScoredRow, prereg: Mapping[str, Any]) -> None:
         m0t_parameters(row.champion)
 
 
-def _events(row: ScoredRow, missing: bool, prereg: Mapping[str, Any]) -> EventRow:
+def _events(row: ScoredRow, missing: bool, unknown: bool, prereg: Mapping[str, Any]) -> EventRow:
     assert row.champion is not None
     m_star, s = m0t_parameters(row.champion)
     ladder = forecast_centered_ladder(round(row.champion.percentiles.q50))
@@ -137,6 +170,7 @@ def _events(row: ScoredRow, missing: bool, prereg: Mapping[str, Any]) -> EventRo
         tuple(rung_outcome(r, row.observed_f) for r in ladder),
         row.fell_back,
         missing,
+        unknown,
     )
 
 
@@ -156,12 +190,9 @@ def _included(
         if key in seen:
             raise ValueError("duplicate OOF row")
         seen.add(key)
-        missing = (
-            bool(raw["lamp_missing"])
-            if isinstance(raw, Mapping) and "lamp_missing" in raw
-            else False
-        )
-        events.append(_events(row, missing, prereg))
+        flag = raw["lamp_missing"] if isinstance(raw, Mapping) and "lamp_missing" in raw else False
+        unknown = flag == UNKNOWN
+        events.append(_events(row, False if unknown else bool(flag), unknown, prereg))
     return sorted(events, key=lambda r: (r.horizon, r.station, r.climate_day, r.version)), excluded
 
 
@@ -238,29 +269,51 @@ def cell_outcome(
     return "PASS"
 
 
+@dataclass(frozen=True)
+class _Item:
+    """Cluster-keyed handle onto one row's precomputed probabilities and outcomes."""
+
+    station: str
+    climate_day: str
+    index: int
+
+
 def _intervals(rows: Sequence[EventRow], arm: str, prereg: Mapping[str, Any]) -> dict[str, Any]:
+    arm_p = [r.probabilities[arm] for r in rows]  # flattened once per cell, not per draw
+    base_p = [r.probabilities["M0t"] for r in rows]
+    outcomes = [r.outcomes for r in rows]
+    items = [_Item(r.station, r.climate_day, i) for i, r in enumerate(rows)]
+
+    def statistic(drawn: Sequence[_Item]) -> float:
+        picks = [item.index for item in drawn]
+
+        def gather(table: Sequence[tuple[Any, ...]]) -> list[Any]:
+            return list(chain.from_iterable(map(table.__getitem__, picks)))
+
+        return resolution_difference(gather(arm_p), gather(base_p), gather(outcomes), BINS)
+
     intervals: dict[str, Any] = {}
     sds = {}
     for name in ("station_day", "climate_day"):
         draws = cluster_bootstrap_draws(
-            rows,
-            statistic=lambda rs: _delta(rs, arm),
+            items,
+            statistic=statistic,
             cluster_key=_station_day if name == "station_day" else _climate_day,
-            seed=BOOTSTRAP_SEED,
+            seed=prereg["ci"]["seed"],
             iterations=prereg["ci"]["B"],
         )
-        intervals[name] = list(percentile_interval(draws, alpha=0.05 / 6))
+        intervals[name] = list(percentile_interval(draws, alpha=_alpha(prereg)))
         sds[name] = statistics.pstdev(draws)
     intervals["gating"] = [min(intervals[k][0] for k in sds), max(intervals[k][1] for k in sds)]
     return {"CI": intervals, "bootstrap_dRES_sd": sds}
 
 
-def _station_day(row: EventRow) -> tuple[str, str]:
-    return row.station, row.climate_day
+def _station_day(item: _Item) -> tuple[str, str]:
+    return item.station, item.climate_day
 
 
-def _climate_day(row: EventRow) -> str:
-    return row.climate_day
+def _climate_day(item: _Item) -> str:
+    return item.climate_day
 
 
 def _cell(
@@ -301,14 +354,17 @@ def _cell(
         result["dRES_M0prime"],
     )
     if result["outcome"] == "PASS":
+        threshold = prereg["overall"]["pass_labels"]["threshold"]
         result["label"] = (
-            "beats ask (indicative)" if result["CI"]["gating"][0] > 0.0228 else "beats NBP"
+            "beats ask (indicative)" if result["CI"]["gating"][0] > threshold else "beats NBP"
         )
     return result
 
 
 def _coverage(rows: Sequence[EventRow], arm: str, prereg: Mapping[str, Any]) -> dict[str, Any]:
-    sensitivity = [r for r in rows if arm not in r.fell_back and not r.lamp_missing]
+    sensitivity = [
+        r for r in rows if arm not in r.fell_back and not r.lamp_missing and not r.lamp_unknown
+    ]
     versions = sorted({r.version for r in rows})
     return {
         "fell_back": {a: sum(a in r.fell_back for r in rows) for a in ARM_NAMES},
@@ -319,12 +375,21 @@ def _coverage(rows: Sequence[EventRow], arm: str, prereg: Mapping[str, Any]) -> 
             "dRES": _delta(sensitivity, arm) if sensitivity else None,
             "by_version": {v: sum(r.version == v for r in sensitivity) for v in versions},
             "excluded_by_version": {
-                v: sum(r.version == v and (arm in r.fell_back or r.lamp_missing) for r in rows)
+                v: sum(
+                    r.version == v and (arm in r.fell_back or r.lamp_missing or r.lamp_unknown)
+                    for r in rows
+                )
                 for v in versions
             },
             "decompositions": _decompositions(sensitivity, arm) if sensitivity else {},
         },
     }
+
+
+def _report_cell(rows: Sequence[EventRow], arm: str, prereg: Mapping[str, Any]) -> dict[str, Any]:
+    cell = _cell(rows, arm, "D0", prereg)
+    cell["lamp_unknown"] = sum(r.lamp_unknown for r in rows)  # no matching J2 feature row
+    return cell
 
 
 def evaluate(
@@ -342,14 +407,9 @@ def evaluate(
         overall = "PASS"
     elif prereg.get("d1_granted") is True and all(o in ("FAIL", "OBS_DRIVEN") for o in outcomes):
         overall = "KILL"
-    report_only = (
-        {
-            a: _cell([r for r in events if r.horizon == "D0_sensitivity"], a, "D0", prereg)
-            for a in ARM_NAMES[1:]
-        }
-        if any(r.horizon == "D0_sensitivity" for r in events)
-        else {}
-    )
+    sensitivity_rows = [r for r in events if r.horizon == "D0_sensitivity"]
+    report_only = {a: _report_cell(sensitivity_rows, a, prereg) for a in ARM_NAMES[1:]}
+    report_only = report_only if sensitivity_rows else {}
     return {
         "schema": "gap1_oof_murphy_v1",
         "cells": cells,
@@ -363,14 +423,16 @@ def evaluate(
     }
 
 
-def count_cells(row_mappings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+def count_cells(
+    row_mappings: Iterable[Mapping[str, Any]], prereg: Mapping[str, Any]
+) -> dict[str, Any]:
     keys: dict[str, set[tuple[str, str]]] = {h: set() for h in HORIZONS}
     missing: dict[str, set[tuple[str, str]]] = {
         f"{a}:{h}": set() for a in ARM_NAMES[1:] for h in HORIZONS
     }
     versions: dict[str, int] = {}
     for row in row_mappings:
-        h, day = row["horizon"], _day(row["climate_day"])
+        h, day = row["horizon"], _day(row["climate_day"], prereg)
         if h == "D0_sensitivity":
             continue
         if h not in HORIZONS:
@@ -395,7 +457,7 @@ def count_cells(row_mappings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             for h in HORIZONS
         },
         "versions": versions,
-        "prior_floor": 914,
+        "prior_floor": prereg["census_rule"]["prior_floor"],
     }
 
 
@@ -431,7 +493,6 @@ def safe_json(path: Path, prereg: Mapping[str, Any], *, successor: bool = False)
     primary = Path(prereg["j3_out_dir"]).expanduser().resolve()
     if successor and path.resolve() == primary / "stage_a.json":
         raise ValueError("successor refuses to open primary stage_a.json")
-    assert not (successor and path.resolve() == primary / "stage_a.json")
     return json.loads(path.read_text())
 
 
@@ -457,6 +518,61 @@ def _git_sha() -> str:
     ).stdout.strip()
 
 
+def _code_ok(older: str, newer: str) -> bool:
+    """Equal, or `older` is a git ancestor of `newer` (full lowercase shas only)."""
+    if not (GIT_SHA.fullmatch(older) and GIT_SHA.fullmatch(newer)):
+        return False
+    if older == newer:
+        return True
+    done = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", older, newer],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    return done.returncode == 0
+
+
+def _current_provenance(prereg: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "prereg_sha256": _digest(prereg),
+        "c1_sha256": _sha(ROOT / prereg["c1_evidence"]["path"]),
+        "code_sha": _git_sha(),
+    }
+
+
+def record_provenance(run: Path, prereg: Mapping[str, Any]) -> None:
+    """Write-once run-time snapshot of the prereg, C1 and code the run starts under."""
+    payload = {"schema": PROVENANCE_SCHEMA, **_current_provenance(prereg)}
+    with (run / PROVENANCE_FILE).open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _recorded_provenance(run: Path, prereg: Mapping[str, Any]) -> dict[str, str]:
+    data = safe_json(run / PROVENANCE_FILE, prereg, successor=True)
+    if data["schema"] != PROVENANCE_SCHEMA:
+        raise ValueError("run provenance schema")
+    return {key: data[key] for key in ("prereg_sha256", "c1_sha256", "code_sha")}
+
+
+def _feature_digests(run: Path, prereg: Mapping[str, Any], *, successor: bool) -> dict[str, str]:
+    """Primary and lag feature digests, each verified against the run's build.json."""
+    build_meta = safe_json(run / "build.json", prereg, successor=successor)
+    features = {
+        role: _sha(run / name) for role, name in (("primary", "f.jsonl"), ("lag", "fl.jsonl"))
+    }
+    if features != build_meta["output_sha256"]:
+        raise ValueError("feature digests differ from build.json")
+    return features
+
+
+def _snapshot(run: Path, prereg: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "feature_sha256": _feature_digests(run, prereg, successor=True),
+        **_recorded_provenance(run, prereg),
+    }
+
+
 def _successor_evidence(j3: Path, primary: Path, prereg: Mapping[str, Any]) -> None:
     evidence = safe_json(j3.parent / "successor_evidence.json", prereg, successor=True)
     if evidence["schema"] != "gap1_successor_evidence_v1":
@@ -466,29 +582,20 @@ def _successor_evidence(j3: Path, primary: Path, prereg: Mapping[str, Any]) -> N
         token in journal.read_text() for token in ("OOM", "RuntimeMaxSec", "MemoryError")
     ):
         raise ValueError("missing infrastructure journal evidence")
-    snapshots = [_snapshot(run, prereg) for run in (primary.parent, j3.parent)]
+    before, after = (_snapshot(run, prereg) for run in (primary.parent, j3.parent))
+    now = _current_provenance(prereg)
     if (
-        snapshots[0] != snapshots[1]
-        or evidence["primary"] != snapshots[0]
-        or evidence["successor"] != snapshots[1]
+        evidence["primary"] != before
+        or evidence["successor"] != after
+        or before["feature_sha256"] != after["feature_sha256"]
+        or any(not before[k] == after[k] == now[k] for k in ("prereg_sha256", "c1_sha256"))
+        or not (
+            _code_ok(before["code_sha"], after["code_sha"])
+            and _code_ok(after["code_sha"], now["code_sha"])
+        )
     ):
         raise ValueError("unchanged-input evidence mismatch")
     _upward_envelopes(evidence)
-
-
-def _snapshot(run: Path, prereg: Mapping[str, Any]) -> dict[str, Any]:
-    build_meta = safe_json(run / "build.json", prereg, successor=True)
-    features = {
-        role: _sha(run / name) for role, name in (("primary", "f.jsonl"), ("lag", "fl.jsonl"))
-    }
-    if features != build_meta["output_sha256"]:
-        raise ValueError("feature digests differ from build.json")
-    return {
-        "feature_sha256": features,
-        "prereg_sha256": _digest(prereg),
-        "c1_sha256": _sha(ROOT / prereg["c1_evidence"]["path"]),
-        "code_sha": _git_sha(),
-    }
 
 
 def _upward_envelopes(evidence: Mapping[str, Any]) -> None:
@@ -553,16 +660,19 @@ def build(prereg_path: Path, f13_path: Path, j3: Path) -> dict[str, Any]:
         raise ValueError("C1 digest mismatch")
     validate_j3(j3, prereg)
     rows = read_oof(j3 / "oof_rows.jsonl", prereg)
-    feature_path = j3.parent / "f.jsonl"
-    meta = safe_json(j3.parent / "build.json", prereg)
-    if _sha(feature_path) != meta["output_sha256"]["primary"]:
-        raise ValueError("features digest differs from build.json")
+    _feature_digests(j3.parent, prereg, successor=False)  # primary and lag, as the successor path
     missing = {
         (r["station"], r["climate_day"], r["horizon"]): bool(r["lamp"]["missing"])
-        for r in _jsonl(feature_path)
+        for r in _jsonl(j3.parent / "f.jsonl")
     }
     for r in rows:
-        r["lamp_missing"] = missing[(r["station"], r["climate_day"], r["horizon"])]
+        key = (r["station"], r["climate_day"], r["horizon"])
+        if key in missing:
+            r["lamp_missing"] = missing[key]
+        elif r["horizon"] == "D0_sensitivity":
+            r["lamp_missing"] = UNKNOWN  # report-only row: never burn the one look on it
+        else:
+            raise ValueError(f"no matched J2 feature row for gating OOF row {key}")
     d1_path = j3.parent / "d1.json"
     d1 = safe_json(d1_path, prereg) if d1_path.exists() else {}
     scoring = dict(
@@ -591,17 +701,25 @@ def write_output(path: Path, payload: Mapping[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for name in ("prereg", "f13-prereg", "j3-dir", "features", "build-json", "out"):
-        parser.add_argument("--" + name, type=Path, required=name == "out")
+        parser.add_argument("--" + name, type=Path)
+    parser.add_argument("--record-provenance", type=Path, metavar="RUNDIR")
     parser.add_argument("--counts-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.out is None and args.record_provenance is None:
+        parser.error("--out is required")
     try:
+        if args.record_provenance is not None:
+            if args.prereg is None:
+                raise ValueError("--record-provenance requires --prereg")
+            record_provenance(args.record_provenance, load_prereg(args.prereg))
+            return 0
         if args.counts_only:
             if args.features is None or args.build_json is None:
                 raise ValueError("counts-only requires --features and --build-json")
             meta = json.loads(args.build_json.read_text())
             if _sha(args.features) != meta["output_sha256"]["primary"]:
                 raise ValueError("features digest differs from build.json")
-            result = count_cells(_jsonl(args.features))
+            result = count_cells(_jsonl(args.features), load_prereg(args.prereg or DEFAULT_PREREG))
         else:
             if any(x is None for x in (args.prereg, args.f13_prereg, args.j3_dir)):
                 raise ValueError("verdict requires --prereg --f13-prereg --j3-dir")

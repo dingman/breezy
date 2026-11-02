@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from breezy.analysis import nbp_calibration as nbp
 from scripts.analysis.multisource_blend_pin_guards import check_not_refrozen
 from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
@@ -74,4 +75,8 @@ def test_t2_citations_and_required_rules() -> None:
     }
     assert p["test_plan"]["T8b"].startswith("scipy.stats.t(df=5")
     assert p["census_rule"]["prior_floor"] == p["power"]["prior_floor"] == 914
+    assert nbp.BOOTSTRAP_SEED == p["ci"]["seed"]
+    assert nbp.G22_TARGET_DIFFERENCE_X == p["constants"]["G22_TARGET_DIFFERENCE_X"]["value"]
+    assert p["ci"]["B"] == 5000 and p["ci"]["alpha"] == "0.05/6"
+    assert p["overall"]["pass_labels"]["threshold"] == 0.0228
     assert p["envelopes"]["J2"]["MemoryMax"] == p["envelopes"]["J3"]["MemoryMax"] == "12G"

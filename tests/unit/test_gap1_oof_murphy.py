@@ -121,10 +121,18 @@ def test_t3_build_cli_and_f13_passthrough(
         }
         for r in rows
     ]
-    f = j3.parent / "f.jsonl"
+    f, fl = j3.parent / "f.jsonl", j3.parent / "fl.jsonl"
     f.write_text("\n".join(json.dumps(r) for r in features))
+    fl.write_text("lag rows")
     (j3.parent / "build.json").write_text(
-        json.dumps({"output_sha256": {"primary": hashlib.sha256(f.read_bytes()).hexdigest()}})
+        json.dumps(
+            {
+                "output_sha256": {
+                    "primary": hashlib.sha256(f.read_bytes()).hexdigest(),
+                    "lag": hashlib.sha256(fl.read_bytes()).hexdigest(),
+                }
+            }
+        )
     )
     f13_path = ROOT / prereg["f13_prereg"]["path"]
     verified = reader.load_prereg
@@ -403,20 +411,39 @@ def test_t11_successor_matrix(
         reader.validate_j3(target, prereg)
 
 
+def write_provenance(
+    reader: ModuleType, run: Path, prereg: dict[str, Any], **override: str
+) -> None:
+    """Run-time provenance exactly as the reader records it, with optional overrides."""
+    data = {
+        "schema": "gap1_run_provenance_v1",
+        "prereg_sha256": reader._digest(prereg),
+        "c1_sha256": reader._sha(ROOT / prereg["c1_evidence"]["path"]),
+        "code_sha": reader._git_sha(),
+        **override,
+    }
+    (run / "run_provenance.json").write_text(json.dumps(data))
+
+
 def successor_evidence(
-    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+    reader: ModuleType,
+    prereg: dict[str, Any],
+    tmp_path: Path,
+    recorded: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[Path, Path]:
     primary = fixture_j3(tmp_path, prereg, [])
     (primary / "oof_rows.jsonl").unlink()
     successor = Path(prereg["successor"]["only_dir"])
     successor.mkdir(parents=True)
-    for run in (primary.parent, successor.parent):
+    recorded = recorded or {}
+    for role, run in (("primary", primary.parent), ("successor", successor.parent)):
         (run / "f.jsonl").write_text("")
         (run / "fl.jsonl").write_text("")
         digest = hashlib.sha256(b"").hexdigest()
         (run / "build.json").write_text(
             json.dumps({"output_sha256": {"primary": digest, "lag": digest}})
         )
+        write_provenance(reader, run, prereg, **recorded.get(role, {}))
     limits = {"MemoryMax": 12, "RuntimeMaxSec": 14400, "--max-memory-gib": 3.5}
     evidence = {
         "schema": "gap1_successor_evidence_v1",
@@ -529,7 +556,7 @@ class BlindRow(Mapping[str, Any]):
         raise AssertionError("must not inspect unrelated fields")
 
 
-def test_t14_counts_only_allowlist(reader: ModuleType) -> None:
+def test_t14_counts_only_allowlist(reader: ModuleType, prereg: dict[str, Any]) -> None:
     r: dict[str, Any] = {
         "station": "KORD",
         "climate_day": "2025-01-01",
@@ -539,7 +566,7 @@ def test_t14_counts_only_allowlist(reader: ModuleType) -> None:
         "pfm_mu_f": None,
         "mos_mu_f": None,
     }
-    result = reader.count_cells([BlindRow(r), BlindRow(copy.deepcopy(r))])
+    result = reader.count_cells([BlindRow(r), BlindRow(copy.deepcopy(r))], prereg)
     assert result["cells"]["M1:D0"]["upper_bound"] == 1
     assert result["cells"]["M3:D0"]["missing_prefix"] == 1
 
@@ -586,3 +613,284 @@ def test_t14_counts_cli_uses_only_mappings(
         == 0
     )
     assert json.loads(out.read_text())["cells"]["M1:D0"]["upper_bound"] == 1
+
+
+def head_parent() -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD~1"], cwd=ROOT, text=True).strip()
+
+
+@pytest.mark.parametrize("key", ["prereg_sha256", "c1_sha256", "code_sha"])
+def test_f1_run_time_values_that_differ_refuse(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path, key: str
+) -> None:
+    """Evidence is self-consistent with what each run recorded, yet the runs differ."""
+    other = "0" * 40 if key == "code_sha" else "f" * 64
+    successor, _ = successor_evidence(reader, prereg, tmp_path, {"primary": {key: other}})
+    with pytest.raises(ValueError, match="unchanged"):
+        reader.validate_j3(successor, prereg)
+
+
+def test_f1_successor_recorded_differs_from_current_refuses(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+) -> None:
+    recorded = {"primary": {"c1_sha256": "f" * 64}, "successor": {"c1_sha256": "f" * 64}}
+    successor, _ = successor_evidence(reader, prereg, tmp_path, recorded)
+    with pytest.raises(ValueError, match="unchanged"):
+        reader.validate_j3(successor, prereg)
+
+
+def test_f1_code_ancestor_of_successor_accepted(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+) -> None:
+    successor, _ = successor_evidence(
+        reader, prereg, tmp_path, {"primary": {"code_sha": head_parent()}}
+    )
+    reader.validate_j3(successor, prereg)
+
+
+def test_f1_code_descendant_primary_refused(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+) -> None:
+    successor, _ = successor_evidence(
+        reader,
+        prereg,
+        tmp_path,
+        {"primary": {"code_sha": reader._git_sha()}, "successor": {"code_sha": head_parent()}},
+    )
+    with pytest.raises(ValueError, match="unchanged"):
+        reader.validate_j3(successor, prereg)
+
+
+def test_f1_missing_run_provenance_refuses(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+) -> None:
+    successor, _ = successor_evidence(reader, prereg, tmp_path)
+    (successor.parent.parent / prereg["run_id"] / "run_provenance.json").unlink()
+    with pytest.raises(ValueError):
+        reader.validate_j3(successor, prereg)
+
+
+def test_f1_record_provenance_is_write_once_and_matches_current(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path
+) -> None:
+    reader.record_provenance(tmp_path, prereg)
+    data = json.loads((tmp_path / "run_provenance.json").read_text())
+    assert data == {
+        "schema": "gap1_run_provenance_v1",
+        "prereg_sha256": reader._digest(prereg),
+        "c1_sha256": reader._sha(ROOT / prereg["c1_evidence"]["path"]),
+        "code_sha": reader._git_sha(),
+    }
+    with pytest.raises(FileExistsError):
+        reader.record_provenance(tmp_path, prereg)
+
+
+def test_f3_bootstrap_flattens_once_not_per_draw(
+    reader: ModuleType, prereg: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prereg["ci"]["B"] = 50
+    calls = 0
+    real = reader._flat
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    events, _ = reader._included([row(i) for i in range(6)], prereg)
+    monkeypatch.setattr(reader, "_flat", counting)
+    reader._intervals(events, "M1", prereg)
+    assert calls < 10, calls
+
+
+def test_f3_golden_result_bytes_pinned(reader: ModuleType, prereg: dict[str, Any]) -> None:
+    """Characterisation of the pre-optimisation result: the refactor must not move a float."""
+    rows = [row(i, h) for h in ("D0", "D-1") for i in range(12)]
+    payload = json.dumps(
+        reader.evaluate(rows, prereg), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    assert hashlib.sha256(payload.encode()).hexdigest() == (
+        "e4f41f5f7f8f914def2fe7a807329a843cac0cc598b70b203e130b9159a3a866"
+    )
+
+
+def test_f4_bootstrap_parameters_come_from_prereg(
+    reader: ModuleType, prereg: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert nbp.BOOTSTRAP_SEED == prereg["ci"]["seed"]
+    prereg["ci"]["B"] = 7
+    prereg["ci"]["alpha"] = "0.1/4"
+    seen: list[tuple[int, int]] = []
+    alphas: list[float] = []
+    real_draws, real_interval = reader.cluster_bootstrap_draws, reader.percentile_interval
+
+    def draws(*args: Any, **kwargs: Any) -> Any:
+        seen.append((kwargs["iterations"], kwargs["seed"]))
+        return real_draws(*args, **kwargs)
+
+    def interval(d: Any, *, alpha: float) -> Any:
+        alphas.append(alpha)
+        return real_interval(d, alpha=alpha)
+
+    monkeypatch.setattr(reader, "cluster_bootstrap_draws", draws)
+    monkeypatch.setattr(reader, "percentile_interval", interval)
+    reader.evaluate([row(i) for i in range(3)], prereg)
+    assert seen and set(seen) == {(7, prereg["ci"]["seed"])}
+    assert set(alphas) == {0.1 / 4}
+
+
+def test_f4_label_threshold_prior_floor_and_cutoff_come_from_prereg(
+    reader: ModuleType, prereg: dict[str, Any]
+) -> None:
+    rows = [row(i, "D-1") for i in range(12)]
+    prereg["overall"]["pass_labels"]["threshold"] = 1e9
+    assert reader.evaluate(rows, prereg)["cells"]["M1:D-1"]["label"] == "beats NBP"
+    prereg["overall"]["pass_labels"]["threshold"] = -1.0
+    assert reader.evaluate(rows, prereg)["cells"]["M1:D-1"]["label"] == "beats ask (indicative)"
+    prereg["census_rule"]["prior_floor"] = 7
+    assert reader.count_cells([], prereg)["prior_floor"] == 7
+    prereg["inclusion"]["cutoff"] = "climate_day < 2025-01-05; refuse post-cutoff rows"
+    with pytest.raises(ValueError, match="cutoff"):
+        reader.evaluate([row(10)], prereg)
+    assert reader.evaluate([row(1)], prereg)["excluded"] == {"champion_none": 0, "fold_id_none": 0}
+
+
+def large_d1_rows(*, wrong_every: int | None, same_prime: bool = False) -> list[dict[str, Any]]:
+    rows = []
+    for i in range(4800):
+        r = row(i, "D-1")
+        r["station"] = ("KORD", "KJFK", "KLAX")[i // 1600]
+        r["climate_day"] = (dt.date(2021, 1, 1) + dt.timedelta(days=i % 1600)).isoformat()
+        if wrong_every and i % wrong_every == 0:
+            r["arm_predictions"]["M1"]["mu"] = 145 - r["observed_f"]
+        if same_prime:
+            r["arm_predictions"]["M0prime"] = dict(r["arm_predictions"]["M1"])
+        rows.append(r)
+    return rows
+
+
+def test_f5_res_only_miscalibrated_at_evaluate_level(
+    reader: ModuleType, prereg: dict[str, Any]
+) -> None:
+    prereg["ci"]["B"] = 40
+    cell = reader.evaluate(large_d1_rows(wrong_every=4), prereg)["cells"]["M1:D-1"]
+    assert cell["outcome"] == "RES_ONLY_MISCALIBRATED"
+    assert cell["decompositions"]["M1"]["REL"] > cell["decompositions"]["M0t"]["REL"]
+    assert cell["CI"]["gating"][0] > 0 and cell["dRES"] >= nbp.G22_TARGET_DIFFERENCE_X
+
+
+def test_f5_obs_driven_only_at_d0_at_evaluate_level(
+    reader: ModuleType, prereg: dict[str, Any]
+) -> None:
+    for horizon, want in (("D0", "OBS_DRIVEN"), ("D-1", "PASS")):
+        rows = [row(i, horizon) for i in range(12)]
+        for r in rows:
+            r["arm_predictions"]["M0prime"] = dict(r["arm_predictions"]["M1"])
+        result = reader.evaluate(rows, prereg)
+        assert result["cells"][f"M1:{horizon}"]["outcome"] == want
+
+
+def test_f5_d0_sensitivity_is_report_only(reader: ModuleType, prereg: dict[str, Any]) -> None:
+    rows = [row(i, h) for h in ("D0", "D-1") for i in range(12)]
+    base = reader.evaluate(rows, prereg)
+    assert base["D0_sensitivity"] == {}
+    sens = [row(i, "D0_sensitivity") for i in range(12)]
+    sens[0]["lamp_missing"] = "UNKNOWN"
+    with_sens = reader.evaluate([*rows, *sens], prereg)
+    assert set(with_sens["D0_sensitivity"]) == {"M1", "M2", "M3"}
+    assert with_sens["cells"] == base["cells"] and with_sens["overall"] == base["overall"]
+    cell = with_sens["D0_sensitivity"]["M1"]
+    assert cell["n"] == 12 and cell["lamp_unknown"] == 1 and cell["lamp_missing"]["M1"] == 0
+    assert cell["sensitivity"]["n"] == 11
+
+
+def build_fixture(
+    reader: ModuleType,
+    prereg: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    drop: tuple[str, str] | None = None,
+    lag_digest: str | None = None,
+) -> list[str]:
+    rows = [row(i, h) for h in ("D0", "D-1", "D0_sensitivity") for i in range(12)]
+    j3 = fixture_j3(tmp_path, prereg, rows)
+    features = [
+        {
+            "station": r["station"],
+            "climate_day": r["climate_day"],
+            "horizon": r["horizon"],
+            "lamp": {
+                "missing": r["horizon"] == "D0_sensitivity" and r["climate_day"] < "2025-01-03"
+            },
+        }
+        for r in rows
+        if (r["horizon"], r["climate_day"]) != drop
+    ]
+    f, fl = j3.parent / "f.jsonl", j3.parent / "fl.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in features))
+    fl.write_text("lag")
+    (j3.parent / "build.json").write_text(
+        json.dumps(
+            {
+                "output_sha256": {
+                    "primary": hashlib.sha256(f.read_bytes()).hexdigest(),
+                    "lag": lag_digest or hashlib.sha256(fl.read_bytes()).hexdigest(),
+                }
+            }
+        )
+    )
+    verified = reader.load_prereg
+    monkeypatch.setattr(
+        reader, "load_prereg", lambda path: prereg if path == PREREG else verified(path)
+    )
+    (j3.parent / "d1.json").write_text(
+        json.dumps({"granted": True, "prereg_frozen_sha": prereg["frozen_sha"]})
+    )
+    return [
+        "--prereg",
+        str(PREREG),
+        "--f13-prereg",
+        str(ROOT / prereg["f13_prereg"]["path"]),
+        "--j3-dir",
+        str(j3),
+    ]
+
+
+def test_f5_d0_sensitivity_without_feature_row_is_unknown_not_refusal(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = build_fixture(
+        reader, prereg, tmp_path, monkeypatch, drop=("D0_sensitivity", "2025-01-12")
+    )
+    prereg["ci"]["B"] = 50
+    assert reader.main([*args, "--out", str(tmp_path / "out.json")]) == 0
+    cell = json.loads((tmp_path / "out.json").read_text())["D0_sensitivity"]["M1"]
+    assert cell["lamp_unknown"] == 1
+    assert cell["lamp_missing"]["M1"] == 2  # the two rows the features flag as LAMP-missing
+    assert cell["n"] == 12
+
+
+def test_f5_gating_row_without_feature_row_still_refuses(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = build_fixture(reader, prereg, tmp_path, monkeypatch, drop=("D0", "2025-01-05"))
+    prereg["ci"]["B"] = 50
+    assert reader.main([*args, "--out", str(tmp_path / "out.json")]) == 2
+
+
+def test_f7_primary_build_checks_the_lag_digest(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = build_fixture(reader, prereg, tmp_path, monkeypatch, lag_digest="0" * 64)
+    prereg["ci"]["B"] = 50
+    assert reader.main([*args, "--out", str(tmp_path / "out.json")]) == 2
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_f7_primary_build_with_matching_lag_digest_passes(
+    reader: ModuleType, prereg: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = build_fixture(reader, prereg, tmp_path, monkeypatch)
+    prereg["ci"]["B"] = 50
+    assert reader.main([*args, "--out", str(tmp_path / "out.json")]) == 0

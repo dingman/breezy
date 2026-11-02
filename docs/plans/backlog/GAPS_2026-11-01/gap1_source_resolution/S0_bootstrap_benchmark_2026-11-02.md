@@ -22,3 +22,4 @@ F13 header content_sha256 is canonical SHA-256 excluding frozen_sha, not the who
 K_cum: no seed or 09-30 inclusion evidence in docs/core/PROGRESS.md; before/after TODO-S0b. Conservatively count 09-30 unless proven already seeded.
 Prior sigma uses code X and code z constants rounded to six decimals: 0.0152*sqrt(592)/(1.959964+0.841621)=0.13200811749139565; adjusted floor=914.
 OPEN_ITEMS: frozen_sha (TODO-S0b, including freeze-history compatibility); k_cum.before (TODO-S0b, reconcile 09-30); k_cum.after (TODO-S0b, derive before+added).
+Frozen 2026-11-02: frozen_sha e648d181 (stamp f86e3b76); OPEN_ITEMS resolved (k_cum before 1 / after 8; test_plan.T8b added).
