@@ -410,6 +410,17 @@ _PLANTED: Final[dict[str, str]] = {
         'import subprocess\nsubprocess.run(["true"], env={"<POSITION>": "25.00"})\n'
     ),
     "environ_update": ('import os\nos.environ.update({"<DAILY>": "100.00"})\n'),
+    "monthly_subscript_assignment": ('import os\nos.environ["<MONTH>"] = "3000.00"\n'),
+    "monthly_fallback_in_environ_get": (
+        'import os\nCAP = os.environ.get("<MONTH>", "3000.00")\n'
+    ),
+    "monthly_monkeypatch_setenv_in_a_test": (
+        "from breezy.adapters.polymarket_us.operator_controls import (\n"
+        "    MAX_MONTHLY_BUDGET_USD_ENV_VAR,\n"
+        ")\n"
+        "def test_something(monkeypatch):\n"
+        '    monkeypatch.setenv(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "3000.00")\n'
+    ),
     "local_alias_of_the_constant": (
         "import os\n"
         "from breezy.adapters.polymarket_us.operator_controls import (\n"
@@ -458,8 +469,10 @@ def _plant(template: str) -> str:
     a test fixture spelling the name would have to be exempted from the very
     check it is proving.
     """
-    return template.replace("<DAILY>", operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR).replace(
-        "<POSITION>", operator_controls.MAX_POSITION_COST_USD_ENV_VAR
+    return (
+        template.replace("<DAILY>", operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR)
+        .replace("<POSITION>", operator_controls.MAX_POSITION_COST_USD_ENV_VAR)
+        .replace("<MONTH>", operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR)
     )
 
 
@@ -840,6 +853,10 @@ def test_the_definition_module_never_touches_os_environ_itself() -> None:
             operator_controls.MAX_POSITION_COST_USD_ENV_VAR,
             operator_controls.operator_max_position_cost_usd,
         ),
+        (
+            operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+            operator_controls.operator_max_monthly_budget_usd,
+        ),
     ],
 )
 def test_refusal_names_the_control_not_the_value(env_var: str, read: object) -> None:
@@ -862,6 +879,7 @@ def test_the_ceiling_refusal_names_the_control_not_the_amounts() -> None:
     with (
         operator_control_env(operator_controls.MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
         operator_control_env(operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         pytest.raises(safety.LiveTradingPermissionError) as excinfo,
     ):
         ledger.authorize_order_cost(
@@ -879,6 +897,7 @@ def test_the_daily_refusal_names_the_control_not_the_amounts() -> None:
     with (
         operator_control_env(operator_controls.MAX_POSITION_COST_USD_ENV_VAR, "1000.00"),
         operator_control_env(operator_controls.MAX_DAILY_BUDGET_USD_ENV_VAR, "10.00"),
+        operator_control_env(operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         pytest.raises(safety.LiveTradingPermissionError) as excinfo,
     ):
         ledger.authorize_order_cost(
@@ -900,6 +919,10 @@ def test_an_absent_control_is_refused_by_name() -> None:
         (
             operator_controls.MAX_POSITION_COST_USD_ENV_VAR,
             operator_controls.operator_max_position_cost_usd,
+        ),
+        (
+            operator_controls.MAX_MONTHLY_BUDGET_USD_ENV_VAR,
+            operator_controls.operator_max_monthly_budget_usd,
         ),
     ):
         with (

@@ -69,7 +69,7 @@ BANNED_MODULES: dict[str, tuple[str, int, str]] = {
     ),
     "breezy.runtime": (
         "src/breezy/runtime/order_enablement.py",
-        155,
+        156,
         "class OrderSubmissionPermit",
     ),
     "breezy.exec": (

@@ -37,6 +37,7 @@ import pytest
 
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.safety import PERMIT_TTL_NS, TRADING_ENABLED_ENV_VAR
@@ -92,6 +93,7 @@ def test_main_logs_live_trading_permit_issued_when_both_permits_are_minted(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         caplog.at_level(logging.INFO),
     ):
         exit_code = trade_module.main()
@@ -118,6 +120,12 @@ def test_main_logs_live_trading_permit_issued_when_both_permits_are_minted(
     assert ttl_s == PERMIT_TTL_NS // 1_000_000_000
 
     assert_no_values_leaked(caplog.text, _SENSITIVE_VALUES)
+    assert_no_values_leaked(caplog.text, ("30000.00", "30000"))
+
+    validated = [r for r in caplog.records if r.getMessage().startswith("operator caps validated")]
+    assert len(validated) == 1
+    assert validated[0].getMessage() == "operator caps validated DAY/POSITION/MONTH"
+    assert not any(character.isdigit() for character in validated[0].getMessage())
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +160,7 @@ def test_main_clamps_the_permit_to_a_valid_expiry_ceiling_env_var(
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, "30000.00"),
         caplog.at_level(logging.INFO),
     ):
         exit_code = trade_module.main()

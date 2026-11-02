@@ -48,6 +48,7 @@ from typing import Protocol, final, runtime_checkable
 from breezy.adapters.polymarket_us import write_transport
 from breezy.adapters.polymarket_us.operator_controls import (
     operator_max_daily_budget_usd,
+    operator_max_monthly_budget_usd,
     operator_max_position_cost_usd,
 )
 from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError, LiveTradingPermit
@@ -211,9 +212,10 @@ class OrderSubmissionPermit:
         try:
             operator_max_daily_budget_usd()
             operator_max_position_cost_usd()
+            operator_max_monthly_budget_usd()
         except LiveTradingPermissionError as exc:
             raise OperatorCapsNotConfiguredError(
-                "both operator-reserved caps must be present and positive"
+                "all three operator-reserved caps must be present and positive"
             ) from exc
 
         rung_hold_family = settings.sending_family_id is not None

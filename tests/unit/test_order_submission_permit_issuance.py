@@ -32,6 +32,7 @@ from nautilus_trader.common.component import TestClock
 
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_MONTHLY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
 from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
@@ -45,7 +46,7 @@ from breezy.runtime.order_enablement import (
     WriteCanonicalStringUnverifiedError,
 )
 from tests.unit.log_leak_assertions import assert_no_values_leaked
-from tests.unit.operator_control_env import operator_control_env
+from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.test_polymarket_us_permit_issuance import (
     clock_at,
     credentials,
@@ -86,10 +87,13 @@ class _FakeSettings:
 
 
 @contextmanager
-def _caps(daily: str = "1000.00", position: str = "10.00") -> Iterator[None]:
+def _caps(
+    daily: str = "1000.00", position: str = "10.00", monthly: str = "30000.00"
+) -> Iterator[None]:
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+        operator_control_env(MAX_MONTHLY_BUDGET_USD_ENV_VAR, monthly),
     ):
         yield
 
@@ -190,6 +194,20 @@ def test_operator_caps_absent_refuses(
             live_trading_permit=live_permit,
             clock=clock,
         )
+    # MONTH alone absent (DAY and POSITION present) still refuses, value-free.
+    # Kept in this function: the B11 call-site pin is keyed by function name.
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        operator_control_unset(MAX_MONTHLY_BUDGET_USD_ENV_VAR),
+        pytest.raises(OperatorCapsNotConfiguredError) as exc,
+    ):
+        _ISSUE(
+            settings=_FakeSettings(),
+            live_trading_permit=live_permit,
+            clock=clock,
+        )
+    assert str(exc.value) == "all three operator-reserved caps must be present and positive"
 
 
 def test_issue_accepts_continuous_without_current(
@@ -311,6 +329,8 @@ def test_operator_caps_and_rung_hold_messages_name_no_value(
                 clock=clock,
             )
         _assert_message_names_no_value(exc_caps.value)
+        assert "three" in str(exc_caps.value)
+        assert "both" not in str(exc_caps.value)
 
         with _caps(), pytest.raises(RungHoldNotReadyError) as exc_rung:
             _ISSUE(
