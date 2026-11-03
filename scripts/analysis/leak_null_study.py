@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -31,7 +31,7 @@ from breezy.analysis.memory_cap import apply_address_space_cap
 from scripts.analysis import leak_null_guards as g
 from scripts.analysis import multisource_blend_skill as skill
 
-if g.FROZEN_THRESHOLDS != asdict(dec.THRESHOLDS):
+if g.FROZEN_THRESHOLDS != g.record(dec.THRESHOLDS):
     raise RuntimeError("FROZEN_THRESHOLDS drifted from leak_null_decide.THRESHOLDS")
 
 RESULT_KEYS = frozenset(
@@ -184,7 +184,7 @@ def _read_record(path: Path, design: g.LeakNullDesign, seed: int, *, pc: bool) -
             summary = _summary(raw)
             if summary.seed != seed or summary.null_id != null_id:
                 raise ValueError("checkpoint seed or null ID differs")
-            if _json_value(asdict(summary)) != raw:
+            if _json_value(g.record(summary)) != raw:
                 raise ValueError("checkpoint summary fields differ")
             if summary.failed is None and (
                 summary.mean is None
@@ -272,7 +272,7 @@ def run_seed(ctx: skill.RunContext, design: g.LeakNullDesign, seed: int) -> dict
             seed,
             null_id,
         )
-        summaries[null_id] = asdict(summary)
+        summaries[null_id] = g.record(summary)
         bad, maxima[null_id], fold_defects[null_id] = _score_defects(scored, ctx, tol)
         defects.extend(f"{null_id}: {d}" for d in bad)
         if null_id == ln.NullId.N2:
@@ -324,7 +324,7 @@ def _pc_seed(ctx: skill.RunContext, design: g.LeakNullDesign, seed: int) -> dict
     return _json_value(
         {
             **_pins(design, seed),
-            "summary": asdict(summary),
+            "summary": g.record(summary),
             "defects": defects,
             "plant_present": len(present),
             "plant_passed": passed,
@@ -367,8 +367,8 @@ def assemble_result(
     for null_id, summaries in by_null.items():
         complete = [s for s in summaries if s.failed is None]
         bounds[null_id] = {
-            "bound": asdict(dec.across_seed_bound(complete)) if complete else None,
-            "seeds": [asdict(s) for s in summaries],
+            "bound": g.record(dec.across_seed_bound(complete)) if complete else None,
+            "seeds": [g.record(s) for s in summaries],
         }
     n1 = [s for s in by_null.get(ln.NullId.N1, ()) if s.failed is None]
     bias = (

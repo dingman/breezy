@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -9,7 +10,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
@@ -27,6 +28,23 @@ from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
 Refusal = skill.Refusal
 
+
+def record(obj: Any) -> Any:
+    """Plain-data copy of a dataclass tree via ``fields()``/``getattr``.
+
+    Mirrors ``dataclasses.asdict`` semantics for the LEAK-NULL value types without
+    calling it: the credential-serialization contract closes the ``asdict`` call
+    sites, and nothing here may ever be handed a credential.
+    """
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {f.name: record(getattr(obj, f.name)) for f in fields(obj)}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(record(v) for v in obj)
+    if isinstance(obj, dict):
+        return {record(k): record(v) for k, v in obj.items()}
+    return copy.deepcopy(obj)
+
+
 # Frozen literal; asserted equal to leak_null_decide.THRESHOLDS immediately below.
 FROZEN_THRESHOLDS: Final[dict[str, float | int]] = {
     "lb_gt": 0.0,
@@ -43,7 +61,7 @@ FROZEN_THRESHOLDS: Final[dict[str, float | int]] = {
     "t_crit_pc5": 2.776,
     "plant_noise_sd_f": 1.0,
 }
-if FROZEN_THRESHOLDS != asdict(THRESHOLDS):
+if FROZEN_THRESHOLDS != record(THRESHOLDS):
     raise RuntimeError("FROZEN_THRESHOLDS drifted from leak_null_decide.THRESHOLDS")
 PINNED_BLOBS: Final[tuple[str, ...]] = (
     "src/breezy/analysis/leak_null.py",
