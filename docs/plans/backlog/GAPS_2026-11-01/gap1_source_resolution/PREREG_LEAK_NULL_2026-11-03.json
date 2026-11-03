@@ -42,7 +42,7 @@
     "result.json",
     "stage_a.json"
   ],
-  "frozen_sha": "UNFROZEN",
+  "frozen_sha": "c53ae69f7621257b0d75f49923be8851de2b844a",
   "inputs": {
     "c1_evidence": {
       "path": "/home/jon/breezy/docs/evidence/f13/c1_lag_evidence_2026-10-21.json",
