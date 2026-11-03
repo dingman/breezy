@@ -235,6 +235,7 @@
     "tests/unit/test_ingest_records.py",
     "tests/unit/test_lamp_archive_stream.py",
     "tests/unit/test_launch_window_table.py",
+    "tests/unit/test_leak_null_study.py",
     "tests/unit/test_maker_stage0_rule.py",
     "tests/unit/test_maker_stage0_verdict.py",
     "tests/unit/test_maker_tape_census.py",
