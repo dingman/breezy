@@ -37,11 +37,14 @@ Both clusterings (station_day, climate_day) agree within 0.0004. Power met in al
   0.165). The PREREG says this never overrides GAP-1, so PASS stands as registered — but the audit is owed, not
   discharged (`multisource_blend_stats.py:230-234`). Candidate benign mechanism: M3's extra regressors under the soft
   sum-to-one penalty; undiagnosable from `oof_rows.jsonl` (shuffled rows not persisted).
-- **KNYC silently absent.** `f.jsonl` holds LAX/MDW/MIA/SFO only. D0 `nbp_missing` 1642 = exactly the D0 row loss vs the
-  10-21 draft (9621 → 7979); NBP manifest sha aa721c24 → 8945df4b. Rows drop in `select_nbp` (available_at_ns ≥ anchor),
-  i.e. an archive-rewrite timestamp skew on KNYC cycles. Conservative direction (rows lost, not leaked), but an
-  undisclosed sample change. NBP's own availability pin is `provisional: true` and not covered by
-  `assert_row_leakage_free` (obs/pfm/mos/lamp only).
+- **KNYC absent by design (KNYC-DROP diagnosed 11-03, skew hypothesis REFUTED).** `f.jsonl` holds LAX/MDW/MIA/SFO
+  only. NYC is "not in scope" per `plan_r1.md:37`, and `plan_r1.md:33` pins `--nbp-root …/derived/nbp`, a 4-station
+  store (manifest 8945df4b, 0 KNYC rows in 6361 partitions); the 10-21 draft read the 5-station `derived/nbp5`
+  (aa721c24). KNYC days therefore hit `select_nbp` with no candidates and are counted as `nbp_missing` (1642 at D0 =
+  exactly the draft's 9621 → 7979 loss). Rows lost, not leaked; no timestamp rewrite involved. Gap: the plan never
+  states that the NYC exclusion is why the row count fell, and the builder counts a zero-candidate station as
+  `nbp_missing` instead of flagging it (candidate guard). NBP's availability pin remains `provisional: true` and
+  outside `assert_row_leakage_free` (obs/pfm/mos/lamp only).
 - Frozen source lags are p99 over 14–15 live days (Oct 2026) applied to 2021–2026 archives; observed maxima exceed
   pins (lav 110.6 vs 90 min; pfm 174 vs ≈99 min). The +60 min lag twin (lb 0.163 vs 0.150) shows the primary result is
   not timing-sensitive at 1 h.
@@ -73,7 +76,8 @@ PASS is recorded as registered. The conditional unlock of backlog #10 (GAP-2 →
 follow-ups, neither of which re-looks at the primary data:
 1. LEAK-NULL: outcome-blind, multi-seed shuffled-null of M3 vs M0prime (re-fit on permuted labels; needs a plan + peer
    loop; must not touch `gap1_j3_2026-11-02/j3`).
-2. KNYC-DROP: read-only diagnosis of KNYC's zero rows (NBP `available_at_ns` vs anchor per station; partition mtime),
-   and a disclosure of the four-station sample.
+2. KNYC-DROP: CLOSED 11-03 — NYC out of scope by plan (`plan_r1.md:37`), 4-station store by plan (`:33`); disclosure
+   is this paragraph. Residual candidate (small): builder guard that flags a configured station with zero NBP
+   candidates instead of counting it as `nbp_missing`.
 Reviews: go/no-go architect + prediction-market (GO-WITH-NOTE); post-read mle-reviewer (PASS_SUSPECT) +
 prediction-market (mechanically correct, not decision-grade while HELD_LEAK_AUDIT stands).
