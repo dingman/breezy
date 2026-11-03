@@ -341,6 +341,18 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-11-02
 **Last updated:** 2026-11-02
 
+### L-82 — A frozen plan's command lines are dry-run against the real roots before the freeze (2026-11-03)
+**Mistake:** The frozen plan's J2 line named an output root the writer's own guard refuses and a `--mos-root` the writer rejects, so three launches failed before any computation.
+**Prevention:** Before freezing a PREREG or plan that pins paths or quotes a command line, dry-run that exact command against the real roots (`--help` or a 10-second start) and record its exit code in the plan.
+**Applied:** 2026-11-03
+**Last updated:** 2026-11-03
+
+### L-83 — Thread pools under an address-space cap abort at startup (2026-11-03)
+**Mistake:** Default 16-core BLAS/Arrow pools could not create threads under a 3.5 GiB address-space cap, so the job aborted with EAGAIN `std::system_error` before any work ran.
+**Prevention:** Every `systemd-run` launch of a capped Python job sets OMP, OPENBLAS, MKL, RAYON and POLARS thread env to ≤ 4 and ARROW_IO_THREADS to ≤ 2 in the unit.
+**Applied:** 2026-11-03
+**Last updated:** 2026-11-03
+
 ## Absorbed index
 
 Every removed L-number resolves to its surviving entry above. Archived (full text in docs/core/archive/LESSONS-archive-2026-10-20.md): L-5, L-57, L-61. Full pre-consolidation text: docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md.
