@@ -1,0 +1,38 @@
+{
+  "cells": {
+    "M1:D-1": {
+      "missing_prefix": 7936,
+      "upper_bound": 7940
+    },
+    "M1:D0": {
+      "missing_prefix": 31,
+      "upper_bound": 7979
+    },
+    "M2:D-1": {
+      "missing_prefix": 7936,
+      "upper_bound": 7940
+    },
+    "M2:D0": {
+      "missing_prefix": 32,
+      "upper_bound": 7979
+    },
+    "M3:D-1": {
+      "missing_prefix": 7936,
+      "upper_bound": 7940
+    },
+    "M3:D0": {
+      "missing_prefix": 32,
+      "upper_bound": 7979
+    }
+  },
+  "git_sha": "29d4836b3f9c548b4da2da79ca17a179e89c86a9",
+  "prior_floor": 914,
+  "schema": "gap1_counts_v1",
+  "versions": {
+    "v4.0": 5907,
+    "v4.1": 3856,
+    "v4.2": 2996,
+    "v4.3": 2716,
+    "v5.0": 444
+  }
+}
