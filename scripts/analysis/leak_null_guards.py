@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
@@ -20,13 +20,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from breezy.analysis.leak_null_decide import THRESHOLDS
 from scripts.analysis import multisource_blend_skill as skill
 from scripts.analysis.multisource_blend_pin_guards import check_not_refrozen
 from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
 Refusal = skill.Refusal
 
-# Seam C will assert equality with leak_null_decide.THRESHOLDS.
+# Frozen literal; asserted equal to leak_null_decide.THRESHOLDS immediately below.
 FROZEN_THRESHOLDS: Final[dict[str, float | int]] = {
     "lb_gt": 0.0,
     "leak_mean_min": 0.005,
@@ -42,6 +43,8 @@ FROZEN_THRESHOLDS: Final[dict[str, float | int]] = {
     "t_crit_pc5": 2.776,
     "plant_noise_sd_f": 1.0,
 }
+if FROZEN_THRESHOLDS != asdict(THRESHOLDS):
+    raise RuntimeError("FROZEN_THRESHOLDS drifted from leak_null_decide.THRESHOLDS")
 PINNED_BLOBS: Final[tuple[str, ...]] = (
     "src/breezy/analysis/leak_null.py",
     "src/breezy/analysis/leak_null_decide.py",
@@ -245,6 +248,8 @@ def guard_probe_parent(path: Path, out_root: Path) -> Path:
     resolved = path.expanduser().resolve()
     if resolved.is_relative_to(out_root.expanduser().resolve()):
         raise Refusal("probe_parent must be outside out_root")
+    if not resolved.is_dir():
+        raise Refusal(f"probe_parent must be an existing directory: {resolved}")
     return resolved
 
 
@@ -314,23 +319,30 @@ def _pinned_path(repo: Path, name: str) -> Path:
     return resolved
 
 
-def _check_loaded_module(name: str, expected: Path) -> None:
+def _check_loaded_module(name: str, expected: Path) -> str | None:
+    """Refuse a module loaded from outside the repo; note (not fail) one not loaded."""
     parts = Path(name).with_suffix("").parts
     module_name = ".".join(parts[1:] if parts[0] == "src" else parts)
     module = sys.modules.get(module_name)
-    if module is not None:
-        loaded = getattr(module, "__file__", None)
-        if not isinstance(loaded, str) or Path(loaded).resolve() != expected:
-            raise Refusal(f"pinned module {module_name} loaded from outside repo: {loaded}")
+    if module is None:
+        return f"pinned module {module_name} not loaded; origin check skipped"
+    loaded = getattr(module, "__file__", None)
+    if not isinstance(loaded, str) or Path(loaded).resolve() != expected:
+        raise Refusal(f"pinned module {module_name} loaded from outside repo: {loaded}")
+    return None
 
 
-def check_code_pin(repo: Path, code_sha: str, paths: Sequence[str]) -> None:
-    """Check ancestry, worktree/HEAD blobs, and already-loaded module origins."""
+def check_code_pin(repo: Path, code_sha: str, paths: Sequence[str]) -> list[str]:
+    """Check ancestry, worktree/HEAD blobs, and already-loaded module origins.
+
+    Returns notes for pinned modules whose origin check was skipped (not loaded).
+    """
     head = _git_value(repo, "rev-parse", "HEAD")
     if not code_ok(repo, code_sha, head):
         raise Refusal("code_sha is not HEAD or an ancestor of HEAD")
     if not paths:
         raise Refusal("code pin has no pinned blobs")
+    notes: list[str] = []
     for name in paths:
         expected_path = _pinned_path(repo, name)
         expected = _git_value(repo, "rev-parse", f"{code_sha}:{name}")
@@ -338,7 +350,10 @@ def check_code_pin(repo: Path, code_sha: str, paths: Sequence[str]) -> None:
         committed = _git_value(repo, "rev-parse", f"HEAD:{name}")
         if current != expected or committed != expected:
             raise Refusal(f"code pin blob drift: {name}")
-        _check_loaded_module(name, expected_path)
+        note = _check_loaded_module(name, expected_path)
+        if note:
+            notes.append(note)
+    return notes
 
 
 def _provenance(design: LeakNullDesign, shas: Mapping[str, str]) -> dict[str, Any]:

@@ -387,6 +387,16 @@ def test_code_pin_refuses_module_loaded_outside_repo(
         g.check_code_pin(repo, sha, (PINNED[0],))
 
 
+def test_code_pin_notes_pinned_modules_that_are_not_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, sha = _repo(tmp_path)
+    monkeypatch.delitem(sys.modules, "breezy.analysis.leak_null", raising=False)
+    notes = g.check_code_pin(repo, sha, (PINNED[0],))
+    assert len(notes) == 1
+    assert "breezy.analysis.leak_null not loaded" in notes[0]
+
+
 @pytest.mark.parametrize("path", ["../outside.py", "/absolute.py", "src/../escape.py"])
 def test_code_pin_refuses_non_repo_relative_paths(tmp_path: Path, path: str) -> None:
     repo, sha = _repo(tmp_path)
@@ -402,7 +412,18 @@ def test_probe_parent_inside_out_root_refused(tmp_path: Path, kind: str) -> None
     path = {"same": root, "child": root / "scratch", "symlink": tmp_path / "alias"}[kind]
     with pytest.raises(g.Refusal, match="probe_parent"):
         g.guard_probe_parent(path, root)
+    (tmp_path / "scratch").mkdir()
     assert g.guard_probe_parent(tmp_path / "scratch", root) == (tmp_path / "scratch").resolve()
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_probe_parent_must_be_an_existing_directory(tmp_path: Path, kind: str) -> None:
+    root = tmp_path / "derived"
+    path = tmp_path / "scratch"
+    if kind == "file":
+        path.write_text("not a directory\n")
+    with pytest.raises(g.Refusal, match="existing directory"):
+        g.guard_probe_parent(path, root)
 
 
 def test_record_provenance_is_write_once(tmp_path: Path) -> None:
