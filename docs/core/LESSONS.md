@@ -353,6 +353,12 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-11-03
 **Last updated:** 2026-11-03
 
+### L-84 — An in-flight gate is never killed by a later instruction (2026-11-03)
+**Mistake:** A review-fix message that said "do not re-run the full suite" was read as "stop the running suite"; the run was killed at 17 min and had to be rerun (~26 min).
+**Prevention:** A gate that is already running always runs to completion; new instructions apply to the next run, and a brief that wants the run stopped says `kill` explicitly.
+**Applied:** 2026-11-03
+**Last updated:** 2026-11-03
+
 ## Absorbed index
 
 Every removed L-number resolves to its surviving entry above. Archived (full text in docs/core/archive/LESSONS-archive-2026-10-20.md): L-5, L-57, L-61. Full pre-consolidation text: docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md.
