@@ -49,6 +49,7 @@ if TYPE_CHECKING:
         HISTORICAL_CUTOFF,
         KalshiHttp,
         climate_day_from_ticker,
+        is_relisted_variant,
     )
 else:
     from k1_cheap_open_settlement import (
@@ -57,7 +58,13 @@ else:
         summarize_stratum,
         wilson_interval,
     )
-    from k1_kalshi_prior import API_BASE, HISTORICAL_CUTOFF, KalshiHttp, climate_day_from_ticker
+    from k1_kalshi_prior import (
+        API_BASE,
+        HISTORICAL_CUTOFF,
+        KalshiHttp,
+        climate_day_from_ticker,
+        is_relisted_variant,
+    )
 
 __all__ = ["break_even_probability", "summarize_stratum"]
 
@@ -305,8 +312,36 @@ def climate_day(row: Mapping[str, Any]) -> dt.date:
     return parsed
 
 
+def _relist_climate_day(ticker: str) -> dt.date | None:
+    """Date named by a k1 re-list (`HIGHAUS--23MAY11-T91`, `HIGHCHI-2-…`), else None.
+
+    The token is read only after `is_relisted_variant` accepts the ticker, then
+    checked with the normal parser. This does not teach `climate_day` the shape.
+    """
+    if not is_relisted_variant(ticker):
+        return None
+    match = re.search(r"\d{2}[A-Z]{3}\d{2}", ticker)
+    if match is None:
+        return None
+    return climate_day_from_ticker(f"X-{match.group(0)}{ticker[match.end() :]}")
+
+
 def in_window(row: Mapping[str, Any]) -> bool:
-    return dt.date(2025, 7, 1) <= climate_day(row) < dt.date(2026, 7, 1)
+    """F-2 window. Out-of-window re-lists drop; in-window re-lists stay poisoned."""
+    start, end = dt.date(2025, 7, 1), dt.date(2026, 7, 1)
+    explicit = row.get("climate_day")
+    if explicit is not None:
+        day = dt.date.fromisoformat(explicit)
+    else:
+        ticker = str(row["ticker"])
+        parsed = climate_day_from_ticker(ticker)
+        if parsed is None:
+            relist = _relist_climate_day(ticker)
+            if relist is None or start <= relist < end:
+                raise PoisonedInput("climate identity")
+            return False
+        day = parsed
+    return start <= day < end
 
 
 def row_exclusion(row: Mapping[str, Any]) -> str | None:

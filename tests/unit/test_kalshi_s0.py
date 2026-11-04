@@ -582,6 +582,41 @@ def test_fetch_filters_before_candle_read_and_records_exclusions(
     assert len(stub.calls) == 3
 
 
+def test_in_window_drops_out_of_window_relist() -> None:
+    market = {"ticker": "HIGHAUS--23MAY11-T91"}
+    with pytest.raises(s.PoisonedInput, match="climate identity"):
+        s.climate_day(market)
+    assert s.in_window(market) is False
+
+
+def test_in_window_refuses_in_window_relist() -> None:
+    with pytest.raises(s.PoisonedInput, match="climate identity"):
+        s.in_window({"ticker": "HIGHAUS--25OCT01-T91"})
+
+
+def test_in_window_refuses_garbage_ticker() -> None:
+    with pytest.raises(s.PoisonedInput, match="climate identity"):
+        s.in_window({"ticker": "NOT-A-TICKER"})
+
+
+def test_fetch_series_counts_relists_as_window_exclusions(tmp_path: Path) -> None:
+    suffixes = ("T91", "B90.5", "B88.5", "B86.5", "T84", "B84.5")
+    relists = [{"ticker": f"HIGHAUS--23MAY11-{suffix}"} for suffix in suffixes]
+    kept = row(ticker="KXHIGHNY-25JUL02-T90", result="no")
+    candles = [{"end_period_ts": 1751382000, "yes_bid": {"close": "0.11"}}]
+    stub = Stub(
+        {"markets": [*relists, kept]},
+        {"markets": []},
+        {"candlesticks": candles},
+    )
+    target = tmp_path / "KXHIGHNY.json"
+    assert s._fetch_series(s.HostPinnedKalshi(stub), "KXHIGHNY", target) is False
+    payload = json.loads(target.read_text())
+    assert payload["exclusions"] == {"window": 6}
+    assert len(payload["rows"]) == 1
+    assert payload["rows"][0]["ticker"] == "KXHIGHNY-25JUL02-T90"
+
+
 def test_disk_refusal_and_f19_halt(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(s, "statvfs", lambda p: type("Disk", (), {"f_bavail": 1, "f_frsize": 1})())
     with pytest.raises(s.Incomplete, match="space"):
