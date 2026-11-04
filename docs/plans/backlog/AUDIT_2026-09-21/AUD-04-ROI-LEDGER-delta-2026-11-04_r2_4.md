@@ -36,6 +36,11 @@ Round 3: prediction-market-reviewer and architect each raised B1. The edits are 
 8. Companion #7 r6 R6-2/R6-5: rename and reworded rule; the false "proves no order could have produced an unseen fill" claim is dropped; entry is withheld on `n_other_excluded > 0`; a `FAMILY_PARTITION` block is read restrictively only.
 9. Companion #5 `size_under_caps/plan_r5_delta.md:64` was not edited (out of this erratum's file scope). Its `n_orders_since_newest_fill` is read as `n_open_anchors_without_fill`. That reference is a "#5 reads none" exclusion, so its meaning is unchanged.
 
+## Erratum r2.4-e2 (2026-11-04, post-merge acceptance)
+Production at K=1 writes no `exec_par/order/` anchors: `build_exec_watcher` builds no counter ingest at K=1. Zero rows therefore do not prove zero orders (L-8). `n_open_anchors_without_fill` ships `None` when no decodable anchor rows exist, including when there are no fills; all existing `None` conditions and the counting rule when anchors exist stand.
+
+Consequence: #7 eligibility under STALE is blocked until an anchor writer is live at K=1 or freshness is OK. A K=1 anchor writer is a separate candidate, not part of #4.
+
 ## 0 Goal state (L-3): r2.3 §0 stands, with two changes
 - WALK: `_run` also computes `n_open_anchors_without_fill` in the ledger pass (item 1; renamed by erratum e1).
 - "#4 DONE" is never written. On outcome (ii), the PROGRESS entry is the §1b text below. #4 is BUILT, and its consumers stay BLOCKED until OPS-4 clears label identity.
