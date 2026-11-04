@@ -208,6 +208,13 @@ source_modules = [
 forbidden_modules = ["breezy.analysis.hypothesis_ledger"]
 allow_indirect_imports = false
 
+[[tool.importlinter.contracts]]
+name = "AUD-04 ROI decision accessor is stdlib-only"
+type = "forbidden"
+source_modules = ["breezy.persistence.portfolio_roi_decision"]
+forbidden_modules = ["nautilus_trader", "pyarrow", "breezy.analysis", "breezy.adapters", "breezy.runtime", "breezy.strategy", "breezy.app"]
+allow_indirect_imports = false
+
 # A8c-R2b: the sending resolver has no sanctioned consumer until AUT-5a. This contract is named
 # outside the `ARCH-0 autonomy (` prefix so B8-R2's count of three stays; AUT-5a amends it (and the
 # AST guard in tests/unit/test_registry_resolver_guards.py) when it lands the consumer.

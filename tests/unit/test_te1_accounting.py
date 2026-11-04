@@ -879,7 +879,7 @@ def test_world_roi_fields(world: World, run: Any) -> None:
     assert Decimal(report["roi_accounting"]) == _prr.roi(
         total_realised_pnl=Decimal("-2.63"), total_capital_deployed=capital
     )
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     assert report["fill_pnl"] and (run.json_path.stat().st_mode & 0o777) == 0o600
 
 
@@ -919,6 +919,7 @@ def _report_kwargs() -> dict[str, Any]:
         total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), fills=[]
     )
     return {
+        "label_gate_status": None,
         "period_start": "2026-10-01",
         "period_end": "2026-10-03",
         "fill_buckets": {},
@@ -1323,15 +1324,15 @@ _V5_KEYS = (
 )
 
 
-def test_schema_v5_reader_accepts_1_to_5_and_rejects_v5_missing_keys(
+def test_schema_reader_accepts_1_to_6_and_rejects_v5_plus_missing_keys(
     world: World, run: Any, tmp_path: Path
 ) -> None:
     raw = run.report()
     path = tmp_path / "v.json"
 
-    assert _prr.PORTFOLIO_ROI_SCHEMA_VERSION == 5
+    assert _prr.PORTFOLIO_ROI_SCHEMA_VERSION == 6
     view = _prr.read_portfolio_roi_report(run.json_path)
-    assert view.schema_version == 5
+    assert view.schema_version == 6
     assert view.roi_accounting_status == "OK"
     assert view.realised_pnl_accounting_total == Decimal("-2.63")
     assert view.fill_pnl is not None and len(view.fill_pnl) == 34

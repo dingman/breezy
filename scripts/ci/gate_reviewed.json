@@ -258,6 +258,7 @@
     "tests/unit/test_polymarket_us_write_sequence.py",
     "tests/unit/test_polymarket_us_write_signing_probe.py",
     "tests/unit/test_polymarket_us_write_transport.py",
+    "tests/unit/test_portfolio_roi_decision.py",
     "tests/unit/test_preflight_memo.py",
     "tests/unit/test_pyo3_network_block.py",
     "tests/unit/test_quote_tape_ingest_bounded_read.py",

@@ -863,6 +863,7 @@
   "tests/unit/test_polymarket_us_write_signing_probe.py": 45,
   "tests/unit/test_polymarket_us_write_transport.py": 21710,
   "tests/unit/test_portfolio_roi_alert_env.py": 4,
+  "tests/unit/test_portfolio_roi_decision.py": 520,
   "tests/unit/test_portfolio_roi_deploy.py": 627,
   "tests/unit/test_portfolio_roi_report.py": 18813,
   "tests/unit/test_portfolio_roi_run_no_input.py": 217,
