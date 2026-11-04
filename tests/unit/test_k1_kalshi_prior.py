@@ -577,7 +577,14 @@ def test_importing_the_module_opens_no_connection(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(urllib.request, "urlopen", explode)
     monkeypatch.setattr("socket.create_connection", explode)
-    importlib.reload(kp)
+    try:
+        importlib.reload(kp)
+    finally:
+        # The reload rebinds `kp.urlopen` (imported by name) to `explode`; monkeypatch only
+        # restores urllib.request, so re-run the import against the real names to keep the
+        # module global state hermetic for every later test (e.g. kalshi_s0 test_h8).
+        monkeypatch.undo()
+        importlib.reload(kp)
 
 
 def test_no_http_client_object_exists_at_module_scope() -> None:
