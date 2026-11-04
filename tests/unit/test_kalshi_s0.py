@@ -951,3 +951,178 @@ def test_l6_antievasion_checker_has_positive_control(snippet: str) -> None:
 def test_l6_no_runtime_built_write_method_names() -> None:
     tree = ast.parse((ROOT / "scripts/analysis/kalshi_s0.py").read_text())
     assert _write_name_reconstructions(tree) == []
+
+
+# Synthetic stand-in for the historical market key set. Instants are chosen so
+# settlement_ts is the earliest parsed bound; .999999 pins truncation (not round).
+_ISO_SETTLEMENT = "2025-08-01T16:00:00.999999Z"
+_ISO_SETTLEMENT_EPOCH = 1754064000
+_OTHER_EPOCH = 1754067600
+_HISTORICAL_MARKET_KEYS = (
+    "can_close_early",
+    "close_time",
+    "created_time",
+    "early_close_condition",
+    "event_ticker",
+    "exchange_index",
+    "expected_expiration_time",
+    "expiration_time",
+    "expiration_value",
+    "floor_strike",
+    "last_price_dollars",
+    "latest_expiration_time",
+    "market_type",
+    "no_ask_dollars",
+    "no_bid_dollars",
+    "no_sub_title",
+    "notional_value_dollars",
+    "open_interest_fp",
+    "open_time",
+    "previous_price_dollars",
+    "previous_yes_ask_dollars",
+    "previous_yes_bid_dollars",
+    "price_level_structure",
+    "price_ranges",
+    "result",
+    "rules_primary",
+    "rules_secondary",
+    "settlement_bounds_type",
+    "settlement_timer_seconds",
+    "settlement_ts",
+    "settlement_value_dollars",
+    "status",
+    "strike_type",
+    "ticker",
+    "title",
+    "updated_time",
+    "volume_24h_fp",
+    "volume_fp",
+    "yes_ask_dollars",
+    "yes_ask_size_fp",
+    "yes_bid_dollars",
+    "yes_bid_size_fp",
+    "yes_sub_title",
+)
+
+
+def _historical_market(**overrides: Any) -> dict[str, Any]:
+    """Historical market shape: real key set, synthetic values, no network."""
+    market: dict[str, Any] = {
+        "can_close_early": False,
+        "close_time": "2025-08-02T00:00:00Z",
+        "created_time": "2025-07-15T00:00:00.100000Z",
+        "early_close_condition": "synthetic",
+        "event_ticker": "KXHIGHNY-25AUG01",
+        "exchange_index": 1,
+        "expected_expiration_time": "2025-08-02T18:00:00Z",
+        "expiration_time": "2025-08-03T00:00:00Z",
+        "expiration_value": "synthetic-unset",
+        "floor_strike": 70,
+        "last_price_dollars": "9.9999",
+        "latest_expiration_time": "2025-08-04T00:00:00Z",
+        "market_type": "binary",
+        "no_ask_dollars": "9.9999",
+        "no_bid_dollars": "9.9999",
+        "no_sub_title": "synthetic no",
+        "notional_value_dollars": "9.9999",
+        "open_interest_fp": "1.00",
+        "open_time": "2025-08-01T12:00:00Z",
+        "previous_price_dollars": "9.9999",
+        "previous_yes_ask_dollars": "9.9999",
+        "previous_yes_bid_dollars": "9.9999",
+        "price_level_structure": "synthetic",
+        "price_ranges": [{"start": "0.2000", "end": "0.8000", "step": "0.0500"}],
+        "result": "no",
+        "rules_primary": "synthetic primary",
+        "rules_secondary": "synthetic secondary",
+        "settlement_bounds_type": "synthetic",
+        "settlement_timer_seconds": 900,
+        "settlement_ts": _ISO_SETTLEMENT,
+        "settlement_value_dollars": "synthetic",
+        "status": "finalized",
+        "strike_type": "greater",
+        "ticker": "KXHIGHNY-25AUG01-T70",
+        "title": "synthetic title",
+        "updated_time": "2025-08-04T00:00:00.100000Z",
+        "volume_24h_fp": "1.00",
+        "volume_fp": "1.00",
+        "yes_ask_dollars": "9.9999",
+        "yes_ask_size_fp": "1.00",
+        "yes_bid_dollars": "9.9999",
+        "yes_bid_size_fp": "1.00",
+        "yes_sub_title": "synthetic yes",
+    }
+    market.update(overrides)
+    return market
+
+
+def test_market_row_accepts_iso_settlement_ts() -> None:
+    market = _historical_market()
+    assert tuple(sorted(market)) == _HISTORICAL_MARKET_KEYS
+    assert isinstance(market["settlement_ts"], str)
+    row = s._market_row(_client({"candlesticks": []}), market, "KXHIGHNY")
+    assert row["settlement_ts"] == _ISO_SETTLEMENT_EPOCH
+    assert row["open_time"] == "2025-08-01T12:00:00Z"
+    assert row["candle_status"] == "success"
+    assert row["candlesticks"] == []
+
+
+def test_market_row_accepts_int_settlement_ts() -> None:
+    market = _historical_market(settlement_ts=_ISO_SETTLEMENT_EPOCH)
+    assert type(market["settlement_ts"]) is int
+    row = s._market_row(_client({"candlesticks": []}), market, "KXHIGHNY")
+    iso = s._market_row(_client({"candlesticks": []}), _historical_market(), "KXHIGHNY")
+    assert row == iso
+    assert row["settlement_ts"] == _ISO_SETTLEMENT_EPOCH
+
+
+def test_market_row_rejects_malformed_settlement_ts() -> None:
+    for garbage in ("", "not-a-timestamp", "1754064000", 1754064000.9, True):
+        market = _historical_market(settlement_ts=garbage)
+        with pytest.raises(s.PoisonedInput):
+            s._market_row(_client(), market, "KXHIGHNY")
+
+
+@pytest.mark.parametrize("field", ["open_time", "close_time", "expiration_time", "settlement_time"])
+@pytest.mark.parametrize(
+    "raw", ["2025-08-01T17:00:00Z", "2025-08-01T17:00:00.999999Z", _OTHER_EPOCH]
+)
+def test_market_row_accepts_other_timestamp_fields(field: str, raw: str | int) -> None:
+    """Every other market timestamp the script reads, as ISO (Z, optional fraction) or int."""
+    market: dict[str, Any] = {
+        "ticker": "KXHIGHNY-25AUG01-T70",
+        "status": "finalized",
+        "result": "no",
+        "open_time": "2025-08-01T12:00:00Z",
+    }
+    stub = Stub({"candlesticks": []})
+    client = s.HostPinnedKalshi(stub)
+    if field == "open_time":
+        market["open_time"] = raw
+        market["settlement_ts"] = _ISO_SETTLEMENT_EPOCH
+    else:
+        market[field] = raw
+    row = s._market_row(client, market, "KXHIGHNY")
+    if field == "open_time":
+        assert row["open_time"] == raw
+        assert stub.calls[0][1]["start_ts"] == _OTHER_EPOCH
+        assert row["settlement_ts"] == _ISO_SETTLEMENT_EPOCH
+    else:
+        assert row["settlement_ts"] == _OTHER_EPOCH
+
+
+def test_market_row_keeps_zero_epoch_and_skips_blank_times() -> None:
+    base = {
+        "ticker": "KXHIGHNY-25AUG01-T70",
+        "status": "finalized",
+        "result": "no",
+        "open_time": "2025-08-01T12:00:00Z",
+    }
+    zero = s._market_row(_client({"candlesticks": []}), {**base, "close_time": 0}, "KXHIGHNY")
+    assert zero["settlement_ts"] == 0
+    blank = s._market_row(
+        _client({"candlesticks": []}),
+        {**base, "close_time": "", "settlement_ts": _ISO_SETTLEMENT_EPOCH},
+        "KXHIGHNY",
+    )
+    assert blank["settlement_ts"] == _ISO_SETTLEMENT_EPOCH

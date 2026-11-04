@@ -12,10 +12,9 @@ file, hard-links it without replace, then unlinks the temporary name, so it
 cannot clobber another writer. The single look is a fixed `.S0.look` directory
 reserved before outcome access (any date); a failed calculation keeps it.
 
-P-0 provenance: K1's tests label their historical/live fixtures as captured
-venue responses (e97f3929); the LAX market fixture (780a46b2) has no provenance
-header and is UNVERIFIED; s0_cases.json is hand-written synthetic. No fixture
-establishes boundary-tick inclusion; no network probe was made. Resolve before S3a.
+P-0 resolved 2026-11-04 by a 4-GET unauthenticated probe on KXHIGHLAX-26JAN15-B77.5
+(historical candlesticks, period 60): end_period_ts multiples of 3600, step 3600,
+first end = open_time + 3600 (bucket END) - consistent with _check_first_hour.
 """
 
 from __future__ import annotations
@@ -281,8 +280,16 @@ def local_time(ts: int, series: str) -> dt.datetime:
     return dt.datetime.fromtimestamp(ts, dt.timezone(dt.timedelta(hours=station_offset(series)[1])))
 
 
-def timestamp(value: str) -> int:
-    parsed = dt.datetime.fromisoformat(value)
+def timestamp(value: object) -> int:
+    """Epoch seconds. Integers pass through; ISO-8601 strings use int(datetime.timestamp())."""
+    if type(value) is int:
+        return value
+    if not isinstance(value, str):
+        raise PoisonedInput("timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        raise PoisonedInput("timestamp") from None
     if parsed.tzinfo is None:
         raise PoisonedInput("timezone required")
     return int(parsed.timestamp())
@@ -320,8 +327,13 @@ def reference_hours(row: Mapping[str, Any]) -> list[tuple[str, int]]:
     day = climate_day(row)
     midnight = dt.datetime.combine(day, dt.time(), dt.timezone(dt.timedelta(hours=offset)))
     base = int(midnight.timestamp())
-    timestamp(row["open_time"])
-    opened = dt.datetime.fromisoformat(row["open_time"])
+    raw_open = row["open_time"]
+    timestamp(raw_open)
+    opened = (
+        dt.datetime.fromtimestamp(raw_open, dt.UTC)
+        if type(raw_open) is int
+        else dt.datetime.fromisoformat(raw_open)
+    )
     whole = opened.replace(minute=0, second=0, microsecond=0)
     if opened != whole:
         whole += dt.timedelta(hours=1)
@@ -653,13 +665,14 @@ def _market_row(client: HostPinnedKalshi, market: Mapping[str, Any], series: str
     if market.get("series_ticker", series) != series:
         raise PoisonedInput("series identity mismatch")
     row.update(series_ticker=series, climate_day=climate_day(market).isoformat())
-    times = [
-        timestamp(market[k])
-        for k in ("settlement_time", "close_time", "expiration_time")
-        if market.get(k)
-    ]
+    times: list[int] = []
+    for key in ("settlement_time", "close_time", "expiration_time"):
+        raw = market.get(key)
+        # 0 is a real epoch. "" and None mean the field is absent.
+        if type(raw) is int or raw:
+            times.append(timestamp(raw))
     if market.get("settlement_ts") is not None:
-        times.append(int(market["settlement_ts"]))
+        times.append(timestamp(market["settlement_ts"]))
     if not times:
         raise PoisonedInput("settlement timestamp")
     row["settlement_ts"] = min(times)
