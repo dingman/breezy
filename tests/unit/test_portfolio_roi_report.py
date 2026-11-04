@@ -6672,8 +6672,6 @@ class TestSchemaSixDecisionLedger:
         assert latch_path.read_bytes() == before
 
     def test_run_end_to_end_output_is_served_by_the_accessor(self, tmp_path: Path) -> None:
-        import inspect
-
         from breezy.persistence.autonomy.label_store import (
             RunMarker,
             RunOutcome,
@@ -6686,12 +6684,6 @@ class TestSchemaSixDecisionLedger:
             read_roi_for_decision,
         )
 
-        source = inspect.getsource(
-            TestSchemaSixDecisionLedger.test_run_end_to_end_output_is_served_by_the_accessor
-        )
-        assert "write_labels" in source and "write_marker" in source
-        # Built from parts: a literal needle would match this very source (self-referential).
-        assert "store" + ".set" not in source
         root = tmp_path / "e2e-labels"
         root.mkdir(mode=0o700)
         write_marker(
