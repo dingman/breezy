@@ -359,6 +359,12 @@ Format per entry: Mistake / Prevention / Applied / Last updated. Headers are cit
 **Applied:** 2026-11-03
 **Last updated:** 2026-11-03
 
+### L-85 — Fixture shapes are not venue shapes; sweep the real listing before a one-shot fetch (2026-11-04)
+**Mistake:** A one-shot fetch built and gated on fixtures hit three real-API shape defects in sequence (ISO-8601 `settlement_ts`, 18 relisted duplicate tickers, off-hour opens), each costing a launch cycle.
+**Prevention:** Before any one-shot or long fetch, run an identity/shape sweep of the real listing endpoint and execute every per-row parse, identity and semantics check over it (outcome-blind) before launch; fixture-green is not launch-ready.
+**Applied:** 2026-11-04
+**Last updated:** 2026-11-04
+
 ## Absorbed index
 
 Every removed L-number resolves to its surviving entry above. Archived (full text in docs/core/archive/LESSONS-archive-2026-10-20.md): L-5, L-57, L-61. Full pre-consolidation text: docs/core/archive/LESSONS_full_pre-consolidation_2026-10-13.md.
