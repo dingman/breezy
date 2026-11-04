@@ -1,0 +1,73 @@
+{
+  "cells": {
+    "HIGH_post_cell": {
+      "adequate": true,
+      "bootstrap": [
+        -0.00844310035842294,
+        0.008663101604278075
+      ],
+      "days": 248,
+      "n": 814,
+      "observations": 911,
+      "pooled_mean": "-0.002294182217343578485181119649",
+      "weighted_mean": "0.0008190008190008190008190008194",
+      "wilson": [
+        0.9689840497104227,
+        0.9874658264549481
+      ]
+    },
+    "HIGH_pre_cell": {
+      "adequate": true,
+      "bootstrap": [
+        -0.0046659341519604556,
+        0.0018916203200930223
+      ],
+      "days": 365,
+      "n": 4269,
+      "observations": 10612,
+      "pooled_mean": "-0.002636637768563889935921598191",
+      "weighted_mean": "-0.001266904817677832435386897773",
+      "wilson": [
+        0.9752778767357597,
+        0.9808403960711851
+      ]
+    },
+    "LOW_post_cell": {
+      "adequate": true,
+      "bootstrap": [
+        -0.024350178890876564,
+        -0.005809964047252183
+      ],
+      "days": 198,
+      "n": 1183,
+      "observations": 1678,
+      "pooled_mean": "-0.01644815256257449344457687723",
+      "weighted_mean": "-0.01451732882502113271344040575",
+      "wilson": [
+        0.9562438443724469,
+        0.9736892309464809
+      ]
+    },
+    "LOW_pre_cell": {
+      "adequate": true,
+      "bootstrap": [
+        -0.019181741277053087,
+        -0.006017163955527287
+      ],
+      "days": 200,
+      "n": 2334,
+      "observations": 8238,
+      "pooled_mean": "-0.01591284292303957271182325807",
+      "weighted_mean": "-0.01240100540229074933445113393",
+      "wilson": [
+        0.9609798841601769,
+        0.9689093934111275
+      ]
+    }
+  },
+  "classification": "SEARCH; alpha unspent",
+  "decision": "KILL",
+  "intervals": "descriptive only",
+  "next_action": "STOP",
+  "prereg_sha": "2073860f93d78225928bc44deb3f86c2bdeecad8839e8b1da57aa478a0fdd18f"
+}
