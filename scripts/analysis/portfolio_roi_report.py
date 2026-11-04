@@ -398,7 +398,8 @@ def read_ledger_fills_with_counts(source_path: Path) -> LedgerReadResult | None:
             n_undecodable += 1
             continue
     open_anchors: int | None = None
-    if anchor_control_ok and epoch_times:
+    # Without decoded anchors, the anchor writer is not proven live (including at K=1).
+    if anchor_control_ok and epoch_times and anchors:
         epoch_ns = min(epoch_times)
         control_passes = all(
             fill.client_order_id in anchors

@@ -6246,8 +6246,13 @@ def _anchor_case(case: str) -> tuple[list[tuple[str, bytes]], int | None]:
     epoch = _epoch_bytes(50)
     if case == "no_epoch":
         return [], None
+    if case == "no_epoch_with_anchor":
+        return [_anchor_bytes("client-a", 100)], None
     if case == "no_anchors":
-        return [epoch], 0
+        return [epoch], None
+    if case == "pre_epoch_buy_without_anchor":
+        fill = _fill(venue_order_id="vo", order_side="BUY", ts_event=40)
+        return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], None
     if case == "filled_older":
         fill = _fill(venue_order_id="vo", ts_event=300)
         return [
@@ -6279,8 +6284,15 @@ def _anchor_case(case: str) -> tuple[list[tuple[str, bytes]], int | None]:
     if case == "post_epoch_buy_without_anchor":
         fill = _fill(venue_order_id="vo", order_side="BUY", ts_event=100)
         return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], None
+    if case == "post_epoch_buy_missing_among_anchors":
+        fill = _fill(venue_order_id="vo", order_side="BUY", ts_event=100)
+        return [
+            epoch,
+            _anchor_bytes("client-other", 75),
+            (_FILL_KEY_PREFIX + "vo", fill.to_bytes()),
+        ], None
     fill = _fill(venue_order_id="vo", order_side="SELL", ts_event=100)
-    return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], 0
+    return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], None
 
 
 class TestSchemaSixDecisionLedger:
@@ -6344,12 +6356,15 @@ class TestSchemaSixDecisionLedger:
         [
             "no_anchors",
             "no_epoch",
+            "no_epoch_with_anchor",
+            "pre_epoch_buy_without_anchor",
             "filled_older",
             "armed_after",
             "no_fill_for_coid",
             "no_fills_counts_all",
             "undecodable",
             "post_epoch_buy_without_anchor",
+            "post_epoch_buy_missing_among_anchors",
             "sell_fill_without_anchor",
         ],
     )
