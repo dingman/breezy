@@ -19,7 +19,6 @@ never the real `~/.local/share`.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import json
 import re
 import sys
@@ -65,10 +64,13 @@ _prr = _load_module()
 
 
 @pytest.fixture(autouse=True)
-def _consumable_label_marker(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+def _consumable_label_marker(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AUT-2 WP6: the full report is gated on the newest label-run marker. Every test that predates
     the gate runs against a root holding a consumable (fresh, clean) marker; the gate's own tests
-    below point the root elsewhere. The marker is dated far ahead so no test clock makes it stale."""
+    below point the root elsewhere. The marker is dated far ahead so no test clock
+    makes it stale."""
     from breezy.persistence.autonomy.label_store import RunMarker, RunOutcome, write_marker
 
     root = tmp_path_factory.mktemp("labels_root")
@@ -249,6 +251,7 @@ def _report_data(
     # dynamically-loaded class in this file (e.g. `AttributedFill`,
     # `BalancePoint`) is never used as an annotation for.
     return PortfolioRoiReportData(
+        label_gate_status=None,
         period_start="2026-01-01",
         period_end="2026-01-10",
         n_fills=n_fills,
@@ -287,7 +290,7 @@ class TestJsonSchemaVersion:
 
         raw = json.loads(path.read_text())
         # Stage C3 bumps this to 2 (the per-trial `trial_rows` breakdown).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 6
         # D6: the JSON is PRIVATE, mode 0600.
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -427,7 +430,7 @@ class TestPerTrialPnlBreakdown:
         write_portfolio_roi_json(path, data)
         raw = json.loads(path.read_text())
 
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 6
         assert raw["trial_rows"] == [
             {
                 "trial_id": "fam_a/trial/1",
@@ -2238,7 +2241,7 @@ class TestAdditiveSchemaFieldBackwardCompat:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 6
         assert view.n_family_station_refusals == 0
 
     def test_the_journal_line_carries_the_new_dimensionless_count(self) -> None:
@@ -2299,7 +2302,7 @@ class TestF1CumulativeReconciliationReachesTheArtefact:
         ]
         # These fields are additive-within-version (D7); the schema_version
         # bump to 2 is unrelated (Stage C3's `trial_rows` field).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 6
 
         view = read_portfolio_roi_report(path)
         assert view.settled_cumulative_passes is False
@@ -3516,7 +3519,8 @@ class TestResidualSettlementCash:
             "2026-09-20": Decimal("105.00"),  # unexplained by any fill or proceeds
         }
         pending = ResidualPending(
-            trial_id="fam/trial/LAX/2026-09-13", release_day="2026-09-14"
+            trial_id="fam/trial/LAX/2026-09-13", release_day="2026-09-14",
+            climate_day="2026-09-13",
         )
 
         without_pending = reconcile_daily(
@@ -4343,7 +4347,9 @@ class TestResidualPnlAndD9:
         trial = _filled_trial(
             trial_id="fam/trial/LAX/2026-09-14", scheduled_release_day="2026-09-14"
         )
-        pending = ResidualPending(trial_id=trial.trial_id, release_day="2026-09-14")
+        pending = ResidualPending(
+            trial_id=trial.trial_id, release_day="2026-09-14", climate_day=trial.climate_day
+        )
         now_ns = _ns_of_day("2026-09-25")
 
         # No ResidualSettlement exists for this trial (it is still
@@ -4483,7 +4489,7 @@ class TestResidualPnlAndD9:
         write_portfolio_roi_json(path, data)
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 6
         assert view.realised_pnl_residual_total == Decimal("0.30")
         assert view.realised_pnl_portfolio_total == Decimal("0.87")
 
@@ -5147,12 +5153,14 @@ class TestFu13bNetOfExternalFlowReconciliation:
             total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), fills=[]
         )
         data_without = build_portfolio_roi_report_data(
+            label_gate_status=None,
             period_start="2026-09-11", period_end="2026-09-13", fill_buckets={},
             total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), baselines=baselines,
             cumulative=cumulative_without, settled_through_statistic="max", lag_sample_n=0,
             permanently_unsettled=(),
         )
         data_with = build_portfolio_roi_report_data(
+            label_gate_status=None,
             period_start="2026-09-11", period_end="2026-09-13", fill_buckets={},
             total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), baselines=baselines,
             cumulative=cumulative_with, settled_through_statistic="max", lag_sample_n=0,
@@ -5233,7 +5241,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
     def test_fu13b_schema_version_stays_3_and_reader_accepts_old_v3(
         self, tmp_path: Path
     ) -> None:
-        assert PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 6
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, _report_data())
         raw = json.loads(path.read_text())
@@ -5255,7 +5263,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 5
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 6
         assert view.external_flow_evidence_status == STATUS_NOT_CONFIGURED
         assert view.n_windows_not_covered == 0
         assert view.settled_cumulative_passes_net is True
@@ -5758,7 +5766,9 @@ class TestLabelGate:
         with pytest.raises(_prr.UnsettledCapitalRoiError):
             _ = view.roi
 
-    def test_a_labelled_fq_fill_is_not_unlabelled_and_the_report_is_ok(self, tmp_path: Path) -> None:
+    def test_a_labelled_fq_fill_is_not_unlabelled_and_the_report_is_ok(
+        self, tmp_path: Path
+    ) -> None:
         from breezy.persistence.autonomy.label_store import write_labels
 
         root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
@@ -5816,7 +5826,9 @@ class TestLabelGate:
                 labels_data_root=root,
             )
             assert code == 0
-            got = json.loads((out / "derived" / "PRIVATE_portfolio_roi_2026-10-04.json").read_text())
+            got = json.loads(
+                (out / "derived" / "PRIVATE_portfolio_roi_2026-10-04.json").read_text()
+            )
             assert got["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY
 
     def test_an_unreadable_marker_gates_identity_never_ok(self, tmp_path: Path) -> None:
@@ -5827,7 +5839,9 @@ class TestLabelGate:
 
         assert _report(tmp_path, "2026-10-04")["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY
 
-    def test_the_default_labels_root_is_env_then_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_the_default_labels_root_is_env_then_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         monkeypatch.setenv("BREEZY_LABELS_DATA_ROOT", str(tmp_path / "x"))
         assert _prr._default_labels_data_root() == tmp_path / "x"
         monkeypatch.delenv("BREEZY_LABELS_DATA_ROOT")
@@ -5877,7 +5891,11 @@ class TestPnlUnionAndNetFlag:
             _prr,
             "read_filled_trials_state_db",
             _stub_reader(
-                {("fam_a/trial/", "LAX"): ((), {"fam_a/trial/LAX/2026-09-01": (True, "vo-a", False)})}
+                {
+                    ("fam_a/trial/", "LAX"): (
+                        (), {"fam_a/trial/LAX/2026-09-01": (True, "vo-a", False)}
+                    )
+                }
             ),
         )
         root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
@@ -5944,6 +5962,7 @@ class TestPnlUnionAndNetFlag:
                 base, settled_cumulative_passes=raw, settled_cumulative_passes_net=net
             )
             return _prr.build_portfolio_roi_report_data(
+                label_gate_status=None,
                 period_start="2026-10-01",
                 period_end="2026-10-03",
                 fill_buckets={},
@@ -5974,13 +5993,15 @@ class TestSchemaV4AndKeptUnsettledSignal:
 
     def _gated_data(self, *, unsettled: int) -> Any:
         return dataclasses.replace(
-            _report_data(unsettled_capital_positions=unsettled, max_days_past_horizon=4 * unsettled),
+            _report_data(
+                unsettled_capital_positions=unsettled, max_days_past_horizon=4 * unsettled
+            ),
             roi_status=_prr.ROI_STATUS_GATED_IDENTITY,
         )
 
-    def test_schema_version_is_five_and_every_prior_version_stays_readable(self) -> None:
-        assert PORTFOLIO_ROI_SCHEMA_VERSION == 5
-        assert _prr._KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS == frozenset({1, 2, 3, 4, 5})
+    def test_schema_version_is_six_and_every_prior_version_stays_readable(self) -> None:
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 6
+        assert _prr._KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS == frozenset({1, 2, 3, 4, 5, 6})
 
     def test_a_label_gated_v4_report_round_trips_with_null_roi_and_raises_on_access(
         self, tmp_path: Path
@@ -5991,8 +6012,8 @@ class TestSchemaV4AndKeptUnsettledSignal:
         raw = json.loads(path.read_text())
         view = read_portfolio_roi_report(path)
 
-        assert raw["schema_version"] == 5 and raw["roi"] is None
-        assert view.schema_version == 5
+        assert raw["schema_version"] == 6 and raw["roi"] is None
+        assert view.schema_version == 6
         for name in ("roi", "roi_minus_b0", "roi_minus_b1"):
             with pytest.raises(_prr.UnsettledCapitalRoiError):
                 getattr(view, name)
@@ -6090,3 +6111,637 @@ class TestBalanceLinesAreStreamedFromNodeLogs:
 
     def test_a_missing_logs_dir_yields_no_lines(self, tmp_path: Path) -> None:
         assert _prr.read_balance_lines(tmp_path / "absent") == []
+
+
+# --------------------------------------------------------------------------
+# AUD-04 r2.4: schema 6 decision stats, freshness-before-write, anchor count.
+# --------------------------------------------------------------------------
+
+_V6_JSON_KEYS = (
+    "generated_at",
+    "days_since_newest_input",
+    "input_freshness_status",
+    "n_open_anchors_without_fill",
+    "label_gate_status",
+    "family_decision_stats",
+)
+
+
+def _decision_build(**over: Any) -> Any:
+    cumulative = cumulative_reconciliation(daily_rows=(), settled_through="2026-10-27")
+    baselines = roi_against_baselines(
+        total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), fills=[]
+    )
+    kwargs: dict[str, Any] = {
+        "period_start": "2026-10-01",
+        "period_end": "2026-11-04",
+        "fill_buckets": {},
+        "total_realised_pnl": Decimal(0),
+        "total_capital_deployed": Decimal(0),
+        "baselines": baselines,
+        "cumulative": cumulative,
+        "settled_through_statistic": "max",
+        "lag_sample_n": 0,
+        "permanently_unsettled": (),
+        "generated_at_ns": 1_700_000_000_500_000_000,
+        "label_gate_status": None,
+        "days_since_newest_input": 1,
+        "n_open_anchors_without_fill": 0,
+        "family_decision_stats": (),
+    }
+    kwargs.update(over)
+    return build_portfolio_roi_report_data(**kwargs)
+
+
+def _pnl_fill(
+    *,
+    family_id: str,
+    source: Any,
+    cli: Any | None = None,
+    coid: str = "c",
+) -> Any:
+    return acct.FillPnlRow(
+        fill_key=f"k-{coid}",
+        client_order_id=coid,
+        instrument_id="LAX-92-94.POLYMARKET_US",
+        climate_day="2026-06-01",
+        family_id=family_id,
+        source=source,
+        status=acct.FillStatus.SETTLED_NWS_IMPLIED,
+        attribution_basis=acct.Basis.C1_DECISION,
+        win=True,
+        payout=Decimal(1),
+        cost=Decimal("0.40"),
+        fee=Decimal("0.03"),
+        net=Decimal("0.57"),
+        fee_unverified=False,
+        booked_tmax_f=90,
+        cli_final_check=acct.CliCheck.AGREE if cli is None else cli,
+        cli_final_net=Decimal("0.57"),
+        entry_ask_known=True,
+    )
+
+
+def _stats(**kwargs: Any) -> tuple[Any, ...]:
+    base: dict[str, Any] = {
+        "admissible_trials": (),
+        "c2_rows": (),
+        "residual_settlements": (),
+        "residual_pending": (),
+        "fee_reconciled_by_trial_id": {},
+        "fill_rows": (),
+        "registered_manifests": (),
+    }
+    base.update(kwargs)
+    rows: tuple[Any, ...] = _prr.family_decision_stats(**base)
+    return rows
+
+
+def _manifest(family_id: str, prefix: str) -> FamilyManifest:
+    return _family_manifest(
+        family_id=family_id,
+        trial_id_prefix=prefix,
+        d0_climate_day="2026-01-01",
+        terminal_climate_day="2026-12-31",
+    )
+
+
+def _ledger(tmp_path: Path, rows: list[tuple[str, bytes]]) -> Path:
+    path = tmp_path / "anchors.db"
+    store = SqliteStateStore(path)
+    try:
+        for key, value in rows:
+            store.set(key, value)
+    finally:
+        store.close()
+    return path
+
+
+def _epoch_bytes(boot_ts: int) -> tuple[str, bytes]:
+    from breezy.runtime.exec_par_records import EPOCH_KEY_PREFIX, EpochRow, encode_record
+
+    record = EpochRow(commit_sha="abc", effective_k=1, force_reason=None, boot_ts=boot_ts)
+    return f"{EPOCH_KEY_PREFIX}boot", encode_record(record)
+
+
+def _anchor_bytes(coid: str, arm_ns: int) -> tuple[str, bytes]:
+    from breezy.runtime.exec_par_records import EXEC_PAR_PREFIX, OrderAnchor, encode_record
+
+    record = OrderAnchor(
+        client_order_id=coid,
+        slug="slug",
+        day="2026-10-01",
+        arm_ns=arm_ns,
+        decision_ask="0.40",
+        qty="1",
+        notional="0.40",
+        window_start_ns=arm_ns,
+        attribution="event_time",
+        station="LAX",
+    )
+    return f"{EXEC_PAR_PREFIX}order/{coid}", encode_record(record)
+
+
+def _anchor_case(case: str) -> tuple[list[tuple[str, bytes]], int | None]:
+    epoch = _epoch_bytes(50)
+    if case == "no_epoch":
+        return [], None
+    if case == "no_anchors":
+        return [epoch], 0
+    if case == "filled_older":
+        fill = _fill(venue_order_id="vo", ts_event=300)
+        return [
+            epoch,
+            _anchor_bytes("client-vo", 100),
+            (_FILL_KEY_PREFIX + "vo", fill.to_bytes()),
+        ], 0
+    if case == "armed_after":
+        fill = _fill(venue_order_id="vo", ts_event=300)
+        return [
+            epoch,
+            _anchor_bytes("client-vo", 400),
+            (_FILL_KEY_PREFIX + "vo", fill.to_bytes()),
+        ], 1
+    if case == "no_fill_for_coid":
+        fill = _fill(venue_order_id="vo", ts_event=300)
+        return [
+            epoch,
+            _anchor_bytes("client-other", 100),
+            _anchor_bytes("client-vo", 200),
+            (_FILL_KEY_PREFIX + "vo", fill.to_bytes()),
+        ], 1
+    if case == "no_fills_counts_all":
+        return [epoch, _anchor_bytes("client-a", 100), _anchor_bytes("client-b", 200)], 2
+    if case == "undecodable":
+        from breezy.runtime.exec_par_records import EXEC_PAR_PREFIX
+
+        return [epoch, (f"{EXEC_PAR_PREFIX}order/bad", b"nope")], None
+    if case == "post_epoch_buy_without_anchor":
+        fill = _fill(venue_order_id="vo", order_side="BUY", ts_event=100)
+        return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], None
+    fill = _fill(venue_order_id="vo", order_side="SELL", ts_event=100)
+    return [epoch, (_FILL_KEY_PREFIX + "vo", fill.to_bytes())], 0
+
+
+class TestSchemaSixDecisionLedger:
+    def test_v6_json_carries_utc_generated_at_from_now_ns(self) -> None:
+        now_ns = 1_700_000_000_500_000_000
+        raw = _portfolio_roi_json_dict(_decision_build(generated_at_ns=now_ns))
+
+        expected = datetime.fromtimestamp(now_ns // 1_000_000_000, tz=UTC).isoformat()
+        assert raw["generated_at"] == expected
+        assert str(raw["generated_at"]).endswith("+00:00")
+        assert raw["schema_version"] == 6
+
+    @pytest.mark.parametrize("age", ["null", "fresh", "four"])
+    def test_freshness_is_computed_before_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age: str
+    ) -> None:
+        now_ns = _ns_of_day("2026-10-04")
+        fills: list[Any] = []
+        if age == "fresh":
+            fills.append(_fill(venue_order_id="vo", ts_event=now_ns - _prr._NS_PER_DAY))
+        elif age == "four":
+            fills.append(_fill(venue_order_id="vo", ts_event=now_ns - 4 * _prr._NS_PER_DAY))
+        store_path = tmp_path / "led.db"
+        store = SqliteStateStore(store_path)
+        try:
+            for fill in fills:
+                store.set(f"{_FILL_KEY_PREFIX}{fill.venue_order_id}", fill.to_bytes())
+        finally:
+            store.close()
+        seen: dict[str, Any] = {}
+        real_write = _prr.write_portfolio_roi_json
+        real_ladder = _prr.apply_freshness_ladder
+
+        def spy_write(path: Path, data: Any) -> None:
+            seen["days"] = data.days_since_newest_input
+            seen["status"] = data.input_freshness_status
+            real_write(path, data)
+
+        def spy_ladder(**kwargs: Any) -> Any:
+            seen["ladder_days"] = kwargs["days_since_newest_input"]
+            return real_ladder(**kwargs)
+
+        monkeypatch.setattr(_prr, "write_portfolio_roi_json", spy_write)
+        monkeypatch.setattr(_prr, "apply_freshness_ladder", spy_ladder)
+        root = _marker_root(tmp_path, marker={}, now_ns=now_ns - _NS_PER_H)
+
+        assert _full_run(tmp_path, store_path, root, now_ns) == 0
+
+        report = _report(tmp_path, "2026-10-04")
+        assert report["days_since_newest_input"] == seen["days"] == seen["ladder_days"]
+        if age == "null":
+            assert seen["days"] is None and seen["status"] == "STALE"
+        elif age == "fresh":
+            assert seen["days"] == 1 and seen["status"] == "OK"
+        else:
+            assert seen["days"] == 4 and seen["status"] == "STALE"
+        assert report["input_freshness_status"] == seen["status"]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "no_anchors",
+            "no_epoch",
+            "filled_older",
+            "armed_after",
+            "no_fill_for_coid",
+            "no_fills_counts_all",
+            "undecodable",
+            "post_epoch_buy_without_anchor",
+            "sell_fill_without_anchor",
+        ],
+    )
+    def test_n_open_anchors_without_fill(self, tmp_path: Path, case: str) -> None:
+        rows, expected = _anchor_case(case)
+
+        result = read_ledger_fills_with_counts(_ledger(tmp_path, rows))
+
+        assert result is not None
+        assert result.n_open_anchors_without_fill == expected
+
+    def test_family_decision_stats_use_admissible_rows_and_sum_to_the_numerator(self) -> None:
+        from tests.support.aut2_fixtures import make_label_row
+
+        manifest = _manifest("fam_a", "fam_a/")
+        kept = _scored_trial(trial_id="fam_a/t1", pnl=Decimal("0.10"), fee=Decimal("0.03"))
+        residual = _scored_trial(trial_id="fam_a/res", pnl=Decimal(9))
+        admissible = admissible_scored_trials(
+            (kept, residual), residual_trial_ids=frozenset({residual.trial_id})
+        )
+        c2 = make_label_row(
+            family_id="fam_a",
+            realized_pnl=Decimal("0.57"),
+            fee_reconciled=Decimal("0.03"),
+            trial_id="c2/t",
+            client_order_id="c2",
+            label_id="b" * 32,
+        )
+        skipped = make_label_row(
+            family_id="fam_a",
+            admissible=False,
+            realized_pnl=Decimal(5),
+            trial_id="c2/skip",
+            client_order_id="skip",
+            label_id="c" * 32,
+        )
+
+        rows = _stats(
+            admissible_trials=admissible,
+            c2_rows=(c2, skipped),
+            registered_manifests=(manifest,),
+            fee_reconciled_by_trial_id={kept.trial_id: (True, "vo", False)},
+        )
+
+        assert sum(row.net_pnl for row in rows) == Decimal("0.67")
+        assert (
+            sum(row.net_pnl for row in rows)
+            == total_realised_pnl_admissible(
+                (kept, residual), residual_trial_ids=frozenset({residual.trial_id})
+            )
+            + c2.realized_pnl
+        )
+        assert all(row.family_id != "UNKNOWN" for row in rows)
+        assert rows[0].n_admissible == 2
+
+    def test_yes_and_no_leg_net_pnl_signs_follow_held_and_settled_outcome(self) -> None:
+        from tests.support.aut2_fixtures import make_label_row
+
+        manifest = _manifest("fam_a", "fam_a/")
+        yes_win = _scored_trial(trial_id="fam_a/yes-win", pnl=Decimal("0.20"), held=True)
+        no_loss = _scored_trial(trial_id="fam_a/bucket^no-loss", pnl=Decimal("-0.15"), held=False)
+        no_win = _scored_trial(trial_id="fam_a/bucket^no-win", pnl=Decimal("0.05"), held=True)
+        c2_loss = make_label_row(
+            family_id="fam_a",
+            settled_outcome=False,
+            realized_pnl=Decimal("-0.04"),
+            trial_id="c2/no",
+            client_order_id="c2no",
+            label_id="d" * 32,
+        )
+
+        rows = _stats(
+            admissible_trials=(yes_win, no_loss, no_win),
+            c2_rows=(c2_loss,),
+            registered_manifests=(manifest,),
+            fee_reconciled_by_trial_id={
+                trial.trial_id: (True, "vo", False) for trial in (yes_win, no_loss, no_win)
+            },
+        )
+
+        assert yes_win.held is True and yes_win.pnl > 0
+        assert no_loss.held is False and no_loss.pnl < 0
+        assert rows[0].net_pnl == Decimal("0.06")
+        assert c2_loss.realized_pnl is not None
+        assert c2_loss.settled_outcome is False and c2_loss.realized_pnl < 0
+
+    def test_incomplete_c2_is_not_an_open_unlabelled_fill(self) -> None:
+        from tests.support.aut2_fixtures import make_label_row
+
+        incomplete = make_label_row(
+            family_id="fam_a",
+            realized_pnl=None,
+            trial_id="c2/open",
+            client_order_id="c-open",
+            label_id="e" * 32,
+        )
+        open_fill = _pnl_fill(
+            family_id=UNKNOWN_TRIAL_FAMILY_LABEL,
+            source=acct.PnlSource.NONE,
+            coid="open-fill",
+        )
+        open_fill = dataclasses.replace(open_fill, status=acct.FillStatus.OPEN, net=None)
+
+        rows = {row.family_id: row for row in _stats(c2_rows=(incomplete,), fill_rows=(open_fill,))}
+
+        assert rows["fam_a"].n_incomplete == 1
+        assert rows["fam_a"].n_admissible == 0
+        assert rows["fam_a"].net_pnl == Decimal(0)
+        assert "fam_a" not in {open_fill.family_id}
+
+    def test_per_family_fee_unverified(self) -> None:
+        from tests.support.aut2_fixtures import make_label_row
+
+        manifest = _manifest("fam_a", "fam_a/")
+        unverified = _scored_trial(trial_id="fam_a/u", pnl=Decimal("0.10"))
+        verified = _scored_trial(trial_id="fam_a/v", pnl=Decimal("0.10"))
+        c2 = make_label_row(
+            family_id="fam_a",
+            fee_reconciled=None,
+            realized_pnl=Decimal("0.20"),
+            trial_id="c2/fee",
+            client_order_id="c-fee",
+            label_id="f" * 32,
+        )
+
+        rows = _stats(
+            admissible_trials=(unverified, verified),
+            c2_rows=(c2,),
+            registered_manifests=(manifest,),
+            fee_reconciled_by_trial_id={verified.trial_id: (True, "vo", False)},
+        )
+
+        assert rows[0].n_fee_unverified == 2
+
+    def test_per_family_cli_disagree_splits_residual(self) -> None:
+        legacy = _pnl_fill(
+            family_id="fam_a", source=acct.PnlSource.LEGACY, cli=acct.CliCheck.DISAGREE
+        )
+        residual = _pnl_fill(
+            family_id="fam_a",
+            source=acct.PnlSource.RESIDUAL,
+            cli=acct.CliCheck.DISAGREE,
+            coid="r",
+        )
+
+        rows = _stats(fill_rows=(legacy, residual))
+
+        assert rows[0].n_settlement_disagree == 1
+        assert rows[0].n_residual_settlement_disagree == 1
+
+    def test_residual_block_sums_and_pending_climate_day(self) -> None:
+        manifest = _manifest("fam_a", "fam_a/")
+        settlement = ResidualSettlement(
+            trial_id="fam_a/s",
+            climate_day="2026-06-01",
+            payout=Decimal(1),
+            dated_at_ns=1,
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.30"),
+        )
+        pending = ResidualPending(
+            trial_id="fam_a/p", release_day="2026-06-02", climate_day="2026-06-01"
+        )
+
+        rows = _stats(
+            residual_settlements=(settlement,),
+            residual_pending=(pending,),
+            registered_manifests=(manifest,),
+        )
+
+        assert rows[0].n_residual == 2
+        assert rows[0].n_residual_pending == 1
+        assert rows[0].residual_pnl == total_realised_pnl_residual((settlement,))
+        assert rows[0].n_residual_fee_unverified == 2
+        assert pending.climate_day == "2026-06-01"
+
+    def test_partition_on_an_11_03_shaped_fixture(self) -> None:
+        from tests.support.aut2_fixtures import make_label_row
+
+        manifests = (
+            _manifest("pm_us_crh_cont", "cont/"),
+            _manifest("pm_us_crh_v4", "v4/"),
+            _manifest("pm_us_crh_v2", "v2/"),
+        )
+        c2 = []
+        fills = []
+        for index in range(4):
+            c2.append(
+                make_label_row(
+                    family_id="pm_us_crh_cont",
+                    realized_pnl=Decimal("0.10"),
+                    fee_reconciled=Decimal("0.01"),
+                    trial_id=f"c2/cont/{index}",
+                    client_order_id=f"cont-{index}",
+                    label_id=f"{index}" * 32,
+                )
+            )
+            fills.append(
+                _pnl_fill(
+                    family_id="pm_us_crh_cont", source=acct.PnlSource.C2, coid=f"cont-{index}"
+                )
+            )
+        for index in range(3):
+            c2.append(
+                make_label_row(
+                    family_id="pm_us_crh_v4",
+                    realized_pnl=Decimal("0.20"),
+                    fee_reconciled=Decimal("0.01"),
+                    trial_id=f"c2/v4/{index}",
+                    client_order_id=f"v4-{index}",
+                    label_id=("a" + str(index)) * 16,
+                )
+            )
+            fills.append(
+                _pnl_fill(family_id="pm_us_crh_v4", source=acct.PnlSource.C2, coid=f"v4-{index}")
+            )
+        settlements = (
+            ResidualSettlement(
+                trial_id="cont/r",
+                climate_day="2026-06-01",
+                payout=Decimal(1),
+                dated_at_ns=1,
+                settlement_basis="nws_final",
+                realised_pnl=Decimal("0.40"),
+            ),
+            ResidualSettlement(
+                trial_id="v2/r",
+                climate_day="2026-06-01",
+                payout=Decimal(1),
+                dated_at_ns=1,
+                settlement_basis="nws_final",
+                realised_pnl=Decimal("-0.10"),
+            ),
+        )
+        fills.append(
+            _pnl_fill(family_id="pm_us_crh_cont", source=acct.PnlSource.RESIDUAL, coid="cont-r")
+        )
+        fills.append(
+            _pnl_fill(family_id="pm_us_crh_v2", source=acct.PnlSource.RESIDUAL, coid="v2-r")
+        )
+
+        rows = {
+            row.family_id: row
+            for row in _stats(
+                c2_rows=tuple(c2),
+                residual_settlements=settlements,
+                fill_rows=tuple(fills),
+                registered_manifests=manifests,
+                fee_reconciled_by_trial_id={
+                    "cont/r": (True, "vo", False),
+                    "v2/r": (True, "vo", False),
+                },
+            )
+        }
+
+        assert (rows["pm_us_crh_cont"].n_admissible, rows["pm_us_crh_cont"].n_residual) == (4, 1)
+        assert rows["pm_us_crh_cont"].n_other_excluded == 0
+        assert (rows["pm_us_crh_v4"].n_admissible, rows["pm_us_crh_v4"].n_other_excluded) == (3, 0)
+        assert (rows["pm_us_crh_v2"].n_admissible, rows["pm_us_crh_v2"].n_residual) == (0, 1)
+        assert rows["pm_us_crh_v2"].n_other_excluded == 0
+        for row in rows.values():
+            n_p = row.n_admissible + row.n_incomplete + row.n_residual
+            assert row.n_fills_attributed == n_p + row.n_other_excluded
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            ("ok", None),
+            ("identity", "GATED_IDENTITY"),
+            ("unlabelled", "GATED_UNLABELLED_FQ"),
+            ("pending", "GATED_UNSETTLED_CAPITAL"),
+        ],
+    )
+    def test_label_gate_status_values_are_written(
+        self, tmp_path: Path, kind: str, expected: str | None
+    ) -> None:
+        from breezy.persistence.autonomy.label_store import RunOutcome, write_labels
+
+        marker: dict[str, Any] = {}
+        if kind == "identity":
+            marker["run_outcome"] = RunOutcome.FAILED_IDENTITY
+        elif kind == "pending":
+            marker["pending"] = 1
+        root = _marker_root(tmp_path, marker=marker, now_ns=_NOW_NS - _NS_PER_H)
+        if kind == "ok":
+            write_labels(root, "pm_us_crh_fq_v1", [_c2_row()], now_ns=_NOW_NS - _NS_PER_H)
+            store = _fq_store(tmp_path)
+        elif kind == "unlabelled":
+            store = _fq_store(tmp_path)
+        else:
+            store = _seed_unlabelled_store(tmp_path, 0)
+
+        _full_run(tmp_path, store, root, _NOW_NS)
+
+        assert _report(tmp_path, "2026-10-04")["label_gate_status"] == expected
+
+    def test_latch_is_unchanged_when_the_report_write_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now_ns = _ns_of_day("2026-10-04")
+        store_path = tmp_path / "led.db"
+        SqliteStateStore(store_path).close()
+        root = _marker_root(tmp_path, marker={}, now_ns=now_ns - _NS_PER_H)
+        latch_path = tmp_path / "derived" / "portfolio_roi" / _prr.INPUT_FRESHNESS_LATCH_FILENAME
+        latch_path.parent.mkdir(parents=True)
+        _ladder.write_latch_state(latch_path, _FRESH_LATCH)
+        before = latch_path.read_bytes()
+
+        def boom(path: Path, data: Any) -> None:
+            assert data.days_since_newest_input is None or isinstance(
+                data.days_since_newest_input, int
+            )
+            raise OSError("report write failed")
+
+        monkeypatch.setattr(_prr, "write_portfolio_roi_json", boom)
+
+        with pytest.raises(OSError, match="report write failed"):
+            _full_run(tmp_path, store_path, root, now_ns)
+
+        assert latch_path.read_bytes() == before
+
+    def test_run_end_to_end_output_is_served_by_the_accessor(self, tmp_path: Path) -> None:
+        import inspect
+
+        from breezy.persistence.autonomy.label_store import (
+            RunMarker,
+            RunOutcome,
+            write_labels,
+            write_marker,
+        )
+        from breezy.persistence.portfolio_roi_decision import (
+            FamilyDecisionStats,
+            RoiDecisionView,
+            read_roi_for_decision,
+        )
+
+        source = inspect.getsource(
+            TestSchemaSixDecisionLedger.test_run_end_to_end_output_is_served_by_the_accessor
+        )
+        assert "write_labels" in source and "write_marker" in source
+        # Built from parts: a literal needle would match this very source (self-referential).
+        assert "store" + ".set" not in source
+        root = tmp_path / "e2e-labels"
+        root.mkdir(mode=0o700)
+        write_marker(
+            root,
+            RunMarker(RunOutcome.LABELLED, 1, None, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+            day="2026-10-04",
+            now_ns=_NOW_NS - _NS_PER_H,
+        )
+        write_labels(root, "pm_us_crh_fq_v1", [_c2_row()], now_ns=_NOW_NS - _NS_PER_H)
+
+        assert _full_run(tmp_path, _fq_store(tmp_path), root, _NOW_NS) == 0
+
+        result = read_roi_for_decision(
+            tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-10-04.json",
+            datetime.fromtimestamp(_NOW_NS // 1_000_000_000, tz=UTC),
+        )
+        assert isinstance(result, RoiDecisionView)
+        assert isinstance(result.for_family("pm_us_crh_fq_v1"), FamilyDecisionStats)
+
+    def test_v5_reader_on_v6_output_parses_no_v6_key(self, tmp_path: Path) -> None:
+        path = tmp_path / "v6.json"
+        write_portfolio_roi_json(path, _decision_build())
+        raw = json.loads(path.read_text())
+
+        assert raw["schema_version"] == 6
+        view = read_portfolio_roi_report(path)
+        for key in _V6_JSON_KEYS:
+            assert key in raw
+            assert not hasattr(view, key)
+
+    def test_residual_settlement_sets_pending_climate_day(self) -> None:
+        trial = _filled_trial(trial_id="fam/t", scheduled_release_day="2026-09-14")
+
+        pending = residual_settlement(trial, None, now_ns=1)
+
+        assert isinstance(pending, ResidualPending)
+        assert pending.climate_day == trial.climate_day
+
+    def test_older_unfilled_anchor_counts_despite_a_newer_filled_anchor(
+        self, tmp_path: Path
+    ) -> None:
+        fill = _fill(venue_order_id="B", ts_event=300)
+        rows = [
+            _epoch_bytes(50),
+            _anchor_bytes("client-A", 100),
+            _anchor_bytes("client-B", 200),
+            (_FILL_KEY_PREFIX + "B", fill.to_bytes()),
+        ]
+
+        result = read_ledger_fills_with_counts(_ledger(tmp_path, rows))
+
+        assert result is not None
+        assert result.n_open_anchors_without_fill == 1

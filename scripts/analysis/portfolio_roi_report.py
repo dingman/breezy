@@ -107,8 +107,6 @@ from breezy.persistence.autonomy.label_store import (
     LabelRow,
     LabelStoreError,
     MarkerCorrupt,
-    RunMarker,
-    RunOutcome,
     labels_consumable,
     read_labels,
     read_newest_marker,
@@ -134,6 +132,11 @@ from breezy.persistence.family_manifest import (
     FamilyManifestError,
     load_family_manifest,
 )
+from breezy.persistence.portfolio_roi_decision import (
+    INPUT_FRESHNESS_OK,
+    INPUT_FRESHNESS_STALE,
+    FamilyDecisionStats,
+)
 from breezy.persistence.realized_draws import admissible_scored_trials
 from breezy.persistence.residual_fills import ExcludedFill, read_excluded_fills, residual_trial_ids
 from breezy.persistence.scored_trial_dedupe import (  # noqa: F401 - re-exported (TE-1 WP-A move)
@@ -147,6 +150,14 @@ from breezy.persistence.scored_trial_store import read_scored_trials, read_score
 from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime import alert_ladder
+from breezy.runtime.exec_par_records import (
+    EPOCH_KEY_PREFIX,
+    EXEC_PAR_PREFIX,
+    EpochRow,
+    ExecParRecordError,
+    OrderAnchor,
+    decode_record,
+)
 from breezy.runtime.health import (
     AlertPayload,
     AlertSink,
@@ -248,6 +259,7 @@ __all__ = [
     "days_since_newest_input",
     "enumerate_family_station_pairs",
     "exit_label_for_fill",
+    "family_decision_stats",
     "fee_reconciliation_label",
     "fill_side_label",
     "is_input_fresh",
@@ -323,6 +335,7 @@ class LedgerReadResult:
     fills: tuple[DurableFillRecord, ...]
     n_ledger_rows: int
     n_undecodable_ledger_rows: int
+    n_open_anchors_without_fill: int | None = None
 
 
 def read_ledger_fills_with_counts(source_path: Path) -> LedgerReadResult | None:
@@ -349,8 +362,34 @@ def read_ledger_fills_with_counts(source_path: Path) -> LedgerReadResult | None:
     fills: list[DurableFillRecord] = []
     n_ledger_rows = 0
     n_undecodable = 0
+    anchors: dict[str, OrderAnchor] = {}
+    epoch_times: list[int] = []
+    anchor_control_ok = True
     for key, value in rows:
-        if not isinstance(key, str) or not key.startswith(FILL_KEY_PREFIX):
+        if not isinstance(key, str):
+            continue
+        if key.startswith(EXEC_PAR_PREFIX + "order/"):
+            if not isinstance(value, bytes):
+                anchor_control_ok = False
+                continue
+            try:
+                anchor = decode_record(OrderAnchor, value)
+                if key != EXEC_PAR_PREFIX + "order/" + anchor.client_order_id:
+                    anchor_control_ok = False
+                anchors[anchor.client_order_id] = anchor
+            except ExecParRecordError:
+                anchor_control_ok = False
+            continue
+        if key.startswith(EPOCH_KEY_PREFIX):
+            if not isinstance(value, bytes):
+                anchor_control_ok = False
+                continue
+            try:
+                epoch_times.append(decode_record(EpochRow, value).boot_ts)
+            except ExecParRecordError:
+                anchor_control_ok = False
+            continue
+        if not key.startswith(FILL_KEY_PREFIX):
             continue
         n_ledger_rows += 1
         try:
@@ -358,8 +397,29 @@ def read_ledger_fills_with_counts(source_path: Path) -> LedgerReadResult | None:
         except ExecutionReportMappingError:
             n_undecodable += 1
             continue
+    open_anchors: int | None = None
+    if anchor_control_ok and epoch_times:
+        epoch_ns = min(epoch_times)
+        control_passes = all(
+            fill.client_order_id in anchors
+            for fill in fills
+            if fill.order_side == ORDER_SIDE_BUY and fill.ts_event >= epoch_ns
+        )
+        if control_passes:
+            fill_coids = {fill.client_order_id for fill in fills}
+            newest = max((fill.ts_event for fill in fills), default=None)
+            # No durable per-coid terminal-close evidence exists: unfilled anchors persist.
+            open_anchors = sum(
+                anchor.client_order_id not in fill_coids
+                or newest is None
+                or anchor.arm_ns > newest
+                for anchor in anchors.values()
+            )
     return LedgerReadResult(
-        fills=tuple(fills), n_ledger_rows=n_ledger_rows, n_undecodable_ledger_rows=n_undecodable
+        fills=tuple(fills),
+        n_ledger_rows=n_ledger_rows,
+        n_undecodable_ledger_rows=n_undecodable,
+        n_open_anchors_without_fill=open_anchors,
     )
 
 
@@ -830,6 +890,108 @@ def _family_label(
     return resolved
 
 
+def _empty_family_stats(family_id: str) -> FamilyDecisionStats:
+    return FamilyDecisionStats(
+        family_id=family_id,
+        n_admissible=0,
+        net_pnl=Decimal(0),
+        n_incomplete=0,
+        n_fee_unverified=0,
+        n_settlement_disagree=0,
+        n_residual=0,
+        n_residual_pending=0,
+        residual_pnl=Decimal(0),
+        n_residual_fee_unverified=0,
+        n_residual_settlement_disagree=0,
+        n_fills_attributed=0,
+        n_other_excluded=0,
+    )
+
+
+def family_decision_stats(
+    *,
+    admissible_trials: Iterable[ScoredTrial],
+    c2_rows: Iterable[LabelRow],
+    residual_settlements: Iterable[ResidualSettlement],
+    residual_pending: Iterable[ResidualPending],
+    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]],
+    fill_rows: Iterable[accounting.FillPnlRow],
+    registered_manifests: Sequence[FamilyManifest],
+) -> tuple[FamilyDecisionStats, ...]:
+    """Report-native statistics; accounting rows supply only refusal/partition counts."""
+    stats: dict[str, FamilyDecisionStats] = {}
+
+    def current(family_id: str) -> FamilyDecisionStats:
+        return stats.get(family_id, _empty_family_stats(family_id))
+
+    for trial in admissible_trials:
+        family_id = _family_id_of_trial(trial, registered_manifests)
+        row = current(family_id)
+        verified = fee_reconciled_by_trial_id.get(trial.trial_id, (False, "", False))[0]
+        stats[family_id] = replace(
+            row,
+            n_admissible=row.n_admissible + 1,
+            net_pnl=row.net_pnl + trial.pnl,
+            n_fee_unverified=row.n_fee_unverified + int(not verified),
+        )
+    for label in c2_rows:
+        if (
+            not label.admissible
+            or label.role.value != "entry"
+            or label.scorer_id == LEGACY_SCORER_ID
+        ):
+            continue
+        row = current(label.family_id)
+        complete = label.realized_pnl is not None
+        stats[label.family_id] = replace(
+            row,
+            n_admissible=row.n_admissible + int(complete),
+            n_incomplete=row.n_incomplete + int(not complete),
+            net_pnl=row.net_pnl
+            + (label.realized_pnl if label.realized_pnl is not None else Decimal(0)),
+            n_fee_unverified=row.n_fee_unverified + int(label.fee_reconciled is None),
+        )
+    residuals: tuple[ResidualSettlement | ResidualPending, ...] = (
+        *residual_settlements,
+        *residual_pending,
+    )
+    for residual in residuals:
+        family_id = _family_label(residual.trial_id, residual.climate_day, registered_manifests)
+        row = current(family_id)
+        pending = isinstance(residual, ResidualPending)
+        verified = fee_reconciled_by_trial_id.get(residual.trial_id, (False, "", False))[0]
+        stats[family_id] = replace(
+            row,
+            n_residual=row.n_residual + 1,
+            n_residual_pending=row.n_residual_pending + int(pending),
+            residual_pnl=row.residual_pnl
+            + (residual.realised_pnl if isinstance(residual, ResidualSettlement) else Decimal(0)),
+            n_residual_fee_unverified=row.n_residual_fee_unverified + int(not verified),
+        )
+    for fill in fill_rows:
+        row = current(fill.family_id)
+        disagree = fill.cli_final_check is accounting.CliCheck.DISAGREE
+        stats[fill.family_id] = replace(
+            row,
+            n_fills_attributed=row.n_fills_attributed + 1,
+            n_settlement_disagree=row.n_settlement_disagree
+            + int(
+                disagree and fill.source in {accounting.PnlSource.LEGACY, accounting.PnlSource.C2}
+            ),
+            n_residual_settlement_disagree=row.n_residual_settlement_disagree
+            + int(disagree and fill.source is accounting.PnlSource.RESIDUAL),
+        )
+    return tuple(
+        replace(
+            row,
+            n_other_excluded=(
+                row.n_fills_attributed - row.n_admissible - row.n_incomplete - row.n_residual
+            ),
+        )
+        for _, row in sorted(stats.items())
+    )
+
+
 # --------------------------------------------------------------------------
 # Realised P&L -- I3: portfolio P&L is never scoped by n's admissibility
 # --------------------------------------------------------------------------
@@ -1224,6 +1386,7 @@ class ResidualPending:
     """
 
     trial_id: str
+    climate_day: str
     release_day: str
 
 
@@ -1244,6 +1407,7 @@ def residual_settlement(
     if isinstance(scored_or_refusal, ScoreRefusal):
         return ResidualPending(
             trial_id=trial.trial_id,
+            climate_day=trial.climate_day,
             release_day=_utc_day_of_ns(trial.scheduled_release_at_ns),
         )
     scored = scored_or_refusal
@@ -2125,8 +2289,9 @@ def roi_against_baselines(
 #: bumps it to 5: the accounting view (`fill_pnl`, `family_pnl`, `disclosures`,
 #: `roi_accounting*`) is REQUIRED from v5 on, and `roi*` is `null` under the new
 #: `GATED_ACCOUNTING_ONLY` status. The in-module reader and the exit-window study's reader
-#: (`read_portfolio_roi_report`) accept 1..5.
-PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 5
+#: (`read_portfolio_roi_report`) accept 1..6. AUD-04 v6 adds the decision
+#: ledger; the historical reader continues to ignore these new keys.
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 6
 
 #: The version `trial_rows` was introduced at -- every `schema_version` at
 #: or above this REQUIRES the key (see `_require_trial_rows`); below it,
@@ -2136,14 +2301,15 @@ _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
 #: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
 #: (the current, writer-stamped version) plus every prior version this
 #: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
-_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3, 4, 5})
+_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3, 4, 5, 6})
 
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
 ROI_STATUS_GATED_UNSETTLED_CAPITAL: Final[str] = "GATED_UNSETTLED_CAPITAL"
 #: AUT-2 r7 WP6: the full report is gated on the label-run marker (`labels_consumable`). An absent,
 #: stale, unreadable or FAILED_IDENTITY marker, or any unresolved / missing-label fill, is
-#: `GATED_IDENTITY`; pending labels reuse `GATED_UNSETTLED_CAPITAL`. A gated report publishes no ROI.
+#: `GATED_IDENTITY`; pending labels reuse `GATED_UNSETTLED_CAPITAL`.
+#: A gated report publishes no ROI.
 ROI_STATUS_GATED_IDENTITY: Final[str] = "GATED_IDENTITY"
 #: TE-1 R6: `GATED_ACCOUNTING_ONLY` -- some booked P&L sits outside the admissible (statistics) set,
 #: so the statistics `roi*` fields are withheld; `roi_accounting*` carries the accounting view.
@@ -2522,6 +2688,7 @@ class PortfolioRoiReportData:
     settled_through_statistic: str
     lag_sample_n: int
     roi_status: str
+    label_gate_status: str | None
     unsettled_capital_positions: int
     max_days_past_horizon: int
     n_family_station_refusals: int = 0
@@ -2602,6 +2769,11 @@ class PortfolioRoiReportData:
     family_pnl: tuple[accounting.FamilyPnlRow, ...] = ()
     #: ``None`` only for data assembled without an accounting view (a hand-built test fixture).
     disclosures: accounting.Disclosures | None = None
+    generated_at: str | None = None
+    days_since_newest_input: int | None = None
+    input_freshness_status: str = INPUT_FRESHNESS_STALE
+    n_open_anchors_without_fill: int | None = None
+    family_decision_stats: tuple[FamilyDecisionStats, ...] = ()
 
 
 def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
@@ -2630,6 +2802,11 @@ def build_portfolio_roi_report_data(
     settled_through_statistic: str,
     lag_sample_n: int,
     permanently_unsettled: tuple[PermanentlyUnsettledTrial, ...],
+    label_gate_status: str | None,
+    generated_at_ns: int | None = None,
+    days_since_newest_input: int | None = None,
+    n_open_anchors_without_fill: int | None = None,
+    family_decision_stats: Sequence[FamilyDecisionStats] = (),
     n_family_station_refusals: int = 0,
     n_ledger_rows: int = 0,
     n_undecodable_ledger_rows: int = 0,
@@ -2773,6 +2950,18 @@ def build_portfolio_roi_report_data(
         fill_pnl=tuple(fill_pnl),
         family_pnl=tuple(family_pnl),
         disclosures=disclosures,
+        label_gate_status=label_gate_status,
+        generated_at=(
+            datetime.fromtimestamp(generated_at_ns // 1_000_000_000, tz=UTC).isoformat()
+            if generated_at_ns is not None
+            else None
+        ),
+        days_since_newest_input=days_since_newest_input,
+        input_freshness_status=(
+            INPUT_FRESHNESS_OK if is_input_fresh(days_since_newest_input) else INPUT_FRESHNESS_STALE
+        ),
+        n_open_anchors_without_fill=n_open_anchors_without_fill,
+        family_decision_stats=tuple(family_decision_stats),
     )
 
 
@@ -2783,6 +2972,12 @@ def _days_between(start_day: str, end_day: str) -> int:
 def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
     return {
         "schema_version": PORTFOLIO_ROI_SCHEMA_VERSION,
+        "generated_at": data.generated_at,
+        "days_since_newest_input": data.days_since_newest_input,
+        "input_freshness_status": data.input_freshness_status,
+        "n_open_anchors_without_fill": data.n_open_anchors_without_fill,
+        "label_gate_status": data.label_gate_status,
+        "family_decision_stats": [row.to_json() for row in data.family_decision_stats],
         "period_start": data.period_start,
         "period_end": data.period_end,
         "n_fills": data.n_fills,
@@ -2796,8 +2991,12 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "capital_deployed_total": str(data.capital_deployed_total),
         # a label-gated report publishes no ROI figure at all (AUT-2 WP6)
         "roi": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi),
-        "roi_minus_b0": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b0),
-        "roi_minus_b1": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b1),
+        "roi_minus_b0": (
+            None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b0)
+        ),
+        "roi_minus_b1": (
+            None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b1)
+        ),
         "realised_pnl_c2_total": str(data.realised_pnl_c2_total),
         "pass_flag": data.pass_flag,
         "unexplained_flow_days": data.unexplained_flow_days,
@@ -4216,7 +4415,7 @@ class _LabelView:
     final_client_orders: frozenset[str]
 
     def c2_rows(self) -> tuple[LabelRow, ...]:
-        """Admissible entry rows the legacy scorer did not write (its rows ARE the legacy trials)."""
+        """Admissible non-legacy entry rows (legacy rows ARE the legacy trials)."""
         return tuple(
             row
             for row in self.rows
@@ -4629,7 +4828,28 @@ def _run(
         for row in fill_rows
     )
 
+    newest_ledger_fill_ts = max((f.ts_event for f in fills), default=None)
+    newest_scored_trial_ts = max((t.scored_at_ns for t in scored_trials), default=None)
+    freshness_days = days_since_newest_input(
+        newest_ledger_fill_ts=newest_ledger_fill_ts,
+        newest_scored_trial_ts=newest_scored_trial_ts,
+        now_ns=now_ns,
+    )
+    decision_stats = family_decision_stats(
+        admissible_trials=admissible_scored_trials(scored_trials, residual_trial_ids=residual_ids),
+        c2_rows=c2_rows,
+        residual_settlements=residual_settlements,
+        residual_pending=residual_pending,
+        fee_reconciled_by_trial_id=fee_reconciled_by_trial_id_pooled,
+        fill_rows=fill_rows,
+        registered_manifests=registered_manifests,
+    )
     report_data = build_portfolio_roi_report_data(
+        generated_at_ns=now_ns,
+        label_gate_status=label_status,
+        days_since_newest_input=freshness_days,
+        n_open_anchors_without_fill=ledger_result.n_open_anchors_without_fill,
+        family_decision_stats=decision_stats,
         period_start=period_start,
         period_end=period_end,
         fill_buckets=buckets,
@@ -4684,13 +4904,6 @@ def _run(
     print(journal_line(report_data))
 
     # D8 -- frozen-input detector.
-    newest_ledger_fill_ts = max((f.ts_event for f in fills), default=None)
-    newest_scored_trial_ts = max((t.scored_at_ns for t in scored_trials), default=None)
-    freshness_days = days_since_newest_input(
-        newest_ledger_fill_ts=newest_ledger_fill_ts,
-        newest_scored_trial_ts=newest_scored_trial_ts,
-        now_ns=now_ns,
-    )
     freshness_latch_path = output_dir / "portfolio_roi" / INPUT_FRESHNESS_LATCH_FILENAME
     freshness_latch = alert_ladder.read_latch_state(freshness_latch_path)
     new_freshness_latch, freshness_decision = apply_freshness_ladder(
