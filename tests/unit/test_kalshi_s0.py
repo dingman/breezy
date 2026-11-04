@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Mapping
 from decimal import Decimal
 from email.message import Message
 from pathlib import Path
@@ -842,6 +843,161 @@ def test_m2_first_candle_gap_is_counted_not_halted() -> None:
     report = s.audit_rows([r])
     assert report["first_hour_gap"] == {"KXHIGHNY": 1}
     assert s.audit_rows([row()])["first_hour_gap"] == {}
+
+
+def _on_hour_f19_cases() -> list[tuple[int, tuple[int, ...]]]:
+    """On-hour opens × first/later ends that are aligned or one minute off."""
+    hour = 3600
+    opens = (1_751_378_400, 1_751_378_400 - 24 * hour, 1_700_000_000 // hour * hour)
+    cases: list[tuple[int, tuple[int, ...]]] = []
+    for opened in opens:
+        assert opened % hour == 0
+        expected = opened + hour
+        ends_for = {
+            "empty": (),
+            "expected": (expected,),
+            "expected-and-later": (expected, expected + hour),
+            "later-only": (expected + hour, expected + 2 * hour),
+            "later-misaligned": (expected, expected + 60),
+            "first-misaligned": (expected + 60,),
+            "first-misaligned-then-aligned": (expected + 60, expected + hour),
+            "at-open": (opened,),
+            "just-after-open": (opened + 60,),
+            "one-second-early": (expected - 1,),
+            "gap-then-misaligned": (expected + hour, expected + hour + 1),
+            "two-hour-gap": (expected + 2 * hour,),
+            "unsorted-exact": (expected + hour, expected),
+            "previous-hour": (opened - hour,),
+        }
+        cases.extend((opened, ends) for ends in ends_for.values())
+    return cases
+
+
+@pytest.mark.parametrize(("opened", "ends"), _on_hour_f19_cases())
+def test_m2_on_hour_check_equivalent_to_prior_rule(opened: int, ends: tuple[int, ...]) -> None:
+    # Prior rule, inlined: halt when the first end is before open+1h or any end
+    # is off the open-hour grid; a later aligned first end is a gap, not a halt.
+    if not ends:
+        prior_halt, prior_gap = False, 0
+    else:
+        prior_halt = min(ends) < opened + 3600 or any((end - opened) % 3600 for end in ends)
+        prior_gap = 0 if prior_halt else int(min(ends) > opened + 3600)
+    counts: Counter[str] = Counter()
+    sample: dict[str, Any] = {
+        "series_ticker": "KXHIGHNY",
+        "open_time": opened,
+        "candlesticks": [{"end_period_ts": end} for end in ends],
+    }
+    halted = False
+    try:
+        s._check_first_hour(sample, counts)
+    except s.SemanticsHalt:
+        halted = True
+    gap = 0 if halted else counts["first_hour_gap:KXHIGHNY"]
+    assert (halted, gap) == (prior_halt, prior_gap)
+
+
+def test_m2_off_hour_open_partial_first_bucket_accepted() -> None:
+    open_iso = "2025-07-01T06:24:29Z"
+    opened = s.timestamp(open_iso)
+    expected = (opened // 3600 + 1) * 3600
+    partial = row(open_time=open_iso)
+    partial["candlesticks"] = [
+        {"end_period_ts": expected},
+        {"end_period_ts": expected + 3600},
+        *partial["candlesticks"],
+    ]
+    assert s.audit_rows([partial])["first_hour_gap"] == {}
+    assert s.selections(row(), Counter()) == [
+        ("pre_cell", Decimal("0.98")),
+        ("pre_cell", Decimal("0.97")),
+        ("post_cell", Decimal("0.99")),
+    ]
+
+
+def test_m2_off_hour_open_bucket_before_open_halts() -> None:
+    open_iso = "2025-07-01T06:24:29Z"
+    opened = s.timestamp(open_iso)
+    previous_hour = (opened // 3600) * 3600
+    assert previous_hour < opened
+    for end in (opened, previous_hour):
+        with pytest.raises(s.SemanticsHalt):
+            s.audit_rows([_f19_row(end, open_iso)])
+
+
+def test_m2_off_hour_open_gap_counted() -> None:
+    open_iso = "2025-07-01T06:24:29Z"
+    opened = s.timestamp(open_iso)
+    expected = (opened // 3600 + 1) * 3600
+    report = s.audit_rows([_f19_row(expected + 3600, open_iso)])
+    assert report["first_hour_gap"] == {"KXHIGHNY": 1}
+    assert report["F19"]["first_hour_gaps"] == 1
+
+
+def _mapping_keys(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        found.update(str(key) for key in value)
+        for item in value.values():
+            found |= _mapping_keys(item)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            found |= _mapping_keys(item)
+    return found
+
+
+def test_audit_f19_reports_offhour_counts() -> None:
+    pre_end = s.timestamp("2025-07-01T23:00:00Z")
+    opened = s.timestamp("2025-07-01T22:39:14Z")
+    assert opened % 3600 != 0
+    assert pre_end == (opened // 3600 + 1) * 3600
+    assert pre_end - opened < 3600
+    partial = row(
+        series_ticker="KXLOWTNYC",
+        ticker="KXLOWTNYC-25JUL02-B70",
+        open_time="2025-07-01T22:39:14Z",
+        result="yes",
+        candlesticks=[
+            {"end_period_ts": pre_end, "yes_bid": {"close": "0.0271"}},
+            {"end_period_ts": pre_end + 3600, "yes_bid": {"close": "0.0271"}},
+            {"end_period_ts": s.timestamp("2025-07-02T15:00:00Z"), "yes_bid": {"close": "0.0271"}},
+        ],
+    )
+    assert ("pre_cell", pre_end) in s.reference_hours(partial)
+    report = s.audit_rows([partial])
+    assert report["F19"] == {
+        "off_hour_opens": 1,
+        "partial_first_bucket_refs": {
+            "HIGH_pre_cell": 0,
+            "HIGH_post_cell": 0,
+            "LOW_pre_cell": 1,
+            "LOW_post_cell": 0,
+        },
+        "first_hour_gaps": 0,
+    }
+    assert "result" not in _mapping_keys(report)
+    assert "0.0271" not in json.dumps(report)
+    chosen = s.selections(s.audit_projection(partial), Counter())
+    assert "pre_cell" in [stratum for stratum, _ in chosen]
+
+
+def test_m2_off_hour_open_misaligned_end_halts() -> None:
+    open_iso = "2025-07-01T06:24:29Z"
+    expected = (s.timestamp(open_iso) // 3600 + 1) * 3600
+    for end in (expected + 60, expected - 1):
+        with pytest.raises(s.SemanticsHalt):
+            s.audit_rows([_f19_row(end, open_iso)])
+
+
+def test_audit_f19_on_hour_negative_control() -> None:
+    report = s.audit_rows([row(), row(ticker="KXHIGHNY-25JUL02-T91")])
+    assert report["F19"]["off_hour_opens"] == 0
+    assert report["F19"]["partial_first_bucket_refs"] == {
+        "HIGH_pre_cell": 0,
+        "HIGH_post_cell": 0,
+        "LOW_pre_cell": 0,
+        "LOW_post_cell": 0,
+    }
 
 
 def test_l1_named_lookahead_survives_optimised_mode() -> None:

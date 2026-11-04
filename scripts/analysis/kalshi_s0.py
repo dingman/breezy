@@ -7,14 +7,15 @@ render as prereg F-7 {pre, post}. Reference labels denote bucket ENDs except the
 opening reference, whose end is ceil(open) + one hour. Whole-range payloads are
 indexed by exact end, never carried forward. The earliest available settlement/
 close/expiration timestamp bounds references. F-19 checks the first returned
-bucket against the actual open, without rounding. Publication writes a temporary
+bucket end against the next clock hour after open. Publication writes a temporary
 file, hard-links it without replace, then unlinks the temporary name, so it
 cannot clobber another writer. The single look is a fixed `.S0.look` directory
 reserved before outcome access (any date); a failed calculation keeps it.
 
 P-0 resolved 2026-11-04 by a 4-GET unauthenticated probe on KXHIGHLAX-26JAN15-B77.5
 (historical candlesticks, period 60): end_period_ts multiples of 3600, step 3600,
-first end = open_time + 3600 (bucket END) - consistent with _check_first_hour.
+first end = the next clock hour after open (open_time + 3600 for on-hour opens;
+bucket END). Off-hour opens: RULING_gap6_f19_offhour_open_2026-11-04.md.
 """
 
 from __future__ import annotations
@@ -446,14 +447,19 @@ class Observation:
 
 
 def _check_first_hour(row: Mapping[str, Any], counts: Counter[str]) -> None:
-    """F-19: halt on a semantics mismatch; a first candle later than open + 1 h is a gap."""
+    """F-19: halt on a misaligned end or a first end before the next clock hour.
+
+    A later first end is a gap. On-hour opens keep the open_time + 3600 boundary
+    (RULING_gap6_f19_offhour_open_2026-11-04.md).
+    """
     ends = [c["end_period_ts"] for c in row["candlesticks"]]
     if not ends:
         return
     opened = timestamp(row["open_time"])
-    if min(ends) < opened + 3600 or any((end - opened) % 3600 for end in ends):
+    expected = (opened // 3600 + 1) * 3600
+    if any(end % 3600 != 0 for end in ends) or min(ends) < expected:
         raise SemanticsHalt("HALT: F-19 bucket ends are not whole hours after open")
-    if min(ends) > opened + 3600:
+    if min(ends) > expected:
         counts[f"first_hour_gap:{row['series_ticker']}"] += 1
 
 
@@ -502,18 +508,37 @@ def observations(row: Mapping[str, Any]) -> list[Observation]:
     ]
 
 
+def _note_partial_first_bucket(row: Mapping[str, Any], opened: int, counts: Counter[str]) -> None:
+    """Count refs that land on a first candle shorter than one hour (end - open)."""
+    ends = [c["end_period_ts"] for c in row["candlesticks"]]
+    if not ends:
+        return
+    first = min(ends)
+    if first - opened >= 3600:
+        return
+    series = row["series_ticker"]
+    side = "HIGH" if series.startswith("KXHIGH") else "LOW"
+    for stratum, ref_end in reference_hours(row):
+        if ref_end == first:
+            counts[f"partial_first_bucket:{side}_{stratum}"] += 1
+
+
 def audit_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     counts: Counter[str] = Counter()
     units: dict[str, set[tuple[str, str]]] = {cell: set() for cell in CELLS}
+    off_hour_opens = 0
     for raw in rows:
         if not in_window(raw):
             counts["window"] += 1
             continue
         row = audit_projection(raw)
+        opened = timestamp(row["open_time"])
+        off_hour_opens += int(opened % 3600 != 0)
         series = row["series_ticker"]
         for stratum, _ in selections(row, counts):
             cell = f"{'HIGH' if series.startswith('KXHIGH') else 'LOW'}_{stratum}"
             units[cell].add((station_offset(series)[0], climate_day(row).isoformat()))
+        _note_partial_first_bucket(row, opened, counts)
     return {
         "cells": {
             cell: {"n": len(units[cell]), "misses": counts[f"{cell}:misses"]} for cell in CELLS
@@ -526,7 +551,15 @@ def audit_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             for key, value in sorted(counts.items())
             if key.startswith("first_hour_gap:")
         },
-        "F19": "consistent (empty series untested)",
+        "F19": {
+            "off_hour_opens": off_hour_opens,
+            "partial_first_bucket_refs": {
+                cell: counts[f"partial_first_bucket:{cell}"] for cell in CELLS
+            },
+            "first_hour_gaps": sum(
+                value for key, value in counts.items() if key.startswith("first_hour_gap:")
+            ),
+        },
     }
 
 
