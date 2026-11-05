@@ -70,6 +70,7 @@ Every item states its ROI mechanism: it earns dollars, or it is a named precondi
 - **Cycle resumed 2026-11-05 via /execute-backlog (operator).** Routing probed: Grok EXHAUSTED (402), Codex LIVE (CLI logged in; MCP server failed to connect).
 - LESSONS volume gate: 37.8 KB accepted this cycle (lossless pass a9193c7b; 30 KB would cut binding Prevention prose).
 - **Next action:** `OPERATOR DECISION NEEDED (11-06): edge screen shows no family with positive after-fee expectancy; GAP-1 champion untestable vs market (zero tape overlap; forward window lacks MOS/METAR/LAMP/FINAL-truth inputs). Choose: (1) spend the holdout look on 08-30..09-28 (M2 arm, no obs), or (2) refresh inputs + FINAL truth into ≥10-02 and score forward. See docs/evidence/EDGE_SCREEN_GAP1_VS_ASK_2026-11-06.md. Backlog items remain PLANNED-HALTED; routing: Grok EXHAUSTED, Codex limit until 03:50Z.` One heavy job at a time; `systemd-run --user`, LimitNOFILE=524288, stall watch, re-entry per L-70.
+  PROJECT ARCHIVED 2026-11-05 — runtime stopped and disabled; see docs/ARCHIVED.md for the deletion checklist.
 - **Live-state watch:** 11-02 16:50Z boot-log check for 'operator caps validated DAY/POSITION/MONTH' unverified; failed oneshots breezy-label-outcomes.service / breezy-portfolio-roi.service need triage; session wakes daily 13:07Z `db1e44f2`/`fc4d504c`, 17:08Z `c45d8c0a`/`bb2925bd`.
 
 ### Calendar obligations
