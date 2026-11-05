@@ -76,3 +76,19 @@ genuinely out-of-sample (a frozen fit scored forward), which is GAP-3's forward 
 re-read of the existing OOF file. Mechanics self-check (not a result, `selfcheck.log`): one real SFO
 2026-09-01 rung through the identical read_rung_tape -> first_snapshot_in_window -> fee path found a
 snapshot (18:00:16Z, ask 0.01, theta 0.06), so the empty join is a data gap, not a wiring defect.
+
+## Forward scoring feasibility (GAP-3 path) — STOPPED, 2026-11-06
+
+- No run performed. Full detail: `docs/evidence/edge_screen_2026-11-06/feasibility_forward.md`.
+- FINAL settlement truth ends 2026-09-28. Sealed holdout is [07-01, 10-02) per RULING_holdout_freeze_and_forward_window_2026-10-03.
+- Tape ∩ FINAL truth = 08-30..09-28 = 120 station-days, ALL inside the holdout.
+- Admissible forward (>=10-02) ∩ FINAL truth = 0 station-days.
+- Input coverage in forward window (4 stations, 35 days):
+  - NBP 25/35; PFM 35/35.
+  - LAMP 0/35 (store ends 09-30); GFS MOS 0/35 (ends 06-30); routine-METAR obs 0/35 (ends 06-30).
+  - FINAL truth 0/35.
+- Consequence: champion M3 cannot be scored anywhere on the tape. M2 at best, without the observation feature.
+- No persisted frozen fit exists (oof_rows are per-fold predictions). fit_blend/score_rows/J2 refuse rows >=07-01.
+- Decision left to operator:
+  - (1) Spend the holdout look on 08-30..09-28 (M2, no obs, underpowered).
+  - (2) Refresh FINAL truth past 10-02 from the CLI alignment cache and extend MOS/METAR/LAMP stores into the forward window, then score >=10-02.
