@@ -25,3 +25,35 @@ The WP decomposition was done by the planner, read-only, on 2026-10-08. Only WP1
 - l.894: there are now five node sites: `trade.py:474,533,782,1201` and `node_config.py:521`.
 - l.1142: `tests/unit/test_systemd_unit_contracts.py` does not exist. Use `tests/contract/test_autonomy_units*.py`.
 - §3.8: the list of failing units dates from 10-02. Re-check it before WP3.
+
+## WP3 slice plan (planner, 2026-10-08; built strictly in order, each slice branching from the previous one's tip)
+
+| Slice | Content | Files |
+|---|---|---|
+| S1 | Failing units, wrapper exits and disposition | `deploy/systemd/{score-live-trials,portfolio-roi,asos-refresh,replay-daily}-run.sh`; `docs/evidence/unit_health/DISPOSITION_failed_units_2026-10-08.md`; `docs/evidence/aut6/WP3_verify_first_2026-10-08.md` (F2); `tests/unit/test_portfolio_roi_run_no_input.py`; `tests/unit/test_score_live_trials_skip_marker.py`; `tests/contract/test_autonomy_units_programme.py` |
+| S2 | Health bwrap row, unit files and contract tests | V-6 in its E-7e form: in-row `systemctl` fails and reads go through the bus snapshot. STOP on any mismatch. The timer is not enabled |
+| S3 | `unit_health.py` core | No permit or orders read anywhere (X-6, FQ-v2 NO-TRADE) |
+| S4 | `unit_health_daemons.py`: invocation and daemon rules, intraday-stage classification | Fixtures only until WP6. `WATCHDOG_DAEMON_UNITS` stays empty until WP4 |
+| S5 | `monitor_watch.py`: timers (both templates), producer, alert delivery, memory #31 | A not-deployed producer or canary is INCONCLUSIVE, never FAIL (decision X-8 below) |
+| S6 | CLI pass, rollup, C4, runbook marker, `aut6.health` pin (last) | F6: p99 ≤ 90 s over 20 runs. STOP if it fails |
+
+**Stale anchors found by the planner:**
+- `discovery-pull` is now at 17:12Z, not 16:52Z.
+- Exit 75 also occurs in `portfolio-roi-run.sh` and `replay-daily-run.sh`.
+- The health bound is slot + 146 s (E-7e).
+- There is a second timer template, `us-source-collector@`.
+- The ARCH programme tests already exist in `test_capture_units.py:182` and `test_launch_window_table.py:421`. Extend them; do not copy them.
+
+**Decisions that carry over to later work packages:**
+- Watchdog checks move to WP4.
+- AF3 moves to WP6.
+- The AG3 stage-reset half moves to WP5b.
+
+## Later decisions
+
+| # | Decision | Ruling |
+|---|---|---|
+| X-8 | Producer, canary and daily-verdict staleness checks (#23, #26, #27) meet units that are not deployed yet (WP2, WP6, WP7) | Ruling, after silent-failure review (CHANGES applied). One committed table, `NOT_YET_DEPLOYED`, in `monitor_watch.py`, with rows `(unit, owner_wp, not_expected_until)`. A unit's row is deleted only by its owning WP's activation commit. A unit gets `INCONCLUSIVE(not_deployed)` only if ALL hold: (1) its row is present and today is before `not_expected_until`; (2) no file and no broken symlink for it exists in `~/.config/systemd/user`; (3) none of its artifacts exists (heartbeat, canary record, daily verdict, summary line, `armed.json`). Otherwise: a missing unit not in the table is FAIL CRITICAL; a broken link is FAIL `unit_link_broken`; an absent unit with artifacts present is FAIL `deployed_then_vanished`; past `not_expected_until`, WARN then CRITICAL on the `AUT4_REPLAY_EXPECTED_BY` clock. Unit names resolve from `deploy/systemd/` file names. INCONCLUSIVE never pages and never counts toward `unknown_streak`. It is listed as `not_deployed=[...]` in `day_<date>.json`. Tests: deleted link, broken symlink, renamed unit, artifact present while unit absent, unlisted absent unit, past deadline, plus the positive control (never-deployed listed unit reads INCONCLUSIVE). `test_every_deploy_systemd_unit_is_installed_or_listed` covers the rest. |
+| X-9 | WP2 verify-first | Path B. See `AUT-6-WP2-pathB-ruling_2026-10-08.md` (in peer review). |
+| X-10 | Redeliver unit `ReadWritePaths=` broke bwrap on this host | Fixed by a65ee68f/03789239, with a contract ban on mount-namespace directives in any wrapped unit. Every new AUT-6 unit inherits the ban. |
+| X-11 | `nbp_drift.py` placement | `nbp_drift.py` holds the pure predicates; `check_drift`/`check_freshness` stay in the script. This is an accepted divergence from the plan text. |
