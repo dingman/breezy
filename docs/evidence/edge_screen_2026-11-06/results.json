@@ -1,0 +1,174 @@
+{
+ "label": "SCREEN -- not confirmatory; upper bound (zero slippage)",
+ "question": "GAP-1 D0 champion vs PM.us YES ask after taker fee, qty-1 taker, zero slippage",
+ "fields_used": {
+  "oof_rows.jsonl": [
+   "station",
+   "climate_day",
+   "horizon==D0",
+   "arm_predictions.M3.{mu,sigma,nu}",
+   "observed_f (cross-check only)"
+  ],
+  "f.jsonl": [
+   "station",
+   "climate_day",
+   "horizon==D0",
+   "anchor_ns (forecast issue instant)"
+  ],
+  "settlement_truth.csv": [
+   "station",
+   "climate_day",
+   "is_final==True",
+   "tmax_f"
+  ],
+  "tape": [
+   "order_book_depths/<slug>.POLYMARKET_US/*.parquet L0 ask_price_0 at first snapshot in [anchor_ns, anchor_ns+10min]"
+  ]
+ },
+ "gating_rule": "first Depth10 L0 snapshot at or after the GAP-1 D0 anchor (10:00 LST D0, f.jsonl.anchor_ns), closed 10-minute window, else drop; anchor is later than P2's 16:50Z D-1 so P2's instant is NOT used",
+ "truth_source": "NWS CLI FINAL tmax_f from settlement_truth.csv (oof observed_f cross-checked)",
+ "counts": {
+  "oof_rows_total": 15613,
+  "oof_rows_d0": 7824,
+  "d0_forecasts_usable": 7824,
+  "truth_finals": 10440,
+  "truth_conflicts_excluded": 0,
+  "oof_station_days_with_cli_truth": 7824,
+  "oof_observed_f_equals_cli": 7824,
+  "depth_dirs_total": 2248,
+  "depth_dirs_not_high_rung_4stn": 662,
+  "depth_dirs_high_rung_4stn": 1586,
+  "tape_station_days_high_4stn": 265,
+  "tape_climate_day_min": "2026-08-30",
+  "tape_climate_day_max": "2026-11-05",
+  "station_days_in_both_oof_and_tape": 0,
+  "rung_dirs_in_join": 0,
+  "joined_rows": 0,
+  "joined_station_days": 0
+ },
+ "oof_climate_day_range": [
+  "2021-01-01",
+  "2026-06-30"
+ ],
+ "joined_climate_day_range": null,
+ "decision_rules": {
+  "R1": 0.0,
+  "R2": 0.03,
+  "R3": 0.05
+ },
+ "bootstrap": {
+  "B": 10000,
+  "seed": 20260904,
+  "cluster": "station_day"
+ },
+ "summary": {
+  "rules": {
+   "R1": {
+    "threshold": 0.0,
+    "n_takes": 0,
+    "n_station_days": 0,
+    "hit_rate": null,
+    "mean_pnl_per_take": null,
+    "total_pnl": null,
+    "ci95_mean_pnl_station_day": null
+   },
+   "R2": {
+    "threshold": 0.03,
+    "n_takes": 0,
+    "n_station_days": 0,
+    "hit_rate": null,
+    "mean_pnl_per_take": null,
+    "total_pnl": null,
+    "ci95_mean_pnl_station_day": null
+   },
+   "R3": {
+    "threshold": 0.05,
+    "n_takes": 0,
+    "n_station_days": 0,
+    "hit_rate": null,
+    "mean_pnl_per_take": null,
+    "total_pnl": null,
+    "ci95_mean_pnl_station_day": null
+   }
+  },
+  "model_free": {
+   "n": 0,
+   "mean_p_minus_ask": null,
+   "ci95_station_day": null
+  },
+  "calibration_10bin": [
+   {
+    "bin": "[0.0,0.1)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.1,0.2)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.2,0.3)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.3,0.4)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.4,0.5)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.5,0.6)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.6,0.7)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.7,0.8)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.8,0.9)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   },
+   {
+    "bin": "[0.9,1.0)",
+    "n": 0,
+    "mean_p": null,
+    "realized_freq": null,
+    "mean_ask": null
+   }
+  ]
+ },
+ "rows": [],
+ "elapsed_s": 0.3
+}

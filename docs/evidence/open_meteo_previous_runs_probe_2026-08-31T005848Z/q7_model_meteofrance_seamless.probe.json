@@ -1,0 +1,12 @@
+{
+  "body": "{\"latitude\":40.75,\"longitude\":-74.0,\"generationtime_ms\":2.1827220916748047,\"utc_offset_seconds\":0,\"timezone\":\"GMT\",\"timezone_abbreviation\":\"GMT\",\"elevation\":45.0,\"hourly_units\":{\"time\":\"iso8601\",\"temperature_2m\":\"\u00b0C\",\"temperature_2m_previous_day1\":\"\u00b0C\"},\"hourly\":{\"time\":[\"2026-08-29T00:00\",\"2026-08-29T01:00\",\"2026-08-29T02:00\",\"2026-08-29T03:00\",\"2026-08-29T04:00\",\"2026-08-29T05:00\",\"2026-08-29T06:00\",\"2026-08-29T07:00\",\"2026-08-29T08:00\",\"2026-08-29T09:00\",\"2026-08-29T10:00\",\"2026-08-29T11:00\",\"2026-08-29T12:00\",\"2026-08-29T13:00\",\"2026-08-29T14:00\",\"2026-08-29T15:00\",\"2026-08-29T16:00\",\"2026-08-29T17:00\",\"2026-08-29T18:00\",\"2026-08-29T19:00\",\"2026-08-29T20:00\",\"2026-08-29T21:00\",\"2026-08-29T22:00\",\"2026-08-29T23:00\"],\"temperature_2m\":[25.6,24.1,22.6,21.8,21.3,20.8,20.3,19.6,19.1,18.6,18.1,17.7,18.3,19.0,20.1,21.4,22.5,23.2,24.4,25.0,25.4,25.7,25.7,25.0],\"temperature_2m_previous_day1\":[24.1,23.6,22.9,22.3,22.3,21.5,22.0,21.5,21.2,20.8,20.1,19.6,18.7,19.7,20.9,22.1,23.2,24.1,23.4,24.0,24.5,24.8,24.5,23.4]}}",
+  "bytes": 1024,
+  "content_type": "application/json; charset=utf-8",
+  "finding": null,
+  "label": "q7_model_meteofrance_seamless",
+  "outcome": "ok",
+  "requested_at_utc": "2026-08-31T00:59:21+00:00",
+  "sha256": "0f7ec73e24a4492be073ab22f8d233d77fb4a7a19e5be9f00d2bb1497578f239",
+  "status": 200,
+  "url": "https://previous-runs-api.open-meteo.com/v1/forecast?end_date=2026-08-29&hourly=temperature_2m%2Ctemperature_2m_previous_day1&latitude=40.78333&longitude=-73.96667&models=meteofrance_seamless&start_date=2026-08-29&timezone=UTC"
+}

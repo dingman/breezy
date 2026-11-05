@@ -9,9 +9,33 @@ them.
 
 ## G-12 — Resolve `MARKET_SLUG_KEY` against the live venue
 
-**Unlock:** operator opens the three-lock credential gate
-(`BREEZY_VENUE_LIVE=1` AND `BREEZY_ALLOW_CREDENTIALED_PYTEST=1` AND
-`--venue-live`), which requires D1 (KYC).
+**Unlock:** ~~operator opens the three-lock credential gate~~ — **CORRECTED
+2026-09-01: this gate is already open and is NOT the blocker.** Credentials are
+present (`~/.config/breezy/polymarket.env`: `POLYMARKET_US_KEY_ID`,
+`POLYMARKET_US_SECRET_KEY_FILE`), D1/KYC is satisfied, and the gate has been
+opened for **four** read-only smoke runs (one 2026-08-25, three 2026-08-30).
+**SUPERSEDED SAME DAY by diagnosis — read this, not the line above.** All four
+runs did return `Connectivity verdict: FAIL`, but the verdict is
+`authenticated_ok AND quotes_delivered > 0 AND node_failure is None`
+(`scripts/venue/polymarket_us_auth_smoke.py:1363`) — it fails on the QUOTE
+count, not on auth. **Authenticated connectivity IS proven:**
+`READONLY_AUTH_SMOKE_2026-08-30T154900+0000.md:34-38` shows step B
+(`GET /v1/portfolio/positions`, authenticated) -> **200**, with the
+path+query-signed variant -> **401** as a discriminating negative control, and
+step D (deliberately stale -120s) -> **200**, i.e. the venue does not enforce a
+signing window. **G-12 IS RESOLVED:** the 2026-08-25 run value-matched the key
+against a configured slug and recorded `marketData.marketSlug`
+(`READONLY_AUTH_SMOKE_2026-08-25T221131+0000.md:2144`) — this is a parsed
+payload, NOT log text. The `MARKET_SLUG_KEY = "marketSlug"` leaf guess
+(`data.py:160`) is CORRECT under a `marketData` parent, which the nested lookup
+at `data.py:616-622` already handles.
+
+**Clock skew is REFUTED as a cause.** The "56593 ms host clock offset" in the
+report headers is a measurement artifact: `_clock_offset_ms`
+(`polymarket_us_auth_smoke.py:890-907`) compares `time.time()` *at call time*
+against the *first* response's `Date` header, and is called at checkpoint time,
+so it measures elapsed run duration. Real signing-time offset is logged at
+`:49164` — **779 ms**, against a 15 000 ms guard that never fired.
 
 **Why it matters more than it looks.** `MARKET_SLUG_KEY = "marketSlug"` is an
 unresolved venue guess, and every routing decision in the recorder rests on it.
@@ -34,9 +58,48 @@ against `.invalid` hosts prove nothing about the live venue.
 
 **Unlock:** same three-lock gate; depends on G-12.
 
-**Current state, verbatim from PROGRESS.md:** "**No live run has happened.**
-Zero authenticated calls, zero live-network verification; every venue host in
-every test is `.invalid`. 2401 green tests do not establish that a real frame
+**Current state (CORRECTED 2026-09-01).** The previously-quoted line "**No
+live run has happened.** Zero authenticated calls" is **false**: four
+authenticated read-only smoke runs were executed against
+`https://api.polymarket.us` and are archived under
+`docs/evidence/venue/polymarket_us/READONLY_AUTH_SMOKE_*.md`. The four `FAIL` verdicts are real but mean
+something narrower than they read: the formula fails on `quotes_delivered > 0`,
+not on auth (see G-12 above). **Venue frames HAVE reached the Nautilus
+DataEngine** — the 2026-08-25 run delivered **11 QuoteTicks from 11 frames**
+with 1 instrument loaded (`READONLY_AUTH_SMOKE_2026-08-25T221131+0000.md:2150-2152`).
+Only the *parquet* clause survives.
+
+**The "0 QuoteTicks" is a MEASUREMENT ARTIFACT, not a data-path defect
+(diagnosed 2026-09-02, every claim verified against the artifact).** The
+2026-08-30 run loaded 60 instruments and received 218 `market_data` + 50
+`error` frames. The smoke's witness counts ticks for **only the two configured
+slugs** (`polymarket_us_auth_smoke.py:1604-1616`), and those two sat past the
+venue's undocumented **10-subscriptions-per-connection cap**
+(`websocket.py:168`), so they were never subscribed and could never tick.
+Exactly **60 distinct requestIds** = 60 subscribe envelopes: 10 accepted (the
+first 10 of the list, all same-day `2026-08-30` slugs, 218 frames, 183 of them
+two-sided), 50 rejected. The accepted 10 almost certainly published quotes that
+nothing counted — `quotes_published` (`data.py:762`) exists but the report never
+renders it. **Next-day-slug hypothesis REFUTED**: every frame that arrived was
+same-day. The 08-25 run got 11/11 because it configured 1 slug, under the cap.
+
+Why the smoke saw 50 rejections: it constructs a bare single-connection
+`PolymarketUSMarketsWebSocket` (`smoke:1207`) and **bypasses the sharding
+pool**. The production factory (`factories.py:417`) builds
+`PolymarketUSMarketsWebSocketPool`, which shards across connections — but that
+pool has **never been exercised against the live venue**, because the only live
+runs are the smoke. Also contradicted: `websocket.py:76-87` says one-envelope-
+per-slug produced ZERO error frames; 08-30 shows 50 explicit ones.
+
+**Real next steps, in order:** (1) render the adapter's own counters in the
+smoke (`quotes_published`, `quote_parse_failures`, `dropped_frames`,
+`frames_missing_routing_key`) so a 0 is self-explaining; (2) route the smoke
+through the factory so the pool is what gets tested live; (3) re-run once with
+same-day slugs. No bot code change is indicated by this evidence.
+
+**Caveat on the ~872 `marketSlug` hits in the 2.8 MB file:** those specific
+occurrences are Breezy's own log text. Do not cite that file for slug
+resolution — cite the 08-25 run, which resolved it by value-matching. 2401 green tests do not establish that a real frame
 reaches parquet. This is exactly the standing lesson of this repo."
 
 **Exit criterion:** one real frame, from the real venue, written to parquet and

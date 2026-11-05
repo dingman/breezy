@@ -1,0 +1,2078 @@
+"""Pure helpers for the Polymarket.us submit path (R-7).
+
+No I/O, no awaits, no network client. ``_submit_order`` is the one chokepoint;
+this module classifies order shape, encodes the venue body, and classifies the
+create-order response. X3 (see the firewall guard's banned-token set) admits
+the outcome-side-NO constant per the ruling at
+``docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md``, while still
+banning the naked-short vocabulary it replaced; ``_outcome_token`` maps a
+NO order via ``leg_of(instrument.id)``, never by reading the free-text
+outcome string.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
+from typing import Any, Final, Literal, Protocol, cast
+
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.identifiers import AccountId, TradeId, VenueOrderId
+from nautilus_trader.model.instruments import BinaryOption, Instrument
+from nautilus_trader.model.objects import Money, Price, Quantity
+
+from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    cancel_order_path as cancel_order_path,  # noqa: PLC0414
+)
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    order_by_id_path as endpoints_order_by_id_path,
+)
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    valid_venue_order_id as valid_venue_order_id,  # noqa: PLC0414
+)
+from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
+from breezy.adapters.polymarket_us.leg_prices import (
+    Leg,
+    exit_wire_price_for_leg,
+    instrument_price_for_leg,
+    wire_price_for_leg,
+)
+from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO, parse_rfc3339_nanos
+from breezy.adapters.polymarket_us.symbology import base_slug_of, leg_of
+from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.domain.exec_intent import intent_fingerprint as intent_fingerprint  # noqa: PLC0414
+from breezy.persistence.exit_gate import family_declares_exit_rule, family_declares_no_leg_exit
+from breezy.persistence.family_manifest import FamilyManifest
+
+logger = logging.getLogger(__name__)
+
+KIND_ACCEPT_FILL: Final[str] = "accept_fill"
+KIND_ZERO_FILL: Final[str] = "zero_fill"
+KIND_REJECT: Final[str] = "reject"
+KIND_AMBIGUOUS: Final[str] = "ambiguous"
+
+RETIRE_ACCEPT_FILL: Final[str] = "ACCEPTED_WITH_DURABLE_FILL"
+RETIRE_ZERO_FILL: Final[str] = "ACCEPTED_ZERO_FILL_TERMINAL"
+RETIRE_REJECT: Final[str] = "DEFINITIVE_REJECT"
+#: Resting-order reasons (S4 WP2, r3 P12). A node writes either only after the
+#: supervisor advertises it (``supervisor_admits_retirement_reason``); each is a
+#: ``RetirementReason`` member (``test_retirement_reason_superset.py``).
+RETIRE_ACCEPTED_RESTING: Final[str] = "ACCEPTED_RESTING"
+RETIRE_BOOT_SWEEP_RESTING_NO_FILL: Final[str] = "BOOT_SWEEP_RESTING_NO_FILL"
+
+SENDER_ABSENT_REASON: Final[str] = "order sender is not injected; this client refuses to submit"
+CANONICAL_UNVERIFIED_REASON: Final[str] = (
+    "write canonical string is unverified; this client refuses to submit"
+)
+PERMIT_ABSENT_REASON: Final[str] = (
+    "live-trading permit is absent or not a LiveTradingPermit; this client refuses to submit"
+)
+RECONCILE_NOT_RUN_REASON: Final[str] = (
+    "submit-intent reconcile_at_startup has not run; this client refuses to submit"
+)
+LATCH_ARM_REFUSED_REASON: Final[str] = (
+    "submit-intent latch refused to arm; this client refuses to submit"
+)
+#: SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check inside
+#: ``_submit_order``, evaluated on the same event-loop thread as ``arm()``
+#: with no ``await`` between them. A WAIT is not a refusal: it spends no
+#: permit, releases no booking (none was authorized yet), and does not latch
+#: ``_trading_refusals``. The strategy clears IN_FLIGHT for this station on
+#: seeing this exact reason (see ``ContinuousRungHoldStrategy.on_order_denied``).
+OPEN_INTENT_WAIT_REASON: Final[str] = (
+    "submit intent is already OPEN for this account; wait for it to resolve"
+)
+STORE_RAISED_REASON: Final[str] = (
+    "the durable store raised before the post; this client refuses to submit"
+)
+#: EXEC-PAR 3.3: plain denials from ``_submit_order`` (no permit, no booking,
+#: no ``_trading_refusals`` entry). Names only -- never a value.
+UNMAPPABLE_INSTRUMENT_REASON: Final[str] = (
+    "the order's instrument has no Polymarket.us market slug; this client refuses to submit"
+)
+BODY_SLUG_MISMATCH_REASON: Final[str] = (
+    "the wire body names a different market than the order's instrument; "
+    "this client refuses to submit"
+)
+BODY_QUANTITY_MISMATCH_REASON: Final[str] = (
+    "the wire body quantity differs from the order quantity; this client refuses to submit"
+)
+AMBIGUOUS_REASON: Final[str] = (
+    "create-order outcome is AMBIGUOUS; latch stays open and the booking is held"
+)
+
+#: AMBIG-LATCH-RESUME: "no venue order id yet", stored in the durable resolver
+#: context's ``venue_order_id`` by the PRE-POST write. The venue issues no
+#: client order id, so a no-id AMBIGUOUS has nothing to join on but the echo
+#: of our own wire body (see ``no_id_attribution``).
+NO_VENUE_ORDER_ID: Final[str] = ""
+
+ZERO: Final[Decimal] = Decimal(0)
+ONE: Final[Decimal] = Decimal(1)
+OPEN_PRICE_EXCLUSIVE_LOW: Final[Decimal] = Decimal("0.00")
+OPEN_PRICE_EXCLUSIVE_HIGH: Final[Decimal] = Decimal("1.00")
+
+ORDER_BODY_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "marketSlug",
+        "type",
+        "price",
+        "quantity",
+        "tif",
+        "outcomeSide",
+        "action",
+        "manualOrderIndicator",
+        "synchronousExecution",
+        "maxBlockTime",
+    }
+)
+
+#: The resting (GTD) create-order body: the IOC keys minus the two synchronous
+#: ones plus ``goodTillTime``. A rest is submitted ASYNCHRONOUSLY (the venue's
+#: own best practice, WP0 note (e)) and confirmed by a GET, so neither
+#: ``synchronousExecution`` nor ``maxBlockTime`` is sent. Exactly nine keys.
+RESTING_ORDER_BODY_KEYS: Final[frozenset[str]] = (
+    ORDER_BODY_KEYS - frozenset({"synchronousExecution", "maxBlockTime"})
+) | frozenset({"goodTillTime"})
+
+#: The highest NO price a resting order may be posted at. Re-valued 0.80 -> 0.89
+#: (the family's B_CAP) by ``RULING_MAKER_sharp_v1_live_small_2026-10-21``; pinned in
+#: ``tests/unit/test_cage_rule_constants_are_pinned.py``.
+RESTING_PRICE_CAP: Final[Decimal] = Decimal("0.89")
+
+#: Flipped to ``True`` only by a reviewed commit citing the positive-control
+#: artifact that proves the venue expires a GTD order at ``goodTillTime`` (S-6).
+#: While ``False`` the resting shape refuses every order (fail closed).
+#: ``True`` since ARM post-B2: S-6 PASS in
+#: ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json`` (sha256
+#: ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938): B echoed GTD within 1 s
+#: and the first EXPIRED was not early.
+GTD_EXPIRY_VERIFIED: Final[bool] = True
+
+#: The bounded GET-confirm that turns a 200+id async create into a bound rest:
+#: poll ``GET /v1/order/{id}`` every ``RESTING_CONFIRM_POLL_S`` for up to
+#: ``RESTING_CONFIRM_DEADLINE_S`` seconds (provisional RulePins, not operator
+#: controls; pinned in ``tests/unit/test_cage_rule_constants_are_pinned.py``).
+RESTING_CONFIRM_DEADLINE_S: Final[int] = 5
+RESTING_CONFIRM_POLL_S: Final[float] = 0.5
+#: Derived (never re-pinned separately): the deadline in nanoseconds.
+RESTING_CONFIRM_DEADLINE_NS: Final[int] = RESTING_CONFIRM_DEADLINE_S * 1_000_000_000
+#: The two verdicts of the confirm. ``NEW_VERIFIED`` is the ONLY value that
+#: binds a rest; every other observation is a ``HOLD`` (the with-id resolver
+#: decides).
+RESTING_CONFIRM_NEW: Final = "NEW_VERIFIED"
+RESTING_CONFIRM_HOLD: Final = "HOLD"
+#: The closed verdict vocabulary of the GET-confirm (a typo is a type error).
+RestingConfirmVerdict = Literal["NEW_VERIFIED", "HOLD"]
+#: The denial when the running supervisor cannot decode ``ACCEPTED_RESTING``.
+RESTING_NOT_ADMITTED_REASON: Final[str] = (
+    "the running supervisor does not list the ACCEPTED_RESTING retirement reason; "
+    "this client refuses to rest an order"
+)
+
+#: S4 WP4: the slug-scoped cancel-all stays DISABLED until a reviewed commit cites
+#: the positive-control artifact proving the venue honours the slug filter (S-2).
+#: While ``False`` the client's slug helper returns :data:`UNSCOPED_UNVERIFIED`
+#: without sending and every cancel is per-order. Pinned in the cage rule table.
+#: ``True`` since ARM post-B2: S-2 PASS over sibling slugs (``slugs_share_event`` true) in
+#: ``docs/evidence/b2/maker_positive_control_20261022T075159Z.json`` (sha256
+#: ffbed58ee17afef28668a029df16aa8da21d08698a8f01f368e761ccffc36938).
+SLUG_SCOPED_CANCEL_ALL_VERIFIED: Final[bool] = True
+UNSCOPED_UNVERIFIED: Final[str] = "UNSCOPED_UNVERIFIED"
+
+#: RETRY-WHEN-OPEN cancel loop pacing (provisional RulePins, not operator controls):
+#: the sleep after each full pass over the pending ids (the last value repeats),
+#: the age from the FIRST refused cancel at which a non-latching CRITICAL alert
+#: fires (re-alerting every ``RETRY_REALERT_S``), and the two terms of the latch
+#: deadline (:func:`cancel_latch_deadline_ns`).
+CANCEL_RETRY_BACKOFF_S: Final[tuple[float, ...]] = (5, 10, 20, 40, 60)
+RETRY_ALERT_AGE_S: Final[int] = 600
+RETRY_REALERT_S: Final[int] = 1800
+RETRY_LATCH_GRACE_S: Final[int] = 120
+RETRY_LATCH_FLOOR_S: Final[int] = 60
+#: B5 review G16: the wall-clock bound, in seconds, on the WHOLE boot sweep (every id's cancel
+#: POST + confirm GET and both open-orders reads), so a hung venue cannot hang ``_connect``.
+#: A timeout latches ``resting_cancel_unconfirmed``. A provisional RulePin, not an operator
+#: control.
+BOOT_SWEEP_DEADLINE_S: Final[float] = 120.0
+#: S4 WP5 / WP6: whether the venue's MAKER commission sign is VERIFIED (a rebate is negative).
+#: Nothing has observed an own passive fill yet, so the sign is unknown and the recognised
+#: commission (``reports.recognised_commission``) clamps a negative to zero everywhere it is
+#: booked. Flipped only by a reviewed commit citing the WP6 probe artifact (the first own
+#: passive fill); pinned in the cage rule table, never an operator control.
+MAKER_COMMISSION_SIGN_VERIFIED: Final[bool] = False
+#: The marker a POLL-booked maker fill carries in ``DurableFillRecord.trade_id`` (the record
+#: gains no key, r4 K1): ``POLL-<venue_order_id>``. The create path stores the venue's own
+#: trade id and the resolver stores ``GET-<venue_order_id>``, so this prefix alone says "booked
+#: by the resting-order poll, as MAKER". The ARM D1 harm-stop selector freezes on it.
+MAKER_POLL_TRADE_ID_PREFIX: Final[str] = "POLL-"
+#: Nautilus ``TradeId`` is at most 36 characters.
+_TRADE_ID_MAX_LEN: Final[int] = 36
+
+
+def maker_poll_trade_id(venue_order_id: str) -> str:
+    """The deterministic, visibly synthetic trade id of a poll-booked maker fill.
+
+    ``POLL-<venue_order_id>`` while that fits a native ``TradeId``; a longer venue id is
+    replaced by a digest of itself (same input, same output; no clock, no counter).
+    """
+    text = f"{MAKER_POLL_TRADE_ID_PREFIX}{venue_order_id}"
+    if len(text) <= _TRADE_ID_MAX_LEN:
+        return text
+    digest = hashlib.sha256(venue_order_id.encode("utf-8")).hexdigest()
+    keep = _TRADE_ID_MAX_LEN - len(MAKER_POLL_TRADE_ID_PREFIX)
+    return f"{MAKER_POLL_TRADE_ID_PREFIX}{digest[:keep]}"
+
+
+def is_maker_poll_fill(trade_id: str | None) -> bool:
+    """True iff a durable fill record's ``trade_id`` marks a poll-booked MAKER fill."""
+    return isinstance(trade_id, str) and trade_id.startswith(MAKER_POLL_TRADE_ID_PREFIX)
+
+
+def commission_sign_class(raw_text: str | None) -> str:
+    """``"-"`` / ``"0"`` / ``"+"`` / ``"?"`` for a venue commission string: the ONLY thing of
+    ``venue_fee_raw`` that may be logged. The sign is the string's first character; a zero
+    (any spelling, signed or not) is ``"0"``; an absent or non-numeric string is ``"?"``."""
+    if raw_text is None:
+        return "?"
+    try:
+        value = Decimal(raw_text)
+    except (InvalidOperation, ValueError):
+        return "?"
+    if not value.is_finite():
+        return "?"
+    if value == 0:
+        return "0"
+    return "-" if value < 0 else "+"
+
+
+#: Three consecutive failed polls of one bound id latch ``resting_query_unreadable``.
+RESTING_POLL_FAILURE_LATCH_COUNT: Final[int] = 3
+#: The two S4 CRITICAL latches. Both refuse NEW rests only (cancels continue); the
+#: clearing path is the terminal read of the subject id, else the next boot's sweep.
+RESTING_CANCEL_UNCONFIRMED_REASON: Final[str] = (
+    "resting_cancel_unconfirmed: a resting order's cancel could not be confirmed terminal; "
+    "new rests are refused (cancels continue)"
+)
+RESTING_QUERY_UNREADABLE_REASON: Final[str] = (
+    "resting_query_unreadable: a bound resting order could not be read three times running; "
+    "new rests are refused (cancels continue)"
+)
+#: S4 WP5: the two commission latches. Both refuse NEW rests only; a fill is ALWAYS still booked
+#: (L-48). Clearing path: both live in the client's in-memory refusal list, so a node restart
+#: after the operator reviewed the venue's fee behaviour clears them; there is no auto-clear.
+RESTING_COMMISSION_OUT_OF_ENVELOPE_REASON: Final[str] = (
+    "resting_commission_out_of_envelope: a resting fill's commission exceeded the modelled taker "
+    "fee; the fill is booked, new rests are refused (cancels continue)"
+)
+#: B6 review H1: half a cent of slack on the commission envelope. A provisional RulePin, not an
+#: operator control (pinned in the cage rule table); widening lets a larger over-charge pass
+#: unlatched, narrowing re-opens the false latch on an ordinary fill.
+COMMISSION_ENVELOPE_SLACK_USD: Final[Decimal] = Decimal("0.005")
+_ONE_CENT: Final[Decimal] = Decimal("0.01")
+
+
+def commission_envelope_bound(*, modelled: Decimal, exact: Decimal) -> Decimal:
+    """The largest commission, in USD, a resting fill may carry without latching
+    ``resting_commission_out_of_envelope``.
+
+    ``max(modelled cent fee, exact unrounded theta*q*p*(1-p), that exact fee rounded UP to
+    the next cent) + COMMISSION_ENVELOPE_SLACK_USD``. The modelled (banker's-rounded) fee alone
+    is 0.01 across the whole 0.75-0.89 band and 0.00 below ~0.07 / above ~0.93, so a venue that
+    charges the unrounded fee, or rounds up, would otherwise latch on an ordinary fill.
+    """
+    rounded_up = exact.quantize(_ONE_CENT, rounding=ROUND_CEILING)
+    return max(modelled, exact, rounded_up) + COMMISSION_ENVELOPE_SLACK_USD
+
+
+RESTING_COMMISSION_UNREADABLE_REASON: Final[str] = (
+    "commission_unreadable: a resting fill's commission was absent or unreadable; the fill is "
+    "booked at the modelled taker fee (unreconciled), new rests are refused (cancels continue)"
+)
+COMMISSION_BPS_DRIFT_REASON: Final[str] = (
+    "commission_bps_drift: a resting order's commission bps fields left the observed inert "
+    "value; the fill is booked, new rests are refused (cancels continue)"
+)
+
+#: Verdicts of :func:`cancel_read_verdict` (what a GET of a cancelled order proves).
+CANCEL_READ_CANCELED: Final[str] = "CANCELED"
+CANCEL_READ_EXPIRED: Final[str] = "EXPIRED"
+#: A zero-fill venue REJECTED (r4 section 6: verdicts follow the native ``OrderStatus``, so it
+#: is its own verdict and retires with ``OrderRejected``, not ``OrderCanceled``).
+CANCEL_READ_REJECTED: Final[str] = "REJECTED"
+CANCEL_READ_FILLED: Final[str] = "FILLED"
+CANCEL_READ_OPEN: Final[str] = "OPEN"
+CANCEL_READ_UNREADABLE: Final[str] = "UNREADABLE"
+_CANCEL_TERMINAL_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "ORDER_STATE_FILLED",
+        "ORDER_STATE_CANCELED",
+        "ORDER_STATE_EXPIRED",
+        "ORDER_STATE_REJECTED",
+    }
+)
+_OPEN_ORDERS_KNOWN_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({"orders", "eof"})
+_CANCEL_OPEN_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "ORDER_STATE_NEW",
+        "ORDER_STATE_PENDING_NEW",
+        "ORDER_STATE_PENDING_RISK",
+        "ORDER_STATE_PENDING_CANCEL",
+        "ORDER_STATE_PARTIALLY_FILLED",
+    }
+)
+
+#: The venue's GTD time-in-force token (public: the client's resting echo reuses it).
+TIF_GTD: Final[str] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+_TIF_GTD: Final[str] = TIF_GTD
+_NANOS_PER_SECOND: Final[int] = 1_000_000_000
+_NANOS_PER_DAY: Final[int] = 86_400 * _NANOS_PER_SECOND
+#: ``goodTillTime`` is sent in whole seconds and the venue echoes whole seconds;
+#: the confirm accepts an echo within this many nanoseconds of what was sent.
+_GOOD_TILL_ECHO_TOLERANCE_NS: Final[int] = _NANOS_PER_SECOND
+
+#: The ONLY market grammar the resting path admits: ``tc-temp-<city3>high-<date>-<bounds>``.
+#: Deliberately its OWN pattern, ASCII-only and applied with ``fullmatch`` -- NOT
+#: ``symbology.parse_weather_slug`` (frozen; its ``$``/``match`` accepts a trailing
+#: newline, and it also admits daily-LOW slugs).
+_DAILY_HIGH_SLUG_RE: Final[re.Pattern[str]] = re.compile(
+    r"tc-temp-[a-z]{3}high-(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})"
+    r"-(?:(?:gte|lte|gt|lt)\d{1,3}){1,2}f",
+    re.ASCII,
+)
+
+_IOC_ZERO_FILL_TERMINAL_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "ORDER_STATE_CANCELED",
+        "ORDER_STATE_REJECTED",
+        "ORDER_STATE_EXPIRED",
+    }
+)
+_LATCH_ARM_REFUSAL_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "SubmitIntentLatched",
+        "SubmitIntentAdmissionDenied",
+        "SubmitIntentInvalidFingerprint",
+        "SubmitIntentLockNotHeld",
+    }
+)
+_OUTCOME_SIDE_YES: Final[str] = "OUTCOME_SIDE_YES"
+_OUTCOME_SIDE_NO: Final[str] = "OUTCOME_SIDE_NO"
+_ORDER_ACTION_BUY: Final[str] = "ORDER_ACTION_BUY"
+#: The closing (sell) counterpart of `_ORDER_ACTION_BUY`, defined the exact
+#: same way -- a `Final` module constant, never assembled from parts. The
+#: X3 banned-token set (see the firewall guard's `BANNED_EXEC_DIRECTION_TOKENS`)
+#: bans the naked-short vocabulary this value is NOT: it carries none of
+#: those banned substrings (verified by
+#: `tests/unit/test_execution_egress_firewall_guard.py`'s X3 scan).
+_ORDER_ACTION_SELL: Final[str] = "ORDER_ACTION_SELL"
+_ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
+_TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+_MANUAL_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
+_MAX_BLOCK_TIME: Final[str] = "5"
+
+
+@dataclass(frozen=True, slots=True)
+class FillGeneration:
+    """Native arguments for ``generate_order_filled``, never a synthesised fill."""
+
+    venue_order_id: VenueOrderId
+    trade_id: TradeId
+    last_qty: Quantity
+    last_px: Price
+    commission: Money
+    commission_raw: str
+    ts_event: int
+    filled_cost_usd: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class CreateOrderOutcome:
+    """One classified create-order response. Absence of a field is absence.
+
+    ``cumulative_qty``/``cumulative_cost``/``cumulative_fee``/
+    ``fee_reconciled`` are the I1a order-level totals (LIVE_FILL_SCORING_CHAIN
+    plan, section "I1a"): populated on ``KIND_ACCEPT_FILL`` only, ``None``/
+    ``False`` on every other kind.
+    """
+
+    kind: str
+    reason: str
+    retirement_name: str | None
+    venue_order_id: str | None
+    fill: FillGeneration | None
+    filled_cost_usd: Decimal | None
+    cumulative_qty: Decimal | None
+    cumulative_cost: Decimal | None
+    cumulative_fee: Decimal | None
+    fee_reconciled: bool
+    generate_submitted: bool
+    #: Redacted, log-only summary of every classified outcome (never ``None``).
+    #: Carries only shape and length -- status code, a coarse ``body_kind``,
+    #: the ``google.rpc.Status`` code when present, and the raw body's byte
+    #: length -- never the body content itself, so it is always safe to log
+    #: even though the body may be adversarial or carry venue-side account
+    #: details.
+    detail: str | None = None
+    #: The ``ExecutionReportMappingError`` message :func:`fill_generation`
+    #: caught and swallowed to ``None``, when an ``executions``-present,
+    #: 200-with-order-id body still ended up ``KIND_AMBIGUOUS`` because the
+    #: nested order/execution shape did not map. ``None`` on every kind
+    #: except that fallthrough. Names-only (the mapper's own message,
+    #: including its full key tree per ``reports.py``'s ``_key_tree`` --
+    #: never a value), so it is safe to log verbatim: it is what turns a
+    #: fee-unreconciled, excluded-from-``n`` AMBIGUOUS into a diagnosable one
+    #: instead of a silent ``return None``.
+    fill_parse_error: str | None = None
+
+
+def latched_refusal_reason(first_reason: str) -> str:
+    return (
+        "this client has latched a trading refusal and will not act on "
+        f"venue state it could not attribute: {first_reason}"
+    )
+
+
+def missing_account_reason(venue: object) -> str:
+    return f"no AccountState is cached for {venue}, so every Nautilus risk cap is inert; refusing"
+
+
+def permit_is_missing(permit: object) -> bool:
+    return type(permit).__name__ != "LiveTradingPermit"
+
+
+def is_latch_arm_refusal(exc: BaseException) -> bool:
+    return type(exc).__name__ in _LATCH_ARM_REFUSAL_TYPES
+
+
+def is_cancelled(exc: BaseException) -> bool:
+    return type(exc).__name__ == "CancelledError"
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    return isinstance(exc, VenueTransportError)
+
+
+def order_price_decimal(order: object) -> Decimal:
+    price = getattr(order, "price", None)
+    if price is None:
+        raise ValueError("limit order carries no price")
+    as_decimal = getattr(price, "as_decimal", None)
+    if callable(as_decimal):
+        return Decimal(str(as_decimal()))
+    return Decimal(str(price))
+
+
+def order_quantity_decimal(order: object) -> Decimal:
+    quantity = getattr(order, "quantity", None)
+    if quantity is None:
+        raise ValueError("order carries no quantity")
+    as_decimal = getattr(quantity, "as_decimal", None)
+    if callable(as_decimal):
+        return Decimal(str(as_decimal()))
+    return Decimal(str(quantity))
+
+
+def order_notional_usd(order: object) -> Decimal:
+    return order_price_decimal(order) * order_quantity_decimal(order)
+
+
+_FINGERPRINT_VERSION: Final[bytes] = b"breezy.exec.request-fingerprint.v1"
+
+
+def request_fingerprint(*, method: str, path: str, body: bytes) -> bytes:
+    """The ONE permit fingerprint: a versioned, length-framed SHA-256 digest
+    over the exact wire request -- uppercase ``method``, exact ``path``, and
+    the exact encoded ``body`` bytes actually handed to the transport.
+
+    BL-10: replaces the retired ``order_fingerprint_bytes``, which hashed
+    caller-chosen Nautilus order fields never bound to the wire body. Call
+    this ONCE, over the SAME ``encoded`` body passed to ``post_order``, and
+    bind both ``assert_live_order_submission_permitted`` and the returned
+    capability's ``consume()`` to its result -- see ``client.py::
+    _submit_order`` and ``safety.py``'s ``LiveOrderSubmissionAuthorization``.
+    """
+    parts = (
+        _FINGERPRINT_VERSION,
+        method.upper().encode("ascii"),
+        path.encode("utf-8"),
+        body,
+    )
+    framed = b"".join(len(part).to_bytes(8, "big") + part for part in parts)
+    return hashlib.sha256(framed).digest()
+
+
+#: Alias used ONLY at the one call site inside `_submit_order` (the coroutine
+#: `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES` AST-scans). That allowlist bans
+#: any callee whose dotted name contains "read"/"send"/"post"/"request" --
+#: the one sanctioned egress call, `self._order_sender.post_order`, is the
+#: sole exemption -- so `request_fingerprint` itself cannot appear there
+#: (see `test_the_order_coroutine_callee_allowlist_reaches_no_venue`'s own
+#: docstring on `order_fingerprint_bytes`, which named itself for the same
+#: reason). The PUBLIC name stays `request_fingerprint`, directly importable
+#: and unit-tested; this alias is a pure rebinding, never a second
+#: implementation.
+wire_fingerprint_bytes = request_fingerprint
+
+
+def _outcome_token(instrument: object) -> str | None:
+    """Map ``instrument`` to its order-body ``outcomeSide`` value.
+
+    Keyed on :func:`leg_of` (the composite ``InstrumentId``), NEVER on the
+    free-text ``outcome`` string -- the parse the parent plan forbids
+    (``parsing.py:1211-1221``). ``info[LEG_KEY]`` is a cross-check that must
+    agree; disagreement is a refusal (``ValueError``), never a fallback.
+    Returns ``None`` only when the instrument carries no resolvable id.
+    """
+    instrument_id = getattr(instrument, "id", None)
+    if instrument_id is None:
+        return None
+    id_leg = leg_of(instrument_id)
+    info = getattr(instrument, "info", None)
+    info_leg = info.get(LEG_KEY) if isinstance(info, Mapping) else None
+    if info_leg is not None and info_leg != id_leg:
+        raise ValueError(
+            f"instrument id leg {id_leg!r} contradicts info[{LEG_KEY!r}]={info_leg!r}; refusing"
+        )
+    return _OUTCOME_SIDE_NO if id_leg == LEG_NO else _OUTCOME_SIDE_YES
+
+
+_WHOLE_CENT: Final[Decimal] = Decimal("0.01")
+NOT_WHOLE_CENT_REASON: Final[str] = (
+    "order price is not a whole cent; the wire renders two decimals and would "
+    "post a different price; refusing"
+)
+
+
+def _is_whole_cent(price: Decimal) -> bool:
+    """True iff ``price`` has no sub-cent part (``f"{p:.2f}"`` is lossless)."""
+    return price == price.quantize(_WHOLE_CENT)
+
+
+def unmappable_order_reason(order: object, instrument: object) -> str | None:
+    """Return a denial reason when the order cannot be mapped, else None."""
+    if instrument is None or not isinstance(instrument, BinaryOption):
+        return "instrument is not a BinaryOption; refusing"
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    if not slug.strip():
+        return "instrument has no resolvable market slug; refusing"
+    if getattr(order, "order_type", None) is not OrderType.LIMIT:
+        return "only a LIMIT order is mappable; refusing"
+    if getattr(order, "time_in_force", None) is not TimeInForce.IOC:
+        return "only an IOC order is mappable; refusing"
+    if getattr(order, "side", None) is not OrderSide.BUY:
+        return "only a BUY is mappable (a SELL is a naked short); refusing"
+    try:
+        quantity = order_quantity_decimal(order)
+        price = order_price_decimal(order)
+    except (TypeError, ValueError, InvalidOperation):
+        return "order price or quantity is unreadable; refusing"
+    if quantity != ONE:
+        return "only a 1-contract order is mappable; refusing"
+    if price <= OPEN_PRICE_EXCLUSIVE_LOW or price >= OPEN_PRICE_EXCLUSIVE_HIGH:
+        return "price must be strictly inside (0.00, 1.00); refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
+    if getattr(order, "is_post_only", False):
+        return "post-only is not mappable; refusing"
+    if getattr(order, "is_reduce_only", False):
+        return "reduce-only is not mappable; refusing"
+    display_qty = getattr(order, "display_qty", None)
+    if display_qty is not None:
+        return "display_qty is not mappable; refusing"
+    expire_time = getattr(order, "expire_time", None)
+    if expire_time is not None:
+        return "expire_time is not mappable; refusing"
+    has_trigger = getattr(order, "has_trigger_price", False)
+    if has_trigger is True or (callable(has_trigger) and has_trigger()):
+        return "trigger_price is not mappable; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side is None:
+        return "no order-body outcome side is derivable from the instrument; refusing"
+    return None
+
+
+def build_order_body(order: object, instrument: object) -> dict[str, Any]:
+    """Return the exact CreateOrderRequest key set. Caller has already mapped."""
+    reason = unmappable_order_reason(order, instrument)
+    if reason is not None:
+        raise ValueError(reason)
+    price = order_price_decimal(order)
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    outcome_side = _outcome_token(instrument)
+    if outcome_side is None:
+        raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
+    # Rev 5 (E5-1): the venue's `price.value` always represents the YES/long
+    # side's price -- identity on the YES leg, `1 - price` on the NO leg.
+    # The complement lives in `leg_prices` (outside `exec/`, where X3 bans
+    # the arithmetic); `intent_fingerprint` still hashes `order.price`, the
+    # Nautilus (instrument) price, never this wire value.
+    wire_price = wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
+    return {
+        "marketSlug": slug,
+        "type": _ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
+        "quantity": 1,
+        "tif": _TIF_IOC,
+        "outcomeSide": outcome_side,
+        "action": _ORDER_ACTION_BUY,
+        "manualOrderIndicator": _MANUAL_AUTOMATIC,
+        "synchronousExecution": True,
+        "maxBlockTime": _MAX_BLOCK_TIME,
+    }
+
+
+def is_daily_high_slug(slug: object) -> bool:
+    """True only for a daily-HIGH weather slug: ASCII, ``fullmatch``, real date.
+
+    The resting path's own admission check (independent of the frozen
+    ``symbology`` parser): a trailing newline, a fullwidth digit, a LOW measure,
+    an impossible calendar date or a composite instrument symbol is refused.
+    """
+    if not isinstance(slug, str) or not slug.isascii():
+        return False
+    match = _DAILY_HIGH_SLUG_RE.fullmatch(slug)
+    if match is None:
+        return False
+    try:
+        date(int(match.group("y")), int(match.group("m")), int(match.group("d")))
+    except ValueError:
+        return False
+    return True
+
+
+def format_good_till_time(expire_ns: int) -> str:
+    """Render ``expire_ns`` (UNIX nanoseconds) as the request ``goodTillTime``.
+
+    RFC 3339 UTC whole seconds (``YYYY-MM-DDTHH:MM:SSZ``), FLOORED: the venue
+    never holds an order past the strategy's own ``expire_time``. Pure integer
+    arithmetic; a non-int, a bool or a non-positive value is a ``ValueError``.
+    """
+    if isinstance(expire_ns, bool) or not isinstance(expire_ns, int) or expire_ns <= 0:
+        raise ValueError("goodTillTime needs a positive integer nanosecond timestamp")
+    try:
+        moment = datetime.fromtimestamp(expire_ns // _NANOS_PER_SECOND, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("goodTillTime is outside the representable range") from None
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _resting_shape_reason(order: object, instrument: object) -> str | None:
+    """Every resting-shape rule that needs neither the clock nor the permit."""
+    if instrument is None or not isinstance(instrument, BinaryOption):
+        return "instrument is not a BinaryOption; refusing"
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    if not slug.strip():
+        return "instrument has no resolvable market slug; refusing"
+    if not is_daily_high_slug(slug):
+        return "resting orders are admitted only on a daily HIGH weather market; refusing"
+    if getattr(order, "order_type", None) is not OrderType.LIMIT:
+        return "only a LIMIT order is mappable; refusing"
+    if getattr(order, "time_in_force", None) is not TimeInForce.GTD:
+        return "only a GTD order is mappable as a resting order; refusing"
+    if getattr(order, "side", None) is not OrderSide.BUY:
+        return "only a BUY is mappable (a SELL is a naked short); refusing"
+    try:
+        quantity = order_quantity_decimal(order)
+        price = order_price_decimal(order)
+    except (TypeError, ValueError, InvalidOperation):
+        return "order price or quantity is unreadable; refusing"
+    if quantity != ONE:
+        return "only a 1-contract order is mappable; refusing"
+    if price <= OPEN_PRICE_EXCLUSIVE_LOW or price > RESTING_PRICE_CAP:
+        return "resting price must be inside (0.00, RESTING_PRICE_CAP]; refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
+    if getattr(order, "is_post_only", False):
+        return "post-only is not mappable; refusing"
+    if getattr(order, "is_reduce_only", False):
+        return "reduce-only is not mappable; refusing"
+    if getattr(order, "display_qty", None) is not None:
+        return "display_qty is not mappable; refusing"
+    has_trigger = getattr(order, "has_trigger_price", False)
+    if has_trigger is True or (callable(has_trigger) and has_trigger()):
+        return "trigger_price is not mappable; refusing"
+    expire_ns = getattr(order, "expire_time_ns", 0)
+    if isinstance(expire_ns, bool) or not isinstance(expire_ns, int) or expire_ns <= 0:
+        return "a GTD order needs a positive expire_time; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side != _OUTCOME_SIDE_NO:
+        return "only the NO leg is mappable as a resting order; refusing"
+    return None
+
+
+def unmappable_resting_order_reason(
+    order: object,
+    instrument: object,
+    *,
+    permit_expires_at_ns: int,
+    now_ns: int,
+    gtd_expiry_verified: bool,
+) -> str | None:
+    """Return a denial reason when the order is not an admissible rest, else None.
+
+    Admits only: LIMIT, BUY, qty 1, the NO leg of a daily-HIGH market, price in
+    (0, :data:`RESTING_PRICE_CAP`], ``TimeInForce.GTD`` (GTC refused), and
+    ``now < expire_time <= min(permit_expires_at_ns, end of the UTC day)``; no
+    post-only/reduce-only/display/trigger. Refuses outright while
+    ``gtd_expiry_verified`` is not ``True`` (the caller passes
+    :data:`GTD_EXPIRY_VERIFIED`). The IOC and exit shapes are untouched.
+    """
+    if gtd_expiry_verified is not True:
+        return "GTD expiry is unverified; this client refuses to rest an order"
+    reason = _resting_shape_reason(order, instrument)
+    if reason is not None:
+        return reason
+    for label, value in (("permit expiry", permit_expires_at_ns), ("now", now_ns)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"{label} must be a positive integer nanosecond timestamp; refusing"
+    expire_ns = int(getattr(order, "expire_time_ns", 0))
+    day_end_ns = (now_ns // _NANOS_PER_DAY + 1) * _NANOS_PER_DAY
+    if expire_ns <= now_ns:
+        return "expire_time must be in the future; refusing"
+    if expire_ns > min(permit_expires_at_ns, day_end_ns):
+        return "expire_time is past the permit expiry or the end of the UTC day; refusing"
+    return None
+
+
+def build_resting_order_body(order: object, instrument: object) -> dict[str, Any]:
+    """Return the exact nine-key resting CreateOrderRequest. Caller has mapped.
+
+    Re-applies the clock-free shape rules (the window and gate are the caller's:
+    ``unmappable_resting_order_reason``). ASYNC by construction: no
+    ``synchronousExecution``, no ``maxBlockTime``.
+    """
+    reason = _resting_shape_reason(order, instrument)
+    if reason is not None:
+        raise ValueError(reason)
+    price = order_price_decimal(order)
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    wire_price = wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
+    return {
+        "marketSlug": slug,
+        "type": _ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
+        "quantity": 1,
+        "tif": _TIF_GTD,
+        "outcomeSide": _OUTCOME_SIDE_NO,
+        "action": _ORDER_ACTION_BUY,
+        "manualOrderIndicator": _MANUAL_AUTOMATIC,
+        "goodTillTime": format_good_till_time(int(getattr(order, "expire_time_ns", 0))),
+    }
+
+
+def _echo_expire_ns(value: object, *, field: str) -> int:
+    return parse_rfc3339_nanos(value, field=field, error=ExecutionReportMappingError)
+
+
+def resting_echo_matches(
+    report: object, wire_echo: Mapping[str, Any], venue_order: Mapping[str, Any]
+) -> bool:
+    """True iff the venue's view of a rest matches the body we posted.
+
+    ``report`` is the native ``OrderStatusReport`` parsed from the confirm GET;
+    ``wire_echo`` is the body sent (:func:`build_resting_order_body`);
+    ``venue_order`` is the raw ``Order`` mapping of that same GET (the report
+    carries neither the slug nor ``goodTillTime``). Compared: slug (wire, venue
+    order and the report's instrument), outcome leg and BUY via the LEG MAPPING
+    (the NO leg is a venue SELL; a raw ``side`` comparison would be wrong),
+    price (the report's instrument-side price against the leg-translated wire
+    price), quantity, TIF GTD, and ``goodTillTime`` within one second. Anything
+    unreadable is ``False``; this never raises. It decides nothing about the
+    order STATE: the caller still requires ``ACCEPTED`` and ``filled_qty == 0``.
+
+    ``venue_order["manualOrderIndicator"]`` must equal the AUTOMATIC value the
+    body carried; a MANUAL, absent or unrecognised value is ``False`` (fail-closed:
+    the WP0 discovery, ``MAKER_S4_WP0_VENUE_DISCOVERY_2026-10-13.md`` S-3, saw the
+    key on the wire of every observed ``Order``).
+    """
+    try:
+        leg = leg_of(getattr(report, "instrument_id"))  # noqa: B009
+        expected_side = _OUTCOME_SIDE_NO if leg == LEG_NO else _OUTCOME_SIDE_YES
+        slug = wire_echo["marketSlug"]
+        if (
+            wire_echo["outcomeSide"] != expected_side
+            or wire_echo["action"] != _ORDER_ACTION_BUY
+            or getattr(report, "order_side", None) is not OrderSide.BUY
+            or venue_order["marketSlug"] != slug
+            or base_slug_of(getattr(report, "instrument_id")) != slug  # noqa: B009
+            or wire_echo["tif"] != _TIF_GTD
+            or getattr(report, "time_in_force", None) is not TimeInForce.GTD
+            # Fail-closed (B4 review F2): only an order the venue marks AUTOMATIC is
+            # ours. MANUAL, absent or unrecognised is a mismatch; a KeyError on an
+            # absent key is caught below and is also False.
+            or venue_order["manualOrderIndicator"] != _MANUAL_AUTOMATIC
+        ):
+            return False
+        wire_price = Decimal(str(wire_echo["price"]["value"]))
+        report_price = getattr(report, "price", None)
+        if report_price is None or instrument_price_for_leg(leg, wire_price) != Decimal(
+            str(report_price)
+        ):
+            return False
+        report_quantity = getattr(report, "quantity", None)
+        if report_quantity is None or Decimal(str(report_quantity)) != Decimal(
+            str(wire_echo["quantity"])
+        ):
+            return False
+        sent = _echo_expire_ns(wire_echo["goodTillTime"], field="wire goodTillTime")
+        seen = _echo_expire_ns(venue_order["goodTillTime"], field="venue goodTillTime")
+        return abs(seen - sent) <= _GOOD_TILL_ECHO_TOLERANCE_NS
+    except (
+        ArithmeticError,
+        AttributeError,
+        ExecutionReportMappingError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _cum_reaches_quantity(cum: Decimal, raw_quantity: object) -> bool:
+    """True iff the echoed ``quantity`` is a positive finite number and ``cum`` reaches it."""
+    if raw_quantity is None or isinstance(raw_quantity, bool):
+        return False
+    try:
+        quantity = Decimal(str(raw_quantity))
+    except (InvalidOperation, ValueError):
+        return False
+    return quantity.is_finite() and quantity > 0 and cum >= quantity
+
+
+def cancel_read_verdict(
+    order: object, *, expected_id: str | None = None, expected_slug: str | None = None
+) -> str:
+    """What one GET of an order proves about its cancel (pure, never raises).
+
+    When ``expected_id`` / ``expected_slug`` are given the body must ECHO them exactly (an
+    absent or different ``id`` / ``marketSlug`` is ``UNREADABLE``, B5 review G15): the read
+    answers for the order that was asked about, or it proves nothing.
+
+    ``FILLED`` for a cumulative fill on an order that is DONE -- a terminal state (even
+    one the venue cancelled: the fill path owns it, a cancel never settles it) or a
+    ``cumQuantity`` that has reached the echoed ``quantity``. A fill on a still-LIVE
+    state (a partial: the rest still rests) is ``OPEN``, so the cancel keeps retrying
+    (B5 review G4); a fill on an unknown state is ``UNREADABLE``. ``CANCELED`` /
+    ``EXPIRED`` only for a zero-fill terminal state with ``cumQuantity`` PRESENT and
+    zero (a venue ``REJECTED`` is its own verdict, ``REJECTED``: the native
+    ``OrderStatus.REJECTED``, r4 section 6); ``OPEN`` for a live state; everything
+    else (not an object, a missing or
+    non-numeric or negative ``cumQuantity``, an unknown state, a FILLED state
+    with nothing filled) is ``UNREADABLE``. A bare 200 on the cancel POST is
+    never an input here: only a read of the order is.
+    """
+    if not isinstance(order, Mapping):
+        return CANCEL_READ_UNREADABLE
+    if (expected_id is not None and order.get("id") != expected_id) or (
+        expected_slug is not None and order.get("marketSlug") != expected_slug
+    ):
+        return CANCEL_READ_UNREADABLE
+    state = order.get("state")
+    raw_cum = order.get("cumQuantity")
+    if not isinstance(state, str) or raw_cum is None or isinstance(raw_cum, bool):
+        return CANCEL_READ_UNREADABLE
+    try:
+        cum = Decimal(str(raw_cum))
+    except (InvalidOperation, ValueError):
+        return CANCEL_READ_UNREADABLE
+    if not cum.is_finite() or cum < 0:
+        return CANCEL_READ_UNREADABLE
+    if cum > 0:
+        if state in _CANCEL_TERMINAL_STATES or _cum_reaches_quantity(cum, order.get("quantity")):
+            return CANCEL_READ_FILLED
+        return CANCEL_READ_OPEN if state in _CANCEL_OPEN_STATES else CANCEL_READ_UNREADABLE
+    if state == "ORDER_STATE_CANCELED":
+        return CANCEL_READ_CANCELED
+    if state == "ORDER_STATE_REJECTED":
+        return CANCEL_READ_REJECTED
+    if state == "ORDER_STATE_EXPIRED":
+        return CANCEL_READ_EXPIRED
+    if state in _CANCEL_OPEN_STATES:
+        return CANCEL_READ_OPEN
+    return CANCEL_READ_UNREADABLE
+
+
+def cancel_backoff_s(pass_no: int) -> float:
+    """The sleep after the ``pass_no``-th full pass of the cancel loop (1-based):
+    the table in :data:`CANCEL_RETRY_BACKOFF_S`, its last value repeating."""
+    table = CANCEL_RETRY_BACKOFF_S
+    return table[min(max(pass_no, 1), len(table)) - 1]
+
+
+def cancel_latch_deadline_ns(first_refused_ns: int, expire_time_ns: int) -> int:
+    """When an unconfirmed cancel latches: the LATER of the order's expiry plus
+    :data:`RETRY_LATCH_GRACE_S` and the first refusal plus the alert age plus
+    :data:`RETRY_LATCH_FLOOR_S`. Since the floor is positive the non-latching alert
+    (first refusal + :data:`RETRY_ALERT_AGE_S`) is STRICTLY earlier for every input.
+    """
+    return max(
+        expire_time_ns + RETRY_LATCH_GRACE_S * _NANOS_PER_SECOND,
+        first_refused_ns + (RETRY_ALERT_AGE_S + RETRY_LATCH_FLOOR_S) * _NANOS_PER_SECOND,
+    )
+
+
+def open_orders_envelope_is_known(payload: object) -> bool:
+    """True iff an open-orders response carries only the declared envelope keys
+    (``orders``, ``eof``). A future ``nextCursor`` is NOT known: a sweep certifying
+    "nothing open" must refuse a page it cannot prove is the whole book."""
+    return isinstance(payload, Mapping) and set(payload) <= _OPEN_ORDERS_KNOWN_ENVELOPE_KEYS
+
+
+def resting_binding_bytes(
+    *, intent_id: str, slug: str, client_order_id: str, expire_time_ns: int
+) -> bytes:
+    """The durable ``resting:{venue_order_id}`` row of a bound rest (pure)."""
+    return json.dumps(
+        {
+            "intentId": intent_id,
+            "slug": slug,
+            "clientOrderId": client_order_id,
+            "expireTimeNs": expire_time_ns,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def resting_index_bytes(venue_order_ids: list[str]) -> bytes:
+    """The durable ``resting:index`` value: the bound venue order ids (pure)."""
+    return json.dumps(venue_order_ids).encode("utf-8")
+
+
+class ExitAuthorizationLike(Protocol):
+    """Structural shape this module needs from a strategy-authored exit
+    authorisation (`breezy.strategy.current_rung_hold.exit_authorization.
+    ExitAuthorization`).
+
+    Adapters never import `strategy/` (the importlinter layer contract
+    places `strategy` above `adapters`; see that module's own docstring), so
+    this file cannot name the dataclass directly. Declaring only the
+    attributes actually consumed below -- never the whole dataclass shape --
+    keeps this protocol minimal and lets the real object satisfy it with no
+    inheritance and no adapter-side import, proven in
+    `tests/unit/test_polymarket_us_exit_submit_chain_2026_09_16.py`.
+    `quantity` is typed `int` to match the real dataclass's own field type
+    exactly (mirrors `FamilyIdentity` in `settlement/family_barrier.py`,
+    the same structural-typing idiom for a cross-layer boundary). Every
+    member is a read-only `@property`, not a plain attribute: the real
+    dataclass is `frozen=True`, so mypy treats its fields as read-only, and a
+    plain (implicitly settable) protocol attribute would refuse to match a
+    read-only one.
+    """
+
+    @property
+    def family_id(self) -> str: ...
+    @property
+    def position_id(self) -> str: ...
+    @property
+    def client_order_id(self) -> str: ...
+    @property
+    def leg(self) -> Leg: ...
+    @property
+    def quantity(self) -> int: ...
+    @property
+    def limit_price(self) -> Decimal: ...
+
+
+def _unmappable_exit_shape_reason(
+    order: object, instrument: object, authorization: ExitAuthorizationLike
+) -> str | None:
+    """Every BUY-path shape rule (`unmappable_order_reason`), re-applied to
+    a closing SELL, plus the authorisation/order attribution cross-checks.
+
+    Shared by `unmappable_exit_order_reason` (which adds the manifest exit
+    gate) and `build_exit_order_body` (which receives no manifest), so
+    neither duplicates the other's shape logic.
+    """
+    if instrument is None or not isinstance(instrument, BinaryOption):
+        return "instrument is not a BinaryOption; refusing"
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    if not slug.strip():
+        return "instrument has no resolvable market slug; refusing"
+    if getattr(order, "order_type", None) is not OrderType.LIMIT:
+        return "only a LIMIT order is mappable; refusing"
+    if getattr(order, "time_in_force", None) is not TimeInForce.IOC:
+        return "only an IOC order is mappable; refusing"
+    if getattr(order, "side", None) is not OrderSide.SELL:
+        return "only a SELL is mappable for a closing exit (a BUY does not close a long); refusing"
+    try:
+        quantity = order_quantity_decimal(order)
+        price = order_price_decimal(order)
+    except (TypeError, ValueError, InvalidOperation):
+        return "order price or quantity is unreadable; refusing"
+    if quantity != ONE:
+        return "only a 1-contract order is mappable; refusing"
+    if price <= OPEN_PRICE_EXCLUSIVE_LOW or price >= OPEN_PRICE_EXCLUSIVE_HIGH:
+        return "price must be strictly inside (0.00, 1.00); refusing"
+    if not _is_whole_cent(price):
+        return NOT_WHOLE_CENT_REASON
+    if getattr(order, "is_post_only", False):
+        return "post-only is not mappable; refusing"
+    if getattr(order, "is_reduce_only", False):
+        return "reduce-only is not mappable; refusing"
+    display_qty = getattr(order, "display_qty", None)
+    if display_qty is not None:
+        return "display_qty is not mappable; refusing"
+    expire_time = getattr(order, "expire_time", None)
+    if expire_time is not None:
+        return "expire_time is not mappable; refusing"
+    has_trigger = getattr(order, "has_trigger_price", False)
+    if has_trigger is True or (callable(has_trigger) and has_trigger()):
+        return "trigger_price is not mappable; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side is None:
+        return "no order-body outcome side is derivable from the instrument; refusing"
+    instrument_leg = leg_of(getattr(instrument, "id"))  # noqa: B009
+    if authorization.leg != instrument_leg:
+        return "authorization leg does not match the instrument leg; refusing"
+    order_client_order_id = str(getattr(order, "client_order_id", ""))
+    if authorization.client_order_id != order_client_order_id:
+        return "authorization client_order_id does not match the order; refusing"
+    if not authorization.position_id:
+        return "authorization carries no position_id; refusing"
+    order_position_id = getattr(order, "position_id", None)
+    if order_position_id is not None and authorization.position_id != str(order_position_id):
+        return "authorization position_id does not match the order; refusing"
+    if Decimal(authorization.quantity) != quantity:
+        return "authorization quantity does not match the order; refusing"
+    if authorization.limit_price != price:
+        return "authorization limit_price does not match the order; refusing"
+    return None
+
+
+def unmappable_exit_order_reason(
+    order: object,
+    instrument: object,
+    authorization: ExitAuthorizationLike | None,
+    manifest: FamilyManifest,
+) -> str | None:
+    """Return a denial reason when the closing order cannot be mapped, else
+    `None`. Reachable only with a real `authorization` -- a missing one is a
+    caller defect, not a refusal, and raises `TypeError` (mirrors the same
+    posture the plan requires of `build_exit_order_body`).
+
+    FU-1d S2 (defense in depth, `RULING_FU-1b_no_leg_marks_2026-09-26.md`
+    re-open item 2): after the family and family_id checks, a NO-leg
+    instrument also requires `family_declares_no_leg_exit(manifest)` --
+    the SAME gate `exit_decider.decide_exit` already enforces upstream, now
+    re-checked at the one seam both this client and the exec-client
+    boundary reach (`client.py`), so a NO exit can never be constructed here
+    even if a caller reached this function with a decider-bypassing
+    authorization.
+    """
+    if authorization is None:
+        raise TypeError(
+            "authorization is required to evaluate a closing exit order; "
+            "this seam is unreachable without one"
+        )
+    reason = _unmappable_exit_shape_reason(order, instrument, authorization)
+    if reason is not None:
+        return reason
+    if not family_declares_exit_rule(manifest):
+        return "family does not declare a registered exit rule; refusing"
+    if manifest.family_id != authorization.family_id:
+        return "manifest family_id does not match the authorization; refusing"
+    if leg_of(getattr(instrument, "id")) == "no" and not family_declares_no_leg_exit(  # noqa: B009
+        manifest,
+    ):
+        return "family does not declare a NO-leg exit; refusing"
+    return None
+
+
+def build_exit_order_body(
+    order: object, instrument: object, authorization: ExitAuthorizationLike | None
+) -> dict[str, Any]:
+    """The same 10-key body as `build_order_body`, action flipped to the
+    closing side. Re-applies every shape and attribution check that does
+    not need a manifest (`_unmappable_exit_shape_reason`), so it can never
+    emit a body for an order `unmappable_exit_order_reason` would refuse on
+    shape grounds -- the manifest exit-gate check is the caller's job.
+    """
+    if authorization is None:
+        raise TypeError(
+            "authorization is required to build a closing exit order body; "
+            "this seam is unreachable without one"
+        )
+    reason = _unmappable_exit_shape_reason(order, instrument, authorization)
+    if reason is not None:
+        raise ValueError(reason)
+    price = order_price_decimal(order)
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    outcome_side = _outcome_token(instrument)
+    if outcome_side is None:
+        raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
+    # `exit_wire_price_for_leg` is the documented exit-call-site alias of
+    # `wire_price_for_leg` (leg_prices, outside exec/): the venue always
+    # prices the YES/long side, on the close as on the open. `outcomeSide`
+    # is unchanged by closing -- only `action` flips.
+    wire_price = exit_wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
+    return {
+        "marketSlug": slug,
+        "type": _ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
+        "quantity": 1,
+        "tif": _TIF_IOC,
+        "outcomeSide": outcome_side,
+        "action": _ORDER_ACTION_SELL,
+        "manualOrderIndicator": _MANUAL_AUTOMATIC,
+        "synchronousExecution": True,
+        "maxBlockTime": _MAX_BLOCK_TIME,
+    }
+
+
+def encode_order_body(body: Mapping[str, Any]) -> bytes:
+    keys = set(body)
+    if keys != ORDER_BODY_KEYS and keys != RESTING_ORDER_BODY_KEYS:
+        raise ValueError("order body key set does not match the venue schema")
+    return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def order_by_id_path(order_id: str) -> str:
+    """The resolver's by-id path -- ONE builder, delegated to the declared read
+    set (``endpoints.order_by_id_path``, RESTING_BID_HUNT Rev 2 section 4.3).
+    Before that increment this spliced the resource out of fragments so V2
+    did not see the literal; the literal is now V2-allowlisted in
+    ``endpoints.py`` alone, and this name is kept only so the resolver's
+    pinned callee (``EXEC_RESOLVER_PERMITTED_CALLEES``) is unchanged."""
+    return endpoints_order_by_id_path(order_id)
+
+
+def _parse_json_object(body: bytes) -> dict[str, Any] | None:
+    """Decode ``body`` as a JSON object, or ``None`` if it cannot be read.
+
+    SP-2 I2b (AR-N1): a body whose nesting exhausts the parser is
+    ``unparseable`` like any other unreadable body -- refused, never
+    accepted, and never allowed to escape ``_submit_order``
+    (``client.py:2748`` is not inside a ``try``).
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _is_google_rpc_status(payload: Mapping[str, Any]) -> bool:
+    code = payload.get("code")
+    message = payload.get("message")
+    details = payload.get("details")
+    return isinstance(code, int) and isinstance(message, str) and isinstance(details, list)
+
+
+def _amount_decimal(value: object) -> Decimal | None:
+    if isinstance(value, Mapping):
+        raw = value.get("value")
+    else:
+        raw = value
+    if raw is None:
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _response_order_id(payload: Mapping[str, Any]) -> str | None:
+    top = payload.get("id")
+    if isinstance(top, str) and top:
+        return top
+    order = payload.get("order")
+    if isinstance(order, Mapping):
+        nested = order.get("id")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
+def _terminal_state(payload: Mapping[str, Any]) -> str | None:
+    for key in ("state", "status"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    order = payload.get("order")
+    if isinstance(order, Mapping):
+        for key in ("state", "status"):
+            value = order.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _cum_quantity(payload: Mapping[str, Any]) -> Decimal | None:
+    raw = payload.get("cumQuantity")
+    if raw is None:
+        order = payload.get("order")
+        if isinstance(order, Mapping):
+            raw = order.get("cumQuantity")
+    if raw is None:
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _durable_execution(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """First fill-type execution carrying a durable order id, price, size and
+    trade id.
+
+    Filtered through :func:`_fill_type_executions` (I1a's own fee filter) so a
+    CANCELED/REJECTED/EXPIRED/NEW/REPLACE/DONE_FOR_DAY row -- or one with no
+    ``type`` at all -- is never selected even when it happens to carry stale
+    ``lastPx``/``lastShares``/``tradeId`` values ahead of the real fill row.
+    """
+    for item in _fill_type_executions(payload):
+        order = item.get("order")
+        if not isinstance(order, Mapping):
+            continue
+        order_id = order.get("id")
+        if not isinstance(order_id, str) or not order_id:
+            continue
+        if item.get("lastPx") is None:
+            continue
+        if item.get("lastShares") is None:
+            continue
+        trade_id = item.get("tradeId")
+        if not isinstance(trade_id, str) or not trade_id:
+            continue
+        return item
+    return None
+
+
+def _filled_cost_from_execution(execution: Mapping[str, Any], *, leg: Leg) -> Decimal | None:
+    """Rev 5 (E5-1): every raw ``avgPx``/``lastPx`` this reads is a WIRE
+    value (YES-denominated); translated via ``leg`` before it prices any
+    cost, identity on the YES leg. This is the create path's OWN I1a total,
+    read independently of :func:`~breezy.adapters.polymarket_us.exec.
+    reports.parse_fill_report` -- both must stay leg-aware or the NO leg's
+    booked cost silently keeps the wire (complement) price."""
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        avg = _amount_decimal(order.get("avgPx"))
+        cum = order.get("cumQuantity")
+        if avg is not None and cum is not None:
+            try:
+                return instrument_price_for_leg(leg, avg) * Decimal(str(cum))
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+    last_px = _amount_decimal(execution.get("lastPx"))
+    last_shares = execution.get("lastShares")
+    if last_px is None or last_shares is None:
+        return None
+    try:
+        return instrument_price_for_leg(leg, last_px) * Decimal(str(last_shares))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+#: I1a fee filter (``types/orders.py:34-43``). ``Execution`` is ``total=False``
+#: (``:95-108``), so a row carrying no ``type`` at all is never fill-type.
+_FILL_EXECUTION_TYPES: Final[frozenset[str]] = frozenset(
+    {"EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL"}
+)
+
+
+def _fill_type_executions(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Every ``executions`` row whose ``type`` is a fill, in payload order.
+
+    A CANCELED/REJECTED/EXPIRED/NEW/REPLACE/DONE_FOR_DAY row -- or one with no
+    ``type`` at all -- is excluded here, so its commission is never summed.
+
+    I6 (CRITICAL): ``type`` is a bare venue-controlled JSON value, so it may
+    be a dict or list -- ``x in <frozenset>`` raises ``TypeError: unhashable
+    type`` on either, uncaught, escaping ``classify_create_order_outcome``
+    and ``_submit_order`` with no refusal and no log (the L-37/AR-N1 class
+    I2b exists to close). ``isinstance(..., str)`` is checked FIRST, short-
+    circuiting the membership test before it ever sees an unhashable value:
+    a non-string ``type`` is simply not a fill-type row, exactly like a
+    string that is not one of the two fill types.
+    """
+    executions = payload.get("executions")
+    if not isinstance(executions, list):
+        return ()
+    return tuple(
+        item
+        for item in executions
+        if isinstance(item, Mapping)
+        and isinstance((execution_type := item.get("type")), str)
+        and execution_type in _FILL_EXECUTION_TYPES
+    )
+
+
+def _sum_last_shares(executions: tuple[Mapping[str, Any], ...]) -> Decimal | None:
+    total = ZERO
+    for item in executions:
+        raw = item.get("lastShares")
+        if raw is None:
+            return None
+        try:
+            total += Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            return None
+    return total
+
+
+def _sum_fill_commission(executions: tuple[Mapping[str, Any], ...]) -> Decimal | None:
+    total = ZERO
+    for item in executions:
+        amount = _amount_decimal(item.get("commissionNotionalCollected"))
+        if amount is None:
+            return None
+        total += amount
+    return total
+
+
+def _cumulative_qty_and_cost(
+    execution: Mapping[str, Any], *, leg: Leg
+) -> tuple[Decimal | None, Decimal | None]:
+    """Qty and cost sourced TOGETHER, from the order snapshot on ``execution``,
+    or together from this one execution's leg -- never mixed (I1a).
+
+    Deliberately NOT a composition of ``_cum_quantity`` and
+    ``_filled_cost_from_execution``: those two succeed independently (one
+    could resolve order-level while the other falls back to the leg), which
+    would pair a whole-order quantity with a one-leg cost or the reverse --
+    exactly the defect I1a forbids. This atomically checks both preconditions
+    before choosing the order-level source.
+
+    Rev 5 (E5-1): the price half of either source is a WIRE value
+    (YES-denominated); translated via ``leg`` (identity on the YES leg)
+    before pricing the cost -- see :func:`_filled_cost_from_execution`.
+    """
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        avg = _amount_decimal(order.get("avgPx"))
+        raw_cum = order.get("cumQuantity")
+        if avg is not None and raw_cum is not None:
+            try:
+                cum = Decimal(str(raw_cum))
+            except (InvalidOperation, ValueError):
+                cum = None
+            if cum is not None:
+                return cum, instrument_price_for_leg(leg, avg) * cum
+    last_px = _amount_decimal(execution.get("lastPx"))
+    last_shares = execution.get("lastShares")
+    if last_px is not None and last_shares is not None:
+        try:
+            qty = Decimal(str(last_shares))
+        except (InvalidOperation, ValueError):
+            return None, None
+        return qty, instrument_price_for_leg(leg, last_px) * qty
+    return None, None
+
+
+def _order_total_commission(execution: Mapping[str, Any]) -> Decimal | None:
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        return _amount_decimal(order.get("commissionNotionalTotalCollected"))
+    return None
+
+
+def _bankers_cent(value: Decimal) -> Decimal | None:
+    """Venue fee quantum: banker's rounding to $0.01. Two exact ``==`` only."""
+    try:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    except InvalidOperation:
+        return None
+
+
+def _amount_raw_string(amount: object) -> str | None:
+    """The venue's original Amount.value string, or ``None`` if absent."""
+    if isinstance(amount, Mapping):
+        raw = amount.get("value")
+    else:
+        raw = amount
+    if raw is None:
+        return None
+    return raw if isinstance(raw, str) else str(raw)
+
+
+def _per_leg_commission_raw(item: Mapping[str, Any]) -> str:
+    collected = item.get("commissionNotionalCollected")
+    if isinstance(collected, Mapping):
+        raw_value = collected.get("value")
+    else:
+        raw_value = collected
+    return str(raw_value)
+
+
+def _commission_raw_audit(
+    execution: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> str:
+    """Order-level total raw when present, else joined per-leg raws."""
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        total_raw = _amount_raw_string(order.get("commissionNotionalTotalCollected"))
+        if total_raw is not None:
+            return total_raw
+    if payload is not None:
+        fill_type = _fill_type_executions(payload)
+        if fill_type:
+            return "+".join(_per_leg_commission_raw(item) for item in fill_type)
+    return _per_leg_commission_raw(execution)
+
+
+def _cumulative_fee_and_reconciliation(
+    payload: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    *,
+    cumulative_qty: Decimal | None,
+) -> tuple[Decimal | None, bool]:
+    """I1a fee + ``fee_reconciled``.
+
+    ``fee_reconciled`` = (sum of fill-type ``lastShares`` == ``cumulative_qty``)
+    AND (order total absent, OR order total == the per-leg fill-type sum,
+    OR order total == bankers_cent(per-leg sum)). Two exact ``==``
+    equalities; the set is widened, never relaxed to a tolerance. The
+    quantity identity alone catches a dropped leg (the sum falls short of
+    ``cumulative_qty``), so the absent-total branch needs no extra condition.
+    ``cumulative_fee`` is the unrounded per-leg sum when reconciled on the
+    exact or absent-total branch. On the bankers branch the cash paid IS
+    the order-level total (what the venue billed); the exact legs live on
+    the raw audit string.
+    """
+    fill_type = _fill_type_executions(payload)
+    leg_qty = _sum_last_shares(fill_type)
+    leg_fee = _sum_fill_commission(fill_type)
+    qty_reconciled = (
+        cumulative_qty is not None and leg_qty is not None and leg_qty == cumulative_qty
+    )
+    order_total = _order_total_commission(execution)
+    if order_total is not None:
+        exact_match = leg_fee is not None and order_total == leg_fee
+        rounded_leg = _bankers_cent(leg_fee) if leg_fee is not None else None
+        bankers_match = not exact_match and rounded_leg is not None and order_total == rounded_leg
+        fee_reconciled = qty_reconciled and (exact_match or bankers_match)
+        if fee_reconciled and exact_match:
+            branch = "exact"
+        elif fee_reconciled and bankers_match:
+            branch = "bankers"
+        else:
+            branch = "none"
+        logger.info("i1a fee_reconciled=%s branch=%s", fee_reconciled, branch)
+        if fee_reconciled and bankers_match:
+            return order_total, True
+        if fee_reconciled:
+            return leg_fee, True
+        return order_total, False
+    return leg_fee, qty_reconciled and leg_fee is not None
+
+
+#: Single cap point (SP-2 I1/I2, Rev 2's value, measured-backed RV2.1-A8):
+#: every diagnostic string this module builds for the create path -- the
+#: underivable-cost message, a mapping-refusal message, the body key-tree
+#: token -- is capped ONCE, at birth, through :func:`_capped_diagnostic` /
+#: :func:`_detail_tree_token`. Downstream consumers (the classified log
+#: line, the AMBIGUOUS tail, the durable store) all inherit the same bound
+#: and never re-truncate (S-L1).
+_DETAIL_TREE_MAX_CHARS: Final[int] = 2048
+
+#: Closed-set per-field tokens for :func:`_underivable_cost_message` -- the
+#: vocabulary already used by :func:`_state_detail_token` /
+#: :func:`_cum_detail_token` in this file. Absent and unparseable are
+#: different drift stories and neither ever echoes the value itself.
+_TOKEN_ABSENT: Final[str] = "absent"
+_TOKEN_PRESENT: Final[str] = "present"
+_TOKEN_UNPARSEABLE: Final[str] = "unparseable"
+
+#: `_safe_key_tree`'s fallback when `_key_tree` itself raises -- belt and
+#: braces for SP-2's own two call sites in this module; the depth bound in
+#: `reports._key_tree` is what actually protects against unbounded
+#: recursion (AR-N2), not this fallback.
+_TREE_UNAVAILABLE: Final[str] = "<tree unavailable: nesting exceeded>"
+
+
+def _capped_diagnostic(text: str) -> str:
+    """Cap ONE diagnostic string at ``_DETAIL_TREE_MAX_CHARS``, at birth.
+
+    The truncation marker is emitted OUTSIDE the capped span (RV3-A13,
+    mirroring ``reports._safe_key_name``'s own placement rule): a string
+    within the cap is returned byte-identical, unchanged.
+    """
+    if len(text) <= _DETAIL_TREE_MAX_CHARS:
+        return text
+    return f"{text[:_DETAIL_TREE_MAX_CHARS]} (truncated from {len(text)} characters)"
+
+
+def _safe_key_tree(payload: Mapping[str, Any]) -> str:
+    """``reports._key_tree``, contained for this module's two call sites.
+
+    ``reports._key_tree`` already bounds its own recursion depth (SP-2 I0);
+    this is belt-and-braces, not the sole containment point (AR-N2) --
+    tested by perturbing ``_key_tree`` to raise, never by pretending the
+    bound itself fails.
+    """
+    try:
+        return _key_tree(payload)
+    except RecursionError:
+        return _TREE_UNAVAILABLE
+
+
+def _amount_token(value: object) -> str:
+    """Closed-set token for an ``Amount``-shaped candidate cost field.
+
+    Mirrors :func:`_amount_decimal`'s own parsing exactly, so the token
+    always agrees with whatever that function would have derived --
+    ``absent`` (no value), ``unparseable`` (present but not a valid
+    decimal), or ``present`` (usable). Never the value itself.
+    """
+    if value is None:
+        return _TOKEN_ABSENT
+    if _amount_decimal(value) is None:
+        return _TOKEN_UNPARSEABLE
+    return _TOKEN_PRESENT
+
+
+def _quantity_token(value: object) -> str:
+    """Closed-set token for a bare-quantity candidate cost field.
+
+    Mirrors :func:`_filled_cost_from_execution`'s own ``Decimal(str(value))``
+    parsing of ``lastShares`` / ``cumQuantity`` -- these are plain numeric
+    strings, not ``Amount``-wrapped, so :func:`_amount_token` does not apply.
+    """
+    if value is None:
+        return _TOKEN_ABSENT
+    try:
+        Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return _TOKEN_UNPARSEABLE
+    return _TOKEN_PRESENT
+
+
+def _underivable_cost_message(execution: Mapping[str, Any]) -> str:
+    """Names-only diagnostic for ``_filled_cost_from_execution`` returning
+    ``None``: a closed-set token for each of the four candidate fields it
+    reads, plus the execution's own sanitised key tree (SP-2 I0) so a
+    drifted shape is visible at once -- never a value.
+
+    T1: this branch is UNREACHABLE in life today. ``parse_fill_report``'s
+    own amount parsing (``parsing._to_decimal`` / ``_parse_amount``) is
+    strictly stronger than this function's, so any leg that fails cost
+    derivation fails MAPPING first and never reaches here -- see
+    ``test_a_leg_that_maps_cleanly_always_yields_a_derivable_filled_cost``.
+    Loud, not deleted, in case that coupling ever breaks (L-37 (2)).
+    """
+    order = execution.get("order")
+    order_avg_px = order.get("avgPx") if isinstance(order, Mapping) else None
+    order_cum_quantity = order.get("cumQuantity") if isinstance(order, Mapping) else None
+    return (
+        "fill report mapped but no filled cost is derivable: "
+        f"order.avgPx={_amount_token(order_avg_px)} "
+        f"order.cumQuantity={_quantity_token(order_cum_quantity)} "
+        f"lastPx={_amount_token(execution.get('lastPx'))} "
+        f"lastShares={_quantity_token(execution.get('lastShares'))}; "
+        f"full body key tree: {{{_safe_key_tree(execution)}}}"
+    )
+
+
+def fill_generation(
+    execution: Mapping[str, Any],
+    *,
+    instrument: object,
+    account_id: object,
+    ts_init: int,
+    payload: Mapping[str, Any] | None = None,
+    errors: list[str] | None = None,
+    closing: bool = False,
+) -> FillGeneration | None:
+    """Map ``execution`` to native fill-generation arguments, or ``None``.
+
+    ``errors``, when supplied, receives the caught exception's own ``str()``
+    on a parse refusal -- UNCHANGED behaviour otherwise: this still returns
+    ``None``, never raises, on a mapping failure. The message is names-only
+    (``reports.py``'s ``ExecutionReportMappingError`` -- including the full
+    key tree its own diagnostic appends -- never a value), so a caller may
+    log it verbatim. Optional, and defaulted to ``None``, so every existing
+    caller that does not pass it keeps recording nothing, exactly as before.
+
+    SP-2 I1: the sink also receives a names-only message when the mapped
+    execution's filled cost cannot be DERIVED (previously a silent
+    ``None`` return, no trace of why -- L-37 (2)). Every message the sink
+    receives is capped with an explicit, placement-ruled marker
+    (:func:`_capped_diagnostic`), so ``fill_parse_error`` is bounded for
+    both the log line and the durable store (SP-2 I3).
+
+    ``closing`` (INC-E2, default ``False``): forwarded verbatim to
+    :func:`reports.parse_fill_report`, which is the ONE place the
+    entry-vs-exit echo table is selected. This function makes no
+    leg/echo decision of its own.
+    """
+    try:
+        report = parse_fill_report(
+            dict(execution),
+            instrument=cast(Instrument, instrument),
+            account_id=cast(AccountId, account_id),
+            report_id=UUID4(),
+            ts_init=ts_init,
+            closing=closing,
+        )
+    except (ExecutionReportMappingError, TypeError, ValueError) as exc:
+        if errors is not None:
+            errors.append(_capped_diagnostic(str(exc)))
+        return None
+    filled_cost = _filled_cost_from_execution(
+        execution, leg=leg_of(cast(Instrument, instrument).id)
+    )
+    if filled_cost is None:
+        if errors is not None:
+            errors.append(_capped_diagnostic(_underivable_cost_message(execution)))
+        return None
+    return FillGeneration(
+        venue_order_id=report.venue_order_id,
+        trade_id=report.trade_id,
+        last_qty=report.last_qty,
+        last_px=report.last_px,
+        commission=report.commission,
+        commission_raw=_commission_raw_audit(execution, payload=payload),
+        ts_event=int(report.ts_event),
+        filled_cost_usd=filled_cost,
+    )
+
+
+def venue_order_id(order_id: str) -> VenueOrderId:
+    return VenueOrderId(order_id)
+
+
+#: Detail for the ``response is None`` AMBIGUOUS case: there is no HTTP
+#: response at all, so every field is the "none" sentinel.
+_AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = "status=none body_kind=none rpc_code=none body_len=0"
+_ORDER_STATE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^ORDER_STATE_[A-Z_]+$")
+
+
+def _state_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``state=`` token for the redacted create-order detail.
+
+    Uses the same top-level ``state``/``status`` then nested ``order`` lookup
+    as :func:`_terminal_state`. Emits the enum value only when it is a
+    ``str`` matching ``ORDER_STATE_[A-Z_]+``; any other present string is
+    ``other`` (never echoed); absence is ``absent``.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = _terminal_state(payload)
+    if raw is None:
+        return "absent"
+    if _ORDER_STATE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _cum_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``cum=`` token for the redacted create-order detail.
+
+    Looks up ``cumQuantity`` top-level then nested ``order``, matching
+    :func:`_cum_quantity`. Emits ``absent``, ``0``, ``nonzero``, or
+    ``unparseable`` -- never the raw value.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = payload.get("cumQuantity")
+    if raw is None:
+        order = payload.get("order")
+        if isinstance(order, Mapping):
+            raw = order.get("cumQuantity")
+    if raw is None:
+        return "absent"
+    try:
+        qty = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return "unparseable"
+    if qty == ZERO:
+        return "0"
+    return "nonzero"
+
+
+def _detail_tree_token(payload: Mapping[str, Any]) -> str:
+    """The ``executions-present``-only `` tree={...}`` suffix for
+    :func:`_body_detail`, capped at ``_DETAIL_TREE_MAX_CHARS`` (SP-2 I2).
+
+    Names-only, per :func:`_safe_key_tree` -- the tree is an OPEN set of
+    NAMES (sanitised per SP-2 I0), never a value. The truncation marker is
+    emitted OUTSIDE the closing brace (RV3-A13): a tree this long already
+    contains its own per-key truncation markers (from
+    ``reports._safe_key_name``), so the 2048-char slice can land mid-key,
+    producing a SECOND, equally authentic truncation immediately before
+    this one -- both are outside the structure they truncate, and neither
+    is forged (AM-6).
+    """
+    tree = _safe_key_tree(payload)
+    if len(tree) <= _DETAIL_TREE_MAX_CHARS:
+        return f" tree={{{tree}}}"
+    return f" tree={{{tree[:_DETAIL_TREE_MAX_CHARS]}}} (truncated from {len(tree)} characters)"
+
+
+def _body_detail(
+    response: VenueResponse,
+    payload: Mapping[str, Any] | None,
+    order_id: str | None,
+) -> str:
+    """Redacted, log-only summary of one classified create-order response.
+
+    Reports shape and length only -- never the body content -- so the venue's
+    answer is recoverable from the log without risking a leaked secret or
+    account detail embedded in an adversarial or malformed body. Closed-set
+    tokens only: status, body_kind, rpc_code, body_len, state, cum -- plus
+    (SP-2 I2) an OPEN set of sanitised NAMES, never a value, in the ``tree=``
+    suffix that appears ONLY on ``executions-present`` (so a SUCCESSFUL fill
+    is captured too, not only an ambiguous one -- T3).
+    """
+    body_len = len(response.body)
+    rpc_code: int | None = None
+    tree_token = ""
+    if payload is None:
+        body_kind = "unparseable"
+    elif isinstance(payload, Mapping) and _is_google_rpc_status(payload) and order_id is None:
+        body_kind = "status-no-order-id"
+        code = payload.get("code")
+        rpc_code = code if isinstance(code, int) else None
+    elif isinstance(payload, Mapping):
+        executions = payload.get("executions")
+        if isinstance(executions, list) and executions == []:
+            body_kind = "empty-executions"
+        elif isinstance(executions, list) and executions:
+            body_kind = "executions-present"
+            tree_token = _detail_tree_token(payload)
+        else:
+            body_kind = "unexpected-shape"
+    else:
+        body_kind = "unexpected-shape"
+    rpc_code_str = "none" if rpc_code is None else str(rpc_code)
+    return (
+        f"status={response.status} body_kind={body_kind} "
+        f"rpc_code={rpc_code_str} body_len={body_len} "
+        f"state={_state_detail_token(payload)} cum={_cum_detail_token(payload)}"
+        f"{tree_token}"
+    )
+
+
+def classify_create_order_outcome(
+    response: VenueResponse | None,
+    *,
+    instrument: object,
+    account_id: object,
+    ts_init: int,
+    closing: bool = False,
+) -> CreateOrderOutcome:
+    """Classify one create-order HTTP outcome. AMBIGUOUS is the residual.
+
+    ``closing`` (INC-E2, default ``False`` -- byte-unchanged for every
+    existing entry-path caller/test): forwarded to :func:`fill_generation`
+    so a CORRECTLY-echoed closing-order response classifies
+    ``KIND_ACCEPT_FILL`` instead of falling through to the AMBIGUOUS
+    residual below. An echo that matches neither table -- a BUY-table echo
+    on a close, or a close-table echo on an entry -- still fails
+    ``reports.parse_fill_report`` and lands here as before, with its own
+    distinct exception message carried on ``fill_parse_error``.
+    """
+    if response is None:
+        return CreateOrderOutcome(
+            kind=KIND_AMBIGUOUS,
+            reason=AMBIGUOUS_REASON,
+            retirement_name=None,
+            venue_order_id=None,
+            fill=None,
+            filled_cost_usd=None,
+            cumulative_qty=None,
+            cumulative_cost=None,
+            cumulative_fee=None,
+            fee_reconciled=False,
+            generate_submitted=False,
+            detail=_AMBIGUOUS_DETAIL_NO_RESPONSE,
+        )
+    status = int(response.status)
+    payload = _parse_json_object(response.body)
+    order_id = _response_order_id(payload) if payload is not None else None
+    detail = _body_detail(response, payload, order_id)
+
+    if (
+        400 <= status < 500
+        and payload is not None
+        and _is_google_rpc_status(payload)
+        and order_id is None
+    ):
+        return CreateOrderOutcome(
+            kind=KIND_REJECT,
+            reason="venue 4xx google.rpc.Status with no order id",
+            retirement_name=RETIRE_REJECT,
+            venue_order_id=None,
+            fill=None,
+            filled_cost_usd=None,
+            cumulative_qty=None,
+            cumulative_cost=None,
+            cumulative_fee=None,
+            fee_reconciled=False,
+            generate_submitted=False,
+            detail=detail,
+        )
+
+    fill_parse_errors: list[str] = []
+    if status == 200 and payload is not None and order_id is not None:
+        execution = _durable_execution(payload)
+        if execution is not None:
+            fill = fill_generation(
+                execution,
+                instrument=instrument,
+                account_id=account_id,
+                ts_init=ts_init,
+                payload=payload,
+                errors=fill_parse_errors,
+                closing=closing,
+            )
+            if fill is not None:
+                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(
+                    execution, leg=leg_of(cast(Instrument, instrument).id)
+                )
+                cumulative_fee, fee_reconciled = _cumulative_fee_and_reconciliation(
+                    payload, execution, cumulative_qty=cumulative_qty
+                )
+                return CreateOrderOutcome(
+                    kind=KIND_ACCEPT_FILL,
+                    reason="200 with durable fill record",
+                    retirement_name=RETIRE_ACCEPT_FILL,
+                    venue_order_id=order_id,
+                    fill=fill,
+                    filled_cost_usd=fill.filled_cost_usd,
+                    cumulative_qty=cumulative_qty,
+                    cumulative_cost=cumulative_cost,
+                    cumulative_fee=cumulative_fee,
+                    fee_reconciled=fee_reconciled,
+                    generate_submitted=True,
+                    detail=detail,
+                )
+        executions = payload.get("executions")
+        terminal = _terminal_state(payload)
+        cum = _cum_quantity(payload)
+        if (
+            isinstance(executions, list)
+            and executions == []
+            and terminal in _IOC_ZERO_FILL_TERMINAL_STATES
+            and cum == ZERO
+        ):
+            return CreateOrderOutcome(
+                kind=KIND_ZERO_FILL,
+                reason="200 with empty executions, terminal IOC state, cumQuantity 0",
+                retirement_name=RETIRE_ZERO_FILL,
+                venue_order_id=order_id,
+                fill=None,
+                filled_cost_usd=ZERO,
+                cumulative_qty=None,
+                cumulative_cost=None,
+                cumulative_fee=None,
+                fee_reconciled=False,
+                generate_submitted=True,
+                detail=detail,
+            )
+
+    return CreateOrderOutcome(
+        kind=KIND_AMBIGUOUS,
+        reason=AMBIGUOUS_REASON,
+        retirement_name=None,
+        venue_order_id=order_id,
+        fill=None,
+        filled_cost_usd=None,
+        cumulative_qty=None,
+        cumulative_cost=None,
+        cumulative_fee=None,
+        fee_reconciled=False,
+        generate_submitted=order_id is not None,
+        detail=detail,
+        fill_parse_error=fill_parse_errors[0] if fill_parse_errors else None,
+    )
+
+
+#: EDGE-2 slice A (AC3): closed-set `createFillEvidence` tokens. `none` and
+#: `unknown` are admissible on their own (never sufficient) for the
+#: resolver's zero-fill gate; `fill_type_present` and `fill_type_unmappable`
+#: block it and raise a contradiction if the resolver still reaches
+#: terminal-zero (AC4(b)).
+CREATE_FILL_EVIDENCE_NONE: Final[str] = "none"
+CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT: Final[str] = "fill_type_present"
+CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE: Final[str] = "fill_type_unmappable"
+CREATE_FILL_EVIDENCE_UNKNOWN: Final[str] = "unknown"
+
+#: Closed-set token vocabulary for a single execution row's raw `type`
+#: value: the value itself, EXACTLY when it is a `str` shaped like the SDK's
+#: `ExecutionType` literals (`EXECUTION_TYPE_[A-Z_]+`); `other` for anything
+#: else. Mirrors `_ORDER_STATE_TOKEN`'s existing pattern in this file. I6:
+#: `isinstance(..., str)` is checked FIRST, so an unhashable `dict`/`list`
+#: value never reaches the regex.
+_EXECUTION_TYPE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^EXECUTION_TYPE_[A-Z_]+$")
+
+_SKIP_ORDER_MISSING: Final[str] = "order missing"
+_SKIP_ORDER_ID_MISSING: Final[str] = "order.id missing"
+_SKIP_LAST_PX_MISSING: Final[str] = "lastPx missing"
+_SKIP_LAST_SHARES_MISSING: Final[str] = "lastShares missing"
+_SKIP_TRADE_ID_MISSING: Final[str] = "tradeId missing"
+
+
+@dataclass(frozen=True, slots=True)
+class CreateFillEvidence:
+    """Closed-set, log-safe evidence extracted from a create-order response
+    body, computed independently of `classify_create_order_outcome` (AC2:
+    that function, `_durable_execution`, and `CreateOrderOutcome` stay
+    byte-unchanged). Every field is a name or a closed-set enum-shaped
+    token -- never a price, quantity, or id (AC3).
+    """
+
+    #: One of the four `CREATE_FILL_EVIDENCE_*` constants above.
+    token: str
+    #: Every execution row's raw `type`, in payload order -- the closed-set
+    #: token from :func:`_execution_type_token`.
+    exec_types: tuple[str, ...]
+    #: The LAST execution's nested `order.state`, tokenised.
+    order_state: str
+    #: The LAST execution's nested `order.cumQuantity`, tokenised.
+    order_cum: str
+    #: Why each fill-type row (in payload order) was skipped by
+    #: `_durable_execution`'s own gate -- never dropped silently (L-37).
+    skips: tuple[str, ...]
+
+
+def _execution_type_token(item: Mapping[str, Any]) -> str:
+    raw = item.get("type")
+    if isinstance(raw, str) and _EXECUTION_TYPE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _last_execution_order(executions: list[Any]) -> Mapping[str, Any] | None:
+    """The LAST execution row's nested ``order``, or ``None`` -- never a
+    fallback to an earlier row, and never the top-level shape
+    :func:`_terminal_state`/:func:`_cum_quantity` also read."""
+    if not executions:
+        return None
+    last = executions[-1]
+    if not isinstance(last, Mapping):
+        return None
+    order = last.get("order")
+    return order if isinstance(order, Mapping) else None
+
+
+def _execution_order_state_token(order: Mapping[str, Any] | None) -> str:
+    if order is None:
+        return _TOKEN_ABSENT
+    raw = order.get("state")
+    if raw is None:
+        return _TOKEN_ABSENT
+    if isinstance(raw, str) and _ORDER_STATE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _execution_order_cum_token(order: Mapping[str, Any] | None) -> str:
+    if order is None:
+        return _TOKEN_ABSENT
+    raw = order.get("cumQuantity")
+    if raw is None:
+        return _TOKEN_ABSENT
+    try:
+        qty = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return _TOKEN_UNPARSEABLE
+    return "0" if qty == ZERO else "nonzero"
+
+
+def _fill_row_skip_reason(item: Mapping[str, Any]) -> str | None:
+    """Why :func:`_durable_execution` would skip this fill-type row, or
+    ``None`` if it would not. Mirrors that function's own gate, in the same
+    order -- named here (L-37) rather than silently `continue`-d."""
+    order = item.get("order")
+    if not isinstance(order, Mapping):
+        return _SKIP_ORDER_MISSING
+    order_id = order.get("id")
+    if not isinstance(order_id, str) or not order_id:
+        return _SKIP_ORDER_ID_MISSING
+    if item.get("lastPx") is None:
+        return _SKIP_LAST_PX_MISSING
+    if item.get("lastShares") is None:
+        return _SKIP_LAST_SHARES_MISSING
+    trade_id = item.get("tradeId")
+    if not isinstance(trade_id, str) or not trade_id:
+        return _SKIP_TRADE_ID_MISSING
+    return None
+
+
+def _fill_row_skips(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        reason
+        for item in _fill_type_executions(payload)
+        if (reason := _fill_row_skip_reason(item)) is not None
+    )
+
+
+def create_fill_evidence(body: bytes) -> CreateFillEvidence:
+    """EDGE-2 slice A (AC3): closed-set create-time fill evidence for a
+    with-id AMBIGUOUS outcome, parsed independently via
+    :func:`_parse_json_object` (option F1 -- a second parse of a ≤ few-KB
+    body, only on the AMBIGUOUS-with-id branch).
+
+    Reuses `_durable_execution`/`_fill_type_executions` READ-ONLY -- calling
+    them does not change their bytes (AC2). The token is:
+
+    - :data:`CREATE_FILL_EVIDENCE_UNKNOWN`: the body is not parseable JSON,
+      or not a JSON object -- the same token a legacy durable blob with no
+      `createFillEvidence` key decodes to.
+    - :data:`CREATE_FILL_EVIDENCE_NONE`: no execution row is fill-type.
+    - :data:`CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE`: a fill-type row
+      exists, but none of them carries a complete durable candidate
+      (`order.id`, `lastPx`, `lastShares`, `tradeId`) -- the L-37
+      silent-skip class, now named in `skips`.
+    - :data:`CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT`: `_durable_execution`
+      found a complete candidate. The outcome can still be AMBIGUOUS here
+      (`fill_generation` may still fail to map it), so this token, unlike
+      the other two, BLOCKS a resolver zero-fill (AC4(b)).
+    """
+    payload = _parse_json_object(body)
+    if payload is None:
+        return CreateFillEvidence(
+            token=CREATE_FILL_EVIDENCE_UNKNOWN,
+            exec_types=(),
+            order_state=_TOKEN_ABSENT,
+            order_cum=_TOKEN_ABSENT,
+            skips=(),
+        )
+    executions = payload.get("executions")
+    execution_rows: list[Any] = executions if isinstance(executions, list) else []
+    exec_types = tuple(
+        _execution_type_token(item) for item in execution_rows if isinstance(item, Mapping)
+    )
+    skips = _fill_row_skips(payload)
+    if _durable_execution(payload) is not None:
+        token = CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+    elif _fill_type_executions(payload):
+        token = CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE
+    else:
+        token = CREATE_FILL_EVIDENCE_NONE
+    last_order = _last_execution_order(execution_rows)
+    return CreateFillEvidence(
+        token=token,
+        exec_types=exec_types,
+        order_state=_execution_order_state_token(last_order),
+        order_cum=_execution_order_cum_token(last_order),
+        skips=skips,
+    )
+
+
+def retirement_member(reasons: object, name: str) -> object:
+    return getattr(reasons, name)

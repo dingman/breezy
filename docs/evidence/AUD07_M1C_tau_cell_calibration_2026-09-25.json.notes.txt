@@ -1,0 +1,11 @@
+Projection (avg tau_per_rep_s = 1.2619656658789609, at full GRID_NPTS=2001, the only
+npts value proven within 1e-3 of boundary_for for multi-look chains -- see
+StreamingBoundary/REDUCED_NPTS docstrings in aud07_live_rule_crossing_sim.py):
+
+  one cell  x 20000 reps  ~= 25239 s  ~=  7.01 hours
+  49 cells  x 20000 reps  ~= 1236726 s ~= 343.5 hours (~14.3 days)
+
+CONCLUSION: the registered 20000-rep x 49-cell grid at full-grid (accuracy-preserving)
+npts is NOT feasible within any single session's compute budget on this shared host.
+This is a measured finding for the M2 ruling, not a recommendation on how to proceed
+(that decision belongs to M2 / the coordinator / peer review).

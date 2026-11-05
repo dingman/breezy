@@ -1,6 +1,6 @@
 """The process-wide owner of shared NWS-ingest state and services.
 
-Governing ruling: ``docs/plans/PHASE1_ACTOR_BRIEF.md`` SS3.6, with the startup
+Governing ruling: ``docs/plans/archive/PHASE1_ACTOR_BRIEF.md`` SS3.6, with the startup
 preconditions of SS6 step 0.
 
 Breezy runs **one Actor per ``(venue, city)``** -- five in production. Two

@@ -1,0 +1,17 @@
+{
+  "body_bytes": 3141508,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,n_x,tmp,dpt,cld,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,obv,poz,pos,typ,station,t06,t12",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2021-01-01 00:00:00",
+  "label": "gfs_kmia_2021",
+  "last_runtime": "2021-12-31 18:00:00",
+  "outcome": "ok",
+  "row_count": 30639,
+  "sample_row_1": "2021-01-01 00:00:00,2021-01-01 06:00:00,GFS,,75,67,SC,120,13,,,,,0.0,,,,8,7,N ,0.0,0.0,R ,KMIA,,",
+  "sample_row_2": "2021-01-01 00:00:00,2021-01-01 09:00:00,GFS,,74,67,SC,120,12,,,,,,,,,8,7,N ,0.0,0.0,R ,KMIA,,",
+  "sha256": "58f2e3eca7d197012199230a118d8fa4bcb7af3e2067a61406b5c28dabe5de30",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KMIA&model=GFS&format=csv&sts=2021-01-01T00%3A00Z&ets=2021-12-31T23%3A59Z"
+}

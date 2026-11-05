@@ -1,0 +1,133 @@
+[Unit]
+# The catalog-conversion step `breezy.runtime.quote_tape_cli` deliberately
+# leaves out of scope (see that module's docstring, "Reading the tape back
+# (deliberately NOT automated here)"). Until this unit exists, turning the
+# recorder's streamed feather into the parquet layout every analysis script
+# queries has been run by hand twice, ever -- 199,079 depth rows for the
+# 2026-09-01 afternoon sat invisible on disk until a manual conversion.
+# Sibling of breezy-k1-daily.service and breezy-offer-gate-daily.service:
+# same oneshot/no-[Install] shape, for the same reason -- this process is
+# started BY its timer, never enabled directly.
+Description=Breezy Polymarket.us quote-tape catalog ingest (periodic)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+# Not a hard dependency: this reads and writes local disk only, and opens no
+# socket -- same posture as breezy-k1-daily.service. The recorder need not be
+# up at the moment this runs; a currently-live instance is skipped by the
+# live-write-avoidance rule (see the module docstring), never converted.
+After=network-online.target
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling. Same 2026-09-11 K1 incident
+# (breezy-k1-daily.service hit a 17.6 GB peak in under 2 minutes with no
+# ceiling at all, pushing the 31 GB host into swap while
+# breezy-trade-supervisor.service -- the live trading node, deliberately
+# left UNcapped, see its own :64 comment -- ran at ~625 MB) prompted capping
+# every nightly-analysis unit. Measured via `journalctl --user -u
+# breezy-quote-tape-ingest.service --since 2026-09-08 --no-pager -o cat |
+# grep -aoE '[0-9.]+[MG] memory peak'`: the last three completed runs were
+# 468.6M, 468.1M, and one 5G outlier (the 09-07 recovery pass, converting a
+# larger-than-usual backlog) over ~1 min wall clock each. MemoryHigh=4G/
+# MemoryMax=6G clears that outlier with headroom while staying far below the
+# 31 GB host (node + recorder + tooling together measure well under 4G), so
+# a genuine runaway still gets OOM-killed in its OWN cgroup, never the
+# host-wide OOM killer.
+MemoryHigh=4G
+MemoryMax=6G
+UMask=0077
+
+# ING-2 S2 (2026-09-26): make this unit's own OOM-kill preference explicit
+# rather than inherited. A user-manager default is not a decision this repo
+# controls (U3, open) -- 500 says plainly "kill this before anything trading
+# related" without relying on that default landing the same way. Never set
+# on breezy-trade-supervisor.service (the live trading node) -- pinned by
+# `tests/unit/test_quote_tape_ingest_unit_contract.py`.
+OOMScoreAdjust=500
+
+# SP-1/I2d (2026-09-12): deprioritised against the shared nightly studies.
+# This unit fires every 15 min (minus the 16:30-17:00Z ticks, O-1) and still runs INSIDE the protected window P --
+# unlike the three heavy studies, it is deliberately NOT behind the studies
+# flock (T6/L-20: starving conversion would recreate "the catalog you query
+# is not the tape you capture"), so G2 is NOT met by this change -- it still
+# peaks ~4.0 G inside P every 15 minutes. `best-effort`/7 rather than
+# `idle` (A-5): `idle` can be starved indefinitely by the live node's own
+# I/O, which would recreate the same catalog-lag risk this deprioritisation
+# is trying to avoid, not fix it.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# No EnvironmentFile: this process holds no venue credential and opens no
+# socket, unlike breezy-quote-tape.service. It shares only the ONE variable
+# both the recorder and this process must agree on, so they can never be
+# pointed at different catalog roots by accident (same value as
+# breezy-quote-tape.service's Environment= line).
+Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us
+
+# Read-only queries `systemctl --user is-active breezy-quote-tape.service` to
+# decide whether the newest instance is currently live (see the module
+# docstring's live-write-avoidance rule) -- it sends no signal to the
+# recorder and never restarts it.
+#
+# ING-2 S2: `--deadline-seconds 600` bounds how many NEW conversion units a
+# single run may START (deferred units retry next run -- see the `deadline`
+# count line this process prints on every non-dry run). 600 is the module
+# default (`DEFAULT_DEADLINE_SECONDS`); 600 + the 180s startup/tail
+# allowance stays at 780s, comfortably under this unit's 900s early-warning
+# margin and well under `TimeoutStartSec` below. NEVER hand-run this while
+# `systemctl --user is-active breezy-quote-tape-ingest.service` reports
+# active -- two writers would race the same markers and catalog (L-50).
+ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape-ingest --deadline-seconds 600
+
+# Mirrors breezy-k1-daily.service and breezy-offer-gate-daily.service: for
+# Type=oneshot this bounds the whole run. A conversion pass over a full
+# day's tape is a bounded local disk operation, not a network wait.
+# O-1 (coordinator ruling O1-R1): 780 = `--deadline-seconds 600` + the
+# documented 180 s startup/tail allowance (was 1800). The measured 3-day max
+# runtime is 649 s (09:00Z rotation backlog). The bound is what lets the
+# frequent timer's last pre-window run (16:15Z) die before the 16:30Z launch
+# window opens: 16:15 + 780 s + 90 s default TimeoutStopSec = 16:29:30Z.
+TimeoutStartSec=780
+
+# No Restart=. A missed ingest pass is not an incident: the feather tape it
+# reads keeps accumulating on disk regardless, and the next scheduled pass
+# (or a later --dry-run/inspection) subsumes it. The timer's Persistent=true
+# is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-quote-tape-ingest
+
+# NO SuccessExitStatus. Exit 0 = ran (even if every instance was skipped as
+# live, truncated, or already converted, or deferred by the deadline
+# budget -- deadline deferral is never a failure: deferred units retry next
+# run; see the `deadline` count line this process prints on every non-dry
+# run); exit 2 = usage/configuration error (no catalog root, the configured
+# path is not a directory, or an invalid --deadline-seconds); exit 3 = at
+# least one instance's outcome was "failed" -- a hard per-file or per-type
+# conversion failure, distinct from an ordinary skip or a deadline deferral
+# (SP-1/I3, EXIT_CONVERSION_FAILED); exit 4 = the EDGE-6 6f deferral-stall
+# alert (EXIT_DEFERRAL_STALLED) -- pending work has been deferred on >= 4
+# consecutive runs AND for >= 60 minutes (see
+# src/breezy/runtime/ingest_deferral_streak.py). Exit 3 outranks exit 4 when
+# both apply on the same run: the run still exits 3, but the
+# `DEFERRAL_STALLED` line still prints in that SAME invocation's journal, so
+# the reason is visible either way; exit 5 = DEFER-STREAK-LOAD
+# (EXIT_DEFERRAL_STREAK_RESET) -- pending work AND the deferral-streak state
+# file was unreadable, corrupt, invalid, or could not be saved, so stall
+# detection was blind for that run (a `DEFERRAL_STREAK_RESET reason=...` line
+# names why; exits 3 and 4 outrank it, and their line still prints). Because
+# there is no SuccessExitStatus= override, exits 2/3/4/5 are ALL, already,
+# ordinary systemd unit failures -- `OnFailure=` above fires on every one of
+# them without any further configuration; nothing here is unique to exit 4. See
+# src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-quote-tape-ingest.timer`
+# is the only thing to enable.

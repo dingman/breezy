@@ -1,0 +1,102 @@
+
+005 
+CDUS41 KOKX 040625
+CLIEWR
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE NEW YORK, NY
+225 AM EDT FRI SEP 04 2026
+
+...................................
+
+...THE NEWARK NJ CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1843 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         89    343 PM 100    1993  82      7       79       
+  MINIMUM         69    249 AM  44    1862  65      4       61       
+  AVERAGE         79                        73      6       70     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.16          2.96 1969   0.13   0.03     0.00     
+  MONTH TO DATE    0.45                      0.37   0.08     0.00     
+  SINCE SEP 1      0.45                      0.37   0.08     0.00     
+  SINCE JAN 1     31.88                     31.89  -0.01    23.59     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0           0.0  2001   0.0    0.0      0.0      
+                                      2002                           
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0      0.0      
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         1     -1        0        
+
+ COOLING                                                              
+  YESTERDAY       14                         8      6        5        
+  MONTH TO DATE   32                        26      6       16        
+  SINCE SEP 1     32                        26      6       16        
+  SINCE JAN 1   1307                      1115    192     1269        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    22   HIGHEST WIND DIRECTION     W (250)       
+  HIGHEST GUST SPEED    33   HIGHEST GUST DIRECTION     W (260)       
+  AVERAGE WIND SPEED     9.6                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.8                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  LIGHT RAIN                                                          
+  FOG                                                                 
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    97           300 AM                                      
+ LOWEST     55           200 PM                                      
+ AVERAGE    76                                                        
+
+..........................................................
+
+
+THE NEWARK NJ CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   82       100      1929                      
+ MINIMUM TEMPERATURE (F)   65        46      1883                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   627 AM EDT   SUNSET   724 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   628 AM EDT   SUNSET   722 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

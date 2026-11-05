@@ -1,0 +1,20 @@
+# AUT-1 r4 (final round): merged (coordinator). trading-bot-architect 92, silent-failure-hunter 89. Final 89; zero CRITICAL or HIGH. Polish to r5.
+- **H1 [ops N1]**: When the file opens, read its last byte; if it is not `\n`, set `_needs_newline=True`. A lone partial tail line is classified `torn_tail` and fails the day. Add `test_new_boot_after_torn_tail_prefixes_newline`.
+- **H2 [ops N2]**: `eval_seq` is the 0-based ordinal per `(instrument, ts_event)` across handler calls, deterministic by arrival. Add `test_same_frame_quote_and_depth_get_distinct_ids`.
+- **H3 [ops N3]**: R1 maps EntryVeto records to TrySubmit lines with closed-set veto reasons, passed through `OnChangeFilter`. Test it.
+- **H4 [ops N4]**: Take-to-submit budget = `min(formula, 150 ms)` as an absolute ceiling. A measured p99 above it blocks the merge, or the path moves to batched or async payload puts.
+- **H5 [sf 1]**: Boots are the union of log instance ids, capture-record `node_boot_id`s and `breezy-trade` unit activations. A boot without a readable log is ERROR. Add `test_capture_records_without_node_log_is_error_not_no_input`.
+- **H6 [sf 3]**: Heal alerts go through `deliver_with_proof`, and the delivery record carries the heal record's `observation_sha256`. Add `test_delivery_record_must_reference_heal_record`.
+- **H7 [sf 4]**: Isolate each watchdog check. A raised check becomes CRITICAL `CAPTURE_WATCHDOG_CHECK_ERROR` with the stamp marked `degraded`. The rate limit is keyed on `delivered=true`. A failed delivery exits non-zero.
+- **H8 [sf 5]**: Dedupe write-failure CRITICALs per cause per 300 s and journal the counts.
+- **H9 [sf 6]**: After 3 consecutive drill refusals while SELF_HEAL is enabled, raise CRITICAL `CAPTURE_DRILL_SKIPPED`.
+- **H10 [sf 7]**: Leg T audits only days at or after the epoch day, or treats pre-AMEND2 days as INFO. The positive control is "every instrument with ≥1 tape quote on D".
+- **H11 [sf 2, sf 8, ops L1–L4]: smaller items.**
+  - Add `ERROR node_log_unparseable`.
+  - `AWAITING_HEARTBEAT` gets a bytes-only stale CRITICAL, with no restart.
+  - Add a live-proof fallback trigger, since the audit exits 1 on ERROR.
+  - Give `venue_silent` an alert row and add it to §7(d).
+  - Delete the unused `_last_depth`.
+  - Ban `close_position`, `close_all_positions`, `market_exit` and `_send_risk_command` under `strategy/**`, or test that they dispatch through the override.
+  - Pin "ended" for leg S to the end of the climate day.
+  - In §6, state that NBP forecast ingest counts as a feed for the stall leg.

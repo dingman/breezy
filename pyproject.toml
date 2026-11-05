@@ -17,6 +17,13 @@ dependencies = [
     # indistinguishable from a guard that passes. Exact pin because this is
     # the cryptographic primitive under a safety barrier.
     "pynacl==1.6.2",
+    # CORE, promoted from the `backfill` extra (SCORER_TALLY_BCA_BRIEF_
+    # 2026-09-04.md, item 10). `settlement/roi_bound.py` (6e) is the R-9
+    # stop-gate BCa bootstrap consumer and imports `scipy.stats.bootstrap`
+    # at module scope; per L-1, reuse over hand-rolling a stop-gate
+    # quantity means it must actually be importable on a default checkout,
+    # not only when the `backfill` extra happens to be installed.
+    "scipy==1.18.1",
 ]
 
 [dependency-groups]
@@ -36,128 +43,6 @@ dev = [
 backfill = ["pyiem==1.27.0"]
 polymarket-us = ["polymarket-us==0.1.2"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "strict"
-addopts = "-q --strict-markers --strict-config -m 'not live and not venue_live and not real_money'"
-markers = [
-    "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
-    "replay: live/backtest parity tests",
-    "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
-    "venue_live: test performs real authenticated calls against the live Polymarket.us venue; gated behind BREEZY_VENUE_LIVE=1 AND BREEZY_ALLOW_CREDENTIALED_PYTEST=1 AND --venue-live",
-    "real_money: can place or affect real-money venue orders and needs BREEZY_REAL_MONEY=1 plus operator approval; deselected by default",
-]
-
-[tool.importlinter]
-root_packages = ["breezy"]
-include_external_packages = true
-
-[[tool.importlinter.contracts]]
-name = "Breezy top-level source packages follow the documented layer direction"
-type = "layers"
-containers = ["breezy"]
-layers = [
-    # `strategy` is the TOP layer: a strategy reaches down into `runtime` for
-    # the backtest feed's shared `ClientId` and into `ingest` for the shared
-    # weather `DataType` factories. Nothing may reach back up into it -- the
-    # harness in `runtime` takes strategies as constructed objects.
-    "strategy",
-    "runtime",
-    "adapters",
-    "ingest",
-    "persistence | registry | normalize",
-    "features | settlement",
-    "domain",
-]
-exhaustive = true
-ignore_imports = [
-    # Current inspected debt from the Polymarket.us read-path slice.
-    "breezy.adapters.polymarket_us.config -> breezy.runtime.settings",
-    "breezy.adapters.polymarket_us.factories -> breezy.runtime.settings",
-    # Current inspected debt from the NWS ingest runtime cycle.
-    "breezy.ingest.nws_actor -> breezy.runtime.health",
-    # Current inspected debt from quote-tape persistence using venue tape records.
-    "breezy.persistence.quote_tape_gaps -> breezy.adapters.polymarket_us.tape_records",
-]
-
-[[tool.importlinter.contracts]]
-name = "Breezy never imports the Nautilus Polymarket .com adapter"
-type = "forbidden"
-source_modules = ["breezy"]
-forbidden_modules = ["nautilus_trader"]
-allow_indirect_imports = true
-ignore_imports = [
-    "breezy.adapters.polymarket_us.config -> nautilus_trader",
-    "breezy.adapters.polymarket_us.credentials -> nautilus_trader",
-    "breezy.adapters.polymarket_us.data -> nautilus_trader",
-    "breezy.adapters.polymarket_us.factories -> nautilus_trader",
-    # Subclasses the native `backtest.models.FeeModel` extension point.
-    "breezy.adapters.polymarket_us.fees -> nautilus_trader",
-    "breezy.adapters.polymarket_us.parsing -> nautilus_trader",
-    "breezy.adapters.polymarket_us.provider -> nautilus_trader",
-    "breezy.adapters.polymarket_us.secure -> nautilus_trader",
-    "breezy.adapters.polymarket_us.signing -> nautilus_trader",
-    "breezy.adapters.polymarket_us.symbology -> nautilus_trader",
-    "breezy.adapters.polymarket_us.tape_records -> nautilus_trader",
-    "breezy.adapters.polymarket_us.transport -> nautilus_trader",
-    "breezy.adapters.polymarket_us.websocket -> nautilus_trader",
-    "breezy.domain.archived_climate_day -> nautilus_trader",
-    "breezy.domain.archived_raw_product -> nautilus_trader",
-    "breezy.domain.nws_climate_day -> nautilus_trader",
-    "breezy.domain.nws_raw_product -> nautilus_trader",
-    "breezy.ingest.config -> nautilus_trader",
-    "breezy.ingest.nws_actor -> nautilus_trader",
-    "breezy.persistence.catalog -> nautilus_trader",
-    "breezy.persistence.archive_catalog -> nautilus_trader",
-    "breezy.persistence.quote_tape_gaps -> nautilus_trader",
-    # Wraps weather records in the native `CustomData` envelope and names
-    # the native `ClientId` -- both are Nautilus extension points.
-    "breezy.runtime.backtest_feed -> nautilus_trader",
-    # Composes the native `BacktestEngine` and subclasses nothing.
-    "breezy.runtime.backtest_harness -> nautilus_trader",
-    # Subscribes to the native `MessageBus` order-event topic and subclasses
-    # nothing; reads `OrderInitialized`/`OrderSide` to screen order intent.
-    "breezy.runtime.backtest_order_guard -> nautilus_trader",
-    # WILDCARD, deliberately, over the whole `breezy.strategy` subtree: every
-    # strategy subclasses the native `Strategy`/`StrategyConfig` extension
-    # points, so a per-module entry made "write a strategy" a pyproject edit
-    # that nothing in `pytest` catches. `**` (whole subtree) rather than `*`
-    # (direct children only) so a strategy in a subpackage is covered too.
-    #
-    # This does NOT weaken the architecture. The LAYERS contract above still
-    # constrains what `strategy` may import from `breezy` -- it is the TOP
-    # layer, so nothing may reach back into it, and it may only reach DOWN.
-    # All this waives is the blanket "no `nautilus_trader` anywhere" rule,
-    # whose purpose is to keep the Polymarket .com adapter out of Breezy;
-    # `nautilus_trader.trading.strategy` is the native extension point a
-    # strategy exists to subclass. Pinned by
-    # `tests/unit/test_strategy_module_gate.py`, which synthesises a brand-new
-    # strategy module and runs the real `lint-imports` over it.
-    "breezy.strategy.** -> nautilus_trader",
-    "breezy.runtime.cli -> nautilus_trader",
-    "breezy.runtime.composition -> nautilus_trader",
-    "breezy.runtime.logging_bridge -> nautilus_trader",
-    "breezy.runtime.node_config -> nautilus_trader",
-    "breezy.runtime.quote_tape_cli -> nautilus_trader",
-]
-
-[[tool.importlinter.contracts]]
-name = "Settlement and strategy code never reaches archived backfill records"
-type = "forbidden"
-source_modules = [
-    "breezy.settlement",
-    "breezy.strategy",
-    "breezy.ingest.nws_actor",
-    "breezy.runtime.backtest_feed",
-]
-forbidden_modules = [
-    "breezy.domain.archived_climate_day",
-    "breezy.domain.archived_raw_product",
-    "breezy.persistence.archive_catalog",
-    "breezy.ingest.archive_records",
-]
-allow_indirect_imports = false
-
 [tool.ruff]
 line-length = 100
 target-version = "py313"
@@ -167,6 +52,12 @@ extend-exclude = [
     "docs/evidence/venue/polymarket_us/sdk_snapshot",
 ]
 
+[tool.ruff.format]
+# FROZEN generated module: its bytes are pinned by the regeneration tests
+# (test_current_rung_hold_archive_table.py, test_archive_table_upper_bound_2026_09_14.py).
+# Formatting it breaks byte-identity (CF-11, 2026-09-28). Lint still applies.
+exclude = ["src/breezy/strategy/current_rung_hold/archive_table.py"]
+
 [tool.ruff.lint]
 # Isort ordering is enforced by default; E501 must be opted in explicitly
 # because Ruff excludes it even under a broad select (formatter-adjacent rule).
@@ -175,6 +66,28 @@ extend-select = ["E501"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
+# CF-12: `scripts/` (and `scripts/analysis/`) ships no `__init__.py` --
+# deliberate, matching the rest of this `files` list's implicit-namespace-
+# package convention -- so without this, mypy resolves
+# `scripts/analysis/discovery_set_equality.py` as the bare top-level module
+# `discovery_set_equality` when it is globbed directly here, but as the
+# qualified `scripts.analysis.discovery_set_equality` when it is reached via
+# `tests/unit/test_discovery_set_equality.py`'s own
+# `from scripts.analysis.discovery_set_equality import ...` -- two module
+# identities for one file, which mypy refuses outright ("Source file found
+# twice under different module names"). `explicit_package_bases` makes every
+# module name derive from the nearest `__init__.py`-free root under the
+# current directory (mypy's own resolution for exactly this shape), so both
+# paths agree on `scripts.analysis.discovery_set_equality`. Config-only: it
+# changes how a module is NAMED, not what is type-checked or which errors are
+# reported for it.
+explicit_package_bases = true
+# Names `breezy.*` from `src/breezy/...` relative to THIS base, so
+# `explicit_package_bases` (above) does not ALSO name the same files
+# `src.breezy.*` relative to the current directory -- the two-name collision
+# `explicit_package_bases` alone reproduced for every `src/breezy` module the
+# moment it was turned on.
+mypy_path = "src:scripts/collect"
 files = [
     "src/breezy/adapters",
     "src/breezy/normalize",
@@ -185,15 +98,21 @@ files = [
     "src/breezy/persistence",
     "src/breezy/runtime",
     "src/breezy/strategy",
+    "src/breezy/analysis",
 
     # The venue slice. The operator EXECUTES the smoke script against
     # PRODUCTION credentials, so it must be typechecked, and so must the test
     # doubles that claim to model the real classes.
     "scripts/venue",
+    # F13-C1 collector (sibling modules import each other by bare name; see mypy_path).
+    "scripts/collect",
     # The settlement seam's analysis scripts (Q-3). Previously excluded
     # because the directory carried pre-existing strict errors owned by that
     # seam; those errors are now fixed and the gate is widened to cover it.
     "scripts/analysis",
+    # `scripts/archive` (P0). The operator EXECUTES this against the only copy
+    # of two irreplaceable datasets, so it is typechecked like the venue smoke.
+    "scripts/archive",
     #
     # `tests/` (Q-2). Previously excluded wholesale -- it carried 159
     # pre-existing strict errors across 38 files, so only the polymarket_us
@@ -210,7 +129,7 @@ files = [
 # is typed as `pd.Timedelta`, so the streaming rotation config cannot be
 # expressed without touching it. Untyped at the boundary, strict within.
 [[tool.mypy.overrides]]
-module = ["pyarrow.*", "pandas.*", "nautilus_trader.*"]
+module = ["pyarrow.*", "pandas.*", "nautilus_trader.*", "scipy.*", "fsspec.*"]
 ignore_missing_imports = true
 follow_untyped_imports = false
 
@@ -225,7 +144,13 @@ disallow_subclassing_any = false
 # module deliberately: a package-wide waiver would silently cover future ingest code
 # that has no such excuse.
 [[tool.mypy.overrides]]
-module = ["breezy.ingest.nws_actor"]
+module = [
+    "breezy.ingest.nws_actor",
+    "breezy.ingest.nws_observation_actor",
+    "breezy.ingest.nbm_quantile_actor",
+    # EXEC-PAR WP5b: the breaker watcher is a native Actor (same erasure).
+    "breezy.runtime.breaker_watcher",
+]
 disallow_subclassing_any = false
 
 # `Strategy` and `StrategyConfig` are compiled Cython classes that erase to Any,
@@ -255,6 +180,79 @@ breezy = "breezy:main"
 # must start on a host with no venue configuration, and the quote-tape recorder
 # must refuse to start without it. See `breezy.runtime.quote_tape_cli`.
 breezy-quote-tape = "breezy.runtime.quote_tape_cli:main"
+# BL-23. A THIRD process, and deliberately not a flag on the recorder: it must
+# run on a host with no venue configuration, opens no socket, holds no
+# credential, and reads the tape READ-ONLY. See
+# `breezy.runtime.quote_tape_preflight_cli` for the exit contract (3 =
+# TRUNCATION DETECTED).
+breezy-quote-tape-preflight = "breezy.runtime.quote_tape_preflight_cli:main"
+# EXEC SPINE R-2. A FOURTH process, deliberately not a flag on the recorder:
+# it refuses to start without a trading identity of its own
+# (`BREEZY_TRADE_TRADER_ID`, no default), writes no tape, and in this
+# increment carries NO execution client -- it is the process shell only. See
+# `breezy.runtime.trade_cli` for the exit contract.
+breezy-trade = "breezy.app.trade:main"
+# A FIFTH process, deliberately not automated inside the recorder itself: the
+# recorder writer must never also be the process that reads its own output
+# back. Converts streamed feather under `<catalog>/live/<instance>/` into the
+# parquet layout every analysis script queries -- the step
+# `breezy.runtime.quote_tape_cli` explicitly leaves out of scope. Holds no
+# venue credential, opens no socket, and never signals the recorder. See
+# `breezy.runtime.quote_tape_ingest_cli` for the live-write-avoidance rule.
+breezy-quote-tape-ingest = "breezy.runtime.quote_tape_ingest_cli:main"
+# A SIXTH process: the operator clear tool for an OPEN submit-intent latch.
+# Never a flag on breezy-trade, never on a timer, never at startup. See
+# `breezy.runtime.clear_submit_intent_cli`.
+breezy-clear-submit-intent = "breezy.runtime.clear_submit_intent_cli:main"
+# An EIGHTH process: mirrors `breezy-clear-submit-intent`'s structure and
+# safety exactly -- the operator tool that terminates the NO-side bounded
+# first-order containment window (PREREG amendment §8 item 4) by writing
+# `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY`, the ONLY sanctioned write site for
+# that key (E3-7's structural scan). Never a flag on breezy-trade, never on
+# a timer, never at startup. See
+# `breezy.runtime.mark_no_side_position_captured_cli`.
+breezy-mark-no-side-position-captured = "breezy.runtime.mark_no_side_position_captured_cli:main"
+# Mirrors `breezy-clear-submit-intent`'s structure and safety exactly: the
+# operator clear tool for the `pm_us_crh_cont` family-wide halt
+# (`continuous_rung_hold/halt`, see `TrialDayLatch.record_duplicate_fill` /
+# `is_family_halted`). There is no automated clear by design -- clearing is
+# a build-side decision made with evidence. See
+# Lives in the `strategy` layer, not `runtime`, because it touches
+# `TrialDayLatch` (`breezy.strategy.current_rung_hold.trial_day_latch`) --
+# `runtime` may never import `strategy` (see the layers contract below).
+# `breezy.strategy.current_rung_hold.clear_family_halt_cli`.
+breezy-clear-family-halt = "breezy.strategy.current_rung_hold.clear_family_halt_cli:main"
+# AUD-02b: enforce the A1 ruling
+# (`docs/evidence/RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md`) -- the
+# SET sibling of `breezy-clear-family-halt` immediately above. Writes exactly
+# the same `FAMILY_HALT_KEY` payload shape via the new
+# `TrialDayLatch.record_policy_halt`; no new state, no new veto, no new key.
+# See `breezy.strategy.current_rung_hold.set_family_halt_cli`.
+breezy-set-family-halt = "breezy.strategy.current_rung_hold.set_family_halt_cli:main"
+# A SEVENTH process: the detached daily launcher for `breezy-trade`
+# (TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md). Values-free -- the seven
+# operator-reserved values travel only through its own forwarded `env=`,
+# never argv, never a file. Requires the distinct argv token
+# `breezy-trade-supervisor-daily` as its first positional argument so
+# `pgrep -f` can find it without substring-matching the node's own argv.
+# See `breezy.runtime.trade_supervisor`.
+breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"
+# [WP-B0] The operator's alert-channel one-shot, deliberately its own
+# process and not a flag on the node or the supervisor: it must run on a
+# host with no venue configuration, holds no credential, touches no state
+# store, and sends exactly ONE alert before exiting. See
+# `breezy.runtime.check_alerts_cli` for the exit contract (2 = NO EGRESS
+# CONFIGURED, 3 = configured but NOT DELIVERED).
+breezy-check-alerts = "breezy.runtime.check_alerts_cli:main"
+# AUD-15a: the `OnFailure=` notifier for every study unit in
+# `deploy/systemd/` (`breezy-study-failed@.service`). Deliberately its own
+# process, mirroring `breezy-check-alerts`'s shape: no credential, no state
+# store, one alert, exits 0 unconditionally. See
+# `breezy.runtime.study_failure_notifier`.
+breezy-study-failed = "breezy.runtime.study_failure_notifier:main"
+# AUT-6 WP1: drains the durable alert outbox. Run by breezy-autonomy-alert-redeliver.service under
+# the shared bwrap wrapper; see `breezy.runtime.alert_redeliver_cli`.
+breezy-autonomy-alert-redeliver = "breezy.runtime.alert_redeliver_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

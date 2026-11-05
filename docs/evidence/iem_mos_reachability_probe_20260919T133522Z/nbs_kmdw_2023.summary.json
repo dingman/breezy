@@ -1,0 +1,17 @@
+{
+  "body_bytes": 4786216,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,tmp,dpt,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,sky,gst,t03,pzr,psn,ppl,pra,s06,slv,i06,lcb,station,dur,mht,twd,tws,hid,sol,txn,xnd,tsd,dsd,ssd,gsd,ifc,ifv,wsd",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2023-01-01 01:00:00",
+  "label": "nbs_kmdw_2023",
+  "last_runtime": "2023-12-31 19:00:00",
+  "outcome": "ok",
+  "row_count": 33580,
+  "sample_row_1": "2023-01-01 01:00:00,2023-01-01 06:00:00,NBS,37,32,150,6,,,,,1.0,,,,70,100,93,9,0,0,0,0,100,,46.0,,60,KMDW,,6,17,10,,0,,,2,2,6,4,0,3,1",
+  "sample_row_2": "2023-01-01 01:00:00,2023-01-01 09:00:00,NBS,39,35,180,6,,,,,,,,,8,40,92,10,2,0,0,0,100,,58.0,,5,KMDW,,6,19,10,,0,,,2,2,8,3,40,11,1",
+  "sha256": "71f3d9f53a868ae0447fdc2aaa8be98b1c8593a8d511ff2b849dc49a76fc5961",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KMDW&model=NBS&format=csv&sts=2023-01-01T00%3A00Z&ets=2023-12-31T23%3A59Z"
+}

@@ -1,6 +1,6 @@
 """Node wiring for the Polymarket.us read-only data client (plan Step 12).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``factories.py`` (``:883-905``), section 7 environment contract
 (``:930-949``), section 8.3 startup flow (``:1026-1042``), controls S3 and
 S14.
@@ -51,12 +51,17 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable, Mapping
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, Logger, MessageBus
+from nautilus_trader.common.config import resolve_path
 from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.live.config import LiveDataClientConfig
-from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
+from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
+from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.config import (
     ORIGIN_FIELD_SCHEMES,
@@ -65,6 +70,8 @@ from breezy.adapters.polymarket_us.config import (
     POLYMARKET_US_GATEWAY_BASE_URL,
     POLYMARKET_US_WS_BASE_URL,
     PolymarketUSDataClientConfig,
+    PolymarketUSExecClientConfig,
+    PolymarketUSMarketDiscoveryConfig,
     assert_well_formed_origin,
 )
 from breezy.adapters.polymarket_us.data import (
@@ -73,7 +80,14 @@ from breezy.adapters.polymarket_us.data import (
     build_data_client,
 )
 from breezy.adapters.polymarket_us.env import load_polymarket_us_credentials
-from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    PRIVATE_READ_QUOTA_KEY,
+    decode_private_payload,
+)
+from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused
+from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, build_query_string
+from breezy.adapters.polymarket_us.operator_controls import DailySpendLedger
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
@@ -82,13 +96,22 @@ from breezy.adapters.polymarket_us.transport import (
     NautilusHttpTransport,
     build_default_quota,
     build_keyed_quotas,
+    build_shared_http_client,
 )
-from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocket
+from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool
+from breezy.adapters.polymarket_us.write_transport import (
+    WRITE_CANONICAL_STRING_VERIFIED,
+    Ed25519WriteRequestSigner,
+    PolymarketUSWriteTransport,
+)
+from breezy.persistence.station_candidates import SIGHTINGS_DIR, FileSightingSink
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
+    "ACCOUNT_NUMBER_ENV_VAR",
     "API_BASE_ENV_VAR",
     "DISCOVERY_RELOAD_INTERVAL_ENV_VAR",
+    "EXEC_STATE_DB_ENV_VAR",
     "GATEWAY_BASE_ENV_VAR",
     "MARKET_SLUGS_ENV_VAR",
     "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR",
@@ -98,7 +121,9 @@ __all__ = [
     "WS_MARKETS_REQUIRES_AUTH",
     "WS_URL_ENV_VAR",
     "PolymarketUSLiveDataClientFactory",
+    "PolymarketUSLiveExecClientFactory",
     "config_from_env",
+    "exec_config_from_env",
 ]
 
 #: The conventional registration name. It becomes the ``ClientId`` verbatim
@@ -141,6 +166,27 @@ _ORIGIN_ENV_VARS: tuple[tuple[str, str, str], ...] = tuple(
 #: (plan section 5.1: docs snapshot ``:82,94,105`` and the SDK's
 #: ``auth.py:26-27`` agree that the query string is NOT signed).
 SIGNING_VARIANT_ENV_VAR: str = "POLYMARKET_US_SIGNING_VARIANT"
+
+# EXEC SPINE W (docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md section 3, OQ-I).
+#
+# REQUIRED. `account_number` has ZERO producers anywhere else in the repo
+# (`grep -rn "account_number" src/ scripts/` outside `exec/client.py` returns
+# nothing but the constructor parameter itself) -- it exists only as the
+# `AccountId` suffix (`exec/client.py:535-537`). Read fresh from the
+# operator's venue configuration on every process start, alongside the
+# credentials at `~/.config/breezy/polymarket.env` -- the SAME mechanism that
+# already makes those credentials stable across a restart makes this value
+# stable too: a static environment variable, never generated, cached or
+# derived. A changed value re-labels every future event under a new
+# `AccountId`; it orphans nothing in the durable store, whose keys are
+# prefixed by venue, never by account (`exec/client.py:80-92`).
+ACCOUNT_NUMBER_ENV_VAR: str = "POLYMARKET_US_ACCOUNT_NUMBER"
+
+#: REQUIRED. Absolute path to the durable execution state store
+#: (`breezy.runtime.sqlite_store.SqliteStateStore`). Deploy path, an operator
+#: ceiling like `BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG` -- no default, and
+#: never guessed, because a wrong path silently starts a fresh, empty store.
+EXEC_STATE_DB_ENV_VAR: str = "POLYMARKET_US_EXEC_STATE_DB"
 
 #: UNRESOLVED venue fact E1: whether ``/v1/ws/markets`` requires authentication
 #: at all. The SDK signs it (``sdk_snapshot/.../websocket/base.py:51``), so the
@@ -187,9 +233,7 @@ def _origin_override(
     if not raw:
         return pinned
     try:
-        return assert_well_formed_origin(
-            field, raw, scheme=scheme, allow_foreign=allow_foreign
-        )
+        return assert_well_formed_origin(field, raw, scheme=scheme, allow_foreign=allow_foreign)
     except SettingsError as exc:
         raise SettingsError(f"{env_var} is not a usable override: {exc}") from exc
 
@@ -285,18 +329,105 @@ def config_from_env(
     )
 
 
-def _required(value: str | None, *, field: str) -> str:
+def exec_config_from_env(
+    env: Mapping[str, str] | None = None,
+) -> PolymarketUSExecClientConfig:
+    """Build the execution-client config (EXEC SPINE W).
+
+    Reuses :func:`config_from_env` verbatim for every shared venue fact --
+    origins, user agent, signing variant, market discovery -- so this is not a
+    second, competing environment policy for the same variables. Only the two
+    values genuinely new to the execution surface are read here:
+    :data:`ACCOUNT_NUMBER_ENV_VAR` and :data:`EXEC_STATE_DB_ENV_VAR`, both
+    REQUIRED with no default.
+
+    ``state_store_opener`` is deliberately left unset: this module is an
+    ``adapters`` package and may not import
+    ``breezy.runtime.sqlite_store.SqliteStateStore`` (the import-linter layer
+    contract puts ``runtime`` above ``adapters``). It is filled in by
+    :func:`breezy.runtime.node_config.build_trade_node_config`.
+    """
+    source = os.environ if env is None else env
+    venue_config = config_from_env(env)
+
+    account_number = source.get(ACCOUNT_NUMBER_ENV_VAR, "").strip()
+    if not account_number:
+        raise SettingsError(
+            f"{ACCOUNT_NUMBER_ENV_VAR} is required and has no default: it "
+            "becomes the AccountId suffix and Breezy cannot derive it from "
+            "anything else"
+        )
+
+    raw_state_db = source.get(EXEC_STATE_DB_ENV_VAR, "").strip()
+    if not raw_state_db:
+        raise SettingsError(f"{EXEC_STATE_DB_ENV_VAR} is required and has no default")
+    state_store_path = Path(raw_state_db)
+    if not state_store_path.is_absolute():
+        raise SettingsError(
+            f"{EXEC_STATE_DB_ENV_VAR} must be an absolute path, was {raw_state_db!r}"
+        )
+    if any(part == ".." for part in state_store_path.parts):
+        raise SettingsError(
+            f"{EXEC_STATE_DB_ENV_VAR} must not contain a '..' segment, was {raw_state_db!r}"
+        )
+
+    return PolymarketUSExecClientConfig(
+        venue=venue_config,
+        account_number=account_number,
+        state_store_path=str(state_store_path),
+    )
+
+
+def spend_ledger_for(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
+    """The client's spend ledger, with the EXEC-PAR bounds only when K > 1.
+
+    At an effective K of 1 the open-exposure bound and the AMBIGUOUS-notional
+    breaker stay OFF (``None``), so the ledger is exactly the K=1 one: the
+    per-order ``cost > f_adm x budget`` refusal could otherwise deny an order
+    the one-at-a-time latch admitted today. The fractions are Breezy-owned
+    ``Final`` constants threaded through the config, never operator controls.
+    """
+    if config.max_concurrent_intents <= 1:
+        return DailySpendLedger()
+    return DailySpendLedger(
+        f_adm=config.open_exposure_bound_fraction,
+        f_breaker=config.breaker_open_ambiguous_fraction,
+    )
+
+
+def _client_ledger(config: PolymarketUSExecClientConfig) -> DailySpendLedger:
+    """The ledger the client admits against: the injected one, else a fresh build.
+
+    BG-5c (A1): ``config.spend_ledger`` is handed through unchanged (same
+    object), so a composition root that built it with :func:`spend_ledger_for`
+    can hold the very instance the client admits against. ``None`` builds
+    exactly as before.
+    """
+    injected = config.spend_ledger
+    if injected is None:
+        return spend_ledger_for(config)
+    if not isinstance(injected, DailySpendLedger):
+        raise SettingsError(
+            "PolymarketUSExecClientConfig.spend_ledger must be a DailySpendLedger "
+            f"(or None); got {type(injected).__name__}"
+        )
+    return injected
+
+
+def _required(
+    value: str | None, *, field: str, config_name: str = "PolymarketUSDataClientConfig"
+) -> str:
     """Narrow a ``str | None`` config field that ``__post_init__`` guarantees.
 
-    ``PolymarketUSDataClientConfig.__post_init__`` already refuses an unset
-    value, so this can only fire if the config was bypassed. It stays because
-    ``msgspec.Struct`` performs no validation on direct construction and mypy
-    cannot see the ``__post_init__`` guarantee.
+    Both configs' ``__post_init__`` already refuse an unset value, so this can
+    only fire if a config was bypassed. It stays because ``msgspec.Struct``
+    performs no validation on direct construction and mypy cannot see the
+    ``__post_init__`` guarantee.
     """
     if value is None or not value.strip():
         raise SettingsError(
-            f"PolymarketUSDataClientConfig.{field} is unset; every venue "
-            "parameter is a required input with no default"
+            f"{config_name}.{field} is unset; every venue parameter is a "
+            "required input with no default"
         )
     return value
 
@@ -315,6 +446,180 @@ def _instrument_provider_config_for(
         log_warnings=provider_config.log_warnings,
         use_gamma_markets=provider_config.use_gamma_markets,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared object-graph caches -- ONE HTTP client, ONE instrument provider
+# ---------------------------------------------------------------------------
+#
+# Defect A. `LiveExecClientFactory.create` and `LiveDataClientFactory.create`
+# are both `@staticmethod`s invoked with no channel back to each other's
+# object graph (`live/node_builder.py:143-246`), so before this each factory
+# built its OWN `PolymarketUSHttpClient` -- and therefore its own
+# `nautilus_pyo3.HttpClient`, which is where the rate limiter actually lives
+# (`transport.py:317-323`: `keyed_quotas` is a construction-time argument of
+# the pyo3 client itself, an in-process token bucket scoped to that ONE
+# object). Two clients built from the SAME quota configuration are two
+# INDEPENDENT buckets: the venue -- which enforces per-account/per-IP, not
+# per-Python-object -- sees up to 2x the configured discovery/instrument
+# request rate, worst at node startup when both instrument providers load
+# concurrently.
+#
+# This is a native idiom this repo missed, not an invention. Every shipped
+# multi-client Nautilus adapter shares one graph via a module-level
+# `@lru_cache(1)` factory function called from BOTH `create()`s -- most
+# tellingly the shipped `nautilus_trader.adapters.polymarket` adapter, our
+# closest sibling: `get_polymarket_http_client`
+# (`adapters/polymarket/factories.py:42-43`, `@lru_cache(1)`) and
+# `get_polymarket_instrument_provider` (`:100-101`, `@lru_cache(1)`), each
+# called from both `PolymarketLiveDataClientFactory.create` and
+# `PolymarketLiveExecClientFactory.create`.
+#
+# Cached by VALUE, not by identity: `PolymarketUSDataClientConfig` is a
+# frozen, hashable `msgspec.Struct` (verified: two independently-constructed,
+# value-equal instances hash and compare equal), and the data and exec
+# factories each build their OWN config instance from the same environment
+# (`config_from_env` / `exec_config_from_env` in `trade_cli.py`) -- so two
+# distinct-but-equal config objects must still resolve to the SAME cached
+# client. `lru_cache` raises `TypeError` if a config is ever unhashable,
+# rather than silently falling through to build a second, unshared client --
+# that would reintroduce this exact defect invisibly, so it is left to raise.
+#
+# `maxsize=1`: this process runs exactly one venue configuration for its
+# lifetime, exactly like the native precedent.
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_signer(
+    config: PolymarketUSDataClientConfig, clock: LiveClock
+) -> Ed25519RequestSigner:
+    # BLOCKING filesystem I/O, deliberately performed here: see
+    # `PolymarketUSLiveDataClientFactory`'s "Why credentials are resolved
+    # HERE" docstring. Loaded once and shared, rather than once per factory.
+    credentials = load_polymarket_us_credentials(config.secrets)
+    return Ed25519RequestSigner.for_variant(
+        credentials,
+        clock=clock,
+        variant=SigningVariant(config.signing_variant),
+    )
+
+
+def _shared_polymarket_us_client(config: PolymarketUSDataClientConfig) -> Any:
+    """The ONE pyo3 HttpClient. Both wrappers call this; a second client halves Quota."""
+    user_agent = _required(config.user_agent, field="user_agent")
+    return build_shared_http_client(
+        timeout_secs=config.http_timeout_secs,
+        default_quota=build_default_quota(config.global_requests_per_second),
+        keyed_quotas=build_keyed_quotas(
+            discovery_requests_per_minute=config.discovery_requests_per_minute,
+            instrument_requests_per_minute=config.instrument_requests_per_minute,
+            book_requests_per_minute=config.book_requests_per_minute,
+        ),
+        default_headers={"User-Agent": user_agent},
+        # One operator switch for both transports; see the identical
+        # comment previously carried on each factory's own construction.
+        check_proxy_env=proxy_env_check_enabled(),
+    )
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_write_transport(
+    config: PolymarketUSDataClientConfig,
+) -> PolymarketUSWriteTransport:
+    """Constructed here; nothing dispatches through it until R-7."""
+    return PolymarketUSWriteTransport(client=_shared_polymarket_us_client(config))
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_transport(
+    config: PolymarketUSDataClientConfig,
+) -> NautilusHttpTransport:
+    """The ONE transport -- and therefore the ONE rate-limiter token bucket."""
+    client = _shared_polymarket_us_client(config)
+    _shared_polymarket_us_write_transport(config)
+    return NautilusHttpTransport(client=client)
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_http_client(
+    config: PolymarketUSDataClientConfig, clock: LiveClock
+) -> PolymarketUSHttpClient:
+    return PolymarketUSHttpClient(
+        transport=_shared_polymarket_us_transport(config),
+        signer=_shared_polymarket_us_signer(config, clock),
+        api_base_url=config.api_base_url,
+        gateway_base_url=config.gateway_base_url,
+        logger=Logger(f"{POLYMARKET_US_CLIENT_NAME}-http"),
+    )
+
+
+def shared_polymarket_us_http_client(
+    config: PolymarketUSDataClientConfig, clock: LiveClock
+) -> PolymarketUSHttpClient:
+    """Public delegation to :func:`_shared_polymarket_us_http_client` (AUD-02b
+    P3(i)): the ONE pyo3-backed HTTP client, exposed so a build-side caller
+    outside this module (``breezy.strategy.current_rung_hold.set_family_halt_cli``)
+    can reuse the EXACT production wiring rather than reaching through the
+    private name. Pure delegation -- the ``@lru_cache`` stays on the private
+    function, so both existing Nautilus factory callers and every
+    ``._shared_polymarket_us_http_client.cache_clear()`` test call site keep
+    calling exactly what they call today, byte-for-byte unchanged.
+    """
+    return _shared_polymarket_us_http_client(config, clock)
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_instrument_provider(
+    client: PolymarketUSHttpClient,
+    provider_config: InstrumentProviderConfig,
+    discovery: PolymarketUSMarketDiscoveryConfig,
+    clock: LiveClock,
+) -> PolymarketUSInstrumentProvider:
+    """The ONE instrument provider, dissolving a divergence risk.
+
+    R-4's ``_find_instrument`` fallback (``exec/client.py:992-1002``) was
+    mitigating two independent providers loading concurrently at startup and
+    transiently disagreeing on which instruments were resolved. One shared
+    provider removes the possibility entirely rather than papering over it.
+    """
+    return PolymarketUSInstrumentProvider(
+        client=client,
+        config=provider_config,
+        venue=POLYMARKET_US_VENUE,
+        discovery=discovery,
+        clock=clock,
+        logger=Logger(f"{POLYMARKET_US_CLIENT_NAME}-discovery"),
+    )
+
+
+def _resolve_sighting_failure_alert(path: str | None) -> Callable[[str], None] | None:
+    """Resolve the runtime-named alert callable; refuse a bad path at build time.
+
+    Nautilus's own ``resolve_path`` (the ``Importable*Config`` mechanism), so
+    the adapter never imports ``breezy.runtime`` itself.
+    """
+    if path is None:
+        return None
+    try:
+        target: Any = resolve_path(path)
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise SettingsError(
+            f"sighting_failure_alert_path {path!r} does not resolve: {exc!r}"
+        ) from exc
+    if not callable(target):
+        raise SettingsError(f"sighting_failure_alert_path {path!r} is not callable")
+    alert: Callable[[str], None] = target
+    return alert
+
+
+@lru_cache(maxsize=1)
+def _shared_sighting_sink(directory: str) -> FileSightingSink:
+    """The ONE sidecar sink for the process (AUD-08 §6b.1), keyed on a hashable ``str``.
+
+    Deliberately NOT a parameter of ``_shared_polymarket_us_instrument_provider``:
+    widening that cache key would make the data and exec factories' keys
+    unequal, evict at ``maxsize=1`` and build a second provider -- a second
+    appender on the same sidecar. The sink is attached after construction.
+    """
+    return FileSightingSink(Path(directory))
 
 
 class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
@@ -353,51 +658,35 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 f"PolymarketUSDataClientConfig; got {type(config).__name__}"
             )
 
-        api_base_url = config.api_base_url
-        gateway_base_url = config.gateway_base_url
         ws_url = config.ws_url
-        user_agent = _required(config.user_agent, field="user_agent")
 
-        # BLOCKING filesystem I/O, deliberately performed here: `build()` runs
-        # before the event loop starts (`live/node.py:272-280`). Never move
-        # this into a coroutine or a reconnect path (plan :520-530).
-        credentials = load_polymarket_us_credentials(config.secrets)
-
-        signer = Ed25519RequestSigner.for_variant(
-            credentials,
-            clock=clock,
-            variant=SigningVariant(config.signing_variant),
+        # BLOCKING filesystem I/O may happen here, deliberately: `build()`
+        # runs before the event loop starts (`live/node.py:272-280`). Never
+        # move this into a coroutine or a reconnect path (plan :520-530).
+        # SHARED with the sibling exec-side factory below (defect A): both
+        # factories call the same `@lru_cache(1)` getters with an
+        # equal-valued `config`, so exactly ONE transport (and therefore ONE
+        # rate-limiter token bucket), ONE signer and ONE instrument provider
+        # exist for the process, never two independently-quota'd clients.
+        # See the "Shared object-graph caches" block above `create`.
+        signer = _shared_polymarket_us_signer(config, clock)
+        http_client = _shared_polymarket_us_http_client(config, clock)
+        instrument_provider = _shared_polymarket_us_instrument_provider(
+            http_client,
+            _instrument_provider_config_for(config),
+            config.market_discovery,
+            clock,
         )
-        transport = NautilusHttpTransport(
-            timeout_secs=config.http_timeout_secs,
-            default_quota=build_default_quota(config.global_requests_per_second),
-            keyed_quotas=build_keyed_quotas(
-                discovery_requests_per_minute=config.discovery_requests_per_minute,
-                instrument_requests_per_minute=config.instrument_requests_per_minute,
-                book_requests_per_minute=config.book_requests_per_minute,
-            ),
-            default_headers={"User-Agent": user_agent},
-            # One operator switch for both transports. `reqwest` would
-            # otherwise honour HTTP_PROXY/HTTPS_PROXY on the path that carries
-            # signing credentials, which `breezy.ingest.http` has refused on
-            # its own path since it was written.
-            check_proxy_env=proxy_env_check_enabled(),
-        )
-        http_client = PolymarketUSHttpClient(
-            transport=transport,
-            signer=signer,
-            api_base_url=api_base_url,
-            gateway_base_url=gateway_base_url,
-            logger=Logger(f"{name}-http"),
-        )
-        instrument_provider = PolymarketUSInstrumentProvider(
-            client=http_client,
-            config=_instrument_provider_config_for(config),
-            venue=POLYMARKET_US_VENUE,
-            discovery=config.market_discovery,
-            clock=clock,
-            logger=Logger(f"{name}-discovery"),
-        )
+        # AUD-08b: `subscribe_trades` already means "this process is the
+        # quote-tape RECORDER" and nothing else, so it is the discriminator
+        # for the ONE sidecar writer -- no second flag. The recorder registers
+        # only this data factory; the trade node keeps the default False and
+        # attaches nothing. Advisory: the sidecar never makes a city tradeable.
+        if config.subscribe_trades:
+            instrument_provider.attach_sighting_sink(
+                _shared_sighting_sink(str(SIGHTINGS_DIR)),
+                failure_alert=_resolve_sighting_failure_alert(config.sighting_failure_alert_path),
+            )
 
         ws_signer = signer if WS_MARKETS_REQUIRES_AUTH else None
         ws_logger = Logger(f"{name}-ws")
@@ -406,7 +695,15 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             # The socket takes its frame handler at construction time and the
             # data client IS that handler, so the client builds its own feed
             # from this closure rather than receiving a pre-built socket.
-            return PolymarketUSMarketsWebSocket(
+            #
+            # A pool, not a bare `PolymarketUSMarketsWebSocket`: the venue caps
+            # subscriptions per connection (`websocket.MAX_SUBSCRIPTIONS_PER_
+            # CONNECTION`, empirically measured 2026-08-30) and silently drops
+            # every subscription past it. The pool shards across as many
+            # connections as the live slug count requires; for <=
+            # MAX_SUBSCRIPTIONS_PER_CONNECTION slugs it behaves identically to
+            # the single connection it replaces.
+            return PolymarketUSMarketsWebSocketPool(
                 ws_url=ws_url,
                 signer=ws_signer,
                 handler=handler,
@@ -414,6 +711,14 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 heartbeat_secs=config.ws_heartbeat_secs,
                 idle_timeout_secs=config.ws_idle_timeout_secs,
                 logger=ws_logger,
+                # The recorder's knob (`build_quote_tape_node_config`); the
+                # trade node's config leaves it False and its wire traffic
+                # unchanged.
+                subscribe_trades=config.subscribe_trades,
+                # OFF everywhere today, including the recorder: doubling the
+                # live connection count per key is gated on an unresolved
+                # connection-per-key probe (`websocket.py` pool docstring).
+                trade_shard_halving=config.trade_shard_halving,
             )
 
         return build_data_client(
@@ -427,3 +732,180 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             feed_factory=feed_factory,
             quote_parser=parse_quote_tick,
         )
+
+
+class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
+    """Construct the reconciling, order-refusing Polymarket.us execution client.
+
+    EXEC SPINE W (``docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`` section 3).
+    Registered exactly like the data-side sibling::
+
+        node.add_exec_client_factory(
+            POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
+        )
+
+    **This is where the GET-only guarantee actually lives.**
+    :class:`~breezy.adapters.polymarket_us.exec.client.PrivateRead` is a
+    ``typing.Protocol`` with no ``runtime_checkable`` decorator
+    (``exec/client.py:335-347``), so nothing at the client boundary can verify
+    the injected callable at runtime beyond ``callable()``. The closure built
+    below is a GET, and only a GET: it calls ``transport.get`` -- the same
+    GET-only wrapper the read-only data client already uses
+    (``transport.py:242-325``) -- and signs through
+    ``Ed25519RequestSigner.sign_headers``, whose ``PERMITTED_METHODS ==
+    frozenset({"GET"})`` (``signing.py:84``) refuses every other verb
+    (``:260-265``). **EDGE-2 slice D (AC10, ruling b): the closure now
+    accepts an optional ``query``.** ``PrivateRead.__call__`` renders it
+    EXACTLY ONCE, via
+    :func:`~breezy.adapters.polymarket_us.http.build_query_string` (the same
+    renderer ``PolymarketUSHttpClient._dispatch`` uses), and signs and sends
+    that ONE resulting string -- never two independent renderings that could
+    drift apart. With ``query=None`` (or omitted), the rendered string is
+    ``""``, so the request is BYTE-IDENTICAL to the pre-slice-D closure: the
+    same bare-path canonical string is signed, and no ``?`` is appended to
+    the URL. This is what makes the resolver's own paginated activities read
+    (``exec/client.py``'s ``_order_trade_activity``) possible without a
+    second, parallel signed-read mechanism.
+
+    **The durable-store opener is injected, never imported.** This module is
+    an ``adapters`` package; ``breezy.runtime.sqlite_store.SqliteStateStore``
+    lives in ``runtime``, ABOVE ``adapters`` in the import-linter layer
+    contract. ``config.state_store_opener`` is filled in by
+    ``breezy.runtime.node_config.build_trade_node_config`` -- see that
+    module's docstring -- and is threaded straight through, unopened, to
+    :class:`PolymarketUSExecutionClient`, which itself only ever calls it
+    from ``_connect``, on the loop thread that will write to it.
+    """
+
+    @staticmethod
+    def create(
+        loop: asyncio.AbstractEventLoop,
+        name: str,
+        config: LiveExecClientConfig,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+    ) -> PolymarketUSExecutionClient:
+        if not isinstance(config, PolymarketUSExecClientConfig):
+            raise SettingsError(
+                "PolymarketUSLiveExecClientFactory requires a "
+                f"PolymarketUSExecClientConfig; got {type(config).__name__}"
+            )
+        venue_config = config.venue
+        if not isinstance(venue_config, PolymarketUSDataClientConfig):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.venue must be a "
+                f"PolymarketUSDataClientConfig; got {type(venue_config).__name__}"
+            )
+        account_number = _required(
+            config.account_number,
+            field="account_number",
+            config_name="PolymarketUSExecClientConfig",
+        )
+        state_store_opener = config.state_store_opener
+        if state_store_opener is None:
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_opener is unset; "
+                "build_trade_node_config must inject it before the node is built"
+            )
+
+        # SHARED with `PolymarketUSLiveDataClientFactory` (defect A): both
+        # factories call the same `@lru_cache(1)` getters with an
+        # equal-valued `venue_config`, so this is the SAME transport (and
+        # therefore the SAME rate-limiter token bucket), the SAME signer and
+        # the SAME instrument provider the data client built -- never a
+        # second, independently-quota'd object graph. See the "Shared
+        # object-graph caches" block above `PolymarketUSLiveDataClientFactory`.
+        # BLOCKING filesystem I/O may happen on a cache miss: see the
+        # identical comment on `PolymarketUSLiveDataClientFactory.create`.
+        signer = _shared_polymarket_us_signer(venue_config, clock)
+        transport = _shared_polymarket_us_transport(venue_config)
+        http_client = _shared_polymarket_us_http_client(venue_config, clock)
+        instrument_provider = _shared_polymarket_us_instrument_provider(
+            http_client,
+            _instrument_provider_config_for(venue_config),
+            venue_config.market_discovery,
+            clock,
+        )
+
+        stripped_api_base_url = venue_config.api_base_url.rstrip("/")
+        credentials = load_polymarket_us_credentials(venue_config.secrets)
+        write_signer = Ed25519WriteRequestSigner(credentials, clock=clock)
+        write = _shared_polymarket_us_write_transport(venue_config)
+        order_sender = write if WRITE_CANONICAL_STRING_VERIFIED is True else None
+
+        async def private_read(
+            path: str, query: Mapping[str, object] | None = None
+        ) -> Mapping[str, Any]:
+            """The injected ``PrivateRead``: one signed GET, decoded Decimal-safe.
+
+            EDGE-2 slice D (AC10, ruling b): ``query`` is rendered EXACTLY
+            ONCE, by :func:`build_query_string`, into ``qs`` -- and that ONE
+            string feeds BOTH the signer and the URL, mirroring
+            ``PolymarketUSHttpClient._dispatch``'s own invariant
+            (``http.py:17-22``). With ``query=None`` (every existing caller,
+            unchanged), ``qs == ""``: the signed canonical string and the
+            fetched URL are BYTE-IDENTICAL to the pre-slice-D closure.
+            ``PolymarketUSHttpClient`` is deliberately NOT used for this
+            call: its own ``_decode`` (`http.py:249-263`) calls
+            ``json.loads`` with no ``parse_float``, which would silently
+            replace a private-surface money literal with a different `float`
+            (`exec/endpoints.py` module docstring). ``decode_private_payload``
+            is the Decimal-preserving decode this surface requires.
+
+            R-6.5a: any non-2xx status is raised as ``PrivateReadRefused`` --
+            carrying the status, the bare path, and the raw body -- rather
+            than handed to ``decode_private_payload``.
+            ``NautilusHttpTransport.get`` (``transport.py``) returns a
+            ``VenueResponse`` for any status short of a 3xx or a transport
+            fault, so before this check a 503 whose body was a
+            ``google.rpc.Status`` JSON object decoded as if it were a
+            payload, and ``classify_venue_refusal`` (``exec/refusals.py``)
+            could never be reached. See ``PrivateRead.__call__``'s own
+            docstring (``exec/client.py``): every implementation, present or
+            future, carries this same obligation.
+            """
+            qs = build_query_string(query)
+            headers = dict(signer.sign_headers("GET", path, query_string=qs))
+            url = f"{stripped_api_base_url}{path}"
+            if qs:
+                url = f"{url}?{qs}"
+            response = await transport.get(
+                url,
+                headers=headers,
+                quota_key=PRIVATE_READ_QUOTA_KEY,
+            )
+            if not 200 <= response.status < 300:
+                raise PrivateReadRefused(status=response.status, path=path, body=response.body)
+            return decode_private_payload(response.body, context=path)
+
+        client = PolymarketUSExecutionClient(
+            loop=loop,
+            client_id=ClientId(name),
+            venue=POLYMARKET_US_VENUE,
+            instrument_provider=instrument_provider,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            private_read=private_read,
+            state_store_opener=state_store_opener,
+            account_number=account_number,
+            instrument_wait_timeout_s=config.instrument_wait_timeout_s,
+            account_registration_timeout_s=config.account_registration_timeout_s,
+            order_sender=order_sender,
+            write_signer=write_signer,
+            live_trading_permit=config.live_trading_permit,
+            spend_ledger=_client_ledger(config),
+            submit_intent_latch=config.submit_intent_latch,
+            credentials=credentials,
+            api_base_url=stripped_api_base_url,
+            retirement_reasons=config.retirement_reasons,
+            submit_veto=config.submit_veto,
+            exit_manifest=config.exit_manifest,
+            resolver_instrument_loader=config.resolver_instrument_loader,
+            no_id_retire_admitted=config.no_id_retire_admitted,
+            resting_accept_admitted=config.resting_accept_admitted,
+            sweep_retire_admitted=config.sweep_retire_admitted,
+            frozen_cost_budget_bucket=config.frozen_cost_budget_bucket,
+        )
+        return client

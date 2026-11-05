@@ -1,0 +1,41 @@
+[Unit]
+# X-3: the OnFailure= notifier for autonomy units. The unit lint refuses
+# breezy-study-failed@ as an OnFailure target by name (E-7a), so this template
+# is distinct — but it runs the same proven breezy-study-failed entry the
+# study notifier runs. Unwrapped on purpose (E-7a rule 5 residual): the wrapped
+# breezy-autonomy-failed row, with its fallback line, is still WP4/WP7. Until
+# that row lands, the unit lint keeps the recorded onfailure_scope gap.
+# Templated so ONE unit covers every autonomy caller: the failing unit's name
+# arrives via %i, never a per-unit copy of this file.
+Description=Breezy autonomy-unit failure notifier for %i
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/study_failure_notifier.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Same shared aggregate ceiling as the study notifier, so a pathological
+# notifier cannot contend with the live trading node (which lives outside
+# this slice entirely -- breezy-trade-supervisor.service).
+Slice=breezy-studies.slice
+UMask=0077
+
+# Same dedicated alerts.env as breezy-study-failed@.service. The leading `-`
+# keeps this unit startable when the file is absent (fails closed to LOG-only,
+# never to a hard start failure). Never breezy-trade.env or polymarket.env.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=%h/breezy/.venv/bin/breezy-study-failed --unit %i
+
+# No Restart=, and deliberately NO OnFailure= of its own: an alerting loop is
+# worse than a missed alert. If this instance itself fails, it lands in
+# `failed` and nothing pages on it — the same accepted residual as the study
+# notifier.
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-autonomy-failed
+
+# NOTE: no [Install] section. This unit is never enabled or started
+# directly — it is invoked ONLY via a sibling unit's
+# `OnFailure=breezy-autonomy-failed@%n.service` line.

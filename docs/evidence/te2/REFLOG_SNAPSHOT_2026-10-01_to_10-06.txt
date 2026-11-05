@@ -1,0 +1,354 @@
+# Captured 2026-10-11 for TE-2 per-boot pin (reflog entries expire). Identity/email columns stripped.
+# source: .git/logs/HEAD
+2026-10-01T00:50:22+00:00 old=1d7ea1016d7c new=c8bb5c9d84e2 commit: docs(evidence): OPERATOR RULING — forecast_quantile_ladder to live real orders ASAP, current caps (2026-10-01)
+2026-10-01T01:08:51+00:00 old=c8bb5c9d84e2 new=d86e30a05e79 commit: docs(plans): FQ go-live plan Rev1 — peer-reviewed (arch 94, sec 92, PM 90 APPROVE)
+2026-10-01T01:30:32+00:00 old=d86e30a05e79 new=5fc820507309 cherry-pick: refactor(strategy): FQ-S1 one location-correction implementation in src (ladder_ev.location_correction), shared by analysis and live
+2026-10-01T01:30:32+00:00 old=5fc820507309 new=dfa75525d5bb cherry-pick: fix(strategy): FQ-S3 margin horizon is hours to LST midnight ending the climate day (not venue expiration_ns)
+2026-10-01T01:30:32+00:00 old=dfa75525d5bb new=b58bb4c856c1 cherry-pick: feat(deploy): FQ-S7 CRH timer wrappers skip forecast_quantile_ladder cleanly (exit 0, logged)
+2026-10-01T01:30:32+00:00 old=b58bb4c856c1 new=9f24e61f758e cherry-pick: fix(analysis): FQ-S4a parity harness loads one D+1 window per cycle (no UTC-date relabel), per-side outcome counts, no-depth census
+2026-10-01T01:54:15+00:00 old=9f24e61f758e new=7cbe6523a20e cherry-pick: feat(strategy): FQ-S6 real-order path — fee probe, conditional subscribe marker, D+1 readiness poll, order alerts, NO-leg reconciliation gate test
+2026-10-01T01:54:15+00:00 old=7cbe6523a20e new=749316c5a20d cherry-pick: feat(strategy): FQ-S10 one side per rung per climate day — opposite_side_latched (durable), check order pinned
+2026-10-01T01:54:25+00:00 old=749316c5a20d new=416c2b5300f3 commit (cherry-pick): feat(runtime): FQ-S5 live-orders enable gate — ruling sha pin, path containment, shadow_only AST guard (fail-closed)
+2026-10-01T01:54:25+00:00 old=416c2b5300f3 new=a1402b0c0d12 cherry-pick: feat(app): FQ-S5 log ruling_sha256 on the fq_live_orders boot line
+2026-10-01T01:54:25+00:00 old=a1402b0c0d12 new=ea40d0a67493 cherry-pick: test: FQ-S5 manifest fixtures use contained relative artefact paths
+2026-10-01T01:54:25+00:00 old=ea40d0a67493 new=89fab9443343 cherry-pick: fix(analysis): tests no longer delete committed docs/evidence notes — write_validate_evidence_note requires an explicit evidence_dir
+2026-10-01T02:25:34+00:00 old=89fab9443343 new=d8f1949391e1 commit: fix(runtime): FQ-S5 ruling live copy under deploy/families/rulings (src never reads docs/evidence); egress-guard set +2 reviewed FQ-S6 tests
+2026-10-01T02:51:02+00:00 old=d8f1949391e1 new=d9bac1bdebe5 merge wip/fq-sl15fix: Merge made by the 'ort' strategy.
+2026-10-01T02:51:02+00:00 old=d9bac1bdebe5 new=59c4b1cd0803 merge wip/fq-s4b: Merge made by the 'ort' strategy.
+2026-10-01T02:52:12+00:00 old=59c4b1cd0803 new=10a5991a148c commit (merge): merge: wip/fq-s11 into feat/data-capture-and-risk (FQ go-live)
+2026-10-01T02:55:45+00:00 old=10a5991a148c new=038cb6e0dadb commit: test(strategy): FQ-S11 decision-funnel tests drop pre-S2 bounds_artefact kwargs (post-merge)
+2026-10-01T02:55:49+00:00 old=038cb6e0dadb new=038cb6e0dadb reset: moving to HEAD
+2026-10-01T02:55:52+00:00 old=038cb6e0dadb new=ad76d2f24415 cherry-pick: feat(deploy): FQ-S8 register pm_us_crh_fq_v1 — REGISTERED manifest, live_orders_ruling, sha-pinned calibration artefact copy
+2026-10-01T03:01:10+00:00 old=ad76d2f24415 new=0f7e10e1ddd4 commit: test(deploy): FQ-S8 registration test on load_live_calibration; positive parse of the registered artefact (5 versions x 200 draws, linear day-length)
+2026-10-01T03:25:26+00:00 old=0f7e10e1ddd4 new=474dff2b1f18 merge wip/fq-s9: Fast-forward
+2026-10-01T03:30:05+00:00 old=474dff2b1f18 new=cc294e4d709c merge wip/fq-ruff: Fast-forward
+2026-10-01T03:53:35+00:00 old=cc294e4d709c new=0f7e10e1ddd4 reset: moving to 0f7e10e1
+2026-10-01T03:53:35+00:00 old=0f7e10e1ddd4 new=fdff685551eb cherry-pick: style: ruff findings introduced by FQ go-live slices (unused noqa/imports, I001, E501, SIM114); repo ruff 253->249
+2026-10-01T05:43:50+00:00 old=fdff685551eb new=b6f928ba8375 cherry-pick: fix(analysis): SL-13p2 parity harness loads only window instruments/depth (slug climate-day + ts pad) and replays one climate day at a time; 1d 2.0GiB, 7d 5.8GiB (was OOM >12G)
+2026-10-01T05:43:50+00:00 old=b6f928ba8375 new=5dff9316f00a cherry-pick: fix(analysis): SL-13p2 live leg clocks depth at the decision instant (ts_init=ts_event) so the permit stub matches spec check (4); 1d mismatches 109532->198
+2026-10-01T05:43:50+00:00 old=5dff9316f00a new=333c3f2abef2 cherry-pick: fix(analysis): SL-13p2 parity replays the production slippage floor on both legs (pinned to the composition's LadderEvConfig) and scopes both legs + census + vacuity guard to the manifest stations
+2026-10-01T13:15:29+00:00 old=333c3f2abef2 new=7623d8880416 cherry-pick: fix(analysis): SL-13p2 parity registers each rung once (NO leg no longer duplicates the ladder partition); exit 2 reports the exception on stderr
+2026-10-01T13:24:09+00:00 old=7623d8880416 new=759911f35430 commit: docs(evidence): SL-13p2 parity 2026-09-25 (0 mismatches / 720597, 7=7 YES takes) under operator ruling cutting the window to 1 day
+2026-10-01T13:39:52+00:00 old=759911f35430 new=60290e9ddd29 cherry-pick: feat(deploy): FQ-S9 activation — supervisor sends pm_us_crh_fq_v1 (d0 2026-10-02); AUD-17 caps proof parametrized over the unit-named family + v4 rollback
+2026-10-01T16:01:36+00:00 old=60290e9ddd29 new=99067d4a9e7a merge wip/fq-d1-cache2: Fast-forward
+2026-10-02T07:31:08+00:00 old=99067d4a9e7a new=763527b686b6 merge emdash/refactor-y4qj4: Fast-forward
+2026-10-02T14:37:42+00:00 old=763527b686b6 new=e0c89f237312 merge fix/family-tally-fq-skip: Fast-forward
+2026-10-02T14:55:09+00:00 old=e0c89f237312 new=d6914fca62cf merge refactor/r15b: Fast-forward
+2026-10-02T15:01:50+00:00 old=d6914fca62cf new=d26ef2111627 merge refactor/int2: Fast-forward
+2026-10-02T15:51:13+00:00 old=d26ef2111627 new=a15fefd22724 merge refactor/t1speed: Fast-forward
+2026-10-02T16:00:52+00:00 old=a15fefd22724 new=7dfd1af114c1 merge docs/refactor-day2: Fast-forward
+2026-10-02T17:47:38+00:00 old=7dfd1af114c1 new=806a8942e095 merge fix/emit-health-critical: Fast-forward
+2026-10-02T17:47:54+00:00 old=806a8942e095 new=e42f2a288421 merge docs/refactor-day2: Fast-forward
+2026-10-02T19:35:11+00:00 old=e42f2a288421 new=62778b4a7ea5 merge refactor/r36: Fast-forward
+2026-10-02T20:05:01+00:00 old=62778b4a7ea5 new=6e99a7ae2dbe merge refactor/r3-batch: Fast-forward
+2026-10-02T20:54:53+00:00 old=6e99a7ae2dbe new=3eb4a1085dbf merge 3eb4a108: Fast-forward
+2026-10-02T21:18:17+00:00 old=3eb4a1085dbf new=d8e8fd92b90e merge d8e8fd92: Fast-forward
+2026-10-02T22:25:46+00:00 old=d8e8fd92b90e new=4b8347a6d58c merge 4b8347a6: Fast-forward
+2026-10-03T13:33:41+00:00 old=4b8347a6d58c new=4709a71dcdb9 commit: docs(plans): autonomy backlog, frozen ARCH Rev 9.2 + errata, seven peer-reviewed READY plans
+2026-10-03T14:22:50+00:00 old=4709a71dcdb9 new=853a82b9322d commit: docs(plans): reopen AUT-1 - Nautilus-native pressure test refutes 'nothing to reuse'; native-first r9 owed
+2026-10-03T15:01:45+00:00 old=853a82b9322d new=f45f5a6558cd commit: docs(progress): binding AUTONOMY priority queue for /execute-backlog; archive closed rows
+2026-10-03T17:40:32+00:00 old=f45f5a6558cd new=d231497df6a2 commit: docs(plans): every backlog item now has an approved peer-reviewed plan
+2026-10-03T19:34:39+00:00 old=d231497df6a2 new=6b6c324240ef commit: docs(plans): ARCH-0 seam A r5 and seam B r5 peer-reviewed to convergence; file errata E-7d, E-7e, E-14
+2026-10-03T21:49:31+00:00 old=6b6c324240ef new=834e4a828615 merge backlog/arch0-seam-a-2026-10-03: Fast-forward
+2026-10-03T22:09:14+00:00 old=834e4a828615 new=d6878c974905 merge backlog/arch0-seam-b-2026-10-03: Fast-forward
+2026-10-03T23:00:07+00:00 old=d6878c974905 new=dde0f646092c merge dde0f646: Fast-forward
+2026-10-03T23:00:36+00:00 old=dde0f646092c new=c5af5d5b1375 commit: docs(plans): ARCH-0 build-time rulings A5/A6, P-1..P-3, B6-R1..R9, B6-A1; erratum E-15 per-row network namespace
+2026-10-03T23:31:28+00:00 old=c5af5d5b1375 new=72eddbf67379 merge backlog/o1-launch-window-2026-10-03: Fast-forward
+2026-10-04T00:24:29+00:00 old=72eddbf67379 new=a84918cfcab0 merge a84918cf: Fast-forward
+2026-10-04T00:24:30+00:00 old=a84918cfcab0 new=8d83bcf9b032 commit: docs(plans): ARCH-0 build-time rulings B7, O1, A4, A5, A5b, A6a
+2026-10-04T01:10:43+00:00 old=8d83bcf9b032 new=b96c0d508575 merge b96c0d50: Fast-forward
+2026-10-04T01:10:43+00:00 old=b96c0d508575 new=70f741a04df5 commit: docs(plans): ARCH-0 rulings A6b, A6d; erratum E-16 pair citation, root introduction, pending-head integrity
+2026-10-04T01:47:23+00:00 old=70f741a04df5 new=b9dbccff15c7 merge b9dbccff: Fast-forward
+2026-10-04T01:47:23+00:00 old=b9dbccff15c7 new=91f6b4f30ada commit: docs(plans): ARCH-0 rulings A6e; erratum E-17 registry write semantics
+2026-10-04T02:12:53+00:00 old=91f6b4f30ada new=5f241529bbae merge 5f241529: Fast-forward
+2026-10-04T02:12:53+00:00 old=5f241529bbae new=bcec03d90125 commit: docs(plans): ARCH-0 rulings A6f, A7e; erratum E-18 full-history exports and corrupt-export incident path
+2026-10-04T02:32:36+00:00 old=bcec03d90125 new=d8ce66987a2e merge d8ce6698: Fast-forward
+2026-10-04T02:32:36+00:00 old=d8ce66987a2e new=35ae7cc8ca8d commit: docs(plans): ARCH-0 rulings A7a; erratum E-19 fold flag scoping and post-launch cause path
+2026-10-04T03:01:13+00:00 old=35ae7cc8ca8d new=7d593fef0d27 merge 7d593fef: Fast-forward
+2026-10-04T03:01:13+00:00 old=7d593fef0d27 new=96d088a02fe8 commit: docs(plans): ARCH-0 rulings A7b; errata E-20 malformed carried counters, E-21 windowed tallies
+2026-10-04T03:37:07+00:00 old=96d088a02fe8 new=edbe90d2b230 cherry-pick: feat(autonomy): lineage/venue tallies, origin, root-lineage check, carried-counter floors, halted_since (ARCH-0 seam A 7b)
+2026-10-04T03:37:07+00:00 old=edbe90d2b230 new=de16c50ca4af cherry-pick: fix(autonomy): windowed tallies carry instants, multiset-union carry merge, null-lineage introducers invalid (ARCH-0 seam A 7b review, A7b-R1..R4, E-21)
+2026-10-04T03:37:10+00:00 old=de16c50ca4af new=d16cd1b4ff80 commit: docs(plans): ARCH-0 rulings A7c
+2026-10-04T04:42:01+00:00 old=d16cd1b4ff80 new=477de4d44e00 merge backlog/arch0-seam-b-2026-10-03: Fast-forward
+2026-10-04T04:42:01+00:00 old=477de4d44e00 new=507df741d34e commit: docs(plans): ARCH-0 rulings A7d, 8a review, B8 integration and the wrapper-mode install obligation
+2026-10-04T05:02:14+00:00 old=507df741d34e new=cb37ca695e8c merge cb37ca69: Fast-forward
+2026-10-04T05:02:14+00:00 old=cb37ca695e8c new=0936af697eb0 commit: docs(plans): ARCH-0 rulings A8b, 8a merge/activation record; erratum E-22 ROLLBACK/ROOT_ADMIT citations
+2026-10-04T05:22:18+00:00 old=0936af697eb0 new=d6761d043e73 merge d6761d04: Fast-forward
+2026-10-04T07:01:15+00:00 old=d6761d043e73 new=e7558619d86f merge e7558619: Fast-forward
+2026-10-04T07:01:15+00:00 old=e7558619d86f new=b2c8895a3368 commit: docs(plans): ARCH-0 rulings B10 (WP-B3 security, B10-R5 firewall), A8c-R1..R7 incl. A8c-R4 adjudication; errata E-23 resolve budget, E-24 immutable family manifest
+2026-10-04T07:43:20+00:00 old=b2c8895a3368 new=feb24fa37291 merge feb24fa3: Fast-forward
+2026-10-04T07:43:20+00:00 old=feb24fa37291 new=97027e1e0847 commit: docs(plans): ARCH-0 post-merge V2 failure record, rulings B11-R1 and B12-R1..R6
+2026-10-04T07:45:35+00:00 old=97027e1e0847 new=26eef694f474 commit: docs(plans): ARCH-0 seam B real-host V-steps record (V0-V21 except V10), V1 registry provisioning
+2026-10-04T09:48:16+00:00 old=26eef694f474 new=612ef12998f3 merge 612ef129: Fast-forward
+2026-10-04T09:48:16+00:00 old=612ef12998f3 new=a725815bd499 commit: docs(plans): AUT-1 build rulings (WP0-R1..R10, WP1-R1..R3, WP3-R1..R4, WP4-R1..R2, sequencing); ARCH-0 rulings A8d-R1..R4
+2026-10-04T11:15:43+00:00 old=a725815bd499 new=5cbadb252e34 merge 5cbadb25: Fast-forward
+2026-10-04T11:15:43+00:00 old=5cbadb252e34 new=b797c911494e commit: docs(plans): AUT-1 build rulings WP2-R1..R6 and the WP1+WP3 integration record
+2026-10-04T12:25:35+00:00 old=b797c911494e new=1c4c7f5aa322 merge 1c4c7f5a: Fast-forward
+2026-10-04T12:25:35+00:00 old=1c4c7f5aa322 new=a1475c6edabf commit: docs(plans): AUT-1 build rulings WP4-R3, WP5-R1..R5 (stage-1 integration, duplicate-evaluation diagnosis)
+2026-10-04T13:58:25+00:00 old=a1475c6edabf new=5305948bb924 merge 5305948b: Fast-forward
+2026-10-04T13:58:25+00:00 old=5305948bb924 new=cab72b463e1e commit: docs(plans): AUT-1 WP5 stage-2 audit design with peer-review resolution S2-R1..R17 and stage-2a outcome
+2026-10-04T14:57:05+00:00 old=cab72b463e1e new=0a9160aae011 commit: docs(plans): AUT-1 WP5 stage-2b W1/W2/W3 outcomes and stage-2c rulings S2-R18..R25
+2026-10-04T15:38:09+00:00 old=0a9160aae011 new=072dbafc72c8 commit: docs(plans): AUT-1 WP5 stage-2c outcome and review rulings S2-R26..R46
+2026-10-04T16:28:31+00:00 old=072dbafc72c8 new=c893e13e603e commit: docs(plans): AUT-1 WP5 stage-2c review-fix outcome and S2-R47/R48
+2026-10-04T17:11:31+00:00 old=c893e13e603e new=2be63d85f657 merge backlog/aut1-s2c-2026-10-04: Fast-forward
+2026-10-04T17:58:36+00:00 old=2be63d85f657 new=3ce51adfa85e merge backlog/arch0-seam-a-2026-10-03: Fast-forward
+2026-10-04T17:58:36+00:00 old=3ce51adfa85e new=afb225d077d6 commit: docs: ARCH-0 complete (V10 node-up PASS, A8d-R5); PROGRESS rows 4-5
+2026-10-04T18:13:51+00:00 old=afb225d077d6 new=5bc482532038 commit: docs(plans): AUT-1 WP5 stage-3 design r1 and round-1 peer-review resolution S3-R1..R23
+2026-10-04T18:25:55+00:00 old=5bc482532038 new=9568249b5f5a commit: docs(plans): AUT-1 WP5 stage-3 design r2 with coordinator rulings RC-1/RC-2
+2026-10-04T18:32:56+00:00 old=9568249b5f5a new=116907c352d1 commit: docs(plans): AUT-1 WP5 stage-3 round-2 peer-review resolution S3-R24..R40
+2026-10-04T18:37:13+00:00 old=116907c352d1 new=ea7e32f7e402 commit: docs(plans): AUT-1 WP5 stage-3 round-3 convergence S3-R41..R47
+2026-10-04T18:46:40+00:00 old=ea7e32f7e402 new=f29986a99c8f commit: docs(plans): AUT-1 WP5 stage-3 r3 build spec (consolidated; S3-R48..R50 resolve C1/C2/O-1)
+2026-10-04T19:41:12+00:00 old=f29986a99c8f new=af898d59f098 merge backlog/aut1-s3a-2026-10-04: Fast-forward
+2026-10-04T19:41:12+00:00 old=af898d59f098 new=528f818afa3c commit: docs(plans): AUT-1 WP5 stage-3 build rulings S3-R51/R52 and S1 outcome
+2026-10-04T20:01:31+00:00 old=528f818afa3c new=4579a08923cc commit: docs(plans): AUT-1 WP5 stage-3 S2/S3 outcomes and S3-R53/R54
+2026-10-04T20:37:36+00:00 old=4579a08923cc new=fca8ffe630a2 commit: docs(plans): FQ loss-response plan r1 (measure, repair, winner search) under peer review
+2026-10-04T20:40:56+00:00 old=fca8ffe630a2 new=7a060a43e8d1 commit: docs(plans): FQ loss-response round-1 peer review resolution FQ-R1..R12
+2026-10-04T20:51:44+00:00 old=7a060a43e8d1 new=af756bb8dca0 commit: docs(plans): FQ loss-response plan r2 (slices of AUT-2/4/5/3, PREREG v2 amendment outline, RC-1..RC-6)
+2026-10-04T20:57:26+00:00 old=af756bb8dca0 new=1a0f59880480 commit: docs(plans): FQ loss-response round-2 resolution FQ-R13..R22
+2026-10-04T20:59:42+00:00 old=1a0f59880480 new=04eaa013a048 merge backlog/fq-halt-cli-2026-10-04: Fast-forward
+2026-10-04T21:00:37+00:00 old=04eaa013a048 new=f057cecd4127 commit: docs(evidence): FQ loss triage 2026-10-04 (halt evidence)
+2026-10-04T21:02:09+00:00 old=f057cecd4127 new=3651f11f12a2 commit: docs(plans): FQ loss-response r3 build spec + rulings FQ-R23..R28
+2026-10-04T21:05:05+00:00 old=3651f11f12a2 new=8b87b112f3ba commit: docs(plans): FQ loss-response round-3 convergence rulings FQ-R29..R33; peer loop closed
+2026-10-04T21:06:50+00:00 old=8b87b112f3ba new=53b02e82f8a5 commit: docs(plans): AUT-1 WP5 stage-3 review rulings S3-R55..R57 + stage-4 checklist
+2026-10-04T21:20:48+00:00 old=53b02e82f8a5 new=aeda38ca39fc commit: docs(plans): FQ F1 draft — errata E-25/E-26, AUT-4 r12 + AUT-5 r8 deltas, conflict register (unfiled, under peer review)
+2026-10-04T21:26:19+00:00 old=aeda38ca39fc new=d407ff3bca07 merge backlog/aut1-s3c-2026-10-04: Fast-forward
+2026-10-04T21:27:34+00:00 old=d407ff3bca07 new=85422f5d97bb commit: docs(plans): FQ F1 peer-review round-1 rulings FQ-R34..R44 (draft unfiled; r2 required)
+2026-10-04T21:33:14+00:00 old=85422f5d97bb new=86ea8fb773df commit: docs(evidence): M1 model-free market scan 2026-10-04 (VALID; no surviving cell; MDE 19.8c; cheap-YES reliable loser)
+2026-10-04T21:33:24+00:00 old=86ea8fb773df new=2a1193645849 commit: docs(evidence): M1 power sentence fix
+2026-10-04T22:12:39+00:00 old=2a1193645849 new=f837a93d3401 commit: docs(core): development halt point 2026-10-04 (state, parked branches, open rulings, resume checklist)
+2026-10-04T22:35:14+00:00 old=f837a93d3401 new=fc4426015ea1 merge backlog/fq-m1-scan-2026-10-04: Fast-forward
+2026-10-04T22:35:21+00:00 old=fc4426015ea1 new=4ba7f10cd1f6 commit: docs(core): halt point — M1 merged fc442601
+2026-10-06T00:55:18+00:00 old=4ba7f10cd1f6 new=b059305cfc33 commit: docs(plans): FQ F1 r2 — E-25..E-28, AUT-4 r12/AUT-5 r8 deltas with FQ-R34..R44 applied; CONFLICT-13/14, GAP-16, DEP-17 open
+2026-10-06T00:59:20+00:00 old=b059305cfc33 new=40397c1a2a45 commit: docs(plans): FQ F1 round-2 rulings FQ-R45..R55 (r3 required)
+2026-10-06T01:07:15+00:00 old=40397c1a2a45 new=533c2fd270ba commit: docs(plans): FQ F1 r3 — FQ-R45..R55 applied; only F5 numerics + GAP-13 F5 ruling open
+2026-10-06T01:09:52+00:00 old=533c2fd270ba new=d51742b70f48 commit: docs(plans): FQ F1 r3 convergence fixes FQ-R56 (MINT rule narrowed to all-RETIRED lineage; RULE_II_NAMES scope; P-1 STOP; F9-B wording)
+2026-10-06T01:10:05+00:00 old=d51742b70f48 new=8bdb5ef1efc8 commit: docs(arch): file errata E-25..E-28 (FQ F1: e-process/e-LOND, FQ model classes, BOOTSTRAP_SEED v2, RC-7 carve-out)
+2026-10-06T01:12:03+00:00 old=8bdb5ef1efc8 new=1c72fbcb87fb commit: docs(core): PROGRESS — FQ loss-response resumed; F-row status; row-7 WP10 delay (FQ-R48)
+2026-10-06T01:12:11+00:00 old=1c72fbcb87fb new=d96e500f56bf commit: docs(core): PROGRESS — drop closed F0/F1 rows (size budget)
+2026-10-06T01:12:17+00:00 old=d96e500f56bf new=98619822276c commit: docs(core): PROGRESS — drop DONE autonomy rows 1-2 (size budget)
+2026-10-06T01:13:59+00:00 old=98619822276c new=0fe98eb491c6 merge backlog/fq-halt-cli-cwd-2026-10-06: Fast-forward
+2026-10-06T01:18:19+00:00 old=0fe98eb491c6 new=c81a46f741df commit: docs(plans): AUT-S winner-search plan r1 (F10; under peer review)
+2026-10-06T01:20:54+00:00 old=c81a46f741df new=277cf56e4cc4 commit: docs(plans): AUT-S plan round-1 rulings AS-R1..R11 (r2 required)
+2026-10-06T01:27:51+00:00 old=277cf56e4cc4 new=d5415a80e471 commit: docs(plans): AUT-S winner-search plan r2 (AS-R1..R11 applied; OPEN-R2-1..4)
+2026-10-06T01:29:38+00:00 old=d5415a80e471 new=a8bbb102a918 commit: docs(plans): AUT-S r2 convergence rulings AS-R12..R16; READY (Phase 0 first)
+2026-10-06T01:30:43+00:00 old=a8bbb102a918 new=e0c2782869bd commit: docs(evidence): AUT-S Phase 0 (partial) — G2 empty; Lane S not built; F13 is the binding winner-search item
+2026-10-06T01:34:38+00:00 old=e0c2782869bd new=f3fab72f46dd commit: docs(evidence): F13 US weather source survey (LAMP, NWS PFM, HRRR top-3; blend ~ market, not beyond)
+2026-10-06T01:38:03+00:00 old=f3fab72f46dd new=94887f26eea7 commit: docs(plans): F13 US source ingest plan r1 (timing study + C1 collector first; blend ~ market)
+2026-10-06T01:40:30+00:00 old=94887f26eea7 new=cc78e010c75d commit: docs(plans): F13 round-1 rulings F13-R1..R9 (r2 required)
+2026-10-06T01:42:30+00:00 old=cc78e010c75d new=fad26d65d6f9 merge backlog/fq-f3-v1-terminal-2026-10-04: Fast-forward
+2026-10-06T01:42:44+00:00 old=fad26d65d6f9 new=f40515e750f1 commit: docs(core): PROGRESS — F3 + halt cwd fix merged; F10/F13 status
+2026-10-06T01:44:25+00:00 old=f40515e750f1 new=ab8cc0a73e96 commit: docs(plans): F13 US source ingest plan r2 (F13-R1..R9 applied; C1 own row)
+2026-10-06T01:46:58+00:00 old=ab8cc0a73e96 new=8f635734cbdb commit: docs(plans): F13 round-2 rulings F13-R10..R21 (r3 required)
+2026-10-06T01:49:31+00:00 old=8f635734cbdb new=9421d52beaf2 commit: docs(plans): F13 US source ingest plan r3 (F13-R10..R21 applied)
+2026-10-06T01:52:04+00:00 old=9421d52beaf2 new=bea91472ad9d commit: docs(plans): F13 r3.1 amendments — round-3 rulings F13-R22..R29
+2026-10-06T01:54:30+00:00 old=bea91472ad9d new=6a7e37c1d1e1 commit: docs(plans): F13 r3.2 amendments — round-4 rulings F13-R30..R33
+2026-10-06T01:56:30+00:00 old=6a7e37c1d1e1 new=e24b4b134b6d commit (amend): docs(plans): F13 READY — r3.2 amendments F13-R30..R34; PROGRESS opens F13-C1
+2026-10-06T02:01:58+00:00 old=e24b4b134b6d new=123167f1b908 commit: docs(evidence): F13 A0 feasibility probe + rulings A0-R1..R6
+2026-10-06T03:37:51+00:00 old=123167f1b908 new=264d8989981d merge backlog/f13-c1-s3-2026-10-06: Fast-forward
+2026-10-06T03:38:03+00:00 old=264d8989981d new=14cca5a9ee88 commit: docs: PROGRESS after F5/F7a/F2/F13-C1 S1-S3 merge; F13 OPEN-7 LAMP window
+2026-10-06T04:02:12+00:00 old=14cca5a9ee88 new=2eda43a077c9 merge backlog/fq-f4-labels-2026-10-06: Fast-forward
+2026-10-06T04:54:20+00:00 old=2eda43a077c9 new=b765cd09d29d merge backlog/f13-c1-s4-2026-10-06: Fast-forward
+2026-10-06T05:17:37+00:00 old=b765cd09d29d new=ae044e3c7691 merge backlog/fq-f4-labels-2026-10-06: Fast-forward
+2026-10-06T06:45:45+00:00 old=ae044e3c7691 new=7739dcbee442 merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:16:22+00:00 old=7739dcbee442 new=24b087469b90 merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:46:32+00:00 old=24b087469b90 new=2005f1e176af merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:46:32+00:00 old=2005f1e176af new=aef00764bb64 commit: docs: F4 build-now complete; open items for WP6-promote/size, L-1, F7b
+2026-10-06T07:46:37+00:00 old=aef00764bb64 new=da4065623cbd commit: docs(core): PROGRESS drop closed F7a row (size budget)
+2026-10-06T07:51:02+00:00 old=da4065623cbd new=f37bc99d8bab commit: docs(f13): rule F13-OPEN-7 as F13-R35 (LAMP remaining-hours feature, peak coverage, missingness)
+2026-10-06T07:55:47+00:00 old=f37bc99d8bab new=f0b53f502f84 commit: docs(m1v3): NO-longshot forward execution-structure screen plan READY (2 review rounds, rulings M1V3-R1..R18)
+2026-10-06T07:55:51+00:00 old=f0b53f502f84 new=47810e68475e commit: docs(core): PROGRESS F2 live, F6 building, F13 C1 live / B0 building
+2026-10-06T08:00:08+00:00 old=47810e68475e new=03d6abba44fc commit: docs(f7b): ARCH-0-E25 + F7b-core plan with round-1 rulings F7B-R1..R20 (Slice 1 READY)
+2026-10-06T08:01:52+00:00 old=03d6abba44fc new=d663eb826c6f commit: docs(f7b): round-2 rulings F7B-R21..R28; Slice 2 READY
+2026-10-06T08:43:13+00:00 old=d663eb826c6f new=1ecacc879f05 merge feat/f7b-s1-arch0-e25: Fast-forward
+2026-10-06T09:49:17+00:00 old=1ecacc879f05 new=2c5f549affde merge backlog/f6-bridge-2026-10-06: Fast-forward
+2026-10-06T09:49:35+00:00 old=2c5f549affde new=17aec28b4509 merge feat/f7b-s2-core: Fast-forward
+2026-10-06T09:50:49+00:00 old=17aec28b4509 new=d6be2d76d281 commit: docs: open items after F6/F7b/F13-B0 merges (F6b producer, F5 pin request, census bug)
+2026-10-06T10:25:17+00:00 old=d6be2d76d281 new=0e1bcecfad40 merge fix/b0-backfill-oversize: Fast-forward
+2026-10-06T10:50:33+00:00 old=0e1bcecfad40 new=47d1b94c599b merge feat/m1v3-no-longshot: Fast-forward
+2026-10-06T10:50:42+00:00 old=47d1b94c599b new=adb1cd8b4ff2 commit: prereg(m1v3): FREEZE the NO-longshot forward screen design (this commit introduces the frozen blob)
+2026-10-06T10:50:42+00:00 old=adb1cd8b4ff2 new=6fbc4f6b54fa commit: prereg(m1v3): stamp frozen_sha adb1cd8b
+2026-10-06T11:19:37+00:00 old=6fbc4f6b54fa new=86e5c101e3b8 merge fix/b0-backfill-pagination: Fast-forward
+2026-10-06T11:19:42+00:00 old=86e5c101e3b8 new=6fbc4f6b54fa reset: moving to 6fbc4f6b
+2026-10-06T11:49:01+00:00 old=6fbc4f6b54fa new=e6f18c3e429b merge fix/b0-backfill-pagination: Fast-forward
+2026-10-06T11:57:01+00:00 old=e6f18c3e429b new=6d1eb4f32653 commit: docs(f13): B0 verdict F13-R36 — B1 UNDERPOWERED (MDE 3.25 °F vs plausible 0.5 °F); census/backfill/B0 evidence
+2026-10-06T13:31:38+00:00 old=6d1eb4f32653 new=7d31ed60788d merge feat/f13-a1-lamp-backfill: Fast-forward
+2026-10-06T14:00:06+00:00 old=7d31ed60788d new=8fcc056135ca merge feat/f13-a-blend: Fast-forward
+2026-10-06T14:26:34+00:00 old=8fcc056135ca new=84c70d9906c1 merge fix/lamp-header-month: Fast-forward
+2026-10-06T14:52:34+00:00 old=84c70d9906c1 new=c33d938d4ba2 merge fix/pfm-history-parse: Fast-forward
+2026-10-06T14:53:19+00:00 old=c33d938d4ba2 new=3de4d9ae923f commit: docs: development halt point 2026-10-06 (resume file, PROGRESS rows)
+# source: .git/logs/refs/heads/feat/data-capture-and-risk
+2026-10-01T00:50:22+00:00 old=1d7ea1016d7c new=c8bb5c9d84e2 commit: docs(evidence): OPERATOR RULING — forecast_quantile_ladder to live real orders ASAP, current caps (2026-10-01)
+2026-10-01T01:08:51+00:00 old=c8bb5c9d84e2 new=d86e30a05e79 commit: docs(plans): FQ go-live plan Rev1 — peer-reviewed (arch 94, sec 92, PM 90 APPROVE)
+2026-10-01T01:30:32+00:00 old=d86e30a05e79 new=5fc820507309 cherry-pick: refactor(strategy): FQ-S1 one location-correction implementation in src (ladder_ev.location_correction), shared by analysis and live
+2026-10-01T01:30:32+00:00 old=5fc820507309 new=dfa75525d5bb cherry-pick: fix(strategy): FQ-S3 margin horizon is hours to LST midnight ending the climate day (not venue expiration_ns)
+2026-10-01T01:30:32+00:00 old=dfa75525d5bb new=b58bb4c856c1 cherry-pick: feat(deploy): FQ-S7 CRH timer wrappers skip forecast_quantile_ladder cleanly (exit 0, logged)
+2026-10-01T01:30:32+00:00 old=b58bb4c856c1 new=9f24e61f758e cherry-pick: fix(analysis): FQ-S4a parity harness loads one D+1 window per cycle (no UTC-date relabel), per-side outcome counts, no-depth census
+2026-10-01T01:54:15+00:00 old=9f24e61f758e new=7cbe6523a20e cherry-pick: feat(strategy): FQ-S6 real-order path — fee probe, conditional subscribe marker, D+1 readiness poll, order alerts, NO-leg reconciliation gate test
+2026-10-01T01:54:15+00:00 old=7cbe6523a20e new=749316c5a20d cherry-pick: feat(strategy): FQ-S10 one side per rung per climate day — opposite_side_latched (durable), check order pinned
+2026-10-01T01:54:25+00:00 old=749316c5a20d new=416c2b5300f3 commit (cherry-pick): feat(runtime): FQ-S5 live-orders enable gate — ruling sha pin, path containment, shadow_only AST guard (fail-closed)
+2026-10-01T01:54:25+00:00 old=416c2b5300f3 new=a1402b0c0d12 cherry-pick: feat(app): FQ-S5 log ruling_sha256 on the fq_live_orders boot line
+2026-10-01T01:54:25+00:00 old=a1402b0c0d12 new=ea40d0a67493 cherry-pick: test: FQ-S5 manifest fixtures use contained relative artefact paths
+2026-10-01T01:54:25+00:00 old=ea40d0a67493 new=89fab9443343 cherry-pick: fix(analysis): tests no longer delete committed docs/evidence notes — write_validate_evidence_note requires an explicit evidence_dir
+2026-10-01T02:25:34+00:00 old=89fab9443343 new=d8f1949391e1 commit: fix(runtime): FQ-S5 ruling live copy under deploy/families/rulings (src never reads docs/evidence); egress-guard set +2 reviewed FQ-S6 tests
+2026-10-01T02:51:02+00:00 old=d8f1949391e1 new=d9bac1bdebe5 merge wip/fq-sl15fix: Merge made by the 'ort' strategy.
+2026-10-01T02:51:02+00:00 old=d9bac1bdebe5 new=59c4b1cd0803 merge wip/fq-s4b: Merge made by the 'ort' strategy.
+2026-10-01T02:52:12+00:00 old=59c4b1cd0803 new=10a5991a148c commit (merge): merge: wip/fq-s11 into feat/data-capture-and-risk (FQ go-live)
+2026-10-01T02:55:45+00:00 old=10a5991a148c new=038cb6e0dadb commit: test(strategy): FQ-S11 decision-funnel tests drop pre-S2 bounds_artefact kwargs (post-merge)
+2026-10-01T02:55:52+00:00 old=038cb6e0dadb new=ad76d2f24415 cherry-pick: feat(deploy): FQ-S8 register pm_us_crh_fq_v1 — REGISTERED manifest, live_orders_ruling, sha-pinned calibration artefact copy
+2026-10-01T03:01:10+00:00 old=ad76d2f24415 new=0f7e10e1ddd4 commit: test(deploy): FQ-S8 registration test on load_live_calibration; positive parse of the registered artefact (5 versions x 200 draws, linear day-length)
+2026-10-01T03:25:26+00:00 old=0f7e10e1ddd4 new=474dff2b1f18 merge wip/fq-s9: Fast-forward
+2026-10-01T03:30:05+00:00 old=474dff2b1f18 new=cc294e4d709c merge wip/fq-ruff: Fast-forward
+2026-10-01T03:53:35+00:00 old=cc294e4d709c new=0f7e10e1ddd4 reset: moving to 0f7e10e1
+2026-10-01T03:53:35+00:00 old=0f7e10e1ddd4 new=fdff685551eb cherry-pick: style: ruff findings introduced by FQ go-live slices (unused noqa/imports, I001, E501, SIM114); repo ruff 253->249
+2026-10-01T05:43:50+00:00 old=fdff685551eb new=b6f928ba8375 cherry-pick: fix(analysis): SL-13p2 parity harness loads only window instruments/depth (slug climate-day + ts pad) and replays one climate day at a time; 1d 2.0GiB, 7d 5.8GiB (was OOM >12G)
+2026-10-01T05:43:50+00:00 old=b6f928ba8375 new=5dff9316f00a cherry-pick: fix(analysis): SL-13p2 live leg clocks depth at the decision instant (ts_init=ts_event) so the permit stub matches spec check (4); 1d mismatches 109532->198
+2026-10-01T05:43:50+00:00 old=5dff9316f00a new=333c3f2abef2 cherry-pick: fix(analysis): SL-13p2 parity replays the production slippage floor on both legs (pinned to the composition's LadderEvConfig) and scopes both legs + census + vacuity guard to the manifest stations
+2026-10-01T13:15:29+00:00 old=333c3f2abef2 new=7623d8880416 cherry-pick: fix(analysis): SL-13p2 parity registers each rung once (NO leg no longer duplicates the ladder partition); exit 2 reports the exception on stderr
+2026-10-01T13:24:09+00:00 old=7623d8880416 new=759911f35430 commit: docs(evidence): SL-13p2 parity 2026-09-25 (0 mismatches / 720597, 7=7 YES takes) under operator ruling cutting the window to 1 day
+2026-10-01T13:39:52+00:00 old=759911f35430 new=60290e9ddd29 cherry-pick: feat(deploy): FQ-S9 activation — supervisor sends pm_us_crh_fq_v1 (d0 2026-10-02); AUD-17 caps proof parametrized over the unit-named family + v4 rollback
+2026-10-01T16:01:36+00:00 old=60290e9ddd29 new=99067d4a9e7a merge wip/fq-d1-cache2: Fast-forward
+2026-10-02T07:31:08+00:00 old=99067d4a9e7a new=763527b686b6 merge emdash/refactor-y4qj4: Fast-forward
+2026-10-02T14:37:42+00:00 old=763527b686b6 new=e0c89f237312 merge fix/family-tally-fq-skip: Fast-forward
+2026-10-02T14:55:09+00:00 old=e0c89f237312 new=d6914fca62cf merge refactor/r15b: Fast-forward
+2026-10-02T15:01:50+00:00 old=d6914fca62cf new=d26ef2111627 merge refactor/int2: Fast-forward
+2026-10-02T15:51:13+00:00 old=d26ef2111627 new=a15fefd22724 merge refactor/t1speed: Fast-forward
+2026-10-02T16:00:52+00:00 old=a15fefd22724 new=7dfd1af114c1 merge docs/refactor-day2: Fast-forward
+2026-10-02T17:47:38+00:00 old=7dfd1af114c1 new=806a8942e095 merge fix/emit-health-critical: Fast-forward
+2026-10-02T17:47:54+00:00 old=806a8942e095 new=e42f2a288421 merge docs/refactor-day2: Fast-forward
+2026-10-02T19:35:11+00:00 old=e42f2a288421 new=62778b4a7ea5 merge refactor/r36: Fast-forward
+2026-10-02T20:05:01+00:00 old=62778b4a7ea5 new=6e99a7ae2dbe merge refactor/r3-batch: Fast-forward
+2026-10-02T20:54:53+00:00 old=6e99a7ae2dbe new=3eb4a1085dbf merge 3eb4a108: Fast-forward
+2026-10-02T21:18:17+00:00 old=3eb4a1085dbf new=d8e8fd92b90e merge d8e8fd92: Fast-forward
+2026-10-02T22:25:46+00:00 old=d8e8fd92b90e new=4b8347a6d58c merge 4b8347a6: Fast-forward
+2026-10-03T13:33:41+00:00 old=4b8347a6d58c new=4709a71dcdb9 commit: docs(plans): autonomy backlog, frozen ARCH Rev 9.2 + errata, seven peer-reviewed READY plans
+2026-10-03T14:22:50+00:00 old=4709a71dcdb9 new=853a82b9322d commit: docs(plans): reopen AUT-1 - Nautilus-native pressure test refutes 'nothing to reuse'; native-first r9 owed
+2026-10-03T15:01:45+00:00 old=853a82b9322d new=f45f5a6558cd commit: docs(progress): binding AUTONOMY priority queue for /execute-backlog; archive closed rows
+2026-10-03T17:40:32+00:00 old=f45f5a6558cd new=d231497df6a2 commit: docs(plans): every backlog item now has an approved peer-reviewed plan
+2026-10-03T19:34:39+00:00 old=d231497df6a2 new=6b6c324240ef commit: docs(plans): ARCH-0 seam A r5 and seam B r5 peer-reviewed to convergence; file errata E-7d, E-7e, E-14
+2026-10-03T21:49:31+00:00 old=6b6c324240ef new=834e4a828615 merge backlog/arch0-seam-a-2026-10-03: Fast-forward
+2026-10-03T22:09:14+00:00 old=834e4a828615 new=d6878c974905 merge backlog/arch0-seam-b-2026-10-03: Fast-forward
+2026-10-03T23:00:07+00:00 old=d6878c974905 new=dde0f646092c merge dde0f646: Fast-forward
+2026-10-03T23:00:36+00:00 old=dde0f646092c new=c5af5d5b1375 commit: docs(plans): ARCH-0 build-time rulings A5/A6, P-1..P-3, B6-R1..R9, B6-A1; erratum E-15 per-row network namespace
+2026-10-03T23:31:28+00:00 old=c5af5d5b1375 new=72eddbf67379 merge backlog/o1-launch-window-2026-10-03: Fast-forward
+2026-10-04T00:24:29+00:00 old=72eddbf67379 new=a84918cfcab0 merge a84918cf: Fast-forward
+2026-10-04T00:24:30+00:00 old=a84918cfcab0 new=8d83bcf9b032 commit: docs(plans): ARCH-0 build-time rulings B7, O1, A4, A5, A5b, A6a
+2026-10-04T01:10:43+00:00 old=8d83bcf9b032 new=b96c0d508575 merge b96c0d50: Fast-forward
+2026-10-04T01:10:43+00:00 old=b96c0d508575 new=70f741a04df5 commit: docs(plans): ARCH-0 rulings A6b, A6d; erratum E-16 pair citation, root introduction, pending-head integrity
+2026-10-04T01:47:23+00:00 old=70f741a04df5 new=b9dbccff15c7 merge b9dbccff: Fast-forward
+2026-10-04T01:47:23+00:00 old=b9dbccff15c7 new=91f6b4f30ada commit: docs(plans): ARCH-0 rulings A6e; erratum E-17 registry write semantics
+2026-10-04T02:12:53+00:00 old=91f6b4f30ada new=5f241529bbae merge 5f241529: Fast-forward
+2026-10-04T02:12:53+00:00 old=5f241529bbae new=bcec03d90125 commit: docs(plans): ARCH-0 rulings A6f, A7e; erratum E-18 full-history exports and corrupt-export incident path
+2026-10-04T02:32:36+00:00 old=bcec03d90125 new=d8ce66987a2e merge d8ce6698: Fast-forward
+2026-10-04T02:32:36+00:00 old=d8ce66987a2e new=35ae7cc8ca8d commit: docs(plans): ARCH-0 rulings A7a; erratum E-19 fold flag scoping and post-launch cause path
+2026-10-04T03:01:13+00:00 old=35ae7cc8ca8d new=7d593fef0d27 merge 7d593fef: Fast-forward
+2026-10-04T03:01:13+00:00 old=7d593fef0d27 new=96d088a02fe8 commit: docs(plans): ARCH-0 rulings A7b; errata E-20 malformed carried counters, E-21 windowed tallies
+2026-10-04T03:37:07+00:00 old=96d088a02fe8 new=edbe90d2b230 cherry-pick: feat(autonomy): lineage/venue tallies, origin, root-lineage check, carried-counter floors, halted_since (ARCH-0 seam A 7b)
+2026-10-04T03:37:07+00:00 old=edbe90d2b230 new=de16c50ca4af cherry-pick: fix(autonomy): windowed tallies carry instants, multiset-union carry merge, null-lineage introducers invalid (ARCH-0 seam A 7b review, A7b-R1..R4, E-21)
+2026-10-04T03:37:10+00:00 old=de16c50ca4af new=d16cd1b4ff80 commit: docs(plans): ARCH-0 rulings A7c
+2026-10-04T04:42:01+00:00 old=d16cd1b4ff80 new=477de4d44e00 merge backlog/arch0-seam-b-2026-10-03: Fast-forward
+2026-10-04T04:42:01+00:00 old=477de4d44e00 new=507df741d34e commit: docs(plans): ARCH-0 rulings A7d, 8a review, B8 integration and the wrapper-mode install obligation
+2026-10-04T05:02:14+00:00 old=507df741d34e new=cb37ca695e8c merge cb37ca69: Fast-forward
+2026-10-04T05:02:14+00:00 old=cb37ca695e8c new=0936af697eb0 commit: docs(plans): ARCH-0 rulings A8b, 8a merge/activation record; erratum E-22 ROLLBACK/ROOT_ADMIT citations
+2026-10-04T05:22:18+00:00 old=0936af697eb0 new=d6761d043e73 merge d6761d04: Fast-forward
+2026-10-04T07:01:15+00:00 old=d6761d043e73 new=e7558619d86f merge e7558619: Fast-forward
+2026-10-04T07:01:15+00:00 old=e7558619d86f new=b2c8895a3368 commit: docs(plans): ARCH-0 rulings B10 (WP-B3 security, B10-R5 firewall), A8c-R1..R7 incl. A8c-R4 adjudication; errata E-23 resolve budget, E-24 immutable family manifest
+2026-10-04T07:43:20+00:00 old=b2c8895a3368 new=feb24fa37291 merge feb24fa3: Fast-forward
+2026-10-04T07:43:20+00:00 old=feb24fa37291 new=97027e1e0847 commit: docs(plans): ARCH-0 post-merge V2 failure record, rulings B11-R1 and B12-R1..R6
+2026-10-04T07:45:35+00:00 old=97027e1e0847 new=26eef694f474 commit: docs(plans): ARCH-0 seam B real-host V-steps record (V0-V21 except V10), V1 registry provisioning
+2026-10-04T09:48:16+00:00 old=26eef694f474 new=612ef12998f3 merge 612ef129: Fast-forward
+2026-10-04T09:48:16+00:00 old=612ef12998f3 new=a725815bd499 commit: docs(plans): AUT-1 build rulings (WP0-R1..R10, WP1-R1..R3, WP3-R1..R4, WP4-R1..R2, sequencing); ARCH-0 rulings A8d-R1..R4
+2026-10-04T11:15:43+00:00 old=a725815bd499 new=5cbadb252e34 merge 5cbadb25: Fast-forward
+2026-10-04T11:15:43+00:00 old=5cbadb252e34 new=b797c911494e commit: docs(plans): AUT-1 build rulings WP2-R1..R6 and the WP1+WP3 integration record
+2026-10-04T12:25:35+00:00 old=b797c911494e new=1c4c7f5aa322 merge 1c4c7f5a: Fast-forward
+2026-10-04T12:25:35+00:00 old=1c4c7f5aa322 new=a1475c6edabf commit: docs(plans): AUT-1 build rulings WP4-R3, WP5-R1..R5 (stage-1 integration, duplicate-evaluation diagnosis)
+2026-10-04T13:58:25+00:00 old=a1475c6edabf new=5305948bb924 merge 5305948b: Fast-forward
+2026-10-04T13:58:25+00:00 old=5305948bb924 new=cab72b463e1e commit: docs(plans): AUT-1 WP5 stage-2 audit design with peer-review resolution S2-R1..R17 and stage-2a outcome
+2026-10-04T14:57:05+00:00 old=cab72b463e1e new=0a9160aae011 commit: docs(plans): AUT-1 WP5 stage-2b W1/W2/W3 outcomes and stage-2c rulings S2-R18..R25
+2026-10-04T15:38:09+00:00 old=0a9160aae011 new=072dbafc72c8 commit: docs(plans): AUT-1 WP5 stage-2c outcome and review rulings S2-R26..R46
+2026-10-04T16:28:31+00:00 old=072dbafc72c8 new=c893e13e603e commit: docs(plans): AUT-1 WP5 stage-2c review-fix outcome and S2-R47/R48
+2026-10-04T17:11:31+00:00 old=c893e13e603e new=2be63d85f657 merge backlog/aut1-s2c-2026-10-04: Fast-forward
+2026-10-04T17:58:36+00:00 old=2be63d85f657 new=3ce51adfa85e merge backlog/arch0-seam-a-2026-10-03: Fast-forward
+2026-10-04T17:58:36+00:00 old=3ce51adfa85e new=afb225d077d6 commit: docs: ARCH-0 complete (V10 node-up PASS, A8d-R5); PROGRESS rows 4-5
+2026-10-04T18:13:51+00:00 old=afb225d077d6 new=5bc482532038 commit: docs(plans): AUT-1 WP5 stage-3 design r1 and round-1 peer-review resolution S3-R1..R23
+2026-10-04T18:25:55+00:00 old=5bc482532038 new=9568249b5f5a commit: docs(plans): AUT-1 WP5 stage-3 design r2 with coordinator rulings RC-1/RC-2
+2026-10-04T18:32:56+00:00 old=9568249b5f5a new=116907c352d1 commit: docs(plans): AUT-1 WP5 stage-3 round-2 peer-review resolution S3-R24..R40
+2026-10-04T18:37:13+00:00 old=116907c352d1 new=ea7e32f7e402 commit: docs(plans): AUT-1 WP5 stage-3 round-3 convergence S3-R41..R47
+2026-10-04T18:46:40+00:00 old=ea7e32f7e402 new=f29986a99c8f commit: docs(plans): AUT-1 WP5 stage-3 r3 build spec (consolidated; S3-R48..R50 resolve C1/C2/O-1)
+2026-10-04T19:41:12+00:00 old=f29986a99c8f new=af898d59f098 merge backlog/aut1-s3a-2026-10-04: Fast-forward
+2026-10-04T19:41:12+00:00 old=af898d59f098 new=528f818afa3c commit: docs(plans): AUT-1 WP5 stage-3 build rulings S3-R51/R52 and S1 outcome
+2026-10-04T20:01:31+00:00 old=528f818afa3c new=4579a08923cc commit: docs(plans): AUT-1 WP5 stage-3 S2/S3 outcomes and S3-R53/R54
+2026-10-04T20:37:36+00:00 old=4579a08923cc new=fca8ffe630a2 commit: docs(plans): FQ loss-response plan r1 (measure, repair, winner search) under peer review
+2026-10-04T20:40:56+00:00 old=fca8ffe630a2 new=7a060a43e8d1 commit: docs(plans): FQ loss-response round-1 peer review resolution FQ-R1..R12
+2026-10-04T20:51:44+00:00 old=7a060a43e8d1 new=af756bb8dca0 commit: docs(plans): FQ loss-response plan r2 (slices of AUT-2/4/5/3, PREREG v2 amendment outline, RC-1..RC-6)
+2026-10-04T20:57:26+00:00 old=af756bb8dca0 new=1a0f59880480 commit: docs(plans): FQ loss-response round-2 resolution FQ-R13..R22
+2026-10-04T20:59:42+00:00 old=1a0f59880480 new=04eaa013a048 merge backlog/fq-halt-cli-2026-10-04: Fast-forward
+2026-10-04T21:00:37+00:00 old=04eaa013a048 new=f057cecd4127 commit: docs(evidence): FQ loss triage 2026-10-04 (halt evidence)
+2026-10-04T21:02:09+00:00 old=f057cecd4127 new=3651f11f12a2 commit: docs(plans): FQ loss-response r3 build spec + rulings FQ-R23..R28
+2026-10-04T21:05:05+00:00 old=3651f11f12a2 new=8b87b112f3ba commit: docs(plans): FQ loss-response round-3 convergence rulings FQ-R29..R33; peer loop closed
+2026-10-04T21:06:50+00:00 old=8b87b112f3ba new=53b02e82f8a5 commit: docs(plans): AUT-1 WP5 stage-3 review rulings S3-R55..R57 + stage-4 checklist
+2026-10-04T21:20:48+00:00 old=53b02e82f8a5 new=aeda38ca39fc commit: docs(plans): FQ F1 draft — errata E-25/E-26, AUT-4 r12 + AUT-5 r8 deltas, conflict register (unfiled, under peer review)
+2026-10-04T21:26:19+00:00 old=aeda38ca39fc new=d407ff3bca07 merge backlog/aut1-s3c-2026-10-04: Fast-forward
+2026-10-04T21:27:34+00:00 old=d407ff3bca07 new=85422f5d97bb commit: docs(plans): FQ F1 peer-review round-1 rulings FQ-R34..R44 (draft unfiled; r2 required)
+2026-10-04T21:33:14+00:00 old=85422f5d97bb new=86ea8fb773df commit: docs(evidence): M1 model-free market scan 2026-10-04 (VALID; no surviving cell; MDE 19.8c; cheap-YES reliable loser)
+2026-10-04T21:33:24+00:00 old=86ea8fb773df new=2a1193645849 commit: docs(evidence): M1 power sentence fix
+2026-10-04T22:12:39+00:00 old=2a1193645849 new=f837a93d3401 commit: docs(core): development halt point 2026-10-04 (state, parked branches, open rulings, resume checklist)
+2026-10-04T22:35:14+00:00 old=f837a93d3401 new=fc4426015ea1 merge backlog/fq-m1-scan-2026-10-04: Fast-forward
+2026-10-04T22:35:21+00:00 old=fc4426015ea1 new=4ba7f10cd1f6 commit: docs(core): halt point — M1 merged fc442601
+2026-10-06T00:55:18+00:00 old=4ba7f10cd1f6 new=b059305cfc33 commit: docs(plans): FQ F1 r2 — E-25..E-28, AUT-4 r12/AUT-5 r8 deltas with FQ-R34..R44 applied; CONFLICT-13/14, GAP-16, DEP-17 open
+2026-10-06T00:59:20+00:00 old=b059305cfc33 new=40397c1a2a45 commit: docs(plans): FQ F1 round-2 rulings FQ-R45..R55 (r3 required)
+2026-10-06T01:07:15+00:00 old=40397c1a2a45 new=533c2fd270ba commit: docs(plans): FQ F1 r3 — FQ-R45..R55 applied; only F5 numerics + GAP-13 F5 ruling open
+2026-10-06T01:09:52+00:00 old=533c2fd270ba new=d51742b70f48 commit: docs(plans): FQ F1 r3 convergence fixes FQ-R56 (MINT rule narrowed to all-RETIRED lineage; RULE_II_NAMES scope; P-1 STOP; F9-B wording)
+2026-10-06T01:10:05+00:00 old=d51742b70f48 new=8bdb5ef1efc8 commit: docs(arch): file errata E-25..E-28 (FQ F1: e-process/e-LOND, FQ model classes, BOOTSTRAP_SEED v2, RC-7 carve-out)
+2026-10-06T01:12:03+00:00 old=8bdb5ef1efc8 new=1c72fbcb87fb commit: docs(core): PROGRESS — FQ loss-response resumed; F-row status; row-7 WP10 delay (FQ-R48)
+2026-10-06T01:12:11+00:00 old=1c72fbcb87fb new=d96e500f56bf commit: docs(core): PROGRESS — drop closed F0/F1 rows (size budget)
+2026-10-06T01:12:17+00:00 old=d96e500f56bf new=98619822276c commit: docs(core): PROGRESS — drop DONE autonomy rows 1-2 (size budget)
+2026-10-06T01:13:59+00:00 old=98619822276c new=0fe98eb491c6 merge backlog/fq-halt-cli-cwd-2026-10-06: Fast-forward
+2026-10-06T01:18:19+00:00 old=0fe98eb491c6 new=c81a46f741df commit: docs(plans): AUT-S winner-search plan r1 (F10; under peer review)
+2026-10-06T01:20:54+00:00 old=c81a46f741df new=277cf56e4cc4 commit: docs(plans): AUT-S plan round-1 rulings AS-R1..R11 (r2 required)
+2026-10-06T01:27:51+00:00 old=277cf56e4cc4 new=d5415a80e471 commit: docs(plans): AUT-S winner-search plan r2 (AS-R1..R11 applied; OPEN-R2-1..4)
+2026-10-06T01:29:38+00:00 old=d5415a80e471 new=a8bbb102a918 commit: docs(plans): AUT-S r2 convergence rulings AS-R12..R16; READY (Phase 0 first)
+2026-10-06T01:30:43+00:00 old=a8bbb102a918 new=e0c2782869bd commit: docs(evidence): AUT-S Phase 0 (partial) — G2 empty; Lane S not built; F13 is the binding winner-search item
+2026-10-06T01:34:38+00:00 old=e0c2782869bd new=f3fab72f46dd commit: docs(evidence): F13 US weather source survey (LAMP, NWS PFM, HRRR top-3; blend ~ market, not beyond)
+2026-10-06T01:38:03+00:00 old=f3fab72f46dd new=94887f26eea7 commit: docs(plans): F13 US source ingest plan r1 (timing study + C1 collector first; blend ~ market)
+2026-10-06T01:40:30+00:00 old=94887f26eea7 new=cc78e010c75d commit: docs(plans): F13 round-1 rulings F13-R1..R9 (r2 required)
+2026-10-06T01:42:30+00:00 old=cc78e010c75d new=fad26d65d6f9 merge backlog/fq-f3-v1-terminal-2026-10-04: Fast-forward
+2026-10-06T01:42:44+00:00 old=fad26d65d6f9 new=f40515e750f1 commit: docs(core): PROGRESS — F3 + halt cwd fix merged; F10/F13 status
+2026-10-06T01:44:25+00:00 old=f40515e750f1 new=ab8cc0a73e96 commit: docs(plans): F13 US source ingest plan r2 (F13-R1..R9 applied; C1 own row)
+2026-10-06T01:46:58+00:00 old=ab8cc0a73e96 new=8f635734cbdb commit: docs(plans): F13 round-2 rulings F13-R10..R21 (r3 required)
+2026-10-06T01:49:31+00:00 old=8f635734cbdb new=9421d52beaf2 commit: docs(plans): F13 US source ingest plan r3 (F13-R10..R21 applied)
+2026-10-06T01:52:04+00:00 old=9421d52beaf2 new=bea91472ad9d commit: docs(plans): F13 r3.1 amendments — round-3 rulings F13-R22..R29
+2026-10-06T01:54:30+00:00 old=bea91472ad9d new=6a7e37c1d1e1 commit: docs(plans): F13 r3.2 amendments — round-4 rulings F13-R30..R33
+2026-10-06T01:56:30+00:00 old=6a7e37c1d1e1 new=e24b4b134b6d commit (amend): docs(plans): F13 READY — r3.2 amendments F13-R30..R34; PROGRESS opens F13-C1
+2026-10-06T02:01:58+00:00 old=e24b4b134b6d new=123167f1b908 commit: docs(evidence): F13 A0 feasibility probe + rulings A0-R1..R6
+2026-10-06T03:37:51+00:00 old=123167f1b908 new=264d8989981d merge backlog/f13-c1-s3-2026-10-06: Fast-forward
+2026-10-06T03:38:03+00:00 old=264d8989981d new=14cca5a9ee88 commit: docs: PROGRESS after F5/F7a/F2/F13-C1 S1-S3 merge; F13 OPEN-7 LAMP window
+2026-10-06T04:02:12+00:00 old=14cca5a9ee88 new=2eda43a077c9 merge backlog/fq-f4-labels-2026-10-06: Fast-forward
+2026-10-06T04:54:20+00:00 old=2eda43a077c9 new=b765cd09d29d merge backlog/f13-c1-s4-2026-10-06: Fast-forward
+2026-10-06T05:17:37+00:00 old=b765cd09d29d new=ae044e3c7691 merge backlog/fq-f4-labels-2026-10-06: Fast-forward
+2026-10-06T06:45:45+00:00 old=ae044e3c7691 new=7739dcbee442 merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:16:22+00:00 old=7739dcbee442 new=24b087469b90 merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:46:32+00:00 old=24b087469b90 new=2005f1e176af merge backlog/fq-f4-wp68-2026-10-06: Fast-forward
+2026-10-06T07:46:32+00:00 old=2005f1e176af new=aef00764bb64 commit: docs: F4 build-now complete; open items for WP6-promote/size, L-1, F7b
+2026-10-06T07:46:37+00:00 old=aef00764bb64 new=da4065623cbd commit: docs(core): PROGRESS drop closed F7a row (size budget)
+2026-10-06T07:51:02+00:00 old=da4065623cbd new=f37bc99d8bab commit: docs(f13): rule F13-OPEN-7 as F13-R35 (LAMP remaining-hours feature, peak coverage, missingness)
+2026-10-06T07:55:47+00:00 old=f37bc99d8bab new=f0b53f502f84 commit: docs(m1v3): NO-longshot forward execution-structure screen plan READY (2 review rounds, rulings M1V3-R1..R18)
+2026-10-06T07:55:51+00:00 old=f0b53f502f84 new=47810e68475e commit: docs(core): PROGRESS F2 live, F6 building, F13 C1 live / B0 building
+2026-10-06T08:00:08+00:00 old=47810e68475e new=03d6abba44fc commit: docs(f7b): ARCH-0-E25 + F7b-core plan with round-1 rulings F7B-R1..R20 (Slice 1 READY)
+2026-10-06T08:01:52+00:00 old=03d6abba44fc new=d663eb826c6f commit: docs(f7b): round-2 rulings F7B-R21..R28; Slice 2 READY
+2026-10-06T08:43:13+00:00 old=d663eb826c6f new=1ecacc879f05 merge feat/f7b-s1-arch0-e25: Fast-forward
+2026-10-06T09:49:17+00:00 old=1ecacc879f05 new=2c5f549affde merge backlog/f6-bridge-2026-10-06: Fast-forward
+2026-10-06T09:49:35+00:00 old=2c5f549affde new=17aec28b4509 merge feat/f7b-s2-core: Fast-forward
+2026-10-06T09:50:49+00:00 old=17aec28b4509 new=d6be2d76d281 commit: docs: open items after F6/F7b/F13-B0 merges (F6b producer, F5 pin request, census bug)
+2026-10-06T10:25:17+00:00 old=d6be2d76d281 new=0e1bcecfad40 merge fix/b0-backfill-oversize: Fast-forward
+2026-10-06T10:50:33+00:00 old=0e1bcecfad40 new=47d1b94c599b merge feat/m1v3-no-longshot: Fast-forward
+2026-10-06T10:50:42+00:00 old=47d1b94c599b new=adb1cd8b4ff2 commit: prereg(m1v3): FREEZE the NO-longshot forward screen design (this commit introduces the frozen blob)
+2026-10-06T10:50:42+00:00 old=adb1cd8b4ff2 new=6fbc4f6b54fa commit: prereg(m1v3): stamp frozen_sha adb1cd8b
+2026-10-06T11:19:37+00:00 old=6fbc4f6b54fa new=86e5c101e3b8 merge fix/b0-backfill-pagination: Fast-forward
+2026-10-06T11:19:42+00:00 old=86e5c101e3b8 new=6fbc4f6b54fa reset: moving to 6fbc4f6b
+2026-10-06T11:49:01+00:00 old=6fbc4f6b54fa new=e6f18c3e429b merge fix/b0-backfill-pagination: Fast-forward
+2026-10-06T11:57:01+00:00 old=e6f18c3e429b new=6d1eb4f32653 commit: docs(f13): B0 verdict F13-R36 — B1 UNDERPOWERED (MDE 3.25 °F vs plausible 0.5 °F); census/backfill/B0 evidence
+2026-10-06T13:31:38+00:00 old=6d1eb4f32653 new=7d31ed60788d merge feat/f13-a1-lamp-backfill: Fast-forward
+2026-10-06T14:00:06+00:00 old=7d31ed60788d new=8fcc056135ca merge feat/f13-a-blend: Fast-forward
+2026-10-06T14:26:34+00:00 old=8fcc056135ca new=84c70d9906c1 merge fix/lamp-header-month: Fast-forward
+2026-10-06T14:52:34+00:00 old=84c70d9906c1 new=c33d938d4ba2 merge fix/pfm-history-parse: Fast-forward
+2026-10-06T14:53:19+00:00 old=c33d938d4ba2 new=3de4d9ae923f commit: docs: development halt point 2026-10-06 (resume file, PROGRESS rows)

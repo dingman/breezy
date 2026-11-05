@@ -1,0 +1,1457 @@
+{
+  "citations": {
+    "client.py": {
+      "ALLOWLIST": [
+        8584
+      ],
+      "BIND_RAISED": [
+        8215
+      ],
+      "DEADLINE": [
+        8636
+      ],
+      "DIDNOTMAP": [
+        8618
+      ],
+      "ECHO": [
+        8626
+      ],
+      "NONNEW": [
+        8632
+      ],
+      "REFUSED": [
+        8614
+      ],
+      "TIMEOUT": [
+        8610
+      ],
+      "accepted": [
+        8702
+      ],
+      "anchor": [
+        8165
+      ],
+      "anchor_error": [
+        8169
+      ],
+      "base": [
+        714
+      ],
+      "cap": [
+        718
+      ],
+      "confirm_call": [
+        8126
+      ],
+      "formula": [
+        3411
+      ],
+      "new": [
+        8721
+      ],
+      "reset": [
+        3823,
+        4911
+      ],
+      "resting": [
+        8123
+      ]
+    },
+    "note": "RE-CHECKED AGAINST TEXT AT RUN TIME; confirm precedes anchor.",
+    "submit_chain.py": {
+      "deadline": [
+        164
+      ],
+      "wait": [
+        91
+      ]
+    }
+  },
+  "counts": {
+    "N_HOLD": 30,
+    "N_NEW": 25,
+    "N_NO_EXIT": 0,
+    "N_UNKNOWN": 2,
+    "N_create": 57,
+    "hold_shares": {
+      "SIG_DIDNOTMAP": 0.0,
+      "SIG_H1_404_DEADLINE": 0.0,
+      "SIG_H2_ECHO": 0.0,
+      "SIG_H3_NONNEW": 0.0,
+      "SIG_X_ALLOWLIST": 0.0,
+      "SIG_X_BIND_RAISED": 0.0,
+      "SIG_X_TIMEOUT": 1.0
+    },
+    "signatures": {
+      "SIG_DIDNOTMAP": 0,
+      "SIG_H1_404_DEADLINE": 0,
+      "SIG_H2_ECHO": 0,
+      "SIG_H3_NONNEW": 0,
+      "SIG_NEW": 25,
+      "SIG_NO_EXIT": 0,
+      "SIG_X_ALLOWLIST": 0,
+      "SIG_X_BIND_RAISED": 0,
+      "SIG_X_TIMEOUT": 30,
+      "UNKNOWN": 2
+    }
+  },
+  "git_sha": "2c60e19380a3c7a6236c51dd9e694b7b8b7dde0c",
+  "logs": [
+    {
+      "N_WAIT": 2,
+      "N_WAIT_unjoined": 2,
+      "counts": {
+        "N_HOLD": 0,
+        "N_NEW": 3,
+        "N_NO_EXIT": 0,
+        "N_UNKNOWN": 0,
+        "N_create": 3,
+        "hold_shares": {
+          "SIG_DIDNOTMAP": 0,
+          "SIG_H1_404_DEADLINE": 0,
+          "SIG_H2_ECHO": 0,
+          "SIG_H3_NONNEW": 0,
+          "SIG_X_ALLOWLIST": 0,
+          "SIG_X_BIND_RAISED": 0,
+          "SIG_X_TIMEOUT": 0
+        },
+        "signatures": {
+          "SIG_DIDNOTMAP": 0,
+          "SIG_H1_404_DEADLINE": 0,
+          "SIG_H2_ECHO": 0,
+          "SIG_H3_NONNEW": 0,
+          "SIG_NEW": 3,
+          "SIG_NO_EXIT": 0,
+          "SIG_X_ALLOWLIST": 0,
+          "SIG_X_BIND_RAISED": 0,
+          "SIG_X_TIMEOUT": 0,
+          "UNKNOWN": 0
+        }
+      },
+      "filename": "breezy-trade-20261030T213607Z.log",
+      "first_relative_s": -8631.513,
+      "last_relative_s": 60037.003,
+      "raw_counts": {
+        "confirm_lines_full": 9,
+        "confirm_lines_window": 3,
+        "empty_mentions_full": 6,
+        "empty_mentions_window": 3
+      },
+      "sha256": "1248e8400a8fb1380015e0b1fdf682c178a8a7dfcd4648bdb7851f9c5e16fb08",
+      "sink_level_lines": {
+        "ERROR": 597,
+        "INFO": 1,
+        "WARN": 179
+      }
+    },
+    {
+      "N_WAIT": 4,
+      "N_WAIT_unjoined": 4,
+      "counts": {
+        "N_HOLD": 3,
+        "N_NEW": 12,
+        "N_NO_EXIT": 0,
+        "N_UNKNOWN": 0,
+        "N_create": 15,
+        "hold_shares": {
+          "SIG_DIDNOTMAP": 0.0,
+          "SIG_H1_404_DEADLINE": 0.0,
+          "SIG_H2_ECHO": 0.0,
+          "SIG_H3_NONNEW": 0.0,
+          "SIG_X_ALLOWLIST": 0.0,
+          "SIG_X_BIND_RAISED": 0.0,
+          "SIG_X_TIMEOUT": 1.0
+        },
+        "signatures": {
+          "SIG_DIDNOTMAP": 0,
+          "SIG_H1_404_DEADLINE": 0,
+          "SIG_H2_ECHO": 0,
+          "SIG_H3_NONNEW": 0,
+          "SIG_NEW": 12,
+          "SIG_NO_EXIT": 0,
+          "SIG_X_ALLOWLIST": 0,
+          "SIG_X_BIND_RAISED": 0,
+          "SIG_X_TIMEOUT": 3,
+          "UNKNOWN": 0
+        }
+      },
+      "filename": "breezy-trade-20261031T165036Z.log",
+      "first_relative_s": 60637.991,
+      "last_relative_s": 146462.692,
+      "raw_counts": {
+        "confirm_lines_full": 13,
+        "confirm_lines_window": 13,
+        "empty_mentions_full": 18,
+        "empty_mentions_window": 18
+      },
+      "sha256": "63458ffe1b537325900c0ab0eb0a02498adc5941945bc4a4f1fe651448aa7d14",
+      "sink_level_lines": {
+        "ERROR": 568,
+        "INFO": 1,
+        "WARN": 179
+      }
+    },
+    {
+      "N_WAIT": 9,
+      "N_WAIT_unjoined": 9,
+      "counts": {
+        "N_HOLD": 27,
+        "N_NEW": 10,
+        "N_NO_EXIT": 0,
+        "N_UNKNOWN": 2,
+        "N_create": 39,
+        "hold_shares": {
+          "SIG_DIDNOTMAP": 0.0,
+          "SIG_H1_404_DEADLINE": 0.0,
+          "SIG_H2_ECHO": 0.0,
+          "SIG_H3_NONNEW": 0.0,
+          "SIG_X_ALLOWLIST": 0.0,
+          "SIG_X_BIND_RAISED": 0.0,
+          "SIG_X_TIMEOUT": 1.0
+        },
+        "signatures": {
+          "SIG_DIDNOTMAP": 0,
+          "SIG_H1_404_DEADLINE": 0,
+          "SIG_H2_ECHO": 0,
+          "SIG_H3_NONNEW": 0,
+          "SIG_NEW": 10,
+          "SIG_NO_EXIT": 0,
+          "SIG_X_ALLOWLIST": 0,
+          "SIG_X_BIND_RAISED": 0,
+          "SIG_X_TIMEOUT": 27,
+          "UNKNOWN": 2
+        }
+      },
+      "filename": "breezy-trade-20261101T165002Z.log",
+      "first_relative_s": 147003.532,
+      "last_relative_s": 232847.186,
+      "raw_counts": {
+        "confirm_lines_full": 48,
+        "confirm_lines_window": 34,
+        "empty_mentions_full": 98,
+        "empty_mentions_window": 67
+      },
+      "sha256": "4875d4e861901bc04b331ab56ea177209f5906f390c4df14ce8638acae51ae53",
+      "sink_level_lines": {
+        "ERROR": 573,
+        "INFO": 1,
+        "WARN": 179
+      }
+    }
+  ],
+  "rows": [
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 3587,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261030T213607Z.log",
+      "new_label": "observed",
+      "ordinal": "c001",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 3610,
+      "exit_lines": [
+        3608,
+        3609
+      ],
+      "exit_relative_s": [
+        -1.129,
+        -0.571
+      ],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261030T213607Z.log",
+      "new_label": "observed",
+      "ordinal": "c002",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP",
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 3641,
+      "exit_lines": [
+        3634
+      ],
+      "exit_relative_s": [
+        -0.63
+      ],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261030T213607Z.log",
+      "new_label": "observed",
+      "ordinal": "c003",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.015,
+      "create_line": 650,
+      "exit_lines": [
+        639
+      ],
+      "exit_relative_s": [
+        -0.706
+      ],
+      "hold_bind_delay_s": 0.015,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c004",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.021,
+      "create_line": 730,
+      "exit_lines": [
+        729
+      ],
+      "exit_relative_s": [
+        -0.581
+      ],
+      "hold_bind_delay_s": 0.021,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c005",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.022,
+      "create_line": 774,
+      "exit_lines": [
+        773
+      ],
+      "exit_relative_s": [
+        -0.572
+      ],
+      "hold_bind_delay_s": 0.022,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c006",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.022,
+      "create_line": 791,
+      "exit_lines": [
+        790
+      ],
+      "exit_relative_s": [
+        -0.574
+      ],
+      "hold_bind_delay_s": 0.022,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c007",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 821,
+      "exit_lines": [
+        820
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c008",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 916,
+      "exit_lines": [
+        915
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c009",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.016,
+      "create_line": 1005,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.016,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c010",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.035,
+      "create_line": 6427,
+      "exit_lines": [
+        6425
+      ],
+      "exit_relative_s": [
+        -0.934
+      ],
+      "hold_bind_delay_s": 0.035,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c011",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.025,
+      "create_line": 6543,
+      "exit_lines": [
+        6542
+      ],
+      "exit_relative_s": [
+        -0.572
+      ],
+      "hold_bind_delay_s": 0.025,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c012",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.068,
+      "create_line": 6726,
+      "exit_lines": [
+        6724,
+        6725
+      ],
+      "exit_relative_s": [
+        -1.134,
+        -0.576
+      ],
+      "hold_bind_delay_s": 0.068,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c013",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP",
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 6970,
+      "exit_lines": [
+        6968,
+        6969
+      ],
+      "exit_relative_s": [
+        -1.142,
+        -0.566
+      ],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c014",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "DIDNOTMAP",
+        "DIDNOTMAP"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.016,
+      "create_line": 10667,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.016,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c015",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.026,
+      "create_line": 10685,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.026,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c016",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.026,
+      "create_line": 10693,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.026,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c017",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 10.016,
+      "create_line": 10711,
+      "exit_lines": [
+        10710
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 10.016,
+      "join_label": "joined",
+      "log": "breezy-trade-20261031T165036Z.log",
+      "new_label": "observed",
+      "ordinal": "c018",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.019,
+      "create_line": 647,
+      "exit_lines": [
+        644,
+        645
+      ],
+      "exit_relative_s": [
+        -1.632,
+        -1.049
+      ],
+      "hold_bind_delay_s": 0.019,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c019",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "REFUSED",
+        "REFUSED"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 663,
+      "exit_lines": [
+        662
+      ],
+      "exit_relative_s": [
+        -0.581
+      ],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c020",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "REFUSED"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.014,
+      "create_line": 716,
+      "exit_lines": [
+        714
+      ],
+      "exit_relative_s": [
+        -0.601
+      ],
+      "hold_bind_delay_s": 0.014,
+      "join_label": "unassignable",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c021",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "REFUSED"
+      ],
+      "signature": "UNKNOWN",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 736,
+      "exit_lines": [
+        714,
+        724,
+        735
+      ],
+      "exit_relative_s": [
+        -2.479,
+        -0.58,
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "unassignable",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c022",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "REFUSED",
+        "REFUSED",
+        "NONNEW"
+      ],
+      "signature": "UNKNOWN",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 878,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c023",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 919,
+      "exit_lines": [
+        918
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c024",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1046,
+      "exit_lines": [
+        1045
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c025",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 1201,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c026",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1233,
+      "exit_lines": [
+        1232
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c027",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 4.938,
+      "create_line": 1384,
+      "exit_lines": [
+        1383
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 4.938,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c028",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 1417,
+      "exit_lines": [
+        1412
+      ],
+      "exit_relative_s": [
+        -2.702
+      ],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c029",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "REFUSED"
+      ],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1454,
+      "exit_lines": [
+        1453
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c030",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1583,
+      "exit_lines": [
+        1582
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c031",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1747,
+      "exit_lines": [
+        1746
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c032",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 1879,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c033",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 1935,
+      "exit_lines": [
+        1934
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c034",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 2096,
+      "exit_lines": [
+        2095
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c035",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.015,
+      "create_line": 2239,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.015,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c036",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 2276,
+      "exit_lines": [
+        2275
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c037",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 2396,
+      "exit_lines": [
+        2395
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c038",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.017,
+      "create_line": 2580,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.017,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c039",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 2644,
+      "exit_lines": [
+        2643
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c040",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 2846,
+      "exit_lines": [
+        2845
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c041",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 2961,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c042",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5126,
+      "exit_lines": [
+        5125
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c043",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5312,
+      "exit_lines": [
+        5311
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c044",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5428,
+      "exit_lines": [
+        5427
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c045",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5615,
+      "exit_lines": [
+        5614
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c046",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5790,
+      "exit_lines": [
+        5789
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c047",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 5877,
+      "exit_lines": [
+        5876
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c048",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 6045,
+      "exit_lines": [
+        6044
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c049",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 6204,
+      "exit_lines": [
+        6203
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c050",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": "never bound",
+      "create_line": 6389,
+      "exit_lines": [
+        6388
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": "never bound",
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "unobserved",
+      "ordinal": "c051",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 20.006,
+      "create_line": 6535,
+      "exit_lines": [
+        6534
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 20.006,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c052",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 59.963,
+      "create_line": 8623,
+      "exit_lines": [
+        8622
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 59.963,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c053",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 0.018,
+      "create_line": 8715,
+      "exit_lines": [],
+      "exit_relative_s": [],
+      "hold_bind_delay_s": 0.018,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c054",
+      "replaced_before_accepted": 0,
+      "sequence": [],
+      "signature": "SIG_NEW",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 10.043,
+      "create_line": 9036,
+      "exit_lines": [
+        9035
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 10.043,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c055",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 64.923,
+      "create_line": 9899,
+      "exit_lines": [
+        9898
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 64.923,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c056",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    },
+    {
+      "backoff_in_force": "UNKNOWN",
+      "bind_delay_s": 15.008,
+      "create_line": 10168,
+      "exit_lines": [
+        10167
+      ],
+      "exit_relative_s": [
+        -0.0
+      ],
+      "hold_bind_delay_s": 15.008,
+      "join_label": "joined",
+      "log": "breezy-trade-20261101T165002Z.log",
+      "new_label": "observed",
+      "ordinal": "c057",
+      "replaced_before_accepted": 0,
+      "sequence": [
+        "TIMEOUT"
+      ],
+      "signature": "SIG_X_TIMEOUT",
+      "waits": []
+    }
+  ],
+  "verdict": {
+    "UNEXPLAINED": false,
+    "confirmed": [
+      "X1"
+    ],
+    "h5": "UNDECIDABLE",
+    "step2_schema_check": false,
+    "stop_report_reasons": [
+      "STOP-REPORT: H5 UNDECIDABLE",
+      "STOP-REPORT: x_dominant"
+    ],
+    "x_dominant": true
+  }
+}

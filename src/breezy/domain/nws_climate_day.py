@@ -101,8 +101,12 @@ from breezy.domain.validation import (
 
 CLIMATE_DAY_SCHEMA_VERSION: Final[int] = 2
 
-MISSING_VALUE_FLAGS: Final[tuple[str, ...]] = ("M", "T", "MS", "MB")
-"""NWS sentinel kinds: missing, trace, missing-at-time, missing-at-midnight.
+MISSING_VALUE_FLAGS: Final[tuple[str, ...]] = ("M", "T", "MS", "MB", "UNREADABLE")
+"""NWS sentinel kinds: missing, trace, missing-at-time, missing-at-midnight --
+plus "UNREADABLE", which is OURS, not NWS's: the parser's row was absent or
+its token could not be read for a non-settlement-bearing field (tmin/tavg).
+See `breezy.normalize.units.SentinelFlag` for why it is a distinct kind
+rather than reusing one of the four NWS sentinels.
 
 A missing value is a genuinely null Arrow column *plus* the sentinel kind in the
 paired ``*_flag`` column. There is no bitmask, and no field is annotated as a

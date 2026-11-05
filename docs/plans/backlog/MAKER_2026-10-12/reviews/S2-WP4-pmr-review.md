@@ -1,0 +1,41 @@
+# S2 WP4 fill simulator: PMR review (commit b8193821, worktree maker-s2-wp4)
+
+Verdict: **REQUEST_CHANGES** (1 HIGH, 5 MEDIUM, 4 LOW). No optimistic fill credit found in the base or stress rule. Tests not run by me (collection hits the egress import gate noise; the gate owner must read EXIT).
+Files: F=`scripts/analysis/maker_stage0_fill.py`, E=`..._fill_events.py`, T=`tests/unit/test_maker_stage0_fill.py`.
+
+## Findings (ranked)
+1. [HIGH] Truncated-frame refusal is side-blind and level-blind. F:254-255, E:54. `DepthTruncation` fires whenever either side exceeds 10 levels (`tape_records.py:450-457`: the committed capture has 12 bids/14 offers, "routine"). Failure: most attempts refuse; the few episodes that start are those at the moments the book is shallow (smaller A), so per-episode fill is selected upward while the day-level rate is pulled down; NO-GO (fill) (<0.10, spec :221) can be set by the guard, which kills the family with no build (spec :229). Not provably conservative. Fix: use r2's rule (plan r2 L186): truncation matters only on the YES-ask side and only if `level = 100-b` exceeds the deepest displayed ask (A then censored: refuse); otherwise A_gt/A_eq are exact, accept. Needs `ask_levels_seen`/`levels_dropped` on `DepthFrame`. Add report fields: refused share, first-refused-to-first-placed delay. Test: truncated frame with level inside displayed range places; beyond it refuses; bid-side-only truncation places.
+2. [MED] Position-unit denominator excludes refused-only rungs. F:361 `rung_trials_posted = len({rung for placed})`, while `bid_bearing` (F:359) counts refused attempts. Plan r3 L175 / r4 (e): pairs on bid-bearing days. Failure: a rung attempted but only ever guard-refused leaves the denominator, inflating the position rate, which can be the "stricter" arm only if station-day is higher, and S3's `fill_icc_rung_trial` reads 0/1 per "posted position". Fix: add `rung_trials_attempted` (rungs with >=1 attempt, refused or not); WP5 divides by it. `filled_pairs_* == rung_trials_filled_*` (F:361) is the right unit (station-day x rung, spec :246-247); keep one, the duplicate is harmless.
+3. [MED] Leakage asserts are vacuous at the two sites that matter. F:272-278 passes `depth_ts_used_ns=ts` (the t0 literal, not the frame's time) and `filled_ns=None`; `_end(...filled=ts)` (F:291) never asserts `t0 < filled`. `Episode.depth_ts_used_ns` (F:327) therefore records t0, not the frame used. The structural guard `ts <= t0` (F:212) does hold, so no leak today, but the plan's "depth_ts_used <= t0" and "t0 < filled" are not evidenced. Fix: add `ts_ns` to `DepthFrame`, record it, assert at attempt and at fill; test asserts `depth_ts_used_ns < t0` for a frame older than t0.
+4. [MED] "Delta pessimistic in every direction" is false for fill rate. E:105-115, F:383-387. Opening later and cancelling earlier lower exposure, but a +Delta forecast release delays forecast-driven cancels (CANCEL_PMIN/STALE are selector decisions at the later release), so a bid whose model says "cancel" rests up to Delta longer and is exposed to extra prints. Bounded by 10 min (S-7). It is leak-safe (the correct goal), not fill-rate-monotone. Fix: wording in plan/report; optionally run Delta=0 and 2*Delta sidecar. Also `delta_ns` is trusted (S-7 only in the pre-pass; F:383): assert `<= S7_DELTA_BOUND_NS` inside `simulate_station_day` too.
+5. [MED] WP6 selector can break the position cap. F:234, F:122. `held` is passed to the selector and silently filtered; if the selector excludes held rungs and returns the next-ranked, base can hold A and post C (3 positions per station-day) while the stress pass still has A live: more trials, higher station-day rate, and the two passes diverge. Fix: simulator enforces `len(held) + len(live)` against a `max_rungs` parameter (default 2) in both passes; test with a selector that backfills.
+6. [MED] Rung rotation. Selection can change at each release, so the distinct rungs posted over a day may exceed MAX_RUNGS (spec :125). Each is a new trial. Fix: same cap as 5 on distinct rungs ever posted per pass, or report `rungs_ever_posted` and let S3 see it.
+7. [LOW] Selector-driven cancels (REPLACED, drop_reason) run after same-ts prints are credited (F:140-141 vs F:139); plan L150 says cancels precede credits. Only Cut events obey it. Realistic ordering (reaction after trade) but not what the plan states; document or move.
+8. [LOW] `p_*_live` for a fill (F:243-245, F:318): `ep.vector` updates only at decisions and the new vector is staged past its release decision (F:142-143), so a fill between a release and the next book frame records the previous vector, and a stress-only-later fill records the base rest's vector. Not leaking; differs from "vector in force at the fill instant" (plan L167). Fix: update `ep.vector` at fill time from `self.vector`; carry per-rule p.
+9. [LOW] Overlapping gap marks on one key: `setdefault` then `pop` (F:181, F:187) ends the gap at the first END. Fix: counter per key, or require merged gaps and assert it.
+10. [LOW] Equal-ts GAP_END: DEPTH (3) and PRINT (2) precede GAP_END (4), so both are inside the gap (stale persists to the next frame). Conservative; accepted. END_OF_DATA end reason (F:146): accepted; WP6 must assert every day ends on a terminating Cut and report the count of END_OF_DATA.
+
+## Spec-vs-code (1)-(3)
+| Item | Spec/plan | Code | Result |
+|---|---|---|---|
+| A_gt / A_eq | NO size at price >b / =b, = YES asks <,= 100-b (spec :237; plan L160) | F:93-98 exact, integer cents | match |
+| Q0 | A_gt+A_eq+1, own last | F:285 `factor*(a_gt+a_eq+1)` | match |
+| BUYER only, NO_AGGRESSOR never | spec :242 | F:212 `!= BUYER` skip | match |
+| Print at t0 not credited | plan L160,171 | F:212 `ts <= t0` and decisions after all same-ts events (F:140) | match |
+| q>b | d=min(v,G); G-=d; R-=d | F:214-217 | match |
+| q<=b | R-=v; G=max(0,G-v) | F:218-220 | match |
+| Fill at R<=0 | cumulative reaches Q0 incl. own unit | F:221 | match |
+| Same-level split | none in plan; print at q==b is not split into better vs equal | not split | match plan (conservative; new better-priced arrivals after t0 are not modeled: known optimism, covered by the stress) |
+| Stress | Q0'=2(A_gt+A_eq+1), G'=2 A_gt | F:271,285-286 | exact; I proved stress never fills before base (R'-R > reduction gap since Q>A_gt) |
+| Empty NO side | no fill from implied price (spec :242) | no special branch; A=0, Q0=1, a later q<=b BUYER print fills | consistent: only real prints credited, none implied; new arrivals ahead unmodeled |
+| GTD/process cut | new episode, queue reset | F:193-201, resume re-posts at same instant (F:199-201, r4 (i)10) | match |
+| Held after fill | no further bids | F:234,294-295 per pass | match (see 5) |
+| Guard | stale / truncated / marketable | F:250-257 (instance, gap-stale, truncated, bid >= no_ask) | match plan; see 1 |
+| Gaps | subtract, no credit, episode continues | F:179-191, F:212 | match; missed prints only lower fill (conservative) |
+
+## Answers to the brief
+- (1) Optimistic credit: none. Directions, same-ts ordering, t0 exclusion, G cap and stress dominance all hold.
+- (4) Vector visibility is strictly after the shifted release (F:142-143, T:380); no truth import (T:590-598). See 4 for what "pessimistic" really means.
+- (5) `n_attempts == n_episodes + n_refused` holds in the base pass (F:359-360); bid_bearing is first-attempt based (pre-fill); K1 frozen at the first non-empty `want` (F:235-236) before any hold, so both passes agree. Sound.
+- (6) `q_censored`: dropped by r3 (L158 makes truncation a refusal), so the code matches the plan. Direction: not monotone. Refused-only days stay in the denominator as unfilled (down), but retry at shallow-book moments biases placed episodes up. Power cost is the refused share, unmeasured here. Restore the exact-coverage acceptance in finding 1.
+- (7) Left to WP6, each able to move the stressed rate: selector held/cap handling (5, 6); `Cut.resume` flags (a resume=True process cut re-posts instantly with no relaunch latency); TradeUnit conversion of both print size and depth size (the sim treats units as equal); how `truncated` and `instance_id` are derived; `forecast_valid` semantics. Freeze all in the (c) code-sha ledger and pins before the run.

@@ -1,0 +1,187 @@
+{
+  "alignment": [
+    {
+      "cycle_ns": 1782738000000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "LAX",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782759600000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "LAX",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782781200000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "LAX",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782738000000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MDW",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782759600000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MDW",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782781200000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MDW",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782738000000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MIA",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782759600000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MIA",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782781200000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "MIA",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782738000000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "SFO",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782759600000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "SFO",
+      "txn_climate_day": "2026-06-30"
+    },
+    {
+      "cycle_ns": 1782781200000000000,
+      "matches_climate_day_for_txn": true,
+      "max_column_climate_day": "2026-06-30",
+      "station": "SFO",
+      "txn_climate_day": "2026-06-30"
+    }
+  ],
+  "climate_day": "2026-06-30",
+  "vintage_age": [
+    {
+      "age_min": 166.56666666666666,
+      "cycle_ns": 1782738000000000000,
+      "expected_age_min": 166.0,
+      "instant": "16:50Z D-1",
+      "station": "LAX",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 222.23333333333332,
+      "cycle_ns": 1782759600000000000,
+      "expected_age_min": 223.0,
+      "instant": "00:00Z D",
+      "station": "LAX",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 47.0,
+      "cycle_ns": 1782781200000000000,
+      "expected_age_min": 46.0,
+      "instant": "02:50Z D",
+      "station": "LAX",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 166.56666666666666,
+      "cycle_ns": 1782738000000000000,
+      "expected_age_min": 166.0,
+      "instant": "16:50Z D-1",
+      "station": "MDW",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 222.23333333333332,
+      "cycle_ns": 1782759600000000000,
+      "expected_age_min": 223.0,
+      "instant": "00:00Z D",
+      "station": "MDW",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 47.0,
+      "cycle_ns": 1782781200000000000,
+      "expected_age_min": 46.0,
+      "instant": "02:50Z D",
+      "station": "MDW",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 166.56666666666666,
+      "cycle_ns": 1782738000000000000,
+      "expected_age_min": 166.0,
+      "instant": "16:50Z D-1",
+      "station": "MIA",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 222.23333333333332,
+      "cycle_ns": 1782759600000000000,
+      "expected_age_min": 223.0,
+      "instant": "00:00Z D",
+      "station": "MIA",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 47.0,
+      "cycle_ns": 1782781200000000000,
+      "expected_age_min": 46.0,
+      "instant": "02:50Z D",
+      "station": "MIA",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 166.56666666666666,
+      "cycle_ns": 1782738000000000000,
+      "expected_age_min": 166.0,
+      "instant": "16:50Z D-1",
+      "station": "SFO",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 222.23333333333332,
+      "cycle_ns": 1782759600000000000,
+      "expected_age_min": 223.0,
+      "instant": "00:00Z D",
+      "station": "SFO",
+      "within_tolerance": true
+    },
+    {
+      "age_min": 47.0,
+      "cycle_ns": 1782781200000000000,
+      "expected_age_min": 46.0,
+      "instant": "02:50Z D",
+      "station": "SFO",
+      "within_tolerance": true
+    }
+  ]
+}

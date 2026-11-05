@@ -1,0 +1,906 @@
+"""The `breezy-trade` console entrypoint: the Breezy trading process.
+
+EXEC SPINE R-2 (process shell) / W (execution client wiring). A FOURTH process
+alongside `breezy` (weather ingestion), `breezy-quote-tape` (venue tape
+recorder) and `breezy-quote-tape-preflight`, for the reason each of those is
+separate: different configuration requirements, different failure
+consequences. The weather collector must start on a host with no venue
+configuration; this one must refuse to start without venue configuration AND
+without a trading identity of its own (``BREEZY_TRADE_TRADER_ID``, no default
+-- see ``breezy.runtime.settings.TRADE_TRADER_ID_VAR``).
+
+WHAT THIS PROCESS CANNOT DO, STILL
+-----------------------------------
+It cannot submit an order. Not "does not"; cannot. EXEC SPINE W registers a
+real execution-client factory (``PolymarketUSLiveExecClientFactory``) so the
+process now RECONCILES the venue account and REFUSES every order -- but no
+strategy and no execution algorithm exist anywhere on this path, and
+:func:`breezy.runtime.node_config.build_trade_node_config` states both as
+empty literals. The execution client's own cage --
+``PolymarketUSExecutionClient._submit_order``/``_cancel_order`` carry an
+unconditional denial body, and its other four lifecycle coroutines raise -- is
+unchanged by W. This module is still a process SHELL in the sense that
+matters: it starts, reconciles, refuses, reaches ``RUNNING``, and stops
+cleanly.
+
+That is not a small thing to have. The repo's standing failure mode is a green
+suite over a deployment that never started, and every subsequent increment
+lands inside a process that has been proven to come up.
+
+Null hypothesis, checked before writing any of it: **Nautilus already provides
+the process shell.** ``TradingNode``/``NautilusKernel`` build the engines, own
+start and stop, and install SIGTERM/SIGINT/SIGABRT handlers for every
+non-BACKTEST environment (``system/kernel.py:558-572``). This module installs
+none of its own and authors no process machinery. It loads settings, builds
+one config, registers the read-only data-client factory and the execution-
+client factory, and translates the outcome into an exit code.
+
+The exit contract matches ``breezy.runtime.quote_tape_cli``:
+
+===========================  ====  ==========================================
+Outcome                      Code  Example
+===========================  ====  ==========================================
+Clean shutdown                  0  SIGTERM -> graceful stop
+Configuration / environment     2  ``BREEZY_TRADE_TRADER_ID`` unset,
+                                   ``POLYMARKET_US_USER_AGENT`` unset,
+                                   ``POLYMARKET_US_ACCOUNT_NUMBER`` unset,
+                                   malformed trader id, unreadable key file
+Runtime failure                 1  the node raised while building or running,
+                                   OR the run ended behind a LATCHED fatal
+                                   market-data fault, OR the run ended behind a
+                                   LATCHED fatal execution-client fault (a
+                                   failed ``_connect`` -- EXEC SPINE risk 2)
+===========================  ====  ==========================================
+
+The last row is the one that needs stating. ``TradingNode.run()`` returns
+``None`` (``live/node.py:283-302``) and the kernel keeps no record of WHY it
+stopped, so a node that shut itself down after losing its market-data feed, or
+whose execution client never finished connecting, returns exactly like one
+stopped by an operator SIGTERM. For a trading process that difference is
+larger than it is for a recorder: a trader running blind, or one that never
+reconciled, is a trader whose next decision is made on stale or absent state.
+The process-scoped latches written by the data client and the execution
+client at the instant each detects its own unrecoverable fault are where that
+one bit survives, and this module is where it becomes the answer to
+``systemctl status``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, Protocol, TextIO
+
+from nautilus_trader.common.actor import Actor
+from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.trading.strategy import Strategy
+
+from breezy.adapters.polymarket_us.exec import submit_chain
+from breezy.adapters.polymarket_us.exec_fault import (
+    clear_fatal_exec_fault,
+    fatal_exec_fault,
+    record_fatal_exec_fault,
+)
+from breezy.adapters.polymarket_us.factories import (
+    POLYMARKET_US_CLIENT_NAME,
+    PolymarketUSLiveDataClientFactory,
+    PolymarketUSLiveExecClientFactory,
+    config_from_env,
+    exec_config_from_env,
+)
+from breezy.adapters.polymarket_us.feed_fault import (
+    clear_fatal_feed_fault,
+    fatal_feed_fault,
+)
+from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.account_presence_halt import install_account_presence_halt
+from breezy.runtime.backtest_order_guard import install_live_order_guard
+from breezy.runtime.component_health_watch import (
+    install_component_degraded_alert,
+    install_reconciliation_refusal_alert,
+    install_refusal_repoll_timer,
+    install_resolver_contradiction_alert,
+    install_resting_alert,
+    install_stale_intent_alert,
+)
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.runtime.logging_bridge import install as install_logging_bridge
+from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
+from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
+from breezy.runtime.observation_composition import build_live_observation_actors
+from breezy.runtime.settings import (
+    SettingsError,
+    load_trade_settings,
+    proxy_env_check_enabled,
+)
+from breezy.runtime.stop_intent_marker import consume_stop_intent_marker
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.adapters.polymarket_us.config import PolymarketUSExecClientConfig
+    from breezy.runtime.order_enablement import OrderSubmissionPermit
+    from breezy.runtime.settings import BreezyTradeSettings
+
+logger = logging.getLogger(__name__)
+
+EXIT_OK = 0
+EXIT_RUNTIME_ERROR = 1
+EXIT_CONFIG_ERROR = 2
+
+#: One event for every boot that returns from ``node.run()`` without the
+#: trader ever having reached RUNNING. Fixed, so an operator can filter on
+#: it. ``detail`` is the closed enum below, never a value.
+BOOT_HALT_EVENT: Final[str] = "BOOT_HALT"
+BOOT_HALT_SEVERITY: Final[str] = "CRITICAL"
+BOOT_HALT_SITE: Final[str] = "global"
+
+
+class BootHaltDetail(StrEnum):
+    """Closed ``detail`` values for :data:`BOOT_HALT_EVENT`.
+
+    Fixed strings. Never exception text, never a count, never a path.
+
+    Only the generic value. Read once, after ``run()`` returns, the public
+    state that survives stop cannot attribute a cause: stop disconnects the
+    engines, reconciliation stores no public result, and
+    ``portfolio.initialized`` stays false for every early return -- not only
+    a portfolio that failed to initialise.
+    """
+
+    TRADER_NEVER_STARTED = "BOOT_HALT_TRADER_NEVER_STARTED"
+    #: AUD-13c review: the node raised while being ASSEMBLED -- factory,
+    #: ``add_actor``/``add_strategy`` (e.g. Nautilus's double external-order
+    #: claim, ``execution/engine.pyx:552-557``) or ``build`` -- so ``run()``
+    #: was never reached. Attributable: the raise happened in this process.
+    NODE_ASSEMBLY_FAILED = "BOOT_HALT_NODE_ASSEMBLY_FAILED"
+
+
+def _trader_reached_running(node: Node) -> bool:
+    """Whether the trader reached RUNNING. Read once, after ``run()`` returns.
+
+    ``Trader.is_stopped`` is the public state a clean stop leaves. The kernel
+    calls ``trader.stop()`` only while ``is_running``, and ``STOPPED`` is that
+    stop completing; a trader that never started is still ``READY``.
+    ``is_running`` covers a ``run()`` that returned with the trader still up.
+    A double that has neither property has not started.
+    """
+    trader = getattr(node, "trader", None)
+    if trader is None:
+        return False
+    if getattr(trader, "is_running", False) is True:
+        return True
+    return getattr(trader, "is_stopped", False) is True
+
+
+def _log_boot_proof_lines(config: TradingNodeConfig) -> None:
+    """Emit boot proof lines from values already fixed in ``config``.
+
+    Nautilus logging is live only once the node exists, so a stdlib record
+    logged while the config is built is dropped by the bridge's sink. The value
+    is read once at config build (AMBIG-LATCH-RESUME section 2.11); only the
+    line is emitted here, never a second read.
+    """
+    exec_config = config.exec_clients.get(POLYMARKET_US_CLIENT_NAME)
+    admitted = getattr(exec_config, "no_id_retire_admitted", None)
+    if admitted is not None:
+        logger.info("no_id_retire_admitted=%s", admitted)
+    resting_admitted = getattr(exec_config, "resting_accept_admitted", None)
+    if resting_admitted is not None:
+        logger.info("resting_accept_admitted=%s", resting_admitted)
+    sweep_admitted = getattr(exec_config, "sweep_retire_admitted", None)
+    if sweep_admitted is not None:
+        logger.info("sweep_retire_admitted=%s", sweep_admitted)
+
+
+def _emit_node_assembly_failed_alert() -> None:
+    """One CRITICAL for a node that raised before ``run()``. Called only
+    AFTER the original error has been reported; a sink that fails, or cannot
+    be constructed, is contained here and never masks that error."""
+    try:
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=BOOT_HALT_SEVERITY,
+                event=BOOT_HALT_EVENT,
+                site=BOOT_HALT_SITE,
+                detail=BootHaltDetail.NODE_ASSEMBLY_FAILED.value,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert must not change the exit code
+        logger.error(
+            "node-assembly boot-halt alert could not be emitted exception_type=%s",
+            type(exc).__name__,
+        )
+
+
+def _emit_boot_halt_alert(node: Node, stop_intent_store_path: Path | None) -> None:
+    """One CRITICAL when ``node.run()`` returned with the trader never started.
+
+    ``emit_alert`` contains sink failures. Construction of the sink is
+    contained here too: a bad webhook URL must not change the exit code.
+
+    [AUD-13d HIGH-1] The stop-intent marker (``breezy.runtime.
+    stop_intent_marker``) is consumed FIRST and unconditionally -- before the
+    ``_trader_reached_running`` read -- so a marker written for an ordinary
+    stop of an already-RUNNING trader is still cleared here rather than left
+    to outlive this boot. Suppression itself only applies on the branch that
+    would otherwise alert: a Breezy-owned SIGTERM (``trade_supervisor``'s
+    ``stop_prior``) that arrived before RUNNING wrote this marker
+    immediately before signalling; a match means the halt was requested, not
+    a crash. ``stop_intent_store_path`` is ``None`` whenever the exec
+    state-DB path could not be resolved, in which case this is a no-op and
+    the alert fires exactly as it always has.
+    """
+    try:
+        stop_was_requested = stop_intent_store_path is not None and consume_stop_intent_marker(
+            stop_intent_store_path, os.getpid()
+        )
+        if _trader_reached_running(node):
+            return
+        if stop_was_requested:
+            logger.info("boot-halt alert suppressed: an intentional Breezy stop was requested")
+            return
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=BOOT_HALT_SEVERITY,
+                event=BOOT_HALT_EVENT,
+                site=BOOT_HALT_SITE,
+                detail=BootHaltDetail.TRADER_NEVER_STARTED.value,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert must not change the exit code
+        logger.error(
+            "boot-halt alert could not be emitted exception_type=%s",
+            type(exc).__name__,
+        )
+
+
+#: Failures that mean "this deployment is misconfigured", not "the run broke".
+#: ``OSError`` is included because the credential key file this process opens
+#: at ``build()`` time fails that way when its path or mode is wrong, which is
+#: an operator problem rather than an engineering one.
+_CONFIG_ERRORS: tuple[type[BaseException], ...] = (
+    SettingsError,
+    NodeConfigError,
+    OSError,
+)
+
+
+class Node(Protocol):
+    """The `TradingNode` surface this module drives.
+
+    EXEC SPINE W adds ``add_exec_client_factory``: the trading process now
+    registers exactly one execution-client factory, alongside the read-only
+    data client. That is still not an order path -- ``strategies=[]`` and
+    ``exec_algorithms=[]`` stay pinned in ``build_trade_node_config``, so
+    nothing calls ``submit_order`` -- it is the client that RECONCILES and
+    REFUSES.
+
+    R-6a adds ``kernel``, read only AFTER ``build()`` to install the
+    long-only order guard -- see ``_run_node``. Untyped (``Any``) rather than
+    a hand-written Protocol: ``NautilusKernel`` (`live/node.py:80-82`) ships
+    no stub, and a Protocol built to match it structurally fails mypy's
+    conformance check for `TradingNode` in a way a real stub would not --
+    the SAME reason :func:`install_order_guard` leaves ``engine.kernel``
+    untyped for a ``BacktestEngine``.
+
+    FU-8b reads one more attribute off that same untyped slice:
+    ``kernel.loop``, the asyncio loop the refusal re-poll timer's callback
+    hops to via ``call_soon_threadsafe``.
+    """
+
+    kernel: Any
+
+    @property
+    def trader(self) -> Any:
+        """BL-24 Seam B: ``trader.add_actor`` registers the observation Actors
+        natively before ``build()``. A property because ``TradingNode.trader``
+        is one (``live/node.py:139``); untyped for the same reason as
+        ``kernel`` -- ``Trader`` (``trading/trader.py``) ships no stub this
+        Protocol could conform to."""
+        ...
+
+    def add_data_client_factory(self, name: str, factory: type) -> None: ...
+
+    def add_exec_client_factory(self, name: str, factory: type) -> None: ...
+
+    def build(self) -> None: ...
+
+    def run(self) -> None: ...
+
+    def dispose(self) -> None: ...
+
+
+NodeFactory = Callable[[TradingNodeConfig], Node]
+
+
+def _report(stderr: TextIO, prefix: str, exc: BaseException, *, expected: bool) -> None:
+    """Write one clear line to ``stderr`` and route the traceback to logging."""
+    print(f"breezy-trade: {prefix}: {exc}", file=stderr)
+    level = logging.DEBUG if expected else logging.ERROR
+    logger.log(level, "%s: %s", prefix, exc, exc_info=True)
+
+
+def _exit_code_for_completed_run(stderr: TextIO) -> int:
+    """Translate a stopped node into an exit status the supervisor can read.
+
+    A ``KeyboardInterrupt`` is routed through here too: a fatal fault followed
+    by a Ctrl-C is still a failed run, and reporting the interrupt would hide
+    the cause.
+
+    The execution fault is checked FIRST. Without this check, EXEC SPINE risk
+    2 is real: a failed ``_connect`` (a durability failure, or -- as measured
+    live against the venue -- an account-balance read returning 500/503) is
+    swallowed by ``LiveExecutionClient``'s own task-completion handler
+    (``nautilus_trader/live/execution_client.py:212-226``), which logs the
+    exception and simply skips marking the client connected. Nothing
+    downstream re-raises it, ``_await_engines_connected``
+    (``nautilus_trader/system/kernel.py:1310-1316``) only WARNS on the
+    resulting timeout, and the node stops as if nothing had gone wrong. Absent
+    this check the process would exit ``EXIT_OK`` having never reconciled and
+    never traded, with a supervisor reading success.
+    """
+    exec_fault = fatal_exec_fault()
+    if exec_fault is not None:
+        print(
+            f"breezy-trade: FATAL execution-client fault in {exec_fault.component}: "
+            f"{exec_fault.reason}. The trading process shut down.",
+            file=stderr,
+        )
+        logger.error(
+            "fatal execution-client fault in %s: %s", exec_fault.component, exec_fault.reason
+        )
+        return EXIT_RUNTIME_ERROR
+
+    fault = fatal_feed_fault()
+    if fault is None:
+        return EXIT_OK
+
+    print(
+        f"breezy-trade: FATAL market-data fault in {fault.component}: {fault.reason}. "
+        "The trading process shut down.",
+        file=stderr,
+    )
+    logger.error("fatal market-data fault in %s: %s", fault.component, fault.reason)
+    return EXIT_RUNTIME_ERROR
+
+
+def _order_guard_reporter(stderr: TextIO) -> Callable[[ValueError], None]:
+    """Build the ``on_refusal`` callback R-6a's live installer requires.
+
+    Reports AT THE MOMENT of refusal, not only via the latch -- latch-then-
+    re-raise alone is not enough on either failure path: on the engine-queue
+    path ``os._exit(1)`` (a failed non-``RuntimeError`` swallowed elsewhere in
+    the kernel) beats ``_exit_code_for_completed_run``, so the ``FATAL`` line
+    printed there would never run; and on a ``LiveClock`` timer callback the
+    exception is discarded outright and the process exits 0, so the latch
+    written here is the only signal that survives that path. ``flush=True``
+    on a line-buffered ``stderr`` makes the write complete before either exit
+    route can beat it.
+    """
+
+    def _report(exc: ValueError) -> None:
+        print(f"breezy-trade: FATAL order-guard refusal: {exc}", file=stderr, flush=True)
+        record_fatal_exec_fault(POLYMARKET_US_CLIENT_NAME, str(exc))
+        logger.error("order-guard refusal: %s", exc)
+
+    return _report
+
+
+def _account_halt_reporter(stderr: TextIO) -> Callable[[str], None]:
+    """Build the ``on_halt`` callback R-7-PRE's installer requires.
+
+    A halt is not a tidy shutdown, so it gets the same treatment as an
+    order-guard refusal: one line on ``stderr`` at the instant it happens, and
+    the process-scoped exec-fault latch, so the run cannot end in ``EXIT_OK``
+    while the node was refusing every order. ``flush=True`` for the same reason
+    :func:`_order_guard_reporter` uses it -- an exit route must not beat the
+    write.
+    """
+
+    def _report(reason: str) -> None:
+        print(f"breezy-trade: FATAL account-presence halt: {reason}", file=stderr, flush=True)
+        record_fatal_exec_fault(POLYMARKET_US_CLIENT_NAME, reason)
+        logger.error("account-presence halt: %s", reason)
+
+    return _report
+
+
+def _exec_client_refusal_reader(node: Node) -> Callable[[], tuple[str, ...]]:
+    """Build the ``reasons`` reader R-6c's degraded-alert subscriber requires.
+
+    Resolved LAZILY, at the instant the alert fires, for two reasons. The
+    refusals do not exist yet at wiring time -- ``_connect`` has not run --
+    and holding the client object in a closure from ``build()`` onward would
+    outlive the node's own registry for no benefit.
+
+    ``ExecutionEngine._clients`` is a ``cdef readonly`` dict
+    (``$NT/execution/engine.pxd:52``): read-only by declaration, and already
+    the idiom ``tests/contract/test_exec_client_wiring_contract.py`` uses to
+    reach the registered client. There is no public accessor -- the engine
+    exposes ``registered_clients`` (``ClientId``\\ s only, ``engine.pyx:212``)
+    and nothing that returns the object.
+
+    A missing client yields ``()``, never an exception: this reader runs
+    inside a message-bus handler, and a degraded component must still produce
+    its alert even if the lookup comes up empty.
+    """
+
+    def _read() -> tuple[str, ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(client.trading_refusals)
+
+    return _read
+
+
+def _exec_client_stale_intent_reader(node: Node) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``stale_alerts`` reader the stale-intent watch requires.
+
+    Same lookup and same lazy-resolution reasoning as
+    :func:`_exec_client_refusal_reader` immediately above: the client is
+    looked up at poll time, never pinned into a closure at wiring time.
+
+    ``getattr(..., ())`` rather than a direct attribute read, deliberately:
+    the exec client on THIS node carries ``stale_ambiguous_intent_alerts``,
+    but this reader must not assume every registered exec client does --
+    a client without the attribute, like a missing client, yields ``()``
+    rather than raising inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "stale_ambiguous_intent_alerts", ()))
+
+    return _read
+
+
+def _exec_client_reconciliation_refusal_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the reader the AUD-13b reconciliation-refusal watch requires.
+
+    Same lookup and lazy resolution as
+    :func:`_exec_client_stale_intent_reader`: the client is looked up at poll
+    time, and a missing client or one without ``reconciliation_refusals``
+    yields ``()`` rather than raising inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "reconciliation_refusals", ()))
+
+    return _read
+
+
+def _exec_client_resolver_contradiction_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``contradictions`` reader EDGE-2 slice D's
+    ``resolver_evidence_contradiction`` watch requires.
+
+    Same lookup and lazy resolution as
+    :func:`_exec_client_stale_intent_reader`: the client is looked up at poll
+    time, and a missing client or one without
+    ``resolver_evidence_contradictions`` yields ``()`` rather than raising
+    inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "resolver_evidence_contradictions", ()))
+
+    return _read
+
+
+def _declared_surface(client: object, name: str) -> tuple[Mapping[str, str], ...]:
+    """``()`` when the client does not declare ``name``; otherwise the surface's value, with any
+    error raised INSIDE a declared property propagated (``getattr(..., ())`` would read an
+    AttributeError in the property body as "no alerts"; B7 review P-2)."""
+    declared = hasattr(type(client), name) or name in getattr(client, "__dict__", {})
+    return tuple(getattr(client, name)) if declared else ()
+
+
+def _exec_client_resting_alert_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``alerts`` reader ARM B7's resting-order alert watch requires.
+
+    Same lookup and lazy resolution as :func:`_exec_client_stale_intent_reader`: the client
+    is looked up at poll time, and a missing client or one without either surface yields
+    ``()`` rather than raising inside a message-bus handler. Joins the cancel and commission
+    surfaces (the no-id fill-while-down entry rides the contradiction surface instead).
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return (
+            *_declared_surface(client, "resting_cancel_alerts"),
+            *_declared_surface(client, "resting_commission_alerts"),
+        )
+
+    return _read
+
+
+def _exec_client_ambiguous_clears_reader(node: Node) -> Callable[[], int]:
+    """Build the ``ambiguous_clears`` reader the degraded alert's F6 episode
+    counter requires (AMBIG-LATCH-RESUME).
+
+    Same lookup and lazy resolution as :func:`_exec_client_refusal_reader`: the
+    client is looked up at poll time, and a missing client or one without
+    ``ambiguous_refusal_clears`` reads as ``0`` rather than raising inside a
+    message-bus handler.
+    """
+
+    def _read() -> int:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return 0
+        return int(getattr(client, "ambiguous_refusal_clears", 0))
+
+    return _read
+
+
+def _exec_client_resume_handler(node: Node) -> Callable[[object], None]:
+    """Build the re-poll handler that asks the exec client to resume once its
+    refusals have cleared (AMBIG-LATCH-RESUME).
+
+    Same lookup and lazy resolution as :func:`_exec_client_refusal_reader`. The
+    call is ``resume_if_refusals_cleared()``: synchronous, no ``await``, and its
+    callees are pinned to the latch read and the native ``resume``/``degrade``
+    (whose actions are no-ops), so it changes a health indicator and can send
+    nothing. A missing client or one without the method is a no-op, and the
+    timer's ``_poll`` isolates each handler, so a raise here costs nothing else.
+    """
+
+    def _resume(event: object) -> None:
+        del event
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return
+        resume = getattr(client, "resume_if_refusals_cleared", None)
+        if resume is None:
+            return
+        resume()
+
+    return _resume
+
+
+def _run_node(
+    config: TradingNodeConfig,
+    node_factory: NodeFactory,
+    stderr: TextIO,
+    *,
+    actors: Sequence[Actor] = (),
+    extra_actors: Sequence[Actor] = (),
+    strategies: Sequence[Strategy] = (),
+    after_build: Callable[[Node], None] | None = None,
+    order_submission_permit: OrderSubmissionPermit | None = None,
+    stop_intent_store_path: Path | None = None,
+) -> int:
+    """Build, run and ALWAYS dispose the node. Never raises.
+
+    BL-24 Seam B: ``actors`` -- the NWS observation Actors, present only
+    when ``BREEZY_LIVE_OBSERVATIONS=1`` -- are registered through the NATIVE
+    ``node.trader.add_actor`` BEFORE ``build()``, exactly as
+    ``composition.build_ingest_node`` registers the ingest Actors.
+    ``build_trade_node_config`` keeps ``actors=[]``; these are not an order
+    path (an Actor is not a Strategy and cannot ``submit_order``).
+
+    ``extra_actors`` (AUD-12b): a SECOND, independent seam for the SAME
+    native registration below -- kept apart from ``actors`` only so each
+    caller's intent stays legible (``actors`` is BL-24's ingest-observation
+    set; ``extra_actors`` is composition-kind-specific, today only the
+    fee-drift probe ``breezy.app.trade`` builds for ``continuous_rung_hold``).
+    Both are registered through the exact SAME ``node.trader.add_actor`` loop,
+    before ``build()``. Defaults to ``()`` so every existing caller is
+    unchanged.
+
+    Shadow-mode ``current_rung_hold`` strategies -- constructed ABOVE this
+    module by ``breezy.app.trade`` -- are registered the same way, through
+    the NATIVE ``node.trader.add_strategy`` BEFORE ``build()``
+    (``trading/trader.py:375-420``). ``build_trade_node_config`` keeps
+    ``strategies=[]``; these are already-built objects, never an order path
+    (``orders_enabled`` stays False and is unreachable from env).
+
+    ``add_data_client_factory``/``add_exec_client_factory`` take the
+    registration NAME and the factory CLASS (``live/node.py:230``, and the
+    execution equivalent), and that name must equal the key used in
+    ``TradingNodeConfig.data_clients``/``exec_clients``
+    (``live/node_builder.py:163,177``, ``:201-246``) -- otherwise the builder
+    resolves nothing, logs an error nobody reads, and the process runs happily
+    with no market data, or no execution client, at all.
+
+    Exactly TWO factories are registered here: the read-only data client, and
+    -- as of EXEC SPINE W -- the reconciling, order-refusing execution client.
+    Neither registration is an order path: see the ``Node`` protocol's
+    docstring.
+
+    R-6a installs the long-only order guard onto ``node.kernel.msgbus`` AFTER
+    ``build()``, the same shape :func:`~breezy.runtime.backtest_order_guard.
+    install_order_guard` uses for a ``BacktestEngine`` (``engine.kernel.
+    msgbus``). It is a ``msgbus.subscribe(...)``, not an ``Actor`` --
+    ``actors=[]`` in ``build_trade_node_config`` stays an untouched empty
+    literal, and nothing here is a new order path: this node still cannot
+    call ``submit_order`` (see the ``Node`` protocol's docstring).
+
+    The ``on_refusal=_order_guard_reporter(stderr)`` argument reports a
+    refusal to ``stderr`` and the exec-fault latch AT THE INSTANT it fires,
+    then the guard still re-raises -- see that function's own docstring for
+    why the latch alone, checked only after the node stops, is not enough.
+
+    R-7-PRE installs :func:`~breezy.runtime.account_presence_halt.
+    install_account_presence_halt` in the SAME idiom, and this call site is
+    load-bearing rather than incidental. Nautilus's
+    ``_check_orders_risk_for_account`` returns ``True`` -- order ALLOWED -- when
+    ``cache.account_for_venue(...)`` is ``None``, and Nautilus is immutable, so
+    the only available denial is the native ``TradingState.HALTED``. Nothing in
+    the framework enters that state on its own; this line is what does.
+    ``tests/contract/test_account_presence_halt_contract.py`` pins it, so R-7
+    -- which gives the execution client's ``_submit_order`` a real body and
+    removes the standing refusal that currently masks the fail-open -- cannot
+    drop it by accident.
+
+    WP-B2 hands that SAME guard the ``order_submission_permit`` the composed
+    strategies were given, plus ``node.kernel.clock``, so a lapsed permit is
+    refused at the kernel chokepoint instead of only at mint. The clock is
+    the node's own Nautilus clock -- the one whose message bus publishes the
+    order events being screened -- never a wall clock, and never a second
+    clock object of this module's own. In shadow mode the permit is ``None``
+    and the rule is inert, so the installed guard is byte-identical to the
+    pre-WP-B2 one. This is DEFENCE IN DEPTH: ``adapters.polymarket_us.safety.
+    assert_live_order_submission_permitted`` stays the authoritative expiry
+    check at venue egress.
+
+    FU-8b arms :func:`~breezy.runtime.component_health_watch.
+    install_refusal_repoll_timer` on ``node.kernel.clock`` immediately after
+    the stale-intent, reconciliation-refusal AND (EDGE-2 slice D) resolver-
+    evidence-contradiction watches are installed -- after ``assembled =
+    True``, so a node that never finishes ``build()`` never arms a timer
+    either. The timer's callback runs on a foreign (Rust/tokio) thread and
+    hops to ``node.kernel.loop`` before calling each handler, so all three
+    triggers stay mutually serial on the loop thread. Arming failure is
+    caught and reported through ``_report`` alone
+    (informational delivery, never a control: FU-8 r2.1) and never blocks
+    boot. The returned ``cancel`` is called in ``finally``, BEFORE
+    ``node.dispose()``, so the timer never outlives the loop it hops to --
+    idempotently alongside the kernel's own ``_cancel_timers`` on stop.
+    """
+    node: Node | None = None
+    assembled = False
+    cancel_repoll: Callable[[], None] | None = None
+    try:
+        node = node_factory(config)
+        _log_boot_proof_lines(config)
+        node.add_data_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory)
+        node.add_exec_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory)
+        for actor in (*actors, *extra_actors):
+            node.trader.add_actor(actor)
+        for strategy in strategies:
+            node.trader.add_strategy(strategy)
+        node.build()
+        assembled = True
+        install_live_order_guard(
+            node.kernel.portfolio,
+            node.kernel.cache,
+            node.kernel.msgbus,
+            on_refusal=_order_guard_reporter(stderr),
+            order_submission_permit=order_submission_permit,
+            clock=node.kernel.clock,
+        )
+        degraded_h = install_component_degraded_alert(
+            node.kernel.msgbus,
+            component_id=POLYMARKET_US_CLIENT_NAME,
+            reasons=_exec_client_refusal_reader(node),
+            ambiguous_reason=submit_chain.AMBIGUOUS_REASON,
+            ambiguous_clears=_exec_client_ambiguous_clears_reader(node),
+        )
+        stale_h = install_stale_intent_alert(
+            node.kernel.msgbus,
+            stale_alerts=_exec_client_stale_intent_reader(node),
+        )
+        recon_h = install_reconciliation_refusal_alert(
+            node.kernel.msgbus,
+            refusals=_exec_client_reconciliation_refusal_reader(node),
+        )
+        contradiction_h = install_resolver_contradiction_alert(
+            node.kernel.msgbus,
+            contradictions=_exec_client_resolver_contradiction_reader(node),
+        )
+        resting_h = install_resting_alert(
+            node.kernel.msgbus,
+            alerts=_exec_client_resting_alert_reader(node),
+        )
+        try:
+            cancel_repoll = install_refusal_repoll_timer(
+                node.kernel.clock,
+                loop=node.kernel.loop,
+                handlers=(
+                    recon_h,
+                    stale_h,
+                    contradiction_h,
+                    degraded_h,
+                    resting_h,
+                    _exec_client_resume_handler(node),
+                ),
+            )
+        # Broad, deliberately: an informational re-poll timer must never
+        # block boot (FU-8 r2.1 ruling; AC9). The state-change path above is
+        # already wired and stays unaffected.
+        except Exception as exc:  # noqa: BLE001
+            _report(stderr, "refusal re-poll timer NOT armed", exc, expected=False)
+        install_account_presence_halt(
+            node.kernel.msgbus,
+            node.kernel.cache,
+            node.kernel.risk_engine,
+            on_halt=_account_halt_reporter(stderr),
+        )
+        if after_build is not None:
+            after_build(node)
+        node.run()
+        # A reconciliation failure does not raise. When ``run()`` returns
+        # with the trader never started, say so. The exit code below is
+        # unchanged either way. One read of public trader state (the FU-8b
+        # re-poll timer is separate and is cancelled in ``finally``).
+        _emit_boot_halt_alert(node, stop_intent_store_path)
+        return _exit_code_for_completed_run(stderr)
+    except KeyboardInterrupt:
+        # A deliberate stop is NOT a failure. `TradingNode.run` catches only
+        # `RuntimeError` (`live/node.py:293-300`), and although the kernel
+        # installs SIGINT/SIGTERM handlers for a LIVE environment
+        # (`system/kernel.py:558-572`), a signal that arrives before the loop
+        # is running -- during `build()`, or between `build()` and `run()` --
+        # surfaces here as `KeyboardInterrupt`. Reporting that as a failure
+        # would tell systemd the run broke when it was simply stopped.
+        print("breezy-trade: interrupted; shutting down", file=stderr)
+        return _exit_code_for_completed_run(stderr)
+    except BaseException as exc:  # noqa: BLE001 - the process exit contract lives here
+        _report(stderr, "trading node failed", exc, expected=False)
+        if not assembled:
+            _emit_node_assembly_failed_alert()
+        return EXIT_RUNTIME_ERROR
+    finally:
+        if node is not None:
+            if cancel_repoll is not None:
+                try:
+                    cancel_repoll()
+                except Exception as exc:  # noqa: BLE001 - must not block dispose
+                    _report(
+                        stderr, "error cancelling the refusal re-poll timer", exc, expected=False
+                    )
+            try:
+                node.dispose()
+            except Exception as exc:  # noqa: BLE001  # pragma: no cover - defensive
+                _report(stderr, "error disposing the trading node", exc, expected=False)
+
+
+def run(
+    *,
+    env: Mapping[str, str] | None = None,
+    node_factory: NodeFactory = TradingNode,
+    stderr: TextIO | None = None,
+    strategies: Sequence[Strategy] = (),
+    extra_actors: Sequence[Actor] = (),
+    submit_intent_latch: object | None = None,
+    after_build: Callable[[Node], None] | None = None,
+    live_trading_permit: object | None = None,
+    settings: BreezyTradeSettings | None = None,
+    exec_client_config: PolymarketUSExecClientConfig | None = None,
+    submit_veto: Callable[[], str | None] | None = None,
+    exit_manifest: FamilyManifest | None = None,
+    order_submission_permit: OrderSubmissionPermit | None = None,
+) -> int:
+    """Load settings, build the node config, run the node, return an exit code.
+
+    ``env`` and ``node_factory`` are injected so every path -- including every
+    failure path -- is exercisable without an event loop or a socket.
+
+    Both loaders run BEFORE any node is constructed, so a half-provisioned
+    host exits 2 having built nothing. The venue variables are read by
+    :func:`breezy.adapters.polymarket_us.factories.config_from_env`, which
+    already owns the section 7 environment contract; they are deliberately not
+    re-read here, because a second reader is a second competing policy for the
+    same variables.
+
+    ``settings`` and ``exec_client_config`` are optional passthroughs.
+    ``breezy.app.trade.run`` already loads both -- the settings to decide
+    whether ``current_rung_hold`` is on, the exec config to open the
+    submit-intent latch on the same store path -- before it ever reaches this
+    function. Re-reading either here would be a second, competing read of the
+    same environment variables at the same instant; when the caller already
+    has a value, it is passed straight through and neither loader runs again.
+
+    ``extra_actors`` (AUD-12b) is a plain passthrough to :func:`_run_node`,
+    default ``()``: ``breezy.app.trade.run`` builds the fee-drift probe
+    Actor (``continuous_rung_hold`` only) and passes it here, already fully
+    constructed -- this function opens no new registration mechanism.
+    """
+    out = sys.stderr if stderr is None else stderr
+    install_logging_bridge()
+    # THIS run's fault, never an inherited one. The latch is process-scoped
+    # and a stale value would fail a healthy run.
+    clear_fatal_feed_fault()
+    clear_fatal_exec_fault()
+    try:
+        try:
+            if settings is None:
+                settings = load_trade_settings(env)
+            data_client_config = config_from_env(env)
+            if exec_client_config is None:
+                exec_client_config = exec_config_from_env(env)
+            config = build_trade_node_config(
+                settings,
+                data_client_config,
+                exec_client_config,
+                submit_intent_latch=submit_intent_latch,
+                live_trading_permit=live_trading_permit,
+                submit_veto=submit_veto,
+                exit_manifest=exit_manifest,
+            )
+        except _CONFIG_ERRORS as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
+
+        # AUD-13d HIGH-1: the SAME exec state-DB path
+        # `trade_supervisor`'s `stop_prior` phase resolves (`spawn_node`
+        # forwards `env=os.environ` as-is, so both processes read the
+        # identical `POLYMARKET_US_EXEC_STATE_DB`) -- already validated
+        # non-``None`` by `exec_config_from_env`/`PolymarketUSExecClientConfig`
+        # by the time `exec_client_config` exists.
+        stop_intent_store_path = (
+            Path(exec_client_config.state_store_path)
+            if exec_client_config.state_store_path is not None
+            else None
+        )
+
+        actors: Sequence[Actor] = ()
+        if settings.live_observations:
+            # 2026-09-16 GAP fix: `catalog_root` is the config seam for the
+            # raw-observation sidecar default path -- `None` whenever no
+            # rung-hold family is on (`settings`'s own only other reader of
+            # this field), which disables the sidecar rather than raising.
+            actors = build_live_observation_actors(
+                check_proxy_env=proxy_env_check_enabled(env),
+                catalog_root=settings.catalog_root,
+            )
+        return _run_node(
+            config,
+            node_factory,
+            out,
+            actors=actors,
+            extra_actors=extra_actors,
+            strategies=strategies,
+            after_build=after_build,
+            order_submission_permit=order_submission_permit,
+            stop_intent_store_path=stop_intent_store_path,
+        )
+    finally:
+        uninstall_logging_bridge()
+
+
+def main() -> int:
+    """Console-script entrypoint. Returns the process exit code.
+
+    B7's ONE caller is ``breezy.app.trade`` -- the composition root the
+    ``breezy-trade`` console script actually enters
+    (``pyproject.toml [project.scripts]``). ``issue_live_trading_permit`` is
+    never called here: this module is a library entrypoint other callers
+    (``breezy.app.trade.run``) also reach directly, and a second issuer at
+    this call site would be a second, competing mint of the same permit.
+    """
+    return run()

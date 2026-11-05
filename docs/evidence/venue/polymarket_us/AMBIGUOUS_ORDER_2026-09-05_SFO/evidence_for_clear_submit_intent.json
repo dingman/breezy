@@ -1,0 +1,108 @@
+{
+ "schema_note": "assembled for breezy-clear-submit-intent --evidence; positions + explicit no-fill attestation",
+ "client_order_id": "O-20260905-201949-L001-SFO-1",
+ "market_slug": "tc-temp-sfohigh-2026-09-05-gte73lt74f",
+ "submitted_at": "2026-09-05T20:19:49.006Z",
+ "intent_id_open_in_latch": "ac87b697622e4b418f60a41623057e2f",
+ "observed_at_utc": "2026-09-05T22:46:15Z",
+ "positions": {},
+ "positions_status": 200,
+ "positions_market_filtered": {
+  "positions": {},
+  "nextCursor": "",
+  "eof": true,
+  "availablePositions": []
+ },
+ "open_orders": [],
+ "open_orders_status": 200,
+ "activities_all_count": 10,
+ "activities_mentioning_market": [],
+ "activities_marketSlug_filter_honoured": false,
+ "balances": {
+  "balances": [
+   {
+    "currentBalance": "97.9145",
+    "currency": "USD",
+    "lastUpdated": null,
+    "buyingPower": "97.9145",
+    "assetNotional": 0,
+    "assetAvailable": 0,
+    "pendingCredit": 0,
+    "openOrders": 0,
+    "unsettledFunds": 0,
+    "pendingWithdrawals": [],
+    "marginRequirement": 0,
+    "balanceReservation": "47.9482",
+    "depositReservation": 10,
+    "bonusReservation": "37.9482",
+    "displayedBonus": "37.9482",
+    "displayedAvailableSoon": 10,
+    "displayedCash": "49.9663",
+    "availableToWithdraw": "49.9663"
+   }
+  ]
+ },
+ "public_book_stats": {
+  "state": "MARKET_STATE_HALTED",
+  "stats": {
+   "openPx": {
+    "value": "0.1300",
+    "currency": "USD"
+   },
+   "closePx": {
+    "value": "0.1100",
+    "currency": "USD"
+   },
+   "lowPx": {
+    "value": "0.1100",
+    "currency": "USD"
+   },
+   "highPx": {
+    "value": "0.3400",
+    "currency": "USD"
+   },
+   "lastTradePx": {
+    "value": "0.3200",
+    "currency": "USD"
+   },
+   "settlementPx": {
+    "value": "0.1100",
+    "currency": "USD"
+   },
+   "sharesTraded": "2141.6800",
+   "notionalTraded": {
+    "value": "54678.7700",
+    "currency": "USD"
+   },
+   "lastTradeQty": "17.5300",
+   "openInterest": "1977.6000",
+   "openSetTime": "2026-09-04T21:12:30.067465486Z",
+   "closeSetTime": "2026-09-04T21:00:06.919028829Z",
+   "highSetTime": "2026-09-05T16:54:18.948777911Z",
+   "lowSetTime": "2026-09-05T13:55:59.954950487Z",
+   "lastTradeSetTime": "2026-09-05T17:11:10.005677921Z",
+   "settlementSetTime": "2026-09-04T21:00:06.919226227Z",
+   "openInterestSetTime": "2026-09-05T17:11:10.039617153Z",
+   "notionalSetTime": "2026-09-05T17:11:10.005677921Z",
+   "settlementPriceCalculationMethod": "SETTLEMENT_PRICE_CALCULATION_METHOD_EVENT_TIER_2",
+   "currentPx": {
+    "value": "0.3200",
+    "currency": "USD"
+   },
+   "lastPriceSample": {
+    "longPx": {
+     "value": "0.3200",
+     "currency": "USD"
+    },
+    "shortPx": {
+     "value": "0.68",
+     "currency": "USD"
+    },
+    "ts": "2026-09-05T22:28:24.055815532Z"
+   }
+  }
+ },
+ "venue_order_id": null,
+ "fill_record": null,
+ "fills": []
+}

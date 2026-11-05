@@ -1,0 +1,94 @@
+[Unit]
+# I3 driver for the 13:55 UTC live-fill scoring run
+# (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md section 3.0/I3),
+# triggered by breezy-score-live-trials.timer. Sibling of
+# breezy-live-tally.service: same oneshot/no-Install shape, same
+# wrapper-script driver style (deploy/systemd/score-live-trials-run.sh) --
+# the timer owns cadence, the script owns the work.
+#
+# This unit runs the covered-listed-station-days counter
+# (scripts/analysis/structural_dead_stop.py) exactly once and then
+# scripts/analysis/score_live_trials.py once per manifest station,
+# resolving its fill source from the exec state DB via
+# POLYMARKET_US_EXEC_STATE_DB below. It writes the ONE dated success marker
+# (score_live_trials_ok_<date>) both the 14:30 v1 tally
+# (breezy-live-tally.service) and the 17:15 v2 tally
+# (breezy-pm-crh-v2-tally.service) assert before running -- see BLOCK-2 in
+# the plan above.
+Description=Breezy I3 live-fill scoring (13:55 UTC daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/score_live_trials.py
+Documentation=file:///home/jon/breezy/docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling. 2026-09-11 incident: breezy-k1-daily.service (a
+# sibling nightly-analysis unit) reached a 17.6 GB memory peak in under 2
+# minutes with NO MemoryHigh=/MemoryMax= configured at all, pushing the 31 GB
+# host into swap while breezy-trade-supervisor.service (the live trading
+# node, deliberately left UNcapped on purpose -- see its own :64 comment)
+# was running at ~625 MB.
+#
+# 2026-09-24 timeout incident (this unit): the original MemoryHigh=1G/
+# MemoryMax=2G was sized on a stale "local parquet/sqlite read" claim.
+# structural_dead_stop.py actually walks the quote-tape Parquet catalog
+# (load_depth per station-day), and since AUD-05 the wrapper runs that
+# counter TWICE, sequentially -- v1-scoped then champion-scoped. Since
+# 2026-09-19 every run sat at the 1G MemoryHigh with 1.5-1.9G swap and took
+# ~2.5 min; on 2026-09-24 it hit TimeoutStartSec=1200 ('Failed with result
+# timeout', 1.1G peak, 1.7G swap), so no success marker was written and all
+# three downstream tallies (breezy-live-tally, breezy-pm-crh-v2-tally,
+# breezy-family-tally@) skipped. A scratch rehearsal of the current wrapper
+# at the production caps was OOM-killed after 544s; at MemoryMax=4G it
+# completed in 96s with a 3.1G cgroup peak (3.38G RSS). MemoryHigh=4G/
+# MemoryMax=5G covers that measured working set with headroom while staying
+# well below the host: a runaway run's OOM still lands on the study, never
+# the node.
+#
+# Overlap ruling (pre-existing, bounded): breezy-quote-tape-ingest-frequent.timer
+# (OnCalendar=*:0/15) fires breezy-quote-tape-ingest.service
+# (MemoryHigh=4G/MemoryMax=6G) every 15 min, so this 13:55 run overlaps its 14:00 and 14:15 fires. Worst
+# case both ceilings sum to 5G + 6G = 11G, plus the ~1G uncapped live node,
+# against 30G RAM with ~23G available (`free -g`, 2026-09-24 ~23:00Z) -- well
+# within bounds, so no flock/slice/timer change. This unit is deliberately
+# NOT a member of breezy-studies.lock: it must not be delayed behind a heavy
+# nightly study past its own 14:30Z/17:20Z downstream tally consumers.
+MemoryHigh=4G
+MemoryMax=5G
+UMask=0077
+
+# No EnvironmentFile: this is a single non-secret filesystem path literal
+# (I3 BLOCK-1.1), never a venue credential, byte-identical to the same
+# line in breezy-live-tally.service (BLOCK-1.3).
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
+# AUT-2 r7 WP6 (L2): Persistent=true on the timer fires a missed run at any hour. The catch-up guard
+# refuses a start whose worst-case span meets the launch window [16:30Z, 17:10Z) or that begins in
+# the heavy night [01:00Z, 04:30Z); its exit 10 is mapped to 1 (a clean skip, never `failed`) and any
+# internal error to 255 (a failure that fires OnFailure=). The scheduled 13:55Z start is permitted.
+ExecCondition=/home/jon/breezy/deploy/systemd/slot-guard-run.sh --unit breezy-score-live-trials
+
+ExecStart=/home/jon/breezy/deploy/systemd/score-live-trials-run.sh
+
+# The counter walks the quote-tape Parquet catalog (load_depth per
+# station-day) and the scorer runs once per manifest station -- generous
+# but bounded, well under breezy-mb-daily's network-bound budget.
+TimeoutStartSec=1200
+
+# No Restart=. A missed run is not an incident on its own -- both tally
+# wrappers refuse loudly (no marker) rather than tally a partial/no-op
+# scoring run. The timer's Persistent=true is what recovers a run missed
+# across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-score-live-trials
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-score-live-trials.timer`
+# is the only thing to enable.

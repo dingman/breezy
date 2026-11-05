@@ -1,0 +1,102 @@
+
+391 
+CDUS46 KSEW 040826
+CLISEA
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE SEATTLE
+126 AM PDT FRI SEP 04 2026
+
+...................................
+
+...THE SEATTLE-TACOMA WA AIRPORT CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1945 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         68    353 PM  92    1988  75     -7       84       
+  MINIMUM         53    527 AM  45    1956  56     -3       59       
+  AVERAGE         61                        65     -4       72     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.12          0.91 1945   0.04   0.08     0.00     
+  MONTH TO DATE    0.35                      0.12   0.23     0.00     
+  SINCE OCT 1     37.26                     37.85  -0.59    28.91     
+  SINCE JAN 1     20.48                     21.91  -1.43    15.51     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0          MM      MM                   0.0      
+  MONTH TO DATE    0.0                                       0.0      
+  SINCE OCT 1      3.0                                       2.3      
+  SINCE JUL 1      0.0                                       0.0      
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        4                         2      2        0        
+  MONTH TO DATE    9                         6      3        0        
+  SINCE SEP 1      9                         6      3        0        
+  SINCE JUL 1     34                        61    -27       24        
+
+ COOLING                                                              
+  YESTERDAY        0                         2     -2        7        
+  MONTH TO DATE    0                         6     -6       11        
+  SINCE SEP 1      0                         6     -6       11        
+  SINCE JAN 1    265                       239     26      305        
+...................................................................
+
+
+WIND (MPH)                                                            
+  RESULTANT WIND SPEED   5   RESULTANT WIND DIRECTION   S (160)       
+  HIGHEST WIND SPEED    14   HIGHEST WIND DIRECTION     S (180)       
+  HIGHEST GUST SPEED    20   HIGHEST GUST DIRECTION     S (180)       
+  AVERAGE WIND SPEED     6.6                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.8                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  LIGHT RAIN                                                          
+  FOG                                                                 
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    90          1100 PM                                      
+ LOWEST     45           400 PM                                      
+ AVERAGE    68                                                        
+
+..........................................................
+
+
+THE SEATTLE-TACOMA WA AIRPORT CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   75        88      2017                      
+ MINIMUM TEMPERATURE (F)   56        42      1952                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   632 AM PDT   SUNSET   743 PM PDT     
+SEPTEMBER  5 2026.....SUNRISE   634 AM PDT   SUNSET   741 PM PDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

@@ -6,7 +6,7 @@
 
 **Subordinate to, and does not supersede:**
 
-- `docs/plans/GO_LIVE_PLAN.md` — phase sequencing A–F and operator gates D1–D5.
+- `docs/plans/archive/GO_LIVE_PLAN.md` — phase sequencing A–F and operator gates D1–D5.
 - `docs/plans/TRADING_ENABLEMENT_PLAN.md` (+ `_AMENDMENTS.md`) — the 85-requirement
   register. **It carries a BLOCK header and this document does not lift it.**
 - `docs/evidence/asymmetric_gate_prereg_2026-08-26.md` revision 14 — **BINDING**.
@@ -306,6 +306,23 @@ venue instruments ─▶ InstrumentProvider ─────┤
 Every arrow into the decision is a *veto*. None of them is a vote. The design has
 no path where a strong signal on one axis compensates for a failed gate on
 another.
+
+### 2.1 Exit-seam flow (PREREG v4)
+
+The registered exit path (`pm_us_crh_exit_v4`, plan POSITION_EXIT_EXECUTION_2026-09-16 INC-E3/E4)
+closes held positions mid-day under a registered rule. Flow: `PositionMonitor` (injects decider)
+→ `exit_decider.decide_exit()` (pure, accepts/refuses per rule) → `ExitAuthorization` (frozen
+value object) → `ExitAuthorizationLike` Protocol (layering boundary) → `exec/submit_chain`
+(unmappable vs exit order body) → exec client → `_RECORD_SIGNS` (SELL side) → `leg_prices`
+exit echo table → venue → fill → native event + durable record. Echo check: YES close =
+`SELL`/`SELL_LONG`; NO close = `BUY`/`SELL_SHORT` (plan Appendix A.2). **Unarmed by construction:**
+`exit_gate.py` frozenset (code gate), `manifest.exit_rule` (manifest gate), decider reason codes,
+live net-long guard (`_refuse_naked_short`, account-wide), `SubmitIntentLatch` (singleton exit/entry),
+family halt on AMBIGUOUS/rejected exit (durable, survives restart, clear only via CLI). **Layering:**
+adapters never import strategy; `ExitAuthorizationLike` is a Protocol defined in `exec/submit_chain.py` that the
+strategy's `ExitAuthorization` satisfies structurally; the order-tag prefixes live in `persistence/exit_tags.py` (the
+lowest layer both sides import); the venue echo tokens (`ORDER_INTENT_SELL_LONG`, `ORDER_INTENT_SELL_SHORT`) live only
+in `leg_prices.py`, outside `exec/`, per `RULING_x3_sell_long_sell_short_2026-09-16.md`.
 
 ---
 
@@ -1188,6 +1205,12 @@ immutable foundation and is accepted. Run-to-completion idempotency is therefore
 obtained differently, from three native or near-native mechanisms:
 
 1. **Durable cache.** `CacheConfig.database` (field verified present) is enabled.
+   **CORRECTION 2026-09-01:** Redis is the ONLY backend (`system/kernel.py:312`;
+   `:324-329` raises for anything else; `common/config.py:385` requires >=6.2), and
+   `docs/plans/EXEC_SPINE_2026-09-01.md` DECLINES that dependency in favour of a
+   Breezy `SqliteStateStore` fill record. Nautilus does persist orders and positions
+   natively when configured (`cache/cache.pyx:393-394`, `:1366-1368`;
+   `cache/database.pyx:709-755`) — so this is a DECLINED NATIVE, not a gap (L-11).
    `cache.database = None` is unacceptable once orders exist (REQ-OPS-13), and
    `generate_missing_orders=True` cannot be the recovery story because it
    *synthesises* orders it cannot match.
@@ -1196,6 +1219,14 @@ obtained differently, from three native or near-native mechanisms:
    which restores a counter, not an identity. Tier-1 needs identity: the same
    decision, re-derived after a crash, must produce the **same** client order ID
    so a retry is a duplicate the venue rejects rather than a second position.
+   **REFUTED 2026-09-01 FOR THIS VENUE — DO NOT BUILD IDEMPOTENCY ON IT.**
+   Polymarket.us `CreateOrderParams`
+   (`docs/evidence/venue/polymarket_us/sdk_snapshot/.../types/orders.py:111-128`)
+   carries NO client-order-id field, so the venue CANNOT reject a duplicate on
+   identity — a deterministic ID would be a mechanism that silently does nothing
+   while reading as protection. Idempotency must be enforced Breezy-side by an
+   un-retired submit-intent latch written before the request leaves the process
+   (EXEC_SPINE R-7), and `RetryManager` is banned by name (barrier B8).
    **Extension:** a deterministic ID derived from
    `(city, climate_day, cluster_id, decision_seq)`. *Null hypothesis line:*
    checked `OrderFactory` and `ClientOrderId` — Nautilus supplies the type and
@@ -1571,6 +1602,8 @@ HALT_ALL_DISPATCH   : additionally refuse everything except
 Neither kind flattens positions automatically. **Nothing in this architecture
 force-closes a position without a human.** That is a deliberate asymmetry: an
 automated flatten under a data fault is itself a trade made on faulty data.
+
+A shadow position monitor exists to continuously evaluate open positions on market observations and Depth10 updates, re-computing entry thesis state (ALIVE / THREATENED / DEAD / LOCKED / UNKNOWN) and recording verdicts (HOLD / REDUCE_RECOMMENDED / EXIT_RECOMMENDED / MISSING_STOP) to a dedicated monitor catalog and summary store for nightly reporting and comparative analysis. The monitor preserves this asymmetry: it evaluates but never submits; a real exit execution requires a family manifest that declares an exit rule via `persistence/exit_gate.py` (empty allow-list today) and a new pre-registration, since an exit rule is a class-(C) change to the registered trial.
 
 ### 10.4 Circuit-breaker numbers
 

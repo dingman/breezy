@@ -1,6 +1,6 @@
 """Serializable configuration for the Polymarket.us live data client.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``config.py`` (``:602-630``), section 7 environment contract
 (``:930-952``) and section 8.2 quota design.
 
@@ -37,16 +37,22 @@ Breezy policy rather than venue truth.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import msgspec
-from nautilus_trader.live.config import LiveDataClientConfig
+from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
 from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSSecretsRefConfig,
     assert_config_type_excludes_secrets,
 )
 from breezy.adapters.polymarket_us.signing import SigningVariant
+from breezy.ingest.gate import StateStoreOpener
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.registry.sites import SiteRegistry, default_registry
 from breezy.runtime.settings import SettingsError
 
@@ -57,6 +63,7 @@ __all__ = [
     "POLYMARKET_US_ORIGIN_DOMAIN",
     "POLYMARKET_US_WS_BASE_URL",
     "PolymarketUSDataClientConfig",
+    "PolymarketUSExecClientConfig",
     "PolymarketUSMarketDiscoveryConfig",
     "discovery_city_codes_from_registry",
 ]
@@ -271,7 +278,31 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     discovery_requests_per_minute: int = 6
     book_requests_per_minute: int = 12
     ws_heartbeat_secs: int = 20
-    ws_idle_timeout_secs: int = 60
+
+    #: Nautilus 1.231 breaks the read task on ANY window with no inbound
+    #: Text/Binary frame -- Ping/Pong deliberately do NOT refresh this timer
+    #: (``WebSocketConfig.idle_timeout_ms``). Dead-peer detection is the
+    #: SEPARATE ``heartbeat_timeout`` (native default 3x heartbeat, reset by
+    #: any frame including pong), so a genuinely dead transport is still
+    #: caught in <= 3 * ``ws_heartbeat_secs`` regardless of this value.
+    #: The prior default (60s) sat inside a quiet-but-alive shard's normal
+    #: book-change gap and produced 224 self-inflicted recorder closes and
+    #: 306 trade-node closes overnight 2026-09-10/11 -- entirely in the
+    #: otherwise-idle window, each one opening a ~5s quote-tape gap. 600s
+    #: keeps the idle timer from ever firing before native dead-peer
+    #: detection would have caught the same failure.
+    ws_idle_timeout_secs: int = 600
+
+    #: Wall-clock budget, in seconds, to retry an initial connect's
+    #: ``EmptyClimateListingError`` before giving up (GL-12). Default 0 --
+    #: NOT in :data:`POSITIVE_FIELDS`, so zero is a legal, deliberate value:
+    #: it is the live trade node's fail-fast default (today's behaviour,
+    #: unchanged). The quote-tape recorder overrides this in
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` to survive
+    #: the venue's own daily discovery lag. Never derived from
+    #: ``recorder_instance_id`` or any other shared flag (L-6): a dedicated
+    #: field with its own default.
+    empty_discovery_retry_secs: float = 0.0
 
     #: Escape from the venue-domain origin allowlist. NOT a secret, and
     #: deliberately a FIELD rather than an environment read performed here.
@@ -289,6 +320,63 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     #: :data:`POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR`; test doubles and
     #: staging wiring set it explicitly in code, which is reviewed.
     allow_foreign_origin: bool = False
+
+    #: Also subscribe the venue's ``SUBSCRIPTION_TYPE_TRADE`` channel (executed
+    #: prints) for every market-data slug, and publish each print as a native
+    #: ``TradeTick`` on the YES instrument. OFF by default: this is the
+    #: quote-tape RECORDER's knob, set in
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` exactly
+    #: where that role already widens ``empty_discovery_retry_secs``. The
+    #: live trade node keeps the default and its wire traffic unchanged.
+    #: Prints are forward-only on this venue and cannot be rebuilt from a
+    #: quote tape, which is why the recorder carries them. Channel facts:
+    #: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+    #: api-reference_websocket_markets_2026-08-25.md:29-31,114-138``.
+    subscribe_trades: bool = False
+
+    #: Opt-in to the systemd watchdog pinger (AUT-1 r12 section 3.10.1). OFF by default: only
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` sets it, so the live trade
+    #: node never creates a pinger and never sends a notification.
+    watchdog_notify: bool = False
+
+    #: The recorder's own streaming directory, ``<catalog_root>/live/<instance_id>``, whose
+    #: ``*.feather`` byte total is the pinger's ``stream_bytes``. Set only with
+    #: ``watchdog_notify`` (the adapter reads no environment and knows no catalog root).
+    watchdog_stream_dir: str | None = None
+
+    #: Shard market-data connections at ``cap // 2`` slugs instead of ``cap``
+    #: when :attr:`subscribe_trades` is on, so every slug's paired TRADE
+    #: subscription always has room under the venue's SHARED per-connection
+    #: cap (measured 2026-09-17 09:00Z: MARKET_DATA and TRADE draw from the
+    #: same 10-subscription pool). OFF by default: with it off, shards stay
+    #: sized at ``cap`` -- the PROVEN-CONCURRENT connection count for this
+    #: venue and key -- and TRADE fills only whatever room MARKET_DATA left,
+    #: which is ZERO once a shard is full (30 slugs at ``cap=10`` -> 3 full
+    #: shards -> no prints captured, only a WARN per shard). Turning this on
+    #: doubles the live connection count per key (6 shards instead of 3 for
+    #: 30 slugs); whether the venue caps CONCURRENT CONNECTIONS per key at
+    #: all is an OPEN QUESTION never probed live, and the trade node's own
+    #: shard(s) share this key and connect AFTER the recorder's from
+    #: 16:50Z -- a connection-cap violation there strands ORDERS, a strictly
+    #: worse failure than lost prints. Enabling this is gated on that probe;
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` leaves it
+    #: at the default for now, so the recorder currently captures zero prints
+    #: and only pins the shard-count-stays-safe behaviour.
+    trade_shard_halving: bool = False
+
+    #: AUD-08b: ``"module:attr"`` path of the RUNTIME-layer callable
+    #: (``detail: str -> None``) the recorder's instrument provider calls ONCE
+    #: when the unregistered-city sighting sidecar has failed to append for
+    #: ``provider.SIGHTING_SINK_FAILURE_ALERT_CYCLES`` consecutive discovery
+    #: cycles. A path, not a callable: this config is an ``lru_cache`` key and
+    #: Nautilus hashes a config through its JSON encoding, which refuses a
+    #: function. Resolved by the data factory with Nautilus's own
+    #: ``nautilus_trader.common.config.resolve_path`` -- the same mechanism
+    #: ``Importable*Config`` uses -- so this ``adapters`` package never imports
+    #: ``breezy.runtime``. Set only by
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config``; the trade
+    #: node keeps ``None`` (it attaches no sidecar sink at all).
+    sighting_failure_alert_path: str | None = None
 
     def __post_init__(self) -> None:
         unset = [
@@ -322,6 +410,34 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise SettingsError(f"{name} must be a positive integer, was {value!r}")
+        if not isinstance(self.subscribe_trades, bool):
+            raise SettingsError(
+                f"subscribe_trades must be a bool, was {type(self.subscribe_trades).__name__}"
+            )
+        if not isinstance(self.watchdog_notify, bool):
+            raise SettingsError(
+                f"watchdog_notify must be a bool, was {type(self.watchdog_notify).__name__}"
+            )
+        if self.watchdog_notify and not (
+            isinstance(self.watchdog_stream_dir, str) and self.watchdog_stream_dir
+        ):
+            raise SettingsError(
+                "watchdog_notify requires a non-empty str watchdog_stream_dir (the byte total "
+                "the gate watches); without it the gate would read zero forever"
+            )
+        if not isinstance(self.trade_shard_halving, bool):
+            raise SettingsError(
+                f"trade_shard_halving must be a bool, was {type(self.trade_shard_halving).__name__}"
+            )
+        if (
+            not isinstance(self.empty_discovery_retry_secs, int | float)
+            or isinstance(self.empty_discovery_retry_secs, bool)
+            or self.empty_discovery_retry_secs < 0
+        ):
+            raise SettingsError(
+                "empty_discovery_retry_secs must be zero or positive, was "
+                f"{self.empty_discovery_retry_secs!r}"
+            )
         try:
             SigningVariant(self.signing_variant)
         except ValueError as exc:
@@ -415,17 +531,14 @@ def assert_well_formed_origin(
     parts = urlsplit(origin)
     if parts.scheme != scheme:
         raise SettingsError(
-            f"PolymarketUSDataClientConfig.{field} must use the {scheme!r} "
-            f"scheme, was {origin!r}"
+            f"PolymarketUSDataClientConfig.{field} must use the {scheme!r} scheme, was {origin!r}"
         )
     if not parts.netloc or not parts.hostname:
         raise SettingsError(
             f"PolymarketUSDataClientConfig.{field} must carry a host, was {origin!r}"
         )
     if "@" in parts.netloc:
-        raise SettingsError(
-            f"PolymarketUSDataClientConfig.{field} must not embed credentials"
-        )
+        raise SettingsError(f"PolymarketUSDataClientConfig.{field} must not embed credentials")
     # Keyed on the RAW delimiters, not on the parsed components. `urlsplit`
     # reports an EMPTY query for 'https://api.polymarket.us?' and an EMPTY
     # fragment for '...#', so a component test passes both. The composed URL
@@ -436,9 +549,7 @@ def assert_well_formed_origin(
             f"PolymarketUSDataClientConfig.{field} must be a bare origin with no "
             f"path, query or fragment, was {origin!r}"
         )
-    _assert_host_on_the_venue_domain(
-        field, origin, parts.hostname, allow_foreign=allow_foreign
-    )
+    _assert_host_on_the_venue_domain(field, origin, parts.hostname, allow_foreign=allow_foreign)
     return origin
 
 
@@ -453,3 +564,184 @@ def _is_required_field_present(name: str, value: object) -> bool:
 
 
 assert_config_type_excludes_secrets(PolymarketUSDataClientConfig)
+
+
+class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
+    """Configuration for :class:`PolymarketUSExecutionClient` (EXEC SPINE W).
+
+    Deliberately a THIN wrapper around an embedded
+    :class:`PolymarketUSDataClientConfig` (``venue``) rather than a second,
+    parallel declaration of every origin/discovery/quota field: the exec
+    client needs the SAME venue facts (API origin, user agent, signing
+    variant, market discovery) the data client already validates, and
+    re-deriving them here would be a second, competing policy for the same
+    values (the exact failure mode ``config_from_env``'s docstring warns
+    against). ``venue.__post_init__`` already ran when ``venue`` itself was
+    constructed, so nothing here re-validates it.
+
+    Parameters
+    ----------
+    venue : PolymarketUSDataClientConfig
+        The shared venue facts: origins, credentials reference, user agent,
+        signing variant and market discovery. REQUIRED -- the ``None``
+        default exists only so ``__post_init__`` can raise a clear
+        :class:`~breezy.runtime.settings.SettingsError` rather than a bare
+        ``TypeError`` when it is omitted.
+    account_number : str | None
+        The operator's Polymarket.us account identifier. Becomes the
+        ``AccountId`` suffix (``exec/client.py:535-537``). REQUIRED, with NO
+        default and NO derivation from anything else -- OQ-I
+        (``docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`` section 3, increment W,
+        item 5). Its source is the operator's venue configuration, read once
+        by :func:`breezy.adapters.polymarket_us.factories.exec_config_from_env`
+        from :data:`breezy.adapters.polymarket_us.factories.ACCOUNT_NUMBER_ENV_VAR`
+        -- the same mechanism (an environment variable read fresh at process
+        start, never generated or cached) that already makes the venue
+        credentials themselves stable across a restart. A changed value
+        RE-LABELS every future event under a new ``AccountId`` but orphans
+        nothing in the durable store, whose keys are prefixed by venue, not by
+        account (``exec/client.py:80-92``).
+    state_store_path : str | None
+        Absolute filesystem path to the durable SQLite state store
+        (``breezy.runtime.sqlite_store.SqliteStateStore``). REQUIRED, absolute,
+        no ``..`` segment -- the same shape rule
+        :func:`breezy.runtime.settings.load_quote_tape_settings` already
+        applies to the quote-tape catalog root.
+    state_store_opener : StateStoreOpener | None
+        The RUNTIME-layer closure that opens the store. This module (an
+        ``adapters`` package) may not import
+        ``breezy.runtime.sqlite_store.SqliteStateStore`` directly -- the
+        import-linter layer contract puts ``runtime`` ABOVE ``adapters``
+        (``pyproject.toml`` ``[tool.importlinter]``) -- so this field is
+        always ``None`` when :func:`exec_config_from_env` builds the config,
+        and is filled in by ``breezy.runtime.node_config.build_trade_node_config``
+        via ``msgspec.structs.replace``, exactly the way
+        ``build_quote_tape_node_config`` threads ``recorder_instance_id``
+        through :class:`PolymarketUSDataClientConfig` after the fact.
+    submit_intent_latch : object | None
+        The already-opened submit-intent latch owned by the composition root.
+        Typed ``object`` so this adapters module does not import
+        ``breezy.runtime.submit_intent`` (runtime sits above adapters). The
+        object is injected by ``build_trade_node_config``, never constructed
+        here, never a factory. This increment stores it; R-7's ``_connect``
+        is what will consume it. The exec client NEVER calls
+        ``open_submit_intent_latch``.
+    spend_ledger : object | None
+        BG-5c (A1): an already-built ``DailySpendLedger`` the composition root
+        injects, the SAME way ``submit_intent_latch`` is. Typed ``object`` so
+        this module takes no ledger-module import; the factory checks
+        the type. When set, the exec client admits against exactly this
+        instance; ``None`` (default) builds the ledger as it always has.
+    instrument_wait_timeout_s, account_registration_timeout_s : float
+        Forwarded verbatim to :class:`PolymarketUSExecutionClient`.
+    submit_veto : Callable[[], str | None] | None
+        Item 4 (slice 4 review): the family-halt chokepoint veto, injected
+        the SAME way ``submit_intent_latch`` is -- a plain callable this
+        module needs no strategy/runtime import to type (``Callable`` is
+        stdlib). ``None`` by default: every composition root that predates
+        this parameter is unaffected. The composition root wires the actual
+        closure (e.g. ``lambda: "family_halt" if latch.is_family_halted()
+        else None``); this config only carries it through.
+    exit_manifest : FamilyManifest | None
+        Review finding A (``POSITION_EXIT_EXECUTION_2026-09-16.md`` §5.1):
+        the registered exit family's manifest, injected the SAME way
+        ``submit_veto``/``submit_intent_latch`` are. Typed as the real
+        :class:`~breezy.persistence.family_manifest.FamilyManifest` (never
+        ``object``): unlike ``runtime``, which sits ABOVE ``adapters`` in the
+        import-linter layer contract, ``persistence`` sits BELOW it, so this
+        module may import the real type directly. ``None`` by default --
+        every composition root that predates this parameter is unaffected,
+        and ``PolymarketUSExecutionClient`` denies every exit-tagged order
+        with ``_EXIT_MANIFEST_ABSENT_REASON`` exactly as it did before this
+        field existed.
+    resolver_instrument_loader : Callable[[str], Any] | None
+        2026-09-24 stuck-prior-day-instrument fix: injected the SAME way
+        ``submit_veto`` is -- a plain callable, typed loosely (``Any``
+        return) so this ``adapters`` module needs no import of the real
+        ``Instrument`` type or of ``breezy.runtime`` to carry it. Given a
+        venue instrument id string, returns the native instrument
+        definition if the resolver's own AMBIGUOUS-intent GET path can
+        obtain one WITHOUT subscribing to market data, or ``None`` if it
+        cannot. ``build_trade_node_config`` fills this in with a closure
+        over the SAME ``ParquetDataCatalog`` the composition root already
+        reads (``resolve_station_instrument_ids``) -- never the venue-backed
+        ``InstrumentProvider``, which refuses anything outside the latest
+        discovery cycle for an expired market. ``None`` by default -- every
+        composition root that predates this parameter is unaffected, and
+        the resolver escalates instead of loading, exactly as it always has.
+    """
+
+    venue: PolymarketUSDataClientConfig | None = None
+    account_number: str | None = None
+    state_store_path: str | None = None
+    state_store_opener: StateStoreOpener | None = None
+    submit_intent_latch: object | None = None
+    spend_ledger: object | None = None
+    instrument_wait_timeout_s: float = 30.0
+    account_registration_timeout_s: float = 30.0
+    live_trading_permit: object | None = None
+    retirement_reasons: object | None = None
+    submit_veto: Callable[[], str | None] | None = None
+    exit_manifest: FamilyManifest | None = None
+    resolver_instrument_loader: Callable[[str], Any] | None = None
+    #: AMBIG-LATCH-RESUME (DH1): True only when the RUNNING supervisor's decode
+    #: marker lists ``RESOLVER_NO_ID_NO_FILL`` (set at node boot, never read from
+    #: the environment). Gates only a RETIREMENT path, never an order. Fail-closed
+    #: default.
+    no_id_retire_admitted: bool = False
+    #: S4 WP2/WP3: True only when the running supervisor's decode marker lists
+    #: ``ACCEPTED_RESTING`` (set at node boot, never from the environment).
+    #: Gates only a RESTING submit, never an IOC or exit order. Fail-closed default.
+    resting_accept_admitted: bool = False
+    #: S4 WP4: True only when the running supervisor's decode marker lists
+    #: ``BOOT_SWEEP_RESTING_NO_FILL`` (set at node boot, never from the
+    #: environment). Gates only a RETIREMENT path, never an order. Fail-closed default.
+    sweep_retire_admitted: bool = False
+    #: EXEC-PAR WP5b: Breezy-owned parallel-intent knobs, filled by
+    #: ``build_trade_node_config`` from ``runtime.node_config`` ``Final``
+    #: constants (never the environment, never an operator control). The
+    #: defaults are the K=1, bound-off behaviour every earlier composition
+    #: root already has. ``max_concurrent_intents`` mirrors the injected
+    #: latch's K; the two fractions and the frozen bucket LABEL only take
+    #: effect when it exceeds 1 (see ``factories``).
+    max_concurrent_intents: int = 1
+    open_exposure_bound_fraction: Decimal | None = None
+    breaker_open_ambiguous_fraction: Decimal | None = None
+    frozen_cost_budget_bucket: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.venue, PolymarketUSDataClientConfig):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.venue is required and must be a "
+                f"PolymarketUSDataClientConfig; got {type(self.venue).__name__}"
+            )
+        if not _is_present(self.account_number):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.account_number is required and has "
+                "no default: it becomes the AccountId suffix and cannot be "
+                "derived from anything else"
+            )
+        if not _is_present(self.state_store_path):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path is required and has no default"
+            )
+        path = Path(self.state_store_path)  # type: ignore[arg-type]
+        if not path.is_absolute():
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path must be an "
+                f"absolute path, was {self.state_store_path!r}"
+            )
+        if any(part == ".." for part in path.parts):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path must not contain "
+                f"a '..' segment, was {self.state_store_path!r}"
+            )
+        for name in ("instrument_wait_timeout_s", "account_registration_timeout_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise SettingsError(
+                    f"PolymarketUSExecClientConfig.{name} must be a positive number, was {value!r}"
+                )
+
+
+assert_config_type_excludes_secrets(PolymarketUSExecClientConfig)

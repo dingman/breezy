@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":true,\"reason\":\"Not Found\"}",
+  "bytes": 35,
+  "content_type": "application/json; charset=utf-8",
+  "finding": null,
+  "label": "q7_model_icon_seamless",
+  "outcome": "ok",
+  "requested_at_utc": "2026-08-31T00:38:45+00:00",
+  "sha256": "0ea38162214142fdea32440c7736f67d9a044d1007087e3dcd08258ba4eede55",
+  "status": 404,
+  "url": "https://api.open-meteo.com/v1/previous-runs?daily=temperature_2m_max%2Ctemperature_2m_max_previous_day1&end_date=2026-08-29&latitude=40.78333&longitude=-73.96667&models=icon_seamless&start_date=2026-08-29&timezone=UTC"
+}

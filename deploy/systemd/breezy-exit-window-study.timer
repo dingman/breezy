@@ -1,0 +1,30 @@
+[Unit]
+Description=15:20 UTC trigger for the Breezy nightly exit-window study
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/current_rung_hold_exit_window_study.py
+
+[Timer]
+Unit=breezy-exit-window-study.service
+
+# 15:20 UTC -- free on the existing schedule (occupied: 01:35, 02:05, 09:00,
+# 13:30, 14:15, 14:30, 15:00, 17:15, 22:30, 22:45, 00/06/12/18:15), and
+# strictly AFTER breezy-position-monitor-report (15:00 UTC), so a shared
+# breezy-studies.lock holder from that run has normally already finished
+# before this one starts (the lock itself still serializes them if not).
+# Outside the protected LST-union window [16:45Z, 01:15Z) (no-start rule
+# [16:35Z, 01:15Z)) -- see deploy/systemd/README.md "Protected window and
+# serialization". UTC is stated explicitly (this host's clock is UTC) so
+# the schedule cannot move if the host timezone is ever changed. No two
+# Breezy timers ever fire in the same hour:minute tick
+# (tests/unit/test_deploy_timer_hours.py).
+OnCalendar=*-*-* 15:20:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day --
+# mirrors breezy-position-monitor-report.timer.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

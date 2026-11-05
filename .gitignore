@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .env
 .env.*
+# Operator-owned file for the two reserved caps. Never commit it.
+/operator.env
 .polymarket-us-credentials.json
 *.pem
 *.key
@@ -11,3 +13,28 @@ __pycache__/
 secrets/
 .coverage
 .coverage.*
+
+# Private venue artifacts (EXEC SPINE R-1 shape capture).
+# `docs/evidence/venue/polymarket_us/` is GIT-TRACKED (135 files), and the
+# smoke script's leak check (`find_secret_leak_offsets`) scans ONLY for supplied
+# credential strings — it cannot see a balance or a position. Anything derived
+# from an authenticated private endpoint must carry the PRIVATE_ prefix so it
+# can never be added by a bare `git add docs/`.
+docs/evidence/venue/**/PRIVATE_*
+
+# AUD-02 A0: fee-drift evidence pull's raw wire-JSON captures. Outside git
+# deliberately -- the evidence doc (docs/evidence/venue/polymarket_us/
+# FEE_DRIFT_EVIDENCE_2026-09-25.md) records each day's sha256 manifest
+# instead, and no retention job may prune this directory (Rev 2.1 item 4).
+data/evidence/fee_drift/
+data/evidence/discovery_set_equality/
+
+# AUD-10b step 14: the one real promotion-proposal run's output. Derived
+# from live venue/exec-state data read-only; never committed, never the
+# live ~/.local/share/breezy/derived tree.
+/scratch/
+.venv
+
+# Per-worktree pytest scratch (--basetemp <worktree>/.pytest-tmp/<name>); keeps test temp
+# inside the repo, off tmpfs /tmp.
+.pytest-tmp/

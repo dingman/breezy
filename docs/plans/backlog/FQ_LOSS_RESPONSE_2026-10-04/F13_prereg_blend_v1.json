@@ -1,0 +1,142 @@
+{
+  "schema": "f13_prereg_blend_v1",
+  "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
+  "status": "DRAFT skeleton (F13 Phase A pins r3, PIN-R2). Every fixed pin and the veto reference are written as exact literals; `source_lags_ns` and `source_breaks` were filled on 2026-10-21 from the freeze-time C1 evidence (docs/evidence/f13/c1_lag_evidence_2026-10-21.json) by their rules (PIN-R6/R7) and are frozen by the stamp commit. Then it is frozen once (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, if the committed blob differs, or if the file was re-frozen.",
+  "pin_note": "coordinator pins before any M1-M3 scoring",
+  "plan": {
+    "document": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md",
+    "binding": "r3 + r3.1 + r3.2 + F13-R35 (LAMP remaining-hours feature). F13-R36 (B1 UNDERPOWERED) is out of scope here.",
+    "sections": ["Phase A1 / A", "Procedure R4/R15", "Acceptance 1-9", "Folds", "Veto analysis R8/R15", "OPEN-3", "R25", "R35"]
+  },
+  "fixed_by_plan": {
+    "holdout_start": "2026-07-01",
+    "holdout_rule": "rows on or after holdout_start are REFUSED by the fit, the folds, the scorer and the runner; open_holdout is never called",
+    "champion": "M0 = nbp_calibration.fit_calibration, module byte-unchanged (sha pinned by test_nbp_calibration_module_is_byte_unchanged)",
+    "ladder": ["M0prime", "M1(+LAMP)", "M2(+PFM)", "M3(+GFS MOS)"],
+    "k": 1,
+    "primary_comparison": "M3 vs M0prime",
+    "test_statistic": "delta = CRPS(M0prime) - CRPS(M3), positive = M3 better",
+    "scorer": "nbp_calibration.crps_numerical with center = the blend mu",
+    "distribution": "Student-t, log sigma = c + d*log(NBP sd) floored; the disagreement term e*log(sd of sources' mu) is a separate, later ladder step, never in the primary arms",
+    "weights": "shrinkage toward a sum of 1 (lambda * n * (sum(w) - 1)^2), not a hard box",
+    "nesting": "a row scores with the longest present prefix of [LAMP, PFM, GFS MOS]; LAMP missing means the row scores as M0prime",
+    "bootstrap": "stationary (Politis-Romano), circular, by climate day averaged across stations and horizons",
+    "mean_block_days": 7,
+    "alpha_one_sided": 0.025,
+    "lb_rule": "one-sided 97.5 % lower bound must be > 0 AND >= floor, for both CRPS(M0prime) - CRPS(M3) and CRPS(M0) - CRPS(M3) (R25)",
+    "floor_rule": "floor = floor_multiple * sample SD of the M0 fold-to-fold mean CRPS, committed before M1-M3 are scored",
+    "fold_sign_fraction": 0.75,
+    "fold_sign_rule": "same sign in >= ceil(0.75 * n_folds) folds",
+    "block_days": 28,
+    "min_train_days": 28,
+    "min_blocks": 2,
+    "fold_rule": "blocked within each NBM version and within each source-break segment; a segment enters only with >= 2 blocks of >= 28 held days and >= 28 train days; no fold straddles a source break; v5 never mints (AS-R14)",
+    "lag_shift_minutes": 60,
+    "lag_rule": "rerun with every source lag +60 min; LB must be >= 0 (R25) and the rows lost are reported",
+    "c1_min_measured_days": 14,
+    "negative_control": "labels shuffled within version; the shuffled delta is reported and must be ~0",
+    "positive_control": "M0 reproduces the committed champion (fit_calibration)",
+    "lamp_feature": {
+      "ruling": "F13-R35",
+      "name": "lamp_rem_max_f",
+      "definition": "max over lavtxt + lavtxt_ext forecast hours with valid_ts strictly after the anchor and inside the LST climate day, from the latest run with available_at (frozen upper-bound lag) before the anchor",
+      "persisted": ["hours_covered", "lamp_peak_covered", "m_lamp", "lamp_rem_max_f", "obs_so_far_f"],
+      "peak_rule": "lamp_peak_covered is true only when every LST hour 12..18 after the anchor is present; otherwise the feature is MISSING (m_lamp = 1) and nothing is imputed",
+      "blend_input": "L = max(obs_so_far, lamp_rem_max_f); at a D-1 anchor obs_so_far is undefined and L = lamp_rem_max_f",
+      "obs_so_far": "from the obs path only (obs available_at before the anchor), never from LAMP",
+      "m0prime_inputs": "NBP q50 and NBP sd, plus obs_so_far when defined (LAMP credit is not confused with observation credit)",
+      "strict_24h_max": "diagnostic only, never read by the blend"
+    },
+    "diagnostics": ["CRPS by horizon", "PIT histogram (10 bins)", "80 % and 95 % coverage", "mean log score on the rung ladder", "RMSE (descriptive only)", "LAMP missingness per horizon"],
+    "outcomes": {
+      "ACCEPT": "every criterion holds",
+      "REFUSED_M0PRIME_WORSE": "CRPS(M0prime) - CRPS(M0) > m0_prime_tolerance_crps_f",
+      "HELD_LEAK_AUDIT": "delta mean > leak_audit_spread_multiple * M0 fold SD",
+      "NO_SKILL": "otherwise: record NO_SKILL, stop Phase D, keep B1 and C1 running"
+    }
+  },
+  "pins": {
+    "floor_multiple": 0.25,
+    "m0_prime_tolerance_crps_f": 0.03,
+    "station_tolerance_crps_f": 0.05,
+    "leak_audit_spread_multiple": 3.0,
+    "student_t_nu": 5,
+    "sigma_floor_f": 0.75,
+    "weight_sum_lambda": 1.0,
+    "min_cell_rows": 60,
+    "bootstrap_n": 10000,
+    "bootstrap_seed": 20261006,
+    "champion_cdf_method": "NORMAL",
+    "champion_cdf_method_source": {
+      "path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+      "commit": "ad76d2f24415b2c4256289f74e5ad12d02dcba0f"
+    },
+    "m0_bootstrap_draws": 200,
+    "source_breaks": [
+      "2022-08-11", "2023-01-18", "2024-05-15", "2024-05-16", "2025-05-28",
+      "2026-03-29", "2026-03-30", "2026-03-31", "2026-05-06"
+    ],
+    "rung_edges_f": [
+      -20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2,
+      4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26,
+      28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50,
+      52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74,
+      76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98,
+      100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120
+    ],
+    "min_uncensored_lag_samples": 30,
+    "embargo_days": 3,
+    "anchors": {
+      "D-1": {"kind": "utc", "hour": 18},
+      "D0": {"kind": "lst", "hour": 10},
+      "D0_sensitivity": {"kind": "lst", "hour": 12},
+      "offset_rule": "fixed_standard_time_never_dst"
+    },
+    "source_lags_ns": {
+      "lamp-mdl": 3600000000000,
+      "lav-iem": 5400000000000,
+      "pfm": 5953353629263,
+      "mos-gfs": 18913081701834,
+      "obs": 1923961500685
+    },
+    "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
+    "obs_cadence_seconds": 3600,
+    "obs_routine_minute_by_station": {"KLAX": 53, "KMDW": 53, "KMIA": 53, "KNYC": 51, "KSFO": 56},
+    "obs_min_coverage_per_station_year": 0.95,
+    "obs_max_pin_minute_excluded_share": 0.02,
+    "lag_arm_max_lost_fraction": {"overall": 0.05, "per_horizon": 0.05, "per_station": 0.10}
+  },
+  "pin_units": {
+    "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
+    "station_tolerance_crps_f": "absolute CRPS in degF; a station whose mean (M0prime - M3) is below minus this is degraded",
+    "sigma_floor_f": "degF",
+    "source_breaks": "list of ISO dates from A0; a fold never straddles one",
+    "rung_edges_f": "integer degF edges for the rung-ladder log score",
+    "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses",
+    "embargo_days": "integer days (>= 2, FB-R6): every day within this many days of a held block is dropped from the training of M0, the pooled-M0 sensitivity AND every blend arm",
+    "anchors": "FB-R1, read by multisource_blend_features_build.py: object {\"D-1\": {\"kind\": \"utc\", \"hour\": 18}, \"D0\": {\"kind\": \"lst\", \"hour\": 10}, \"D0_sensitivity\": {\"kind\": \"lst\", \"hour\": 12}, \"offset_rule\": \"fixed_standard_time_never_dst\"}. A utc anchor is that UTC hour on the day before the climate day; an lst anchor is that local-STANDARD hour on the climate day (EST 15Z, CST 16Z, PST 18Z for hour 10). D0_sensitivity builds a separate file pair, never mixed into the primary pair.",
+    "source_lags_ns": "FB-R4/PIN-R6, integer nanoseconds per source key lamp-mdl, lav-iem, pfm, mos-gfs, obs: availability = nominal time + lag. Each value = max(R29 floor, nearest-rank p99 of the C1 uncensored lag samples in the freeze-time evidence file docs/evidence/f13/c1_lag_evidence_2026-10-21.json), written as an exact integer ns and never rounded down. The builder refuses any value below the R29 floor (lamp-mdl 60 min, lav-iem 90 min, pfm 60 min, mos-gfs 5 h, obs 15 min); the runner refuses any value below that source's C1 observed p99 (PIN-R6). Frozen only after >= 14 days of C1 measurement (R29); every value's basis is flagged in the build report.",
+    "obs_source": "FB-R3/FB-R15, a string label for the obs_so_far path; the builder accepts only iem_routine_metar_tgroup_round_half_up_f (the routine-METAR store, T group quantised through round_half_up_f). The 1-min archive is no longer a source; its raw running max and 5-min arm are descriptive, non-METAR arms only.",
+    "obs_cadence_seconds": "FB-R13, integer seconds between routine METAR readings; the builder refuses any value other than 3600 (obs_so_far is the running max of routine hourly METAR values only; interval rows and specials are excluded).",
+    "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report; FB-R15: a VALIDATION FILTER over the routine-METAR store (rows at another minute are excluded and counted). Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied).",
+    "obs_min_coverage_per_station_year": "number in [0, 1] (PIN-R4): a station-year in scope whose routine-METAR coverage (routine rows used / expected hourly reports at the pinned minute, from local-standard midnight to each requested day's last anchor) is below it is EXCLUDED from every row (all arms, M0 included) and named in the report and sidecars; the build refuses only if every station-year fails. Null refuses (the builder never assigns it). The report also carries coverage per station-month, the report-minute histogram and pin-minute-excluded share per station-year (to detect an era change) and the mean (final truth Tmax - D0 obs_so_far) per station-year.",
+    "lag_arm_max_lost_fraction": "PIN-R5: object {\"overall\": x, \"per_horizon\": y, \"per_station\": z}, each a fraction in [0, 1]. The runner refuses to emit a verdict when the +60 min shift loses more than overall of the primary file's (station, climate day, horizon) keys, more than per_horizon of any one horizon's keys (D-1 and D0 separately), or more than per_station of any one station's keys. The lag arm is compared with the primary on the common keys only (paired difference), so a larger loss would make the sensitivity answer a different question; the twin's measured loss can only refuse a run, never loosen a cap",
+    "obs_max_pin_minute_excluded_share": "PIN-R4: number in [0, 1]; a station-year whose share of stored routine reports at a minute other than the pinned one is above it is EXCLUDED, like one below obs_min_coverage_per_station_year, from every row of both feature files (all arms, M0 included), listed in the build report and bound into both sidecars by a digest; the build refuses only if every station-year fails. Never chosen while looking at the truth-gap diagnostic",
+    "champion_cdf_method_source": "PIN-R2: where champion_cdf_method was read: the committed champion calibration artefact (path) at that commit; its cdf_method value `normal` is CdfMethod.NORMAL. Provenance only, not a required pin"
+  },
+  "veto": {
+    "label": "descriptive only, carries no verdict (R8, R15)",
+    "take_rule": {
+      "open_item": "OPEN-3",
+      "citation": "src/breezy/strategy/forecast_quantile_ladder/decision.py:349-355 (net EV against the cost, take iff net > forecast_margin); margin src/breezy/strategy/forecast_quantile_ladder/margin.py:30-37; fee src/breezy/strategy/weather_common/costs.py:155-183; reached through the shipped evaluate() via scripts/analysis/fq_evaluate_shim.py (call_evaluate; re-exported by fq_mc_livedata as _call_evaluate)",
+      "order": "YES: ev_net(p_lower, cost); NO: ev_net_no(p_upper, cost); cost = fee theta*p*(1-p) + slippage floor; take iff net > margin(h)",
+      "fixed_by_code": "theta, slippage floor, h_hours and bound halfwidth are the scripts/analysis/fq_mc_livedata.py LoopConfig defaults, read from the code and never copied",
+      "proxy_deviation": "no out-of-fold bootstrap draws exist, so p_lower and p_upper are p_hat -/+ the LoopConfig bound halfwidth"
+    },
+    "reference": {"kind": "raw_nbp_cdf", "method": "NORMAL", "spread_prob": 0.02},
+    "reference_note": "no tape exists before 2026-08-30, so the pre-07-01 proxy needs a pre-registered reference ask; the coordinator pins its kind and value. Until then blend_veto_descriptive.py refuses to run. Kinds: raw_nbp_cdf = {kind, spread_prob} (the uncalibrated NBP NORMAL rung probability plus spread_prob, YES p + s, NO 1 - p + s); const = {kind, price} is unsuitable (rung-blind), tests and smoke runs only.",
+    "tape_start": "2026-08-30",
+    "horizon": "D-1 (the FQ family trades D+1)",
+    "champion_output": "out-of-fold only; a fitted-in-sample champion is refused"
+  }
+}

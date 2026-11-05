@@ -1,0 +1,59 @@
+
+705 
+CDUS44 KEWX 041223
+CLIAUS
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE AUSTIN/SAN ANTONIO
+723 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE AUSTIN BERGSTROM CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+VALID AS OF 0700 AM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1943 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE           
+                VALUE   (LST)  VALUE       VALUE  FROM               
+                                                  NORMAL           
+................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM         81   3:39 AM 110    2000  94    -13                 
+  MINIMUM         79   5:33 AM  58    1974  70      9                 
+  AVERAGE         80                                               
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          3.55 2020   0.10  -0.10              
+  MONTH TO DATE    T                         0.42  -0.42              
+  SINCE SEP 1      T                         0.42  -0.42              
+  SINCE JAN 1     23.50                     23.42   0.08              
+
+................................................................
+
+
+THE AUSTIN BERGSTROM CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   93       112      2000                      
+ MINIMUM TEMPERATURE (F)   70        55      1974                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   7:09 AM CDT   SUNSET   7:49 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   7:10 AM CDT   SUNSET   7:48 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

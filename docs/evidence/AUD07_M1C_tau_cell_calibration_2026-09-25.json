@@ -1,0 +1,20 @@
+{
+  "mixed_k2_all_equal": {
+    "cell_label": "q_max=1,dispersion=all_equal,k=2,side_mix=mixed",
+    "n_reps": 20,
+    "npts": 2001,
+    "wall_s_total": 16.10168331908062,
+    "tau_per_rep_s": 0.8050841659540311,
+    "mean_look_count": 8.15,
+    "crossing_rate": 0.05
+  },
+  "all_yes_k1_control": {
+    "cell_label": "q_max=1,dispersion=all_equal,k=1,side_mix=all_yes",
+    "n_reps": 20,
+    "npts": 2001,
+    "wall_s_total": 34.37694331607781,
+    "tau_per_rep_s": 1.7188471658038906,
+    "mean_look_count": 16.0,
+    "crossing_rate": 0.0
+  }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Operator connectivity proof for Polymarket.us -- read-only, GET-only.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 10 (``:1306-1352``), section 9 Step 15, controls S5, S8 and S15.
 
 This script answers ONE operator question -- *are we actually connected to
@@ -127,6 +127,7 @@ __all__ = [
     "assert_smoke_enabled",
     "build_safe_excepthook",
     "build_safe_loop_exception_handler",
+    "classify_canonical_string_outcome",
     "describe_exception",
     "disable_core_dumps",
     "drain_node_task",
@@ -1039,16 +1040,46 @@ async def _probe_authenticated(
         )
 
 
+def classify_canonical_string_outcome(*, path_only: int | None, path_with_query: int | None) -> str:
+    """Reduce the two measured statuses to one of FOUR coded shapes.
+
+    Total by construction: every pair of statuses -- including the pair where
+    neither request reached the venue at all -- lands in exactly one named
+    outcome. Extracted from :func:`_probe_canonical_string` so the same coded
+    vocabulary can classify a measurement taken by the R-5R-0 runner, rather
+    than being re-derived (and quietly re-worded) at a second call site.
+    """
+    if path_only == 200 and path_with_query != 200:
+        return "Path ONLY is signed; the default builder is correct."
+    if path_with_query == 200 and path_only != 200:
+        return (
+            "The query string IS part of the canonical string; switch "
+            "signing_variant to path_with_query."
+        )
+    if path_only == 200 and path_with_query == 200:
+        return "BOTH forms were accepted; the venue does not verify the query segment."
+    return f"Inconclusive: path_only={path_only}, path_with_query={path_with_query}."
+
+
 async def _probe_canonical_string(
     prepared: Prepared,
     transport: RecordingTransport,
     build_client: Any,
+    *,
+    path: str = PORTFOLIO_PATH,
 ) -> tuple[list[RequestRecord], Finding]:
     """Step C: is the query string part of the signed canonical string?
 
     Both builders ship. The default (path-only) is the evidence-backed
     hypothesis; this measures it rather than assuming it, and records BOTH
     outcomes so "they both work" is a recordable answer rather than a failure.
+
+    ``path`` is a CALLER argument. It was pinned to :data:`PORTFOLIO_PATH`
+    until R-5R-3, which made the probe unrunnable whenever that one endpoint
+    was unavailable -- exactly the state measured on 2026-09-02, when the
+    portfolio path returned 503 while another private path returned 200. The
+    discriminator is about the SIGNATURE, not about any particular endpoint,
+    so any private path that answers at all can carry it.
     """
     from breezy.adapters.polymarket_us.signing import SigningVariant
 
@@ -1058,9 +1089,7 @@ async def _probe_canonical_string(
     for variant in (SigningVariant.PATH_ONLY, SigningVariant.PATH_WITH_QUERY):
         client = build_client(variant)
         try:
-            await client.get_authenticated(
-                PORTFOLIO_PATH, query=query, quota_key=QUOTA_KEY_PORTFOLIO
-            )
+            await client.get_authenticated(path, query=query, quota_key=QUOTA_KEY_PORTFOLIO)
             note = "accepted"
         except PolymarketUSError as exc:
             note = f"rejected: {type(exc).__name__}"
@@ -1068,26 +1097,17 @@ async def _probe_canonical_string(
             transport,
             step="C",
             label=f"query-bearing read signed {variant.value}",
-            path=PORTFOLIO_PATH,
+            path=path,
             query_string="limit=1",
             note=note,
         )
         records.append(record)
         outcomes[variant.value] = record.status
 
-    path_only = outcomes.get("path_only")
-    with_query = outcomes.get("path_with_query")
-    if path_only == 200 and with_query != 200:
-        answer = "Path ONLY is signed; the default builder is correct."
-    elif with_query == 200 and path_only != 200:
-        answer = (
-            "The query string IS part of the canonical string; switch "
-            "signing_variant to path_with_query."
-        )
-    elif path_only == 200 and with_query == 200:
-        answer = "BOTH forms were accepted; the venue does not verify the query segment."
-    else:
-        answer = f"Inconclusive: path_only={path_only}, path_with_query={with_query}."
+    answer = classify_canonical_string_outcome(
+        path_only=outcomes.get("path_only"),
+        path_with_query=outcomes.get("path_with_query"),
+    )
     return records, Finding(
         key="C",
         question="Is the query string part of the signed canonical string?",
@@ -1292,7 +1312,42 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Skip step G (the deliberate read burst).",
     )
+    parser.add_argument(
+        "--canonical-probe-path",
+        default=PORTFOLIO_PATH,
+        help=(
+            "Private path step C signs against (R-5R-3). Defaults to the "
+            "portfolio path; re-point it at any private path that answers "
+            "when that one does not."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
+    """The shipped GET-only transport, budgeted exactly as the smoke budgets it.
+
+    Imported here, not at module import, so ``--help`` and the opt-in gate in
+    :func:`prepare` stay credential-free and client-free. The factory's own
+    guards run when this is called, which is only after ``prepare``.
+    """
+    from breezy.adapters.polymarket_us.transport import (
+        NautilusHttpTransport,
+        build_default_quota,
+        build_keyed_quotas,
+        build_shared_http_client,
+    )
+
+    client = build_shared_http_client(
+        timeout_secs=config.http_timeout_secs,
+        default_quota=build_default_quota(config.global_requests_per_second),
+        keyed_quotas=build_keyed_quotas(
+            instrument_requests_per_minute=config.instrument_requests_per_minute,
+            book_requests_per_minute=config.book_requests_per_minute,
+        ),
+        default_headers={"User-Agent": str(config.user_agent)},
+    )
+    return NautilusHttpTransport(client=client)
 
 
 async def run_smoke(
@@ -1306,11 +1361,6 @@ async def run_smoke(
 
     from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
     from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
-    from breezy.adapters.polymarket_us.transport import (
-        NautilusHttpTransport,
-        build_default_quota,
-        build_keyed_quotas,
-    )
 
     config = prepared.config
     started_at = dt.datetime.now(tz=dt.UTC).isoformat(timespec="seconds")
@@ -1325,15 +1375,7 @@ async def run_smoke(
     previous_loop_handler = loop.get_exception_handler()
     loop.set_exception_handler(build_safe_loop_exception_handler(counter, secrets))
 
-    inner = NautilusHttpTransport(
-        timeout_secs=config.http_timeout_secs,
-        default_quota=build_default_quota(config.global_requests_per_second),
-        keyed_quotas=build_keyed_quotas(
-            instrument_requests_per_minute=config.instrument_requests_per_minute,
-            book_requests_per_minute=config.book_requests_per_minute,
-        ),
-        default_headers={"User-Agent": str(config.user_agent)},
-    )
+    inner = _build_read_transport(config)
     transport = RecordingTransport(inner=inner)
 
     def build_client(variant: SigningVariant) -> Any:
@@ -1416,7 +1458,7 @@ async def run_smoke(
         checkpoint_now("Smoke run in progress: authenticated read has been checkpointed.")
 
         canonical_records, canonical_finding = await _probe_canonical_string(
-            prepared, transport, build_client
+            prepared, transport, build_client, path=args.canonical_probe_path
         )
         records.extend(canonical_records)
         findings.append(canonical_finding)
@@ -1745,8 +1787,7 @@ def build_safe_excepthook(guard: CredentialGuard) -> Callable[..., None]:
     ) -> None:
         if guard.credential_read_begun:
             print(
-                f"FATAL (uncaught): {exc_type.__name__}. "
-                f"{POST_CREDENTIAL_SUPPRESSION_NOTE}",
+                f"FATAL (uncaught): {exc_type.__name__}. {POST_CREDENTIAL_SUPPRESSION_NOTE}",
                 file=sys.stderr,
             )
             return

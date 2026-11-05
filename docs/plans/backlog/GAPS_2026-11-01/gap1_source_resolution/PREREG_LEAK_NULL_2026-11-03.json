@@ -1,0 +1,139 @@
+{
+  "bootstrap": {
+    "mean_block": "ctx.fixed.mean_block_days",
+    "n_boot": "ctx.pins.bootstrap_n"
+  },
+  "code_sha": "f4d29e661d187967087cd9f7b276edb1c187b8e8",
+  "code_sha_note": "merge commit f4d29e66 of backlog/leak-null-2026-11-03 into feat/data-capture-and-risk (the pinned code commit)",
+  "decision_rule": {
+    "R0": "INVALID (HELD stands) on any of: level-0 invariant |CRPS(M0prime)-CRPS(M3)| > 1e-9 on rows with levels[M3]==0; fold-disjointness defect (AC10); N3 M0prime != N1 M0prime row for row (> 1e-9); prefix_level changed by scramble or plant; positive control not flagged (AC11); < 18 completed seeds in any null; prereg digest or code pin changed.",
+    "R1": "L_N2 > 0 and M_N2 >= 0.005 -> LEAK_CONFIRMED (GAP-1 PASS withdrawn to UNRESOLVED-LEAK; #10 held). L_N2 > 0 and M_N2 < 0.005 -> HELD_INCONCLUSIVE.",
+    "R2": "L_N1 <= 0 and N1 per-seed positives <= 2/20 and n_completed_N1 == 20 -> DISCHARGED_FLUKE; uses completed-seed bounds only.",
+    "R3": "L_N1 > 0, L_N2 <= 0, M_N2 <= 0.25*M_N1, L_N3 > 0, M_N3 >= 0.5*M_N1 -> DISCHARGED_BENIGN_DOF.",
+    "R4": "L_N1 > 0, L_N2 <= 0, M_N2 <= 0, and AC12 passes -> DISCHARGED_PENALTY_MEDIATED (pipeline clean; sufficiency not shown).",
+    "failed_seeds": "FitNotConvergedError marks (seed,null) failed with reason; counts as non-positive with denominator K=20; excluded from M_N/sd/n.",
+    "order": "R0 then R1 then R2 then R3 then R4; anything else -> HELD. Every discharge requires R0 to pass. L_N = M_N - t*sd/sqrt(n), t=2.093 at n=20."
+  },
+  "envelope": {
+    "LimitNOFILE": 524288,
+    "MemoryMax": "6G",
+    "RuntimeMaxSec": 14400,
+    "max_memory_gib": 3.5,
+    "thread_env": {
+      "ARROW_IO_THREADS": 2,
+      "MKL_NUM_THREADS": 4,
+      "OMP_NUM_THREADS": 4,
+      "OPENBLAS_NUM_THREADS": 4,
+      "POLARS_MAX_THREADS": 4,
+      "RAYON_NUM_THREADS": 4
+    }
+  },
+  "f13_record": {
+    "floor": 0.0641485362960074,
+    "floor_multiple": 0.25,
+    "m0_fold_sd": 0.2565941451840296,
+    "m0p_vs_m3_lb": 0.15052026471299823,
+    "m0p_vs_m3_mean": 0.16547079366662057,
+    "source": "file=/mnt/storage/breezy/derived/gap1_source_resolution/gap1_j3_2026-11-02/j3/result.json sha256=8816bd44bdd1e08f9a00c0e536d3080510d4666ddf0d1a37f5601a6e03a66649 fields: mean=.delta_m0p_m3.mean lb=.delta_m0p_m3.lb floor=.floor floor_multiple=.report.floor_multiple"
+  },
+  "forbidden_inputs": [
+    "murphy.json",
+    "oof_rows.jsonl",
+    "result.json",
+    "stage_a.json"
+  ],
+  "frozen_sha": "c53ae69f7621257b0d75f49923be8851de2b844a",
+  "inputs": {
+    "c1_evidence": {
+      "path": "/home/jon/breezy/docs/evidence/f13/c1_lag_evidence_2026-10-21.json",
+      "sha256": "792ff2a8417debefc0e0df9e6b4171b52e1e9b20a9b2c4d391ec050c72746d3b"
+    },
+    "f13_prereg": {
+      "content_sha256": "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7",
+      "frozen_sha": "205fd542b8d601524893b5855ad49736f01436ad",
+      "path": "/home/jon/breezy/docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13_prereg_blend_v1.json",
+      "sha256": "d84ce7976b926bc6ed6509653cc7ceeb683ba52740f736135576ecd20d161c9a"
+    },
+    "features": {
+      "path": "/mnt/storage/breezy/derived/gap1_source_resolution/gap1_j3_2026-11-02/f.jsonl",
+      "sha256": "3f79629165682727ec6bc4233bf1932ed105a6143e12cf2111237d2c612e10b6"
+    },
+    "lag_features": {
+      "path": "/mnt/storage/breezy/derived/gap1_source_resolution/gap1_j3_2026-11-02/fl.jsonl",
+      "sha256": "8c623fb057435417c8f0ee5733280fb868a62483dd729655f8020fcb768037a6"
+    }
+  },
+  "nulls": [
+    "N1_within_version",
+    "N2_penalty_off",
+    "N3_scrambled_sources"
+  ],
+  "one_look_note": "One look only: no successor study on INVALID / HELD / HELD_INCONCLUSIVE / R4 (L-34); J3 result.json and GAP-1 PREREG never edited.",
+  "out_root": "/mnt/storage/breezy/derived/gap1_source_resolution",
+  "pinned_blobs": [
+    "src/breezy/analysis/leak_null.py",
+    "src/breezy/analysis/leak_null_decide.py",
+    "src/breezy/analysis/multisource_blend_fit.py",
+    "src/breezy/analysis/multisource_blend_folds.py",
+    "src/breezy/analysis/multisource_blend_stats.py",
+    "src/breezy/analysis/multisource_blend_features.py",
+    "src/breezy/analysis/multisource_blend.py",
+    "scripts/analysis/leak_null_guards.py",
+    "scripts/analysis/leak_null_study.py",
+    "scripts/analysis/multisource_blend_skill.py"
+  ],
+  "probe_record": {
+    "command": "systemd-run --user --wait --pipe --collect --unit=breezy-leak-null-probe2 -p MemoryMax=6G -p RuntimeMaxSec=3600 -p LimitNOFILE=524288 -E OMP_NUM_THREADS=4 -E OPENBLAS_NUM_THREADS=4 -E MKL_NUM_THREADS=4 -E RAYON_NUM_THREADS=4 -E POLARS_MAX_THREADS=4 -E ARROW_IO_THREADS=2 -E PYTHONPATH=/home/jon/breezy/src:/home/jon/breezy --working-directory=/home/jon/breezy /home/jon/breezy/.venv/bin/python scripts/analysis/leak_null_study.py --prereg docs/plans/backlog/GAPS_2026-11-01/gap1_source_resolution/PREREG_LEAK_NULL_2026-11-03.json --out-dir /mnt/storage/breezy/derived/gap1_source_resolution/leak_null_2026-11-03 --timing-probe --probe-parent <scratchpad>/leak_null_probe --max-memory-gib 3.5",
+    "exit_code": 0,
+    "folds": 67,
+    "n1_s": 0.4696487921755761,
+    "n2_s": 0.4840765120461583,
+    "n3_s": 0.451427869964391,
+    "projected_seed_s": 94.1452626704704,
+    "projected_pc_s": 162.16563153546304,
+    "note": "largest-train fold × n_folds is a conservative overestimate (L-12 widen-only)",
+    "help_exit": 0,
+    "refusal_exit": 2,
+    "utc": "2026-11-03T20:57:09Z"
+  },
+  "probe_seed": 3310905843,
+  "seed_rule": "seeds[i-1]=int(sha256(f'leak_null_seed:{i}').hexdigest()[:8],16) for i=1..20; probe_seed same rule with i=0",
+  "seeds": [
+    3838142263,
+    2785477765,
+    3990650771,
+    2590343262,
+    4231069519,
+    1905657653,
+    3871978119,
+    2427704913,
+    2400702631,
+    433036994,
+    3640270905,
+    2392624611,
+    1178803170,
+    723579293,
+    676465512,
+    816519990,
+    4217350486,
+    704532437,
+    458651639,
+    2484723219
+  ],
+  "thresholds": {
+    "benign_n2_ratio_max": 0.25,
+    "benign_n3_ratio_min": 0.5,
+    "fluke_count_max": 2,
+    "invariant_tol": 1e-09,
+    "k": 20,
+    "lb_gt": 0.0,
+    "leak_mean_min": 0.005,
+    "max_failed_seeds": 2,
+    "min_moved_fraction": 0.5,
+    "pc_k": 5,
+    "plant_noise_sd_f": 1.0,
+    "source": "multisource_blend_stats.py:230",
+    "t_crit_k20": 2.093,
+    "t_crit_pc5": 2.776
+  }
+}

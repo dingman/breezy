@@ -109,6 +109,7 @@ without calling it.
 from __future__ import annotations
 
 import calendar
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -137,8 +138,10 @@ from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import (
+    EmptyBookSideError,
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
+    SiteRegistryMismatchError,
     VenuePayloadError,
 )
 from breezy.adapters.polymarket_us.symbology import (
@@ -146,6 +149,7 @@ from breezy.adapters.polymarket_us.symbology import (
     REGISTRY_VENUE_KEY,
     assert_bounds_cross_checked,
     assert_valid_slug,
+    no_leg_instrument_id,
     parse_weather_slug,
     slug_to_instrument_id,
 )
@@ -172,6 +176,8 @@ __all__ = [
     "QUOTE_CURRENCY_CODE",
     "TERMINAL_SETTLEMENT_METHOD",
     "TRADE_CONTAINER_KEY",
+    "TRADE_KNOWN_KEYS",
+    "TRADE_QUANTITY_UNIT",
     "assert_fee_schedule_known",
     "depth_levels_dropped",
     "parse_binary_option",
@@ -202,6 +208,28 @@ DEPTH10_LEVELS: int = 10
 #: fabricated print. Confirmation is a live-probe question for
 #: ``polymarket-us-discovery``.
 TRADE_CONTAINER_KEY: str = "trade"
+
+#: Every key the venue documents on the ``trade`` payload
+#: (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:114-138``;
+#: SDK ``_TradePayload``, ``websocket/types.py:164-170``). The data client
+#: records -- bounded, never fatally -- any key outside this set.
+#:
+#: ``quantity`` is documented as ``Amount{value, currency: "USD"}`` -- the
+#: venue's CASH-quantity shape elsewhere (orders overview :106,130,185;
+#: create-order :77,308; preview :106-107,122-123) -- while contract counts are
+#: bare numbers. Its UNIT is therefore :data:`TRADE_QUANTITY_UNIT`.
+TRADE_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"marketSlug", "price", "quantity", "tradeTime", "maker", "taker"}
+)
+
+#: Unit of a print's ``quantity`` -- and so of ``TradeTick.size`` -- on this
+#: venue: ``"CONTRACTS"``. Resolved 2026-10-14 by
+#: ``scripts/analysis/trade_quantity_unit_crosscheck.py`` (evidence:
+#: ``docs/evidence/MAKER-S1_preconditions_2026-10-14.md``): 25 counted of 28
+#: pinned own create-path fills were each matched to a unique recorded print
+#: and only CONTRACTS survived; the dollars-inversion check HOLDS on every
+#: match. The parser performs NO unit conversion -- the tape stays byte-stable.
+TRADE_QUANTITY_UNIT: str = "CONTRACTS"
 
 #: Venue ``state`` values that mean the contract has reached a terminal
 #: settlement, so ``settlementPx`` is the final value rather than a daily mark.
@@ -240,15 +268,31 @@ OBSERVED_SETTLEMENT_METHODS: frozenset[str] = frozenset(
     }
 )
 
-#: Venue taker-side spellings mapped onto Nautilus's aggressor side. UNRESOLVED:
-#: no trade frame has been captured, so an unrecognised token maps to
-#: ``NO_AGGRESSOR`` rather than to a guessed direction.
+#: Venue ``taker.side`` spellings mapped onto Nautilus's aggressor side, read
+#: on the YES leg (the only instrument Breezy publishes).
+#:
+#: ``ORDER_SIDE_BUY`` / ``ORDER_SIDE_SELL`` are the spellings the venue itself
+#: emitted in ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
+#: activities_p0.json`` and the documented trade example uses
+#: (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:126-133``).
+#: A NO buy is echoed by the venue as ``SELL`` / ``BUY_SHORT`` on the SAME slug
+#: (memory 2026-09-14), so it lands as ``SELLER`` here and the ``intent`` is
+#: deliberately not consulted. Anything else -- including the venue's own
+#: ``ORDER_SIDE_UNDEFINED`` -- is ``NO_AGGRESSOR``, never a guessed direction.
+#: The un-prefixed forms are kept for the account-activity readers that share
+#: this table.
 _TAKER_SIDES: dict[str, AggressorSide] = {
+    "ORDER_SIDE_BUY": AggressorSide.BUYER,
+    "ORDER_SIDE_SELL": AggressorSide.SELLER,
     "SIDE_BUY": AggressorSide.BUYER,
     "SIDE_SELL": AggressorSide.SELLER,
     "BUY": AggressorSide.BUYER,
     "SELL": AggressorSide.SELLER,
 }
+
+#: Hex digits kept from the SHA-256 that derives a print's ``TradeId`` (the
+#: venue sends none). 32 <= the native 36-character ``TradeId`` bound.
+_TRADE_ID_HEX_CHARS: int = 32
 
 #: The only settlement currency Polymarket.us (a fiat DCM) is documented to use.
 #: A payload naming anything else is refused rather than coerced.
@@ -348,9 +392,22 @@ def _require_mapping(payload: object, key: str, *, context: str) -> Mapping[str,
     return value
 
 
-def _require(payload: Mapping[str, Any], key: str, *, error: type[VenuePayloadError]) -> Any:
+def _require(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    error: type[VenuePayloadError],
+    context: str = "Polymarket.us payload",
+) -> Any:
+    """Read a required field, or refuse. Never defaults, never coerces.
+
+    ``context`` names the payload the field was expected on. It exists so a
+    caller with several nested shapes in flight (the execution-report mappers
+    read an ``Execution`` that embeds an ``Order``) can attribute the refusal
+    without maintaining a second copy of this function.
+    """
     if key not in payload or payload[key] is None:
-        raise error(f"Polymarket.us payload is missing required field {key!r}")
+        raise error(f"{context} is missing required field {key!r}")
     return payload[key]
 
 
@@ -407,28 +464,80 @@ def _assert_representable(
     return quantised
 
 
-def _build_price(value: Decimal, *, precision: int, field: str) -> Price:
+def _assert_price_representable(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> Decimal:
+    """Return ``value`` checked as a PRICE, or raise. The whole price guard.
+
+    Two refusals, in order: outside the binary-option range ``[0, 1]``, and
+    carrying a significant digit below the instrument's tick. Split out of
+    :func:`_build_price` so a caller that needs the CHECKED DECIMAL rather than
+    a native ``Price`` -- ``OrderStatusReport.avg_px`` is typed
+    ``Decimal | None`` -- runs the identical guard instead of a weaker one.
+    That gap was real: ``avg_px`` reaches ``instrument.make_price()`` inside
+    Nautilus reconciliation, which rounds in silence.
+
+    ``error`` is threaded so the refusal lands in the CALLER's taxonomy. A
+    module that documents "everything here raises X" cannot keep that promise
+    if a shared primitive hardcodes a sibling class.
+    """
     if value < _PRICE_MIN or value > _PRICE_MAX:
-        raise VenuePayloadError(
+        raise error(
             f"Field {field!r} value {value} is outside the binary-option range "
             f"[{_PRICE_MIN}, {_PRICE_MAX}]"
         )
-    quantised = _assert_representable(
-        value, precision=precision, field=field, error=VenuePayloadError
-    )
+    return _assert_representable(value, precision=precision, field=field, error=error)
+
+
+def _build_price(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> Price:
+    quantised = _assert_price_representable(value, precision=precision, field=field, error=error)
     return Price.from_str(format(quantised, f".{precision}f"))
 
 
-def _build_quantity(value: Decimal, *, precision: int, field: str) -> Quantity:
-    if value <= 0:
-        raise VenuePayloadError(f"Field {field!r} value {value} is not a positive size")
-    quantised = _assert_representable(
-        value, precision=precision, field=field, error=VenuePayloadError
-    )
+def _build_quantity(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+    allow_zero: bool = False,
+) -> Quantity:
+    """Build a native ``Quantity``, or refuse. Never rounds, never clamps.
+
+    ``allow_zero`` exists for the REPORT surface: a zero fill quantity on an
+    unfilled order is a fact, whereas a zero size on a book level is not a
+    level. The default stays strict.
+
+    The refusal names the FIELD and not the value: the same primitive reads
+    public book sizes and the operator's own order and position sizes, and a
+    message that echoes the number leaks the latter the first time a logger is
+    attached to it.
+    """
+    if value < 0 or (value == 0 and not allow_zero):
+        raise error(
+            f"Field {field!r} is not a usable size (negative, or zero where a "
+            "positive size is required); value withheld"
+        )
+    quantised = _assert_representable(value, precision=precision, field=field, error=error)
     return Quantity.from_str(format(quantised, f".{precision}f"))
 
 
-def parse_rfc3339_nanos(value: object, *, field: str) -> int:
+def parse_rfc3339_nanos(
+    value: object,
+    *,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> int:
     """Parse a venue RFC 3339 UTC timestamp to UNIX nanoseconds, losslessly.
 
     The venue emits nine fractional digits (``...T00:19:48.120237895Z``).
@@ -439,24 +548,53 @@ def parse_rfc3339_nanos(value: object, *, field: str) -> int:
     Only the ``Z`` form is accepted. A numeric offset is not something the
     venue has been observed to send, and guessing at one is how a timestamp
     ends up hours wrong.
+
+    ``error`` is threaded for the same reason it is on the money primitives: a
+    module that documents "every refusal here raises X" cannot keep that
+    promise while a shared primitive hardcodes a sibling class. The execution
+    report mappers read three timestamps -- ``createTime``, ``transactTime``
+    and ``updateTime`` -- and a caller writing ``except
+    ExecutionReportMappingError`` would otherwise miss all three. The default
+    keeps every market-data caller unchanged.
     """
     if not isinstance(value, str):
-        raise VenuePayloadError(
-            f"Field {field!r} must be an RFC 3339 UTC string, got {type(value).__name__}"
-        )
+        raise error(f"Field {field!r} must be an RFC 3339 UTC string, got {type(value).__name__}")
     match = _RFC3339_RE.match(value)
     if match is None:
-        raise VenuePayloadError(f"Field {field!r} is not an RFC 3339 UTC timestamp ending in 'Z'")
+        raise error(f"Field {field!r} is not an RFC 3339 UTC timestamp ending in 'Z'")
     try:
         moment = datetime.strptime(  # noqa: DTZ007 - tz is fixed UTC by the regex
             f"{match.group('date')}T{match.group('time')}", "%Y-%m-%dT%H:%M:%S"
         )
     except ValueError:
-        raise VenuePayloadError(f"Field {field!r} is not a valid calendar date/time") from None
+        raise error(f"Field {field!r} is not a valid calendar date/time") from None
     seconds = calendar.timegm(moment.timetuple())
     fraction = match.group("fraction") or ""
     nanos = int(fraction.ljust(_FRACTION_DIGITS, "0")) if fraction else 0
     return seconds * _NANOS_PER_SECOND + nanos
+
+
+def _name_value(value: object, *, limit: int = 64) -> str:
+    """Describe a venue-supplied value for diagnosis, without echoing it whole.
+
+    An unrecognised enum member has to be NAMED or the refusal is undebuggable,
+    but the string is venue-controlled and unbounded, and a non-string could be
+    an entire nested payload. So: a short string is quoted verbatim, a long one
+    is truncated with its true length stated, and a non-string is named by TYPE
+    only.
+
+    I7 (coordinator ruling, SEC-H1 sibling): moved here from ``exec/reports.py``
+    so ``_parse_amount``'s own currency-mismatch message can use it without
+    ``parsing.py`` importing ``exec/reports.py`` (which imports ``parsing.py``
+    already -- an import cycle). Re-exported from ``exec/reports.py`` via a
+    plain import; its output bytes, and every existing caller's exact-string
+    pin, are unchanged by the move.
+    """
+    if not isinstance(value, str):
+        return type(value).__name__
+    if len(value) <= limit:
+        return repr(value)
+    return f"{value[:limit]!r} (truncated from {len(value)} characters)"
 
 
 def _parse_amount(
@@ -468,7 +606,7 @@ def _parse_amount(
     currency = value.get("currency")
     if currency != QUOTE_CURRENCY_CODE:
         raise error(
-            f"Field {field!r} is denominated in {currency!r}, not "
+            f"Field {field!r} is denominated in {_name_value(currency)}, not "
             f"{QUOTE_CURRENCY_CODE!r}; refusing to treat it as a USD amount"
         )
     return _to_decimal(_require(value, "value", error=error), field=f"{field}.value", error=error)
@@ -514,19 +652,16 @@ def _parse_fee_coefficient(market: Mapping[str, Any]) -> tuple[Decimal | None, s
 def _parse_levels(levels: object, *, side: str) -> list[tuple[Decimal, Decimal]]:
     """Validate and return EVERY level of one book side, in venue order.
 
-    Previously this function range-checked all levels and then returned a
-    single ``min()``/``max()``. Every level below the top was validated and
-    discarded, which made slippage-at-size unmeasurable from the recorded tape
-    -- see ``tests/unit/test_polymarket_us_depth_parsing.py`` for why that
-    biases the Phase 1.5 gate. The validation is unchanged; only the discarding
-    is gone.
+    An empty JSON array is a valid parsed side: a missing bid or offer is a
+    legitimate venue state on thin weather markets, not a malformed payload.
+    Per-level checks (type, binary price range, positive size) are unchanged.
+    Callers that need a two-sided quote must require a populated side
+    themselves -- see ``_require_best_level``.
     """
     if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
         raise VenuePayloadError(
             f"Book side {side!r} must be a JSON array, got {type(levels).__name__}"
         )
-    if not levels:
-        raise VenuePayloadError(f"Book side {side!r} is empty; there is no top of book to quote")
     parsed: list[tuple[Decimal, Decimal]] = []
     for index, level in enumerate(levels):
         if not isinstance(level, Mapping):
@@ -552,8 +687,27 @@ def _parse_levels(levels: object, *, side: str) -> list[tuple[Decimal, Decimal]]
     return parsed
 
 
-def _best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+def _require_best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+    """Return the best ``(price, size)`` of one side, or refuse an empty side.
+
+    ``QuoteTick`` is a two-sided quote. Inventing a bid (or ask) of 0 -- or
+    any other price -- would fabricate a top of book the venue did not send.
+    Empty is therefore an error here, not a default. Depth capture uses
+    ``parse_book_levels``, which records the populated side instead.
+
+    The refusal is an :class:`~breezy.adapters.polymarket_us.errors.EmptyBookSideError`
+    -- a ``VenuePayloadError`` subclass, so every existing caller and test is
+    unaffected -- purely so the caller can separate this EXPECTED condition
+    from a genuinely malformed payload without matching on message text. Every
+    other refusal on this path (malformed level, out-of-range price,
+    non-positive size, crossed book) stays a plain ``VenuePayloadError`` and
+    stays loud.
+    """
     parsed = _parse_levels(levels, side=side)
+    if not parsed:
+        raise EmptyBookSideError(
+            f"Book side {side!r} is empty; there is no top of book to quote", side=side
+        )
     return min(parsed) if want_lowest else max(parsed)
 
 
@@ -566,13 +720,20 @@ def parse_book_levels(
     a slippage walk (level ``n`` is the ``n``-th best), and a venue that stops
     sorting a side would otherwise produce a silently wrong slippage estimate
     from a tape that looks perfectly well formed.
+
+    A one-sided book (empty bids or empty offers, but not both) is returned
+    as-is: the populated side is the recordable market state. A fully empty
+    book is still refused -- padding both sides with zero is not a price.
+    The crossed-book check runs only when both sides are populated.
     """
     market_data = _require_mapping(payload, "marketData", context="order book payload")
     bids = _parse_levels(_require(market_data, "bids", error=VenuePayloadError), side="bids")
     asks = _parse_levels(_require(market_data, "offers", error=VenuePayloadError), side="offers")
     bids.sort(key=lambda level: level[0], reverse=True)
     asks.sort(key=lambda level: level[0])
-    if bids[0][0] > asks[0][0]:
+    if not bids and not asks:
+        raise VenuePayloadError("Order book has no populated side; there is nothing to record")
+    if bids and asks and bids[0][0] > asks[0][0]:
         raise VenuePayloadError(
             f"Order book is crossed: best bid {bids[0][0]} exceeds best offer {asks[0][0]}"
         )
@@ -590,12 +751,16 @@ def parse_book_top(payload: Mapping[str, Any]) -> tuple[Decimal, Decimal, Decima
 
     The best level is selected by price rather than by array position, so a
     venue that stops sorting a side cannot silently produce a wrong top of book.
+
+    A one-sided book cannot form this return value: there is no bid (or no
+    ask) to quote. This function refuses rather than inventing a price. Depth
+    capture uses ``parse_book_levels``, which records the populated side.
     """
     market_data = _require_mapping(payload, "marketData", context="order book payload")
-    bid_price, bid_size = _best_level(
+    bid_price, bid_size = _require_best_level(
         _require(market_data, "bids", error=VenuePayloadError), side="bids", want_lowest=False
     )
-    ask_price, ask_size = _best_level(
+    ask_price, ask_size = _require_best_level(
         _require(market_data, "offers", error=VenuePayloadError), side="offers", want_lowest=True
     )
     if bid_price > ask_price:
@@ -659,10 +824,13 @@ def parse_order_book_depth10(
     **Why the native type and not a custom one.** ``OrderBookDepth10`` is
     Arrow-registered (``serialization/arrow/serializer.py``), is a
     per-instrument table in ``StreamingFeatherWriter``
-    (``persistence/writer.py:137-147``), partitions natively into
-    ``data/order_book_depths/<instrument_id>/``, and carries ``to_quote_tick()``
-    for free. Measured end to end before this function was written. A custom
-    depth type would have reimplemented all of that.
+    (``persistence/writer.py:137-147``), and partitions natively into
+    ``data/order_book_depths/<instrument_id>/``. Measured end to end before
+    this function was written. A custom depth type would have reimplemented
+    all of that. Do not quote from ``to_quote_tick()``: on a one-sided book
+    that native helper reads the size-0 pad as a 0 price. Two-sided quotes
+    stay on ``parse_quote_tick`` / ``parse_book_top``; depth consumers must
+    skip ``size == 0``.
 
     **Truncation is real and is the price of the native carrier.** The
     committed capture ``book_open_510636.json`` has **12 bid levels and 14 offer
@@ -746,19 +914,42 @@ def depth_levels_dropped(payload: Mapping[str, Any]) -> int:
 def parse_trade_tick(
     payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
 ) -> TradeTick:
-    """Build a ``TradeTick`` from an executed-print frame.
+    """Build a ``TradeTick`` from a ``SUBSCRIPTION_TYPE_TRADE`` frame.
 
     Executed prints are the only ground truth for what actually traded rather
     than what was merely quoted (REQ-DATA-04), and they cannot be reconstructed
     later from a quote tape.
 
-    **UNRESOLVED venue fact.** No trade frame has been captured; the field names
-    here are the singular forms already used by the book payload
-    (``px``/``qty``/``transactTime``/``marketSlug``) plus ``tradeId`` and
-    ``takerSide``. Every one is REQUIRED except ``takerSide``, so a frame that
-    does not match raises :class:`VenuePayloadError` and is dropped and counted
-    by the caller. A wrong guess therefore degrades to "no trades recorded",
-    which the drop counter makes visible -- never to a fabricated print.
+    Shape per the venue's documentation
+    (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:114-138``)
+    and the SDK ``_TradePayload`` (``websocket/types.py:164-170``)::
+
+        {"trade": {"marketSlug", "price": Amount, "quantity": Amount,
+                   "tradeTime": RFC3339, "maker": {side, intent},
+                   "taker": {side, intent}}}
+
+    ``marketSlug``, ``price``, ``quantity`` and ``tradeTime`` are REQUIRED; a
+    frame missing any of them raises :class:`VenuePayloadError` and is dropped
+    and counted by the caller -- never defaulted. ``taker`` is optional and
+    only ever narrows to ``NO_AGGRESSOR`` (see :data:`_TAKER_SIDES`). Unknown
+    keys are ignored here and recorded, bounded, by the data client.
+
+    **The print is published on the YES instrument only.** A NO-leg print is a
+    print on the same market; its direction is carried by ``aggressor_side``
+    and nothing is synthesised for a NO instrument.
+
+    **The trade id is derived, not venue-issued.** The documented frame has no
+    id, so ``sha256(slug | tradeTime | price | quantity | taker.side)`` over
+    VENUE-ONLY fields supplies one. The receipt instant is deliberately
+    excluded: a frame the venue replays after a reconnect then collides with
+    the original and the data client dedupes it (bounded). The accepted cost
+    is that two genuine prints identical in all five fields collapse to one;
+    ``tradeTime`` is documented with nanosecond precision, which bounds that
+    risk. It cannot be reconciled with the venue and must never be presented
+    as if it could.
+
+    **``size`` is in contracts** per :data:`TRADE_QUANTITY_UNIT` (resolved by
+    the own-fill crosscheck); no conversion is applied here.
     """
     trade = _require_mapping(payload, TRADE_CONTAINER_KEY, context="trade payload")
     expected_slug = instrument.id.symbol.value
@@ -768,38 +959,64 @@ def parse_trade_tick(
             f"Trade frame is for slug {observed_slug!r} but was parsed against "
             f"instrument {expected_slug!r}"
         )
-    price = _parse_amount(_require(trade, "px", error=VenuePayloadError), field="trade.px")
+    price = _parse_amount(_require(trade, "price", error=VenuePayloadError), field="trade.price")
     if price < _PRICE_MIN or price > _PRICE_MAX:
         raise VenuePayloadError(
-            f"Trade price {price} is outside the binary-option range "
-            f"[{_PRICE_MIN}, {_PRICE_MAX}]"
+            f"Trade price {price} is outside the binary-option range [{_PRICE_MIN}, {_PRICE_MAX}]"
         )
-    size = _to_decimal(
-        _require(trade, "qty", error=VenuePayloadError), field="trade.qty", error=VenuePayloadError
+    size = _parse_trade_quantity(
+        _require(trade, "quantity", error=VenuePayloadError), field="trade.quantity"
     )
     if size <= 0:
-        raise VenuePayloadError(f"Trade size {size} is not a positive size")
-    ts_event = parse_rfc3339_nanos(
-        _require(trade, "transactTime", error=VenuePayloadError), field="transactTime"
-    )
-    raw_trade_id = _require(trade, "tradeId", error=VenuePayloadError)
-    if not isinstance(raw_trade_id, str) or not raw_trade_id.strip():
-        raise VenuePayloadError("Field 'tradeId' must be a non-empty string")
+        raise VenuePayloadError("Trade size is not a positive size; value withheld")
+    raw_trade_time = _require(trade, "tradeTime", error=VenuePayloadError)
+    ts_event = parse_rfc3339_nanos(raw_trade_time, field="tradeTime")
 
-    raw_side = trade.get("takerSide")
-    aggressor = _TAKER_SIDES.get(raw_side, AggressorSide.NO_AGGRESSOR) if isinstance(
-        raw_side, str
-    ) else AggressorSide.NO_AGGRESSOR
+    taker = trade.get("taker")
+    raw_side = taker.get("side") if isinstance(taker, Mapping) else None
+    aggressor = (
+        _TAKER_SIDES.get(raw_side, AggressorSide.NO_AGGRESSOR)
+        if isinstance(raw_side, str)
+        else AggressorSide.NO_AGGRESSOR
+    )
+
+    derived_id = hashlib.sha256(
+        "|".join(
+            (
+                expected_slug,
+                str(raw_trade_time),
+                format(price, "f"),
+                format(size, "f"),
+                raw_side if isinstance(raw_side, str) else "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:_TRADE_ID_HEX_CHARS]
 
     return TradeTick(
         instrument_id=instrument.id,
-        price=_build_price(price, precision=instrument.price_precision, field="trade.px"),
-        size=_build_quantity(size, precision=instrument.size_precision, field="trade.qty"),
+        price=_build_price(price, precision=instrument.price_precision, field="trade.price"),
+        size=_build_quantity(size, precision=instrument.size_precision, field="trade.quantity"),
         aggressor_side=aggressor,
-        trade_id=TradeId(raw_trade_id.strip()),
+        trade_id=TradeId(derived_id),
         ts_event=ts_event,
         ts_init=ts_init,
     )
+
+
+def _parse_trade_quantity(value: object, *, field: str) -> Decimal:
+    """Read a print's ``quantity`` as a decimal; the unit is CONTRACTS.
+
+    The snapshot types ``quantity`` as ``Amount{value, currency}`` -- the
+    venue's cash-quantity shape elsewhere -- while the book payload's ``qty``
+    is a bare decimal. Both shapes are accepted; the value is carried into
+    ``TradeTick.size`` unchanged: the unit is CONTRACTS per
+    :data:`TRADE_QUANTITY_UNIT`, and no conversion is performed. The currency
+    label is not consulted here.
+    """
+    raw: object = value
+    if isinstance(value, Mapping):
+        raw = _require(value, "value", error=VenuePayloadError, context=f"Field {field!r}")
+    return _to_decimal(raw, field=field, error=VenuePayloadError)
 
 
 def venue_market_state(payload: Mapping[str, Any]) -> str | None:
@@ -988,9 +1205,7 @@ def parse_mark_price(
     price, ts_event = settlement
     return MarkPriceUpdate(
         instrument_id=instrument.id,
-        value=_build_price(
-            price, precision=instrument.price_precision, field="stats.settlementPx"
-        ),
+        value=_build_price(price, precision=instrument.price_precision, field="stats.settlementPx"),
         ts_event=ts_event,
         ts_init=ts_init,
     )
@@ -1119,7 +1334,11 @@ def _weather_info(
     try:
         site = sites.site_for_venue_city_token(venue_key, parsed.city)
     except SiteNotFoundError as exc:
-        raise InstrumentDefinitionError(
+        # CF-14a A3: this is a `discovery.city_codes` <-> `SiteRegistry`
+        # mismatch -- a Breezy config bug, not a venue payload error -- so it
+        # must NOT masquerade as `InstrumentDefinitionError`. See
+        # `SiteRegistryMismatchError`'s docstring.
+        raise SiteRegistryMismatchError(
             f"Market {slug!r} carries venue_city_token {parsed.city!r}, but no "
             f"settlement site is registered for venue {venue_key!r}"
         ) from exc
@@ -1171,9 +1390,21 @@ def parse_binary_option(
     expiration_ns = parse_rfc3339_nanos(
         _require(market, "endDate", error=InstrumentDefinitionError), field="endDate"
     )
-    ts_event = parse_rfc3339_nanos(
-        _require(market, "updatedAt", error=InstrumentDefinitionError), field="updatedAt"
-    )
+    # `updatedAt` is absent on markets the venue has never modified since
+    # listing (measured live, 2026-09-03 cohort: 20/20 newly-listed markets
+    # carry `createdAt` but no `updatedAt`). A market that was never updated
+    # was last changed when it was created, so `createdAt` is the correct
+    # `ts_event` -- never a synthesised `0` or `now()`, which would silently
+    # corrupt a forward-only tape. `createdAt` stays REQUIRED: if a market
+    # carries neither timestamp, refuse loudly rather than widen `ts_event`
+    # into an optional field.
+    updated_at = market.get("updatedAt")
+    if updated_at is not None:
+        ts_event = parse_rfc3339_nanos(updated_at, field="updatedAt")
+    else:
+        ts_event = parse_rfc3339_nanos(
+            _require(market, "createdAt", error=InstrumentDefinitionError), field="createdAt"
+        )
     if expiration_ns <= activation_ns:
         raise InstrumentDefinitionError(
             f"Market {slug!r} expires at or before it activates "
@@ -1193,6 +1424,10 @@ def parse_binary_option(
         # Recorded verbatim, per market. PolymarketUSFeeModel reads it from here.
         FEE_COEFFICIENT_KEY: None if fee_coefficient is None else str(fee_coefficient),
         FEE_SCHEDULE_STATUS_KEY: fee_schedule_status,
+        # Additive S2 marker (plan `NO_SIDE_EDGE_2026-09-14.md` S2): every
+        # existing caller reads `info` by key, never by exact-equality, so
+        # this never breaks a caller that ignores it.
+        LEG_KEY: LEG_YES,
     }
     active_sites = default_registry() if sites is None else sites
     info.update(_weather_info(market, slug, sites=active_sites, venue_key=venue_key))
@@ -1219,6 +1454,84 @@ def parse_binary_option(
         description=_description(market),
         info=info,
     )
+
+
+#: `info["leg"]` marker values (S2, plan `NO_SIDE_EDGE_2026-09-14.md`). Additive.
+LEG_KEY: str = "leg"
+LEG_YES: str = "yes"
+LEG_NO: str = "no"
+
+
+def parse_binary_option_pair(
+    payload: Mapping[str, Any],
+    *,
+    venue: Venue = POLYMARKET_US_VENUE,
+    ts_init: int,
+    sites: SiteRegistry | None = None,
+    venue_key: str = REGISTRY_VENUE_KEY,
+) -> tuple[BinaryOption, BinaryOption | None]:
+    """Build the YES leg (:func:`parse_binary_option`, unchanged) plus its NO leg.
+
+    The NO leg is the second (non-``long``) entry of ``marketSides``, never a
+    hardcoded ``"No"`` outcome string. It shares ``raw_symbol=Symbol(slug)``
+    with the YES leg (the venue slug identifies the MARKET, not the leg) and
+    gets the composite id from :func:`~breezy.adapters.polymarket_us.
+    symbology.no_leg_instrument_id`. ``info`` is copied from the YES leg
+    (including :data:`FEE_COEFFICIENT_KEY`) with ``info["leg"]`` overwritten
+    to ``"no"``. A market with no second side returns ``(yes, None)``.
+    """
+    yes = parse_binary_option(
+        payload, venue=venue, ts_init=ts_init, sites=sites, venue_key=venue_key
+    )
+
+    market = _require_mapping(payload, "market", context="market payload")
+    slug = _require(market, "slug", error=InstrumentDefinitionError)
+    assert_valid_slug(slug)
+    sides, _yes_outcome = _market_sides(market, slug)
+    no_sides = [side for side in sides if side.get("long") is not True]
+    if not no_sides:
+        return yes, None
+    if len(no_sides) != 1:
+        raise InstrumentDefinitionError(
+            f"Expected exactly one non-long market side for {slug!r}, found {len(no_sides)}"
+        )
+    no_outcome = _require(no_sides[0], "description", error=InstrumentDefinitionError)
+    if not isinstance(no_outcome, str) or not no_outcome.strip():
+        raise InstrumentDefinitionError(
+            f"Non-long market side for {slug!r} carries no usable outcome description"
+        )
+
+    no_info: dict[str, Any] = dict(yes.info)
+    no_info[LEG_KEY] = LEG_NO
+
+    # F1 fee guard (`test_polymarket_us_fee_guard.py`): `.maker_fee`/`.taker_fee`
+    # are UNGUARDED reads of a Nautilus-native field that holds a placeholder
+    # `Decimal(0)` when the fee schedule is UNKNOWN, so the NO leg's fee is
+    # re-derived from the payload -- exactly what `parse_binary_option` itself
+    # does -- rather than read back off the already-built YES instrument.
+    fee_coefficient, _fee_schedule_status = _parse_fee_coefficient(market)
+
+    no_leg = BinaryOption(
+        instrument_id=no_leg_instrument_id(slug, venue),
+        raw_symbol=Symbol(slug),
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=yes.price_precision,
+        size_precision=yes.size_precision,
+        price_increment=yes.price_increment,
+        size_increment=yes.size_increment,
+        activation_ns=yes.activation_ns,
+        expiration_ns=yes.expiration_ns,
+        ts_event=yes.ts_event,
+        ts_init=ts_init,
+        min_quantity=yes.min_quantity,
+        maker_fee=fee_coefficient,
+        taker_fee=fee_coefficient,
+        outcome=no_outcome,
+        description=yes.description,
+        info=no_info,
+    )
+    return yes, no_leg
 
 
 def _description(market: Mapping[str, Any]) -> str | None:

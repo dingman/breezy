@@ -1,0 +1,12 @@
+{
+  "body": "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n",
+  "bytes": 196,
+  "content_type": "text/html; charset=iso-8859-1",
+  "finding": "Server answered HTTP 404 (non-2xx).",
+  "label": "p4_retention_20260912",
+  "outcome": "http_404",
+  "requested_at_utc": "2026-09-19T13:38:21+00:00",
+  "sha256": "80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880",
+  "status": 404,
+  "url": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260912/"
+}

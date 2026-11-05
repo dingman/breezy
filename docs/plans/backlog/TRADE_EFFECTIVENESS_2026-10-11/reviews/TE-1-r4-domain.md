@@ -1,0 +1,2 @@
+# TE-1 r3.4 domain review (prediction-market-reviewer) — 80 READY-WITH-CHANGES (coordinator summary)
+HIGH F1 no-leak proof by grep only → consumer-exclusion test + P41 restated. MED F2 ts lower bound; F3 successor shadowing; F4 post_terminal_pnl disclosure; F5 unrelated-count note; F6 option-3 sentence. LOW F7 cross-report note; F8 Unknown 2 resolved (fq_scorer has no window check); F9 tz assumption. All applied in r3.5.

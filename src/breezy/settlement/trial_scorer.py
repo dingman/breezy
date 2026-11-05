@@ -1,0 +1,330 @@
+"""6c settlement scorer -- `held`/`pnl` per filled trial.
+
+`docs/plans/SCORER_TALLY_BCA_BRIEF_2026-09-04.md` section 6c, as amended by
+the "Converged peer review (2026-09-04)" section, which is BINDING over the
+draft body. Pure module: no Nautilus, no I/O, no wall clock -- every time
+value the scorer needs is an explicit `now_ns` input from the caller.
+
+Fill source (draft, unchanged by review): neither the trial latch nor
+`Position` is today's input. The latch is written before submit and holds
+only the quoted ask; `Position.realized_pnl` is fee-INCLUSIVE and requires an
+unlanded live exec client. `FilledTrial` is therefore an explicit, caller-
+built input record, and `pnl = 1{held} - fill_px - fee` is built from a
+fee-EXCLUSIVE `fill_px` plus a separate, per-contract `fee` term -- never
+`Position.realized_pnl`, and the two are never summed (see
+`breezy/settlement/exit_guard.py` for the fee-inclusive sibling quantity).
+
+Venue fallback settlement (review item 1): `VENUE_FACTS_2026-08-25.md:721` --
+absent an NWS FINAL seven days after the scheduled release, the contract
+settles at the venue's own last-fair-price. A trial scores
+`settlement_basis="venue_last_fair_price_fallback"` ONLY once both the
+seven-day window has elapsed AND the venue's own settlement value is present
+on the input (`FilledTrial.venue_settlement_tmax_f`); such a score is always
+stamped `excluded_reason="venue_settled_without_nws"` so 6d/6e never pool it
+with an NWS-keyed row. Before that, the trial stays refused/PENDING. Once a
+trial has been fallback-scored, a caller must not re-invoke this scorer for
+that trial against a later-arriving FINAL -- "a FINAL that lands after the
+venue booked fallback cash does NOT re-score against NWS" is a DRIVER-level
+invariant (`scripts/analysis/score_live_trials.py` must skip re-scoring a
+trial whose latest stored row already carries the fallback basis); this pure
+function has no history to consult and always scores off its inputs.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Literal
+
+from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
+from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.domain.weather_bucket_facts import WeatherBucketFacts
+from breezy.settlement.settlement_truth import final_tmax_f
+
+__all__ = [
+    "BucketSource",
+    "FilledTrial",
+    "ScoreRefusal",
+    "ScoredTrial",
+    "score_trial",
+    "score_trials",
+]
+
+#: Venue fallback window (review item 1): seven days after the scheduled
+#: NWS release, absent a FINAL, the venue's own settlement becomes eligible.
+_SEVEN_DAYS_NS: int = 7 * 24 * 60 * 60 * 1_000_000_000
+
+SettlementBasis = Literal["nws_final", "venue_last_fair_price_fallback"]
+
+#: Provenance of a scored row's rung facts -- "catalog" (the persisted
+#: instrument definition, the historical and still-preferred source) or
+#: "slug" (derived from the instrument id's own slug grammar when the
+#: catalog held no definition, `scripts/analysis/score_live_trials.py
+#: ._bucket_facts_from_instrument_id`). Defaults to "catalog" so every
+#: existing `ScoredTrial` construction -- including a pre-existing stored
+#: row read back with no persisted value for this column -- keeps its
+#: historical meaning unchanged.
+BucketSource = Literal["catalog", "slug"]
+
+RefusalReason = Literal[
+    "no_record",
+    "preliminary_only",
+    "superseded",
+    "sentinel_tmax",
+    "rung_unresolved",
+    "station_day_mismatch",
+    "instrument_unavailable",
+    "malformed_input",
+]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FilledTrial:
+    """One filled trial's inputs to the per-trial net return.
+
+    `bucket` is `None` when the caller (the driver script) could not resolve
+    the rung -- e.g. the persisted instrument definition itself is absent, in
+    which case the caller emits `ScoreRefusal(reason="instrument_unavailable")`
+    directly and never constructs a `FilledTrial` at all; a resolved
+    instrument whose rung bounds are still unusable is represented as
+    `bucket=None` here and refused with `reason="rung_unresolved"`.
+
+    `fee` is per-contract, entry leg only (venue charges at fill; settlement
+    carries no fee -- OQ8). An adapter that divides a total commission by
+    `qty` before populating this field lands with the `OrderFilled` ->
+    `FilledTrial` adapter (R-7/R-8), not here; this module always treats
+    `fee` as already per-contract and never multiplies or divides it by
+    `qty` when computing `pnl`.
+
+    `entry_ask` is the decision-time (latch) ask, carried alongside
+    `fill_px` so `slippage = fill_px - entry_ask` can be computed without a
+    second join (review item 6).
+
+    `climate_day` is an ISO-8601 date string (`"2026-08-31"`), not
+    `datetime.date` -- `src/breezy/settlement/` is an AST-enforced pure
+    package (`tests/unit/test_settlement_purity_guard.py` D1: no `datetime`,
+    `os`, `pathlib`, `time`, or similar side-effecting/non-deterministic
+    imports anywhere under it), so this module never imports `datetime`.
+    Callers hold real `datetime.date` values (`NwsClimateDay.climate_day`,
+    `WeatherBucketFacts.climate_day`) and pass `.isoformat()`.
+    """
+
+    trial_id: str
+    station: str
+    climate_day: str
+    instrument_id: str
+    bucket: WeatherBucketFacts | None
+    fill_px: Decimal
+    fee: Decimal
+    qty: Decimal
+    filled_at_ns: int
+    entry_ask: Decimal
+    #: When the NWS FINAL was scheduled to publish for this station-day.
+    scheduled_release_at_ns: int
+    #: The venue's own recorded settlement reading, once (and only once) it
+    #: has booked a last-fair-price fallback close. `None` until then.
+    venue_settlement_tmax_f: int | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ScoredTrial:
+    """One trial's settlement outcome -- `held`, `pnl`, and full provenance.
+
+    `pnl` is per-contract; both production writers (`score_live_trials`,
+    `current_rung_hold_paper_replay`) assert qty==1 before scoring, so it is
+    also per-fill (FU-3d)."""
+
+    trial_id: str
+    station: str
+    climate_day: str
+    instrument_id: str
+    settlement_tmax_f: int
+    held: bool
+    pnl: Decimal
+    revision_seq: int
+    raw_sha256: str
+    scored_at_ns: int
+    score_seq: int
+    settlement_basis: SettlementBasis
+    excluded_reason: str | None
+    slippage: Decimal
+    entry_ask: Decimal
+    fill_px: Decimal
+    fee: Decimal
+    bucket_source: BucketSource = "catalog"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ScoreRefusal:
+    """Why one trial could not be scored -- never a fabricated outcome."""
+
+    trial_id: str
+    reason: RefusalReason
+    detail: str
+
+
+def score_trial(
+    trial: FilledTrial,
+    record: NwsClimateDay | None,
+    *,
+    now_ns: int,
+    score_seq: int = 0,
+) -> ScoredTrial | ScoreRefusal:
+    """Score one filled trial against its settlement record.
+
+    `record` is the caller-resolved `NwsClimateDay` for `(trial.station,
+    trial.climate_day)` (or `None` if none exists yet) -- resolving it is the
+    caller's I/O, kept out of this pure function.
+    """
+    if trial.bucket is None:
+        return ScoreRefusal(
+            trial_id=trial.trial_id,
+            reason="rung_unresolved",
+            detail=f"{trial.instrument_id}: no resolvable WeatherBucketFacts for this trial",
+        )
+    if record is not None and (
+        record.station != trial.station or record.climate_day.isoformat() != trial.climate_day
+    ):
+        return ScoreRefusal(
+            trial_id=trial.trial_id,
+            reason="station_day_mismatch",
+            detail=(
+                f"record is for ({record.station}, {record.climate_day.isoformat()}), "
+                f"trial is for ({trial.station}, {trial.climate_day})"
+            ),
+        )
+
+    basis_result = _resolve_settlement_basis(trial, record, now_ns=now_ns)
+    if isinstance(basis_result, ScoreRefusal):
+        return basis_result
+    settlement_basis, excluded_reason, settlement_tmax_f, revision_seq, raw_sha256 = basis_result
+
+    # Leg derived from `instrument_id`'s `^no` composite suffix (S5 Track D
+    # fix-first review, plan NO_SIDE_EDGE_2026-09-14 R3-5(i)) -- no schema
+    # change on `FilledTrial`/`ScoredTrial`. `contains` is always
+    # `HIGH in r_i`; a NO leg holds exactly when HIGH is OUTSIDE the rung.
+    leg = leg_of_symbol(symbol_of_instrument_id(trial.instrument_id))
+    contains = trial.bucket.contains(settlement_tmax_f)
+    held = contains if leg == "yes" else not contains
+    pnl = (Decimal(1) if held else Decimal(0)) - trial.fill_px - trial.fee
+    slippage = trial.fill_px - trial.entry_ask
+
+    return ScoredTrial(
+        trial_id=trial.trial_id,
+        station=trial.station,
+        climate_day=trial.climate_day,
+        instrument_id=trial.instrument_id,
+        settlement_tmax_f=settlement_tmax_f,
+        held=held,
+        pnl=pnl,
+        revision_seq=revision_seq,
+        raw_sha256=raw_sha256,
+        scored_at_ns=now_ns,
+        score_seq=score_seq,
+        settlement_basis=settlement_basis,
+        excluded_reason=excluded_reason,
+        slippage=slippage,
+        entry_ask=trial.entry_ask,
+        fill_px=trial.fill_px,
+        fee=trial.fee,
+    )
+
+
+def _resolve_settlement_basis(
+    trial: FilledTrial, record: NwsClimateDay | None, *, now_ns: int
+) -> tuple[SettlementBasis, str | None, int, int, str] | ScoreRefusal:
+    """Resolve `(basis, excluded_reason, settlement_tmax_f, revision_seq,
+    raw_sha256)` for one trial, or the refusal if neither an NWS final nor an
+    elapsed venue fallback is available yet. Extracted from `score_trial` so
+    that function stays a short dispatcher (review item 6); behaviour is
+    unchanged from the inlined form."""
+    final = final_tmax_f(record)
+    if final is not None:
+        assert record is not None
+        return "nws_final", None, final, record.revision_seq, record.raw_sha256
+
+    fallback_due = now_ns >= trial.scheduled_release_at_ns + _SEVEN_DAYS_NS
+    if fallback_due and trial.venue_settlement_tmax_f is not None:
+        return (
+            "venue_last_fair_price_fallback",
+            "venue_settled_without_nws",
+            trial.venue_settlement_tmax_f,
+            0,
+            "",
+        )
+
+    return ScoreRefusal(
+        trial_id=trial.trial_id,
+        reason=_pending_reason(record),
+        detail=(
+            f"{trial.station} {trial.climate_day}: not settlement-grade "
+            "and the venue fallback window has not both elapsed and produced a "
+            "venue settlement reading"
+        ),
+    )
+
+
+def score_trials(
+    pairs: Sequence[tuple[FilledTrial, NwsClimateDay | None]],
+    *,
+    now_ns: int,
+) -> tuple[tuple[ScoredTrial, ...], tuple[ScoreRefusal, ...]]:
+    """Score every `(trial, record)` pair; `len(scored) + len(refused) ==
+    len(pairs)` always -- the `TradeReturnSample` invariant
+    (`exit_guard.py:100-108`), applied here to settlement scoring."""
+    scored: list[ScoredTrial] = []
+    refused: list[ScoreRefusal] = []
+    for trial, record in pairs:
+        result = score_trial(trial, record, now_ns=now_ns)
+        if isinstance(result, ScoreRefusal):
+            refused.append(result)
+        else:
+            scored.append(result)
+    return tuple(scored), tuple(refused)
+
+
+class ScoredPathQtyInvariantError(Exception):
+    """A `(FilledTrial, record)` pair reaching `score_trials` had `qty != 1`.
+
+    Ruling Q1 + FU-3d: `ScoredTrial.pnl` is per-contract (`score_trial`,
+    :206). It is also per-fill -- and every downstream consumer that treats
+    it that way (the PREREG draw, the tally, the ROI-bound ratio, the
+    payout identity -- see `docs/plans/backlog/FU-3d_plan_r2_2026-09-26.md`
+    "Design & Data Flow") stays correct -- ONLY because both production
+    writers of the ScoredTrial store (`scripts/analysis/score_live_trials.py`
+    `score_live_trials`, `scripts/analysis/current_rung_hold_paper_replay.py`
+    `main`) call :func:`assert_scored_pairs_are_unit_qty` immediately before
+    `score_trials` and never persist a refused run. A future qty>1 family
+    (Increment B / the station-day trial unit ruling, L-40) must lift this
+    guard deliberately, not bypass it silently.
+    """
+
+
+def assert_scored_pairs_are_unit_qty(
+    pairs: Sequence[tuple[FilledTrial, NwsClimateDay | None]],
+) -> None:
+    """Fail-closed guard: every `trial.qty` in `pairs` must equal ``1``.
+
+    Raises :class:`ScoredPathQtyInvariantError`, naming every offending
+    `trial_id` and its `qty`, if any pair violates the invariant. Pure and
+    side-effect-free -- it is the caller's job to never reach `score_trials`
+    (and therefore never write a scored-store row) once this raises. Kept
+    separate from `score_trial`/`score_trials`, which never change: this
+    lets a caller with no settlement store (e.g. `_print_roi_and_wilson`'s
+    reporting-only call) keep calling `score_trials` directly.
+    """
+    offenders = [(trial.trial_id, trial.qty) for trial, _record in pairs if trial.qty != Decimal(1)]
+    if offenders:
+        detail = ", ".join(f"{trial_id!r} (qty={qty})" for trial_id, qty in offenders)
+        raise ScoredPathQtyInvariantError("refusing to score: qty != 1 for pair(s) " + detail)
+
+
+def _pending_reason(record: NwsClimateDay | None) -> RefusalReason:
+    if record is None:
+        return "no_record"
+    if not record.is_final:
+        return "preliminary_only"
+    if record.is_superseded:
+        return "superseded"
+    return "sentinel_tmax"

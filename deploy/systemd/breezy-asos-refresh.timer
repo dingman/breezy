@@ -1,0 +1,33 @@
+[Unit]
+Description=Daily trigger for the Breezy ASOS fixed-window refresh (AUD-15 re-home)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/asos_recent_refresh.py
+
+[Timer]
+Unit=breezy-asos-refresh.service
+
+# 13:30 UTC -- the exact slot `breezy-mb-daily.timer` vacated on retirement,
+# chosen for the same three reasons that timer stated:
+# 1. AFTER the 12:15 UTC quote-tape-catalog ingest tick.
+# 2. AFTER every dense station's previous climate day has closed AND its CLI
+#    final has normally posted (latest, SFO/LAX at UTC-8, closes 08:00 UTC).
+# 3. 90 minutes AHEAD of the first consumer (the 15:00Z hypothetical-hold
+#    monitor), leaving lead time to act on a delivered `asos_cache_stale`
+#    WARN before either live-path consumer runs.
+# Outside the LST-derived protected window [16:35Z, 01:15Z) (see README.md
+# "Protected window and serialization"). UTC is stated explicitly (this
+# host's clock is UTC) so the schedule cannot move if the host timezone is
+# ever changed.
+OnCalendar=*-*-* 13:30:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day.
+Persistent=true
+
+# A single HTTP GET per site, no venue rate limit of its own concern, and a
+# deterministic time makes correlating a snapshot with the tape and the
+# other daily jobs easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

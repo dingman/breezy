@@ -1,0 +1,57 @@
+# S2 r4 delta verification - mle-reviewer - 2026-10-13
+Verdict: READY-WITH-EDITS (1 HIGH, 5 MED, 4 LOW). Edits 1-4 are applied in substance; the HIGH is a self-introduced V0 estimator that departs from the "use S1's estimator, do not invent a second" instruction and makes the sample floor outcome-dependent. All fixes are plan text. Reviewed: r4 delta rev 1, the S1 SEARCH amendment (draft), r3 MLE verification, `maker_tape_census.py:96-97,689-690,715`, `scoring_core.py:216,246`, `NBP_S2_VALIDATE_RESULT_2026-09-30.md:105-134`, `nbm_quantile_actor.py:126`.
+
+## Disposition of r3 MLE required edits
+| Edit | Status | Evidence |
+|---|---|---|
+| 1 V0 / S-4 / Spec input 2 / E1 / RED test | APPLIED, estimator deviates | delta (a) L25-48: V0 row, S-4 replaced (L40), Spec inputs deleted (L41), E1 gains no-S-1 (L39), `test_below_effective_n_floor_is_underpowered_wait_not_no_go` (L48). L29-31 ICC is a second estimator -> H1 |
+| 2 PRIMARY = nominal, overlay report-only, outage defined, node logs pinned | APPLIED | (d) L72-85, tests L87-88; gaps M3, L2 |
+| 3 fit window from evidence doc | APPLIED, incomplete | (g) L150 + test L151; M4 |
+| 4 station_days.csv, rerun test over every table, clean tree, package set | APPLIED, incomplete | (g) L135-151; reproducibility gaps M1/M2 below |
+| 5 poll-lag stress, 07Z moot | CAPTURED as WP2 item (i)1-2 L161-166; NO test named -> M6. Pin: `DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS = 900` (`nbm_quantile_actor.py:126`) |
+| 6 per-instance Delta + S-7; >=50% covered-hours sensitivity | (i)3 L167-169 has a test; (i)4 L170 (threshold fixed, no test) -> M6; S-7 disposition undefined -> L1 |
+| 7 cluster bootstrap beside Wilson; --bench | (i)5 L171 (no test) -> M6; (i)8 L178 has tests |
+
+## Findings
+**H1 [HIGH] V0 uses a new, outcome-dependent ICC estimator (delta L29-33).**
+- Spec 6.0 :222-224 names "the S1 station-day floor"; S1's estimator is `n_eff_ub = sum_d m_d/(1+(m_d-1)*0.5)` with rho assumed (`maker_tape_census.py:689-690`). Required edit 1(b) said "same estimator S1 uses; do not invent a second one".
+- rho-hat is computed on the base-rule FILL indicator, so whether the programme-terminal verdict is UNDERPOWERED-WAIT or NO-GO depends on fills. Knife-edge: n_sd 40, n0 10 -> zero fills falls to rho 0.5, n_eff 16, WAIT; one fill can make rho-hat truncate to 0, n_eff 40, NO-GO. With n0 about 8-26 clusters rho-hat is far too noisy to relax the floor, and truncation at 0 is anti-conservative.
+- Fix: V0 is decided by S1's form at RHO_ASSUMED (import `RHO_ASSUMED`, `N_EFF_FLOOR`, and the `_n_eff` form; do not copy) on the bid-bearing set: n_eff_gov = sum_d m_d/(1+(m_d-1)*0.5). Report rho-hat, deff_hat and n_eff_hat as descriptive only. Replace L29-33 accordingly; keep `test_icc_anova_matches_hand_computation...` for the report-only value and add `test_v0_is_decided_by_rho_assumed_not_by_fill_outcomes` (same days, fills flipped, V0 unchanged).
+- If ICC is kept anyway: (i) n_eff must be sum_d m_d/(1+(m_d-1)*rho), not n_sd/(1+(m_bar-1)*rho). For unequal clusters the arithmetic mean m_bar understates deff (the weighted size sum m^2/sum m is the right one) and by Jensen (f(m)=m/(1+(m-1)rho) concave) gives n_eff >= S1's form, i.e. the new floor is looser than S1's at equal rho. (ii) the ANOVA m0 and (MSB-MSW)/(MSB+(m0-1)MSW) are correct, but "defined for all n0>=2" is false: when N = n0 (all clusters of size 1) MSW has 0 df. Add it to the fallback list (deff = 1 there, harmless, but the code must not divide by zero). (iii) "smaller n_eff governs" across unit hypotheses is correct for V0 (n_sd is common; larger rho-hat = smaller n_eff), but (f) L110 "more severe verdict" needs an explicit severity order in which V0 outranks V1-V5, else a WAIT under one hypothesis and a NO-GO under another picks arbitrarily.
+
+**M1 [MED] Tables not byte-reproducible from the three files (delta L141).** See the table check below: overlay comparison, WP0 block, +60/poll-lag stress blocks, non-COVERED-by-reason, depth-frame rate, gap-share table. Either add the missing inputs to the rerun contract (overlay `station_days` CSV, stress-run CSVs, a `census_days.csv` of every day in the frozen set with reason) or narrow the test and label the unreproducible blocks "run-time only, sha-pinned".
+
+**M2 [MED] `station_days.csv` column contract lacks fields (L135-140).** Missing: a depth-frame flag or count (r3 Q3 report-only rate, L95); a defined gap_share (gap_h / forecast_valid_h) and definition of "NO-GO-driving day" for (i)4; days-to-200 (r3 F4 listed it); `p_yes_point_live` is episode-level so fine. Rows must exist for every census day in the frozen set (including non-COVERED, outage and node_log_absent) or the "counted by reason" blocks cannot be rebuilt.
+
+**M3 [MED] Amendment "reads it once" vs actual NBP reads (delta (b), (c), (k); amendment :10).** The store is also read by WP2 verify-first (S-6), `--bench` at 4 and 8 station-days, and `--tail-only`. Reword the amendment to: "one scoring pass (verdict run); bench and verify-first read without producing fill/rate output; tail-only is report-only on the same code_sha." Add a persistent ledger (path in `pins.json`, refused-on-existing keyed by amendment sha) so a second verdict run on the set is mechanically refused, not only by a new run_id dir. Define abort handling: a verdict run that dies (S-5 OOM, disk) with partial `episodes.jsonl` visible may resume only on the same code_sha; a code change after any fill number has been seen is a void, and the amendment's "no second verdict run" must say whether a crashed run counts. Bench test must also assert no `episodes.jsonl`/fill file is written, not only that stdout has no rate (L178).
+
+**M4 [MED] Fit-window assertion binds a doc to constants, not to the artefact (L150).** Evidence doc :7 and :39 carry `artefact_sha256 9c0b6d6e...`; the delta pins the doc's own sha but does not assert doc.artefact_sha256 == the loaded model's sha. Add that equality (RED: doc with different artefact sha). Pin the semantic: the doc's v5.0 `v5_fit_slice.last_climate_day` (2026-06-30, :131) == `DEFAULT_SPLITS.v5_fit_slice.end`, and no era's last_climate_day > 2026-06-30; "max <= X == Y" at L150 is ambiguous (<= or ==). Refuse on an unparseable block (already stated).
+
+**M5 [MED] Frozen date set has no machine-readable form (amendment :12; delta L53-54).** The amendment holds a prose placeholder. Specify a fenced `FROZEN_DATE_SET:` block of ISO dates the driver parses; add a RED that an unfilled placeholder, a date > 2026-10-13, or NYC fails closed (extend `test_replay_refuses_day_outside_frozen_set_or_amendment_sha_mismatch`). Amendment L12 also assumes the NBP holdout clause for days >= 10-02 (delta (m)4 admits no cite): state that no S2 label drives an NBP fit or promotion decision, or cite.
+
+**M6 [MED] Several WP-time items have no named RED (L161-176).** Add: (i)1 `test_poll_lag_stress_delays_available_at_by_actor_poll_interval` (use the 900 s constant, import not copy; stress at the full interval); (i)4 `test_coverage_sensitivity_threshold_half_of_process_live_is_report_only`; (i)5 `test_fewer_than_five_clusters_prints_not_estimable_and_null_key`; (i)6 `test_day_without_cli_final_is_excluded_from_s69_for_filled_and_unfilled_and_counted`.
+
+**L1 [LOW] S-7 (L168).** State the disposition: STOP aborts the whole run before any scoring (Delta is computed pre-fill, so outcome-blind). Define Delta for a station-day that spans two recorder instances (max over both). Say Delta is applied as a magnitude in the pessimistic direction.
+**L2 [LOW] Outage (L80-82).** A log file covering only part of the window is neither "covering" nor absent; classify as `node_log_absent`. WP1 real-line tests must include a node booted before 16:50Z (no in-window boot line, permit line present).
+**L3 [LOW] Code freeze scope (L63).** `git status --porcelain -- scripts/analysis src tests/unit` omits `pyproject.toml`, `uv.lock`, and fixtures; widen or pin their shas (package-set sha partly covers it).
+**L4 [LOW] Truth isolation (L176).** The AST import test does not catch a shared helper module that both sides import; assert on the transitive import closure. Pick the outside-set day pre-09-18 with CLI FINAL.
+
+## Leakage / look-ahead after the delta (item 2)
+- (c) freeze: sound and testable with a tmp git repo (`test_verdict_run_refuses_dirty_tree`); needs M3 ledger and L3.
+- (i)7 truth isolation: sound; strengthen per L4.
+- (b) E5: set is outcome-blind (contiguous range from print-time first day to last censused day with CLI FINAL; no fill number exists before P2); sha pin and refuse are testable; needs M5. Single-read wording needs M3.
+- (g) fit window: sound once M4 applied.
+
+## Items 5, 6
+- (d)/(e): outage uses logs only; covered is S1's reason plus covered_bidlive; bid-bearing = first-decision-instant attempt, so it precedes any fill and cannot depend on fills (attempt set is independent of fills only at the first instant; keep the definition as "first attempt exists", state it). Sample clock is fixed pre-fill EXCEPT V0 via H1.
+- (i)3: per-instance Delta fine with L1. (i)9: two points detect slope but not nonlinearity or heavy-day peaks. Choose bench days by largest catalog size (outcome-blind), log RSS per station-day in the progress events, and add an in-run RSS watch that aborts under S-5; MemoryMax 2x peak or 4G is containment only. Extrapolation to the 104-station-day ceiling is acceptable as a screen, not a proof.
+
+## Table reproducibility (item 3)
+Reproducible from `scored_episodes.csv` + `station_days.csv` + `tail_reliability.csv`: V0 block (n_sd, n0, S1 n_eff, deff from bid_bearing/climate_day/filled columns), V1-V5 rates, cluster-bootstrap intervals (seeded, `_clusters` sorts by repr, deterministic), S3 block (`r_lo*`, `*_k1`, `two_fill_share`, bid median/IQR from episodes), Test A/B, tail table, Delta distribution (`delta_ns`), coverage sensitivity (`covered_live_h`, `process_live_h`).
+CANNOT: (1) overlay comparison (second pass, own fills; no input file); (2) WP0 agreement block; (3) +60 min P2 and poll-lag stress blocks; (4) non-COVERED-by-reason counts and the >=1-depth-frame rate (no rows for non-replayed days, no frame field); (5) gap-share-of-NO-GO-driving-days table (undefined columns). Fix per M1/M2.
+
+## Build-now confirmation (item 7)
+RED is producible with fixtures for every WP and every named test: WP3/WP4 synthetic events (incl. K1 held-rung and per-instance Delta), WP1 with tmp git repo, real log-line fixtures, tmp evidence doc, WP2 `DerivedNbpRow` store, WP5 fixture CSVs, WP6 fake catalog (bench, streaming, existing run dir). Caveats: (a) `test_driver_streams_episodes_without_accumulating` must be structural (consumed-iterator/weakref spy), not a tracemalloc slope, else flaky; (b) the shared S1 schema fixture should be generated from `CensusedDay.to_dict`/field set and asserted equal, not hand-typed; (c) `test_stats_rerun_...` scope depends on M1; (d) the (i)9 benchmark and WP0 SFO positive control are run-time only, correctly sequenced after E5 (k L207-217). No test in the delta is unproducible; none needs S1 output, P2, or E5.
+
+## Decision
+READY once H1 is fixed and M1-M6 text is applied (L1-L4 may land at WP time). Primary risks: weak eval (outcome-dependent floor), irreproducible training (table gaps, read-once wording). Tests run: none (plan review); source read via codegraph and file reads; no mutation beyond this file.

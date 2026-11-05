@@ -1,6 +1,6 @@
 """Polymarket.us Nautilus extension package -- read-only authenticated slice.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2).
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2).
 
 What this package is
 --------------------
@@ -46,6 +46,20 @@ the generic one was what would actually run. The other half is barrier F2 in
 ``tests/unit/test_polymarket_us_fee_guard.py``, which fails the suite for any
 module under ``src/`` or ``scripts/`` that builds a venue without passing
 ``fee_model=PolymarketUSFeeModel()``.
+
+``issue_live_trading_permit`` is deliberately NOT exported, and its absence
+is a barrier rather than an oversight (NS-2 defect D-2). The issuer derives
+the operator gate, both spend ceilings and the operator identity from
+``os.environ`` and takes no parameter but a clock, so any module holding a
+reference to it can mint authority for itself. Re-exporting it from the
+most-imported module in the package put that one import away from every
+caller in the tree. It stays reachable from
+``breezy.adapters.polymarket_us.safety`` -- where the operator-enablement
+seam lives and is tested -- and is callable from nothing in ``src/`` or
+``scripts/``: barrier B7 in ``tests/unit/test_polymarket_us_readonly_guard``
+pins it at zero callers with no allowlist, and ``PERMANENTLY_UNEXPORTED`` in
+``tests/unit/test_polymarket_us_package_exports`` pins the export's absence
+in both halves (not in ``__all__``, and not reachable as an attribute).
 
 No secret is exported, and none can be. Credentials live only in
 ``RedactedSecureString`` at runtime and are resolved exclusively in the
@@ -104,7 +118,6 @@ from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
     LiveTradingPermit,
     assert_live_order_submission_permitted,
-    issue_live_trading_permit,
     live_trading_budget_remaining,
 )
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
@@ -188,7 +201,6 @@ __all__ = [
     "build_keyed_quotas",
     "config_from_env",
     "instrument_id_to_slug",
-    "issue_live_trading_permit",
     "live_trading_budget_remaining",
     "load_polymarket_us_credentials",
     "parse_binary_option",

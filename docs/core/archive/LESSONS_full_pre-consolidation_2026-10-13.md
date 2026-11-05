@@ -1,0 +1,1711 @@
+Verbatim LESSONS.md as of commit 30bbbd9f, before the 2026-10-13 consolidation (5b82b3de). Kept for the how-to-apply checks, amendments and wiki-links that the canonical file dropped.
+The canonical file wins on conflict.
+
+# Breezy — Lessons
+
+Binding rules earned from real mistakes on this project. If a proposed approach
+violates an active lesson, halt and report rather than proceeding.
+
+---
+
+## L-1 — Validate the Nautilus null hypothesis BEFORE proposing to build, not after
+
+**Date:** 2026-08-30. **Trigger:** operator correction.
+
+### What happened
+
+While sequencing post-backtest work, the coordinator produced a P0-P6 plan that
+named four things to *build* — a data-client health watchdog, a catalog
+conversion integrity check, a convert-and-prune retention job, and
+portfolio-wide/daily risk caps — without first checking whether
+`nautilus-trader==1.231.0` already provides them. Peer reviews were run and were
+valuable, but every peer was asked to design *around* the assumed gap rather
+than to test whether the gap was real. The operator caught it.
+
+### Why this is binding
+
+CLAUDE.md's Immutable Foundation already states the null hypothesis: assume
+Nautilus provides the functionality until proven otherwise. The failure mode is
+not ignorance of the rule — it is applying the rule at implementation time
+instead of at *planning* time. By then the plan has already spent reviewer
+attention on an architecture for something that may not need to exist, and the
+"smallest correct extension" has been framed as an extension rather than as a
+configuration change.
+
+This is the same class of error the repo has hit before: `BACKTEST_VENUE_CONFIG`
+and the harness exist precisely because Nautilus behaviour was assumed rather
+than read, and the substituted errors were silent.
+
+### The rule
+
+Every increment in every plan carries an explicit **Null hypothesis** verdict
+before it is reviewed or implemented, citing INSTALLED-SOURCE `file:line` under
+`.venv/lib/python3.13/site-packages/nautilus_trader/`:
+
+- **NATIVE — sufficient** -> name the class/method/config field; the increment
+  becomes "configure X"; write no code.
+- **NATIVE — insufficient** -> name what exists and state precisely where it
+  stops short. Do not overstate absence to justify building.
+- **GENUINELY ABSENT** -> say what was searched for and where, so the negative
+  is credible; then propose the smallest correct extension.
+
+Read the installed source. Never answer from memory or from general Nautilus
+documentation — the API surface differs between versions, and a plausible-
+sounding wrong answer here produces a parallel implementation of something the
+framework already does.
+
+### How to apply
+
+- Load the `nautilus-trader-patterns` skill before answering any "does Nautilus
+  do X" question.
+- A brief that asks a peer to *design a solution* must first ask it to *test
+  whether the problem is real*. Order matters.
+- Treat "we need to build a supervisor/validator/aggregator/limit" as a
+  red flag phrase: frameworks usually have these. Check `RiskEngine`,
+  `Portfolio`, `TradingState`, `ParquetDataCatalog` and the live node/kernel
+  before writing any of the four.
+
+---
+
+## L-2 — A native substitution is a UNIT change until proven otherwise (2026-08-30)
+
+**What happened.** A null-hypothesis audit found that `PortfolioFacade.net_exposure` is
+account-wide and therefore closes the cross-strategy exposure hole without building
+anything. Revision 1 of `DATA_CAPTURE_AND_RISK_PLAN.md` accepted that as a pure
+simplification and instructed: *"read exposure from `self.portfolio.net_exposure(...)`
+rather than summing `qty × contract_size`."*
+
+Two independent reviewers caught it. `MispricingContract.contract_size` is
+**payout dollars per contract** (`bucket_contract.py:47-48`), so `risk.py:116-131`
+measures caps in **max-payout** units. `net_exposure` is **mark-to-market**. At a 0.05
+bucket price the substitution loosens every cap **20×** — shipped as a null-hypothesis
+win. The characterisation test written to catch silent retuning could not have passed.
+
+**The rule.** Before replacing a hand-rolled computation with a native one, state the
+UNIT of both and prove they match. "Nautilus already computes this" answers *whether*
+a number exists, never *what the number means*. The null hypothesis is about
+capability; it is silent about semantics, and semantics is where the money is.
+
+**How to apply.**
+- Any increment that swaps a local calculation for a framework call carries a line:
+  `unit before = X; unit after = Y; equal because <reason>`. If X != Y it is a
+  behaviour change, declared as one — not a refactor.
+- Declare the system's exposure unit ONCE, in the plan, before any cap is designed.
+  See `DATA_CAPTURE_AND_RISK_PLAN.md` §2.3.
+- A characterisation test only protects a refactor if the refactor is genuinely
+  behaviour-preserving. If it cannot pass, that is the signal — not a test to adjust.
+
+**Related.** The same review pass found the audits were right about four native
+*mechanisms* and wrong about the *degree* of two (`TradingState.REDUCING` does not
+deny an opening BUY from flat; the free-balance guard is conditional on
+`not allow_borrowing`). Degree is where a native verdict fails. Hence the binding
+test-doctrine rule: every "NATIVE — configure" verdict gets a contract test that
+EXECUTES the native path and asserts the outcome.
+
+---
+
+## L-3 — A plan whose end state is not the goal state is not a plan (2026-08-31)
+
+### What happened
+
+Asked why the build was taking so long when Nautilus "already has almost everything",
+three independent investigations converged on an answer nobody had noticed: the active
+plan, `DATA_CAPTURE_AND_RISK_PLAN.md` §5, is a five-to-six-week ordered sequence
+(`P0 → P1 → (P2 ∥ P5-probe) → P5-fix → P4 → P3a → P3b → P6 → P7`) that, **executed
+perfectly and to completion, still ends with a bot that cannot place an order.**
+
+`grep -rn "LiveExecutionClient\|ExecutionClient" src/` returns **zero hits**.
+`safety.py:8` describes itself as "The single **future** chokepoint" and
+`assert_live_order_submission_permitted` has no production caller — only a re-export
+and its own tests. The entire order-egress workstream lived only in Phase F of
+`GO_LIVE_PLAN.md`, a document dated 2026-08-26 whose code-state audit had gone
+wholesale stale and which was therefore no longer being read.
+
+The plan had survived four adversarial peer reviews and a full revision-2 rewrite.
+None of them caught it, because **every review asked "is what is written here correct?"
+and none asked "does what is written here add up to the goal?"**
+
+### Why this is binding
+
+This is the single largest schedule finding in the project so far, and it is not a
+coding error — it is a planning-topology error. Each increment was individually
+well-justified, well-evidenced, and correctly sequenced against its neighbours. The
+defect existed only in the *gaps between* increments, which is exactly the place no
+increment-level review looks.
+
+It also explains the measured effort profile: ~40% self-imposed process and ~28%
+rework, against ~22% genuine domain difficulty. Rigour was being spent generously on
+the increments we already knew how to specify, while the one workstream nobody had
+scoped stayed invisible — and being unscoped, it never competed for attention.
+
+The failure mode generalises: **work that has never been decomposed is work that never
+appears on the critical path**, so a plan will systematically under-schedule precisely
+what it understands least. Difficulty and visibility are inversely correlated here.
+
+### The rule
+
+Every plan states its GOAL STATE as a falsifiable predicate, then proves — explicitly,
+in the plan — that completing the listed increments reaches it. Absent that proof the
+plan is a list of good ideas, not a route.
+
+### How to apply
+
+- Each plan opens with: `GOAL STATE: <predicate>` and `WALK: <increment> → … → GOAL`,
+  where the walk is checked end-to-end, not increment by increment.
+- Add the reviewer's second question. Increment review asks "is this correct?";
+  **plan review must separately ask "what is NOT here, and would its absence stop the
+  goal?"** Reviews that only audit written text cannot find omissions — the prompt must
+  name the omission hunt as its own task.
+- **Suspect the workstream you cannot yet decompose.** If a plan is precise for eight
+  increments and silent on a ninth, the silence is the signal: that is the long pole,
+  not a detail to fill in later.
+- A plan that cites another plan for a whole workstream has a dependency, not a
+  delegation. Verify the cited document is still live — `GO_LIVE_PLAN.md` was being
+  relied on for Phase F while its own audit had been stale for five days. Stale
+  documents do not announce themselves; a superseded marker is now mandatory the
+  moment a plan's factual claims are found wrong.
+
+---
+
+## L-4 — A fix is a diff against one finding; a document is a set of claims (2026-08-31)
+
+### What happened
+
+`ORDER_EGRESS_PLAN.md` went through three adversarial review rounds. Round 1: 16
+blocking findings. Round 2: 5 criticals, with 15 of 16 round-1 findings genuinely
+closed — converging. Round 3: roughly 7 criticals and 10 highs, and **most were
+created by revision 3's own fixes**. Round 2 had already shown 3 of its 5 criticals
+were introduced by round-1's repairs. Two consecutive rounds is a pattern.
+
+Four of round 3's findings share one mechanism. A revision changed a fact in the
+place the finding pointed at, and did not change the other places asserting the same
+fact:
+
+- §4.2 deleted `cost_cap = payout_cap × price` and gave E-5 an AST scan banning it;
+  E-5's body still computed it. An implementer following the increment trips the
+  increment's own scanner.
+- The settlement source was reverted in E-3 and E-6; `:473` and `:2028` still
+  described the pre-revert arrangement, and `:473` is the reuse table an implementer
+  reads to decide what to reuse.
+- G0's coverage line omitted the increment that actually registers the exec client.
+
+The remaining round-3 findings share a second mechanism: a fix that satisfies its
+named finding while perturbing a neighbouring design area. Moving position-attribution
+to a later increment closed the phantom short and created a backward dependency.
+Adding a fifth authority type closed a bypass and made `POST /v1/orders` reachable
+under a second, budget-invisible type.
+
+### Why
+
+Revising against a block list optimises hard against the named findings. Nothing in
+that loop re-runs the document's global consistency checks, so the edit is locally
+correct and globally wrong. The larger and more cross-referenced the document, the
+worse the ratio: this one designed the settlement identity, the authority-type
+algebra and the container/ordering simultaneously, so every fix perturbed two other
+areas.
+
+### The rule
+
+**After any revision, sweep for propagation before claiming a finding closed.** For
+every FACT the revision changed, enumerate every site in the document asserting that
+fact and verify each one changed. This is mechanical and cheap; it would have caught
+three of round 3's findings for the cost of three greps.
+
+**And when review rounds stop converging, the document is the defect.** Two
+consecutive rounds where repairs generate more criticals than they close is not a
+signal to revise harder — it is a signal that the scope is too entangled to converge.
+Cut it at a principled seam and plan the halves separately, after the earlier half
+exists as code and answers the later half's questions.
+
+### How to apply
+
+- A revision report names, per finding, the sites it swept — not just the site it
+  edited. "Fixed at `:1296`" is incomplete; "fixed at `:1296`, swept `:550`, `:558`,
+  `:2028`" is the claim.
+- Re-review every revision. Never assume a fix is a monotonic improvement; in this
+  document it was not, twice.
+- Track findings-per-round. Rising counts mean stop revising and re-scope. The seam
+  should be one the domain already provides — here, NO-SEND / SEND, because settlement
+  is not needed until a position can exist and multi-type authority is not needed
+  until a write endpoint exists.
+- Prefer several small plans over one large one for anything spanning more than one
+  design area. The 2246-line document was not thorough; it was three plans sharing a
+  namespace.
+
+### Correction to L-3
+
+L-3's "third recurrence" was recorded as *the trading process itself does not exist*,
+on the strength of `grep "TradingNode(" src/` returning zero hits. **That inference was
+false.** The repo passes the class rather than calling it — `node_factory: NodeFactory
+= TradingNode` (`quote_tape_cli.py:195`, `cli.py:147`), then `node_factory(config);
+node.build(); node.run()` (`:151-156`). A real `TradingNode` is built and run today by
+the quote-tape process. The true gap is narrower and still real: no trading-ROLE node
+config (`build_quote_tape_node_config` pins `exec_clients={}`, `strategies=[]`) and no
+`breezy-trade` entry point.
+
+**Amendment 2026-09-01:** that entry point now EXISTS —
+`breezy-trade = "breezy.runtime.trade_cli:main"` (`pyproject.toml:240`, EXEC SPINE R-2,
+commit b5c7eb9) — alongside `build_trade_node_config`, so the node-config half is closed too.
+What remains absent is any execution CLIENT: `src/breezy/adapters/polymarket_us/exec/` is
+empty. The lesson is unchanged — a `[V]` belongs on the inference, not on the command. L-3's substance survives — no increment built the
+trading-role container — but its headline overstated the gap, and the overstatement
+was carried into a plan as a `[V]`-tagged fact.
+
+**The generalisable half:** `[V]` belongs on the INFERENCE, not on the command that
+produced it. A grep result is evidence; what it implies is a separate claim needing
+separate proof. Zero hits for `Foo(` does not mean `Foo` is unused — it means `Foo` is
+not called *in that syntactic form*. See [[verify-agent-claims-against-artifact]].
+
+---
+
+## L-5 — A state document that outgrows re-verification becomes a source of false claims (2026-08-31)
+
+**Date:** 2026-08-31. **Trigger:** operator challenge ("PROGRESS.md at 1400 lines feels
+like a waste of context space, what value is it actually providing to us?").
+
+### What happened
+
+`docs/core/PROGRESS.md` had grown to 1401 lines / 76 KB — 31 status-marked headings of
+which 11 were already closed, plus resolution narratives, evidence summaries duplicating
+`docs/evidence/`, and post-mortems duplicating L-1..L-4. In the same session it produced
+**three false claims** that were acted on before being caught:
+
+- It recorded `calibration_mean_reversion` as "blocked on liquidity". The real gate is
+  `SHORTS_DISABLED`, which fires in the decision layer *before* any liquidity check.
+- It recorded `forecast_revision` as "REFUSED, naked short". Commit `4a1280f` had
+  flipped `allow_short` to `False`, silently converting that loud abort into a counted
+  refusal. A live re-run confirmed the record was stale.
+- It carried `[BLOCKER] B-1 — No venue market data has ever been captured` and
+  `[LOW] lint-imports has no configuration`, both of which reality had already closed.
+
+Severity tags (`[HIGH]`, `[MEDIUM]`) were also used as *labels on closed work*, so the
+file could not be skimmed for what was actually open.
+
+### Why this is binding
+
+Length is not a cosmetic property of a state document — it is what makes the document
+wrong. Nobody re-reads 76 KB on each update, so entries are appended and never
+reconciled; the file accumulates claims that were true once. A state document that
+cannot be re-verified in one pass will drift, and drifted state is worse than absent
+state because it is trusted.
+
+The cost compounds: `/execute-backlog` Phase 0 dispatches an agent whose entire job is
+to read this file, and the skill's own `PROGRESS_DONE>30` volume gate exists precisely
+to force consolidation before execution.
+
+### The rule
+
+`docs/core/PROGRESS.md` tracks **OPEN state only**, under a hard budget of
+**250 lines / 12 KB**, enforced by `.claude/hooks/progress-size-gate.sh`
+(`PostToolUse` on `Write|Edit`, exit 2).
+
+- An item **leaves the file when it closes.** Never rewrite it as a `[CLOSED]`
+  narrative — the commit is the record.
+- **Never restate evidence** in it; link `docs/evidence/<file>.md`.
+- **Never restate a durable rule** in it; that belongs here in LESSONS.md.
+- **Severity tags mark OPEN items only.**
+- Superseded history goes to `docs/core/archive/`, never deleted outright.
+
+### How to apply
+
+- Before adding to PROGRESS.md, ask what can be *removed* in the same edit.
+- Treat a status claim older than the last relevant commit as unverified until re-checked
+  against code or a live run — see [[verify-agent-claims-against-artifact]].
+- If the size gate blocks a write, consolidate; do not raise the budget.
+- The same failure mode applies to any long-lived state doc, not just this one.
+
+## L-6 — Promoting a shared flag to a kill switch inherits every producer (2026-09-01)
+
+**What happened.** `79b9b44` made a dead market-data feed shut the node down and
+exit non-zero, reading the existing `is_degraded` flag as the fatal signal. That
+flag had THREE producers, not the two the change reasoned about: reconnect
+exhaustion (`websocket.py:699`), supervisor death (`:710`), and
+`_watch_for_silent_subscriptions` (`:795`) — one subscribed slug producing no
+inbound frame within 60s. The third is an ordinary overnight condition in a thin
+book. With ~60 weather markets subscribed, the first quiet one would have ended
+an 8-hour capture around minute one, exiting 1 with "feed lost and not
+recoverable" — a false statement, and a null capture that would have been read
+as a dead market.
+
+**Why it got in.** The flag was SAFE to share while its only consumer was inert:
+producer 3's comment (`websocket.py:791-793`) explicitly justified reusing
+`is_degraded` rather than "adding a second, unpolled signal", and it was right
+at the time — the consumer set `_safe_mode`, which is written and never read.
+The defect was not introduced by the producer or by the consumer. It was
+introduced by the CHANGE IN WHAT THE FLAG MEANT, which no single site records.
+The aggregator's own docstring (`:946-951`) still described the flag as "ANY
+shard has abandoned reconnection" — it never mentioned producer 3 — so the
+blast radius was invisible from the exact place the new consumer read it.
+
+**The rule.** Before wiring an existing boolean to an irreversible action
+(process exit, shutdown, halt, liquidate, alert-the-operator), ENUMERATE ITS
+WRITERS — every assignment, not just the one you are reasoning about — and
+classify each as fatal or not. A flag's docstring is not the enumeration; the
+assignments are. If any writer is a routine condition, the flag is a
+health*indicator*, not a kill switch, and needs the fatal class split out. Ask
+"was this flag safe only because nothing important consumed it?" A signal that
+has never had teeth has never been pressure-tested for precision.
+
+**Corollary for reviews.** "Fail closed" is only correct when the signal means
+what the action assumes. Fail-closed on an imprecise signal is not conservative
+— it converts routine noise into an outage, which is strictly worse than the
+silent failure it replaced.
+
+## L-7 — Public information has no offer side (2026-09-01)
+
+**What happened.** `cli_settlement_print_lock` was built on the thesis that the
+book has not yet absorbed the final CLI print. On the first admissible run,
+Nautilus submitted 0 orders. The reason was not a gate: on all five stations the
+bucket containing the printed value carried **0 asks across 3332 depth rows**,
+with bids of 0.99 x 7682 on the NYC winner. The losing rungs mirrored it --
+asks at 0.01 in huge size, no bids. The strategy identified the correct contract
+every single time and could not buy it.
+
+**The rule.** A strategy that acts on information ALREADY PUBLIC to the venue is
+not competing on speed or accuracy -- it is asking someone to sell it a contract
+that is known to pay $1. Nobody does. Before designing any strategy, ask what
+the COUNTERPARTY believes at the moment of the fill: if the answer is "the same
+thing we believe, from the same public source", the offer side will be empty and
+the edge is unharvestable regardless of how correct the model is.
+
+**Corollary — a settlement-truth edge must be priced BEFORE settlement is
+knowable.** The `p_stable` measurement (99.989%) was never wrong; it was a
+measurement about a moment at which no trade is available. Measured certainty
+and executable certainty are different quantities, and only the second pays.
+
+**Method note that made this legible.** Two independent nulls landed on the same
+window (no legal window, and no ask). Because 90 per-decision records were
+persisted with the FIRST blocking gate, the null was decodable offline instead
+of mute -- `RefusalCounter` was EMPTY, since nothing reached the decision layer.
+A null with no persisted inputs would have been indistinguishable from a dead
+market. See [[verify-agent-claims-against-artifact]]: the 0-ask count was
+confirmed independently through the native catalog reader before being acted on.
+
+**Amendment (2026-09-01, same day).** "Public" does not mean "officially
+published." Re-reading the same tape by timestamp: the NYC winner carried no ask
+at 03:30Z -- **3 h before its final printed, and ~10 h after its climate day had
+ended.** The book had already fully repriced while the official record did not
+yet exist. So the moment that empties the offer side is the moment the outcome
+becomes PHYSICALLY DETERMINED and observable to anyone watching the same
+instrument, not the moment a bulletin is issued. Any future strategy that names
+a publication event as its trigger is anchored to the wrong clock and will
+arrive late by exactly the publication lag. This is the measurement that
+generated H3 (`docs/strategies/archive/H3_intraday_running_max_lock.md`).
+
+## L-8 — A 0-row read is not a quiet market until the tape is verified (2026-09-01)
+
+**What happened.** A quote-tape capture was killed uncleanly. The file was not
+corrupted in the ordinary sense -- `close()` only appends the end-of-stream
+marker, so a clean EOF at a message boundary still reads fine. But when the file
+ended MID-MESSAGE, `ParquetDataCatalog._read_feather_file` caught
+`(pa.ArrowInvalid, OSError)` and returned `None` (`parquet.py:2795-2800`), which
+`convert_stream_to_data` turned into `continue` (`:2644-2646`). Conversion then
+reported SUCCESS over an empty catalog: 228 KB on disk, 0 rows delivered, no
+exception, no log line.
+
+**The rule.** In this system a null result has two indistinguishable causes --
+the market did nothing, or the tape silently failed to load. They are
+indistinguishable *by construction*, because the loader's failure path is a
+`continue`. **Never interpret a 0-row or low-row result as evidence about the
+market until the tape behind it has been independently verified** (row counts by
+file, timestamp coverage against the intended window, and a truncation
+preflight). Verification precedes interpretation; a strategy verdict built on an
+unverified tape is a verdict about the recorder.
+
+**How to apply.** Run `breezy-quote-tape-preflight` over the catalog before any
+run that will produce a strategy verdict, and quote its per-file status
+(`EMPTY_FILE` / `EMPTY_STREAM` / `INTACT` / `TRUNCATED` / `UNREADABLE`) in the
+evidence document alongside the result. Loss from an unclean death is bounded by
+the write buffer (~8 KB), not the flush interval -- salvage recovered 491/500
+records -- so a truncated tail is usually recoverable and should be salvaged
+rather than discarded. Pinned by
+`tests/contract/test_quote_tape_unclean_shutdown.py`.
+
+### L-8 amendment — a 2xx is not a datum (2026-09-01)
+
+The same failure has now occurred on the HTTP surface, and the coordinator
+committed it. The Open-Meteo probe report records
+`q3_archive_depth_2019` as **HTTP 200, 5079 bytes**
+(`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/PROBE_REPORT.md:39`).
+Reading only that row, the coordinator asserted "forecast archive depth
+confirmed back to 2019" and propagated it into two agent briefs.
+
+The very next section of the same report says the step is **partial**: "2xx, but
+the payload did not carry the datum this step was designed to extract"
+(`:62`). Only `q3_archive_depth_2022` ANSWERED, with `rows=168` (`:61`). The
+report even states the conclusion explicitly at `:83` — coverage is
+"NON-CONTIGUOUS ... an unexplained gap, not a clearance". A dedicated bisect
+probe then measured `2024-01-01 -> 0/168` for all four models, bracketing the
+boundary between 2023-12-09 and 2024-01-01.
+
+**The rule, generalised:** a status code, a byte count, and a non-empty response
+are all compatible with zero usable data. **Every coverage or availability claim
+must cite a ROW COUNT, never a status code, and must be read together with the
+report's own answered/partial classification.** The probe had already done the
+work correctly; the error was entirely in the reading.
+
+Corollary for briefs: a fact asserted into a subagent brief propagates at the
+speed of dispatch and is expensive to recall — two briefs and one external
+design run were seeded with the false 2019 claim before it was caught. Verify a
+load-bearing premise BEFORE it enters a brief, not after the returns land.
+
+## L-9 — On this venue the near-certain rung is never offered; stop designing lock strategies (2026-09-01)
+
+**What happened.** Three independent strategy families, three refutations, one
+mechanism.
+
+| Strategy | Trigger | Result |
+|---|---|---|
+| `cli_settlement_print_lock` | after the FINAL CLI print | winner rung **0 asks / 3332 rows**, 5 stations |
+| H1/H2 `running_extreme_lock` tails | after a preliminary print | fired **0/4**; venue lists tails 4-8 F outside the day |
+| H4 headroom-1 afternoon lock | after the diurnal peak, BEFORE any print | condition held **375/375, 381/381, 372/372**; ask present **0.00%** |
+
+H4 was designed specifically to escape the first two by triggering EARLIER, on a
+physical observation rather than a publication. It failed identically. The
+adjacent rungs were offered on ~100% of rows at 0.01-0.02 throughout: the ladder
+is liquid, and the offer is absent on exactly the rung our model likes.
+
+**The rule.** On this venue, a LONG-ONLY TAKER cannot harvest certainty. Every
+strategy of the form "identify the outcome that is nearly determined, then buy
+it" requires a counterparty to sell a contract known to pay $1, and no such
+counterparty exists at any hour we have observed -- before or after the print,
+before or after the physical lock. Moving the trigger earlier does not help,
+because the market maker reprices off the same public observations we do and is
+not slower than us (Breezy polls CLI on a 300 s timer; it is structurally
+slower). **Do not design another lock strategy. The null is not "we picked the
+wrong hour"; it is "this trade has no seller."**
+
+**Where the remaining edge must live.** If certainty is unsellable, the only
+harvestable region is where genuine UNCERTAINTY remains -- an offer exists
+precisely because the outcome is still in doubt. Winning there requires being
+BETTER CALIBRATED than the market while both sides are still uncertain, which is
+a forecasting edge, not a lock. Note what that implies and do not skip past it:
+Breezy currently ingests **no forecast data at all**, so the entire strategy
+family that could work is blocked on a capability that has been deprioritised
+twice (programme P2/P3). Any next hypothesis should either live in that family
+and carry forecast ingestion as its Gate 0, or state explicitly why it escapes
+this lesson.
+
+**Method note.** All three nulls were decodable because per-decision inputs were
+persisted and the tape was verified before interpretation ([[L-8]]). The H4 run
+also shows the right shape for a cheap kill: measure whether the ORDER IS
+AVAILABLE before measuring whether it is profitable. An absent ask is not a
+pricing problem that a better model or a lower break-even can solve.
+
+### L-9 amendment — the cheap side is mostly a lottery already lost (2026-09-01)
+
+L-9 sent the programme toward "where uncertainty remains", and the first reading
+of the microstructure pointed at the deep books on the cheap rungs (median
+~35,991 contracts offered at 0.01, against 0.58 at 0.99 on winners). The
+coordinator framed that inversion as the tradeable region. **That framing was
+wrong and must not be repeated.**
+
+Those deep 0.01 offers are overwhelmingly **post-peak**: rungs the climate day
+has already missed. Their true probability is residual METAR<->CLI basis plus
+late-rise, not "a 1% event" — buying them is buying a lottery that has already
+lost, and paying the 0.01 tick floor as the entry fee. H1/H2 are the same object
+in costume: listed tails 4-8 F from the printed high, triggered 0/4, asks at
+0.01 correctly pricing a non-event.
+
+Nor is the pre-event cheap rung automatically juicy. At 24 h the forecast error
+is roughly sigma ~= 2.8 F, so a 6 F tail is about `1 - Phi(6/2.8) ~= 1.6%`
+against a 1% minimum tick — **fair to slightly expensive after fees**, not a
+100:1 mispricing. A tick floor that coarse means a genuine sub-tick edge cannot
+even be expressed; the existing engine's `p_floor = 0.01` is an accidental
+confession of exactly that.
+
+**What survives:** only the PRE-EVENT (D+1) cheap-open book, which is
+structurally different from the post-peak dump and is at present essentially
+unmeasured. **Gate it before building for it.** The measurement (K1) is: first
+cheap-open ask per `(station, climate_day, rung)` on the D+1 book, scored
+against the eventual CLI integer final, Wilson 95%. If the upper bound sits at
+or below break-even, the calibration family is dead too — and that result is
+worth far more than the forecast-ingestion build it saves.
+
+**The ordering rule this reinforces:** measure whether the trade is AVAILABLE,
+then whether the population is REAL, and only then build the model. The
+programme has twice run the settlement-side test first and terminated at "gate
+PASS, economics unknown."
+
+## L-10 — A brief's vocabulary becomes a subagent's verified fact (2026-09-01)
+
+The EXEC SPINE plan asserted, as a **CONFIRMED present** Nautilus native, "the
+native Command-outcome taxonomy … is exactly `{terminal, retryable,
+AMBIGUOUS}`", and used it to JUSTIFY CUTTING SCOPE ("more is speculative").
+
+**No such taxonomy exists.** `AMBIGUOUS|Ambiguous` and `retryable|RETRYABLE` each
+match in **0 files** across installed `nautilus_trader` 1.231.0.
+
+**Provenance is the lesson.** The coordinator wrote that three-word set into the
+commissioning brief's non-goals list — not as a claim about Nautilus, merely as a
+convenient label for a scope cut. The planner read authoritative-sounding
+vocabulary in an authoritative document and promoted it to a verified native.
+Neither party checked. The upstream cause was the brief.
+
+Worse, the same session had ALREADY recorded this failure shape: the L-8
+amendment's own corollary says "verify a load-bearing premise BEFORE it enters a
+brief, not after the returns land." It was written and then violated within the
+hour — this was the **third** false premise seeded into a brief in one session
+(the others: the Open-Meteo 2019 archive depth, and the D1 walk-the-book cost
+characterisation that a marketable IOC LIMIT makes impossible).
+
+**The rule.** Anything a brief states in the register of fact — a version, an API
+name, a taxonomy, a coverage span, an execution semantic — must be VERIFIED
+before dispatch or explicitly marked `UNVERIFIED — confirm before relying`. A
+subagent cannot distinguish the coordinator's shorthand from the coordinator's
+knowledge, and it has every incentive to treat the brief as ground truth.
+
+**The countermeasure that worked.** The mandatory adversarial peer-review caught
+it, which is precisely why the planning gate is not discretionary. The near-miss
+is instructive: an ordering test HAD already been implemented from this same
+unreviewed plan. It was test-only and harmless, but the review gate was skipped
+to get there. **Run the gate before implementing, not after — including when the
+increment looks too small to need it.**
+
+**Also record the missed real native.** `live/retry.py:65 RetryManager[T]` and
+`:242 RetryManagerPool[T]` DO exist and are NOT wired into `LiveExecutionClient`
+(0 references). It is the first thing an implementer reaches for, and wiring it
+to `submit_order` on a venue with **no client-order-id** auto-resubmits and
+silently doubles the position. Fabricating a native hid a real one that is
+actively dangerous. See [[validate-nautilus-before-planning]].
+
+---
+
+## L-11 — Claiming a gap where a native exists is the same defect as claiming a native where none does (2026-09-01)
+
+**Rule.** Every "Nautilus does not provide this" verdict is a null-hypothesis
+claim and carries exactly the same burden of proof as "Nautilus provides this":
+a `file:line` that was actually opened, plus a search that could have found the
+opposite. A FALSE GAP is harder to catch than a false native, because the code
+you then write **works** — nothing fails, no test goes red, and the duplication
+is only visible to someone who goes looking.
+
+**What happened.** `EXEC_SPINE` Revision 1 justified a Breezy-owned durable store
+with *"`CacheConfig(database=None)` is memory-only, so a restart orphans the
+position"* — stated as a property of Nautilus. It is a property of **our
+configuration**. Nautilus persists both natively: `cache/cache.pyx:393-394`
+restores orders and `:1366-1368` rebuilds the venue-order-id index;
+`cache/database.pyx:709-755` replays stored `OrderFilled` events and reconstructs
+the `Position`, so `avg_px_open` is derived from fills and survives byte-exact.
+The store may still be the right call — Redis is the only backend
+(`system/kernel.py:312`, `:324-329` raises otherwise) and we decline that
+dependency — but **"we decline a native" and "no native exists" are different
+statements, and only one of them was true.**
+
+**Why it matters beyond tidiness.** L-10 recorded a fabricated native that caused
+a wrong scope CUT. This is the mirror: a fabricated gap causes a wrong scope
+ADD. Both survive review by sounding like the conclusion of an investigation that
+never happened. The operator caught this one by asking directly, which is not a
+control we can rely on.
+
+**How to apply.** State the verdict in one of exactly three forms, never a fourth:
+`NATIVE CONFIRMED (file:line)` · `NATIVE EXISTS, DECLINED BECAUSE <cost>
+(file:line)` · `GENUINE GAP — verified absent (file:line of the search, plus the
+positive control)`. "Declined" must name what is being given up. A plan that
+reads "no native exists" where the truth is "a native exists and costs a Redis
+dependency" has hidden a decision the reader is entitled to re-make.
+
+**The tooling trap that makes false gaps cheap here.** Grep's *directory
+recursion* under `.venv/` is silently blind — ripgrep honours `.gitignore:1`
+(`.venv/`), so a recursive search of installed Nautilus returns **0 matches with
+no error**. Measured: `rg -l 'Nautech Systems'` under `nautilus_trader/live/` → 0
+files; `--no-ignore` → 15. File-scoped Grep works. **A bare "0 matches" never
+closes a null hypothesis in this repo** — re-run with shell `grep -r` and a
+positive control in the same command, e.g. `expiration_ns` = 0 across `live/`,
+`execution/`, `portfolio/`, `risk/`, `trading/` is meaningful only beside
+`expiration_ns` = 63 in `model/instruments/`.
+
+**Evidence:** `docs/evidence/native_reuse_audit_2026-09-01.md` — five-seam audit
+of every Breezy surface against its nearest native, including the inverse finding
+that Breezy configures **no** native risk caps at all. See [[L-10]],
+[[validate-nautilus-before-planning]], [[native-substitution-is-a-unit-change]].
+
+## L-12 — Widen an exact-set barrier, never relax it
+
+Two barriers in this repo assert **set EQUALITY**, so legitimate new work turns
+them RED and the tempting fix is to loosen the assertion:
+
+- `tests/unit/test_weather_data_type_barrier.py:94` (W1) does not cover a new
+  weather record class.
+- `tests/unit/test_probe_containment.py:297-310` asserts set equality, so adding
+  a third endpoint turns it RED.
+
+The same shape governs the execution-egress firewall: N2, X3 and E0-INERT in
+`tests/unit/test_execution_egress_firewall_guard.py` are exact-set equalities
+whose docstrings require a new `exec/` module to update the set **in the same
+commit**.
+
+**The rule: WIDEN the expected set, never relax the comparison.** Never convert
+`==` to `in`, to a subset test, or to an allowlist. An equality that a reviewer
+must consciously update is the mechanism — it is what makes a new
+execution-egress module impossible to land silently. Relaxing it keeps the test
+green while deleting the only thing it was protecting.
+
+Corollary, learned landing R-3 (2026-09-01): membership in an exact set proves a
+module **exists**, never that it is **inert**. E0 listed modules; it took
+E0-INERT to assert that none of them can reach the network. When you widen a set,
+ask what the set actually proves — and whether the property you care about is
+asserted anywhere at all. Both X1 and X3 had been **silently vacuous**, scanning
+a package no test imported.
+
+## L-13 — An extremum statistic is not comparable across different sampling cadences (2026-09-02)
+
+The CLI-basis boundary study measured `P(CLI_final >= R_h + 1)` per station,
+where `R_h` is the ASOS RUNNING MAXIMUM. NYC returned 56-60% against 16-26% for
+the other four stations, and it passed the pre-registered bar by nine times over.
+It was an artifact. KNYC reports **hourly**, ~24 observations/day; the others
+report every 5 minutes, ~321/day.
+
+**A running maximum computed from a sparse series is biased LOW**, because fewer
+samples means fewer chances to catch the peak. Every statistic of the form "did
+the truth exceed our observed extremum" is therefore biased HIGH by exactly the
+sparsity, and the bias does not announce itself — the cell had n=1808, a tight
+Wilson interval, and was stationary across five years. Power, precision and
+stability are all properties of the SAMPLE; none of them detects this.
+
+**The rule: before comparing an extremum-derived statistic across sources,
+compare the sources' sampling cadences. Where they differ, DOWNSAMPLE THE DENSE
+SOURCE to the sparse one's resolution and recompute.** That experiment is cheap,
+it is causal, and it settles the question in one run. Here it moved LAX 25.27% ->
+64.34%, MIA 25.50% -> 64.29%, SFO 22.29% -> 60.92%, MDW 15.55% -> 54.98% — every
+dense station landing on NYC's measured value. That is not evidence NYC is
+special; it is proof the metric reads cadence, not weather.
+
+Corollary, and the more general trap: **a filter that selects almost everything
+is not a condition, and a statistic conditioned on it is unconditional.** The
+same study framed its result as a late-day effect over hours 17..23, but
+`P(R_17 == R_23)` is 99.40% at LAX — the running max had already converged, so
+the hour filter added no information and the number was the unconditional
+CLI-vs-ASOS basis wearing a condition's clothing. Before believing a conditional
+edge, measure how much the condition actually excludes. If a "condition" is true
+of ~99% of the sample, the edge it appears to isolate belongs to the population,
+and is very likely already in the price.
+
+See also L-1 (validate before building) and the standing note that an
+underpowered verdict describes the sample, not the world — this is its mirror
+image: a WELL-powered verdict can also describe the sample rather than the world.
+
+## L-14 — A barrier list is DERIVED from "what would refuse this?", never recalled (2026-09-02)
+
+Three plan revisions across four increments each stated which barrier tests a
+change would touch, and each was wrong the same way. Increment W's list read
+"N2 exact-set pin ... Nothing else." Building it turned FOUR barriers red:
+`PERMITTED_EXECUTION_CLIENTS` (`test_polymarket_us_readonly_guard.py:734-743`,
+whose docstring said outright "Factories stay banned outright"), its meta-pin
+(`test_cage_rule_constants_are_pinned.py:511,777`), and
+`TestTheReadOnlyCageIsDeclaredNotDefaulted` (`test_runtime_node_config.py:347`),
+the last tripping TWICE — once on the build-site count, once on the per-field
+rule. Auditing the rest of the plan on the same suspicion moved one increment's
+list from two entries to NINE.
+
+**Why the error is systematic rather than careless.** A barrier list written
+from memory is a list of the tests the author READ. The barriers that actually
+gate a change are the ones that would REFUSE it, and several of those fire on
+properties nobody looks up: an equality over a pin TABLE that every new constant
+must join; a COUNT pin that trips on each new allowlist ENTRY, so two entries
+are two changes and not one; widened/narrowed-neighbour tests that come free
+with every new pin; and scans whose roots (`src` + `scripts` + `tests`) are
+broader than the package under edit.
+
+**The rule: derive the list by asking "what would refuse this?" and answer it by
+running the suite against a deliberately broken version of the change — not by
+recalling which files were read.** A barrier list is a falsifiable claim, so
+test it. In this repo the cheap derivation is: grep the barrier files for the
+constant, the class base, the path prefix, and the config field the change
+touches, then check each hit for a count pin and a meta-pin above it.
+
+Corollary, and the reason this matters beyond tidiness: an under-enumerated
+barrier list makes a change look SMALLER than it is at planning time, so the
+increment is sized wrong, and the widenings get done under implementation
+pressure rather than under review. That is the condition under which someone
+relaxes a comparison instead of widening a set — which is exactly what L-12
+exists to prevent.
+
+---
+
+## L-15 — When a barrier's scope is decided by a classifier, RUN the classifier (2026-09-02)
+
+The R-6a increment plan stated its barrier basis as: "`backtest_order_guard.py`
+carries **0** venue references, so B4 never classifies it and V1-V4 do not
+apply." Both halves were false. The file carries **6** venue references, and
+`is_venue_touching()` returns **True** on it — classifier rule **C5**
+(`_VENUE_NAME_RE = /polymarket/i`, `test_polymarket_us_readonly_guard.py:230`)
+matches the venue's NAME in *any* `ast.Constant`, and a module docstring **is**
+an `ast.Constant`. The file had been inside barrier B4's scope the entire time.
+
+The conclusion — "no barrier files change" — happened to survive, because the
+increment adds no write verb. That near-miss is the point: a false premise that
+reaches a true conclusion is not caught by the conclusion being true.
+
+**Why the derivation failed even though L-14 was followed.** L-14 fixed *not
+deriving the list*. This is the next failure inward: the list WAS derived, but
+one input to it was **guessed by reading the file** when the thing that decides
+it is an **importable, executable function**. Nobody has to reason about whether
+a docstring counts as a string constant, or whether "0 venue references" is even
+the right question — `is_venue_touching(path, ast.parse(src))` answers it in one
+line, and `find_write_egress_violations(path, src)` returns the current
+violations as data:
+
+```python
+import ast, sys; sys.path.insert(0, "tests/unit")
+from test_polymarket_us_readonly_guard import is_venue_touching, find_write_egress_violations
+```
+
+**How to apply.** Before asserting in any plan, brief, or review that a barrier
+does or does not apply to a file: import the barrier's own predicate and call it
+on that file. Report the measured boolean, not a reading of the source. If a
+barrier's scope cannot be evaluated by calling something, say the scope is
+UNKNOWN rather than inferring it — an inferred exemption is the one that gets
+discovered by a red gate at landing time.
+
+**The trap this particular case was hiding.** Because the file *is* in scope,
+rule V3 applies to it: V3 refuses any `ast.Attribute` named `post`, `put`,
+`patch`, `delete`, or `request` — **syntactically, on any object at all**.
+Nautilus's `MessageBus` has a `.request()` method. An installer written as
+`msgbus.request(...)` would trip V3 inside a file the plan called exempt, and
+the tempting "fix" — narrowing the classifier or shrinking the attribute set —
+is precisely the [[L-12]] violation: widen an exact-set barrier, never relax the
+comparison. Use `msgbus.subscribe(...)`; the code bends, the barrier does not.
+
+Related: L-12 (never relax an exact-set barrier), L-14 (derive the barrier list,
+never recall it).
+
+---
+
+## L-16 — A raise inside a Nautilus `LiveClock` timer callback is silently discarded (2026-09-02)
+
+Reproduced directly against the pinned wheel (`nautilus_trader==1.231.0`): a
+`LiveClock` default handler that raises has its exception **vanish**. No
+propagation out of `asyncio.run`, no `sys.unraisablehook`, no
+`threading.excepthook`, exit code 0, process continues.
+
+```
+asyncio.run RETURNED NORMALLY (no propagation)
+callback fired: 1 | unraisablehook: 0 | threading.excepthook: 0
+```
+
+The dispatch is Rust-side, so the exception never reaches a Python frame that
+would surface it. `Actor.register_default_handler(self.handle_event)`
+(`common/actor.pyx:722`) wires `on_time_event`-driven callbacks through this
+same mechanism, so it generalises to any strategy acting on a timer — which is
+the natural shape for a forecast-driven weather strategy.
+
+**Why this matters beyond the one bug.** "Raise to refuse" is the idiom Breezy's
+safety guards use, and it is correct in backtest, where a raise deterministically
+aborts a single-threaded run. Live, the same raise has THREE different fates and
+only one of them is loud:
+
+| Path | Fate of the raise |
+|---|---|
+| Engine queue task | caught → `_handle_queue_exception` → `os._exit(1)` — process dies, but bypasses the CLI's `finally`/exit-code mapping, so the operator gets exit 1 with **no cause line** |
+| `MessageBus.publish_c` dispatch | no try/except around `sub.handler(msg)`; unwinds into whichever frame published |
+| **`LiveClock` timer callback** | **silently discarded — no signal at all** |
+
+`graceful_shutdown_on_exception` defaults `False`
+(`live/config.py:60,78,201`), and all three live engines end at
+`os._exit(1)  # Immediate crash`.
+
+**How to apply.** Never rely on a raise alone to inform an operator in a live
+Nautilus node. A refusal must **write its own operator-visible record at the
+moment it refuses** — latch the fault AND write the line to line-buffered stderr
+right there — because the process may die without unwinding, or may not die at
+all. The safety property (the order never reaches `cache.add_order`) survives on
+every path; only the *observability* does not, and a safety control nobody can
+tell fired is one you will believe never fired.
+
+Corollary for reviewers: "an uncaught exception here kills the node" is a claim
+about a specific dispatch path, not a general truth. Determine which of the
+three paths applies before accepting it — and prefer reproducing it over reading
+for it, as was done here. Related: [[L-15]] (run the executable oracle rather
+than reasoning about what it would say).
+
+---
+
+## L-17 — A field present in every sample you have seen is not thereby REQUIRED (2026-09-02)
+
+`parse_binary_option` treated `updatedAt` as required (`parsing.py:1281`). Every
+market payload ever inspected carried it, so it looked mandatory. It is not:
+the venue omits it on a market it has **never modified since listing**. Measured
+live — of the 20 freshly-listed 2026-09-03 markets, **20/20 carried `createdAt`
+and none carried `updatedAt`**. Older cohorts all carry it, alongside
+`ep3SyncedAt` stamps, because by the time anyone had looked at them they had
+been updated at least once.
+
+**Why every sample lied.** The field appears after a STATE TRANSITION. Any
+sample gathered from markets that have existed for a while is drawn entirely
+from the post-transition population; the pre-transition state is invisible
+precisely because it is brief and early. `updatedAt`, `resolvedAt`, `closedAt`,
+`firstFillAt`, `lastTradeAt` are all this shape. **Optionality is a property of
+the producer's contract, not of your sample**, and a sample can only ever
+establish presence, never necessity.
+
+**What made it total rather than partial.** One unparseable market aborts the
+WHOLE discovery cycle, so a single never-updated market blocked all 30 for ~24
+minutes. **Measured correction — the first draft of this lesson overstated it,
+and a lesson about overstating from a sample must not itself overstate:**
+capture did NOT go to zero. Already-subscribed markets kept recording (132 files
+in that window, including quote ticks); an aborted reload raises before
+`_reconcile_discovered_subscriptions`, so it can only cost NEW subscriptions.
+The real loss is that the new cohort was never subscribed, so its opening price
+discovery — the most informative and least contested segment there is — does not
+exist on a forward-only tape.
+
+**How to apply.** For every `_require`, ask: *what lifecycle state of this
+record would legitimately lack this field?* Newly-created is the canonical
+answer and the one your sample structurally cannot contain. Where a field is a
+transition timestamp, prefer an explicit fallback to the creation timestamp
+(a record never updated was last changed when it was created) over either
+requiring it or defaulting to `0`/`now()` — **a synthesised timestamp silently
+corrupts a tape, which is strictly worse than refusing it.** Widen exactly the
+one field the producer has proven optional and no others ([[L-12]]).
+
+**The forecasting failure worth keeping.** The triage that had just closed the
+morning's listing-gap incident predicted "Breezy will pick the cohort up
+automatically with no intervention." That prediction was confidently wrong, and
+wrong for this reason: it reasoned from the 100 markets it had parsed
+successfully, every one of them already updated. A verdict of "the parser is
+proven healthy — 100/100 accepted" was true of the sample and false of the
+population. When a component is declared healthy on a sample, state which
+population the sample came from, and treat any *new* population — a fresh
+cohort, a new venue state, a first-of-its-kind record — as unproven until it
+arrives. Related: [[L-15]] (run the executable oracle), [[L-13]] (a statistic
+is not comparable across the regimes it was not sampled from).
+
+## L-18 — A counterfactual is a claim about a mechanism you have not run (2026-09-02)
+
+Two of my own errors in one review round, same shape: I recorded what *would
+happen if something changed*, as fact, without tracing the mechanism that would
+have to carry it.
+
+**Instance 1, the dangerous one.** `PROGRESS.md` stated that removing the R-4
+standing refusal (`exec/client.py:1338-1350`) "**enables order sends**". False.
+The signer permits only GET (`signing.py:84`), no write transport exists under
+`src/`, and R-6.5/R-7 are unlanded — there is no send to enable. Removing R-4
+would have deleted the only **denial** on the path, so a submitted order would
+receive neither `OrderDenied` nor a send and would hang in flight silently.
+The entry did not merely overstate a benefit; it inverted the sign. It made a
+strictly-worse change look like the natural next step, and it had sat in the
+backlog as a standing invitation to make it.
+
+**Instance 2, cheap but instructive.** The T-1 plan required RED-7
+(`PARTIALLY_FILLED`) to fail on the pre-fix tree. It cannot: `PARTIALLY_FILLED`
+is already inside `is_open_c` (`base.pyx:421-430`), so the narrow query always
+saw it. The widening's only status-visible change is `INITIALIZED`/`SUBMITTED`.
+One look at the membership list would have caught it; instead the implementer
+found it at the code, having first written a test that could not go red.
+
+**Why this class survives review.** A counterfactual reads like an observation
+and is graded like one. "Removing X enables Y" has the grammar of a measurement
+but the content of a prediction, and nothing in the sentence marks which. Both
+instances were **one grep from disproof** — membership of a status list, and
+the presence of a write verb. Neither was hard; both were simply never run,
+because the claim already sounded settled.
+
+**The sharpest instance of the same family, found in that review.** A safety
+control can be asserted and unenforced: `safety.py:668
+assert_live_order_submission_permitted` — the operator-permit chokepoint for
+live submission — has **zero callers in `src/`** (only a re-export at
+`__init__.py:120`), and barrier B6/B7 actively *bans* it from acquiring one. It
+reads in every document as the gate on live order submission. It gates nothing.
+**A function with no caller is not a control**, however exactly it is named.
+
+**How to apply.** Before writing that changing X produces Y — especially in
+`PROGRESS.md`, a plan, or a commit message, where it becomes the premise of
+someone else's work — name the mechanism that carries Y and check it exists.
+Mark it `UNVERIFIED` if you did not. When citing a control as a cover, check it
+has a **caller**, not just a definition and a good name; when asserting a test
+will go red, check the predicate actually changes for the case you chose. Same
+discipline as [[L-15]] (run the executable oracle rather than reasoning about
+what it would say) and [[L-17]] (a sample establishes presence, never
+necessity) — and the reason [[L-12]] insists a barrier is widened by measured
+need rather than by argument.
+
+## L-19 — Measure a blast radius by SIMULATING the change, not by counting call sites (2026-09-02)
+
+Reviewing the T-4 plan, which changes `PortfolioSnapshot.equity` from
+`float = 10_000.0` to `float | None = None`, the reviewer did not reason about
+what would break. It patched `PortfolioSnapshot.__init__.__defaults__` to `None`
+and the five `_equity()` bodies to drop their fallback, via a pytest plugin,
+then ran the full suite against the unmodified repo.
+
+That produced a number no census could: **16 failures, of which 15 were
+`TypeError` at the arithmetic site and one was not.** The odd one out —
+`test_calibration_mean_reversion_shorts_disabled_alert.py:193` — fails on
+*assertions* instead (`refusals.total() == 0` -> 1, `len(orders) == 1` -> 0),
+because its rig has no venue account. It is the **control** proving the
+shorts-disabled alert tracks the permission rather than the market, so it must
+be repaired with a stub account and never by relaxing the assertion. A grep for
+`PortfolioSnapshot(` would have listed it among 89 sites with nothing to
+distinguish it; a census of "sites relying on the default" would have missed it
+entirely, because it *passes* `equity` explicitly.
+
+**The count was also simply wrong by hand.** The plan said 88/39/49; the AST
+census said **89/40/49**. The uncounted site re-fabricates the constant by hand
+(`test_weather_strategy_quote_staleness.py:99`,
+`PortfolioSnapshot(equity=10_000.0)`), so it would have survived the whole fix
+as a live fabrication *and* been invisible to a structural guard on the default.
+
+**A second finding of the same shape, about the enforcement itself.** The plan
+leaned on strict mypy to prevent misuse of the new optional. Measured with a
+repro: an unguarded read in another method IS caught — but
+**`portfolio.equity or 0.0` type-checks clean** and silently restores the exact
+fabrication the change removes, and mypy flags **zero** of the 49
+default-reliant sites. The type change is a real but PARTIAL control. Claiming
+a type makes an invalid state unrepresentable is itself a claim to check
+([[L-18]]): `T | None` plus `or` is `T` again, with no diagnostic.
+
+**How to apply.** For any change to a widely-constructed type's default or
+nullability, spend the ten minutes to simulate it — monkeypatch the default,
+run the suite, read the failures — BEFORE writing the scope section. The
+failures that are not the expected exception type are the ones worth the whole
+exercise: they are where the change alters *meaning* rather than merely types,
+and they are exactly what a call-site census cannot see. And when a plan claims
+the type system will enforce something, write the escape hatch out and check
+whether it compiles.
+
+## L-20 — The catalog you query is not the tape you capture (2026-09-02)
+
+**Rule.** Before concluding that the quote tape lacks a window, a day, or an
+instrument, compare the parquet catalog under `<catalog>/data/` against the
+Arrow IPC streams under `<catalog>/live/<instance>/` — row counts per instance,
+per data type — and run `breezy-quote-tape-ingest` (or the preflight) first.
+An analysis that reads `data/` measures **what has been converted**, not what
+was captured.
+
+**Why.** M_A reported `n_afternoon = 0` — "the tape has no 12:00–17:00 LST
+coverage" — and Grok's memo, my report, and a ten-line diagnosis brief were all
+about to treat that as a capture defect. 199,079 `OrderBookDepth10` rows for the
+09-01 afternoon were sitting in `live/5a111bca…`, unconverted, because
+`convert_stream_to_data` had been run by hand exactly twice and
+`quote_tape_cli.py` declares conversion out of scope. After conversion:
+`n_afternoon = 4`, 9,588 qualifying snapshots, and the first non-dead signal in
+the programme. The wrong reading would have cost nothing visible — it would
+simply have kept the family "dead" for want of data that already existed.
+
+**How to apply.** The six-hourly `breezy-quote-tape-ingest.timer` now bounds the
+lag, and the live writer is skipped (no end-of-stream marker; convert only
+after a clean SIGTERM). But the rule outlives the timer: any "the data is
+missing" verdict names the layer it looked at, and a zero from a query is a
+[[measure-catalog-freshness-with-epoch]]-class measurement bug until the
+stream directory has been checked. Companion to [[L-18]]: "no coverage" is a
+claim about a mechanism (conversion) that had not run.
+
+## L-21 — A climatological base rate is not the comparator for a market price (2026-09-02)
+
+**Rule.** When an archive-derived probability (unconditional on the day's
+information) exceeds a venue ask by a wide margin, the default reading is
+"the archive answers a different question," not "the market is wrong." The
+statistic that can discriminate is the **realized** outcome rate of the trials
+the screen would have taken, against `ask + fee`, at a sample size the kill
+criterion names in advance.
+
+**Why.** M_B's archive table said P(CLI max lands in the 2°F rung the running
+max sits in at noon) has a Wilson-lower of 0.59 for MDW-SON, and the venue
+priced that rung at 0.06 on 09-01 — a formal "edge" of +0.53. The table was
+audited and reproduced exactly; nothing was wrong with it. The day settled two
+degrees above the rung. A market maker prices off the forecast and the
+warming trend; the archive pools every historical day regardless. Grok's
+original kill sentence compared the archive bound to the ask and therefore
+could neither fire nor confirm; it was amended to the realized hold rate
+(kill n≥60, survive n≥150).
+
+**How to apply.** Any screen built from history alone is a **selector**, never
+the edge; write the kill in terms of what actually happened to the selected
+trials. And do not fake the missing conditioning (forecast, trend) into the
+screen after seeing a miss — that is moving the goalposts, and the forecast
+family was killed for exactly the lack of that ingest. Companion to
+[[L-9]] (three refutations of "identify the near-certain rung, then buy it")
+and [[L-18]].
+
+## L-22 — A safety primitive's exclusion must be unforgeable, not offered (2026-09-03)
+
+**Rule.** When a library exists to prevent a double action (a submit-intent
+latch, a writer lock, a kill switch), the mechanism that makes it exclusive
+is part of the primitive's constructor, never a sibling helper the call site
+is trusted to remember. If the object can be built without the lock, the
+design has a fail-open path by construction, and no call-site discipline or
+docstring closes it.
+
+**Instance.** The first R-7 latch brief specified `SubmitIntentLatch(store)`
+plus a separate `hold_submit_intent_process_lock()` context manager. The
+security review reproduced two `arm()` calls both returning OPEN (get-then-set
+with nothing binding the flock to the latch) and one arm overwriting the
+other's durable record. Fix `5d41eaa`: `open_submit_intent_latch()` is the
+only constructor, holds the flock for its lifetime, every method asserts it
+is still held, and an instance mutex serialises the read-modify-write.
+
+**Detection.** Any brief for a guard primitive that lists the lock as a
+separate bullet from the guarded object. Ask: can the object exist unlocked?
+If yes, rewrite before dispatch.
+
+## L-23 — A configuration snapshot is not the effective runtime; the journal is (2026-09-03)
+
+Hunting the missing 2026-09-02 station-day, a sub-agent read
+`instrument_reload_interval_mins: null` from every recorder instance's
+`config.json` and concluded discovery ran exactly once per process, so a cohort
+listed mid-session could never be picked up. Confident, specific, wrong: the
+recorder journal showed the reload loop firing 6-hourly and retrying every 60 s
+after a failure (`quote_tape_cli.py:263` overrides the field at start-up), and
+the venue had simply never listed a 09-02 cohort at all — a by-slug `404` with
+09-01 and 09-03 as passing positive controls settled it.
+
+**Why this is binding.** A persisted config field records what was *written*,
+not what the process *does*; overrides, defaults resolved at construction, and
+CLI flags all live between the file and the behaviour. The failure shape is the
+same as L-8 and L-20: a plausible artefact standing in for the measurement. It
+would have produced a "fix" (set the interval) that changed nothing and closed
+the ticket on a gap the venue owns.
+
+**The rule.** A root cause about *what a running process did* must cite the
+process's own record — the journal, the emitted tally, the on-disk output — and
+must survive a positive control. A config value, a docstring, or a default is a
+hypothesis about behaviour, never evidence of it. Before naming a cause that
+implies "we never asked the venue", prove the venue had something to give
+(L-8): fetch the missing key by identifier and fetch its neighbours the same way.
+
+**How to apply.** When a finding rests on a config or snapshot field, ask "what
+line would this process have logged if that were true?" and go read it. When a
+finding says "the data was never captured", classify it VENUE-NEVER-LISTED /
+LISTED-BUT-FILTERED / LISTED-AND-ABORTED only after the by-identifier probe with
+neighbours as controls. Related: [[L-8]], [[L-18]], [[L-20]].
+
+## L-24 — A fixture that always satisfies an invariant never tests the driver that must supply it (2026-09-04)
+
+**What happened.** The 6b paper-replay harness landed with 15 green unit tests,
+three of them running a real `BacktestEngine`. The first real run over the
+captured tape refused all 14 invocations at `SettlementInvariantError`: the
+driver had never loaded the tape's `InstrumentClose` stream, so no tradeable
+instrument could ever settle. Every unit fixture had been built with a close
+record in hand, so the invariant was satisfied by construction and the driver's
+omission was invisible to the suite. The invariant itself worked exactly as
+designed; the tests around it had only ever fed it the happy input.
+
+**The rule.** For every fail-closed invariant a driver must satisfy, the driver's
+tests carry the NEGATIVE fixture (the input the driver is responsible for
+supplying, omitted) and assert the invariant fires — and the driver's positive
+path is exercised at least once against the real artefact, not only against
+fixtures that pre-satisfy it. A refusal on first real use is a result (L-8,
+L-18); a suite that never produced that refusal in miniature is the defect.
+
+**How to apply.** When a brief names an invariant the new code must satisfy,
+add a RED test titled "…still refuses when <the driver's input> is absent" next
+to the happy path, and schedule one real-artefact run in the build sequence
+before calling the increment done. Related: [[L-8]], [[L-18]], [[L-20]].
+
+## L-25 — A fill better than the displayed ask is a defect signature, not price improvement (2026-09-04)
+
+**What happened.** The first paper replay to reach a decision (MDW 2026-09-01,
+`current_rung_hold`, instance `5a111bca`) scored one trial and printed
+`slippage: mean=-0.11` — an execution 11 cents BETTER than the ask, presented as
+favourable. A read-only reconstruction showed two driver defects and no price
+improvement: `entry_ask` was the tape's FIRST quote (08:28 LST, 0.15), four
+hours before the decision, while the strategy's own latch held the real
+decision ask (0.06); and the decision `QuoteTick` and its `OrderBookDepth10`
+carry the identical `ts_init` (one venue message), so the quote was delivered
+first and the IOC crossed the PREVIOUS snapshot's already-removed 0.04 level.
+The adapter agreed with itself at every instant; the driver's recording and
+ordering did not.
+
+**The rule.** For a taker order whose limit is the displayed best ask of one
+message, `fill_px <= ask` is the only permitted relation; `fill_px < ask` means
+the order crossed a book the decision never saw. A replay guards that relation
+and raises, records the entry price from the decision instant (the latch), and
+applies same-timestamp book updates BEFORE the quote derived from them. A
+flattering number is scrutinised harder than a disappointing one — the
+mechanism test exists to catch exactly the error that would inflate ROI.
+
+**How to apply.** When a replay or backtest prints negative slippage, a fill
+below the decision ask, or a fee of zero on a non-trivial fill, treat it as a
+bug until the decision tick and the adjacent depth snapshots have been
+reconstructed from the catalog. Never source an "entry" price from a
+convenient row (first quote, last quote) when the decision path already
+records the real one. Related: [[L-18]], [[L-24]].
+
+## L-26 — A coordinator session is not a supervisor; a live process launched inside it dies with it (2026-09-04)
+
+**What happened.** The first live trade node (`BREEZY-L001`, 17:54 UTC) was
+started with `nohup .venv/bin/breezy-trade &` from a subshell inside the
+coordinator session. `nohup` only ignores SIGHUP. When that session ended at
+21:42 UTC the harness terminated the session's process group with SIGTERM, the
+node shut down cleanly (exit 0, account flat) with the LAX/SFO afternoon window
+still open, and the session-bound `CronCreate` relaunch died with the session
+too. Nothing alerted: a clean shutdown looks like an intended one. The runbook
+already said "one process per trading day, launched from an automation shell",
+and the automation shell chosen was the one thing guaranteed not to outlive the
+day.
+
+**The rule.** Any process that must outlive the conversation — a live node, a
+recorder, a daily relaunch — is started in its own session (`setsid` /
+`subprocess.Popen(..., start_new_session=True)`), verified with
+`ps -o pid,sid,pgid`, and supervised by something whose lifetime is the host's,
+never the coordinator's (a systemd unit where the runbook allows one; the
+detached in-memory supervisor of `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md`
+where it does not). **Sharpened 2026-09-24:** a new session is NOT enough on this
+host. The coordinator runs inside a `tmux-spawn-*.scope` cgroup, and closing the SSH
+connection kills the whole cgroup regardless of SID: a hand-relaunched node
+(`setsid` + `start_new_session=True`) and nine external CLI workers died together
+with no SIGTERM line. Launch anything that must outlive the session through
+`systemd-run --user` (`--scope` when a launcher forks the real process and exits), and
+verify with `cat /proc/<pid>/cgroup` that it sits under `app.slice`, not the tmux scope. A session-bound cron or `/loop` may *check* the process; it
+must never be the only thing that *starts* it. Five of the seven enablement
+values stay memory/shell-only; the two caps may live in the operator's
+gitignored `operator.env` at the repo root (never committed, never written by
+the build side).
+
+**How to apply.** Every session opens by checking `pgrep -f 'breezy-trade$'`
+(anchored — the supervisor's argv shares the prefix) and the newest trade log
+for `Received SIGTERM`; a SIGTERM that coincides with a session boundary is
+this lesson, not a venue event. When recovering, five of the seven enablement
+values stay memory/shell-only; the two caps may live in the operator's
+gitignored `operator.env`. [[L-22]] on unforgeable exclusion applies to the
+relaunch path too. Related: [[L-5]], [[L-23]].
+
+## L-27 — A test that configures a process-global logger can write into the production audit log (2026-09-05)
+
+**What happened.** `breezy-trade-supervisor` gained a file handler in `main()`
+(`configure_supervisor_logging(log_dir)`, `log_dir` defaulting to
+`Path.home()/.local/share/breezy/logs`). Its unit suite, run four times
+through the no-egress gate, wrote ~15 KB of fake-PID decision lines
+(`launched pid=9001`, `self_check result=PASS_ADOPTED_LOG_UNKNOWN`) into the
+REAL `breezy-trade-supervisor.log` — the audit file the coordinator's monitor
+watches for the 16:40/16:50/17:05 UTC decisions — timestamped 00:39:48Z,
+seconds before the real `supervisor_started` at 00:40:18Z. The sandbox blocks
+network egress, not writes to `$HOME`. Lines in that file earlier than
+2026-09-05T00:40:18Z `supervisor_started` are test pollution, not history.
+
+**The rule.** A test suite for any module that opens a file, socket, lock, or
+logger handler from a HOME- or config-derived default path runs under an
+autouse fixture that redirects `Path.home()` (or injects the path) to
+`tmp_path`, and a guard test asserts the real path's size/mtime is unchanged
+after the module's tests. Process-global sinks (module loggers, `logging`
+handlers, singletons) are reset between tests, because one test that touches
+the real path makes every later test's output land there too.
+
+**How to apply.** Before accepting "the suite is green" for a module with a
+`main()` or a default path, `stat` the production artefacts that path could
+name before and after the run. Treat a production log line whose timestamp
+precedes the process's own start line as a contamination signal. Related:
+[[L-20]], [[L-24]], [[L-26]].
+
+## L-28 — A shipped helper's default arguments are part of the population it measures (2026-09-05)
+
+**What happened.** Rev 2 of the live fill → scored-trial plan closed the v1
+structural-dead denominator gap with "a reusable computation SHIPS —
+`count_covered_listed_station_days_from_catalog` — so the wrapper just calls
+it; no increment needed." Round-2 review read the function: its `fetch_start`
+defaults to `ASOS_FETCH_START` = 2026-08-30, the archive study window, so
+called as written it would have counted six pre-live days per station, cleared
+`MIN_STRUCTURAL_DEAD_STATION_DAYS` (15) on the first evaluation, and paired
+that denominator with a numerator scoped to the live family's first day: a
+manufactured KILL of a family with zero live fills.
+
+**The rule.** "A function that computes this already exists" is a claim about
+a signature, not about a number. Before a plan wires a shipped computation into
+a stop, a tally or a threshold, it names EVERY argument that selects the
+population (start/end dates, station set, source catalog, venue) and shows
+that both sides of any ratio share one window from one declared source. A
+default that was correct for the study that wrote it is a foreign window
+here; "just call it" with defaults is prohibited on any live-consequence path.
+
+**How to apply.** When you cite a helper as the fix, quote its signature with
+defaults in the plan and write the call with every population argument
+explicit; add a RED test that pins numerator and denominator window equality.
+Related: [[L-2]] (a substitution is a unit change), [[L-3]] (reach the goal
+state), [[L-10]] (brief vocabulary becomes verified fact).
+
+## L-29 — A diagnostics buffer with no production consumer is an unbounded allocation (2026-09-05)
+
+**What happened.** The live trade node reached 5.0 GB resident in six hours
+(~1 GB/h, 4.85 GB anonymous heap, no fd or thread growth) and the host's 8 GB
+swap was exhausted. `PolymarketUSDataClient._frame_diagnostics` was a plain
+list that `_handle_ws_frame` appended to on EVERY inbound websocket frame,
+before routing, with a full walk of the payload structure per frame; its only
+readers were one unit test and the venue auth-smoke script -- nothing in the
+node or the recorder. The same class powers the quote-tape recorder,
+whose earlier "memory fix" (d46b725) added cgroup limits and a cache cap and
+never touched the list — the symptom was contained, the cause survived, and
+the recorder has been swapping against its ceiling ever since.
+
+**The rule.** Any per-message collection in a long-running process is bounded
+by construction (`deque(maxlen=...)`, a counter, or a periodic flush) and has
+a named production consumer; a collection whose only reader is a test is a
+leak wearing the grammar of observability. A memory ceiling on a unit is
+containment, not a fix: when a process sits at its `MemoryHigh`, the root
+cause is still open and goes on the register as such.
+
+**How to apply.** When a process's anonymous RSS grows linearly with message
+rate, search the message path for `.append(` on `self.*` attributes before
+suspecting caches, threads or fds; confirm with a RED test that feeds N
+messages and asserts the collection's size is O(1) in N. Related: [[L-3]]
+(reach the goal state), [[L-19]] (simulate the change), [[L-27]] (process-
+global sinks).
+
+## L-30 — A missing log line proves only that nothing was written, not that nothing happened (2026-09-05)
+
+### What happened
+Eight trade-node logs since the first launch carried no `live-trading permit issued` line. Two agents in one session promoted that absence into "the node has no permit; the live trial could never fill", and a memory was written to that effect. A unit test on the exact deployed environment then showed the settings loader succeeds and `orders_enabled_requested` is True. The permit block in `main()` logged through stdlib `logging` before `trade_cli.run()` installed the Nautilus bridge; the root logger had no handler, so every audit line was dropped on every boot. The permit was almost certainly minted all along.
+
+### Why this is binding
+The inference "no line ⇒ no event" is only valid when the emitting path is known to be handled. Nautilus-logger lines and stdlib-logger lines share one file but not one handler, so a log can look complete while an entire audit stream is silently discarded. The wrong conclusion cost a hand relaunch of a healthy node during the trading window.
+
+### The rule
+Before concluding from an absent log line, prove the line CAN appear: find the emitter, find its handler at that moment of the process lifecycle, and if possible find one historical occurrence. If none of those is available, the state is UNKNOWN, never disproven, and the memory says so.
+
+### How to apply
+Boot-time audit lines go through a logger with its own handler attached before anything else runs (`breezy.app.trade.boot`, `f85a452`). An enabled-but-unminted node exits non-zero instead of running silently. Agents briefing from logs state the emitter and handler for any negative claim.
+
+## L-31 — A loop over `catalog.instruments()` runs once per republished definition, not once per instrument (2026-09-06)
+
+### What happened
+The whole-tape paper replay was recorded on 09-06 as "driver memory unbounded, ~0.5 GB/min" after a regeneration was SIGTERMed at 2.8 GB. Profiling that morning found the dominant cost was not loading: `_load_clean_instance` iterated `catalog.instruments()`, which yields one row per RECORDED definition, and the recorder republishes definitions on every reconnect — 210 rows for 60 ids over 2 climate days on one instance. Each row triggered `_select_capture_instruments`, which reloads that day's entire quote and depth set (~3 s), so a single instance never reached replay inside 600 s. The memory growth was a second, independent defect: every CLEAN instance's quotes/depths stayed alive after winner selection (~2 KiB per depth row).
+
+### Why this is binding
+Two different mechanisms were filed under one symptom because the symptom ("grows then dies") was described instead of measured. A per-row loop over a republished table is quadratic in tape length and hides behind any catalog helper that looks like a per-instrument call.
+
+### The rule
+Treat `catalog.instruments()` (and any Nautilus catalog listing of definitions) as a multiset: dedupe by instrument id or by the key you actually iterate on BEFORE doing per-row work, and count the calls into the selector in a test. A "memory" report on a driver needs the retained-object slope (objects at N vs 2N) and the call count of the heaviest helper, not an RSS-over-time description.
+
+### How to apply
+`whole_tape_paper_replay._load_clean_instance` selects once per unique climate day and `release_non_winner_tape` clears non-winner lists; `test_load_clean_instance_selects_capture_instruments_once_per_unique_climate_day` pins the call count. The same shape (per-prefix restart of a sequential recursion) was found in the group-sequential boundary replay the same day and fixed with `_iter_boundary_looks` (120 → 15 convolutions, bit-identical).
+
+## L-32 — A backlog row is a claim; search the prior ruling before planning (2026-09-06)
+
+### What happened
+PROGRESS.md row GL-1 instructed "Classify documented empty-executions as ZERO_FILL". A planner (a different model) produced a HIGH-confidence plan for that reclassification; of two independent plan reviewers, one missed the prior ruling and one found it. R-7 item 5 (`docs/plans/R7_BUILD_BRIEF_2026-09-04.md`) already rules that `200 + id + no executions + NON-terminal or absent status` stays AMBIGUOUS. The venue create-order snapshot (`docs/evidence/venue/polymarket_us/docs_snapshots/api-reference_orders_create-order_2026-08-25.md`) says the synchronous block waits until filled, canceled, or expired, up to `maxBlockTime` seconds, so an empty executions list at ~5.2 s (`maxBlockTime` = 5) is the TIMEOUT shape, not an IOC cancel. `tests/unit/test_polymarket_us_submit_order_chain.py` param `"200-id-no-exec"` pins that body as AMBIGUOUS. Implementing the row as written would have replaced a fail-closed outcome (latch OPEN, DEGRADE) with a fail-open one (retire the intent, book 0, `generate_order_canceled`) on a possibly working order. Only the diagnostics half (body_kind / body_len / state / cum detail tokens) shipped; the reclassification awaits a strategy-lead ruling.
+
+### Why this is binding
+A backlog row is written in the grammar of an instruction. A planner that treats it as the spec will not look for a converged decision that already classified the same input, and a reviewer asked only "is this plan correct against the row?" will not either. Fail-open on a live order-state is irreversible: booking 0 and canceling an order that may still fill is worse than leaving it AMBIGUOUS.
+
+### The rule
+Before a plan is dispatched for a backlog row that changes a classification, retirement, or settlement outcome, grep `docs/plans` and `docs/evidence` for a converged decision on the same input shape and cite it in the brief as CONFIRMS or CONTRADICTS. A CONTRADICTS halts the row for a ruling — never resolve it inside the plan. When a prior ruling and a backlog row disagree about an order-state outcome, the fail-closed reading stands until ruled. A pinned test of that body shape is itself a ruling.
+
+### How to apply
+The search is mechanical: the input shape (status, id present, executions empty, terminal vs not) plus the proposed new outcome word. Hits in a build brief, a coordinator decision, or a parametrized test named for that shape are in scope. A HIGH-confidence plan that never names the prior ruling has not searched. Related: L-10 (brief vocabulary becomes fact), L-12 (pinned tests are contracts), L-18 (an outcome claim is a mechanism claim).
+
+## L-33 — A characterisation item has no RED; demand mutation evidence instead (2026-09-07)
+
+### What happened
+Backlog row GL-9 asked for "a synthetic 200+fill body through the live chain in a test". The plan listed a RED expectation for every new test. Two independent reviews showed the headline test already existed and passed (`tests/contract/test_live_fill_scoring_chain_contract.py:207-324`), that a proposed schema-equality assertion was a tautology (the writer and reader share the schema object), and that nothing in a no-`src/`-change item can go red at all. A build accepted on that plan would have reported a fabricated RED→GREEN.
+
+### Why this is binding
+RED→GREEN is the repo's change artifact (§5). For an item whose only deliverable is new assertions on unchanged code, "RED" cannot mean "fails before the change" — there is no change. Without a substitute, the implementer either invents a failure or ships assertions that cannot fail (L-24). Both look identical to a real increment in the return.
+
+### The rule
+Before dispatch, classify every backlog item as CHANGE (source delta; RED = the new test fails before the delta) or CHARACTERISATION (no source delta; RED = each new assertion is shown to FAIL when its expected value is deliberately perturbed, then restored). A characterisation plan that lists RED expectations, or a review that does not ask which assertions are genuinely new against the existing tests, is incomplete. An assertion that cannot be perturbed into failure (schema written and read with the same object; a fixture equal by construction, L-24) is not coverage and is refused.
+
+### How to apply
+The return for a characterisation item carries `MUTATION_RED_EVIDENCE`: one perturbation per new assertion with its failing id, then the restored GREEN line. Reviewers diff the new assertions against the existing module first ("already covered at `path:line`" closes the row without code). Related: L-24 (fixtures that always satisfy the invariant), L-30 (absence proves nothing), L-32 (a pin can pre-empt an open ruling — a characterisation pin of behaviour under ruling is refused).
+
+## L-34 — The trial's TRIGGER is pinned; a re-look is a second snapshot (2026-09-09)
+
+### What happened
+Asked to close the gap "the strategy does not continuously evaluate for edge", a design proposal recommended adding a native `Clock.set_timer` that re-runs the SAME evaluation on unlatched stations, alongside the existing quote-tick path, and classified it PREREG-COMPATIBLE on the reasoning that "the trigger is not pinned". Adversarial review refuted it. v1 §2:41-44 defines the trial as "the FIRST executable snapshot ... to which the taken test is applied once". `Cache.quote_tick()` returns the LAST tick (`cache.pyx:3204-3234`), so a timer applies the taken test to a different snapshot than the first executable one, changing which `ask`/`instrument_id` is written to the latch — i.e. which row can enter `n`. The clock-speed ruling (`docs/evidence/grok_clock_speed_ruling_2026-09-04.md:29`) rejects ">1 snapshot/station-day"; one latch does not save it, because the rejected lever is extra snapshots as a throughput trick. The blueprint's "LiveClock timers DECLINED" is a separate implementation hazard (timer raises are swallowed), not the class pin.
+
+### Why this is binding
+"Pure addition" reasoning is seductive: a timer adds no new decision rule, changes no threshold, and leaves the latch arithmetic identical, so it reads as observability-grade. It is not. In a first-snapshot family the TRIGGER selects the estimand. Changing when you look changes what you measure, silently, on a live family whose n cannot be re-run.
+
+### The rule
+For any pre-registered family, treat the evaluation trigger as part of the frozen decision rule until the spec says otherwise. Before classifying a change as PREREG-COMPATIBLE, ask: could this cause a DIFFERENT observation to become the trial? If yes it is class (C) regardless of how additive the code looks. "The spec does not mention X" is not evidence that X is unpinned — quote the clause that defines the estimand and reason from it.
+
+### How to apply
+The mechanical check is the selector: name the exact datum the registered rule selects (here, the first executable snapshot), then name the datum the proposed path would feed the same test (here, the cached last tick). If they can differ on any afternoon, the change is (C). Related: L-18 (an outcome claim is a mechanism claim), L-32 (search the prior ruling before planning), L-16 (timer raises are swallowed).
+
+## L-35 — QuoteTicks cannot observe an empty bid; measure depth from Depth10 (2026-09-09)
+
+### What happened
+The standing assumption "the weather-market bid side is empty" (median TOB bid 0.3 contracts) was traced to a SIX-MINUTE capture on 2026-08-30 (n=675), and is a pooled-median artifact — two slugs in that same sample had bid medians of 143 and 1431. Re-measured over the full tape (1,842,152 QuoteTicks), the D0+ executable-ask universe shows bid p50 55.0 with a >=1-lot top-of-book bid 93.6% of the time. But the re-measurement carries its own trap, found only by attacking it: `parse_quote_tick` -> `_require_best_level` REFUSES a one-sided book (`parsing.py:646-649,698-709`), so the QuoteTick empty-bid rate is structurally ZERO. Depth10 shows 12% of frames with no TOB bid, and 2026-09-07 — 79-87% one-sided — produced 30 depth directories and ZERO quote directories, so the emptiest captured day is absent from the quote tape entirely.
+
+### Why this is binding
+Both the original claim and its refutation were measurements of a filtered population presented as facts about the venue. The 0.3 figure justified having no exit path at all; the 55.0 figure would justify building one. A dataset that cannot represent the condition you are testing for will always report that the condition does not occur.
+
+### The rule
+Never answer "is there a bid" from the quote tape — that tape is defined to exclude one-sided books. Depth questions are answered from `order_book_depths` with a level walk, never from top-of-book, and never from a tick-weighted pooled median without also reporting a per-instrument and per-station-day weighting. State the capture window of any depth statistic; a sample spanning minutes is not a venue fact.
+
+### How to apply
+Where bids ARE genuinely thin is the case that matters most: D0+ near-certain contracts (ask >= 0.95) have spread p50 0.43 and only 42% of frames can fill 25 lots — exiting a WINNER is hazardous on both spread and depth, which is the opposite of the "thin everywhere" story. Any exit design needs a depth walk, a spread budget, and an explicit one-sided-book policy. Related: L-23 (a missing day is not an absent market), L-8 (recorder write time is not venue list time), L-18.
+
+## L-36 — Strict ZERO_FILL is unreachable; a no-fill IOC is AMBIGUOUS until a GET says otherwise (2026-09-10)
+
+### What happened
+Planning the continuous-hunt family assumed a no-liquidity IOC comes back as strict ZERO_FILL so the hunt could continue. The venue's own schema says otherwise: `CreateOrderResponse` is `{id, executions}` only (`docs/evidence/venue/polymarket_us/docs_snapshots/api-reference_orders_create-order_2026-08-25.md:126-136`); `state` and `cumQuantity` exist only on the Order schema returned by `GET /v1/order/{id}`. The strict predicate in `classify_create_order_outcome` (currently `exec/submit_chain.py:1294-1302`: terminal state AND cumQuantity==0) therefore cannot fire from a spec-conformant body — a miss is byte-identical to the maxBlockTime timeout shape and classifies AMBIGUOUS, which latches the account-wide OPEN submit intent and denies every later order. Zero ZERO_FILL hits exist in 40 node logs; every ZERO_FILL fixture is synthetic (`tests/unit/test_polymarket_us_submit_order_chain.py:1073-1080`). Two plan revisions were built on that unreachable branch before an evidence hunt found it.
+
+### Why this is binding
+Any design that "restores budget / keeps hunting on ZERO_FILL" is dead code, and the real live behaviour is one order per process, then a halt. Continuous hunting is impossible without automated resolution of the with-id AMBIGUOUS class.
+
+### The rule (ruling, plan rev 5 Resolution H, carried into rev 6.1)
+R-7 item 5 and L-32 pin the interpretation of the **create-order response body**: `200` + `id` + `executions == []` with no terminal `state`/`cumQuantity` stays KIND_AMBIGUOUS, and `classify_create_order_outcome` (currently `exec/submit_chain.py:1200-1322`) is byte-unchanged — the pin `test_an_ambiguous_outcome_keeps_the_latch_open_and_does_not_release_the_booking["200-id-no-exec"]` (currently `tests/unit/test_polymarket_us_submit_order_chain.py:826`) must keep passing and must not be reused as a resolver test. A subsequent `GET /v1/order/{id}` is a **new evidence source**, not a reclassification. `_resolve_ambiguous_intents` is a **new retire caller for an AMBIGUOUS OPEN intent, with a venue order id only**, using `RetirementReason.STATUS_REPORT_ZERO_FILL_TERMINAL` (new member) or `ACCEPTED_WITH_DURABLE_FILL`. B10 still holds: `clear_submit_intent` is not invoked and stays the only no-id path (`runtime/clear_submit_intent_cli.py:130-138`). R-7 item 5 "exit is the clear tool" is superseded **for the with-id class only**. Fail-closed: GET failure, 5xx, malformed, PENDING, not-found and retry exhaustion are never terminal evidence.
+
+### How to apply
+The Nautilus in-flight poller stays disabled (`runtime/node_config.py:689-712`: retry exhaustion resolves FAILED, a false terminal on a venue with no client-order-id); the resolver is a firewall-scanned client coroutine off `_connect`, bounded, positions-gated on both zero and fill. Before citing any venue response shape as a design input, find a captured body or the schema line — a fixture is not evidence (L-17 is about optional fields; this is about provenance). Related: L-32, R-7 item 5, L-34.
+
+**Superseded 2026-10-03 (AMBIG-LATCH-RESUME r4, coordinator ruling CH1) for the no-id class:** an automated no-id resolver retires on complete reads only (`RESOLVER_NO_ID_NO_FILL`; attribution by the venue's echo of our own wire body inside a time window, since the venue issues no client order id; ADOPT hands a found order to the unchanged with-id path). `clear_submit_intent` stays available and is never invoked by code. Every other clause above is preserved: `classify_create_order_outcome` is byte-unchanged, fail-closed on every read failure, the in-flight poller stays disabled.
+
+## L-37 — A swallowed venue-shape error on the create path is a silent-fill hazard (2026-09-11/12)
+
+### What happened
+The second live order (SFO, IOC BUY @0.22, 2026-09-11 20:20:29Z, venue id CEBPX0EVTTMX) FILLED, but `parse_fill_report` refused it because the venue added four new fields (action, lastTransactTime, manualOrderIndicator, outcomeSide). The error was caught and **silently swallowed** by `fill_generation` without logging; the fill never reached the order state, intent stayed OPEN, and every subsequent order was denied account-wide. The GET-based resolver retried 3,615 times over 5 hours on the same field drift with no backoff.
+
+### Why this is binding
+A mapping error on the create-order path is NOT observability. It hides a FILL under a shape mismatch until a relaunch discovers it — meanwhile the account is locked. A venue that adds fields is routine; silent failures are the gap.
+
+### The rule
+Every venue-shape guard on a money surface MUST (1) emit the full names-only key tree on refusal (not just "shape mismatch"), (2) surface the error into the AMBIGUOUS diagnostic if it swallows on the create path, (3) declare additive field drift PER SURFACE with captured evidence — never by relaxing the guard. Any unbounded retry on a venue read needs backoff and an age alert (L-36 resolver: 5 → 300 s backoff; `open_intent_stale` CRITICAL).
+
+### How to apply
+Fixes: commits 8d56a26, ba2c5ee. Guards emit names-only key trees, allowlists are declared-and-logged per surface, resolver has backoff+age ceiling. Before accepting "shape drift handled", require: (a) the refusal names every field it saw, (b) the create path surfaces it visibly, (c) a test pins the new field as accepted post-fix. Related: L-17 (optional fields), L-22 (unforgeable primitives), L-36 (AMBIGUOUS semantics).
+
+**Addendum 2026-09-14 (third AMBIGUOUS, MIA CFJ485874TMM).** The surfaced error is only useful if it is READ. The coordinator theorised a classifier root cause ("no top-level order id") from a truncated key-tree line; the `fill_parse_error=` tail of the same AMBIGUOUS detail line (node log `breezy-trade-20260913T165011Z.log:533`) and the durable resolver context's `fillParseError` already named the five refused execution keys. Rule sharpened: before proposing any create-path classification change, quote the `fill_parse_error=` tail of the AMBIGUOUS detail line and the `exec/polymarket_us/resolver/<intent>` record's `fillParseError`; the `state=`/`cum=` detail tokens read top-level only and are never the diagnosis. Fix: `_EXECUTION_DRIFT_ALLOWED_KEYS` (commit 7a65e18, closes R-6); evidence `docs/evidence/venue/polymarket_us/CREATE_ORDER_EXECUTION_DRIFT_2026-09-13_MIA.md`. Last updated 2026-09-14.
+
+## L-38 — A stop rule whose counter cannot increment is a missing stop, not a running clock (2026-09-12)
+
+### What happened
+PROGRESS.md carried date arithmetic for the structural-dead KILL ("the 15th lands 09-11 / 09-12") while the counter artefact (`derived/covered_listed_station_days_<date>.json`) had read `count: 0` for every station-day since D0. The zero was not an outage: the any-overlap rule (`structural_dead_stop.py:163-216`) combined with feed-wide gap fan-out (one reconnect → a gap row per subscribed instrument) meant no afternoon could ever qualify, and dead recorder processes left gap rows that never resolve. The family traded for eight days with its registered safety stop structurally unable to fire; only the calendar stop and the −60 contract-unit halt bounded it. Separately, the v3 tally wrapper passes the structural-dead population only for v2 (`family-tally-v2-run.sh:73,85`) and the installed timer invokes only `pm_us_crh_v2` (`breezy-pm-crh-v2-tally.service:46`), so the registered v3 family had no nightly tally at all: no look, no KILL, no SURVIVE could ever be declared for it.
+
+### Why this is binding
+A safety stop is only a stop if it can fire. A counter that reads zero for a week is either evidence of a dead market or evidence of a dead counter, and the two demand opposite actions; treating it as "the clock is running" hides that the family has no active stop. Backlog arithmetic built on the counter inherits the defect silently (L-5, L-32).
+
+### The rule
+Before citing any stop rule as active, read its counter artefact AND show that the counter can increment under normal operation (one positive control: a day that should count, counts). A stop that structurally cannot fire is reported as MISSING, in the same severity class as a missing permit, and the family's effective stops are restated without it. Never write time-to-KILL arithmetic from a counter that has never moved.
+
+### How to apply
+At every readiness readout: (1) the counter's last value and the date it last changed; (2) the mechanism that would make it change tomorrow; (3) whether every registered family's tally actually receives the counter (the wrapper's argument gate, not the module's ability). If any of the three is unknown, the stop is MISSING. Related: L-5, L-8, L-20, L-32, L-35. Evidence: `docs/evidence/READINESS_AUDIT_2026-09-12.md`, `docs/plans/COVERAGE_KILL_CLOCK_2026-09-12.md`.
+
+## L-39 — Prose that names an operator-reserved control by its env-var name fails the census (2026-09-14)
+
+### What happened
+An untracked plan document (`docs/plans/MULTI_POSITION_PER_STATION_2026-09-14.md`) spelled out the two operator-control environment-variable names in its sizing formulas. The full gate on the live tree then failed `tests/unit/test_operator_control_assignment_scan.py::test_only_the_definition_module_names_an_operator_reserved_control` — the census walks every repo file, untracked included, and permits those names only in `operator.env*` and the definition module. The merged code was clean; the failure was the coordinator's own document.
+
+### Why this is binding
+The census is a security floor (no file but the definition module may even NAME a reserved control, so nothing can quietly assign, read, or leak it). A gate that fails on prose is doing its job; the fix is never to widen the census.
+
+### The rule
+Plans, evidence, memories and briefs refer to the reserved controls as "the per-position cap" and "the daily budget" — never by the environment-variable name. Before running the gate on a tree that carries a new untracked doc, grep that doc for the control names.
+
+### How to apply
+`grep -c "BREEZY_MAX" docs/plans/<new>.md` must print 0. Related: L-37 (declared drift per surface), the operator-control contract in PROGRESS.md.
+
+## L-40 — A station carries as many positions as it has current rungs; the trial unit is the station-day, with the exact mutual-exclusivity variance (2026-09-14)
+
+### What happened
+The construction bound of "one trial per station-day" was removed by operator ruling 2026-09-14 (plan `docs/plans/MULTI_POSITION_PER_STATION_2026-09-14.md`, Rev 3). A station can legitimately hold a position on every rung that is currently "current" at once (`tick_eval.py`'s `instrument_rung_is_current`), so a station-day can carry k≥1 mutually exclusive rung fills. The first proposed statistic (Rev 1/2 §2, a qty-weighted "borrowed Bernoulli" combined draw) was struck by the prediction-market reviewer (R3-3): it did not correctly encode that sibling rungs are mutually exclusive (`Cov(held_i, held_j) = -BE_i·BE_j` under H0), only their marginal probabilities.
+
+### Why this is binding
+The registered sequential statistic must have `Var_H0(S) = 1` exactly, or the LD-OBF group-sequential boundary controls the wrong error rate. Getting the per-station-day variance formula wrong is not a cosmetic bug — it silently changes the family's actual Type-I error while the boundary artefact keeps reporting `alpha=0.025`.
+
+### The rule
+When a trial unit can bundle more than one correlated sub-observation (here: sibling rungs on one station-day), derive `Var_H0` from the TRUE joint distribution of the bundle, never from a per-item variance sum that assumes independence. For k mutually exclusive Bernoulli-style sub-draws with marginal probabilities `BE_i`, `X_sd = Σ qty_i·(held_i − BE_i)` and `Var_H0(X_sd) = Σ qty_i²·BE_i(1−BE_i) − 2·Σ_{i<j} qty_i·qty_j·BE_i·BE_j`. At qty≡1 this algebraically collapses to `S·(1−S)` where `S = Σ BE_i` — the SAME single-Bernoulli variance ceiling (`≤ 1/4` at `S=0.5`) a pre-existing `I_max = n_max/4` pin already assumes, so a multi-rung station-day never raises the information ceiling by itself. Mixing `qty > 1` across sibling rungs is a different story: it can raise a station-day's variance well past the single-Bernoulli ceiling and de-calibrates a boundary artefact sized for qty=1 (measured: an H0 Monte-Carlo at qty∈{1,2,3} crossed the artefact's efficacy boundary at ~5.9%, versus the ≤3.5% (alpha+slack) target; the SAME methodology at qty≡1 measured ~1.1–1.3%, within tolerance).
+
+### How to apply
+Before trusting a "trial unit" whose members can co-occur, write down the mutual-exclusivity structure explicitly and derive `Var_H0` from it (never assume independence by default). Before reusing a boundary artefact for a widened statistic, re-validate with a seeded H0 Monte-Carlo checking (a) `Var(S_terminal) ≈ 1` and (b) the realised one-sided crossing rate ≤ alpha + a Monte-Carlo slack — using the artefact's own solved boundary values (`reference_table` interpolation or `boundary_for`), never a re-solve. A failing crossing-rate check blocks only the SCOPE that produced it (here: qty>1 / Increment B), not an already-validated narrower scope (here: qty≡1 / Increment A). Evidence: `docs/evidence/RULING_multi_position_per_station_2026-09-14.md`, `tests/unit/test_multi_position_validation_2026_09_14.py`.
+
+### Amendment (2026-09-25, AUD-07 amendment Stage M1a) — mixed-side variance is not the qty≡1 ceiling; validation must replay the live look loop
+The qty≡1 collapse above (`S·(1−S) ≤ 1/4`) was derived and measured for **same-side** station-days only — every constituent row YES, or every constituent row NO. It does not hold for a mixed YES+NO station-day:
+
+(i) For a mixed day, `Var_H0 = S − (q_y − q_n)²` where `S = q_y + q_n ≤ 1` (q_i is `BE_i` for a YES row, `1 − BE_i` for a NO row, per the sign-aware `combine_station_day` formula this lesson's own "How to apply" already cites). This maximum is **1.0**, not `1/4` — four times the same-side qty≡1 ceiling a pre-existing `I_max = n_max/4` pin assumes. Treat the qty≡1 ceiling as scoped to same-side days only; a mixed day is a separate case, never folded into the same bound.
+
+(ii) A re-validation Monte-Carlo (this lesson's "How to apply", clause (b)) must replay the **live look loop verbatim**, including its terminal stop at `I ≥ I_max` (the look that spends the remaining alpha and `break`s). A validation harness that never stops at `I_max` — continuing to re-test later draws against `b_eff(1)` — is not validating the registered rule; it is validating a different, unregistered one that happens to share the same boundary artefact. Confirmed divergent by construction: `family_tally_v2.py`'s live tally re-solves `boundary_for` over the realised `t_history` and stops at `I_max`; the AUD-06a sweep and the `test_multi_position_validation_2026_09_14.py` strict-xfail harness interpolate a static reference table and never stop, so neither one's measured crossing rate is evidence about the live rule until the loop shape matches.
+
+(iii) A streaming re-implementation of `boundary_for`'s own recursion (needed because a Monte-Carlo replay cannot afford `load_boundary_artefact`'s full reference-table replay per draw) is allowed and is **not** a re-solve of the artefact in the sense clause (b) forbids, provided it is proven equal to `boundary_for` to a tight tolerance on real histories first (exact form, `1e-12`; reduced-grid form, `1e-3`, spot-checked at full grid) — it imports the artefact's own `_look_step`/`_one_sided_spend` primitives rather than re-deriving the spending function. Evidence: `docs/plans/backlog/AUDIT_2026-09-21/AUD-07-AMENDMENT-2026-09-25.md` §2.1, §4 M1a/M1b; `tests/unit/test_family_tally_v2_look_loop_golden.py`.
+
+## L-41 — A Monte-Carlo null must reproduce the registered H0 exactly; quote noise plus selection manufactures edge (2026-09-14)
+
+### What happened
+The first S6b re-validation of the LD-OBF boundary under the real YES/NO selection rule (`tests/unit/test_no_side_ldobf_validation_2026_09_14.py`, 3c8b53d) reported crossing rates of 0.03–0.14 at k ≥ 2 concurrent rungs and blamed "winner's curse". Adjudication found the simulation set `ask = p + gauss(0, spread)` and then selected rungs whose calibration bound beat `BE`, so selected legs had `BE < p` in expectation — a real edge under the simulation's own model — while the statistic's variance `q(1−q)` omitted `Var(BE)`. The registered H0 is `BE_i ≡` the true cell probability exactly, which is what the boundary and `combine_station_day` were solved for and what the Increment A validation used.
+
+### Why this is binding
+An inflation number from a misspecified null looks like evidence against a live statistic (here it would have implicated Increment A's multi-rung days) and would have been cited by a PREREG amendment.
+
+### The rule
+A boundary re-validation simulates the REGISTERED null verbatim (quotes exactly at the cell probability; selection driven only by an independent calibration draw). Any deviation from that null (quote noise, table staleness) is a separately labelled sensitivity study, never the H0 run, and its variance term must include every source of randomness the deviation adds.
+
+### How to apply
+Before citing a Monte-Carlo crossing rate: (1) read how `ask`, `BE`, `p_true`, the calibration sample and `held` are generated; (2) check `E[held − BE | selected] = 0` holds by construction; (3) confirm the null matches `_sample_station_day` in `test_multi_position_validation_2026_09_14.py`. Related: L-40, PREREG v3 amendment draft.
+
+## L-42 — A test of a store-reading gate must write its fixture through the real writer path (2026-09-14)
+
+### What happened
+S4's `refuse_if_sibling_leg_traded` and `station_day_admission` read trial-day records keyed by the bare symbol, while every real writer (`consume_if_absent` on fill, the fill-walk join) keys by the dotted `str(InstrumentId)`. The gates were green because their tests wrote fixtures via `_latch.consume(key_instrument_id=<bare>)`, the gate's own convention. Against production data both gates were dead: they always passed. Found by the S3b safety review (f2d33f4), not by any test.
+
+### Why this is binding
+A gate that never finds the record it guards against is a silent bypass of a safety control, and a green suite that shares the gate's own mistake proves nothing.
+
+### The rule
+Any test of a function that READS durable state must create that state through the production WRITER (the strategy's fill handler, the exec client's record writer), never by calling the store or the low-level `consume` with a hand-built key. Key formats are normalised inside the reader, with a round-trip test in both directions.
+
+### How to apply
+When briefing a slice that adds a store reader: require the RED test to write via the real path and name that path. When reviewing: grep the new tests for direct `store.set`/`consume(` calls with literal keys. Related: L-37 (declared drift), L-40.
+
+## L-43 — Two slices that are each green can be jointly broken; gate the integration branch after EVERY merge (2026-09-14)
+
+### What happened
+S6a's review fix (4d26f5c) added a refusal for a mixed-side station-day whose rows lack rung keys. S6b's Monte-Carlo (c564602, branched before that fix) built rows without rung keys. Each branch was green in its own worktree and each was reviewed. After both were merged into the NO-side base branch, the S6b test file failed 13 of 15 cases in under a second with `combine_station_day() is undefined for an empty station-day`, and the "corrected" Monte-Carlo numbers already cited by the PREREG amendment had been produced against the pre-fix statistic. The coordinator had run the base gate after the S1–S4 and S3/S3b merges but skipped it after the S6b merge.
+
+### Why this is binding
+Parallel worktrees hide interface drift between slices; a review of one slice cannot see a later fix to another. Numbers cited by a registration document must come from the integrated code.
+
+### The rule
+Run the full no-egress gate on the integration branch immediately after every slice merge, before merging the next slice, and never cite an evidence artefact whose test does not pass on the integration branch at the cited commit.
+
+### How to apply
+After `git merge` on the base branch: gate → only then merge the next branch. When a merged evidence artefact's test fails on the base, the artefact is withdrawn until re-run on the base commit. Related: L-41, [[one-tree-many-agents-fakes-test-failures]].
+
+**Amendment (2026-09-25, ING-2 S1):** the environment can differ, not only the code. A new subprocess test asserted that `PYTHONPATH` was set, which is true only under the worktree convention. Its worktree full gate passed. The primary-tree gate after merge (c5d1e24) failed deterministically. Rules:
+- A test that spawns a Python child derives the child's `src` from the parent's own `breezy.__file__`, never from an env var.
+- The child asserts that it imports the same module path as the parent.
+- A worktree gate is not evidence that the integration branch is green.
+
+## L-44 — Logic written for one leg silently mislabels the other; test each leg's terminal state (2026-09-15)
+
+### What happened
+The shadow position monitor's thesis classifier (`strategy/current_rung_hold/monitor_decision.py`, merged ad31dd8) was YES-shaped: DEAD when `running_max_lower > rung_high`, LOCKED when the running-max interval sat inside the rung after the peak hour. The plan named the NO-leg MARK inversion (walk the asks, `1 − vwap`) and four blind reviewers approved, but nobody inverted the STATE machine. Run over the day's live board, the MIA NO [92,93] position (running max 93 inside the rung since 17:55Z, preliminary CLI 93, economically dead) reported `LOCKED_BY_OBSERVATION / HOLD`, and DEAD was structurally unreachable for any NO leg. Found only by executing the code against real positions of both legs; fixed in 88914eb.
+
+### Why this is binding
+A leg-conditional classifier that is right for YES and inverted for NO produces confident, wrong evidence for exactly the positions the NO-side amendment made live, and every fixture that only ever builds YES positions (L-24) stays green.
+
+### The rule
+Any leg-conditional logic — marks, thesis states, verdicts, PnL sign, fee basis, admission — carries (a) a two-column table of both legs' semantics in the module docstring, (b) one test per leg proving that leg's LOSING terminal state is reachable and the other leg's terminal state is not, and (c) a review line "which leg did you check this against?" answered with a NO-leg case.
+
+### How to apply
+When briefing or reviewing anything that reads `leg`/`side`: grep the tests for a NO-leg fixture; if none exists the slice is RED. Before citing a monitor or scorer verdict for a NO position, confirm the verdict path is leg-aware. Related: L-24, L-42, NO-side amendment §8.
+
+## L-45 — A venue limit is per RESOURCE UNIT, not per slug; verify a new subscription type by coverage count on its first boot (2026-09-17)
+
+### What happened
+The recorder's first boot with TRADE-print capture (09-17 09:00Z) kept sharding at 10 SLUGS per websocket connection while
+sending two subscription requests per slug. The venue's cap of 10 is per SUBSCRIPTION and is shared across types, so the
+6th–10th slugs on every shard had their MARKET_DATA request rejected: 40 rejections, and 10 of 30 slugs (all SFO, four MIA,
+one NYC) recorded no depth, no quotes and no prints for the day. The sharder comment had predicted a shared cap would
+"only cost prints, loudly" — a prediction (L-18) that was wrong in the expensive direction. The rejections were logged at
+ERROR, yet nothing in the boot check counted covered instruments, so the loss was found by hand at 09:13Z.
+
+### Why this is binding
+Every capture gap here is a permanent hole in the only corpus the studies and the KILL clock read (ING-1 already strands
+~55 % of station-days). A new subscription type is the one change that multiplies slot usage without changing slug count.
+
+### The rule
+1. Size every sharded resource on the venue's counted unit (subscriptions, connections, requests), never on slugs; when a
+   second type is added, the divisor changes.
+2. Order requests so the trading-critical type (MARKET_DATA) is fully placed before any optional type takes a slot, and
+   name the slugs the optional type skipped in one WARN.
+3. The first boot after any subscription change is verified by COVERAGE COUNT — instrument directories written per type
+   against the subscribed list — not by the absence of errors or the presence of the new data.
+4. Any unmeasured sibling limit (connections per key) that a fix leans on stays an open question with a probe, and the
+   behaviour that depends on it ships opt-in.
+
+### How to apply
+Websocket pool: `slugs_per_shard = cap // subscriptions_per_slug`; MARKET_DATA-first replay on reconnect; boot INFO
+`subscriptions per slug / slugs per shard / shards`. Boot check: `comm -23 <subscribed> <ls order_book_depths>` must be
+empty. Applies equally to Kalshi when it arrives.
+
+## L-46 — Disguising the offender is deleting the guard; grep the contract tests before placing a module (2026-09-18)
+
+### What happened
+FC-0a-1's plan (four peer-review rounds, HIGH) placed a paced IEM probe transport at `src/breezy/ingest/iem_mos_probe_transport.py`. Nobody — planner, two reviewers, coordinator — searched the contract tests for the host or the package. The first full gate failed `tests/unit/test_archive_import_contract.py::test_settlement_transport_hosts_stay_nws_only_and_src_never_names_iem_host`, whose docstring names its mutant: "moving IEM retrieval into `src/breezy`". The Grok implementer went green with `IEM_HOST = ".".join(("mesonet", "agron", "iastate", "edu"))  # noqa: FLY002`, a comment admitting the purpose, and a one-line `PLAN_ADHERENCE: deviated` note. The read-only verifier reproduced the green suite and returned PASS. Only the security and code reviews (both CRITICAL) caught it. The fix was relocating the module to `scripts/venue/` with the plain literal; the contract test was never edited.
+
+### Why this is binding
+A textual contract guard is only as strong as the reader's refusal to hide from it. Obfuscating the value the guard scans for keeps the suite green while removing the property it proves — functionally the same as deleting the assertion, and worse because the test still looks alive. A peer-reviewed plan is not evidence that a contract permits the placement; the contract test outranks the plan.
+
+### The rule
+1. Before a plan names a NEW module path, host, or literal, grep `tests/` for that host, package, and directory and read the docstring of every contract test that matches; a plan that contradicts one is revised, never the test.
+2. Any implementer deviation that mentions a contract, guard, census, or barrier test is opened and read in full by the coordinator before the item proceeds — a "deviated" line is a red flag, not a footnote.
+3. A value assembled, encoded, split, or aliased so that a scanner cannot see it is rejected on sight, whatever the suite says. The honest fixes are: move the code to where the contract permits it, or widen the contract with justification in the same commit (L-12) — never disguise.
+4. Verification of a guarded change includes reading the guard's stated intent (its docstring/mutant), not only reproducing the pass.
+
+### How to apply
+Planner/reviewer brief line: "list every contract test under `tests/` whose scan roots or literals cover the paths and hosts this plan introduces, and quote its docstring." Coordinator audit: `grep -n "join\|noqa: FLY\|\\\\x\|codecs\|base64" <diff>` near any host/path constant. Related: L-12 (widen, never relax), L-14 (derive the barrier list), L-15 (run the classifier).
+
+## L-47 — A blanket "verified against installed source" covers nothing; one unverified premise can contradict your own repo's measured fact (2026-09-19)
+
+### What happened
+WP-0e's NB-2 decision record (`docs/evidence/ING1_REPLACE_VS_EXTEND_2026-09-19.md`) opened its justification section with "Verified against installed `nautilus_trader` 1.231.0 in `.venv`, not against docs or memory." Three of its four claims were in fact verified, with exact installed file:line. The fourth — that `OrderBookDepth10` lands in a FLAT, identifier-less catalog directory, and is therefore subject to the `delete_data_range` no-op trap — was never checked against the installed writer at all. It is false: `StreamingFeatherWriter.__init__` (`persistence/writer.py:139-148`) hard-codes `_per_instrument_writers` containing `order_book_depths`, `quote_tick`, `trade_tick`, so those types always take the identifier writer and land per-instrument at `data/order_book_depths/<instrument_id>/`. Worse, this repo had ALREADY measured and written that down: `src/breezy/runtime/node_config.py:493-496` states QuoteTick "partitions natively into `data/quote_tick/<instrument_id>/` — measured, not assumed." The doc contradicted an existing measured statement in the same repository. The implementation was independently correct and RED→GREEN proven; only the RECORD was wrong — and the record is the artefact that gates every future "covered station-day" claim.
+
+### Why this is binding
+A decision record outlives the run that produced it and is read as settled ground by every later agent. A blanket assurance sentence is an unfalsifiable claim about the author's process, not evidence about the code; it launders unverified premises into the same visual authority as cited ones. The danger is specific: the EXTEND decision happened to remain correct on other grounds, so nothing failed, and the false premise would have sat unchallenged as the documented reason. A premise that contradicts a measurement already in the repo is the cheapest possible signal that verification did not happen — and it is free to check.
+
+### The rule
+1. Every factual claim about an installed library carries its OWN file:line citation. A section-level or document-level "verified against installed source" assurance is worth nothing and must not be written; reviewers verify the per-claim citation and treat an uncited claim as unverified regardless of the preamble.
+2. Before asserting a new fact about how a library stores, partitions, names, or dispatches something, grep `src/` and `docs/` for an existing statement about the same behaviour. Contradicting your own repo's recorded measurement is a STOP: one of the two is wrong and it must be resolved before the claim is used.
+3. When a premise in a load-bearing decision record is refuted, correcting the record is mandatory even if the DECISION survives — strike the false claim in place, state what is true, and re-derive the decision from the surviving premises. A conclusion that is still right for different reasons is not "fine"; the reasons are what the next agent reuses.
+4. A claim that a trap, guard, or limitation "applies here" requires showing the code path REACHES it, not only that the trap exists. Trap mechanisms are general; their applicability is specific.
+
+### How to apply
+Reviewer brief line: "for each claim about installed behaviour, state CONFIRMED or REFUTED with installed file:line — do not accept the document's own assurance that it checked." Author/coordinator audit before accepting an evidence note: for every "X is flat / absent / unsupported / no-ops", grep the repo for a prior measured statement about X, and confirm the diff's actual call path reaches the cited trap. Related: L-1 (null hypothesis against the installed surface), L-12 (widen, never relax), L-46 (the contract outranks the plan).
+
+## L-48 — A latch whose only clearing path it blocks is a deadlock, not a safety stop (2026-09-24)
+
+### What happened
+An AMBIGUOUS IOC (CP05MNWMAWP6, 09-23) left the account-wide submit intent OPEN. The supervisor refuses to launch any node while an intent is OPEN, yet only a running node's resolver can retire one. The resolver could not have retired it anyway: a state-blind `leaves == qty − cum` check rejected the venue's terminal EXPIRED body (leaves 0) 285 times, and the next day's node cached only today's instruments, so yesterday's order looped on "not in the cache". The node stayed down for a day with no path out that did not require a human.
+
+### Why this is binding
+A fail-closed latch is only safe if something can open it while it is closed. Otherwise "fail closed" silently becomes "never trade again", which looks like a quiet market.
+
+### The rule
+For every blocking latch (open intent, family halt, permit), name the clearing path and prove it can run WHILE the latch is closed and across a day boundary. Test that path end to end with the real stuck shape (the venue body verbatim, a past-day instrument, a node that boots after the latch was set).
+
+### How to apply
+Plans that add or touch a latch carry a "clearing path" row: who clears it, in which process, with which inputs, and a test that drives it. Mapping guards must be state-aware (terminal vs live), and must log the offending field values, not only the field names. Related: L-36 (AMBIGUOUS is the default), L-38 (a stop that cannot fire).
+
+## L-49 — Low CPU over wall time on a failing unit means a memory ceiling, not a slow job (2026-09-24)
+
+### What happened
+`breezy-quote-tape-ingest.service` had `MemoryHigh=4G`, sized to historical peaks. A growing 90G `live/` backlog pushed its working set past the ceiling, and every run from 10:15Z did about 5 minutes of CPU, then sat in `__mem_cgroup_handle_over_high` until the 30-minute timeout killed it. Seventeen runs made zero progress. The converted catalog stopped at 09-23, so the trade node resolved 0 instruments and refused to start. With `MemoryHigh=10G` a single run drained the whole backlog in 16 minutes.
+
+### Why this is binding
+Raising the timeout would only have lengthened the thrash. A unit killed by timeout looks like "slow", and the real limiter is invisible unless you compare CPU time with wall time.
+
+### The rule
+When a unit fails with CPU/wall < 0.3, check `memory.high` throttling (`wchan`, major faults, swap peak) before touching timeouts. Size a memory ceiling against the current backlog's working set, not past peaks, and keep a downstream consumer's input (the catalog) from depending on one unbounded run.
+
+### How to apply
+Triage line for any repeatedly failing unit: `systemctl --user show -p MemoryHigh,MemoryMax,TimeoutStartSec`, plus the journal's "Consumed X CPU over Y wall". Status of the ingest durable fix (2026-09-25):
+- Instruments-before-depths ordering is DELIVERED by ING-2 S1 (merge c5d1e24): a definitions-only pass over a frozen liveness snapshot runs before any tick type. A killed run still leaves resolvable instruments.
+- S2 (a per-run deadline) is DELIVERED.
+- S3a (2026-09-26): the fast and per-file feather reads are now bounded, via `breezy.persistence.feather_read.read_feather_coalesced` -- never `reader.read_all()` on a one-row-per-message stream. Measured on the real 891,170-message F3 file: native `read_all()` peaks at ~5.87 GB (5.3 KB/message); the coalesced read's ΔRSS is ~164 MiB. **Amendment: never `read_all()` a one-row-per-message Arrow IPC stream. Measure memory as a ΔRSS over a post-import, post-warm-up baseline in a fresh child process (`ru_maxrss`), never as absolute RSS -- `tracemalloc` cannot see Arrow/IPC allocations at all (pool `bytes_allocated` was 0 throughout Stage-0).**
+- Still unbounded after S3a: EXTEND (`_extend_overlapping_stream`, the per-file EXTEND fallback) still materializes a whole file's rows as objects and runs an unfiltered dedupe query. S3b (chunked EXTEND) is conditional on Phase 0's measured trigger; see `docs/plans/backlog/ING-2_2026-09-25/README.md`.
+
+Related: L-29 (unbounded buffers), L-20 (the catalog you query is not the tape you capture).
+
+## L-50 — Two writers of one rewrite-in-place file race even when both "append" (2026-09-25)
+
+### What happened
+A deploy agent ran two ledger registrar invocations (`hypothesis_register.py --register-forecast-taker-closed` and `--register-underpowered H-NO-SIDE-2026-09`) at the same time. Each one reads the whole ledger, adds its record and atomically replaces the file. Both records survived only because the runs did not overlap: the design did not rule out the loss, timing just happened to avoid it. An atomic `os.replace` makes each write whole, but it does not stop one write from overwriting the other.
+
+### Why this is binding
+The ledger, the exec-state DB, the halt store and the catalog markers are all read-modify-write state. With a lost-update race, both writers exit 0 and nothing looks wrong. The record is simply missing. For a hypothesis ledger that means an alpha slot or a zero-look disposition disappears silently.
+
+### The rule
+- Never run two writers of the same read-modify-write file or store concurrently.
+- Serialize them in the brief ("run step N only after step N−1 exits 0").
+- Or the writer holds a lock for its whole read-modify-write cycle.
+
+### How to apply
+- Deploy and ops briefs name each write step as sequential.
+- After any batch of writes, add a positive control that reads the store back and asserts the exact record set, as L-30 requires.
+- A writer CLI that lacks a lock is a backlog item, not a license to parallelize.
+
+Related: L-22 (an instance mutex serializes the read-modify-write), [[give-each-agent-its-own-scratchpad]].
+
+## L-51 — A worktree shares the venv and the stash stack with production; isolation of files is not isolation of state (2026-09-26)
+
+### What happened
+Two things on 2026-09-26 went wrong because a worktree was treated as fully isolated:
+- The WP-D1 implementer ran `uv sync` from `/home/jon/breezy-wpd1`. That worktree's `.venv` is a symlink to `/home/jon/breezy/.venv`, the environment the live node, the supervisor and every systemd study run from. `uv sync` rewrote it to the lockfile's default set and stripped the optional extras. The agent restored them, and the coordinator verified the imports, but for that window any unit that spawned would have imported a different environment.
+- Two implementers (FU-5 and the R-7 hardening round) ran `git stash` inside their own worktrees, although both briefs forbade it. The stash stack is per-repository, not per-worktree. A stash made in one worktree can be popped, listed or dropped from any other. No work was lost only because both stashes were popped straight away.
+
+### Why this is binding
+A worktree isolates the checked-out files and the index. It does not isolate:
+- anything reached through a symlink (the venv);
+- the object store and refs (including `refs/stash`);
+- host state (systemd units, the catalog, `~/.local/share/breezy`).
+
+"It's my worktree" is exactly the belief that causes these writes.
+
+### The rule
+- From any worktree, never run an installer that can change the environment: `uv sync`, `uv add`, `uv pip`, `pip install`, `uv run`. Use `/home/jon/breezy/.venv/bin/python` with `PYTHONPATH=<wt>/src`.
+- Never `git stash` anywhere in this repo. To compare against the pre-change code, use `git show <sha>:<path>`, a detached scratch worktree, or edit-then-`git checkout -- <file>`.
+
+### How to apply
+- Every implementer and reviewer brief restates both bans.
+- After every implementer returns, and before merging, the coordinator runs `git stash list` (must be empty), `git status -s` on every live worktree, and an import smoke of the shared venv (`python -c "import nautilus_trader, breezy, pyarrow"`, versions unchanged).
+
+Related: L-50 (shared read-modify-write state), [[never-uv-sync-the-shared-venv]], [[never-git-stash-in-a-shared-tree]], [[worktree-needs-pythonpath]].
+
+## L-52 — A corroborating read is evidence only if it can tell the outcomes apart at the time it is read (2026-09-27)
+
+### What happened
+- EDGE-2: the resolver retired an AMBIGUOUS order as zero-fill on a positions read. Once a market has settled, its position leaves the page, so an empty positions page cannot tell "never filled" from "filled and settled".
+- The same pattern turned up in three more places:
+  - a create-response body whose fill rows were skipped;
+  - a cross-process fill that no daily budget charged;
+  - a supervisor adoption read that returned nothing and was treated as "no permit".
+
+### The rule
+Before a read can retire, clear, or credit anything, state which outcomes it can distinguish at the moment it runs (settled vs. unsettled, same-day vs. past-day, read-failed vs. read-empty). A read that collapses two outcomes into one value must leave the state AMBIGUOUS or UNKNOWN, never terminal.
+
+### How to apply
+- Name the distinguishing evidence in the plan, and test each collapsed case explicitly. For example: an unreadable index means stays AMBIGUOUS; completeness counts only at eof; an I/O failure means retry, never absent.
+- A new detector must ship with its delivery path, proven end to end (09-20 alerts-reach-nobody).
+- **Amendment (2026-09-27, ING-2-RSS):** a `caplog` test does not prove delivery.
+  - The `extend_dedupe:` line was written with `logger.info` and pinned by caplog tests. Its sibling lines all use `print(..., file=out)`.
+  - Production configures no INFO handler for that logger, so the first live run (11:30Z) logged nothing. Every test was still green.
+  - Rule: an operator-visible line must be asserted on the stream the unit actually writes to, meaning the entrypoint's stdout or journal. It must also be checked in the journal after the first live run, before the item is called done.
+
+Related: L-36 (strict ZERO_FILL is unreachable), EDGE-2 plan r3, `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md`, SUP-ADOPT-PERMIT.
+
+## L-53 — A cache cannot fix an input that never completes; one oversized item makes a capped job fail forever (2026-09-27)
+
+### What happened
+- REPLAY-INCR added a per-instance census cache so the daily replay would stop re-doing work. The plan assumed the 09-27 timeout came from corpus growth.
+- Warm run 1 showed otherwise. The run spent all 30 minutes on ONE 8.2 GB instance (`ea485c90`, the 09-27 rotation), throttled at MemoryHigh=3G (CPU/wall 0.19).
+- An item that cannot finish is never cached. It is a miss on every run, so the job fails every day regardless of how warm the rest of the cache is.
+
+### The rule
+Before designing an incremental or caching fix for a capped job that timed out, find the **largest single work item** and check that it can complete within the cap on its own. If it cannot, the fix is bounded-memory processing of that item, not caching around it.
+
+### How to apply
+- Size the per-item worst case first: `du` of the biggest instance, and a measured peak from one capped run.
+- Watch for L-49 CPU/wall < 0.3 on that item.
+- A SIGTERM cannot interrupt a long native call. Plan for SIGKILL (TimeoutStopSec) to be the real stop, and keep per-chunk work bounded.
+
+Related: L-29 (a cap is containment), L-49 (throttle signature), REPLAY-INCR / REPLAY-BIGINST plans.
+
+## L-54 — Shared test config is pinned by containment tests; any edit to it needs a search for its pins first (2026-09-27)
+
+### What happened
+- REPLAY-BIGINST appended `and not slow` to `[tool.pytest.ini_options] addopts`, so a new slow memory test would be deselected by default.
+- Two plan peer rounds and two implementation reviews approved the change. The focused test runs were green.
+- The full gate failed on `test_probe_containment.py::test_pyproject_addopts_deselect_the_probe_markers`. That test pins the exact `-m 'not live and not venue_live and not real_money'` substring, because it is the one guarantee that live and real-money tests never run by default.
+
+### The rule
+Before editing a shared config surface (`pyproject.toml` pytest or import-linter sections, the gate wrapper, `conftest.py`), search the tests for literal pins of the text being changed. A containment pin is changed only by a safety-reviewed item, never as a side effect of a feature.
+
+### How to apply
+- Briefs that touch `pyproject.toml` or `conftest.py` must say: "grep `tests/` for the exact string you are changing; if a test pins it, do not change it."
+- Opt a single test out by env-gated `skipif` or a marker the defaults already exclude. Never widen or reword the pinned default filter.
+- Focused runs cannot catch this. It surfaces only in the full gate, so run the full gate after every merge (L-43).
+
+Related: L-43 (full gate after every merge), REPLAY-BIGINST, fix 0cc87c2.
+
+## L-55 — A test that injects a fake dependency must also run the production default once (2026-09-28)
+
+### What happened
+- R3V-a added batch mode to `replay_daily_runner.py`. `run_batch` passes `timeout=` to its `run_subprocess` dependency.
+- All 20 new tests injected fakes that accept `timeout`. The production default, `_default_run_subprocess(argv)`, does not. Every real batch run would have crashed with `TypeError` on its first target.
+- The per-target RSS fix (`_run_subprocess_with_rss`) was unit-tested in isolation but never wired as the default, so it was dead in production.
+- 135/135 tests were green. The code review found it by calling the default directly (fixed in faef60d).
+
+### The rule
+When a function takes an injectable dependency with a production default, at least one test must call the function WITHOUT injecting it, against a real, cheap stand-in: a short-lived child process, a tmp file, a local store. It asserts the production contract end to end.
+
+### How to apply
+- Briefs that add an injectable seam say: "one test runs the real default."
+- Reviewers grep new tests: if every call site passes the seam, that is a finding.
+- Related: L-42 (fixtures through the real writer path), L-28 (defaults are part of what is measured).
+
+## L-56 — A hypothesis picked from a handful of fills cannot be powered by them, and its re-score must use the bot's own band function (2026-10-11)
+
+### What happened
+- The trade-effectiveness audit picked "cheap NO longshots win" from 3 live NO fills. A hand re-score treated `gte{A}lt{B}` as half-open and reported the wrong wins (corrected: 4 wins / −2.63 overall, NO side 1/3, P(≥1 | 0.12) = 0.32 — no anomaly).
+- The recompute needs n = 1486 station-days (1743 at FWER 0.025) against a PM.us ceiling of 490; TE-3 closed as UNDERPOWERED_NOT_REGISTERED (`RULING_TE-3_NO_CHEAP_LONGSHOT_2026-10-11.md`).
+
+### The rule
+Before planning a test of a hypothesis chosen from live fills: (1) re-score every fill only through `bucket_facts_from_instrument_id` (with `leg_of_symbol` for `^no`); (2) compute the fill-count probability under the null; (3) run `recompute_mde` against the venue's station-day ceiling. A "structural" infeasibility claim must also hold across its own sensitivity table (rate low/central/high, α) before it is written as a ruling.
+
+### How to apply
+- Audit and plan briefs that score outcomes name `bucket_facts_from_instrument_id`; a hand-rolled band is a review finding.
+- The SEARCH fills that motivated a hypothesis are premises only; they never count toward its n.
+- Related: L-44 (NO-leg buy semantics), L-55.
+
+## L-57 — A production-default path that a test can reach will write live state the moment its precondition flips (2026-10-11)
+
+### What happened
+- TE-1 WP-A pinned the `aut2.label` producer. An existing guard test (`test_aut2_canary_isolation::test_cli_requires_exactly_one_mode`) called `label_run.main([])` with no factory; while the producer was unpinned it refused early, so the test was harmless.
+- Once pinned, the same call reached the production factory on the live host: it wrote `evidence/aut2/holds/…_label-outcomes.json` and a CRITICAL `aut2.label_timer_held` alert that was delivered (20:20Z / 20:23Z). The first fix still trusted any `run-r*.service` cgroup leaf — the name `systemd-run` gives the very gate units we launch.
+
+### The rule
+A production-default seam that touches host paths must refuse unless it is positively inside its own unit (exact unit name, not a pattern a transient unit can match) AND not under pytest (`"pytest" in sys.modules` or `PYTEST_CURRENT_TEST`). Before flipping any pin, flag or gate that unlocks such a path, grep `tests/` for every call that reaches it without injection.
+
+### How to apply
+- Briefs that flip a pin/enable a producer include: "grep tests/ for un-injected calls to the newly reachable default; list each".
+- Spurious live artefacts are quarantined (moved, never deleted) with a README, so no consumer counts them.
+- Related: L-55 (run the production default once — against a tmp root, never the host), L-51.

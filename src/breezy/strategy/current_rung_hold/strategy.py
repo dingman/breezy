@@ -1,0 +1,764 @@
+"""``CurrentRungHoldStrategy`` -- Nautilus wiring only (build order step 6).
+
+Consumes every landed piece: :class:`CurrentRungHoldConfig`,
+:func:`evaluate_decision`/:class:`DecisionInputs`/:class:`Take`/
+:class:`Refuse`, :class:`TrialDayLatch` (received via a factory so tests can
+inject a temp-store latch -- see ``__init__``), :data:`P_HOLD_LOWER`
+(indirectly, through ``decision.py``), :class:`RunningExtremeAccumulator`,
+``StationObservation``/``station_observation_data_type`` (Seam B's publish
+topic, subscribed natively via ``Actor.subscribe_data``), and
+``WeatherBucketFacts``/``read_weather_bucket_facts`` for the venue ladder.
+
+ORDER CAPABILITY -- read this carefully, it has been misread before.
+``CurrentRungHoldConfig.orders_enabled`` is refused ``True`` at construction
+(``config.py``, L-22 shape), but that flag is NOT the gate. The real gate is the
+injected, sealed ``OrderSubmissionPermit``: ``_maybe_submit`` submits when
+``self._order_submission_permit is not None`` (see ``config.py``'s own note on
+the field). The permit is minted in ``app/trade.py::main`` and threaded through
+``build_current_rung_hold_strategies``. The ``submit_order`` call is therefore
+LIVE, not unreachable -- it fired on 2026-09-05 20:19:49Z (SFO, IOC, AMBIGUOUS).
+Reading ``orders_enabled`` as the gate leads to the false conclusion that this
+strategy can never trade.
+
+FIRST-EXECUTABLE-SNAPSHOT selection (blueprint correction, Grok rev 2 over
+rev 1; ``mb_current_rung_edge_study.py:545-551``)
+--------------------------------------------------------------------------
+Per station-day, THE trial is the first UNAMBIGUOUS executable quote, in
+the ``[12:00,17:00)`` LST window, on an instrument that COULD be the
+current rung (``running_max.lower_f`` falls inside that instrument's own
+closed ``[lower_f, upper_f]`` facts -- the same lower-bound resolution
+``evaluate_decision`` itself uses against the full ladder, so an
+ambiguous ``RunningMax`` spanning two rungs is still evaluated, never
+pre-filtered away), with ``0.05 < ask < 0.95`` and displayed size
+``>= 1``. That one quote is evaluated through :func:`evaluate_decision`
+exactly ONCE and the verbatim outcome (``"taken"`` or the refusal
+reason) is durably recorded to the trial-day latch before this
+station-day is ever looked at again -- ``on_quote_tick`` checks
+``latch.is_consumed`` first, unconditionally, on every call. An
+``observation_ambiguous`` or non-executable snapshot does not consume:
+it is counted (ambiguous) or diagnosed (non-executable) and the latch
+stays open for a later unambiguous executable candidate.
+
+Restricting candidacy to the ladder's CURRENTLY-active-rung instrument (not
+any subscribed instrument) mirrors the archive study reading its lagged
+entry from ``depth.get(rung.instrument_id, ...)`` -- the rung the study
+prices is always the SAME rung the running max just resolved to, never a
+different instrument's book. A quote on a non-active-rung instrument is
+silently skipped (not a counted refusal): it simply is not a decision
+instant for that instrument yet.
+
+Window and legal-cell derivation
+---------------------------------
+``season``/``hour_lst`` are derived from the LOCAL STANDARD time of the
+quote's own ``ts_event`` at the station's fixed standard-time offset, read
+from :func:`breezy.registry.sites.default_registry` (``climate_day_window``,
+``breezy/registry/sites.toml``'s per-site ``std_utc_offset_hours``) ONCE per
+supported station in ``on_start`` and cached on
+``self._std_utc_offset_hours_by_station`` -- ``registry`` sits below
+``strategy`` in the layers contract (``pyproject.toml``), so this is a native
+import, never a private duplicate of the TOML values. ``season_for``
+(:mod:`breezy.domain.season`) re-derives (not imports; ``scripts/`` is
+unimportable from ``src/breezy``, see the layers contract) the single lookup
+at ``scripts/analysis/pmr_climatology_study.py:182-187``.
+``width_code``/``m_code`` are derived from the CURRENTLY-active-rung
+instrument's own :class:`WeatherBucketFacts` bounds against
+``running_max.lower_f`` -- ``width_code=0`` (interior) with
+``m_code = running_max.lower_f - facts.lower_f``; ``width_code=1``
+(open_upper, ``upper_f is None``) or ``width_code=2`` (open_lower,
+``lower_f is None``) with ``m_code`` fixed at 0 (the open tails have no
+margin axis -- ``archive_table.py``'s header). A key that cannot be derived
+(no ``RunningMax`` yet) never reaches the table lookup at all: the strategy
+returns before building one -- see ``on_quote_tick``.
+
+Lag semantics vs. ``mb_current_rung_edge_study.py`` (stated, not papered over)
+--------------------------------------------------------------------------------
+The study's ``build_current_rung_trials`` reads its tradeable entry price at
+``t + lag_minutes`` (``find_lagged_entry(depth, not_before=t + lag)``,
+``:479-490``) -- a DELIBERATE forward offset from the observation instant
+``t`` that established the running max, modelling the latency between "the
+rung became current" and "an order could realistically reach the book"
+(SS2, ``:36-40``). This strategy applies NO such offset: ``on_quote_tick``
+prices whatever live ``QuoteTick`` arrives, at that tick's own ``ts_event``,
+the instant it arrives -- there is no synthetic delay inserted between the
+``StationObservation`` that sets ``running_max`` and the quote read.  The two
+are equivalent ONLY at ``lag_minutes=0`` (``tests/unit/
+test_current_rung_hold_study_replay_equivalence.py`` pins the replay at
+``lag_minutes=0`` for exactly this reason) -- an operator running the study
+at a nonzero ``lag_minutes`` is measuring a DIFFERENT execution model than
+this strategy implements. This is a live-vs-study divergence, not a bug:
+the live strategy is implicitly lag-0 because it reacts to real market data
+in real time, and adopting a nonzero synthetic lag here is out of scope for
+this increment.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack
+from decimal import Decimal
+from typing import TYPE_CHECKING, Final
+
+from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderFilled, PositionOpened
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.trading.strategy import Strategy
+
+from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
+from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
+from breezy.domain.season import season_for
+from breezy.domain.station_observation import StationObservation
+from breezy.domain.weather_bucket_facts import (
+    Measure,
+    WeatherBucketFacts,
+    read_weather_bucket_facts,
+)
+from breezy.ingest.iem_observations import station_observation_data_type
+from breezy.registry.sites import default_registry
+from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.runtime.order_enablement import OrderSubmissionPermit
+from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.decision import (
+    Decision,
+    Refuse,
+    Take,
+    evaluate_decision,
+)
+from breezy.strategy.current_rung_hold.tick_eval import (
+    build_eligible_inputs,
+    instrument_rung_is_current,
+    width_and_m,
+)
+from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
+from breezy.strategy.weather_common.refusals import (
+    OBSERVATION_AMBIGUOUS,
+    RefusalAlerter,
+    RefusalCounter,
+)
+from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.core.data import Data
+    from nautilus_trader.model.data import QuoteTick
+    from nautilus_trader.model.instruments import Instrument
+    from nautilus_trader.model.position import Position
+
+__all__ = [
+    "CurrentRungHoldStrategy",
+    "MissingTrialDayLatchError",
+    "evaluate_decision",
+    "season_for",
+]
+
+_NS_PER_SECOND: Final[int] = 1_000_000_000
+_WINDOW_START_HOUR_LST: Final[int] = 12
+_WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
+#: Counted (``decision.REFUSAL_REASONS`` / ``risk.COUNTED_REFUSAL_REASONS``),
+#: never emitted by ``evaluate_decision`` -- the window check runs here,
+#: before a quote ever reaches that function.
+_OUTSIDE_DECISION_WINDOW: Final[str] = "outside_decision_window"
+
+#: Counted (``decision.REFUSAL_REASONS``), never emitted by
+#: ``evaluate_decision`` -- an ``on_start`` cache-resolution refusal, before
+#: any quote reaches this instrument at all. See ``on_start``'s docstring
+#: note: one unresolved id is skipped and counted, never fatal to its
+#: siblings; ALL configured ids unresolved is still fatal (unchanged
+#: fail-closed posture).
+_INSTRUMENT_UNRESOLVED: Final[str] = "instrument_unresolved"
+
+#: WAIT-state diagnostics -- deliberately NOT refusal reasons. Each names a
+#: quote that arrived inside the decision window but was not yet this
+#: station-day's trial: ``evaluate_decision`` is never reached, nothing is
+#: recorded to the trial-day latch, and the refusal alerter never fires (see
+#: ``on_quote_tick``'s three matching ``return`` statements and the module
+#: docstring). They exist ONLY so an operator staring at a zero-take run can
+#: tell "nothing happened yet" apart from "nothing will ever happen" --
+#: never added to ``decision.REFUSAL_REASONS``, the latch's ``_REASONS``, or
+#: ``risk.COUNTED_REFUSAL_REASONS``.
+_DIAG_NOT_EXECUTABLE: Final[str] = "in_window_not_executable"
+_DIAG_NO_RUNNING_MAX_YET: Final[str] = "in_window_no_running_max_yet"
+_DIAG_RUNG_NOT_CURRENT: Final[str] = "in_window_rung_not_current"
+
+#: Log-only open-position observability (O-1). Counted on
+#: ``self.position_events``, never on ``self.refusals`` / ``self.diagnostics``,
+#: never a latch reason, and never a scored-trial input. A mid-life mark is
+#: not realizable (v1 §9.1) -- these keys exist so the operator can see a
+#: fill, a position open, and later ask-marked unrealised PnL.
+_ORDER_FILLED: Final[str] = "order_filled"
+_POSITION_OPENED: Final[str] = "position_opened"
+_OPEN_POSITION_ASK_MARK: Final[str] = "open_position_ask_mark"
+#: Event name ``RefusalAlerter`` emits for ``_OPEN_POSITION_ASK_MARK`` with
+#: composition's POSITION vocabulary. Mark-log throttle keys off THIS
+#: payload, never the aggregate emit count of fill/open siblings.
+_OPEN_POSITION_ASK_MARK_EVENT: Final[str] = "OPEN_POSITION_ASK_MARK_POSITION"
+
+#: The venue key this package looks up every ``(venue, city)`` registry
+#: accessor with -- see ``breezy.registry.sites``. ``city`` is the station
+#: code itself (``LAX``/``MDW``/``MIA``/``SFO``), matching
+#: ``breezy/registry/sites.toml``'s ``[sites.polymarket_us.<STATION>]``
+#: tables.
+_VENUE: Final[str] = "polymarket_us"
+
+#: The IEM ASOS station id (``StationObservation.station``) for each of the
+#: four :data:`~breezy.strategy.current_rung_hold.config.SUPPORTED_STATIONS`
+#: -- mirrors ``breezy/registry/sites.toml``'s ``iem_asos_id`` (identical to
+#: ``icao`` for all four: ``KLAX``/``KMDW``/``KMIA``/``KSFO``).
+_ICAO_BY_STATION: Final[dict[str, str]] = {
+    "LAX": "KLAX",
+    "MDW": "KMDW",
+    "MIA": "KMIA",
+    "SFO": "KSFO",
+}
+_STATION_BY_ICAO: Final[dict[str, str]] = {
+    icao: station for station, icao in _ICAO_BY_STATION.items()
+}
+
+
+def _local_hour(now_ns: int, std_utc_offset_hours: float) -> int:
+    seconds, nanoseconds = divmod(now_ns, _NS_PER_SECOND)
+    instant = dt.datetime.fromtimestamp(seconds, tz=dt.UTC) + dt.timedelta(
+        microseconds=nanoseconds // 1_000,
+    )
+    tz = dt.timezone(dt.timedelta(hours=std_utc_offset_hours))
+    return instant.astimezone(tz).hour
+
+
+class MissingTrialDayLatchError(RuntimeError):
+    """Raised at ``on_start`` when no ``trial_day_latch_factory`` was supplied.
+
+    Mirrors ``RunningExtremeLockStrategy``'s ``MissingObservationBoundError``
+    posture: a mis-wired strategy fails LOUDLY at startup rather than
+    silently never evaluating a single quote.
+    """
+
+
+class CurrentRungHoldStrategy(Strategy):
+    """Buys LONG_YES, one contract, on the currently-active rung's first
+    executable snapshot each station-day -- see the module docstring.
+    """
+
+    def __init__(
+        self,
+        config: CurrentRungHoldConfig,
+        *,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]] | None = None,
+        order_submission_permit: OrderSubmissionPermit | None = None,
+    ) -> None:
+        super().__init__(config)
+        self._config: CurrentRungHoldConfig = config
+        self._latch_factory = trial_day_latch_factory
+        #: The sealed, unforgeable capability minted by
+        #: ``runtime.order_enablement.OrderSubmissionPermit.issue`` and
+        #: threaded in by the composition root (``app/trade.py::main`` ->
+        #: ``composition.build_current_rung_hold_strategies``). ``None`` is
+        #: the shadow default -- absence, never a default grant. This is the
+        #: gate ``_maybe_submit`` checks; ``config.orders_enabled`` stays
+        #: refused ``True`` forever and is never the mechanism (see
+        #: ``OrdersEnabledNotPermittedError``'s docstring). A fifth
+        #: distinct station-day beyond the four supported stations is
+        #: bounded only by the daily budget, not by this permit -- the
+        #: trial-day latch + fixed station list are what enforce ``<=4``
+        #: orders per day (converged review item 11).
+        self._order_submission_permit = order_submission_permit
+        self._latch: TrialDayLatch | None = None
+        self._exit_stack: ExitStack | None = None
+        self._facts: dict[str, WeatherBucketFacts] = {}
+        self._ladders: dict[tuple[str, str], list[tuple[int | None, int | None]]] = {}
+        self._accumulators: dict[str, RunningExtremeAccumulator] = {}
+        self._std_utc_offset_hours_by_station: dict[str, float] = {}
+        #: PUBLIC -- readable by an operator or a test asking "did this
+        #: strategy do nothing, or was it stopped from doing something?"
+        #: (mirrors every sibling weather strategy's ``self.refusals``).
+        self.refusals = RefusalCounter()
+        #: PUBLIC -- WAIT-state visibility, never a refusal (see
+        #: ``_DIAG_NOT_EXECUTABLE`` et al.'s module-level docstring). Reuses
+        #: ``RefusalCounter``'s dict-of-ints shape (it validates nothing
+        #: about *which* strings it is handed, so it is equally correct as
+        #: a plain named counter here) rather than inventing a parallel
+        #: type for three keys.
+        self.diagnostics = RefusalCounter()
+        #: Set post-construction by
+        #: ``composition.install_current_rung_hold_refusal_watch`` (never via
+        #: ``__init__`` -- the alerter's ``site`` is ``str(strategy.id)``,
+        #: only stable once ``Trader.add_strategy`` has assigned it). ``None``
+        #: until wired -- e.g. a unit test driving the strategy directly --
+        #: so ``_report_alerter`` degrades to a no-op rather than
+        #: raising. Review fix: the counter used to surface only on a rare
+        #: ``COMPONENT_STATE_TOPIC`` FSM-degrade event, so it stayed invisible
+        #: for a whole normal run; reporting here, on every refusal, needs no
+        #: new ``LiveClock`` timer (L-16) and is throttled by the refusal
+        #: itself -- a counter only ever increments, so every call is a real
+        #: count change, not a poll.
+        self.refusal_alerter: RefusalAlerter | None = None
+        #: PUBLIC -- the SAME per-tick alert mechanism as
+        #: ``self.refusal_alerter``, over a SEPARATE ``RefusalAlerter``
+        #: bound to ``self.diagnostics`` instead of ``self.refusals``, so a
+        #: WAIT-state diagnostic's count-change reaches the existing alert
+        #: sink (``_report_alerter``) without ever raising a
+        #: refusal condition. Set post-construction by
+        #: ``composition.install_current_rung_hold_refusal_watch``, exactly
+        #: like ``self.refusal_alerter``; ``None`` (e.g. a unit test driving
+        #: the strategy directly) degrades ``_report_alerter`` to
+        #: a no-op.
+        self.diagnostics_alerter: RefusalAlerter | None = None
+        #: PUBLIC -- log-only fill/position/mark visibility, never a
+        #: refusal and never a WAIT diagnostic. Reuses ``RefusalCounter``
+        #: the same way ``self.diagnostics`` does. Set post-construction by
+        #: ``composition.install_current_rung_hold_refusal_watch`` onto
+        #: ``self.position_alerter``; ``None`` degrades
+        #: ``_report_alerter`` to a no-op.
+        self.position_events = RefusalCounter()
+        self.position_alerter: RefusalAlerter | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def on_start(self) -> None:
+        if self._latch_factory is None:
+            raise MissingTrialDayLatchError(
+                "CurrentRungHoldStrategy was constructed with no "
+                "trial_day_latch_factory; see the module docstring."
+            )
+        exit_stack = ExitStack()
+        self._latch = exit_stack.enter_context(self._latch_factory())
+        self._exit_stack = exit_stack
+
+        registry = default_registry()
+        self._std_utc_offset_hours_by_station = {
+            station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+            for station in self._config.stations
+        }
+
+        resolved_any = False
+        for instrument_id in self._config.instrument_ids:
+            instrument = self.cache.instrument(instrument_id)
+            if instrument is None:
+                # ONE unresolved id (L-23: ~9% of station-days never listed,
+                # and the live instrument provider may lag the catalog) is
+                # a counted, logged skip -- never fatal to every OTHER
+                # configured station's subscription. Fatal only when NO
+                # configured id resolves at all (checked after this loop).
+                self.log.warning(
+                    f"no instrument {instrument_id} in the cache; skipping "
+                    "subscription (refusal: instrument_unresolved)",
+                )
+                self.refusals.record(_INSTRUMENT_UNRESOLVED)
+                continue
+            resolved_any = True
+            facts = read_weather_bucket_facts(instrument.info)
+            if facts.measure is not Measure.HIGH:
+                self.log.warning(
+                    f"{instrument_id} measures {facts.measure.value!r}; this package "
+                    "trades HIGH only, skipping subscription.",
+                )
+                continue
+            if facts.settlement_station not in self._config.stations:
+                self.log.warning(
+                    f"{instrument_id} settles {facts.settlement_station!r}, outside "
+                    f"{self._config.stations!r}; skipping subscription.",
+                )
+                continue
+            iid = str(instrument_id)
+            self._facts[iid] = facts
+            key = (facts.settlement_station, facts.climate_day.isoformat())
+            self._ladders.setdefault(key, []).append((facts.lower_f, facts.upper_f))
+            self.subscribe_quote_ticks(instrument_id)
+            self.log.info(f"CurrentRungHoldStrategy subscribed {instrument_id}")
+
+        if self._config.instrument_ids and not resolved_any:
+            # Every configured id was unresolved -- the unchanged fail-closed
+            # posture: a strategy with nothing it could possibly subscribe to
+            # must not silently idle.
+            self.log.error(
+                "no configured instrument resolved from the cache; stopping",
+            )
+            self.stop()
+            return
+
+        self.subscribe_data(
+            station_observation_data_type(),
+            client_id=NWS_BACKTEST_CLIENT_ID,
+        )
+
+    def on_stop(self) -> None:
+        """Log the diagnostics tally, then close the trial-day latch this
+        strategy owns, unconditionally.
+
+        Review finding 2: ``AlertState``'s false->true-then-renotify
+        semantics (``_report_alerter``) tell an operator a gate fired at
+        least once, and diagnostics use a 15-minute intra-session cadence,
+        but the alert stream still cannot recover the exact per-gate
+        magnitudes after a covered afternoon. Logging
+        ``self._diagnostics_snapshot_message()`` here, on EVERY stop (a
+        clean shutdown, not only a crash), leaves one line carrying the
+        exact, full per-gate tally.
+
+        Then runs the ``ExitStack``'s exit path -- the SAME stack
+        ``on_start`` entered the latch factory's context manager through --
+        so a start -> stop -> start cycle (a genuine Nautilus lifecycle, not
+        just a test artefact: engine restarts, live redeploys) releases the
+        underlying flock and re-arms cleanly on the next ``on_start``,
+        rather than leaking a stale hold that would raise
+        ``SubmitIntentLockHeld`` on the re-open.
+        """
+        self.log.info(self._diagnostics_snapshot_message())
+        exit_stack, self._exit_stack = self._exit_stack, None
+        self._latch = None
+        if exit_stack is not None:
+            exit_stack.close()
+
+    def _diagnostics_snapshot_message(self) -> str:
+        """The full per-gate WAIT-state tally, as ONE line ``on_stop`` logs.
+
+        Extracted (not inlined into ``on_stop``) so a test can call it
+        directly and assert on the returned string -- ``Actor.log`` is
+        Nautilus's own Cython logger, which ``caplog`` cannot observe.
+        Sorted so the line is deterministic across runs, never dependent on
+        dict insertion order.
+        """
+        counts = dict(sorted(self.diagnostics.counts.items()))
+        return f"current_rung_hold diagnostics snapshot: {counts}"
+
+    # ------------------------------------------------------------------
+    # Data handlers
+    # ------------------------------------------------------------------
+    def on_data(self, data: Data) -> None:
+        if type(data) is not StationObservation:
+            return
+        station = _STATION_BY_ICAO.get(data.station)
+        if station is None or station not in self._config.stations:
+            return
+        offset = self._std_utc_offset_hours_by_station[station]
+        accumulator = self._accumulators.setdefault(
+            station,
+            RunningExtremeAccumulator(std_utc_offset_hours=offset),
+        )
+        accumulator.push(
+            data.observed_at_ns,
+            data.temp_c_tenths,
+            data.precision_c_tenths,
+            data.is_metar,
+            data.received_at_ns,
+        )
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        # Open-position mark MUST run before the latch-first return: after a
+        # fill the station-day is consumed, and a mark placed below that
+        # return would stay silent until next-day NWS score. Log-only --
+        # never a decision, never an order.
+        self._report_open_position_mark(tick)
+        iid = str(tick.instrument_id)
+        facts = self._facts.get(iid)
+        if facts is None:
+            return
+        station = facts.settlement_station
+        climate_day = facts.climate_day
+        climate_day_key = climate_day.isoformat()
+
+        assert self._latch is not None  # armed in on_start before any quote can arrive
+        if self._latch.is_consumed(station, climate_day_key):
+            return  # entry-only halt: this station-day already has its one trial
+
+        now_ns = tick.ts_event
+        offset = self._std_utc_offset_hours_by_station[station]
+        hour_lst = _local_hour(now_ns, offset)
+        if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
+            self.refusals.record(_OUTSIDE_DECISION_WINDOW)
+            self._report_alerter(
+                self.refusal_alerter,
+                "current_rung_hold refusal report failed",
+            )
+            return
+
+        ask = tick.ask_price.as_decimal()
+        size = int(tick.ask_size)
+        raw_executable = (
+            self._config.executable_ask_lower < ask < self._config.executable_ask_upper
+            and size >= self._config.minimum_displayed_size
+        )
+        if not raw_executable:
+            self.diagnostics.record(_DIAG_NOT_EXECUTABLE)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "current_rung_hold diagnostics report failed",
+            )
+            return  # in-window, not yet the candidate: wait, no latch (module docstring)
+
+        accumulator = self._accumulators.get(station)
+        running_max = None if accumulator is None else accumulator.value_at(now_ns)
+        if running_max is None or accumulator is None:
+            self.diagnostics.record(_DIAG_NO_RUNNING_MAX_YET)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "current_rung_hold diagnostics report failed",
+            )
+            return  # no observation yet: not this instrument's decision instant
+        # Route to `evaluate_decision` whenever the observation interval
+        # TOUCHES this instrument's rung at either end, not only when its
+        # `lower_f` does -- an interval spanning two instruments (`lower_f`
+        # in a neighbour, `upper_f` in this one) must still reach
+        # `RunningMax.spans` on THIS instrument's tick and be counted
+        # `observation_ambiguous`, never silently skipped as "not yet this
+        # instrument's decision instant".
+        if not instrument_rung_is_current(facts, running_max):
+            self.diagnostics.record(_DIAG_RUNG_NOT_CURRENT)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "current_rung_hold diagnostics report failed",
+            )
+            return  # this instrument's rung cannot be the current one
+
+        width_code, m_code = width_and_m(facts, running_max)
+        instrument = self.cache.instrument(tick.instrument_id)
+        fee_coefficient = self._guarded_fee_coefficient(instrument)
+        # Barrier F1: absent/unresolved fee → same counted refusal
+        # evaluate_decision emits for a mismatched coefficient. The
+        # evaluate_decision CALL stays on this module so the study-replay
+        # spy (strategy.evaluate_decision) still observes v2.
+        built = build_eligible_inputs(
+            station=station,
+            climate_day=climate_day,
+            now_ns=now_ns,
+            ladder=self._ladders[(station, climate_day_key)],
+            fee_coefficient=fee_coefficient,
+            ask=ask,
+            size=size,
+            running_max=running_max,
+            staleness_ns=accumulator.staleness_ns(now_ns),
+            config=self._config,
+            hour_lst=hour_lst,
+            width_code=width_code,
+            m_code=m_code,
+        )
+        decision: Decision
+        if isinstance(built, Refuse):
+            decision = built
+        else:
+            decision = evaluate_decision(built)
+        if isinstance(decision, Refuse) and decision.reason == OBSERVATION_AMBIGUOUS:
+            self.refusals.record(decision.reason)
+            self._report_alerter(
+                self.refusal_alerter,
+                "current_rung_hold refusal report failed",
+            )
+            return
+        reason = decision.reason if isinstance(decision, Refuse) else "taken"
+        self._latch.consume(
+            station,
+            climate_day_key,
+            latched_at_ns=self.clock.timestamp_ns(),
+            instrument_id=iid,
+            ask=ask,
+            reason=reason,
+        )
+        if isinstance(decision, Refuse):
+            self.refusals.record(decision.reason)
+            self._report_alerter(
+                self.refusal_alerter,
+                "current_rung_hold refusal report failed",
+            )
+            return
+        self._maybe_submit(iid, decision)
+
+    def _report_alerter(
+        self,
+        alerter: RefusalAlerter | None,
+        fail_message: str,
+    ) -> tuple[object, ...] | None:
+        """Surface a counter change through the existing alert path, on THIS tick.
+
+        One reporter for refusals, diagnostics, and position events -- the
+        caller picks the alerter. ``AlertState`` (inside
+        ``RefusalAlerter.report_payloads``) dedupes an already-active
+        condition, so an ongoing streak does not spam the sink on every
+        tick -- only the false->true transition and that alerter's re-notify
+        emit.
+
+        Returns the payloads this cycle decided to emit, an empty tuple when
+        no alerter is wired, or ``None`` when observability failed.
+        Observability failure must never kill a live strategy: an exception
+        is logged, not raised. ``handle_event`` in installed
+        ``trading/strategy.pyx:1985-1987`` re-raises handler exceptions and
+        would skip ``on_order_event`` / ``on_position_event`` / ``on_event``.
+        """
+        if alerter is None:
+            return ()
+        result = self._run_observability(
+            fail_message,
+            lambda: alerter.report_payloads(now_ns=self.clock.timestamp_ns()),
+        )
+        if result is None:
+            return None
+        return tuple(result)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Log-only fill / position handlers
+    # ------------------------------------------------------------------
+    # Installed Nautilus 1.231.0 ``trading/strategy.pyx:723-767``: these
+    # are empty "Optionally override in subclass" stubs. Engine cache /
+    # portfolio bookkeeping happens BEFORE ``handle_event`` publishes the
+    # event to the strategy (``:1970-1974`` dispatches to the override,
+    # then to ``on_order_event`` / ``on_position_event``, then ``on_event``).
+    # Call ``super()`` so the stub contract is preserved; wrap reporting
+    # so an observability exception cannot skip the follow-on handlers.
+    def on_order_filled(self, event: OrderFilled) -> None:
+        super().on_order_filled(event)
+        self._report_order_filled(event)
+
+    def on_position_opened(self, event: PositionOpened) -> None:
+        super().on_position_opened(event)
+        self._report_position_opened(event)
+
+    def _report_order_filled(self, event: OrderFilled) -> None:
+        def _report() -> None:
+            self.position_events.record(_ORDER_FILLED)
+            self.log.info(self._order_filled_message(event))
+            self._report_alerter(
+                self.position_alerter,
+                "current_rung_hold position report failed",
+            )
+
+        self._run_observability("current_rung_hold fill report failed", _report)
+
+    def _report_position_opened(self, event: PositionOpened) -> None:
+        def _report() -> None:
+            self.position_events.record(_POSITION_OPENED)
+            self.log.info(self._position_opened_message(event))
+            self._report_alerter(
+                self.position_alerter,
+                "current_rung_hold position report failed",
+            )
+
+        self._run_observability(
+            "current_rung_hold position-opened report failed",
+            _report,
+        )
+
+    def _report_open_position_mark(self, tick: QuoteTick) -> None:
+        def _report() -> None:
+            positions = self.cache.positions_open(instrument_id=tick.instrument_id)
+            if not positions:
+                return
+            for position in positions:
+                self.position_events.record(_OPEN_POSITION_ASK_MARK)
+            payloads = self._report_alerter(
+                self.position_alerter,
+                "current_rung_hold position report failed",
+            )
+            # Unwired (alerter is None) keeps today's per-tick log. Once
+            # composition has wired the alerter, reuse AlertState's
+            # dedupe/renotify as the throttle -- skip the Decimal/Money/
+            # f-string line unless THIS mark key emitted. A sibling
+            # fill/open re-notify must not unthrottle the mark. Observability
+            # failure (payloads is None) still attempts the log.
+            if self.position_alerter is not None and payloads is not None:
+                mark_emitted = any(
+                    getattr(payload, "event", None) == _OPEN_POSITION_ASK_MARK_EVENT
+                    for payload in payloads
+                )
+                if not mark_emitted:
+                    return
+            for position in positions:
+                self.log.info(self._open_position_mark_message(position, tick))
+
+        self._run_observability(
+            "current_rung_hold open-position mark report failed",
+            _report,
+        )
+
+    def _run_observability(self, message: str, action: Callable[[], object]) -> object:
+        """Run an observability action; log failures, never raise.
+
+        Catching ``Exception`` is the live-strategy invariant: installed
+        ``handle_event`` (``trading/strategy.pyx:1983-1986``) re-raises
+        handler exceptions and would skip ``on_order_event`` /
+        ``on_position_event`` / ``on_event``. Installed Nautilus
+        ``Logger.exception`` is ``(message, ex)`` (``common/component.pyx:1564``),
+        not stdlib's one-arg ``logging.exception``.
+        """
+        try:
+            return action()
+        except Exception as exc:
+            self.log.exception(message, exc)  # noqa: TRY401
+            return None
+
+    def _order_filled_message(self, event: OrderFilled) -> str:
+        return (
+            "current_rung_hold order filled: "
+            f"instrument={event.instrument_id} qty={event.last_qty} "
+            f"px={event.last_px}"
+        )
+
+    def _position_opened_message(self, event: PositionOpened) -> str:
+        return (
+            "current_rung_hold position opened: "
+            f"instrument={event.instrument_id} qty={event.quantity} "
+            f"avg_px_open={event.avg_px_open}"
+        )
+
+    def _open_position_mark_message(self, position: Position, tick: QuoteTick) -> str:
+        # LONG is marked at the ask, SHORT at the bid -- installed
+        # ``cache.pyx:1523-1528``. Breezy is long-only (``allow_short`` is
+        # False); label the log as ask-marked, never "bid-marked". Bid
+        # SIZE is a separate vanishing-book observation, not the mark.
+        pnl = self.cache.calculate_unrealized_pnl(position)
+        mark = "mark=ask" if pnl is not None else "mark=unavailable"
+        return (
+            "current_rung_hold open position mark: "
+            f"instrument={position.instrument_id} qty={position.quantity} "
+            f"avg_px_open={position.avg_px_open} "
+            f"unrealized_pnl={pnl} {mark} "
+            f"bid_size={tick.bid_size}"
+        )
+
+    def _guarded_fee_coefficient(self, instrument: Instrument | None) -> Decimal | None:
+        """The instrument's fee coefficient, read ONLY after the venue guard passes.
+
+        ``instrument.maker_fee`` is a real, typed ``Decimal`` even while the
+        Polymarket.us fee schedule is UNKNOWN -- Nautilus defaults it, per
+        ``breezy.adapters.polymarket_us.parsing``'s module docstring -- so
+        every read must be preceded by :func:`assert_fee_schedule_known`
+        (barrier F1, ``tests/unit/test_polymarket_us_fee_guard.py``). Returns
+        ``None`` -- never raises, never defaults to a sentinel -- for a
+        missing instrument or an unresolved/unknown schedule; the caller
+        routes that to the existing ``fee_schedule_mismatch`` refusal.
+        """
+        if instrument is None:
+            return None
+        try:
+            assert_fee_schedule_known(instrument)
+        except FeeScheduleUnknownError:
+            return None
+        fee = instrument.maker_fee
+        return fee if isinstance(fee, Decimal) else None
+
+    # ------------------------------------------------------------------
+    # Execution -- LIVE when the OrderSubmissionPermit is present (module docstring).
+    # ------------------------------------------------------------------
+    def _maybe_submit(self, instrument_id: str, decision: Take) -> None:
+        if not (
+            self._order_submission_permit is not None
+            and isinstance(self._config.stale_observation_minutes, int)
+        ):
+            self.log.info(
+                "TAKE recorded, no submit "
+                f"(order_submission_permit="
+                f"{'granted' if self._order_submission_permit is not None else 'none'}): "
+                f"{instrument_id} qty={decision.quantity} px={decision.limit_price} "
+                f"p_hold_lower={decision.p_hold_lower} break_even={decision.break_even}",
+            )
+            return
+        nt_id = InstrumentId.from_str(instrument_id)
+        instrument = self.cache.instrument(nt_id)
+        if instrument is None:
+            self.log.error(f"instrument vanished from cache: {instrument_id}")
+            return
+        order = self.order_factory.limit(
+            instrument_id=nt_id,
+            order_side=OrderSide.BUY,
+            quantity=instrument.make_qty(decision.quantity),
+            price=instrument.make_price(decision.limit_price),
+            time_in_force=TimeInForce.IOC,
+            post_only=False,
+        )
+        self.submit_order(order)

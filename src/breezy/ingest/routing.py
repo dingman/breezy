@@ -1,6 +1,6 @@
 """Poll-outcome error routing: one pure decision per possible poll result.
 
-Implements the routing table in `docs/plans/PHASE1_ACTOR_BRIEF.md` §5. Every
+Implements the routing table in `docs/plans/archive/PHASE1_ACTOR_BRIEF.md` §5. Every
 transport, status-code, parse, write and supervision outcome of an NWS poll
 maps to exactly one :class:`GateAction`, with a severity and the handful of
 flags the Actor needs to execute it.
@@ -89,6 +89,14 @@ from breezy.ingest.http import (
     TransportError,
     TransportTimeoutError,
     redact_url,
+)
+from breezy.ingest.mdl_lamp_transport import (
+    LampArchiveIntegrityError,
+    LampNotPublishedError,
+)
+from breezy.ingest.nbm_quantile_transport import (
+    BothHostsFailedError,
+    NbmQuantileFetchError,
 )
 from breezy.normalize.cli_parse import (
     CliContentError,
@@ -556,6 +564,31 @@ _TRANSPORT_ERROR_ROUTES: dict[type[TransportError], PollOutcome] = {
     # looks like graceful degradation while silently converting a possible
     # injection attempt into a successful poll.
     InvalidCacheValidatorError: PollOutcome.CACHE_VALIDATOR,
+    # `NbmQuantileFetchError` is `NbmQuantileTransport`'s own base marker,
+    # exactly analogous to the bare `TransportError` row above: never raised
+    # directly today (only `BothHostsFailedError` extends it), so it is
+    # routed identically to that base-class row -- a generic, presumed-
+    # transient fetch hiccup, not an integrity alarm.
+    NbmQuantileFetchError: PollOutcome.NETWORK_FAILURE,
+    # `BothHostsFailedError` means the AWS S3 primary AND the NOMADS fallback
+    # both failed for one cycle. Each wrapped cause (`.primary_error`,
+    # `.fallback_error`) is itself an ordinary `TransportError` from
+    # `_fetch_one` (timeout, 5xx, reset, etc.) -- i.e. exactly the kind of
+    # thing `ServerError`/`TransportTimeoutError` already route as transient
+    # above. Losing BOTH mirrors on the same cycle is presumed a same-day
+    # upstream hiccup (see `docs/evidence/NBP_LAG_CENSUS_2026-09-29.md`'s
+    # 2026-09-24 same-day, multi-hour delay on three consecutive cycles),
+    # not a settlement-integrity event, so it shares the SERVER_ERROR
+    # transient bucket rather than a new one.
+    BothHostsFailedError: PollOutcome.SERVER_ERROR,
+    # F13-C1 `mdl_lamp_transport`. A 404 on an hourly LAMP bulletin is the
+    # routine "not yet published" poll miss: transient, never an integrity
+    # alarm (the collector records it as an availability miss).
+    LampNotPublishedError: PollOutcome.NETWORK_FAILURE,
+    # A malformed or unsafe archive container (traversal/absolute/special
+    # member, corrupt tar) is an integrity alarm, routed with the other
+    # content-integrity rows rather than as a hiccup.
+    LampArchiveIntegrityError: PollOutcome.CONTENT_ENCODING,
 }
 
 TRANSPORT_ERROR_ROUTES: MappingProxyType[type[TransportError], PollOutcome] = MappingProxyType(

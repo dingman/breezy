@@ -1,0 +1,42 @@
+[Unit]
+# F-3 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): decisions/ sidecar retention.
+# Gzip only, atomic, verified before rename (see decisions_retention.py's
+# module docstring). Never deletes anything by default -- pruning ships
+# disabled behind an explicit opt-in deletion flag this ExecStart= never
+# passes (R6). Never touches observations/, the node, or the order path.
+Description=Breezy F-3 decisions/ sidecar retention (gzip only)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/ops/decisions_retention.py
+Documentation=file:///home/jon/breezy/docs/plans/STALL_FOLLOWUPS_F1_F4_2026-09-24.md
+
+# Alert on failure (timeout, OOM-kill, or non-zero exit).
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Light unit band, matching breezy-decision-funnel-digest.service: this
+# reads/rewrites one day's JSONL at a time in streamed chunks, never loads a
+# whole file into memory.
+MemoryHigh=256M
+MemoryMax=512M
+
+# Same shared slice and flock as the other analysis units
+# (decisions-retention-run.sh).
+Slice=breezy-studies.slice
+UMask=0077
+
+# No EnvironmentFile=: this unit reaches no venue credential and no alert
+# webhook -- failures are surfaced via OnFailure= only.
+ExecStart=/home/jon/breezy/deploy/systemd/decisions-retention-run.sh
+
+TimeoutStartSec=300
+
+# No Restart=. A bad run must not retry-storm. Persistent=true on the timer
+# catches a reboot-missed run.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-decisions-retention
+
+# NOTE: no [Install] section. Enable the timer, never this unit.

@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":true,\"reason\":\"Not Found\"}",
+  "bytes": 35,
+  "content_type": "application/json; charset=utf-8",
+  "finding": null,
+  "label": "q2_previous_day_boundary_probe",
+  "outcome": "ok",
+  "requested_at_utc": "2026-08-31T00:38:20+00:00",
+  "sha256": "0ea38162214142fdea32440c7736f67d9a044d1007087e3dcd08258ba4eede55",
+  "status": 404,
+  "url": "https://api.open-meteo.com/v1/previous-runs?daily=temperature_2m_max_previous_day8&latitude=40.78333&longitude=-73.96667&timezone=UTC"
+}

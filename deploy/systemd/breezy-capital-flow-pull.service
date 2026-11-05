@@ -1,0 +1,61 @@
+[Unit]
+# FU-13b (docs/plans/backlog/NIGHT_2026-09-26/FU-13b_plan_r2_2026-09-26.md).
+# Unattended, read-only, signed-GET pull of Polymarket.us portfolio
+# activities (deposits, withdrawals, referral bonuses, transfers). Writes
+# one immutable, closed-schema snapshot per run under
+# ~/.local/share/breezy/derived/capital_flows/ so
+# scripts/analysis/portfolio_roi_report.py can read it as EVIDENCE (never by
+# inference) for the net-of-flow reconciliation ladder.
+#
+# Standalone unit -- deliberately NOT folded into breezy-trade-supervisor or
+# breezy-quote-tape, the plan's Risk Register: a pull failure or hang must
+# never couple to node launch (supervisor is launch-critical), and a daily
+# oneshot has a lifecycle mismatch with quote-tape's continuous stream.
+Description=Breezy FU-13b read-only capital-flow puller (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/venue/polymarket_us_capital_flow_pull.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/NIGHT_2026-09-26/FU-13b_plan_r2_2026-09-26.md
+
+# Orders the pull ahead of the report that reads it -- holds even under a
+# missed-then-caught-up Persistent=true firing of both timers together.
+Before=breezy-portfolio-roi.service
+
+# AUD-15a-style alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# A bounded JSON pull (<=20 pages x 100 records) with no catalog/tape read --
+# well under any heavy-study ceiling.
+MemoryMax=512M
+UMask=0077
+
+# The ONLY credentialed venue read in this unit -- polymarket.env carries the
+# Ed25519 signing key. breezy.env is the shared, non-credential host config
+# (POLYMARKET_US_USER_AGENT's contact string lives there like every other
+# venue-touching unit's). alerts.env is loaded for a future alert sink.
+# Never breezy-trade.env or operator.env: this unit must never see an
+# operator-reserved control (round-2 review binding, restated from the plan's
+# Risk Register).
+EnvironmentFile=-%h/.config/breezy/breezy.env
+EnvironmentFile=-%h/.config/breezy/polymarket.env
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+ExecStart=/home/jon/breezy/deploy/systemd/capital-flow-pull-run.sh
+
+# <=20 pages at the shared portfolio quota's <=12 requests/min pacing
+# completes in well under 2 minutes (plan "Pagination"); this leaves
+# generous headroom.
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-capital-flow-pull
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-capital-flow-pull.timer`
+# is the only thing to enable. NOT enabled by this change -- the coordinator
+# installs it.

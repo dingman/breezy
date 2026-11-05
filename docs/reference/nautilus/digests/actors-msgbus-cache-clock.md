@@ -308,8 +308,16 @@ registered with a trader (`actor.pyx:892-896`).
 **With `CacheConfig.database = None` (the default, and the default in backtests), `on_save` is never
 called and `on_load` never receives anything — silently.** The only trace is an INFO line
 `"No previous state found for <id>"` (`cache.pyx:1551`). A backing store must be configured via
-`CacheConfig.database` (`cache/config.py:63`) — Redis or Postgres
-(`docs:concepts/cache.md:134-143`).
+`CacheConfig.database` (`cache/config.py:63`). **Redis is the ONLY backend in the 1.231.0 Python
+wheel** — `DatabaseConfig` documents `type : str, {'redis'}, default 'redis'`
+(`common/config.py:357-358`), `system/kernel.py:312` accepts `"redis"`, and `:324-329` raises
+`ValueError("The only database type currently supported is 'redis'")` for anything else. The
+`PostgresCacheConfig` named at `v1.231.0/concepts/cache.md:135-136` is a **Rust-native** type
+reached through the `CacheDatabaseFactory` trait (`cache.md:145-146`) and does not exist in the
+Python wheel: `PostgresCacheConfig` and `RedisCacheConfig` each match **0 files** in the installed
+package (positive control: `class DatabaseConfig` matches 1). There is no `cache/postgres/` and no
+`infrastructure/` directory. *(Corrected 2026-09-01 — the earlier "Redis or Postgres" reading came
+from the upstream concept doc, which describes the Rust core, not the wheel.)*
 
 **22. Generic `Cache.add` / `Cache.get` — signatures and reach. [EMPIRICAL]**
 ```python

@@ -1,0 +1,24 @@
+[Unit]
+Description=09:20 UTC trigger for the Breezy AUD-03 decision-funnel digest
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/decision_funnel_daily_digest.py
+
+[Timer]
+Unit=breezy-decision-funnel-digest.service
+
+# 09:20 UTC — twenty minutes after breezy-quote-tape-rotate (09:00 UTC), so
+# the prior climate day's sidecar is no longer the live recorder's file,
+# and before the 12:15 UTC ingest tick. Free against every other
+# OnCalendar= in this directory (tests/unit/test_deploy_timer_hours.py).
+# Outside the protected window [16:45Z, 01:15Z) / no-start [16:35Z, 01:15Z).
+# UTC is stated explicitly so a host timezone change cannot move it.
+OnCalendar=*-*-* 09:20:00 UTC
+
+# A run missed because the host was down fires once the timer is next
+# active, instead of waiting a full extra day.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

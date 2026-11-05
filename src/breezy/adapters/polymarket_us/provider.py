@@ -33,9 +33,9 @@ under the ``instruments`` quota key.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Final, Literal, overload
 
 from nautilus_trader.common.component import Clock
 from nautilus_trader.common.providers import InstrumentProvider
@@ -43,13 +43,14 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 
 from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
-from breezy.adapters.polymarket_us.errors import VenuePayloadError
+from breezy.adapters.polymarket_us.errors import EmptyClimateListingError, VenuePayloadError
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, SupportsVenueLog
-from breezy.adapters.polymarket_us.parsing import parse_binary_option
+from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
     REGISTRY_VENUE_KEY,
     assert_bounds_cross_checked,
+    assert_catalog_aliases_are_unique,
     assert_valid_slug,
     instrument_id_to_slug,
     parse_weather_slug,
@@ -59,13 +60,22 @@ from breezy.adapters.polymarket_us.transport import (
     QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_INSTRUMENTS,
 )
+from breezy.persistence.station_candidates import (
+    SIGHTING_SCHEMA_VERSION,
+    SightingSink,
+    UnregisteredCitySighting,
+)
 from breezy.registry.sites import SiteRegistry, default_registry
 
 __all__ = [
     "MARKET_BY_SLUG_PATH",
     "MARKET_LIST_PATH",
+    "SIGHTING_SCHEMA_VERSION",
+    "SIGHTING_SINK_FAILURE_ALERT_CYCLES",
     "DiscoveredMarket",
     "PolymarketUSInstrumentProvider",
+    "SightingSinkAlreadyAttachedError",
+    "UnregisteredCitySighting",
     "discovery_candidate_slugs",
 ]
 
@@ -112,6 +122,86 @@ class DiscoveredMarket:
     payload: Mapping[str, Any]
 
 
+#: Consecutive discovery cycles whose sidecar append failed before the ONE
+#: sidecar-broken alert fires (AUD-08b review). A cycle with no sightings is
+#: no evidence either way and neither counts nor resets. Three reload cycles
+#: rules out a single transient fault without leaving a broken disk silent.
+SIGHTING_SINK_FAILURE_ALERT_CYCLES: Final[int] = 3
+
+
+class SightingSinkAlreadyAttachedError(RuntimeError):
+    """A DIFFERENT sighting sink was attached to a provider that already has one.
+
+    The sidecar has exactly one writer by construction (AUD-08 §6b.1); a
+    second sink would be a second appender on the same file.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _StageThreeFailure:
+    """One stage-3 (bounds/instrument-definition) failure, named for the tally.
+
+    CF-14a A2 (docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md). ``city`` and
+    ``cohort`` fall back to ``None`` rather than raising: a slug that stops
+    parsing mid-cycle is itself informative and must not crash the very
+    diagnostic built to explain it.
+    """
+
+    slug: str
+    city: str | None
+    cohort: str | None
+    exception: VenuePayloadError
+
+    @classmethod
+    def from_exception(cls, slug: str, exception: VenuePayloadError) -> _StageThreeFailure:
+        parsed = parse_weather_slug(slug)
+        return cls(
+            slug=slug,
+            city=parsed.city if parsed is not None else None,
+            cohort=parsed.climate_date if parsed is not None else None,
+            exception=exception,
+        )
+
+
+def _cohort_failure_tally(
+    *,
+    discovered_count: int,
+    loaded: Sequence[tuple[str, str | None]],
+    failures: Sequence[_StageThreeFailure],
+) -> str:
+    """Render the ONE ERROR line naming every stage-3 failure (CF-14a A2).
+
+    Today's incident log named one field of one market and nothing about the
+    other 19; this names slug, city, cohort and exception type for EVERY
+    failure, plus per-cohort loaded/failed counts, in a single message.
+    """
+    cohort_counts: dict[str, dict[str, int]] = {}
+
+    def _bump(cohort: str | None, key: str) -> None:
+        bucket = cohort_counts.setdefault(cohort or "unknown", {"loaded": 0, "failed": 0})
+        bucket[key] += 1
+
+    for _slug, cohort in loaded:
+        _bump(cohort, "loaded")
+    for failure in failures:
+        _bump(failure.cohort, "failed")
+
+    failure_lines = "; ".join(
+        f"slug={failure.slug!r} city={failure.city!r} cohort={failure.cohort!r} "
+        f"error_type={type(failure.exception).__name__} message={failure.exception}"
+        for failure in sorted(failures, key=lambda item: item.slug)
+    )
+    cohort_lines = "; ".join(
+        f"{cohort}: loaded={counts['loaded']} failed={counts['failed']}"
+        for cohort, counts in sorted(cohort_counts.items())
+    )
+    return (
+        "Polymarket.us discovery cycle aborting: "
+        f"{len(failures)} of {discovered_count} discovered market(s) failed stage-3 "
+        f"parsing. Failures: {failure_lines}. Per-cohort counts: {cohort_lines}."
+    )
+
+
 def discovery_candidate_slugs(
     payload: Mapping[str, Any],
     *,
@@ -121,12 +211,36 @@ def discovery_candidate_slugs(
     return tuple(market["slug"] for market in _weather_market_payloads(payload, city_codes))
 
 
+@overload
 def _weather_market_payloads(
     payload: Mapping[str, Any],
     city_codes: tuple[str, ...],
-) -> tuple[Mapping[str, Any], ...]:
+    *,
+    collect_unregistered: Literal[False] = False,
+) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@overload
+def _weather_market_payloads(
+    payload: Mapping[str, Any],
+    city_codes: tuple[str, ...],
+    *,
+    collect_unregistered: Literal[True],
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[UnregisteredCitySighting, ...]]: ...
+
+
+def _weather_market_payloads(
+    payload: Mapping[str, Any],
+    city_codes: tuple[str, ...],
+    *,
+    collect_unregistered: bool = False,
+) -> (
+    tuple[Mapping[str, Any], ...]
+    | tuple[tuple[Mapping[str, Any], ...], tuple[UnregisteredCitySighting, ...]]
+):
     markets = _markets_from_payload(payload)
     accepted: list[Mapping[str, Any]] = []
+    sightings: list[UnregisteredCitySighting] = []
     city_set = set(city_codes)
     for index, market in enumerate(markets):
         if not isinstance(market, Mapping):
@@ -153,14 +267,46 @@ def _weather_market_payloads(
                 "refusing to fall back to slug parsing"
             )
         if parsed.city not in city_set:
-            raise VenuePayloadError(
-                f"{MARKET_LIST_PATH} returned weather market naming {city_name!r} "
-                f"({slug!r}, slug city {parsed.city!r}), which has no polymarket_us "
-                "entry in the settlement registry; refusing to trade or to skip a "
-                "city Breezy holds no settlement truth for"
+            if not collect_unregistered:
+                raise VenuePayloadError(
+                    f"{MARKET_LIST_PATH} returned weather market naming {city_name!r} "
+                    f"({slug!r}, slug city {parsed.city!r}), which has no polymarket_us "
+                    "entry in the settlement registry; refusing to trade or to skip a "
+                    "city Breezy holds no settlement truth for"
+                )
+            # Recorded, not traded: one unknown city must not abort the cohort.
+            sightings.append(
+                UnregisteredCitySighting(
+                    schema_version=SIGHTING_SCHEMA_VERSION,
+                    venue=REGISTRY_VENUE_KEY,
+                    city_token=parsed.city,
+                    slug=slug,
+                    climate_date=parsed.climate_date,
+                    observed_ts_ns=0,
+                )
             )
+            continue
         accepted.append(market)
+    if collect_unregistered:
+        return tuple(accepted), tuple(sightings)
     return tuple(accepted)
+
+
+def _unregistered_cities_warning(sightings: Sequence[UnregisteredCitySighting]) -> str:
+    """One line naming every distinct unregistered city and its slug count."""
+    counts: dict[str, int] = {}
+    for sighting in sightings:
+        counts[sighting.city_token] = counts.get(sighting.city_token, 0) + 1
+    rendered = ", ".join(
+        f"{city_token} ({count} slug{'' if count == 1 else 's'})"
+        for city_token, count in sorted(counts.items())
+    )
+    kind = "city" if len(counts) == 1 else "cities"
+    return (
+        "Polymarket.us discovery cycle observed unregistered weather "
+        f"{kind} with no polymarket_us entry in the settlement registry; "
+        f"refusing to trade or subscribe: {rendered}"
+    )
 
 
 def _weather_city_name_from_payload(market: Mapping[str, Any]) -> str | None:
@@ -233,6 +379,10 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         self._market_slugs: tuple[str, ...] = ()
         self._active_market_slugs: tuple[str, ...] = ()
         self._resolved_market_reasons: dict[str, str] = {}
+        self._unregistered_city_sightings: tuple[UnregisteredCitySighting, ...] = ()
+        self._sighting_sink: SightingSink | None = None
+        self._sighting_failure_alert: Callable[[str], None] | None = None
+        self._sighting_sink_consecutive_failures: int = 0
         self._last_successful_non_empty_discovery: tuple[str, ...] = ()
 
     @property
@@ -255,43 +405,195 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         """Return latest venue-owned resolution reasons keyed by slug."""
         return dict(self._resolved_market_reasons)
 
+    @property
+    def unregistered_city_sightings(self) -> tuple[UnregisteredCitySighting, ...]:
+        """Sightings from the latest discovery cycle. Empty when that cycle saw none.
+
+        In-process only. Lost on restart. Not a subscription set and not a
+        trading allow-list.
+        """
+        return self._unregistered_city_sightings
+
+    @property
+    def sighting_sink(self) -> SightingSink | None:
+        """The attached sidecar sink, or ``None`` (every non-recorder process)."""
+        return self._sighting_sink
+
+    @property
+    def sighting_sink_consecutive_failures(self) -> int:
+        """Consecutive cycles whose sidecar append failed. 0 after any good cycle."""
+        return self._sighting_sink_consecutive_failures
+
+    def attach_sighting_sink(
+        self,
+        sink: SightingSink,
+        *,
+        failure_alert: Callable[[str], None] | None = None,
+    ) -> None:
+        """Attach the ONE sidecar writer (AUD-08 §6b.1). Idempotent by identity.
+
+        Attached after construction, never a constructor or ``lru_cache`` key
+        parameter, so the process keeps exactly one shared provider.
+        ``failure_alert`` is the runtime-injected callable raised once per
+        streak of :data:`SIGHTING_SINK_FAILURE_ALERT_CYCLES` failed cycles.
+        """
+        if self._sighting_sink is not None and self._sighting_sink is not sink:
+            raise SightingSinkAlreadyAttachedError(
+                "a different sighting sink is already attached; the sidecar has exactly one writer"
+            )
+        self._sighting_sink = sink
+        if failure_alert is not None:
+            self._sighting_failure_alert = failure_alert
+
+    def _append_sightings(self) -> None:
+        """One append per sighting of this cycle. Advisory: a fault never aborts discovery."""
+        sink = self._sighting_sink
+        if sink is None or not self._unregistered_city_sightings:
+            return
+        for sighting in self._unregistered_city_sightings:
+            try:
+                sink.append(sighting)
+            except (OSError, ValueError) as exc:
+                self._record_sighting_sink_failure(type(exc).__name__)
+                return
+        self._sighting_sink_consecutive_failures = 0
+
+    def _record_sighting_sink_failure(self, error_type: str) -> None:
+        # Exception TYPE only: an OSError's text carries an absolute path,
+        # which an alert detail must never contain.
+        self._sighting_sink_consecutive_failures += 1
+        failures = self._sighting_sink_consecutive_failures
+        self._discovery_log.error(
+            f"Polymarket.us sighting sidecar append failed ({error_type}); "
+            f"{failures} consecutive cycle(s); this cycle's remaining sightings are "
+            "not persisted and discovery continues"
+        )
+        if failures != SIGHTING_SINK_FAILURE_ALERT_CYCLES or self._sighting_failure_alert is None:
+            return
+        detail = (
+            f"sighting sidecar append failed for {failures} consecutive discovery "
+            f"cycles ({error_type}); unregistered-city sightings are not being "
+            "recorded - check the recorder's derived/station_candidates dir"
+        )
+        try:
+            self._sighting_failure_alert(detail)
+        except Exception as exc:  # noqa: BLE001 - an alert fault must never abort discovery
+            self._discovery_log.error(
+                f"Polymarket.us sighting sidecar alert could not be raised ({type(exc).__name__})"
+            )
+
     async def load_all_async(self, filters: dict[Any, Any] | None = None) -> None:
         """Discover weather markets through ``GET /v1/markets`` and load active ones."""
-        discovered = await self._discover_markets()
+        discovered, sightings = await self._discover_markets()
+        observed_ts_ns = self._clock.timestamp_ns()
+        self._unregistered_city_sightings = tuple(
+            replace(sighting, observed_ts_ns=observed_ts_ns) for sighting in sightings
+        )
+        if self._unregistered_city_sightings:
+            # One WARN per cycle, not one line per market.
+            self._discovery_log.warning(
+                _unregistered_cities_warning(self._unregistered_city_sightings)
+            )
+            self._append_sightings()
         if not discovered:
             message = (
                 "Polymarket.us market discovery returned zero configured-city weather "
                 "markets this cycle; refusing to treat this as a quiet market"
             )
             self._discovery_log.error(message)
-            raise VenuePayloadError(message)
+            raise EmptyClimateListingError(message)
 
         slugs = tuple(market.slug for market in discovered)
         if len(set(slugs)) != len(slugs):
             raise VenuePayloadError("Polymarket.us market discovery returned duplicate slugs")
 
-        active_slugs: list[str] = []
         resolved: dict[str, str] = {}
+        # CF-14a A4: instruments are built here, LOCALLY, and never handed to
+        # `self.add()` until the whole cohort's verdict is known -- otherwise
+        # evaluate-all (A1) would make the known `_instruments` leak
+        # (`.venv/.../nautilus_trader/common/providers.py:152-192`, never
+        # cleared) strictly WORSE by adding every parseable market before an
+        # abort instead of only the ones that preceded today's first raise.
+        pending_adds: list[tuple[str, Any, Any | None]] = []
+        failures: list[_StageThreeFailure] = []
         for market in discovered:
             if market.resolved_reason is not None:
                 resolved[market.slug] = market.resolved_reason
                 continue
-            self._assert_bounds(market.payload, market.slug)
-            payload = {"market": market.payload}
-            instrument = parse_binary_option(
-                payload,
-                venue=self._venue,
-                ts_init=self._clock.timestamp_ns(),
-                sites=self._sites,
-                venue_key=REGISTRY_VENUE_KEY,
-            )
-            if instrument.id.symbol.value != market.slug:
-                raise VenuePayloadError(
-                    f"Discovered market slug {market.slug!r} but the parser produced "
-                    f"{instrument.id.symbol.value!r}"
+            try:
+                self._assert_bounds(market.payload, market.slug)
+                payload = {"market": market.payload}
+                instrument, no_instrument = parse_binary_option_pair(
+                    payload,
+                    venue=self._venue,
+                    ts_init=self._clock.timestamp_ns(),
+                    sites=self._sites,
+                    venue_key=REGISTRY_VENUE_KEY,
                 )
+                if instrument.id.symbol.value != market.slug:
+                    raise VenuePayloadError(
+                        f"Discovered market slug {market.slug!r} but the parser produced "
+                        f"{instrument.id.symbol.value!r}"
+                    )
+            except VenuePayloadError as exc:
+                # CF-14a A1: evaluate every market before deciding, instead of
+                # raising on the first stage-3 failure. `SiteRegistryMismatchError`
+                # (A3) is deliberately NOT a `VenuePayloadError` and so is
+                # deliberately NOT caught here: a registry/config mismatch is
+                # not a per-market payload defect this tally is about, and it
+                # still aborts immediately, exactly as it does today.
+                failures.append(_StageThreeFailure.from_exception(market.slug, exc))
+                continue
+            pending_adds.append((market.slug, instrument, no_instrument))
+
+        if failures:
+            # CF-14a C1: the tally is logged HERE, by the provider, before the
+            # raise -- `_run_one_reload_cycle` (`data.py:1055-1063`) never
+            # reaches its own downstream code on abort, so a tally logged
+            # after `initialize(reload=True)` returns could never fire in the
+            # exact case it exists for.
+            parsed_pending = [
+                (slug, parsed.climate_date if (parsed := parse_weather_slug(slug)) else None)
+                for slug, _instrument, _no_instrument in pending_adds
+            ]
+            self._discovery_log.error(
+                _cohort_failure_tally(
+                    discovered_count=len(discovered),
+                    loaded=parsed_pending,
+                    failures=failures,
+                )
+            )
+            # CF-14a C2: re-raise the FIRST collected failure, unchanged in
+            # type, message and ordering identity, so abort semantics are
+            # LITERALLY unchanged at the exception level and no existing
+            # assertion needs touching.
+            raise failures[0].exception
+
+        # R3-1/coordinator hazard: the catalog's SQL sanitiser can alias two
+        # DIFFERENT instrument ids (a NO-leg composite id vs. an unrelated
+        # base slug spelled with `-`/`_` interchangeably) to the same table,
+        # silently dropping one side. Checked over every id (both legs) about
+        # to be added, before any of them is added.
+        assert_catalog_aliases_are_unique(
+            instrument_id
+            for _slug, instrument, no_instrument in pending_adds
+            for instrument_id in (
+                (instrument.id, no_instrument.id) if no_instrument is not None else (instrument.id,)
+            )
+        )
+
+        active_slugs: list[str] = []
+        for slug, instrument, no_instrument in pending_adds:
             self.add(instrument)
-            active_slugs.append(market.slug)
+            if no_instrument is not None:
+                self.add(no_instrument)
+            # R3-6 both-legs assertion: this lives HERE (immediately after the
+            # add loop), never in `_reconcile_discovered_subscriptions`, which
+            # is a slug-keyed subscription planner that never sees a NO id.
+            assert self.find(instrument.id) is not None
+            if no_instrument is not None:
+                assert self.find(no_instrument.id) is not None
+            active_slugs.append(slug)
 
         self._market_slugs = slugs
         self._active_market_slugs = tuple(active_slugs)
@@ -338,7 +640,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 MARKET_BY_SLUG_PATH.format(slug=slug),
                 quota_key=QUOTA_KEY_INSTRUMENTS,
             )
-            instrument = parse_binary_option(
+            instrument, no_instrument = parse_binary_option_pair(
                 payload,
                 venue=self._venue,
                 ts_init=self._clock.timestamp_ns(),
@@ -350,10 +652,24 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                     f"Requested market slug {slug!r} but the venue returned "
                     f"{instrument.id.symbol.value!r}"
                 )
+            # See `load_all_async` for why this check runs before either leg
+            # is added (R3-1/coordinator catalog-alias hazard).
+            assert_catalog_aliases_are_unique(
+                (instrument.id, no_instrument.id) if no_instrument is not None else (instrument.id,)
+            )
             self.add(instrument)
+            if no_instrument is not None:
+                self.add(no_instrument)
+            # R3-6 both-legs assertion (see `load_all_async`).
+            assert self.find(instrument.id) is not None
+            if no_instrument is not None:
+                assert self.find(no_instrument.id) is not None
 
-    async def _discover_markets(self) -> tuple[DiscoveredMarket, ...]:
+    async def _discover_markets(
+        self,
+    ) -> tuple[tuple[DiscoveredMarket, ...], tuple[UnregisteredCitySighting, ...]]:
         discovered: list[DiscoveredMarket] = []
+        sightings: list[UnregisteredCitySighting] = []
         offset = 0
         limit = self._discovery.limit
         for page in range(MAX_DISCOVERY_PAGES + 1):
@@ -371,7 +687,12 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 quota_key=QUOTA_KEY_DISCOVERY,
             )
             page_markets = _markets_from_payload(payload)
-            for market in _weather_market_payloads(payload, self._discovery.city_codes):
+            accepted, page_sightings = _weather_market_payloads(
+                payload,
+                self._discovery.city_codes,
+                collect_unregistered=True,
+            )
+            for market in accepted:
                 slug = market["slug"]
                 assert isinstance(slug, str)
                 discovered.append(
@@ -381,10 +702,11 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                         payload=market,
                     )
                 )
+            sightings.extend(page_sightings)
             if len(page_markets) < limit:
                 break
             offset += limit
-        return tuple(discovered)
+        return tuple(discovered), tuple(sightings)
 
     def _query(self, *, offset: int) -> dict[str, object]:
         query: dict[str, object] = {

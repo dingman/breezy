@@ -1,0 +1,85 @@
+I'll review the plan against Nautilus 1.231.0 source, starting with the plan, the project skill, and the cited extension points. No repo changes.The plan's non-substitution table is the claim set. I'll open each cited Nautilus line and look for a native facility the audits treated as absent.## Nautilus architecture review — PLAN Rev 1
+
+Reviewed against installed NautilusTrader **1.231.0** (`/home/jon/breezy/.venv/.../nautilus_trader`) and the worktree. Read-only. No tests, no edits. Overall: **APPROVE-WITH-CHANGES**. The "replace with Nautilus: none" disposition holds. Several reasons and two "pure move" steps do not.
+
+### (A) §1.2 verdicts
+
+| Row | Verdict | Evidence |
+|---|---|---|
+| `SqliteStateStore` vs `Cache`+`CacheDatabase` | **CONFIRM** | `system/kernel.py:310-329` accepts only `cache.database.type == "redis"` (else `ValueError`). `cache/cache.pyx:1704-1708` writes the DB only if `self._database is not None`; `get` is `self._general.get` (`:2853`) and never read-through. Warm-load is `cache_general` (`:279-298`). `DatabaseConfig.type` is documented `{'redis'}` (`common/config.py:357,389`). A shared SQLite file used by the node, supervisor, and CLIs is not a process-local Redis cache. |
+| `DailySpendLedger` vs `max_notional_per_order` / `Throttler` | **CONFIRM** | `RiskEngineConfig` has only `bypass`, two rate strings, `max_notional_per_order: dict[str, int]`, `debug` (`risk/config.py:21-45`). No day key, no position cap. `PortfolioConfig` (`portfolio/config.py:22-46`) is price-source options only. No cached account → `return True` (`risk/engine.pyx:684-689`); margin accounts also return `True` (`:691-692`). The cap that does run is `Money(float(...))` (`:679`). |
+| `SubmitIntentLatch` vs `max_order_submit_rate` | **CONFIRM** | The field is a rate (`"100/00:00:01"`, `risk/config.py:29-42`). `Throttler` (`common/component.pyx:2973`) buffers or drops messages. Neither is a single-outstanding-create mutex. |
+| In-flight check off + AMBIGUOUS resolver vs `_check_inflight_orders` | **CONFIRM** | `live/execution_engine.py:701-765` queries by `client_order_id`. After `inflight_check_retries`, `_resolve_inflight_order` (`:767-785`) turns `SUBMITTED` into `OrderRejected` reason `"UNKNOWN"`. That frees another submit. It is not an AMBIGUOUS hold. The "Polymarket.us has no client order id" premise was not re-opened against the venue; the native reject path was. **CONFIRMED** (native path) / **HYPOTHESIS** (venue id premise, carried from S1b). |
+| `PolymarketUSFeeModel` vs `ProbabilityPriceFeeModel` | **CONFIRM** | `backtest/engine.pyx:651` is `Condition.type(fee_model, FeeModel, ...)`. The PyO3 class's bases are `(object,)` and its docstring is `qty * fee_rate * p * (1-p)` with no dated θ and no refusal. In-tree `adapters/polymarket/fee_model.py` is a Cython `FeeModel` for **.COM** category rebates, not this schedule. |
+| WebSocket supervisor vs `WebSocketConfig.reconnect_*` | **CONFIRM** | Headers exist only on `WebSocketConfig.__init__` (`core/nautilus_pyo3.pyi:5531-5544`). Runtime dir has `header_names` and no setter. `post_reconnection` (`:5555`) runs after connect. Rust "reuses the same header list" is **HYPOTHESIS** (no Rust sources in the wheel); there is still no API to pass fresh headers into a retry. The 10-sub shard cap is not a Nautilus facility. |
+| PyNaCl vs `ed25519_signature` | **REFUTE** (the stated reason) | Not "never executed" after this pass. Throwaway 32-byte seed, data `str` = UTF-8 canonical bytes: `ed25519_signature` returned the same standard base64 as `nacl.signing.SigningKey.sign(...).signature`. `bytes` data raises `TypeError`. A 64-byte `seed\|\|public` key, which `signing.py:169-170` accepts, raises `ValueError: Invalid Ed25519 private key length`. The primitive is not the signer (method cage, skew window, header triple). Do not swap. |
+| `health.py` vs `heartbeat_interval_secs` | **CONFIRM** | `MessageBusConfig.heartbeat_interval_secs` is only declared (`common/config.py:463-480`). No kernel/msgbus reader. Architect AX's same field name is a different config class. `Component.degrade` (`component.pyx:2098-2127`) is a state transition, not the alert ladder. |
+| `logging_bridge` vs `LoggingConfig` | **CONFIRM** | `LogLevel` is `OFF/DEBUG/INFO/WARNING/ERROR` (`nautilus_pyo3.pyi:1653-1658`). No `CRITICAL`. Cython `Logger.debug/info/warning/error` return immediately when `not logging_is_initialized()` (`component.pyx:1450-1451`, `:1484`, `:1519`, `:1554`). `use_pyo3` defaults `False` (`common/config.py:686`). The PyO3 branch (`:1441`) has **no** initialized-guard; the drop claim is the default Cython path. |
+| Catalog wrapper / feather reader | **CONFIRM** | Equal-range write prints and returns (`persistence/catalog/parquet.py:378-380`). No `flock` anywhere in that file. `_read_feather_file` is `reader.read_all()` (`:2788-2798`). The "~48× memory" factor was **not** re-measured (**HYPOTHESIS**); the full-IPC read is **CONFIRMED**. Breezy's `fcntl.flock` lives in `persistence/catalog.py` (~`:850`). |
+| Actor timer bridge vs `run_in_executor` | **CONFIRM** | Returns `TaskId` (`common/actor.pyx:1047-1106`). With no executor, `func` runs inline and the return value is discarded (`:1091-1093`). `ActorExecutor.get_future` exists (`common/executor.py:120`) but `Actor` does not expose it; the worker awaits the future and only logs `task.exception()` (`executor.py:193-218`). It also cannot replace the bridge: the work is a coroutine that must run on the loop `SqliteStateStore` was built on. |
+| `cache.orders_open` vs `weather_common/inflight.py` | **CONFIRM** | `is_open_c` is `ACCEPTED/TRIGGERED/PENDING_CANCEL/PENDING_UPDATE/PARTIALLY_FILLED` (`model/orders/base.pyx:421-430`). `orders_open` uses that index (`cache.pyx:4741`). `is_inflight_c` is `SUBMITTED/PENDING_CANCEL/PENDING_UPDATE` only (`base.pyx:444-449`); the index is filled from that predicate (`cache.pyx:1430-1431`, `:2614-2615`). `INITIALIZED` is in neither. `cache.pyx:5906` ("inflight = INITIALIZED, SUBMITTED") is **stale**. Unioning the two indexes double-counts `PENDING_*`. `working_orders` (`inflight.py:81`) is `cache.orders` filtered by `not is_closed`, which is the right native composition, not a second cache. Columns in the plan are swapped relative to the header. |
+
+Postgres note on row 1 (**CONFIRMED**, not a substitute): `nautilus_pyo3.PostgresCacheDatabase` and `CachePostgresAdapter` (`cache/adapter.py:58-66`) exist. The kernel will not construct them. The adapter also replaces a passed config with a default `CacheConfig()`. Still a network database, still no read-through `get`.
+
+### (B) Extension points and the cited steps
+
+Sanctioned for 1.231.0 and correctly shaped:
+
+- `HttpClient.get/post` plus `request`/`patch`/`delete` — `nautilus_pyo3.pyi:5416-5452`. Every verb is exposed. **CONFIRMED**.
+- `WebSocketClient.connect(..., post_reconnection=)` — `pyi:5547-5558`. Resubscribe hook, not a header refresh. **CONFIRMED**.
+- `LiveMarketDataClient` — `live/data_client.py:320`. `InstrumentProvider.load_all_async` — `common/providers.py:76`. **CONFIRMED**.
+- Five `generate_*` coroutines — `live/execution_client.py:343,371,394,417,440` (`generate_mass_status` is the fifth). **CONFIRMED**.
+- Cython `FeeModel.get_commission` — `backtest/models/fee.pyx:33-64`. **CONFIRMED**.
+- `RiskEngine.set_trading_state` — `risk/engine.pyx:228-257` (publishes `events.risk`). **CONFIRMED**.
+- `register_arrow` — `serialization/arrow/serializer.py:89-128`, keyed on the **class object**. `register_serializable_type` is keyed on `cls.__name__` (`serialization/base.pyx:335-339`). Catalog directory name is `type(obj).__name__` (`parquet.py:320-336`). Filename is the `ts_init` range (`parquet.py:373-376`, `_timestamps_to_filename` `:2942-2946`). **CONFIRMED**.
+- `ParquetDataCatalog.convert_stream_to_data` — `parquet.py:2604`, and it has its **own** equal-range skip near `:2684`. **CONFIRMED**.
+- `MessageBus.subscribe(topic, handler, priority=0)` — `common/component.pyx:2678`. It is not a typed `subscribe(ComponentStateChanged)` method. **CONFIRMED** as a topic subscription; the plan's wording is slightly wrong.
+- `Clock.set_timer(..., start_time=)` — `component.pyx` (Python wrapper around `:930` `set_timer_ns`). `LiveClock` registers the callback through `create_pyo3_conversion_wrapper` (`:972-973`, `:1006-1010`) into Rust. The installed Python does not name the thread; Breezy's measured "Rust `_DummyThread`, exceptions swallowed" (`nws_actor.py:749-765`) is the operative contract. **CONFIRMED** (wrapper) / **HYPOTHESIS** (thread name, from Breezy's measurement, not re-executed here).
+
+**Mis-cite (CONFIRMED):** §3.1 "Fee model" points `calculate_commission` at `live/execution_client.py:343-440`. Those lines are the report generators. There is no `commission` string in that file. The live hook is `ExecutionClient.calculate_commission` at `execution/client.pyx:165-194`, and the base returns `None` (reconciliation fills book zero commission if not overridden). Backtest registration remains `FeeModel` at `backtest/engine.pyx:651`.
+
+| Step | Contract risk |
+|---|---|
+| **R1.2** actor bridge | Not a Data/catalog break if it keeps `clock.set_timer` + `run_coroutine_threadsafe` + `call_soon_threadsafe` for gate/sqlite/`AlertState`. It **is** an L-16 break if the helper runs those mutations on the timer callback. Copies are not identical: the observation actor increments `inflight` under a lock inside `_submit` (timer thread, by design), and `_record_task_death` sets `_rebuild_trusted = False` (`nws_observation_actor.py:261-267`). `nws_actor` also arms a second, unstaggered deadline timer (`:679-682`). `run_in_executor` must stay unused. **CONFIRMED**. |
+| **R1.4** catalog split | Moving the flock/mount probe does not change Arrow registration, `__name__`, or `ts_init` filenames **if** `write_data`/`query` stay put. A re-export does not redirect `monkeypatch.setattr("breezy.persistence.catalog._…")` once the lookup moves. `tests/unit/test_archive_import_contract.py:15` rewrites `persistence/catalog.py` in place (ENG-20). **CONFIRMED** as a behavior trap; not a Nautilus type-registration break by itself. |
+| **R1.5** health-type move | `AlertState` is explicitly **not persisted** (`runtime/health.py` class docstring: in-memory, one loop thread). The plan's "maybe JSON" note is false. These are not `Data` subclasses, so `register_arrow` / catalog dirs are unaffected. Re-export from `runtime.health` keeps class identity. **CONFIRMED**. |
+| **R3.3** ingest split | Safe only as a move that does not retouch `ts_init`, the filename interval, or the monotonic deadline vs wall clock (`quote_tape_ingest_cli.py` `run` documents those as different clocks). "Fixing" the native equal-range skip would change catalog contents. **HYPOTHESIS** on clock-unification (the long functions were not line-audited); the skip rule is **CONFIRMED**. |
+| **R3.6** health extraction | `_emit_health` must keep `AlertState.evaluate` on the loop thread (`health.py`: evaluate is read-modify-write; do not hand `dispatch` to an executor). The `ts_init` nudge (`nws_actor.py`, CT-4) must not move with `_alert_conditions`. CT-9 (`is_settlement_grade`) does not pin either. **CONFIRMED** (thread rule and the wrong pin); nudge line number not re-opened this pass (**HYPOTHESIS** that it still sits at `:1436-1437`). |
+
+Domain "boilerplate simplification" (§3.1, deferred): a second `register_arrow` for the same class silently overwrites `_SCHEMAS` while leaving `cls._schema` stale. Any later generator must call it once. **CONFIRMED** from `serializer.py:121-128` plus the project skill's already-verified trap.
+
+### (C) Native capability the audits under-weighted
+
+Searched, in the 1.231.0 tree: `cache/` (facade, Redis adapter, Postgres adapter), `risk/config.py` + `risk/engine.pyx`, `live/config.py` `LiveExecEngineConfig` (reconciliation, inflight, open-check, position-check), `portfolio/config.py`, `backtest/models/fee.pyx`, `execution/client.pyx`, `common/component.pyx` (`Throttler`, `MessageBus`, `LiveClock`, `LogLevel` path), `persistence/catalog/parquet.py` and `writer.py`, `actor.pyx` + `executor.py`, `nautilus_pyo3` (`WebSocket*`, `ed25519_signature`, `PostgresCacheDatabase`, `ProbabilityPriceFeeModel`, `StreamingFeatherWriter`).
+
+No facility there replaces a §1.2 row and preserves behavior. Near-misses, none of which should become an R-step:
+
+1. **`ed25519_signature` primitive matches PyNaCl** on one 32-byte-seed vector (base64). It rejects the 64-byte expanded key Breezy accepts. **CONFIRMED** this pass. Not a signer replacement.
+2. **`orders_inflight`** is real and still misses `INITIALIZED`. **CONFIRMED**.
+3. **`PostgresCacheDatabase`** is real and unwired. **CONFIRMED**.
+4. **`ExecutionClient.calculate_commission`** (`execution/client.pyx:165`) is the live reconciliation-fill hook and returns `None`. The plan pointed at the wrong lines. **CONFIRMED**.
+5. **`Component.degrade` is already used** (`exec/client.py:5950`, and `runtime/component_health_watch.py`). §2's "unused" is wrong. It still does not replace `health.py`. **CONFIRMED**.
+6. **`RetryManager` and `StreamingFeatherWriter` are already used** (websocket supervisor; quote-tape streaming). Not missed reinventions. `StreamingFeatherWriter.include_types` is Arrow-serializable types only (`persistence/writer.py:78-80`); it does not keep a raw payload or Breezy's byte cap. **CONFIRMED** (API); raw-payload loss for observation streams remains the plan's **HYPOTHESIS**, and it is correctly outside the R-steps.
+
+### (D) Equivalence traps
+
+1. **R1.2 is filed under "pure moves" and the copies differ** (inflight lock, `_rebuild_trusted = False`, second deadline timer, CRITICAL log strings that alert parsers match). **CONFIRMED**.
+2. **Timer callback thread.** `set_timer` callbacks must not touch `SqliteStateStore`, the gate, or `AlertState`. `run_in_executor` does not marshal a coroutine onto that loop, and its result is discarded. **CONFIRMED**.
+3. **Re-export ≠ monkeypatch retarget**, and `test_archive_import_contract.py` rewrites `catalog.py` source. **CONFIRMED**.
+4. **Moving a `Data` subclass without renaming** does not change the catalog directory (`__name__`) or the Arrow registry (class object). **Renaming does.** `register_serializable_type` collides on `__name__` across modules. R1.6's refusal to move `QuoteTapeGap` is the right call. **CONFIRMED**.
+5. **Same-range catalog rewrite is a silent no-op** (`parquet.py:378-380` and the convert path near `:2684`). A split that "repairs" idempotency changes stored bytes. **CONFIRMED**.
+6. **`AlertState` is not durable JSON.** Moving it cannot break a catalog type name; calling `evaluate` off the loop can corrupt dedupe. The plan's persistence hypothesis is the wrong risk. **CONFIRMED**.
+7. **BC-11 "if `/v1/ws/markets` is public"** contradicts in-tree evidence: `websocket.py:1278-1280` records that the 2026-08-30 probe failed authentication and the path requires auth. **CONFIRMED** (the contradiction). Whether a newer probe reversed that was not re-checked (**HYPOTHESIS**).
+
+### (E) Required revisions
+
+1. **MAJOR** — Take R1.2 out of "pure move." The helper's timer callback may only submit; death handling stays `call_soon_threadsafe`; the observation fail-closed hook, inflight lock, deadline timer, and CRITICAL strings stay behavior-identical. Acceptance already names `test_live_timer_thread_affinity.py`; add an assertion that the callback mutates no store. **CONFIRMED**.
+2. **MAJOR** — Rewrite the §1.2 signing row and narrow BC-11. Parity of the 32-byte primitive was executed and matched; the 64-byte key form does not. The signer stays Breezy because of the cage, the skew window, and key shapes, not because nobody has run the function. **CONFIRMED**.
+3. **MAJOR** — Fix the fee extension-point cite to `execution/client.pyx:165-194` (base returns `None`) and keep `backtest/engine.pyx:651` as the backtest gate. Do not send an implementer to `live/execution_client.py:343`. **CONFIRMED**.
+4. **MAJOR** — R1.5/R3.6: drop "AlertState may be persisted JSON." Pin `evaluate` on the loop thread. Forbid moving the `ts_init` nudge with `_alert_conditions`. Do not treat CT-9 as the pin for R3.6. **CONFIRMED**.
+5. **MINOR** — §1.2 cache row: "only Redis" is the kernel wire-up, not the whole install (`CachePostgresAdapter`). Say that, and do not open a Postgres step. **CONFIRMED**.
+6. **MINOR** — §1.2 orders row: state that `orders_inflight` still misses `INITIALIZED` and overlaps `orders_open` on `PENDING_*`. Note `cache.pyx:5906` is stale. **CONFIRMED**.
+7. **MINOR** — Strike or re-scope BC-11's "public markets socket" until a probe newer than `websocket.py:1278-1280`. The subscription cap is not native either. **CONFIRMED**.
+8. **MINOR** — §2 "Component.degrade unused" is false (`exec/client.py:5950`). No design change. **CONFIRMED**.
+
+**Verdict: APPROVE-WITH-CHANGES.** No §1.2 retain decision should flip to a Nautilus replacement. Do not start R1.2, R3.3, or R3.6 until revisions 1 and 4 are in the plan text.

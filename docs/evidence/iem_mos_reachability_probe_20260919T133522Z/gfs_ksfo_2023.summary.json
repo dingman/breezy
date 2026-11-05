@@ -1,0 +1,17 @@
+{
+  "body_bytes": 3137562,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,n_x,tmp,dpt,cld,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,obv,poz,pos,typ,station,t06,t12",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2023-01-01 00:00:00",
+  "label": "gfs_ksfo_2023",
+  "last_runtime": "2023-12-31 18:00:00",
+  "outcome": "ok",
+  "row_count": 30660,
+  "sample_row_1": "2023-01-01 00:00:00,2023-01-01 06:00:00,GFS,,54,46,OV,240,16,,,,,0.0,,,,6,7,N ,0.0,0.0,R ,KSFO,,",
+  "sample_row_2": "2023-01-01 00:00:00,2023-01-01 09:00:00,GFS,,53,45,OV,270,15,,,,,,,,,5,7,N ,0.0,0.0,R ,KSFO,,",
+  "sha256": "f91ff7dcd136272be89b33b1cacbc499c2f4ad5711a9d3b854e2317c2c0c1550",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KSFO&model=GFS&format=csv&sts=2023-01-01T00%3A00Z&ets=2023-12-31T23%3A59Z"
+}

@@ -173,29 +173,16 @@ A single weather site has FOUR names in different systems; conflating them is a 
 
 ---
 
-## Use pyIEM — Do NOT Hand-Roll Parsing
+## Current Parser Stance — Breezy Parser, Structural Allowlist
 
-**Pin exact versions in pyproject.toml**:
-```toml
-pyiem = "==1.27.0"  # CLI/F6 parsing, production-grade since 2024
-metar = "==2.0.1"   # METAR decoding
-pynws = "==2.1.0"   # Async client (forecasts/obs only, no text products)
-```
+Current ingest uses Breezy's own `breezy.normalize.cli_parse.parse_cli_product`,
+called by `NwsIngestActor` behind a bounded executor. pyIEM remains a backfill
+extra only; it is not the production CLI settlement parser.
 
-**`pyiem.nws.products.cli`** (akrherz, battle-tested behind Iowa Environmental Mesonet) handles:
-- CORRECTION regex (CCA/CCB, "CORRECTED", " CORRECTION" suffix)
-- M/MM (missing), T (trace), unit conversion (°F rounding)
-- Multi-station CLIs (section splitting)
-- AM/PM time-column format drift across WFOs
-- Whitespace-delimited fixed-width column parsing per office
-
-Similarly, `pyiem.nws.products.cf6` parses the F6 form (monthly/daily climate table). **Do not reimplement this.**
-
-**CRITICAL: pyIEM Parser Architecture** — `pyiem.parser()` opens a **live PostgreSQL connection** by default on the standard path. For settlement-critical parsing:
-1. Construct the parser **offline** (pass `dbname=None` or an in-memory fallback) to avoid blocking the trading event loop.
-2. Run CLI parsing **behind a structural allowlist** (city/ICAO/header regex tuple from the registry).
-3. Wrap the parser in a **killable executor with a timeout** (10–60 seconds depending on text size). ReDoS in regex-heavy fixed-width parsing can stall the asyncio thread indefinitely, orphaning the trading loop. A timeout-wrapped subprocess or thread pool prevents this.
-4. Catch and log timeout/parsing exceptions separately from business logic; never re-raise to the trading context.
+Do not replace the current parser with pyIEM by default. Any parser change must
+preserve the existing structural allowlist `(city, ICAO, CLI location,
+body_header_regex, issuing_office)`, the distinct parse/classify/sanity failure
+routes, and the no-validator rule for `/products/{id}` bodies.
 
 **Libraries to AVOID** (stale/unmaintained): nwswx, nwsapy, noaa-sdk.
 

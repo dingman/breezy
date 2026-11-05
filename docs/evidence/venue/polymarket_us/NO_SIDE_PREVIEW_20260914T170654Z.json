@@ -1,0 +1,258 @@
+{
+  "book": {
+    "request": {
+      "headers": {
+        "User-Agent": "breezy/1.0 (+mailto:weather-breezy@jonathan.vc)"
+      },
+      "method": "GET",
+      "path": "/v1/markets/tc-temp-mdwhigh-2026-09-14-gte76lt77f/book",
+      "url": "https://api.polymarket.us/v1/markets/tc-temp-mdwhigh-2026-09-14-gte76lt77f/book"
+    },
+    "response": {
+      "body": {
+        "marketData": {
+          "bids": [
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.0300"
+              },
+              "qty": "163.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.0200"
+              },
+              "qty": "658.2800"
+            }
+          ],
+          "marketSlug": "tc-temp-mdwhigh-2026-09-14-gte76lt77f",
+          "offers": [
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.0800"
+              },
+              "qty": "108.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.0900"
+              },
+              "qty": "144.8000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.1200"
+              },
+              "qty": "100.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.1400"
+              },
+              "qty": "487.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.1900"
+              },
+              "qty": "106.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.2100"
+              },
+              "qty": "2.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.2200"
+              },
+              "qty": "13.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.3000"
+              },
+              "qty": "137.2700"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.3100"
+              },
+              "qty": "28.0000"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.9800"
+              },
+              "qty": "1.1600"
+            },
+            {
+              "px": {
+                "currency": "USD",
+                "value": "0.9900"
+              },
+              "qty": "1.0000"
+            }
+          ],
+          "state": "MARKET_STATE_OPEN",
+          "stats": {
+            "currentPx": {
+              "currency": "USD",
+              "value": "0.0500"
+            },
+            "highPx": {
+              "currency": "USD",
+              "value": "0.4000"
+            },
+            "highSetTime": "2026-09-14T00:17:52.736532284Z",
+            "lastPriceSample": {
+              "longPx": {
+                "currency": "USD",
+                "value": "0.0700"
+              },
+              "shortPx": {
+                "currency": "USD",
+                "value": "0.93"
+              },
+              "ts": "2026-09-14T17:06:51.326047199Z"
+            },
+            "lastTradePx": {
+              "currency": "USD",
+              "value": "0.0700"
+            },
+            "lastTradeQty": "1.0000",
+            "lastTradeSetTime": "2026-09-14T16:51:29.809434385Z",
+            "lowPx": {
+              "currency": "USD",
+              "value": "0.0100"
+            },
+            "lowSetTime": "2026-09-14T16:06:21.820338337Z",
+            "notionalSetTime": "2026-09-14T16:51:29.809434385Z",
+            "notionalTraded": {
+              "currency": "USD",
+              "value": "47632.0500"
+            },
+            "openInterest": "1030.4600",
+            "openInterestSetTime": "2026-09-14T16:51:23.227494307Z",
+            "openPx": {
+              "currency": "USD",
+              "value": "0.3200"
+            },
+            "openSetTime": "2026-09-13T14:01:32.781504455Z",
+            "settlementPx": {
+              "currency": "USD",
+              "value": "0.0000"
+            },
+            "sharesTraded": "2065.3900"
+          },
+          "transactTime": "2026-09-14T17:06:51.326047199Z"
+        }
+      },
+      "status": 200
+    }
+  },
+  "captured_at": "20260914T170654Z",
+  "envelope": "sdk_request_wrapper",
+  "outcome_side": "OUTCOME_SIDE_NO",
+  "preview": {
+    "request": {
+      "body": {
+        "request": {
+          "action": "ORDER_ACTION_BUY",
+          "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+          "marketSlug": "tc-temp-mdwhigh-2026-09-14-gte76lt77f",
+          "maxBlockTime": "5",
+          "outcomeSide": "OUTCOME_SIDE_NO",
+          "price": {
+            "currency": "USD",
+            "value": "0.05"
+          },
+          "quantity": 1,
+          "synchronousExecution": true,
+          "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+          "type": "ORDER_TYPE_LIMIT"
+        }
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "breezy/1.0 (+mailto:weather-breezy@jonathan.vc)",
+        "X-PM-Access-Key": "<redacted>",
+        "X-PM-Signature": "<redacted>",
+        "X-PM-Timestamp": "<redacted>"
+      },
+      "method": "POST",
+      "path": "/v1/order/preview",
+      "url": "https://api.polymarket.us/v1/order/preview"
+    },
+    "response": {
+      "body": {
+        "order": {
+          "action": "ORDER_ACTION_BUY",
+          "avgPx": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "cashOrderQty": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "commissionNotionalTotalCollected": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "commissionsBasisPoints": "0",
+          "createTime": "2026-09-14T17:06:55.247728922Z",
+          "cumQuantity": 0,
+          "goodTillTime": null,
+          "id": "",
+          "insertTime": null,
+          "intent": "ORDER_INTENT_BUY_SHORT",
+          "lastTransactTime": null,
+          "leavesQuantity": 1,
+          "makerCommissionsBasisPoints": "0",
+          "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+          "marketMetadata": {
+            "eventId": "111404",
+            "eventSlug": "temp-mdwhigh-2026-09-14",
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20chicago-716f1c56f8.png",
+            "outcome": "No",
+            "slug": "tc-temp-mdwhigh-2026-09-14-gte76lt77f",
+            "subject": {
+              "id": 0,
+              "name": "76 to 77",
+              "subjectType": ""
+            },
+            "title": "Highest temperature in Chicago on September 14?"
+          },
+          "marketSlug": "tc-temp-mdwhigh-2026-09-14-gte76lt77f",
+          "outcomeSide": "OUTCOME_SIDE_NO",
+          "price": {
+            "currency": "USD",
+            "value": "0.05"
+          },
+          "quantity": 1,
+          "side": "ORDER_SIDE_SELL",
+          "state": "ORDER_STATE_PENDING_NEW",
+          "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+          "type": "ORDER_TYPE_LIMIT"
+        }
+      },
+      "status": 200
+    }
+  },
+  "schema": "breezy.no_side_preview_capture.v1",
+  "slug": "tc-temp-mdwhigh-2026-09-14-gte76lt77f"
+}

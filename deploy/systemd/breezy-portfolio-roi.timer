@@ -1,0 +1,25 @@
+[Unit]
+Description=17:40 UTC trigger for the Breezy AUD-04 portfolio ROI report
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/portfolio_roi_report.py
+
+[Timer]
+Unit=breezy-portfolio-roi.service
+
+# 17:40 UTC -- after the 17:20 breezy-family-tally@.timer tick (section 6
+# D1), and free against every occupied tick on this host (checked against
+# every OnCalendar= in deploy/systemd/*.timer;
+# tests/unit/test_deploy_timer_hours.py enforces uniqueness). This report
+# never reads either PREREG tally's output, so it does not need to follow
+# either for correctness -- only for a lower-contention slot on the shared
+# studies lock.
+OnCalendar=*-*-* 17:40:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is
+# next active, instead of being silently skipped until the following day.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+{
+  "body_bytes": 4750956,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,tmp,dpt,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,sky,gst,t03,pzr,psn,ppl,pra,s06,slv,i06,lcb,station,dur,mht,twd,tws,hid,sol,txn,xnd,tsd,dsd,ssd,gsd,ifc,ifv,wsd",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2023-01-01 01:00:00",
+  "label": "nbs_klax_2023",
+  "last_runtime": "2023-12-31 19:00:00",
+  "outcome": "ok",
+  "row_count": 33580,
+  "sample_row_1": "2023-01-01 01:00:00,2023-01-01 06:00:00,NBS,59,57,200,14,,,,,1.0,,,,9,20,96,24,7,0,0,0,100,,78.0,,8,KLAX,,15,18,22,,0,,,3,3,4,6,35,28,4",
+  "sample_row_2": "2023-01-01 01:00:00,2023-01-01 09:00:00,NBS,57,53,260,14,,,,,,,,,27,90,65,22,7,0,0,0,100,,64.0,,22,KLAX,,20,27,20,,0,,,3,3,33,7,9,0,4",
+  "sha256": "d762229194d515661972161082cce947403c6b6c2fb8e14c05ec1bd8382a77df",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KLAX&model=NBS&format=csv&sts=2023-01-01T00%3A00Z&ets=2023-12-31T23%3A59Z"
+}

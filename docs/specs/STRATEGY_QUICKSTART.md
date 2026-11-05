@@ -12,22 +12,21 @@ This guide takes you from zero to a working backtest in ~30 minutes. Follow it l
 
 A Breezy strategy is a subclass of Nautilus Trader's native `Strategy`, extended to consume weather data (`NwsClimateDay` records from NOAA). You write the trading logic, the backtest harness handles the simulation and feed mechanics. No Breezy wrapper, no lifecycle abstraction — just Nautilus' own extension point.
 
-**You have two reference strategies:**
+**You have one reference strategy:**
 
 - **`src/breezy/strategy/harness_probe.py`** — Minimal. Counts what arrives, submits one market order, logs decisions. Copy this if you want the smallest possible working shape.
-- **`src/breezy/strategy/forecast_edge.py`** — Ordinary. Subscribes to weather and L2 book, maps tmax to a model probability, buys when edge clears a threshold. Copy this if you're building a real trading model.
 
 ---
 
 ## 2. Copy and rename a reference strategy
 
 ```bash
-cp src/breezy/strategy/forecast_edge.py src/breezy/strategy/my_strategy.py
+cp src/breezy/strategy/harness_probe.py src/breezy/strategy/my_strategy.py
 ```
 
 Edit the file:
-- Rename the config class: `ForecastHighEdgeBuyerConfig` → `MyStrategyConfig`
-- Rename the strategy class: `ForecastHighEdgeBuyer` → `MyStrategy`
+- Rename the config class: `BreezyHarnessProbeConfig` → `MyStrategyConfig`
+- Rename the strategy class: `BreezyHarnessProbe` → `MyStrategy`
 - Update docstrings and `__all__`
 
 **No changes to `pyproject.toml` or any init file are required.** Strategies are loaded by direct import at the call site (see §5). If you find yourself editing `pyproject.toml` to register your strategy, that's a bug — report it.
@@ -380,7 +379,7 @@ Type-checks your strategy code under strict mode. If you read a config field, us
 lint-imports
 ```
 
-Enforces the layer contract defined in `pyproject.toml`. Your strategy is in the top layer and may import from `runtime`, `ingest`, `domain`, and `persistence`, but not vice versa. If you need something from a lower layer, the architecture contract blocks it — that's a signal to refactor.
+Enforces the layer contract defined in `pyproject.toml`: `app > analysis > strategy > runtime > adapters > ingest > persistence|registry|normalize > settlement > domain`. Strategy code may import only downward through those layers. If you need something from a higher layer, the architecture contract blocks it — that's a signal to refactor.
 
 ---
 
@@ -446,7 +445,7 @@ The example in §7 lists all required imports at the top. If you copy only the c
 
 ## 12. Next steps
 
-1. **Copy a reference strategy** (forecast_edge for a real model, harness_probe for minimal).
+1. **Copy the reference strategy** (`harness_probe`).
 2. **Write your trading logic** in `on_data` and `on_order_book_depth`.
 3. **Test with synthetic data** (see `tests/support/synthetic_binary_tape.py`).
 4. **Run the four gates** (pytest, ruff, mypy, lint-imports).
@@ -456,8 +455,8 @@ The example in §7 lists all required imports at the top. If you copy only the c
 
 ## 13. References
 
-- **Strategy examples:** `src/breezy/strategy/harness_probe.py`, `src/breezy/strategy/forecast_edge.py`
-- **Test shape:** `tests/integration/test_forecast_edge_backtest.py`
+- **Strategy examples:** `src/breezy/strategy/harness_probe.py`
+- **Test shape:** `tests/integration/test_catalog_market_data_backtest.py`
 - **Backtest harness:** `src/breezy/runtime/backtest_harness.py` (BreezyBacktestConfig, run_backtest)
 - **Weather wrapping:** `src/breezy/runtime/backtest_feed.py` (as_backtest_data, NWS_BACKTEST_CLIENT_ID)
 - **Weather bucket facts:** `src/breezy/domain/weather_bucket_facts.py` (read_weather_bucket_facts)

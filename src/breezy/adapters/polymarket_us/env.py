@@ -52,7 +52,7 @@ Blocking I/O — must not run on the Nautilus event loop
 it from a coroutine would block the Nautilus event loop and stall every other
 client on it. Load credentials ONCE at startup, before the loop runs (e.g. in
 the adapter factory), or wrap the call in ``asyncio.to_thread``. See
-``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md``.
+``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md``.
 """
 
 from __future__ import annotations

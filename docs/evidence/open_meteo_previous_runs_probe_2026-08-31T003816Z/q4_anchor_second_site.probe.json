@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":true,\"reason\":\"Not Found\"}",
+  "bytes": 35,
+  "content_type": "application/json; charset=utf-8",
+  "finding": null,
+  "label": "q4_anchor_second_site",
+  "outcome": "ok",
+  "requested_at_utc": "2026-08-31T00:38:32+00:00",
+  "sha256": "0ea38162214142fdea32440c7736f67d9a044d1007087e3dcd08258ba4eede55",
+  "status": 404,
+  "url": "https://api.open-meteo.com/v1/previous-runs?daily=temperature_2m_max%2Ctemperature_2m_max_previous_day1%2Ctemperature_2m_max_previous_day2%2Ctemperature_2m_max_previous_day3%2Ctemperature_2m_max_previous_day4%2Ctemperature_2m_max_previous_day5&end_date=2026-08-29&latitude=37.61961&longitude=-122.36558&start_date=2026-08-23&timezone=UTC"
+}

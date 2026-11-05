@@ -1,6 +1,6 @@
 # Polymarket US Connector Decision
 
-> Superseded for implementation sequencing by `docs/plans/POLYMARKET_US_BUILD_PLAN.md` (2026-08-25). This document remains evidence for rejecting a repointed `.com` adapter, but the build plan now owns phase order, safety gates, and open questions.
+> Superseded for implementation sequencing by `docs/plans/archive/POLYMARKET_US_BUILD_PLAN.md` (2026-08-25). This document remains evidence for rejecting a repointed `.com` adapter, but the build plan now owns phase order, safety gates, and open questions.
 
 ## Verdict
 

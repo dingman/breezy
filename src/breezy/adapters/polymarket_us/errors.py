@@ -18,13 +18,17 @@ __all__ = [
     "CredentialConfigError",
     "CredentialSerializationError",
     "CredentialSourceError",
+    "EmptyBookSideError",
+    "ExecutionReportMappingError",
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "InstrumentDefinitionError",
+    "MakerFeeScheduleMismatchError",
     "MakerRebateUnmodelledError",
     "MethodNotPermittedError",
     "PolymarketUSError",
     "SignatureClockSkewError",
+    "SiteRegistryMismatchError",
     "VenueAuthError",
     "VenuePayloadError",
     "VenueRateLimitError",
@@ -136,6 +140,60 @@ class VenuePayloadError(PolymarketUSError, ValueError):
     """
 
 
+class EmptyBookSideError(VenuePayloadError):
+    """One side of the order book carried no levels, so there is no top of book.
+
+    **This is the venue's NORMAL state, not a fault.** The repo's own
+    measurement of Polymarket.us weather markets puts the median top-of-book
+    bid at 0.3 contracts, and the ``polymarket-us-integration`` discovery log
+    records ``marketData.bids == []`` on 5/5 frames of a deep-out-of-the-money
+    strike. A ten-hour capture of ~60 markets meets this condition tens of
+    thousands of times.
+
+    Its own class purely so the CALL SITE can tell it apart. The behaviour is
+    unchanged and deliberately so: ``QuoteTick`` is two-sided, and
+    :func:`~breezy.adapters.polymarket_us.parsing.parse_book_top` still
+    refuses rather than inventing a bid, while
+    :func:`~breezy.adapters.polymarket_us.parsing.parse_book_levels` still
+    records the populated side as depth (BL-18, commit ``b6e4982``). What
+    changes is only how the refusal is REPORTED: an expected, already-handled
+    condition logged at ERROR once per frame buries the one genuine error an
+    unattended operator needs to see, which is the same operational failure as
+    BL-22.
+
+    A ``VenuePayloadError`` subclass, not a sibling, so every existing
+    ``except VenuePayloadError`` and every existing
+    ``pytest.raises(VenuePayloadError)`` keeps holding. Discriminating on the
+    message text instead would have been a substring match against a sentence
+    -- silently broken by any rewording, and unable to distinguish this from a
+    crossed book or a malformed level, both of which stay loud.
+
+    ``side`` is the venue's own spelling of the empty side (``"bids"`` or
+    ``"offers"``) so the report can name it without re-parsing the message.
+    """
+
+    def __init__(self, message: str, *, side: str) -> None:
+        super().__init__(message)
+        self.side: str = side
+
+
+class EmptyClimateListingError(VenuePayloadError):
+    """Market discovery returned zero configured-city weather markets.
+
+    Its own class purely so the CALL SITE (``PolymarketUSDataClient._connect``,
+    GL-12) can tell this apart from every other :class:`VenuePayloadError` --
+    duplicate slugs, stage-3 cohort failures, bounds violations -- and retry
+    ONLY this one. Those other payload errors stay fatal on the first
+    occurrence; an empty listing during the venue's own daily discovery lag
+    (measured ~09:45-10:30Z) is not.
+
+    A ``VenuePayloadError`` subclass, not a sibling, for the same reason
+    :class:`EmptyBookSideError` is: every existing ``except VenuePayloadError``
+    and ``pytest.raises(VenuePayloadError, match="discovery returned zero")``
+    keeps holding unchanged.
+    """
+
+
 class InstrumentDefinitionError(VenuePayloadError):
     """An instrument definition payload cannot be turned into a valid instrument.
 
@@ -144,6 +202,36 @@ class InstrumentDefinitionError(VenuePayloadError):
     instrument definition must abort the load. The instrument provider raises
     this rather than skipping the market, so a venue schema change surfaces as
     a failed start-up instead of a silently short instrument list.
+    """
+
+
+class ExecutionReportMappingError(VenuePayloadError):
+    """A private-endpoint payload cannot be mapped to a native execution report.
+
+    Distinct from the general payload error because the *consequence* differs,
+    in the same way :class:`InstrumentDefinitionError` is distinct: a bad quote
+    frame is dropped and the next one used, whereas a balance, order, fill or
+    position that cannot be mapped is an input to RECONCILIATION -- the process
+    that decides what Breezy believes it owns and what it may still spend.
+    Coercing one, defaulting one, or silently skipping one produces a confident
+    and wrong account state, which is the failure this class exists to make
+    loud and attributable.
+
+    Raised for exactly four situations, all of them refusals:
+
+    * a field the SDK snapshot declares is absent (never defaulted -- an
+      absent balance is not a zero balance);
+    * a field carries a value outside the shapes the snapshot declares (an
+      unrecognised order state, execution type, side, type or time-in-force);
+    * the payload carries a key the snapshot does NOT declare, which means the
+      venue's shape moved under a surface we reconcile money against;
+    * a money value would not survive the native constructor unchanged --
+      ``Money(Decimal("0.3125"), USD)`` returns ``Money(0.31, USD)`` without a
+      word, so the refusal is interposed in Breezy ahead of it.
+
+    A ``VenuePayloadError`` subclass, not a sibling, so every existing
+    ``except VenuePayloadError`` keeps holding and a caller can still write
+    ``except PolymarketUSError`` and miss nothing.
     """
 
 
@@ -195,6 +283,25 @@ class FeeScheduleUnknownError(PolymarketUSError):
     """
 
 
+class SiteRegistryMismatchError(PolymarketUSError):
+    """A discovered market names a city with no registered settlement site.
+
+    CF-14a (docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md, item A3).
+    Previously this condition -- ``SiteRegistry.site_for_venue_city_token``
+    raising ``SiteNotFoundError`` -- was re-raised *as*
+    ``InstrumentDefinitionError``, making a ``discovery.city_codes`` <->
+    ``SiteRegistry`` mismatch (a Breezy CONFIG bug) indistinguishable from a
+    venue payload error (a venue DATA bug).
+
+    Deliberately **not** a :class:`VenuePayloadError` subclass: the payload is
+    fine, and nothing about it can be "isolated" as a per-market data defect
+    the way a malformed instrument definition can. Keeping this distinct now
+    means a future per-market isolation gate keyed on payload-error identity
+    (CF-14b) can never accidentally treat a systemic registry gap as a
+    skippable single-market failure.
+    """
+
+
 class MakerRebateUnmodelledError(PolymarketUSError):
     """A maker-only (post-only) order reached the fee model, which cannot price it.
 
@@ -212,6 +319,28 @@ class MakerRebateUnmodelledError(PolymarketUSError):
 
     Resolve by observing a real maker fill and recording the venue's actual
     maker treatment, not by relaxing this refusal.
+    """
+
+
+class MakerFeeScheduleMismatchError(PolymarketUSError):
+    """The venue's reported maker commission disagrees with the pinned rebate.
+
+    ``PolymarketUSFeeModel`` prices an opted-in maker fill at a single pinned
+    coefficient, ``fees.MAKER_FEE_COEFFICIENT`` (``-0.0125``), transcribed
+    from the venue's documented fee schedule
+    (``docs/evidence/venue/polymarket_us/docs_snapshots/fees_2026-08-25.md:
+    12-26``, "Maker Rebate | -0.0125") -- DOCUMENTED-NOT-WIRE-OBSERVED, since
+    no captured payload or fill has independently confirmed it.
+
+    The venue's OWN wire schema separately carries a per-order maker
+    commission field: ``Order.makerCommissionsBasisPoints``
+    (``docs/evidence/venue/polymarket_us/docs_snapshots/
+    api-reference_orders_create-order_2026-08-25.md:339-341``, "Maker
+    commission rate in basis points"). If that figure is ever surfaced onto
+    ``instrument.info`` under ``fees.MAKER_FEE_BPS_INFO_KEY`` and disagrees
+    with the pinned coefficient, pricing at the stale pin would be silently
+    wrong. Raised instead of silently mispricing; resolve by re-verifying the
+    venue's maker schedule and updating the pin, not by relaxing this guard.
     """
 
 

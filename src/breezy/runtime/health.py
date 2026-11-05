@@ -52,14 +52,33 @@ import os
 import ssl
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final
 from urllib.parse import urlsplit
 
 import httpx
 
+from breezy.registry.health_model import (
+    ALLOWED_ALERT_PAYLOAD_KEYS,
+    FINAL_OVERDUE,  # noqa: F401 - re-exported kind constant
+    GAP_RETENTION_WARNING,  # noqa: F401 - re-exported kind constant
+    MAX_ALERT_DETAIL_CHARS,
+    POLL_STALE,  # noqa: F401 - re-exported kind constant
+    POST_SETTLEMENT_REVISION,  # noqa: F401 - re-exported kind constant
+    SCHEMA_VERSION,
+    SITE_BLOCKED,  # noqa: F401 - re-exported kind constant
+    UA_TRAP_LATCHED,  # noqa: F401 - re-exported kind constant
+    AlertCondition,
+    AlertConditionKey,
+    AlertPayload,
+    AlertSink,
+    GapSummary,
+    HealthSnapshot,
+    SiteHealth,
+)
+
 __all__ = [
+    "ALERT_EGRESS_UNCONFIGURED_EVENT",
     "ALERT_WEBHOOK_URL_ENV_VAR",
     "ALLOWED_ALERT_PAYLOAD_KEYS",
     "DEFAULT_RENOTIFY_AFTER_NS",
@@ -77,41 +96,30 @@ __all__ = [
     "LoggingAlertSink",
     "SiteHealth",
     "WebhookAlertSink",
+    "alert_egress_configured",
     "emit_alert",
+    "log_alert_egress_status",
+    "new_alert_state",
     "resolve_alert_sink",
     "write_snapshot_atomic",
 ]
 
 logger = logging.getLogger(__name__)
 
-#: Bumped whenever `HealthSnapshot.to_dict()`'s shape changes, so an
-#: operator or a future reader of the file on disk can tell an old snapshot
-#: apart from a new one without inferring it from field presence.
-SCHEMA_VERSION: Final[int] = 2
-
 #: Re-notify cadence while a condition remains continuously active: 24h in
 #: nanoseconds, matching the design's "slow re-notify" default.
 DEFAULT_RENOTIFY_AFTER_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
-
-#: `AlertPayload`'s explicit field allowlist. A contract test asserts every
-#: `AlertPayload.to_dict()` key is a subset of this constant, so a future
-#: contributor cannot silently widen the payload by passing a whole
-#: snapshot (or settings) dict into `AlertSink.emit`.
-ALLOWED_ALERT_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
-    {"severity", "event", "site", "detail"}
-)
-
-#: `AlertPayload.detail` is truncated to this many characters. The threat
-#: this bounds is payload over-collection into a typo'd or compromised
-#: webhook endpoint -- a full state dump or a raw upstream HTTP body/header
-#: pasted into `detail` would defeat the allowlist in spirit even though
-#: every key stayed on the list.
-MAX_ALERT_DETAIL_CHARS: Final[int] = 200
 
 #: `WebhookAlertSink` is constructed by `resolve_alert_sink` ONLY when this
 #: variable is set. Unset (the default) is not a placeholder empty string
 #: baked into source -- it is the literal absence of any endpoint.
 ALERT_WEBHOOK_URL_ENV_VAR: Final[str] = "BREEZY_ALERT_WEBHOOK_URL"
+
+#: [WP-B0] Event name on the one-line boot WARNING emitted by
+#: :func:`log_alert_egress_status` when no webhook is configured. Greppable
+#: in the node/supervisor log and in `journalctl`, so "did anyone ever have
+#: a delivery channel?" is answerable from the log alone.
+ALERT_EGRESS_UNCONFIGURED_EVENT: Final[str] = "BREEZY_ALERT_EGRESS_UNCONFIGURED"
 
 #: Mode of the health snapshot FILE: owner read/write only. Gap and gate
 #: contents disclose exactly when and how collection is degraded.
@@ -122,149 +130,10 @@ SNAPSHOT_FILE_MODE: Final[int] = 0o600
 #: without read access to the 0600 files themselves.
 SNAPSHOT_DIR_MODE: Final[int] = 0o700
 
-#: Vocabulary of alert condition kinds this module's callers are expected
-#: to evaluate and pass in as `AlertCondition.key.kind`. Kept as plain
-#: strings (not an `Enum`) so the not-yet-built wiring code can construct
-#: `AlertConditionKey`s without importing an enum from this module for
-#: every call site -- the *dedupe* logic below never branches on which
-#: kind a condition is, only on its `(kind, site, extra)` identity.
-UA_TRAP_LATCHED: Final[str] = "ua_trap_latched"
-SITE_BLOCKED: Final[str] = "site_blocked"
-FINAL_OVERDUE: Final[str] = "final_overdue"
-GAP_RETENTION_WARNING: Final[str] = "gap_retention_warning"
-POLL_STALE: Final[str] = "poll_stale"
-POST_SETTLEMENT_REVISION: Final[str] = "post_settlement_revision"
-
 
 # --------------------------------------------------------------------------
 # Snapshot data model
 # --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class GapSummary:
-    """One `open_gaps` line item for `SiteHealth`.
-
-    **This is the seam WI-10's gap ledger (`src/breezy/ingest/gaps.py`,
-    not yet built) plugs into.** `health.py` never imports `gaps.py` and
-    never computes gap state itself -- it only knows how to render an
-    already-decided gap entry into the snapshot and, optionally, feed it
-    into `AlertState` as a `GAP_RETENTION_WARNING` condition. The future
-    adapter is expected to be a thin `GapEntry -> GapSummary` mapping
-    function living beside the ledger (or in the `nws_actor.py` wiring),
-    producing one `GapSummary` per currently-open (or acknowledged-lost)
-    entry each poll cycle.
-
-    `state` and `severity` are plain `str`, not this module's own enums,
-    deliberately: the ledger owns those vocabularies (`GapState` is
-    `OPEN | RESOLVED | ACKNOWLEDGED_LOST` per the design doc), and
-    `health.py` must not fork a second, competing definition of either.
-    """
-
-    climate_day: str
-    state: str
-    severity: str
-    days_until_retention_loss: int
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "climate_day": self.climate_day,
-            "state": self.state,
-            "severity": self.severity,
-            "days_until_retention_loss": self.days_until_retention_loss,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class SiteHealth:
-    """Per-`(venue, city)` section of a `HealthSnapshot`.
-
-    Every field is a plain value the (later) wiring code is expected to
-    extract from `SettlementGate.status`/`blocking_causes` and
-    `NwsIngestActor.resume_cursor` -- this module never imports either.
-    `gate_state`/`gate_reason`/`blocking_causes` are `str`, not `gate.py`'s
-    own `GateState`/`GateReason` enums, so this module carries zero
-    dependency on `breezy.ingest.gate`.
-
-    **`ledger_unavailable` qualifies `open_gaps`, and is the only field
-    here that may not be read independently of another.** `None` means the
-    gap ledger was read successfully this cycle, so `open_gaps` is
-    authoritative; any string means reconciliation FAILED and `open_gaps`
-    is merely what was known before the failure -- almost always the empty
-    list, which is byte-identical to a genuinely healthy site. A file-based
-    monitor must therefore treat a non-`None` value as "gap state unknown",
-    never as "no gaps". It is a plain `str | None` (a bool would force the
-    operator back to the log to learn *which* failure, and the string is
-    already bounded and scrubbed by the caller) and deliberately NOT a
-    `gaps.py` type: this module imports nothing from `breezy.ingest`, which
-    is the same boundary `GapSummary` exists to hold. The string is
-    free-text, so it is the one field here that is not redaction-safe by
-    construction -- the caller is responsible for scrubbing paths, contact
-    addresses and upstream product text out of it BEFORE constructing this
-    object (see `nws_actor._scrub_failure_detail`).
-    """
-
-    venue: str
-    city: str
-    gate_state: str
-    gate_reason: str
-    blocking_causes: tuple[str, ...]
-    last_successful_poll_ns: int | None
-    cursor: str | None
-    open_gaps: tuple[GapSummary, ...]
-    acknowledged_lost_count: int
-    ledger_unavailable: str | None
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "venue": self.venue,
-            "city": self.city,
-            "gate_state": self.gate_state,
-            "gate_reason": self.gate_reason,
-            "blocking_causes": list(self.blocking_causes),
-            "last_successful_poll_ns": self.last_successful_poll_ns,
-            "cursor": self.cursor,
-            "open_gaps": [gap.to_dict() for gap in self.open_gaps],
-            "acknowledged_lost_count": self.acknowledged_lost_count,
-            "ledger_unavailable": self.ledger_unavailable,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class HealthSnapshot:
-    """The whole machine-readable health artifact, written atomically to
-    disk by `write_snapshot_atomic`.
-
-    `snapshot_at_ns` is mandatory (never `None`): a stale file is itself
-    the "process is dead" signal an operator (or a monitor reading the
-    file) relies on, so the snapshot must always carry the wall-clock
-    instant it was produced.
-
-    Deliberately excludes: `user_agent_contact` (or any other
-    `BreezyRuntimeSettings` field -- this module never accepts or imports
-    that type), and every absolute filesystem path (state-db path, catalog
-    base path). There is no field slot for either, by construction --
-    see the module docstring's "Redaction" section.
-    """
-
-    schema_version: int
-    process_started_at_ns: int
-    snapshot_at_ns: int
-    trader_id: str
-    sites: tuple[SiteHealth, ...]
-    ua_trap_latched: bool
-    alerts_emitted_this_cycle: int
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": self.schema_version,
-            "process_started_at_ns": self.process_started_at_ns,
-            "snapshot_at_ns": self.snapshot_at_ns,
-            "trader_id": self.trader_id,
-            "sites": [site.to_dict() for site in self.sites],
-            "ua_trap_latched": self.ua_trap_latched,
-            "alerts_emitted_this_cycle": self.alerts_emitted_this_cycle,
-        }
 
 
 def write_snapshot_atomic(path: Path, snapshot: HealthSnapshot) -> None:
@@ -336,53 +205,6 @@ def write_snapshot_atomic(path: Path, snapshot: HealthSnapshot) -> None:
 # --------------------------------------------------------------------------
 # Alert payload + sinks
 # --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class AlertPayload:
-    """The ONLY shape ever handed to an `AlertSink.emit`.
-
-    Exactly four fields, matching `ALLOWED_ALERT_PAYLOAD_KEYS`. `detail` is
-    truncated to `MAX_ALERT_DETAIL_CHARS` in `__post_init__` -- never
-    raises on an oversize `detail`, since the caller here is always this
-    module's own `AlertState`, not untrusted input; truncation is the
-    correct containment, not a validation error.
-
-    Forbidden in `detail` (enforced by callers constructing
-    `AlertCondition`, not by this class, which cannot tell a full state
-    dump from a short sentence): full state/snapshot dumps, absolute
-    filesystem paths, raw upstream HTTP bodies or headers, and
-    `user_agent_contact`.
-    """
-
-    severity: str
-    event: str
-    site: str
-    detail: str
-
-    def __post_init__(self) -> None:
-        if len(self.detail) > MAX_ALERT_DETAIL_CHARS:
-            object.__setattr__(self, "detail", self.detail[:MAX_ALERT_DETAIL_CHARS])
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "severity": self.severity,
-            "event": self.event,
-            "site": self.site,
-            "detail": self.detail,
-        }
-
-
-class AlertSink(Protocol):
-    """Anything that can receive an `AlertPayload`.
-
-    Deliberately synchronous: sinks are always called through
-    `emit_alert`, which contains any failure (including from a fully
-    synchronous, blocking `httpx.Client.post`) so the caller never awaits
-    or unwinds through sink internals.
-    """
-
-    def emit(self, payload: AlertPayload) -> None: ...
 
 
 class LoggingAlertSink:
@@ -492,6 +314,81 @@ class WebhookAlertSink:
         self._client.close()
 
 
+class TeeAlertSink:
+    """Fan ONE `AlertPayload` out to several sinks, containing each branch
+    INDEPENDENTLY.
+
+    Why this exists (a measured 2026-09-20 regression). `resolve_alert_sink`
+    used to return EITHER `LoggingAlertSink` OR `WebhookAlertSink`. While
+    `BREEZY_ALERT_WEBHOOK_URL` was unset everywhere, every alert reached the
+    node log. The afternoon the webhook was configured, the same node went
+    from 10 `breezy alert` lines in its first ~51 minutes of uptime to
+    ZERO, while 11 alerts were delivered to the webhook. Enabling delivery
+    had silently destroyed local diagnosability -- and the node log is the
+    authoritative forensic record here (it alone carries the boot-time
+    permit line that proves order capability). A channel that costs the
+    record is not an upgrade; it is a trade.
+
+    **Composition, not modification.** Neither `LoggingAlertSink` nor
+    `WebhookAlertSink` knows this class exists; both are unchanged, and
+    either can still be used alone. This type adds fan-out and nothing
+    else -- no formatting, no filtering, no retry, no ordering guarantee
+    beyond "in the order given".
+
+    **Per-branch containment is the whole point.** Every branch is invoked
+    through `emit_alert` -- the same function, with the same deliberate
+    `BaseException` catch, that already guarantees a sink can never abort
+    the poll cycle it is reporting on. So a webhook that throws, times out
+    or hangs does NOT suppress the local log line, a local logger that
+    throws does NOT suppress delivery, and nothing propagates out of
+    `emit`. A tee that let one branch's failure become two would recreate
+    the very loss it was built to prevent. Calling `emit_alert` per branch
+    rather than re-implementing a `try/except` here is deliberate: there is
+    then exactly ONE definition of "contained" in this module.
+
+    **Never names the endpoint.** The webhook URL is a bearer credential.
+    This class logs only an exception TYPE (in `close`), never a message --
+    `httpx` and `ssl` embed the full URL in theirs.
+    """
+
+    __slots__ = ("_sinks",)
+
+    def __init__(self, *sinks: AlertSink) -> None:
+        if not sinks:
+            raise ValueError("TeeAlertSink requires at least one branch sink")
+        self._sinks: tuple[AlertSink, ...] = tuple(sinks)
+
+    @property
+    def sinks(self) -> tuple[AlertSink, ...]:
+        """The branches, in invocation order. Read-only by construction."""
+        return self._sinks
+
+    def emit(self, payload: AlertPayload) -> None:
+        """Hand the SAME payload object to every branch, each contained."""
+        for sink in self._sinks:
+            emit_alert(sink, payload)
+
+    def close(self) -> None:
+        """Close every branch that owns a transport, duck-typed exactly as
+        `composition._close_alert_sink` does.
+
+        Never raises, and never stops early: one branch failing to close
+        must not leak another branch's socket. Only the exception TYPE is
+        logged -- a transport error's message can carry the webhook URL.
+        """
+        for sink in self._sinks:
+            closer = getattr(sink, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except BaseException as exc:  # noqa: BLE001 - teardown must never unwind
+                # `logger.exception` is deliberately NOT used here: an
+                # `httpx`/`ssl` traceback embeds the full webhook URL,
+                # which is a bearer credential. Only the TYPE is logged.
+                logger.error("alert sink branch close() failed: %s", type(exc).__name__)
+
+
 def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     """Return the `AlertSink` this process should use.
 
@@ -501,14 +398,89 @@ def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
 
     `WebhookAlertSink` -- and the `httpx.Client` (and TLS context) inside
     it -- is constructed ONLY when `BREEZY_ALERT_WEBHOOK_URL` is set to a
-    non-empty value. Unset (the default) returns `LoggingAlertSink()` and
-    builds no client, opens no socket, and touches no `ssl` module state.
+    non-empty value. Unset (the default) returns a bare `LoggingAlertSink()`
+    and builds no client, opens no socket, and touches no `ssl` module
+    state.
+
+    **Configured means BOTH, never either/or.** A configured webhook
+    returns a `TeeAlertSink` whose branches are the local log FIRST and the
+    webhook second -- delivery off the box must never cost the node log
+    line, which is the authoritative forensic record (see
+    `TeeAlertSink`'s docstring for the regression this ordering and
+    fan-out exist to prevent). The log branch runs first so the local
+    record is written before a webhook POST that may block up to its
+    timeout; per-branch containment means the ordering is an ordering, not
+    a dependency.
+
+    A malformed URL still raises `ValueError` out of this function, loudly
+    and at construction: `WebhookAlertSink` is built before the tee, so a
+    bad endpoint can never be silently demoted to log-only.
     """
     active_env: Mapping[str, str] = os.environ if env is None else env
     url = active_env.get(ALERT_WEBHOOK_URL_ENV_VAR)
     if not url:
         return LoggingAlertSink()
-    return WebhookAlertSink(url)
+    # Imported here: alert_delivery imports this module at load, and this call is the only
+    # construction site that changes (AUT-6 §3.6.5). Writer id is legacy_runtime (X-2).
+    from breezy.runtime.alert_delivery import JournalingWebhookAlertSink
+
+    return TeeAlertSink(
+        LoggingAlertSink(),
+        JournalingWebhookAlertSink(url, writer="legacy_runtime"),
+    )
+
+
+def alert_egress_configured(env: Mapping[str, str] | None = None) -> bool:
+    """True iff this process can deliver an alert OFF this machine.
+
+    [WP-B0] Deliberately the EXACT condition :func:`resolve_alert_sink`
+    branches on -- a non-empty ``BREEZY_ALERT_WEBHOOK_URL`` -- so there can
+    never be two competing definitions of "configured" that drift apart.
+    URL *validity* is not re-checked here on purpose: a set-but-malformed
+    URL makes :func:`resolve_alert_sink` raise loudly at construction,
+    which is a different (and already noisy) failure from the SILENT
+    degradation to `LoggingAlertSink` that this predicate exists to make
+    queryable by a later health check.
+    """
+    active_env: Mapping[str, str] = os.environ if env is None else env
+    return bool(active_env.get(ALERT_WEBHOOK_URL_ENV_VAR))
+
+
+def log_alert_egress_status(env: Mapping[str, str] | None = None, *, component: str) -> bool:
+    """Make alert reachability VISIBLE at boot. Returns the predicate.
+
+    [WP-B0] Before this existed, an unset webhook degraded in total
+    silence: every alert went to a log file nobody reads, and the system
+    paid for it twice -- a fee-schedule halt that ran three days unnoticed
+    and a live-trading permit lapse that ran eleven hours unnoticed. Both
+    were emitted; neither was delivered.
+
+    **Loud, never fatal.** An unconfigured channel logs one WARNING line
+    and returns ``False``; it never raises and never blocks startup.
+    Refusing to start the bot over telemetry would trade a real trading
+    capability for an observability one, which is the wrong trade.
+
+    **Never logs the URL.** An operator webhook URL is a bearer
+    credential -- possession of it IS authorisation to post -- so the
+    configured branch names only the environment variable, never its value
+    and never the endpoint's host.
+    """
+    if alert_egress_configured(env):
+        logger.info(
+            "breezy alert egress configured component=%s source=%s",
+            component,
+            ALERT_WEBHOOK_URL_ENV_VAR,
+        )
+        return True
+    logger.warning(
+        "%s component=%s: NO alert egress is configured -- every alert this "
+        "process emits will reach the log ONLY and no operator. Set %s to an "
+        "https endpoint and verify it with `breezy-check-alerts`.",
+        ALERT_EGRESS_UNCONFIGURED_EVENT,
+        component,
+        ALERT_WEBHOOK_URL_ENV_VAR,
+    )
+    return False
 
 
 def emit_alert(sink: AlertSink, payload: AlertPayload) -> None:
@@ -522,63 +494,32 @@ def emit_alert(sink: AlertSink, payload: AlertPayload) -> None:
     an alert sink must never be able to abort the poll cycle it is
     reporting on, for ANY reason, mirroring `nws_actor.py`'s own stance in
     `_on_poll_done` toward supervision errors. A failure here is logged at
-    ERROR (with the stack trace, via `logger.exception`) and swallowed.
+    ERROR and swallowed.
+
+    **Only the exception TYPE is logged, never its message or traceback**
+    (AUD-15 amendment, 2026-09-22) -- an `httpx`/`ssl` exception's own
+    message routinely embeds the failing request's full URL, and for
+    `WebhookAlertSink` that URL is a bearer credential. `logger.exception`
+    (which attaches `exc_info`, and therefore the message, via the
+    traceback) is deliberately NOT used here, mirroring
+    `TeeAlertSink.close()`'s and `check_alerts_cli`'s own withheld-message
+    discipline elsewhere in this module.
     """
     try:
         sink.emit(payload)
-    except BaseException:  # deliberate: see docstring -- this is the contract, not sloppiness.
-        logger.exception(
-            "alert sink failed to emit event=%s site=%s severity=%s",
+    except BaseException as exc:  # noqa: BLE001 - deliberate; see docstring.
+        logger.error(
+            "alert sink failed to emit event=%s site=%s severity=%s exception_type=%s",
             payload.event,
             payload.site,
             payload.severity,
+            type(exc).__name__,
         )
 
 
 # --------------------------------------------------------------------------
 # Alert dedupe / transition tracking
 # --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class AlertConditionKey:
-    """Identifies one alertable condition instance for dedupe purposes.
-
-    `site` is `"<venue>/<city>"` or `"global"`, matching `AlertPayload.site`.
-    `extra` lets one `kind` track multiple simultaneous instances at the
-    same site (e.g. one key per open gap `climate_day` under
-    `GAP_RETENTION_WARNING`) without widening `kind` into a combinatorial
-    enum. Hashable and orderless: two conditions with the same
-    `(kind, site, extra)` are the same tracked condition across cycles,
-    full stop.
-    """
-
-    kind: str
-    site: str
-    extra: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class AlertCondition:
-    """One condition, evaluated fresh by the caller every poll cycle, fed
-    into `AlertState.evaluate`/`dispatch`.
-
-    `active`: is the condition true right now (this cycle's answer, not a
-    remembered one -- `AlertState` owns the memory).
-    `renotify_muted`: suppresses the periodic re-notify while `active`
-    stays `True` -- the `ACKNOWLEDGED_LOST`-gap case: still alertable on
-    the transition into the condition, but not repeatedly afterward, while
-    still appearing in the health snapshot via `GapSummary` regardless.
-    `severity`/`event`/`detail` are used verbatim to build the
-    `AlertPayload` on every cycle this condition actually fires.
-    """
-
-    key: AlertConditionKey
-    active: bool
-    severity: str
-    event: str
-    detail: str
-    renotify_muted: bool = False
 
 
 class AlertState:
@@ -666,3 +607,8 @@ class AlertState:
             site=condition.key.site,
             detail=condition.detail,
         )
+
+
+def new_alert_state() -> AlertState:
+    """A fresh, cold-start :class:`AlertState` (the ``HealthIO`` factory seam)."""
+    return AlertState()

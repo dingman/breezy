@@ -1,0 +1,30 @@
+[Unit]
+Description=11:10 UTC trigger for the Breezy AUD-02 A0 fee-drift evidence pull
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/venue/fee_drift_evidence_pull.py
+
+[Timer]
+Unit=breezy-fee-evidence-pull.service
+
+# 11:10 UTC -- clear of every occupied tick on this host (00,06,12,18:15,
+# 01:35, 09:00, 09:20, 09:25, 13:30, 14:15, 14:30, 15:00, 15:20, 17:20,
+# 17:40; tests/unit/test_deploy_timer_hours.py enforces uniqueness), clear
+# of the 15-minute quote-tape ingest ticks, and outside the protected
+# no-start window [16:35Z, 01:15Z) the script itself also enforces
+# defensively (Rev 2.1 item 2 of the AUD-02 completion plan) -- so a
+# Persistent=true catch-up firing late from a reboot still lands well clear
+# of that window in the ordinary case. UTC is stated explicitly so a host
+# timezone change cannot move this schedule.
+OnCalendar=*-*-* 11:10:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day. If a
+# catch-up fire DOES land inside the protected window, the script itself
+# exits 0 having pulled nothing and marks that day INCOMPLETE -- the timer
+# does not need to reason about that case.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

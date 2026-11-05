@@ -1,0 +1,58 @@
+
+706 
+CDUS44 KEWX 041223
+CLISAT
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE AUSTIN/SAN ANTONIO
+723 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE SAN ANTONIO CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+VALID AS OF 0700 AM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1886 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE           
+                VALUE   (LST)  VALUE       VALUE  FROM               
+                                                  NORMAL           
+................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM         82  12:18 AM 109    2000  93    -11                 
+  MINIMUM         80   5:59 AM  56    1974  73      7                 
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          4.69 1942   0.13  -0.13              
+  MONTH TO DATE    0.00                      0.52  -0.52              
+  SINCE SEP 1      0.00                      0.52  -0.52              
+  SINCE JAN 1     26.54                     21.19   5.35              
+
+................................................................
+
+
+THE SAN ANTONIO CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   93       111      2000                      
+ MINIMUM TEMPERATURE (F)   72        54      1974                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   7:13 AM CDT   SUNSET   7:52 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   7:13 AM CDT   SUNSET   7:51 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

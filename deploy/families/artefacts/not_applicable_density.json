@@ -1,0 +1,6 @@
+{
+  "schema": "breezy_density_artefact_v1",
+  "applicable": false,
+  "reason": "current_rung_hold and continuous_rung_hold composition kinds price against the frozen archive table, not a forecast density table; this sentinel is the committed density_artefact_path pin for every non-forecast family manifest until a real forecast density table exists (WP-13).",
+  "generated_by": "WP-11b (2026-09-19)"
+}

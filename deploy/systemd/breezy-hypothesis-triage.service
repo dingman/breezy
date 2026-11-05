@@ -1,0 +1,52 @@
+[Unit]
+# AUD-18 hypothesis triage (docs/plans/backlog/AUDIT_2026-09-21/
+# AUD-18-strategy-design-backtest-iterate-programme.md §6.4b). Sibling of
+# breezy-replay-daily.service: oneshot, no [Install], wrapper-script
+# driver. The timer owns cadence. This unit consumes that replay's
+# artefacts and must not precede it.
+Description=Breezy hypothesis triage (offline JSONL join, no tape scan)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/hypothesis_triage.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-18-strategy-design-backtest-iterate-programme.md
+
+# Ordered after the 15:50 UTC replay this job reads. The studies lock is
+# the real mutual exclusion; After= is belt-and-braces, not a substitute.
+After=breezy-replay-daily.service
+
+# AUD-15a pattern: alert on failure (timeout, OOM-kill, or non-zero exit).
+# A killed process cannot emit its own alert. The 2026-09-11 k1-daily
+# incident peaked at 17.6 GB with no per-unit ceiling; this unit's own
+# MemoryHigh=/MemoryMax= below is what contains a runaway in this cgroup.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# JSONL joins and a bounded draw set, an order of magnitude under the
+# 12G/16G tape studies. 1G/2G is an engineering containment parameter,
+# not an operator cap.
+MemoryHigh=1G
+MemoryMax=2G
+
+Slice=breezy-studies.slice
+UMask=0077
+
+# Same alerts.env convention as breezy-replay-daily.service: without it,
+# in-process resolve_alert_sink/emit_alert calls resolve a log-only sink
+# (BREEZY_ALERT_WEBHOOK_URL lives only here). The leading `-` keeps the
+# unit startable before migrate-alerts-env.sh has run. Never
+# breezy-trade.env / polymarket.env / operator.env -- this unit holds no
+# venue credential and no operator-reserved value.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+ExecStart=/home/jon/breezy/deploy/systemd/hypothesis-triage-run.sh
+
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-hypothesis-triage
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly.

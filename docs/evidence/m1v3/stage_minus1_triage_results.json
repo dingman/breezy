@@ -1,0 +1,158 @@
+{
+ "stats": {
+  "norow": 96,
+  "nobid": 169,
+  "rungs": 1085
+ },
+ "days_with_rungs": 37,
+ "main4": {
+  "days": 37,
+  "days_with_cands": 33,
+  "cand_mean": 9,
+  "cand_median": 10,
+  "total": 333,
+  "share_first5s": 0.42042042042042044,
+  "gap_q": {
+   "0": 3.928e-06,
+   "0.1": 0.0011490532,
+   "0.25": 0.090566884,
+   "0.5": 1.100055233,
+   "0.75": 5.9566279492500005,
+   "0.9": 17.298104818800024,
+   "1": 1725.85338165
+  },
+  "gap_share_le_1s": 0.49,
+  "gap_share_lt_150s": 0.99,
+  "days_with_shared_ts": 0,
+  "tied_extra_rungs": 0,
+  "p": {
+   "0.1": {
+    "p50": 0.4610909090909091,
+    "p90": 0.5823418181818182,
+    "mean": 0.45069810458901366,
+    "se_day": 0.019928403940135998,
+    "attempted_per_day_over_candidate_days": 5.42769696969697,
+    "attempted_per_day_all_days": 4.840918918918919,
+    "verdict": "STOP"
+   },
+   "0.18": {
+    "p50": 0.5620909090909091,
+    "p90": 0.6450509090909091,
+    "mean": 0.5409499688022416,
+    "se_day": 0.01766538602458798,
+    "attempted_per_day_over_candidate_days": 4.495787878787879,
+    "attempted_per_day_all_days": 4.009756756756756,
+    "verdict": "STOP"
+   },
+   "0.33": {
+    "p50": 0.691,
+    "p90": 0.7368391608391609,
+    "mean": 0.6646738350874715,
+    "se_day": 0.017632438193070185,
+    "attempted_per_day_over_candidate_days": 3.2256969696969695,
+    "attempted_per_day_all_days": 2.876972972972973,
+    "verdict": "STOP"
+   }
+  }
+ },
+ "main4+NYC": {
+  "days": 37,
+  "days_with_cands": 33,
+  "cand_mean": 10.513513513513514,
+  "cand_median": 12,
+  "total": 389,
+  "share_first5s": 0.442159383033419,
+  "gap_q": {
+   "0": 3.928e-06,
+   "0.1": 0.0012871915,
+   "0.25": 0.06211307425,
+   "0.5": 0.8657063355000001,
+   "0.75": 5.26185835925,
+   "0.9": 14.197666017,
+   "1": 1725.85338165
+  },
+  "gap_share_le_1s": 0.5196629213483146,
+  "gap_share_lt_150s": 0.9915730337078652,
+  "days_with_shared_ts": 0,
+  "tied_extra_rungs": 0,
+  "p": {
+   "0.1": {
+    "p50": 0.5011818181818182,
+    "p90": 0.6236218181818182,
+    "mean": 0.4866154572700027,
+    "se_day": 0.019447724567093157,
+    "attempted_per_day_over_candidate_days": 5.895787878787878,
+    "attempted_per_day_all_days": 5.258405405405406,
+    "verdict": "STOP"
+   },
+   "0.18": {
+    "p50": 0.5945555555555555,
+    "p90": 0.6779781818181818,
+    "mean": 0.5824917505053868,
+    "se_day": 0.01730246823205861,
+    "attempted_per_day_over_candidate_days": 4.745757575757576,
+    "attempted_per_day_all_days": 4.232702702702703,
+    "verdict": "STOP"
+   },
+   "0.33": {
+    "p50": 0.719,
+    "p90": 0.7661333333333333,
+    "mean": 0.6996673427582518,
+    "se_day": 0.01772373689412502,
+    "attempted_per_day_over_candidate_days": 3.349121212121212,
+    "attempted_per_day_all_days": 2.987054054054054,
+    "verdict": "STOP"
+   }
+  }
+ },
+ "NYC_only": {
+  "days": 37,
+  "days_with_cands": 31,
+  "cand_mean": 1.5135135135135136,
+  "cand_median": 1,
+  "total": 56,
+  "share_first5s": 0.5714285714285714,
+  "gap_q": {
+   "0": 2.6151e-05,
+   "0.1": 0.001118269,
+   "0.25": 0.020056649,
+   "0.5": 2.876318473,
+   "0.75": 6.002504429,
+   "0.9": 23.121524974200035,
+   "1": 87.015570049
+  },
+  "gap_share_le_1s": 0.44,
+  "gap_share_lt_150s": 1.0,
+  "days_with_shared_ts": 0,
+  "tied_extra_rungs": 0,
+  "p": {
+   "0.1": {
+    "p50": 0.0525,
+    "p90": 0.5,
+    "mean": 0.1597956989247312,
+    "se_day": 0.03891657645425402,
+    "attempted_per_day_over_candidate_days": 1.4305483870967741,
+    "attempted_per_day_all_days": 1.1985675675675675,
+    "verdict": "STOP"
+   },
+   "0.18": {
+    "p50": 0.088,
+    "p90": 0.5,
+    "mean": 0.17589784946236559,
+    "se_day": 0.03843179864121955,
+    "attempted_per_day_over_candidate_days": 1.3875161290322582,
+    "attempted_per_day_all_days": 1.1625135135135136,
+    "verdict": "STOP"
+   },
+   "0.33": {
+    "p50": 0.1475,
+    "p90": 0.5,
+    "mean": 0.20233064516129032,
+    "se_day": 0.038495622352686464,
+    "attempted_per_day_over_candidate_days": 1.3177419354838709,
+    "attempted_per_day_all_days": 1.104054054054054,
+    "verdict": "STOP"
+   }
+  }
+ }
+}

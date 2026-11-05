@@ -40,11 +40,13 @@ equality rather than an assumption. Cross-checking an explicitly configured
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.registry.sites import RegistryError, default_registry, load_registry
 
 _TRADER_ID_VAR = "BREEZY_TRADER_ID"
@@ -61,17 +63,85 @@ _HEALTH_SNAPSHOT_DIR_VAR = "BREEZY_HEALTH_SNAPSHOT_DIR"
 #: :func:`load_settings`. See that function's docstring for why the venue
 #: role is loaded separately.
 QUOTE_TAPE_CATALOG_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG"
-_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING"
-)
+_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING"
 _QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR"
-_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING"
-)
+_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING"
 _QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR"
-_QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
-)
+_QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
+
+#: The TRADING role's own trader id. Read ONLY by
+#: :func:`load_trade_settings`, and deliberately a DIFFERENT variable from
+#: ``BREEZY_TRADER_ID`` with NO default.
+#:
+#: ``TraderId`` is stamped on every order and every position the trading
+#: process will ever create. Two reasons this is separate and required:
+#:
+#: * a host provisioned only for weather ingestion carries
+#:   ``BREEZY_TRADER_ID`` (which defaults anyway), so reusing it would let a
+#:   collector host start a trading process by accident -- the fail-OPEN
+#:   direction, on the one process that can eventually spend money;
+#: * an order attributed to the collector's shared ``BREEZY-001`` is
+#:   ambiguous in the venue's records and in ours.
+#:
+#: There is no default because there is no correct value to invent.
+TRADE_TRADER_ID_VAR = "BREEZY_TRADE_TRADER_ID"
+
+#: BL-24 Seam B section 6: registers the per-station NWS observation Actors
+#: on the TRADING node. OFF unless set to exactly ``"1"`` -- absent or any
+#: other value registers nothing. Parsed in the `_parse_check_proxy_env`
+#: idiom. The ingest node and the tape recorder never read it.
+LIVE_OBSERVATIONS_VAR = "BREEZY_LIVE_OBSERVATIONS"
+
+#: WP-11b (active-family registry, cardinality-1): the ONE identifier
+#: naming which ``deploy/families/<id>.json`` manifest is the sending
+#: family for this boot. Replaces the retired
+#: ``BREEZY_CURRENT_RUNG_HOLD``/``BREEZY_CONTINUOUS_RUNG_HOLD`` boolean
+#: pair -- cardinality-1 is now STRUCTURAL (one string slot), not an
+#: N-boolean mutex that happens to be checked. Unset means no sending
+#: family (shadow / tape-recorder / ingest-role boots). Requires
+#: :data:`LIVE_OBSERVATIONS_VAR` -- every composition kind prices against
+#: live data, so enabling a sending family without the publisher would
+#: latch ``observation_unavailable`` on every station-day and burn the
+#: trial. The tape recorder never reads this variable.
+SENDING_FAMILY_ID_VAR = "BREEZY_SENDING_FAMILY_ID"
+
+#: Family-id shape: the same charset `deploy/families/*.json` basenames
+#: already use everywhere (lowercase/digits/underscore/colon, for the
+#: ``kalshi:`` venue-prefixed ids). A comma or embedded whitespace can never
+#: be a single id, so it is the natural, cheap way a caller could otherwise
+#: try to smuggle two ids through the one string slot -- refused by
+#: :func:`_parse_sending_family_id` before it ever reaches a file lookup.
+_FAMILY_ID_RE_SOURCE = r"^[a-z0-9_:]+$"
+
+#: Phase 0 shadow build-side escape hatch. OFF unless set to exactly
+#: ``"1"``. Under WP-11b's single ``sending_family_id`` slot this folds the
+#: retired ``phase0_family_permits``'s behaviour (composed, but the
+#: order-submission permit is deliberately withheld) into
+#: ``strategy.current_rung_hold.composition.phase1_sending_permit``: with
+#: this on, the ONE sending family is still composed and still boots, but
+#: never receives a real permit (permit stays ``None`` by construction) --
+#: it can never, even under this hatch, name a SECOND sending id. This is
+#: a BUILD-SIDE flag, never an operator-reserved control, so its name may
+#: appear in tracked files; it does not gate order submission by itself.
+CRH_CONT_PHASE0_SHADOW_VAR = "BREEZY_CRH_CONT_PHASE0_SHADOW"
+
+#: Trade-role catalog root used as the pre-build discovery source when a
+#: sending family is on. Distinct from :data:`QUOTE_TAPE_CATALOG_VAR`, which
+#: remains the recorder's single-reader contract. Required, absolute, no
+#: ``..`` segment, only when a sending family is set.
+TRADE_CATALOG_ROOT_VAR = "BREEZY_TRADE_CATALOG_ROOT"
+
+#: CRH enablement step 8 (converged review item 7): a build-side REQUEST
+#: for the order path to be reachable, not an enablement by itself. OFF
+#: unless set to exactly ``"1"`` -- same idiom as :data:`LIVE_OBSERVATIONS_VAR`.
+#: Requires both of those to already be on: the strategy has no order path
+#: to gate without a sending family, and no fresh price to gate it against
+#: without ``live_observations``. This field is a REQUEST that
+#: ``runtime.order_enablement.issue_order_submission_permit`` reads and
+#: validates alongside five other preconditions -- it is never, on its own,
+#: sufficient to submit an order. It is a build-side flag, not an
+#: operator-reserved control, so its name may appear in tracked files.
+ORDERS_ENABLED_VAR = "BREEZY_ORDERS_ENABLED"
 
 _DEFAULT_TRADER_ID = "BREEZY-001"
 
@@ -103,6 +173,15 @@ _DEFAULT_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS = 30
 #: aliases NOT present on Nautilus's `LogLevel` and must be rejected here.
 _SUPPORTED_LOG_LEVELS = frozenset({"OFF", "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"})
 _STATE_DB_RELATIVE_PATH = Path("state") / "breezy-state.sqlite3"
+
+#: WP-11b: where every family manifest lives, relative to the process CWD.
+#: `trade_supervisor.py`'s `_launch`/`_relaunch` always set
+#: `cwd=str(repo_root)` before spawning the trading process, the same
+#: relative-path convention `deploy/families/*.json` already uses
+#: everywhere else (test fixtures, `scripts/analysis/*`'s own
+#: `--family-manifest` CLI args, `app/trade.py`'s own manifest load).
+_FAMILIES_DIR = Path("deploy/families")
+_FAMILY_ID_RE = re.compile(_FAMILY_ID_RE_SOURCE)
 
 
 class SettingsError(ValueError):
@@ -249,6 +328,91 @@ def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
     return env.get(_ALLOW_PROXY_ENV_VAR) != "1"
 
 
+def _parse_live_observations(env: Mapping[str, str]) -> bool:
+    return env.get(LIVE_OBSERVATIONS_VAR) == "1"
+
+
+def _parse_sending_family_id(env: Mapping[str, str]) -> str | None:
+    """Parse :data:`SENDING_FAMILY_ID_VAR`; ``None`` when unset (no sending
+    family -- a legitimate shadow/tape-recorder/ingest-role boot).
+
+    Cardinality-1 is enforced HERE, structurally, before the value is ever
+    used to look up a manifest: a comma or embedded whitespace can never be
+    a single family id, so it is refused as an attempt to name two ids
+    through the one string slot rather than silently truncated or
+    first-token-accepted.
+    """
+    raw = env.get(SENDING_FAMILY_ID_VAR)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must not be blank; unset it entirely for no sending family"
+        )
+    if "\x00" in raw:
+        raise SettingsError(f"{SENDING_FAMILY_ID_VAR} must not contain a NUL byte")
+    if "," in raw or any(ch.isspace() for ch in raw):
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must name exactly ONE family id (cardinality-1); "
+            f"was {raw!r}, which looks like more than one id"
+        )
+    if not _FAMILY_ID_RE.match(raw):
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must match {_FAMILY_ID_RE_SOURCE!r}, was {raw!r}"
+        )
+    return raw
+
+
+def _validate_sending_family_manifest(sending_family_id: str) -> None:
+    """Fail-closed manifest validation at settings-LOAD time (WP-11b):
+    unknown id, missing file, or ``DRAFT_NOT_REGISTERED`` all refuse here
+    (``SettingsError``, exit 2) rather than surfacing later as a confusing
+    crash deep inside composition. Never passes ``allow_draft=True`` --
+    a production boot always requires a REGISTERED manifest; DRAFT loads
+    are a test/tooling-only affordance reached through
+    ``persistence.family_manifest.load_family_manifest`` directly, never
+    through this settings loader.
+    """
+    manifest_path = _FAMILIES_DIR / f"{sending_family_id}.json"
+    try:
+        load_family_manifest(manifest_path)
+    except FamilyManifestError as exc:
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r}: manifest at "
+            f"{manifest_path} failed to load ({type(exc).__name__}): {exc}"
+        ) from exc
+    except OSError as exc:
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r}: manifest at "
+            f"{manifest_path} could not be read: {exc}"
+        ) from exc
+
+
+def _parse_crh_cont_phase0_shadow(env: Mapping[str, str]) -> bool:
+    return env.get(CRH_CONT_PHASE0_SHADOW_VAR) == "1"
+
+
+def _parse_orders_enabled(env: Mapping[str, str]) -> bool:
+    return env.get(ORDERS_ENABLED_VAR) == "1"
+
+
+def _parse_trade_catalog_root(env: Mapping[str, str]) -> Path:
+    """Parse :data:`TRADE_CATALOG_ROOT_VAR`; required, absolute, no ``..``."""
+    raw = _require(env, TRADE_CATALOG_ROOT_VAR)
+    if not raw.strip():
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} is required and must not be blank")
+    if "\x00" in raw:
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} must not contain a NUL byte")
+    catalog_root = Path(raw.strip())
+    if not catalog_root.is_absolute():
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} must be an absolute path, was {raw!r}")
+    if any(part == ".." for part in catalog_root.parts):
+        raise SettingsError(
+            f"{TRADE_CATALOG_ROOT_VAR} must not contain a '..' segment, was {raw!r}"
+        )
+    return catalog_root
+
+
 def proxy_env_check_enabled(env: Mapping[str, str] | None = None) -> bool:
     """Return whether proxy/TLS environment hygiene is enforced.
 
@@ -296,9 +460,7 @@ def _parse_health_snapshot_dir(env: Mapping[str, str]) -> Path | None:
         raise SettingsError(f"{_HEALTH_SNAPSHOT_DIR_VAR} must not contain a NUL byte")
     path = Path(raw)
     if not path.is_absolute():
-        raise SettingsError(
-            f"{_HEALTH_SNAPSHOT_DIR_VAR} must be an absolute path, was {raw!r}"
-        )
+        raise SettingsError(f"{_HEALTH_SNAPSHOT_DIR_VAR} must be an absolute path, was {raw!r}")
     return path
 
 
@@ -544,9 +706,7 @@ def load_quote_tape_settings(
         raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} must not contain a NUL byte")
     catalog_root = Path(raw.strip())
     if not catalog_root.is_absolute():
-        raise SettingsError(
-            f"{QUOTE_TAPE_CATALOG_VAR} must be an absolute path, was {raw!r}"
-        )
+        raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} must be an absolute path, was {raw!r}")
     # Refused, not resolved. Normalising would mean the directory an operator
     # reads in the unit file is not the directory the tape lands in, and the
     # tape is the one artifact that cannot be re-created if it lands somewhere
@@ -614,4 +774,129 @@ def load_quote_tape_settings(
         max_file_bytes_warning=max_file_bytes_warning,
         max_file_bytes_error=max_file_bytes_error,
         disk_check_interval_seconds=disk_check_interval_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# EXEC SPINE R-2 -- the TRADING role
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BreezyTradeSettings:
+    """Validated settings for the **trading** role.
+
+    A THIRD type alongside :class:`BreezyRuntimeSettings` and
+    :class:`PolymarketUSQuoteTapeSettings`, for the reason the other two are
+    separate: three processes, three jobs, three different things that must
+    make them refuse to start. Folding the trading role's required identity
+    onto a shared type would make it mandatory for the weather collector and
+    the recorder as well, which is exactly the outage this repo has already
+    taken once.
+
+    Deliberately SMALL. Everything the trading process needs beyond an
+    identity and a log level is owned elsewhere and is not re-read here:
+
+    * venue endpoints, user agent and signing belong to
+      :func:`breezy.adapters.polymarket_us.factories.config_from_env`, which
+      already implements the section 7 environment contract; a second reader
+      would be a second competing policy for the same variables;
+    * the two OPERATOR-RESERVED controls -- max daily budget and max per
+      position -- are **not fields here and never will be**. They are added as
+      mechanism in a later increment, they are never given a value by Breezy,
+      and their absence must fail closed. A settings field is precisely where
+      a default would silently appear, so there is none.
+    """
+
+    trader_id: str
+    log_level: str
+    #: BL-24 Seam B: whether the NWS observation Actors are registered on
+    #: this node. Default OFF; see :data:`LIVE_OBSERVATIONS_VAR`.
+    live_observations: bool = False
+    #: WP-11b: the ONE family (by id) authorized to send orders on this
+    #: boot, or ``None`` for no sending family. Structural cardinality-1 --
+    #: a single ``str | None`` slot replaces the retired
+    #: ``current_rung_hold``/``continuous_rung_hold`` boolean pair; there is
+    #: no representation in this type for "two families on". See
+    #: :data:`SENDING_FAMILY_ID_VAR`.
+    sending_family_id: str | None = None
+    #: Build-side Phase 0 shadow escape hatch; see
+    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR`. Default OFF.
+    phase0_shadow: bool = False
+    #: Pre-build discovery catalog, set when a sending family is on. See
+    #: :data:`TRADE_CATALOG_ROOT_VAR`.
+    catalog_root: Path | None = None
+    #: CRH enablement step 8: a REQUEST that the order path be reachable.
+    #: Default OFF; see :data:`ORDERS_ENABLED_VAR`. This is NOT an
+    #: enablement -- it can never, by itself, cause an order to be
+    #: submitted. It is one of six preconditions
+    #: ``runtime.order_enablement.issue_order_submission_permit`` reads off
+    #: this already-loaded settings object (never re-parsing the env) before
+    #: minting the sealed, unforgeable ``OrderSubmissionPermit`` that the
+    #: strategy actually gates on. Requires ``live_observations`` True and a
+    #: ``sending_family_id`` set; refused otherwise at load time.
+    orders_enabled_requested: bool = False
+
+
+def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSettings:
+    """Load and validate the trading process's own settings.
+
+    Exactly one required variable, :data:`TRADE_TRADER_ID_VAR`, with no
+    default and no fallback to the collector's ``BREEZY_TRADER_ID``. Calling
+    this IS the act of starting the trading role, so failing here fails the
+    right process and never the weather collector.
+
+    The trader id's SHAPE is validated later, by
+    :func:`breezy.runtime.node_config.validated_trader_id`, which owns that
+    rule for all three roles. What is checked here is presence and
+    non-blankness -- the part that is an environment-contract question rather
+    than an identifier-format one.
+    """
+    active_env: Mapping[str, str] = os.environ if env is None else env
+
+    raw = _require(active_env, TRADE_TRADER_ID_VAR)
+    if not raw.strip():
+        raise SettingsError(f"{TRADE_TRADER_ID_VAR} is required and must not be blank")
+
+    live_observations = _parse_live_observations(active_env)
+    sending_family_id = _parse_sending_family_id(active_env)
+    phase0_shadow = _parse_crh_cont_phase0_shadow(active_env)
+    has_sending_family = sending_family_id is not None
+    if has_sending_family and not live_observations:
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r} requires "
+            f"{LIVE_OBSERVATIONS_VAR}=1: every composition kind prices "
+            "against live data, so enabling a sending family without the "
+            "publisher would latch observation_unavailable on every "
+            "station-day and burn the trial"
+        )
+    if sending_family_id is not None:
+        # WP-11b: fail-closed manifest validation at settings-LOAD time --
+        # unknown id, missing file, or DRAFT_NOT_REGISTERED all refuse here
+        # (mirrors UnregisteredFamilyManifestError / UnpinnedBoundaryArtefactError).
+        _validate_sending_family_manifest(sending_family_id)
+    orders_enabled_requested = _parse_orders_enabled(active_env)
+    if orders_enabled_requested and not (has_sending_family and live_observations):
+        # A sending family plus live_observations is enough to match
+        # OrderSubmissionPermit.issue()'s own gate (order_enablement.py: "a
+        # sending family and live_observations must be enabled"). No
+        # sending family is still refused here at settings-load time
+        # (SettingsError, exit 2) rather than falling through to issue()'s
+        # FATAL OrderSubmissionRefused (exit 1).
+        raise SettingsError(
+            f"{ORDERS_ENABLED_VAR}=1 requires {LIVE_OBSERVATIONS_VAR}=1 and "
+            f"{SENDING_FAMILY_ID_VAR} to be set: a request for the order "
+            "path to be reachable is meaningless without a sending family "
+            "and its price source both enabled"
+        )
+    catalog_root = _parse_trade_catalog_root(active_env) if has_sending_family else None
+
+    return BreezyTradeSettings(
+        trader_id=raw.strip(),
+        log_level=_parse_log_level(active_env),
+        live_observations=live_observations,
+        sending_family_id=sending_family_id,
+        phase0_shadow=phase0_shadow,
+        catalog_root=catalog_root,
+        orders_enabled_requested=orders_enabled_requested,
     )

@@ -1,0 +1,1314 @@
+[
+ {
+  "n": 1,
+  "at": "2026-09-04T22:20:13+00:00",
+  "path": "/v1/series",
+  "params": {
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 166,
+  "envelope_keys": [
+   "series"
+  ],
+  "len_series": 277
+ },
+ {
+  "n": 2,
+  "at": "2026-09-04T22:20:14+00:00",
+  "path": "/v1/series",
+  "params": {
+   "archived": true,
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 228,
+  "envelope_keys": [
+   "series"
+  ],
+  "len_series": 277
+ },
+ {
+  "n": 3,
+  "at": "2026-09-04T22:20:15+00:00",
+  "path": "/v1/series",
+  "params": {
+   "closed": true,
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 111,
+  "envelope_keys": [
+   "series"
+  ],
+  "len_series": 277
+ },
+ {
+  "n": 4,
+  "at": "2026-09-04T22:20:16+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 1000,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 184,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 5,
+  "at": "2026-09-04T22:20:17+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 159,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 6,
+  "at": "2026-09-04T22:20:18+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 162,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 7,
+  "at": "2026-09-04T22:20:19+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 1000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 165,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 8,
+  "at": "2026-09-04T22:20:20+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 1500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 172,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 9,
+  "at": "2026-09-04T22:20:21+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 2000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 178,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 10,
+  "at": "2026-09-04T22:20:22+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 2500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 166,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 11,
+  "at": "2026-09-04T22:20:23+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 3000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 79,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 12,
+  "at": "2026-09-04T22:20:25+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "limit": 500,
+   "offset": 3500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 163,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 243
+ },
+ {
+  "n": 13,
+  "at": "2026-09-04T22:20:26+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 245,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 14,
+  "at": "2026-09-04T22:20:27+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 179,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 15,
+  "at": "2026-09-04T22:20:28+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 1000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 249,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 16,
+  "at": "2026-09-04T22:20:29+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 1500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 264,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 17,
+  "at": "2026-09-04T22:20:30+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 2000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 233,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 18,
+  "at": "2026-09-04T22:20:31+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 2500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 263,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 19,
+  "at": "2026-09-04T22:20:32+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 3000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 290,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 20,
+  "at": "2026-09-04T22:20:33+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "climate"
+   ],
+   "includeHidden": true,
+   "limit": 500,
+   "offset": 3500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 242,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 243
+ },
+ {
+  "n": 21,
+  "at": "2026-09-04T22:20:34+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1053,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 22,
+  "at": "2026-09-04T22:20:35+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1503,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 23,
+  "at": "2026-09-04T22:20:37+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "limit": 500,
+   "offset": 1000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1136,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 24,
+  "at": "2026-09-04T22:20:38+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "limit": 500,
+   "offset": 1500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 949,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 25,
+  "at": "2026-09-04T22:20:39+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "limit": 500,
+   "offset": 2000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1193,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 499
+ },
+ {
+  "n": 26,
+  "at": "2026-09-04T22:20:40+00:00",
+  "path": "/v1/events",
+  "params": {
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1363,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 27,
+  "at": "2026-09-04T22:20:41+00:00",
+  "path": "/v1/events",
+  "params": {
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1621,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 28,
+  "at": "2026-09-04T22:20:43+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "weather",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 197,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 29,
+  "at": "2026-09-04T22:20:44+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "temperature",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 25,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 30,
+  "at": "2026-09-04T22:20:45+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "high temperature",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 27,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 31,
+  "at": "2026-09-04T22:20:46+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "low temperature",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 179,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 1
+ },
+ {
+  "n": 32,
+  "at": "2026-09-04T22:20:47+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "rain",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 266,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 31
+ },
+ {
+  "n": 33,
+  "at": "2026-09-04T22:20:48+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "precipitation",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 163,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 34,
+  "at": "2026-09-04T22:20:49+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "snow",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 182,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 2
+ },
+ {
+  "n": 35,
+  "at": "2026-09-04T22:20:50+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "snowfall",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 163,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 36,
+  "at": "2026-09-04T22:20:51+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "hurricane",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 446,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 5
+ },
+ {
+  "n": 37,
+  "at": "2026-09-04T22:20:52+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "storm",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 254,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 4
+ },
+ {
+  "n": 38,
+  "at": "2026-09-04T22:20:53+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "tornado",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 232,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 39,
+  "at": "2026-09-04T22:20:54+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "wind",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 341,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 50
+ },
+ {
+  "n": 40,
+  "at": "2026-09-04T22:20:56+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "heat",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 665,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 50
+ },
+ {
+  "n": 41,
+  "at": "2026-09-04T22:20:57+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "freeze",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 297,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 42,
+  "at": "2026-09-04T22:20:58+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "frost",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 164,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 2
+ },
+ {
+  "n": 43,
+  "at": "2026-09-04T22:20:59+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "humidity",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 174,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 44,
+  "at": "2026-09-04T22:21:00+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "drought",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 158,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 45,
+  "at": "2026-09-04T22:21:01+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "flood",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 145,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 7
+ },
+ {
+  "n": 46,
+  "at": "2026-09-04T22:21:02+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "wildfire",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 142,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 47,
+  "at": "2026-09-04T22:21:03+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "el nino",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 275,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 8
+ },
+ {
+  "n": 48,
+  "at": "2026-09-04T22:21:04+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "enso",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 191,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 2
+ },
+ {
+  "n": 49,
+  "at": "2026-09-04T22:21:05+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "climate",
+   "limit": 50
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 148,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 50,
+  "at": "2026-09-04T22:21:06+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "weather",
+   "limit": 50,
+   "status": "closed"
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 183,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 51,
+  "at": "2026-09-04T22:21:07+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "weather",
+   "limit": 50,
+   "status": "upcoming"
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 207,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 52,
+  "at": "2026-09-04T22:21:08+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "temperature",
+   "limit": 50,
+   "status": "closed"
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 185,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 53,
+  "at": "2026-09-04T22:21:09+00:00",
+  "path": "/v1/search",
+  "params": {
+   "query": "temperature",
+   "limit": 50,
+   "status": "upcoming"
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 468,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 10
+ },
+ {
+  "n": 54,
+  "at": "2026-09-04T22:21:10+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "crypto"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 163,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 57
+ },
+ {
+  "n": 55,
+  "at": "2026-09-04T22:21:11+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "geopolitics"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 155,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 15
+ },
+ {
+  "n": 56,
+  "at": "2026-09-04T22:21:12+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "politics"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 274,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 57,
+  "at": "2026-09-04T22:21:13+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "politics"
+   ],
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 185,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 58,
+  "at": "2026-09-04T22:21:14+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "politics"
+   ],
+   "limit": 500,
+   "offset": 1000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 182,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 59,
+  "at": "2026-09-04T22:21:15+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "politics"
+   ],
+   "limit": 500,
+   "offset": 1500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 231,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 60,
+  "at": "2026-09-04T22:21:17+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "weather"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 62,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 0
+ },
+ {
+  "n": 61,
+  "at": "2026-09-04T22:21:18+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "science"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 207,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 14
+ },
+ {
+  "n": 62,
+  "at": "2026-09-04T22:21:19+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "economics"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 152,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 0
+ },
+ {
+  "n": 63,
+  "at": "2026-09-04T22:21:20+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "culture"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 268,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 64,
+  "at": "2026-09-04T22:21:21+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "culture"
+   ],
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 245,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 500
+ },
+ {
+  "n": 65,
+  "at": "2026-09-04T22:21:22+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "entertainment"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 142,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 0
+ },
+ {
+  "n": 66,
+  "at": "2026-09-04T22:21:23+00:00",
+  "path": "/v1/markets",
+  "params": {
+   "categories": [
+    "esports"
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 276,
+  "envelope_keys": [
+   "markets"
+  ],
+  "len_markets": 0
+ },
+ {
+  "n": 67,
+  "at": "2026-09-04T22:21:24+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    31
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 140,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 0
+ },
+ {
+  "n": 68,
+  "at": "2026-09-04T22:21:25+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    149
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 4309,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 69,
+  "at": "2026-09-04T22:21:29+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    149
+   ],
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 4508,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 70,
+  "at": "2026-09-04T22:21:34+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    149
+   ],
+   "limit": 500,
+   "offset": 1000
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 4090,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 71,
+  "at": "2026-09-04T22:21:38+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    152
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 1565,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 500
+ },
+ {
+  "n": 72,
+  "at": "2026-09-04T22:21:39+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    152
+   ],
+   "limit": 500,
+   "offset": 500
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 215,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 18
+ },
+ {
+  "n": 73,
+  "at": "2026-09-04T22:21:40+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    155
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 606,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 110
+ },
+ {
+  "n": 74,
+  "at": "2026-09-04T22:21:41+00:00",
+  "path": "/v1/events",
+  "params": {
+   "seriesId": [
+    35
+   ],
+   "limit": 500,
+   "offset": 0
+  },
+  "attempt": 0,
+  "ok": true,
+  "ms": 485,
+  "envelope_keys": [
+   "events"
+  ],
+  "len_events": 124
+ }
+]

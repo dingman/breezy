@@ -1,0 +1,13 @@
+#!/home/jon/breezy/.venv/bin/python3 -I
+"""Shared bwrap wrapper for autonomy units (ARCH-0 seam B, plan r5 AC-1).
+
+Usage: breezy-autonomy-bwrap ROW CMD [ARGS...]. All logic lives in
+``breezy.runtime.autonomy_sandbox.bwrap``; this file only calls ``main``. It runs
+isolated (``-I``) and stdlib-only, and sits outside every bind it creates.
+"""
+
+import sys
+
+from breezy.runtime.autonomy_sandbox.bwrap import main
+
+sys.exit(main(sys.argv[1:]))

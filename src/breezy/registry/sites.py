@@ -42,6 +42,7 @@ DEFAULT_REGISTRY_PATH: Final[Path] = Path(__file__).resolve().parent / "sites.to
 
 _REQUIRED_IDENTIFIER_FIELDS: Final[tuple[str, ...]] = (
     "icao",
+    "iem_asos_id",
     "cli_location",
     "issuing_office",
     "body_header_regex",
@@ -108,6 +109,7 @@ class SettlementSite:
     venue: str
     city: str
     icao: str
+    iem_asos_id: str
     cli_location: str
     issuing_office: str
     body_header_regex: Pattern[str]
@@ -216,6 +218,7 @@ def _build_settlement_site(venue: str, city: str, table: dict[str, Any]) -> Sett
         venue=venue,
         city=city,
         icao=str(table["icao"]),
+        iem_asos_id=str(table["iem_asos_id"]),
         cli_location=str(table["cli_location"]),
         issuing_office=str(table["issuing_office"]),
         body_header_regex=_compile_header_regex(str(table["body_header_regex"]), site_key),
@@ -266,9 +269,7 @@ def _build_climate_day_window(venue: str, city: str, table: dict[str, Any]) -> C
     )
 
 
-def _build_settlement_deadline(
-    venue: str, city: str, table: dict[str, Any]
-) -> SettlementDeadline:
+def _build_settlement_deadline(venue: str, city: str, table: dict[str, Any]) -> SettlementDeadline:
     site_key = f"{venue}.{city}"
     for field in _REQUIRED_SETTLEMENT_DEADLINE_FIELDS:
         _require_field(table, field, site_key)
@@ -346,6 +347,25 @@ class SiteRegistry:
         """All `(venue, city)` pairs known to this registry."""
         return tuple(self._settlement_sites.keys())
 
+    def known_iem_asos_ids(self) -> frozenset[str]:
+        """The closed set of registered `iem_asos_id` values, across every site.
+
+        Validation against IEM station ids must use this closed set, never a
+        shape regex: IEM ids satisfy `_CLI_LOCATION_PATTERN` too, so a
+        pattern cannot separate a legitimate id from an unregistered one.
+        """
+        return frozenset(site.iem_asos_id for site in self._settlement_sites.values())
+
+    def known_icaos(self) -> frozenset[str]:
+        """The closed set of registered `icao` values, across every site.
+
+        Same shape and same reason as `known_iem_asos_ids`: the NWS
+        observation transport validates its `{icao}` path segment against
+        this set, because a shape regex cannot separate KMDW from KORD and
+        a neighbouring station is never a substitute (BL-24 Seam B).
+        """
+        return frozenset(site.icao for site in self._settlement_sites.values())
+
     def settlement_site(self, venue: str, city: str) -> SettlementSite:
         """Return the settlement identity for `(venue, city)`.
 
@@ -374,8 +394,7 @@ class SiteRegistry:
             return self._sites_by_venue_city_token[(venue, token)]
         except KeyError as exc:
             raise SiteNotFoundError(
-                f"no settlement site registered for venue={venue!r} "
-                f"venue_city_token={token!r}"
+                f"no settlement site registered for venue={venue!r} venue_city_token={token!r}"
             ) from exc
 
     def climate_day_window(self, venue: str, city: str) -> ClimateDayWindow:
@@ -462,15 +481,9 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
             settlement_sites[(venue, city)] = site
             venue_symbologies[(venue, city)] = symbology
             sites_by_venue_city_token[token_key] = site
-            climate_day_windows[(venue, city)] = _build_climate_day_window(
-                venue, city, table_raw
-            )
-            settlement_deadlines[(venue, city)] = _build_settlement_deadline(
-                venue, city, table_raw
-            )
-            enrichment_sites[(venue, city)] = _build_enrichment_coordinates(
-                venue, city, table_raw
-            )
+            climate_day_windows[(venue, city)] = _build_climate_day_window(venue, city, table_raw)
+            settlement_deadlines[(venue, city)] = _build_settlement_deadline(venue, city, table_raw)
+            enrichment_sites[(venue, city)] = _build_enrichment_coordinates(venue, city, table_raw)
 
     return SiteRegistry(
         registry_version=registry_version,

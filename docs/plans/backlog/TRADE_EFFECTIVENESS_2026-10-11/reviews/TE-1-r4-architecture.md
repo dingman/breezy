@@ -1,0 +1,2 @@
+# TE-1 r3.4 architecture review (architect) — 88 REQUEST_CHANGES (coordinator summary)
+HIGH WP-B recomputes basis via a partial predicate → scope + identical-set test. MED resolve aut6.health closure at Stage 0 (done: regen --check exit 0, portfolio-roi pins nothing); strict-wins test; L-55 production latch_key_exists. LOW P43; cross-report note; ts_event rationale; lint-imports + x1 in WP-B gate. Applied in r3.5 (strict-wins resolved as fail-closed R11.5 per python H2).

@@ -1,0 +1,13 @@
+# AUT-5 r3 (final round): merged (coordinator). security-reviewer 90 (1 HIGH), trading-bot-architect 91 (1 HIGH). Final 90. Revise to r4.
+- **B1 [sec 1]: adopt errata E-5.**
+  - Add the counter `drill_close_restores` (≤1 per venue per day) and the cause `drill_close_restore`.
+  - Add a RESUME gate for the E-5 case: shas re-verify, no non-DRILL cause, §4.4 preconditions, charging no drill or production budget.
+  - Add the E-5 tests and cite E-5 in §0. Change §3.2, §3.3.7, WP1 and WP4.
+- **B2 [tr D1]**: Drawdown below `min_settled_real_money_fills`, including zero fills, gives PASS with `drawdown_used_frac = statistic/limit` (0 for no fills) and `day_status=BELOW_MIN`. INCONCLUSIVE is reserved for malformed rows or a missing label store. Add `test_drawdown_zero_fills_passes_drill_gate`.
+- **B3 [sec 2]**: The bootstrap instance gets `ReadWritePaths=%h/.local/share/breezy/derived/artefacts` through a per-mode drop-in. Add the `derived/artefacts` and `root.json` row to the one-writer table. Add `test_engine_unit_sandbox_covers_every_writer`, including a read-only open of the exec-store halt mirror under the sandbox flags.
+- **B4 [sec 3]**: Scope live-proof item 7 to the engine and producer closure manifests, `pins.py`, `deploy/systemd/breezy-autonomy-*`, the policy copy and the allowlist file. Add a coordinator merge hold on those paths for the episode window, plus a test that fails if `CLOSURE_MODULES` changes during it.
+- **B5 [tr D2]**: `autonomy_drawdown_h0.py` takes the measured fills/day from the durable store. Run the power test at that rate and report the expected fills by 2027-01-25. If m exceeds that count, refuse the pair and state in the ruling that the HALT is inert.
+- **B6 [tr D3]**: Fix the stage S exit: run the shadow DEMOTE on the last S day, or allow RESUME on the shadow root. Name the shadow marker writer and the drill clause for it.
+- **B7 [tr D4; errata E-6]**: Adopt errata E-6 for the L1 bootstrap. A `stop_complete_<day>.json` that already exists for the same day is kept, with no error and no ts change. Add `test_stop_complete_rewrite_after_supervisor_restart_is_noop`.
+- **B8 [sec 4]**: Repoint the units only after the 16:42:30 pass exits; that pass runs against the shadow root.
+- **B9 [sec 5]**: `transitions.validate` for HWM_RESET refuses any `carried_counters` below the export's values (enforced by the store, not only the CLI).

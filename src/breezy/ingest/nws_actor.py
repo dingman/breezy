@@ -1,6 +1,6 @@
 """The per-``(venue, city)`` NWS ingest Actor.
 
-Governing spec: ``docs/plans/PHASE1_ACTOR_BRIEF.md``. One instance per site,
+Governing spec: ``docs/plans/archive/PHASE1_ACTOR_BRIEF.md``. One instance per site,
 five in production. It polls the NWS API on a Nautilus timer, routes every
 outcome through :mod:`breezy.ingest.routing` into the one
 :class:`~breezy.ingest.gate.SettlementGate`, persists settlement-grade records
@@ -131,8 +131,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
-from zoneinfo import ZoneInfo
+from typing import Any, Final
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.core.data import Data
@@ -141,9 +140,9 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.nws_raw_product import NwsRawProduct
-from breezy.ingest import gaps
+from breezy.ingest import gaps, nws_health
 from breezy.ingest.config import NwsIngestActorConfig
-from breezy.ingest.gate import GateReason, GateState, GateStatus, SettlementGate, StateStore
+from breezy.ingest.gate import GateReason, GateStatus, SettlementGate, StateStore
 from breezy.ingest.http import REDACTION_MARKER, FetchResult, TransportError
 from breezy.ingest.nws_envelope import (
     DiscoveryEntry,
@@ -152,6 +151,13 @@ from breezy.ingest.nws_envelope import (
     ProductEnvelope,
     parse_discovery_list,
     parse_product_envelope,
+)
+from breezy.ingest.nws_health import (
+    CHRONIC_UNREADABLE_PRODUCT,
+    CHRONIC_UNREADABLE_PRODUCT_STREAK,
+    LEDGER_UNAVAILABLE,
+    SITE_BLOCKED_ALERT_INTERVALS,
+    STALENESS_DEGRADE_INTERVALS,
 )
 from breezy.ingest.product_index import (
     CorruptProductIndexEntryError,
@@ -192,22 +198,26 @@ from breezy.persistence.catalog import (
     read_raw_products,
     write_records,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - typing only; see `_health` for the cycle.
-    from breezy.runtime.health import (
-        AlertCondition,
-        AlertPayload,
-        AlertSink,
-        AlertState,
-        GapSummary,
-        HealthSnapshot,
-    )
+from breezy.registry.health_model import (
+    HEALTH_EMISSION_FAILING,
+    AlertCondition,
+    AlertPayload,
+    AlertSink,
+    AlertTracker,
+    GapSummary,
+    HealthIO,
+    HealthSnapshot,
+)
+from breezy.registry.settlement_clock import settlement_deadline_ns
 
 __all__ = [
+    "CHRONIC_UNREADABLE_PRODUCT",
+    "CHRONIC_UNREADABLE_PRODUCT_STREAK",
     "CURSOR_KEY_PREFIX",
     "DEFAULT_OBSERVABILITY_IO_TIMEOUT_S",
     "LEDGER_UNAVAILABLE",
     "PARSER_VERSION",
+    "SITE_BLOCKED_ALERT_INTERVALS",
     "VALIDATORS_KEY_PREFIX",
     "NwsIngestActor",
     "nws_climate_day_data_type",
@@ -216,18 +226,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: `AlertCondition.key.kind`/`event` for "this site's gap ledger could not be
-#: read or reconciled this cycle".
-#:
-#: Declared HERE and not in `runtime/health.py` alongside that module's other
-#: kind constants, and the asymmetry is deliberate: `health.py` documents
-#: itself as importing nothing from `breezy.ingest` and knowing nothing of the
-#: ledger's vocabulary, while the condition is raised only from this module's
-#: `reconcile_and_report` failure handler. `AlertConditionKey.kind` is a plain
-#: `str` by that module's own design ("kept as plain strings (not an `Enum`) so
-#: the ... wiring code can construct `AlertConditionKey`s without importing an
-#: enum"), so the wiring owning the condition also owns its name.
-LEDGER_UNAVAILABLE: Final[str] = "ledger_unavailable"
 
 #: Character ceiling for the scrubbed ledger-failure detail. Deliberately
 #: tighter than `health.MAX_ALERT_DETAIL_CHARS` (200): that constant bounds
@@ -304,28 +302,6 @@ def _scrub_failure_detail(exc: BaseException) -> str:
 DEFAULT_OBSERVABILITY_IO_TIMEOUT_S: Final[float] = 30.0
 
 
-def _health() -> Any:
-    """Import :mod:`breezy.runtime.health` at CALL time, not import time.
-
-    ``breezy/runtime/__init__.py`` imports ``breezy.runtime.composition``,
-    which imports ``NwsIngestActor`` from this module -- so a module-scope
-    ``from breezy.runtime.health import ...`` here is a genuine circular
-    import, and not a latent one: it was executed and it fails outright with
-    *"cannot import name 'NwsIngestActor' from partially initialized module"*
-    whenever this module is imported before ``breezy.runtime``.
-
-    Deferring to call time is the same fix :meth:`NwsIngestActor._have_final_for`
-    already applies to ``read_climate_day_as_of_settlement``, and it costs one
-    ``sys.modules`` hit per poll. The dependency direction stays correct on
-    paper too: ``health`` imports neither ``breezy.ingest`` nor anything else
-    from ``breezy`` -- it takes plain ``str``/``int``/``bool`` and its own
-    ``GapSummary`` -- so this is a wiring edge, never a layering inversion.
-    """
-    from breezy.runtime import health
-
-    return health
-
-
 #: Provenance of the code that produced a `ParsedCliProduct`. Stored on every
 #: settlement record so a later parser change is attributable.
 PARSER_VERSION: Final[str] = "breezy.normalize.cli_parse@0.1.0"
@@ -333,20 +309,22 @@ PARSER_VERSION: Final[str] = "breezy.normalize.cli_parse@0.1.0"
 CURSOR_KEY_PREFIX: Final[str] = "breezy:nws:cursor:"
 VALIDATORS_KEY_PREFIX: Final[str] = "breezy:nws:validators:"
 
-#: Staleness thresholds, derived from the configured poll interval rather than
-#: from new config fields. Four missed intervals is a degrade; twelve is a
-#: block. Both are multipliers on the ONE cadence the site actually has, so a
-#: site polling every five minutes and one polling every hour get proportionate
-#: watchdogs without a second knob to keep in sync.
-STALENESS_DEGRADE_INTERVALS: Final[int] = 4
 STALENESS_BLOCK_INTERVALS: Final[int] = 12
 
-#: A site continuously BLOCKED for this many poll intervals raises the
-#: `SiteBlocked` alert. Same reasoning as the two multipliers above -- derived
-#: from the ONE cadence the site actually has, so there is no second knob to
-#: keep in sync, and a five-minute site and an hourly site get proportionate
-#: patience without either being configured separately.
-SITE_BLOCKED_ALERT_INTERVALS: Final[int] = 4
+
+#: Consecutive `_emit_health` failures before the actor escalates directly to
+#: the alert sink. `reconcile_and_report` swallows each failure (containment),
+#: but a persistently failing emission path loses every alert and snapshot --
+#: the 2026-09-20 "detector without delivery" class. 3 polls x the default
+#: 300 s cadence = 15 min of persistent failure, long enough to ride out one
+#: transient write error, short enough for an operator to act the same hour.
+HEALTH_EMISSION_FAILURE_ESCALATION_THRESHOLD: Final[int] = 3
+#: Re-escalate at most this often while failure persists. Mirrors
+#: `runtime.health.DEFAULT_RENOTIFY_AFTER_NS` (24 h), which `ingest` may not
+#: import.
+HEALTH_EMISSION_RENOTIFY_AFTER_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
+#: Greppable marker on the CRITICAL escalation and its recovery log line.
+HEALTH_EMISSION_FAILING_MARKER: Final[str] = "NWS_HEALTH_EMISSION_FAILING"
 
 #: The Actor owns the retry window; the gate only records its outcome
 #: (`record_transient_failure(final_window_elapsed=...)`, mirroring the
@@ -529,6 +507,12 @@ class NwsIngestActor(Actor):
         #: first use and caches it -- so no `httpx.Client` and no TLS context
         #: is ever built for a deployment that configured no webhook.
         self.alert_sink: AlertSink | None = None
+        #: The health I/O surface (`HealthIO`): the `runtime.health` module,
+        #: injected by `runtime.composition.build_ingest_actors` because
+        #: `ingest` may not import `runtime`. `None` (the default) is a
+        #: miswiring: a live `on_start` refuses it (fail closed) and
+        #: `_health_io` raises naming the missing wiring.
+        self.health_io: HealthIO | None = None
         #: The most recently emitted snapshot, for introspection and tests.
         self.last_health_snapshot: HealthSnapshot | None = None
 
@@ -537,7 +521,11 @@ class NwsIngestActor(Actor):
         #: above, so a test can shorten it without patching module globals.
         self.observability_io_timeout_s: float = DEFAULT_OBSERVABILITY_IO_TIMEOUT_S
 
-        self._alert_state: AlertState | None = None
+        self._alert_state: AlertTracker | None = None
+        #: Consecutive `_emit_health` failures; reset on the first success.
+        self._emit_health_failures = 0
+        #: `now_ns` of the last escalation while failure persists, else `None`.
+        self._emit_health_escalated_at_ns: int | None = None
         #: Mutual exclusion for `poll_once`; see that method's docstring.
         self._poll_in_flight = False
         #: Set by `reconcile_and_report` when `gaps.reconcile` raised, cleared
@@ -545,6 +533,12 @@ class NwsIngestActor(Actor):
         #: `LEDGER_UNAVAILABLE`, so a swallowed ledger failure is loud.
         self._ledger_failure_detail: str | None = None
         self._blocked_since_ns: int | None = None
+        #: CF-5b: consecutive CLI parses (this process, in-memory only, same
+        #: cold-start stance as `AlertState` itself) that left a
+        #: non-settlement-bearing field unreadable. Read by
+        #: `_alert_conditions` to raise `CHRONIC_UNREADABLE_PRODUCT`. See
+        #: `_record_field_read_outcome`.
+        self._unreadable_field_streak: int = 0
         self._process_started_at_ns = shared.clock()
 
     # -- read-only accessors -------------------------------------------
@@ -576,18 +570,12 @@ class NwsIngestActor(Actor):
     @property
     def staleness_degraded_after_ns(self) -> int:
         return (
-            int(self._config.poll_interval_seconds)
-            * STALENESS_DEGRADE_INTERVALS
-            * _NS_PER_SECOND
+            int(self._config.poll_interval_seconds) * STALENESS_DEGRADE_INTERVALS * _NS_PER_SECOND
         )
 
     @property
     def staleness_blocked_after_ns(self) -> int:
-        return (
-            int(self._config.poll_interval_seconds)
-            * STALENESS_BLOCK_INTERVALS
-            * _NS_PER_SECOND
-        )
+        return int(self._config.poll_interval_seconds) * STALENESS_BLOCK_INTERVALS * _NS_PER_SECOND
 
     # -- lifecycle ------------------------------------------------------
 
@@ -612,6 +600,13 @@ class NwsIngestActor(Actor):
             )
             return
 
+        # Fail closed on a miswired live actor. `reconcile_and_report` swallows
+        # every non-Timeout failure from `_emit_health`, so an unwired seam
+        # discovered at poll time would mean alerts reach nobody. The snapshot
+        # path is NOT checked: it is optional in production (no snapshot dir
+        # configured -> no file), and `alert_sink` is always set by composition.
+        self._require_health_wiring()
+
         # Supervised exactly like the timer-path coroutines below: a warm
         # start that raises (corrupt catalog, permission error, disk full)
         # must reach the settlement gate, not vanish as "Task exception was
@@ -622,6 +617,29 @@ class NwsIngestActor(Actor):
         # duplicated, so warm start and poll share one supervision path.
         self._submit(self.warm_start())
         self._arm_timers()
+
+    def _require_health_wiring(self) -> None:
+        """Raise unless the injected health seams a live actor needs are set."""
+        missing = [
+            name
+            for name, value in (("health_io", self.health_io), ("alert_sink", self.alert_sink))
+            if value is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"NwsIngestActor {self._venue}/{self._city} is not wired for live "
+                f"operation: {', '.join(missing)} not wired -- "
+                "runtime.composition.build_ingest_actors must set it"
+            )
+
+    def _health_io(self) -> HealthIO:
+        """The injected health I/O, or a RuntimeError naming the wiring gap."""
+        if self.health_io is None:
+            raise RuntimeError(
+                f"health_io not wired for {self._venue}/{self._city}: "
+                "runtime.composition.build_ingest_actors must set it"
+            )
+        return self.health_io
 
     def on_stop(self) -> None:
         self._cancel_timers()
@@ -649,9 +667,7 @@ class NwsIngestActor(Actor):
         # stays satisfied indefinitely, and no record is ever written.
         self.clock.set_timer(
             name=self._deadline_timer_name,
-            interval=timedelta(
-                seconds=int(self._config.final_deadline_check_interval_seconds)
-            ),
+            interval=timedelta(seconds=int(self._config.final_deadline_check_interval_seconds)),
             # `start_time=None` -- UNSTAGGERED, deliberately, and the asymmetry
             # with the poll timer above is the point. The stagger exists to
             # spread concurrent HTTP requests to `api.weather.gov` across five
@@ -776,9 +792,7 @@ class NwsIngestActor(Actor):
         loop.call_soon_threadsafe(self._record_task_death, exc)
 
     def _record_task_death(self, exc: BaseException) -> None:
-        logger.critical(
-            "poll task for %s/%s died: %r", self._venue, self._city, exc, exc_info=exc
-        )
+        logger.critical("poll task for %s/%s died: %r", self._venue, self._city, exc, exc_info=exc)
         self._execute(route_unhandled_exception(exc))
 
     # -- SS6 step 1: may we perform network I/O? --------------------------
@@ -868,8 +882,7 @@ class NwsIngestActor(Actor):
         """
         if self._poll_in_flight:
             logger.warning(
-                "skipping overlapping poll cycle for %s/%s: the previous cycle "
-                "is still running",
+                "skipping overlapping poll cycle for %s/%s: the previous cycle is still running",
                 self._venue,
                 self._city,
             )
@@ -1208,6 +1221,26 @@ class NwsIngestActor(Actor):
             )
             raise _AbortPoll from exc
 
+        # CF-5: a non-settlement-bearing field (tmin/tavg) that could not be
+        # read must not have hard-blocked this poll -- `parse_cli_product`
+        # already carried it through as an explicit `UNREADABLE` sentinel
+        # instead of raising. One WARNING per field, naming exactly the site,
+        # product and offending token -- never the whole product body.
+        for warning in parsed.field_warnings:
+            logger.warning(
+                "%s/%s CLI%s: field %s could not be read (token=%r); "
+                "settlement-bearing fields are unaffected",
+                self._venue,
+                self._city,
+                self._site.cli_location,
+                warning.field,
+                warning.token,
+            )
+        # CF-5b: the per-occurrence WARNING above never dedupes and never
+        # reaches an operator -- track the CONSECUTIVE-parse streak so a
+        # chronic run raises exactly one alert through `AlertState` instead.
+        self._record_field_read_outcome(unreadable=bool(parsed.field_warnings))
+
         logger.info(
             "%s/%s prepared %s product %s for climate day %s (correction_evidence=%s)",
             self._venue,
@@ -1217,9 +1250,25 @@ class NwsIngestActor(Actor):
             parsed.summary_date.isoformat(),
             has_correction_evidence(envelope.product_text),
         )
-        return _PreparedProduct(
-            fetch=result, envelope=envelope, header=header, parsed=parsed
-        )
+        return _PreparedProduct(fetch=result, envelope=envelope, header=header, parsed=parsed)
+
+    def _record_field_read_outcome(self, *, unreadable: bool) -> None:
+        """CF-5b: update the consecutive-unreadable-parse streak.
+
+        In-memory only, matching `_blocked_since_ns`'s own cold-start stance
+        (and `AlertState`'s: see its class docstring) -- this is deliberately
+        NOT persisted, so a process restart starts the streak fresh rather
+        than replaying a stale count against a possibly-already-recovered
+        field. A single clean parse clears it: a site that recovers must
+        re-arm for the NEXT genuine chronic run rather than staying at a
+        stuck non-zero count that never again crosses the threshold from
+        zero (which would silently disable the alert for the rest of the
+        process's life).
+        """
+        if unreadable:
+            self._unreadable_field_streak += 1
+        else:
+            self._unreadable_field_streak = 0
 
     def _parse_envelope(self, result: FetchResult) -> ProductEnvelope:
         text = result.text
@@ -1327,9 +1376,7 @@ class NwsIngestActor(Actor):
         self._integrity_alarm(uuid, observation.detail)
         return False
 
-    async def _persist_batch(
-        self, prepared: Sequence[_PreparedProduct]
-    ) -> tuple[Data, ...] | None:
+    async def _persist_batch(self, prepared: Sequence[_PreparedProduct]) -> tuple[Data, ...] | None:
         """Steps 9-11 for the whole poll. Returns the written records, or
         `None` when the write did not complete (the gate is already driven).
         """
@@ -1420,7 +1467,6 @@ class NwsIngestActor(Actor):
         if decision.outcome is not PollOutcome.PERSISTED:
             return None
         return ordered
-
 
     # -- publication and the resume cursor (SS3.3) ------------------------
 
@@ -1710,6 +1756,7 @@ class NwsIngestActor(Actor):
 
         try:
             await self._emit_health(now_ns, entries=entries, revisions=revisions)
+            self._note_health_emission_success()
         except TimeoutError:
             # NOT swallowed, and the one exception to this method's containment
             # rule. Every other failure here is a defect in our own
@@ -1729,6 +1776,73 @@ class NwsIngestActor(Actor):
                 self._venue,
                 self._city,
             )
+            await self._note_health_emission_failure(now_ns)
+
+    def _note_health_emission_success(self) -> None:
+        """Reset the failure streak; log recovery once if it had escalated."""
+        escalated = self._emit_health_escalated_at_ns is not None
+        self._emit_health_failures = 0
+        self._emit_health_escalated_at_ns = None
+        if escalated:
+            logger.warning(
+                "%s recovered: health emission succeeded again for %s/%s",
+                HEALTH_EMISSION_FAILING_MARKER,
+                self._venue,
+                self._city,
+            )
+
+    async def _note_health_emission_failure(self, now_ns: int) -> None:
+        """Count a failure; escalate at the threshold, at most once per renotify window.
+
+        Delivered straight to `self.alert_sink` -- NOT via `health_io` or
+        `_emit_health`, whose failure is the condition being reported. Never
+        raises: a failing sink is logged (type only) and swallowed. The sink
+        call is a blocking POST for a webhook sink, so it runs off the loop
+        under `_bounded_io`, exactly like the normal `_emit_all` dispatch.
+        """
+        self._emit_health_failures += 1
+        if self._emit_health_failures < HEALTH_EMISSION_FAILURE_ESCALATION_THRESHOLD:
+            return
+        last = self._emit_health_escalated_at_ns
+        if last is not None and now_ns - last < HEALTH_EMISSION_RENOTIFY_AFTER_NS:
+            return
+        self._emit_health_escalated_at_ns = now_ns
+        site = f"{self._venue}/{self._city}"
+        logger.critical(
+            "%s: health emission failed %d consecutive polls for %s -- alerts and "
+            "snapshots are being lost",
+            HEALTH_EMISSION_FAILING_MARKER,
+            self._emit_health_failures,
+            site,
+        )
+        sink = self.alert_sink
+        if sink is None:
+            logger.warning(
+                "%s: escalation dropped for %s (no alert sink wired)",
+                HEALTH_EMISSION_FAILING_MARKER,
+                site,
+            )
+            return
+        payload = AlertPayload(
+            severity="CRITICAL",
+            event=HEALTH_EMISSION_FAILING,
+            site=site,
+            detail=(
+                f"{self._emit_health_failures} consecutive health-emission "
+                "failures; alerts and snapshots are not being delivered"
+            ),
+        )
+        try:
+            await self._bounded_io(lambda: sink.emit(payload))
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - as wide as runtime.health.emit_alert.
+            # Type only: httpx/ssl messages embed the webhook URL (a credential).
+            logger.error(
+                "health-emission escalation sink failed for %s exception_type=%s",
+                site,
+                type(exc).__name__,
+            )
 
     async def _emit_health(
         self,
@@ -1737,147 +1851,13 @@ class NwsIngestActor(Actor):
         entries: Sequence[gaps.GapEntry],
         revisions: Sequence[gaps.RevisionEvent],
     ) -> None:
-        """Build this cycle's alert conditions and `HealthSnapshot`, dispatch,
-        and write the snapshot atomically if a path is configured.
-
-        The ``GapEntry -> GapSummary`` mapping lives HERE, at the call site,
-        and that is deliberate: ``health.py`` does not import
-        ``breezy.ingest`` and ``gaps.py`` does not import ``health`` -- neither
-        module may learn the other's vocabulary, so the adapter belongs to the
-        wiring that already knows both.
-        """
-        health = _health()
-
-        status = self.gate.status(self._venue, self._city)
-        causes = self.gate.blocking_causes(self._venue, self._city)
-        ua_latched = GateReason.UA_TRAP_403 in causes
-        site_label = f"{self._venue}/{self._city}"
-        today = gaps.local_standard_date(now_ns, self._window.std_utc_offset_hours)
-
-        # `open_gaps` deliberately includes ACKNOWLEDGED_LOST: an acknowledged
-        # day is muted for re-notify, never hidden. Removing it from the
-        # snapshot would make an operator's acknowledgement look like a repair.
-        summaries = tuple(
-            health.GapSummary(
-                climate_day=entry.climate_day.isoformat(),
-                state=entry.state.value,
-                severity=gaps.severity_for(entry.climate_day, today).value,
-                days_until_retention_loss=gaps.days_remaining_until_retention_loss(
-                    entry.climate_day, today
-                ),
-            )
-            for entry in entries
-            if entry.state is not gaps.GapState.RESOLVED
-        )
-        acknowledged_lost = sum(
-            1 for entry in entries if entry.state is gaps.GapState.ACKNOWLEDGED_LOST
-        )
-
-        conditions = self._alert_conditions(
-            now_ns,
-            health=health,
-            site_label=site_label,
-            status=status,
-            causes=causes,
-            ua_latched=ua_latched,
-            entries=entries,
-            summaries=summaries,
-            revisions=revisions,
-        )
-        # SPLIT ACROSS THE THREAD BOUNDARY, deliberately, and the split line
-        # is the whole point.
-        #
-        # `evaluate` -- ON THE LOOP THREAD. It is a read-modify-write over
-        # `AlertState`'s two dicts, and that class documents itself as
-        # "deliberately not thread-safe ... exactly one poll loop is expected
-        # to own an instance". Running it on an executor worker made that
-        # ownership claim false: it was safe only because no other code path
-        # dispatches alerts today -- thread-safety by exclusion, which the
-        # next caller added anywhere silently converts into a data race over
-        # the exact transitions that must never be lost (`UA_TRAP_LATCHED`,
-        # `SITE_BLOCKED` are latched-persistent, so a lost false->true edge is
-        # not re-tried until the 24h re-notify). It is pure bookkeeping over
-        # a handful of dict entries, so it costs the loop nothing.
-        #
-        # `emit_alert` -- OFF THE LOOP, under the same ceiling as before. This
-        # is the half with a real reason to leave: `WebhookAlertSink.emit` is
-        # a SYNCHRONOUS `httpx.Client.post` with a 5s default timeout, and the
-        # incident case is exactly the case it fires in -- several sites
-        # transitioning to blocked at once serialises those POSTs and delays
-        # every other site's poll and final-overdue check near a settlement
-        # deadline.
-        #
-        # The `dispatch` contract is preserved exactly: `emitted` is what this
-        # cycle DECIDED to emit, never what the sink managed to deliver, and
-        # `emit_alert` still swallows every sink failure inside the worker.
-        # The whole fan-out is one `_bounded_io` call, as `dispatch` was, so a
-        # black-holed webhook still trips the ceiling and routes to
-        # `_record_task_death` rather than parking a worker forever.
-        tracker = self._alert_tracker(health)
-        sink = self._resolved_alert_sink(health)
-        payloads = tracker.evaluate(conditions, now_ns=now_ns)
-        emitted = len(payloads)
-        if payloads:
-            await self._bounded_io(lambda: self._emit_all(health, sink, payloads))
-
-        snapshot = health.HealthSnapshot(
-            schema_version=health.SCHEMA_VERSION,
-            process_started_at_ns=self._process_started_at_ns,
-            snapshot_at_ns=now_ns,
-            trader_id=str(getattr(self, "trader_id", "") or ""),
-            sites=(
-                health.SiteHealth(
-                    venue=self._venue,
-                    city=self._city,
-                    gate_state=status.state.value,
-                    gate_reason=status.reason.value,
-                    blocking_causes=tuple(cause.value for cause in causes),
-                    last_successful_poll_ns=status.last_successful_poll_ns,
-                    cursor=self._cursor_text(),
-                    open_gaps=summaries,
-                    acknowledged_lost_count=acknowledged_lost,
-                    # The FILE-based half of the `LEDGER_UNAVAILABLE` signal.
-                    # The alert alone is not enough: `BREEZY_ALERT_WEBHOOK_URL`
-                    # is unset by default, so `resolve_alert_sink` yields a
-                    # LOGGING sink and the CRITICAL reaches nothing an operator
-                    # polls -- while the runbook points them at
-                    # `health-<venue>.<city>.json`. Without this field that
-                    # file shows `open_gaps: []`, byte-identical to a healthy
-                    # site, for a ledger that has been unreadable for days.
-                    ledger_unavailable=self._ledger_failure_detail,
-                ),
-            ),
-            ua_trap_latched=ua_latched,
-            alerts_emitted_this_cycle=emitted,
-        )
-        self.last_health_snapshot = snapshot
-        snapshot_path = self.health_snapshot_path
-        if snapshot_path is not None:
-            # Off the loop for the same reason as the dispatch above:
-            # `write_snapshot_atomic` does an `fsync` plus a rename, and a
-            # stalled disk must not be able to hold the poll cycle's thread.
-            # BOUNDED for the second reason: off-loop-and-unbounded is a
-            # fail-open, not a fix -- see `_bounded_io`.
-            await self._bounded_io(
-                lambda: health.write_snapshot_atomic(snapshot_path, snapshot)
-            )
-
-    @staticmethod
-    def _emit_all(health: Any, sink: AlertSink, payloads: Sequence[AlertPayload]) -> None:
-        """The blocking half of the old `AlertState.dispatch`, run on a worker.
-
-        Kept as a named method rather than a comprehension inside the lambda so
-        the executor call site reads as "fan out these already-decided
-        payloads" -- the decision itself happened on the loop thread.
-        """
-        for payload in payloads:
-            health.emit_alert(sink, payload)
+        """Delegates to :func:`breezy.ingest.nws_health.emit_health` (R3.6)."""
+        await nws_health.emit_health(self, now_ns, entries=entries, revisions=revisions)
 
     def _alert_conditions(
         self,
         now_ns: int,
         *,
-        health: Any,
         site_label: str,
         status: GateStatus,
         causes: Sequence[GateReason],
@@ -1886,167 +1866,20 @@ class NwsIngestActor(Actor):
         summaries: Sequence[GapSummary],
         revisions: Sequence[gaps.RevisionEvent],
     ) -> list[AlertCondition]:
-        """Every condition this site tracks, evaluated fresh for this cycle.
-
-        ``AlertState.evaluate`` leaves a key it is not handed untouched, so
-        every standing condition is passed on every cycle -- including the ones
-        that are ``active=False``, which is what lets a cleared condition fire
-        again next time it sets.
-
-        ``detail`` strings are short and structural by construction: no
-        absolute path, no upstream body or header, no settings field. The
-        snapshot has no slot for those either, so neither artifact can leak
-        ``user_agent_contact``.
-        """
-        blocked_after_ns = (
-            int(self._config.poll_interval_seconds) * SITE_BLOCKED_ALERT_INTERVALS * _NS_PER_SECOND
-        )
-        # Duration is measured from when THIS process first OBSERVED the block,
-        # never from `GateStatus.at_ns`. Two independent reasons, both found by
-        # test rather than by inspection:
-        #
-        # 1. `at_ns` is the last TRANSITION instant, and a blocked site keeps
-        #    transitioning -- `check_staleness` alone re-records every cycle.
-        #    Elapsed-since-`at_ns` therefore resets continuously and a
-        #    permanently blocked site would never reach the threshold at all.
-        # 2. A never-polled site reports `BLOCKED` with `at_ns == 0`, so the
-        #    same arithmetic reads the entire Unix epoch as downtime and pages
-        #    CRITICAL on every fresh deployment.
-        #
-        # In-memory and never persisted, matching `AlertState`'s own cold-start
-        # stance: at boot the site is unobserved, so the clock starts now and a
-        # genuinely dead-on-arrival deployment alerts after the threshold --
-        # which is the ONLY signal for that case, since `PollStale` cannot fire
-        # while `last_successful_poll_ns` is still `None`. Sampled once per
-        # cycle, because once per cycle is the only observation cadence there
-        # is.
-        if status.state is GateState.BLOCKED:
-            if self._blocked_since_ns is None:
-                self._blocked_since_ns = now_ns
-        else:
-            self._blocked_since_ns = None
-        blocked_long = (
-            self._blocked_since_ns is not None
-            and now_ns - self._blocked_since_ns >= blocked_after_ns
-        )
-        last_poll_ns = status.last_successful_poll_ns
-        poll_stale = (
-            last_poll_ns is not None and now_ns - last_poll_ns >= self.staleness_degraded_after_ns
+        """Delegates to :func:`breezy.ingest.nws_health.alert_conditions` (R3.6)."""
+        return nws_health.alert_conditions(
+            self,
+            now_ns,
+            site_label=site_label,
+            status=status,
+            causes=causes,
+            ua_latched=ua_latched,
+            entries=entries,
+            summaries=summaries,
+            revisions=revisions,
         )
 
-        conditions: list[AlertCondition] = [
-            health.AlertCondition(
-                key=health.AlertConditionKey(kind=health.UA_TRAP_LATCHED, site="global"),
-                active=ua_latched,
-                severity="CRITICAL",
-                event=health.UA_TRAP_LATCHED,
-                detail="global UA-trap latch is set; every site has stopped polling",
-            ),
-            health.AlertCondition(
-                key=health.AlertConditionKey(kind=health.SITE_BLOCKED, site=site_label),
-                active=blocked_long,
-                severity="CRITICAL",
-                event=health.SITE_BLOCKED,
-                detail=(
-                    f"blocked for at least {SITE_BLOCKED_ALERT_INTERVALS} poll intervals; "
-                    f"causes={','.join(cause.value for cause in causes)}"
-                ),
-            ),
-            health.AlertCondition(
-                key=health.AlertConditionKey(kind=health.FINAL_OVERDUE, site=site_label),
-                active=GateReason.FINAL_CLI_OVERDUE in causes,
-                severity="CRITICAL",
-                event=health.FINAL_OVERDUE,
-                detail="the final CLI is overdue past the venue settlement deadline",
-            ),
-            health.AlertCondition(
-                key=health.AlertConditionKey(kind=health.POLL_STALE, site=site_label),
-                active=poll_stale,
-                severity="WARN",
-                event=health.POLL_STALE,
-                detail=(
-                    f"no successful poll for at least {STALENESS_DEGRADE_INTERVALS} poll intervals"
-                ),
-            ),
-            # CRITICAL, and passed on EVERY cycle -- inactive ones included,
-            # so `AlertState` sees the true->false edge and the next failure
-            # is a fresh false->true rather than a 24h-muted repeat.
-            #
-            # This is the only signal that `reconcile_and_report`'s swallowed
-            # branch fired. Without it the ledger can be unreadable
-            # indefinitely while the snapshot reports `open_gaps: []` -- zero
-            # gaps and zero alerts are exactly what a HEALTHY site looks like,
-            # so the failure is indistinguishable from success. CRITICAL and
-            # not WARN because a dead ledger means revision detection is off:
-            # a superseded final can be settled on with nothing to notice it.
-            health.AlertCondition(
-                key=health.AlertConditionKey(kind=LEDGER_UNAVAILABLE, site=site_label),
-                active=self._ledger_failure_detail is not None,
-                severity="CRITICAL",
-                event=LEDGER_UNAVAILABLE,
-                detail=(
-                    "gap ledger reconciliation failed; open_gaps in this snapshot is "
-                    f"NOT authoritative ({self._ledger_failure_detail})"
-                ),
-            ),
-        ]
-
-        # One condition per gap inside the retention warning band, keyed by
-        # climate day so several simultaneous gaps each alert once rather than
-        # collapsing into a single flapping condition. ACKNOWLEDGED_LOST is
-        # muted for re-notify but still fires on transition and still appears
-        # in the snapshot -- acknowledgement silences repetition, not the fact.
-        acknowledged_days = {
-            entry.climate_day.isoformat()
-            for entry in entries
-            if entry.state is gaps.GapState.ACKNOWLEDGED_LOST
-        }
-        for summary in summaries:
-            conditions.append(
-                health.AlertCondition(
-                    key=health.AlertConditionKey(
-                        kind=health.GAP_RETENTION_WARNING,
-                        site=site_label,
-                        extra=summary.climate_day,
-                    ),
-                    active=summary.severity != gaps.GapSeverity.INFO.value,
-                    severity=summary.severity.upper(),
-                    event=health.GAP_RETENTION_WARNING,
-                    detail=(
-                        f"climate day {summary.climate_day} is {summary.state} with "
-                        f"{summary.days_until_retention_loss} day(s) until assumed "
-                        f"retention loss"
-                    ),
-                    renotify_muted=summary.climate_day in acknowledged_days,
-                )
-            )
-
-        # A revision is an EVENT, not a standing condition: `extra` carries the
-        # new sequence number so each distinct revision is a distinct key and
-        # therefore always a false->true transition. Passed only on the cycle
-        # it is observed; a key not passed is left untouched, never cleared.
-        for revision in revisions:
-            conditions.append(
-                health.AlertCondition(
-                    key=health.AlertConditionKey(
-                        kind=health.POST_SETTLEMENT_REVISION,
-                        site=site_label,
-                        extra=f"{revision.climate_day.isoformat()}:{revision.new_revision_seq}",
-                    ),
-                    active=True,
-                    severity="CRITICAL",
-                    event=health.POST_SETTLEMENT_REVISION,
-                    detail=(
-                        f"climate day {revision.climate_day.isoformat()} revised "
-                        f"{revision.previous_revision_seq}->{revision.new_revision_seq} "
-                        f"correction={revision.correction_flag} "
-                        f"superseded={revision.is_superseded}"
-                    ),
-                )
-            )
-        return conditions
-
-    def _alert_tracker(self, health: Any) -> AlertState:
+    def _alert_tracker(self, health_io: HealthIO) -> AlertTracker:
         """The one `AlertState` for this site, created on first use.
 
         Never seeded from persisted state: a UA-trap latch or an open gap that
@@ -2055,11 +1888,11 @@ class NwsIngestActor(Actor):
         make exactly those persistent, silent conditions never alert.
         """
         if self._alert_state is None:
-            self._alert_state = health.AlertState()
-        state: AlertState = self._alert_state
+            self._alert_state = health_io.new_alert_state()
+        state: AlertTracker = self._alert_state
         return state
 
-    def _resolved_alert_sink(self, health: Any) -> AlertSink:
+    def _resolved_alert_sink(self, health_io: HealthIO) -> AlertSink:
         """The configured sink, or a lazily-resolved default.
 
         Resolution is deferred to first use rather than done in ``__init__``
@@ -2067,7 +1900,7 @@ class NwsIngestActor(Actor):
         constructs an ``httpx.Client`` or an ``ssl.SSLContext`` at all.
         """
         if self.alert_sink is None:
-            self.alert_sink = health.resolve_alert_sink()
+            self.alert_sink = health_io.resolve_alert_sink()
         sink: AlertSink = self.alert_sink
         return sink
 
@@ -2128,14 +1961,13 @@ class NwsIngestActor(Actor):
         offset used for the climate-day boundary and nothing else. They are
         separate accessors returning separate types precisely so this cannot be
         gotten wrong by autocomplete.
+
+        Promoted to ``breezy.registry.settlement_clock.settlement_deadline_ns``
+        (I2, ``LIVE_FILL_SCORING_CHAIN_2026-09-05.md``) so
+        ``score_live_trials.py``'s live fill reader shares this exact
+        arithmetic rather than a second copy.
         """
-        hour_text, minute_text = self._deadline.settlement_time_local.split(":")
-        when = dt.datetime.combine(
-            climate_day + dt.timedelta(days=1),
-            dt.time(int(hour_text), int(minute_text)),
-            tzinfo=ZoneInfo(self._deadline.settlement_timezone),
-        )
-        return int(when.timestamp()) * _NS_PER_SECOND
+        return settlement_deadline_ns(self._deadline, climate_day)
 
     async def _have_final_for(self, climate_day: dt.date, *, as_of_ts_init: int) -> bool:
         """Durable answer, read off the catalog rather than off process memory.
@@ -2336,9 +2168,7 @@ class NwsIngestActor(Actor):
         killed, so `wait_for` frees the *cycle*, not the worker. The stall
         still surfaces -- loudly, as task death -- instead of hanging.
         """
-        return await asyncio.wait_for(
-            self._run_off_loop(fn), self.observability_io_timeout_s
-        )
+        return await asyncio.wait_for(self._run_off_loop(fn), self.observability_io_timeout_s)
 
     async def _bounded[T](self, fn: Callable[[], T]) -> T:
         """Run ``fn`` off the loop under a real wall-clock ceiling.

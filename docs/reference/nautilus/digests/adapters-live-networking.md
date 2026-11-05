@@ -570,6 +570,23 @@ def on_data(self, data: Data) -> None:
 
 ### Retry wrapper
 
+> **NEVER APPLY THIS TO ORDER SUBMISSION ON A VENUE WITH NO CLIENT-SUPPLIED ORDER ID.**
+> `RetryManagerPool` re-invokes the wrapped call on a classified-transient failure with **no
+> idempotency key**, so an ambiguous timeout resubmits and **doubles the position**. The recipe
+> below uses `max_retries=3` because it is a DATA-fetch example; copying it onto a submit path
+> is a money-losing bug.
+>
+> Nautilus' own shipped Polymarket adapter agrees, and it is worth reading as the reference:
+> it wraps batch submit at `adapters/polymarket/execution.py:1557-1567`, but defaults
+> `max_retries: PositiveInt | None = None` (`adapters/polymarket/config.py:208`) and resolves it
+> `config.max_retries or 0` (`execution.py:223`) — **retry is OFF by default on submit, and that
+> is deliberate.** Its `_is_unknown_submit_result` / `_handle_unknown_batch_submit_result`
+> (`:1571-1577`) exist precisely because the outcome is ambiguous rather than retryable.
+>
+> Rule: `max_retries=0` for submit. Retry only cancels and reads. In Breezy this is enforced by
+> barrier **B8** (see `docs/plans/EXEC_SPINE_2026-09-01.md`), which bans `RetryManager`,
+> `RetryManagerPool` and `retry_*` kwargs on the submit path by name.
+
 ```python
 from nautilus_trader.live.retry import RetryManagerPool
 

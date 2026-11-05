@@ -1,0 +1,15 @@
+# AUT-6 WP1 (plan r15 section 3.10, R-e): slot-critical, so AccuracySec=1s and no
+# RandomizedDelaySec. Minutes 3, 8, ..., 58 of every hour. Never Persistent: a missed run is
+# recovered by the next one. Enabled by the coordinator, not by the build.
+[Unit]
+Description=Every-5-minutes trigger for the Breezy AUT-6 alert outbox redeliver
+
+[Timer]
+Unit=breezy-autonomy-alert-redeliver.service
+OnCalendar=*:03/5
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

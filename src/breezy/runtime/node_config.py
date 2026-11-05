@@ -1,6 +1,6 @@
 """Builds the `TradingNodeConfig` for each Breezy process ROLE.
 
-Two roles, two functions, deliberately not one parameterised function:
+Three roles, three functions, deliberately not one parameterised function:
 
 * :func:`build_node_config` -- the NWS-ingestion process. Actor-driven,
   zero data clients, zero venue configuration. It must start on a host that
@@ -8,6 +8,13 @@ Two roles, two functions, deliberately not one parameterised function:
 * :func:`build_quote_tape_node_config` -- the venue quote-tape recorder.
   One read-only data client, native streaming persistence, zero Actors,
   zero exec clients. It cannot start without venue configuration.
+* :func:`build_trade_node_config` -- the trading process (EXEC SPINE R-2;
+  the execution client itself was wired in at EXEC SPINE W). One read-only
+  data client, no streaming, and one execution client -- constructed and
+  reachable -- but still zero strategies and zero exec algorithms: nothing
+  on this process calls ``submit_order``, so it remains a process shell
+  that can start, run, stop and reconcile, and cannot ORIGINATE an order.
+  It additionally refuses to start without a trading identity of its own.
 
 Collapsing them would make venue configuration a hard startup requirement of
 the weather collector; that regression has already happened once and the
@@ -45,18 +52,26 @@ Deployment values are never hardcoded here: every one comes from settings.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
 import stat
+from collections.abc import Callable
+from datetime import UTC
+from datetime import datetime as datetime_cls
 from datetime import time as datetime_time
+from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pandas as pd
 from msgspec.structs import replace as msgspec_replace
 from nautilus_trader.common import Environment
 from nautilus_trader.config import (
     CacheConfig,
+    LiveExecEngineConfig,
+    LiveRiskEngineConfig,
     LoggingConfig,
     TradingNodeConfig,
 )
@@ -71,9 +86,19 @@ from nautilus_trader.model.data import (
 )
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.config import StreamingConfig
 from nautilus_trader.persistence.writer import RotationMode
 
+from breezy.adapters.polymarket_us.recorder_watchdog import (
+    CONNECT_BUDGET_S,
+    DISCOVERING_GRACE_S,
+    ROTATE_MARGIN_S,
+    START_EXTEND_S,
+    STOP_HOOK_BOUND_S,
+    UNIT_TIMEOUT_START_SEC,
+    UNIT_TIMEOUT_STOP_SEC,
+)
 from breezy.adapters.polymarket_us.tape_records import (
     DepthTruncation,
     QuoteTapeGap,
@@ -81,18 +106,45 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueSettlementSnapshot,
 )
 from breezy.persistence.catalog import CatalogPathError
-from breezy.runtime.settings import BreezyRuntimeSettings, PolymarketUSQuoteTapeSettings
+from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.exec_par_boot_flag import default_repo_root, force_k1_at_boot
+from breezy.runtime.exec_par_constants import (
+    EXEC_PAR_MAX_CONCURRENT_INTENTS,  # noqa: F401 - re-exported: existing importers keep working
+)
+from breezy.runtime.exec_par_promo_record import apply_promo_guard
+from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
+from breezy.runtime.settings import (
+    BreezyRuntimeSettings,
+    BreezyTradeSettings,
+    PolymarketUSQuoteTapeSettings,
+)
+from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import SubmitIntentLatch
+from breezy.runtime.supervisor_decode_marker import (
+    supervisor_admits_retirement_reason,
+    supervisor_admits_slot_schema,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
-    # inside :func:`build_quote_tape_node_config`, never at module scope:
-    # `breezy/runtime/__init__.py` eagerly imports `composition`, which imports
-    # this module, while `adapters.polymarket_us.config` imports
-    # `breezy.runtime.settings` -- so a module-scope adapter import here closes
-    # the cycle and raises `ImportError: partially initialized module`.
-    # Measured, not hypothesised. Keeping it under TYPE_CHECKING means mypy
-    # still checks the signature with the real type.
-    from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+    # inside :func:`build_quote_tape_node_config`, never at module scope.
+    # Historical cause (measured, not hypothesised): `composition` imports
+    # this module, and `adapters.polymarket_us.config` imports
+    # `breezy.runtime.settings` -- while `breezy/runtime/__init__.py` still
+    # eagerly imported `composition`, a module-scope adapter import here
+    # closed that cycle and raised `ImportError: partially initialized
+    # module`. NOTIFIER-IMPORT-ISOLATION made the package `__init__`
+    # import-free, which removes the eager leg of that cycle -- but flipping
+    # this back to a module-scope import is a separate, untested change
+    # (YAGNI), so the TYPE_CHECKING guard and the call-site import inside
+    # :func:`build_quote_tape_node_config` stay. Keeping it under
+    # TYPE_CHECKING means mypy still checks the signature with the real type.
+    from breezy.adapters.polymarket_us.config import (
+        PolymarketUSDataClientConfig,
+        PolymarketUSExecClientConfig,
+    )
+
+logger = logging.getLogger(__name__)
 
 #: The ingest Actor's ``"pkg.mod:Class"`` colon path.
 #:
@@ -142,9 +194,11 @@ def validated_trader_id(value: str) -> TraderId:
     """
     if not _TRADER_ID_PATTERN.match(value):
         raise NodeConfigError(
-            f"trader_id {value!r} is malformed: it must be two non-empty, "
-            "whitespace-free segments separated by a single hyphen (e.g. "
-            "'BREEZY-001'). Set BREEZY_TRADER_ID accordingly."
+            f"trader_id {value!r} is malformed: it must be EXACTLY two "
+            "non-empty, whitespace-free segments separated by a single hyphen "
+            "(e.g. 'BREEZY-001'); a second hyphen is not allowed. Set the "
+            "trader-id variable for this role accordingly -- BREEZY_TRADER_ID "
+            "for ingestion, BREEZY_TRADE_TRADER_ID for the trading process."
         )
     return TraderId(value)
 
@@ -278,6 +332,94 @@ QUOTE_TAPE_INCLUDE_TYPES: list[type] = [
 #: rate negligible for a handful of weather markets.
 QUOTE_TAPE_FLUSH_INTERVAL_MS: int = 10_000
 
+#: ``Cache`` tick/bar deque capacity for the quote-tape recorder, PER
+#: INSTRUMENT (``CacheConfig.tick_capacity``/``bar_capacity``,
+#: ``nautilus_trader/cache/config.py:56-58,73-74``; the deques themselves:
+#: ``cache/cache.pyx:117-118,1755-1988``). The native default is
+#: ``10_000`` each -- sized for a strategy process that reads ticks/bars back
+#: out of the cache. This recorder never does: it registers zero Actors and
+#: zero strategies (``build_quote_tape_node_config`` below), and nothing on
+#: its path calls ``Cache.quote_ticks``/``bars`` (checked with codegraph --
+#: every ``subscribe_quote_ticks``/cache-read caller in ``src/breezy/`` is a
+#: strategy module, none of which this process constructs). Left at the
+#: default, 30+ subscribed instruments each carry a 10_000-entry deque that is
+#: written and NEVER read -- pure unread headroom on a host that was OOM-killed
+#: at ~1.1 GB RSS (``tests/unit/test_polymarket_us_connect_fail_fast.py:3-4``).
+#: Pinned to ``1``, not ``0``: ``CacheConfig`` types both fields
+#: ``PositiveInt`` (``gt=0``) and msgspec does not enforce that constraint at
+#: direct-construction time (measured: ``CacheConfig(tick_capacity=0)``
+#: succeeds today) -- but that is an accident of this msgspec version, not a
+#: documented guarantee, and ``deque(maxlen=0)`` is also a needless edge case
+#: (some cache paths call ``.append`` unconditionally regardless of whether
+#: anything ever reads back). ``1`` satisfies the type's own contract, still
+#: collapses the per-instrument footprint by four orders of magnitude, and
+#: the writer never reads the cache back either way so no data is lost by
+#: shrinking it -- everything durable goes through the streaming feather
+#: writer, not the in-memory cache.
+QUOTE_TAPE_CACHE_CAPACITY: int = 1
+
+#: GL-12: seconds the quote-tape recorder retries an initial connect's
+#: ``EmptyClimateListingError`` before giving up. The venue's own daily
+#: discovery job lands the next day's climate cohort at **D-1 ~09:45Z,
+#: drifting to ~10:30Z** by the end of an observed cohort
+#: (``docs/evidence/venue/polymarket_us/
+#: LISTING_GAP_INCIDENT_2026-09-02T0845Z.md:32-36``). A 09:00Z
+#: ``try-restart`` that lands before that lag resolves must not latch a
+#: fatal fault the venue was always going to resolve within the hour --
+#: but it also must not retry forever: 3600s covers the observed 10:30Z
+#: lead with headroom, and `Restart=always` (`StartLimitBurst=20`,
+#: `RestartSec=30`) still recovers a listing that slips even later than
+#: that. The live trade node stays at the field default (0, fail-fast
+#: immediately) -- only this ONE process's config is widened.
+QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS: float = 3600.0
+
+
+def recorder_max_start_s(
+    base_start_s: float,
+    *,
+    discovery_retry_s: float = QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS,
+    discovering_grace_s: float = DISCOVERING_GRACE_S,
+    connect_budget_s: float = CONNECT_BUDGET_S,
+    extend_s: float = START_EXTEND_S,
+) -> int:
+    """The longest a recorder start can run under `EXTEND_TIMEOUT_USEC` (AUT-1 r12 GH1).
+
+    Base start (process start to `_connect`) + the discovering window (retry budget + grace) +
+    the connecting budget + the last extension's tail. 4500 s at a base of 180 s.
+    """
+    return math.ceil(
+        base_start_s + discovery_retry_s + discovering_grace_s + connect_budget_s + extend_s
+    )
+
+
+def rotate_timeout_start_s(
+    max_start_s: float,
+    *,
+    member_stop_s: float = UNIT_TIMEOUT_STOP_SEC,
+    hook_bound_s: float = STOP_HOOK_BOUND_S,
+    margin_s: float = ROTATE_MARGIN_S,
+) -> int:
+    """The rotate unit's `TimeoutStartSec`: stop + hook + max start + margin, to whole minutes."""
+    total = member_stop_s + hook_bound_s + max_start_s + margin_s
+    return math.ceil(total / 60) * 60
+
+
+#: AUT-1 r12 GH1: ONE constant for the recorder's longest start and ONE for the rotate bound.
+#: Every unit-file literal and every cross-plan reader derives from these two names.
+QUOTE_TAPE_MAX_START_SECS: int = recorder_max_start_s(UNIT_TIMEOUT_START_SEC)
+QUOTE_TAPE_ROTATE_TIMEOUT_START_SECS: int = rotate_timeout_start_s(QUOTE_TAPE_MAX_START_SECS)
+
+#: GL-12: native `timeout_connection` (`system/config.py:85,127`, default
+#: 60.0) for the quote-tape node ONLY. Must exceed
+#: :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` -- otherwise
+#: `NautilusKernel._await_engines_connected` (`system/kernel.py:1298-1313`)
+#: WARN-times-out and `start_async` (`:1024-1025`) returns without ever
+#: raising or stopping, while `_connect` is still legitimately retrying in
+#: the background: a half-started node, native-config option (C) rejected
+#: in the GL-12 plan. +120s margin over the retry budget covers the final
+#: attempt's own request latency.
+QUOTE_TAPE_TIMEOUT_CONNECTION_SECS: float = QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS + 120.0
+
 #: Mode the tape root is created with. Matches
 #: ``breezy.runtime.health.SNAPSHOT_DIR_MODE`` and the station-catalog
 #: convention. The tape is not a secret, but it is strategy-inferable: which
@@ -367,8 +509,7 @@ def prepare_quote_tape_root(root: Path) -> Path:
         )
     if not stat.S_ISDIR(status.st_mode):
         raise CatalogPathError(
-            f"quote-tape root {root} exists and is not a directory; refusing to "
-            "record through it"
+            f"quote-tape root {root} exists and is not a directory; refusing to record through it"
         )
 
     # `mkdir`'s mode argument is masked by the umask, and an already-existing
@@ -376,6 +517,30 @@ def prepare_quote_tape_root(root: Path) -> Path:
     # that the `lstat` above has established this is not a symlink.
     os.chmod(root, QUOTE_TAPE_ROOT_MODE)
     return root
+
+
+#: The one alert the recorder raises for a persistently broken sighting sidecar.
+SIGHTING_SIDECAR_BROKEN_EVENT: Final[str] = "BREEZY_SIGHTING_SIDECAR_BROKEN"
+#: Resolved by the adapter's data factory (``resolve_path``), never imported by it.
+SIGHTING_SIDECAR_BROKEN_ALERT_PATH: Final[str] = f"{__name__}:emit_sighting_sidecar_broken_alert"
+
+
+def emit_sighting_sidecar_broken_alert(detail: str) -> None:
+    """Deliver the provider's sidecar-broken detail through the shipped alert path.
+
+    Resolved per call (it fires at most once per failure streak), so the
+    process environment at alert time -- ``alerts.env`` via the recorder unit --
+    is what counts. ``emit_alert`` contains every sink failure.
+    """
+    emit_alert(
+        resolve_alert_sink(),
+        AlertPayload(
+            severity="WARN",
+            event=SIGHTING_SIDECAR_BROKEN_EVENT,
+            site="polymarket_us/recorder",
+            detail=detail,
+        ),
+    )
 
 
 def build_quote_tape_node_config(
@@ -442,7 +607,45 @@ def build_quote_tape_node_config(
     # supported copy-with-change for a frozen Struct and it re-runs
     # `__post_init__`, so the config's own validation is not bypassed here.
     data_client_config = msgspec_replace(
-        data_client_config, recorder_instance_id=instance_id.value
+        data_client_config,
+        recorder_instance_id=instance_id.value,
+        # GL-12: quote-tape ONLY. See
+        # :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` for why; the live
+        # trade node keeps the field default (0, fail-fast immediately).
+        empty_discovery_retry_secs=QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS,
+        # Quote-tape ONLY: capture the venue's executed prints as native
+        # `TradeTick`s (already in `QUOTE_TAPE_INCLUDE_TYPES`, so the writer
+        # persists them with no further wiring). Prints are forward-only on
+        # this venue; the live trade node keeps the field default (off).
+        subscribe_trades=True,
+        # Quote-tape ONLY, cleared by the 2026-09-17 09:29-09:30Z
+        # connection-per-key probe (venue evidence: WS concurrent-connections
+        # probe run WS_CONCURRENT_CONNECTIONS_20260917T093016Z, recorded under
+        # the venue probes evidence directory): 12
+        # concurrent authenticated `/v1/ws/markets` connections succeeded on
+        # this key in one run (recorder's 3 existing shards + 9 probe
+        # connections), zero refusals or evictions; the ceiling was not
+        # located, only that 12 is reachable. Enabling this halves the
+        # recorder's shard size (`cap // 2` instead of `cap`), which is what
+        # lets every subscribed slug's TRADE request actually fit -- at the
+        # cost of doubling the recorder's own live connection count (3 -> 6
+        # shards for 30 slugs). 6 recorder shards + the live trade node's own
+        # 3 = 9, still under the measured 12, so it is safe to turn on HERE.
+        # The live trade node keeps the field's off default: it never sets
+        # `subscribe_trades`, so halving would be a no-op for it, and this
+        # keeps its shard count byte-identical regardless.
+        trade_shard_halving=True,
+        # AUD-08b, quote-tape ONLY: the recorder is the one process that
+        # writes the sighting sidecar, so it is the one that can report the
+        # sidecar persistently broken. Injected here because the adapter may
+        # not import the runtime alert path.
+        sighting_failure_alert_path=SIGHTING_SIDECAR_BROKEN_ALERT_PATH,
+        # AUT-1 r12 section 3.10.1, quote-tape ONLY: opt in to the systemd watchdog pinger.
+        # Under today's `Type=simple` every notification is a no-op; the trade node never
+        # sets this. The stream dir is the kernel's `<catalog>/live/<instance_id>` (the byte
+        # total the gate watches).
+        watchdog_notify=True,
+        watchdog_stream_dir=str(settings.catalog_root / "live" / instance_id.value),
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
@@ -452,7 +655,12 @@ def build_quote_tape_node_config(
         environment=Environment.LIVE,
         trader_id=validated_trader_id(settings.trader_id),
         logging=LoggingConfig(log_level=settings.log_level),
-        cache=CacheConfig(database=None, flush_on_start=False),
+        cache=CacheConfig(
+            database=None,
+            flush_on_start=False,
+            tick_capacity=QUOTE_TAPE_CACHE_CAPACITY,
+            bar_capacity=QUOTE_TAPE_CACHE_CAPACITY,
+        ),
         message_bus=None,
         catalogs=[],
         actors=[],
@@ -471,5 +679,480 @@ def build_quote_tape_node_config(
             rotation_time=QUOTE_TAPE_ROTATION_TIME,
             rotation_timezone=QUOTE_TAPE_ROTATION_TIMEZONE,
         ),
+        # GL-12: kernel._check_engines_connected yields with sleep(0) while
+        # waiting (native, not a hang) -- this only widens how long that
+        # native wait is allowed to run so the whole empty-discovery retry
+        # budget fits inside it. See
+        # :data:`QUOTE_TAPE_TIMEOUT_CONNECTION_SECS`.
+        timeout_connection=QUOTE_TAPE_TIMEOUT_CONNECTION_SECS,
+    )
+    return cast(TradingNodeConfig, config)
+
+
+#: Plan A3 (S3, 2026-09-14): a build-side, STATED (never operator-supplied,
+#: never env-derived) native submit-rate ceiling -- `RiskEngineConfig`'s
+#: own field, `max_order_submit_rate: str` (format `"<count>/<HH:MM:SS>"`;
+#: default `"100/00:00:01"`, installed
+#: `nautilus_trader/risk/config.py:29-30`).
+#:
+#: EXEC-PAR r5 3.9 (re-stated; the VALUE is unchanged). Native behaviour: the
+#: throttle is `RiskEngine`'s submit throttler with `output_drop=
+#: self._deny_new_order` (`risk/engine.pyx:140-150`), so a submit over the
+#: rate is DROPPED (denied) upstream of `_submit_order`, never queued, and it
+#: wastes no permit and arms no intent. At K=1 the submit-intent latch admits
+#: at most one OPEN intent, so this ceiling can never bind. At K>1 up to K
+#: submits may be admitted in one synchronous burst; this ceiling is then
+#: defence in depth only, and the operative bounds on order flow stay, in
+#: order: the daily spend ledger (with its open-exposure bound), the native
+#: per-order notional cap (see the docstring above), and the slot table
+#: itself. It is deliberately NOT raised for K>1: a drop here is a visible,
+#: modelled denial (plan 6), and a loose ceiling must never become the thing
+#: that stops a runaway. Never read from an env var -- see the module
+#: docstring's ban on inventing a literal on an operator-reserved path; this
+#: literal is Breezy's, not the operator's, and is not one of the two
+#: OPERATOR-RESERVED controls (max daily budget, max per position).
+TRADE_RISK_MAX_ORDER_SUBMIT_RATE: Final[str] = "5/00:00:01"
+
+
+# ---------------------------------------------------------------------------
+# EXEC-PAR (r5 section 5 WP5b): Breezy-owned parallel-intent constants.
+#
+# Every one is a module-level `Final`, NEVER read from the environment, and
+# reaches the exec client only through `PolymarketUSExecClientConfig` fields
+# (`build_trade_node_config`). None is one of the two operator-reserved
+# controls (max daily budget, max per position). K stays 1 until D-PREREG is
+# frozen and the activation gates pass.
+# ---------------------------------------------------------------------------
+
+_EXEC_PAR_NS_PER_SECOND: Final[int] = 1_000_000_000
+
+# K, EXEC_PAR_MAX_CONCURRENT_INTENTS, lives in the dependency-free
+# `exec_par_constants` (the supervisor reads it without importing this module)
+# and is re-exported at the top of this file.
+
+#: `f_adm`: AMBIGUOUS open notional (and any single order) may not exceed this
+#: fraction of the daily budget. A ratio, never a dollar value.
+OPEN_EXPOSURE_BOUND_FRACTION: Final[Decimal] = Decimal("0.50")
+
+#: `f_breaker` (< `f_adm`): AMBIGUOUS open notional above this fraction of the
+#: daily budget trips the breaker.
+BREAKER_OPEN_AMBIGUOUS_FRACTION: Final[Decimal] = Decimal("0.25")
+
+#: Admission denies entries when the watcher heartbeat is older than this
+#: (12 polls of the 5 s watcher tick).
+BREAKER_HEARTBEAT_MAX_AGE_NS: Final[int] = 60 * _EXEC_PAR_NS_PER_SECOND
+
+#: Admission denies entries when the resolver's last pass is older than this
+#: (2 x the 300 s resolver backoff cap, so a venue-wide 5xx backoff does not
+#: false-trip while a dead resolver task does).
+RESOLVER_PASS_STALE_NS: Final[int] = 600 * _EXEC_PAR_NS_PER_SECOND
+
+#: The D-PREREG-frozen cap/budget bucket LABEL (WP0 findings). The unit is
+#: per-position cap / daily budget (r5.1 E6). A live label above it forces K=1.
+EXEC_PAR_FROZEN_BUCKET: Final[str] = "0.05"
+
+#: The marker-less force-to-1 reason (names no value).
+EXEC_PAR_MARKER_ABSENT_REASON: Final[str] = (
+    "the running supervisor's decode marker does not admit slot schema v2"
+)
+
+
+def force_k1_without_supervisor_marker(
+    latch: SubmitIntentLatch,
+    store_path: Path,
+    *,
+    admits: Callable[[Path], bool] | None = None,
+) -> bool:
+    """Force the slot latch to K=1 unless the RUNNING supervisor can decode v2.
+
+    A node must never write a v2 slot table a supervisor would read as corrupt
+    (L-48). At a configured K of 1 this is a no-op. A raising ``admits`` counts
+    as "not admitted" (fail closed). Returns ``True`` iff K was forced.
+    """
+    if latch.max_slots() <= 1:
+        return False
+    check = supervisor_admits_slot_schema if admits is None else admits
+    try:
+        admitted = bool(check(store_path))
+    except Exception:  # noqa: BLE001 - an unreadable marker is "not admitted"
+        admitted = False
+    if admitted:
+        return False
+    latch.force_k1(EXEC_PAR_MARKER_ABSENT_REASON)
+    return True
+
+
+def force_k1_on_durable_flag(
+    latch: SubmitIntentLatch,
+    *,
+    repo_root: Path | None = None,
+    alert_sink: AlertSink | None = None,
+) -> bool:
+    """Force the slot latch to K=1 when the durable force-K1 flag is SET or UNREADABLE.
+
+    Also holds K=1 at a configured K>1 while an un-amended ``cleanup_demotion`` to
+    K=1 stands (N4), or at a configured K>2 without a valid O3 promotion record.
+    A CLEARED flag does nothing; at configured K=1 forcing is
+    harmless. ``repo_root`` defaults to the module-anchored root, never the cwd.
+    The latch already carries the store, so none is passed. Returns ``True`` iff K was forced.
+    """
+    sink = resolve_alert_sink() if alert_sink is None else alert_sink
+    root = default_repo_root() if repo_root is None else repo_root
+    forced = force_k1_at_boot(latch, repo_root=root, alert_sink=sink)
+    today = datetime_cls.now(UTC).date()
+    return apply_promo_guard(latch, repo_root=root, alert_sink=sink, today=today) or forced
+
+
+def build_trade_risk_engine_config(
+    market_slugs: tuple[str, ...],
+) -> LiveRiskEngineConfig:
+    """Return the trading process's NATIVE pre-trade risk configuration.
+
+    Nothing here is new machinery: ``RiskEngine`` already implements a
+    per-order notional cap (``risk/engine.pyx:675-679``, denial reason
+    ``NOTIONAL_EXCEEDS_MAX_PER_ORDER`` at ``:912-917``) and the kernel already
+    builds the engine from this config. Until now Breezy configured **no**
+    native risk caps at all, so that mechanism sat unused.
+
+    **Shape, read from source, not guessed.**
+    ``RiskEngineConfig.max_notional_per_order`` is ``dict[str, int]``
+    (``risk/config.py:44``) keyed by instrument-ID string --
+    ``_initialize_risk_checks`` calls ``InstrumentId.from_str_c`` on every key
+    (``risk/engine.pyx:193-196``). It is NOT a scalar and there is no
+    all-instruments form, so the cap can only cover instrument IDs that exist
+    when the config is built. That is why ``market_slugs`` is the input.
+
+    **Residual, stated rather than papered over.** Markets discovered at
+    runtime by the instrument provider are NOT in this mapping and are NOT
+    covered by this cap; only statically declared slugs
+    (``POLYMARKET_US_MARKET_SLUGS``) are. The always-applicable
+    per-order chokepoint remains
+    :func:`breezy.adapters.polymarket_us.safety.authorize_live_order_submission`,
+    which enforces the operator's exact ``Decimal`` ceiling on every order.
+    This function adds a second, native, independent line of defence for the
+    markets it can key; it does not replace the first.
+
+    **And a second residual, already pinned elsewhere.** Every cap below
+    ``risk/engine.pyx:684-689`` is inert until a real ``AccountState`` is
+    cached -- see ``tests/contract/test_risk_engine_ordering_enforcement.py``,
+    which is the authority on that ordering constraint.
+
+    The VALUE is the operator's, never Breezy's: it comes from
+    :func:`~breezy.adapters.polymarket_us.safety.operator_max_order_notional_whole_usd`.
+    Operator ruling 2026-09-10: when the per-order session var is absent that
+    reader derives from the per-position cap; it fails closed only when the
+    caps needed for derivation are absent. There is deliberately no invented
+    literal on this path. The two OPERATOR-RESERVED controls -- max daily
+    budget and max per position -- are never assigned by this repo.
+    """
+    # Deferred to call time to break the package import cycle documented at
+    # the TYPE_CHECKING block at the top of this module.
+    from breezy.adapters.polymarket_us.safety import (
+        operator_max_order_notional_whole_usd,
+    )
+    from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
+
+    ceiling_usd = operator_max_order_notional_whole_usd()
+    return LiveRiskEngineConfig(
+        # Stated, not defaulted: `bypass=True` disables every pre-trade check
+        # including the cap above (`risk/engine.pyx:273-277`).
+        bypass=False,
+        max_notional_per_order={
+            str(slug_to_instrument_id(slug)): ceiling_usd for slug in market_slugs
+        },
+        # Plan A3 (S3): stated explicitly so it is never silently the
+        # Nautilus default -- see `TRADE_RISK_MAX_ORDER_SUBMIT_RATE`'s own
+        # docstring for why this value, and why it can never bind ahead of
+        # the submit-intent latch.
+        max_order_submit_rate=TRADE_RISK_MAX_ORDER_SUBMIT_RATE,
+    )
+
+
+def _resolver_instrument_loader_from_catalog(catalog_root: Path) -> Callable[[str], Any]:
+    """Return a ``PolymarketUSExecClientConfig.resolver_instrument_loader``
+    closure over ``catalog_root``'s durable history.
+
+    2026-09-24 stuck-prior-day-instrument fix: the AMBIGUOUS-intent resolver
+    (``exec/client.py``'s ``_resolve_ambiguous_intents``) may need an
+    instrument definition for a PRIOR day's node boot that is absent from
+    THIS run's cache -- the node boots for TODAY's instruments only
+    (``breezy.strategy.current_rung_hold.composition.
+    resolve_station_instrument_ids``). This reads the SAME
+    ``ParquetDataCatalog`` root that function already reads, never the
+    venue-backed ``PolymarketUSInstrumentProvider`` -- that provider's
+    ``load_ids_async`` (``adapters/polymarket_us/provider.py:437-453``)
+    raises ``VenuePayloadError`` for any id outside the LATEST discovery
+    cycle, which a resolved/expired prior-day market always is, and even a
+    hypothetical bypass would be a live venue call and a new market-data
+    subscription path -- neither of which the resolver may reach.
+
+    ``catalog.instruments(instrument_ids=[...])`` silently omits every
+    flat-written row -- the SAME gotcha ``resolve_station_instrument_ids``'s
+    own docstring documents -- so this always calls ``instruments()``
+    unfiltered and matches by id string locally, never by the identifier
+    filter.
+
+    This module (``runtime``) may not import ``breezy.strategy`` (the layer
+    contract: ``strategy`` sits ABOVE ``runtime``), so the read is
+    reimplemented here rather than reused from
+    ``resolve_station_instrument_ids`` -- both read the one native call,
+    :meth:`ParquetDataCatalog.instruments`.
+    """
+
+    def _load(instrument_id: str) -> Any:
+        catalog = ParquetDataCatalog(str(catalog_root))
+        raw = catalog.instruments()
+        instruments = list(raw) if raw is not None else []
+        for instrument in instruments:
+            if str(getattr(instrument, "id", None)) == instrument_id:
+                return instrument
+        return None
+
+    return _load
+
+
+def build_trade_node_config(
+    settings: BreezyTradeSettings,
+    data_client_config: PolymarketUSDataClientConfig,
+    exec_client_config: PolymarketUSExecClientConfig,
+    *,
+    submit_intent_latch: object | None = None,
+    live_trading_permit: object | None = None,
+    submit_veto: Callable[[], str | None] | None = None,
+    exit_manifest: FamilyManifest | None = None,
+) -> TradingNodeConfig:
+    """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE W).
+
+    A THIRD role, and a third function, for the reason the first two are
+    separate: the weather collector must start on a host with no venue
+    configuration, the recorder must refuse to start without it, and this one
+    must additionally refuse to start without a trading identity of its own
+    (:data:`breezy.runtime.settings.TRADE_TRADER_ID_VAR`). Collapsing any two
+    of the three makes one role's requirement another role's outage.
+
+    Null hypothesis, re-checked against the installed ``nautilus-trader==1.231.0``:
+    **Nautilus already provides the process shell.** ``TradingNode`` /
+    ``NautilusKernel`` build every engine, install the signal handlers
+    (``system/kernel.py:558-572``) and own start/stop. This function therefore
+    authors no process machinery. It maps settings onto native config objects,
+    and makes exactly one non-default decision (the in-flight pin below).
+
+    **EXEC SPINE W wires the execution client in, and it is STILL not able to
+    submit an order.** R-4's ``PolymarketUSExecutionClient`` had ZERO
+    construction sites until this increment: ``PolymarketUSLiveExecClientFactory``
+    (``adapters/polymarket_us/factories.py``) is registered against this exact
+    ``exec_clients`` key by ``breezy.runtime.trade_cli``, so the client that
+    was previously only exercised by fixtures is now CONSTRUCTED by the node.
+    That de-inerts every Nautilus risk cap for the first time in the running
+    process (``risk/engine.pyx:684-689`` returns ``True`` -- order allowed --
+    while no ``AccountState`` is cached). What remains a structural property
+    of the returned config, not a convention, is that nothing can ORIGINATE an
+    order:
+
+    * ``strategies=[]`` -- nothing that calls ``submit_order``
+      (``trading/strategy.pyx``);
+    * ``exec_algorithms=[]`` -- the second route, easy to misread as data-side
+      because ``ExecAlgorithm`` subclasses ``Actor``, but it carries
+      ``submit_order``/``modify_order``/``cancel_order`` in its own right
+      (``execution/algorithm.pyx``) and the kernel instantiates every entry
+      unconditionally.
+
+    Both are stated as empty literals rather than defaulted, so the intent is
+    visible in review and checkable from source --
+    ``TestTheReadOnlyCageIsDeclaredNotDefaulted`` reads this call. The
+    execution client's OWN cage -- ``_submit_order`` and ``_cancel_order``
+    carry an unconditional denial body, and the other four lifecycle
+    coroutines raise -- is R-4's, unchanged by W (``exec/client.py``).
+
+    **``exec_client_config.state_store_opener`` is injected HERE, not earlier.**
+    ``breezy.adapters.polymarket_us.factories`` is an ``adapters`` package and
+    may not import :class:`~breezy.runtime.sqlite_store.SqliteStateStore`
+    (``runtime`` sits ABOVE ``adapters`` in the import-linter layer contract),
+    so :func:`~breezy.adapters.polymarket_us.factories.exec_config_from_env`
+    always leaves this field ``None``. This function is on the ``runtime``
+    side of that boundary, so it is where the real opener is built and
+    threaded through via ``msgspec.structs.replace`` -- the identical pattern
+    :func:`build_quote_tape_node_config` already uses for
+    ``recorder_instance_id``. The opener is never CALLED here: the store is
+    thread-confined (``sqlite_store.py:120,128-135``) and must be constructed
+    on the execution engine's own event loop, inside ``_connect`` -- see
+    ``exec/client.py``'s module docstring.
+
+    **``inflight_check_interval_ms=0`` -- READ THIS BEFORE CHANGING IT.**
+
+    The authority for the disable is CODE, not the config docstring:
+    ``live/execution_engine.py:574-575`` and ``:591-592`` both guard on
+    ``if self.inflight_check_interval_ms > 0`` before arming the in-flight
+    timer and before contributing an interval, and ``:383-386`` schedules the
+    continuous-reconciliation task at all only if one of the three intervals
+    is truthy. Zero therefore genuinely disables in-flight checking; verified
+    by reading the installed source, not inferred from documentation.
+
+    The config docstring (``live/config.py:111-114``) says only "the interval
+    (milliseconds) between checking whether in-flight orders have exceeded
+    their time-in-flight threshold. This should not be set less than the
+    ``inflight_check_threshold_ms``." It documents **no** disable semantic,
+    and its "should not be set less than" guidance does not contemplate 0 --
+    0 is trivially less than the 5000 ms default threshold. A future reader
+    who follows the docstring alone will "helpfully" raise this to 5000 and
+    silently re-arm in-flight checking. Do not.
+
+    Why the pin matters here specifically: **Polymarket.us has no
+    client-order-id.** ``_check_inflight_orders``
+    (``live/execution_engine.py:701``) issues ``QueryOrder`` commands to
+    VERIFY -- it does not resubmit -- but after ``inflight_check_retries``
+    attempts it calls ``_resolve_inflight_order``, resolving as FAILED an
+    order we have no id with which to ask about. A false terminal on a venue
+    with no deduplication key is the first step toward a doubled position.
+
+    **``CacheConfig(database=None, flush_on_start=False)``** -- identical to
+    both sibling builders. ``kernel.py:311-329`` accepts only ``'redis'`` for
+    either backing store; there is no Redis in this deployment, and Breezy's
+    durable state deliberately lives outside the Nautilus cache.
+
+    **No streaming.** The recorder writes the tape; the trader does not. A
+    second process streaming into the same catalog root would interleave two
+    runs' feather files and make the tape unattributable.
+
+    **No operator-reserved control appears here.** Max daily budget and max
+    per position are the operator's two values, added as mechanism in a later
+    increment, never assigned by Breezy, and fail-closed when absent. There is
+    nothing to reference from a node config, so nothing is referenced.
+
+    **Native pre-trade risk caps ARE configured here**, via
+    :func:`build_trade_risk_engine_config` -- read its docstring for the shape
+    the cap takes and for the two residuals it does not close. The per-order
+    notional ceiling is the operator's existing
+    ``BREEZY_MAX_ORDER_NOTIONAL_USD``, which is a per-ORDER session control
+    and is not one of the two reserved ones. Operator ruling 2026-09-10:
+    when that session var is unset the native cap is derived from the
+    per-position cap; building this config RAISES
+    ``LiveTradingPermissionError`` only when the caps needed for that
+    derivation are also absent, so the trading process still refuses to
+    start uncapped. The two read-only
+    roles above are unaffected -- they have no execution surface and no risk
+    engine traffic, so requiring a trading ceiling from them would only make a
+    weather host fail for a value it can never use.
+    """
+    # Deferred to call time to break the package import cycle documented at
+    # the TYPE_CHECKING block at the top of this module.
+    from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
+
+    # `PolymarketUSExecClientConfig.state_store_path` is typed `str | None`
+    # because `None` is only the constructor default that lets
+    # `__post_init__` raise a clear error; that same `__post_init__` already
+    # guarantees a non-empty string by the time an instance exists. Narrowed
+    # here, once, for mypy -- not re-validated.
+    state_store_path = cast(str, exec_client_config.state_store_path)
+
+    # See the docstring: the store is opened only inside `_connect`, on the
+    # execution engine's own loop -- this closure never runs here.
+    # ``submit_intent_latch`` is the composition root's already-opened latch
+    # (object, never a factory). The exec client stores it; R-7's ``_connect``
+    # is what will consume it. A second ``open_submit_intent_latch`` here
+    # would flock-conflict with the composition root and kill the process --
+    # so this function never opens one; it only threads through what the
+    # composition root already opened.
+    #
+    # `PolymarketUSExecClientConfig.submit_intent_latch` is typed `object |
+    # None` because the `adapters` package cannot import `runtime`
+    # (`runtime` sits ABOVE `adapters` in the import-linter layer contract,
+    # same reason `state_store_opener` is injected here and not in
+    # `exec_config_from_env`). The exec client therefore duck-types the field
+    # (`self._latch: Any`, `exec/client.py`) and cannot itself verify what it
+    # was handed. This is the one place on the `runtime` side of that
+    # boundary that CAN import the real type, so the check belongs here, not
+    # there: a caller that hands this function anything other than a real,
+    # already-opened `SubmitIntentLatch` (or `None`, meaning "no latch yet")
+    # is refused at config-build time, before it ever reaches the client.
+    from breezy.runtime.submit_intent import RetirementReason
+
+    if submit_intent_latch is not None and not isinstance(submit_intent_latch, SubmitIntentLatch):
+        raise NodeConfigError(
+            "submit_intent_latch must be a real breezy.runtime.submit_intent."
+            f"SubmitIntentLatch (or None); got {type(submit_intent_latch).__name__!r}"
+        )
+    # Item 4 (slice 4 review): the family-halt chokepoint veto. Unlike
+    # `submit_intent_latch`, `PolymarketUSExecClientConfig.submit_veto` is
+    # typed as the real `Callable[[], str | None]` -- a plain callable needs
+    # no `runtime`-only type to validate against, so it carries no `object`
+    # widening and no isinstance check against a real class. `callable()` is
+    # still the strongest refusal available at config-build time.
+    if submit_veto is not None and not callable(submit_veto):
+        raise NodeConfigError(
+            f"submit_veto must be a callable (or None); got {type(submit_veto).__name__!r}"
+        )
+    # Review finding A(2) (POSITION_EXIT_EXECUTION_2026-09-16.md §5.1):
+    # `PolymarketUSExecClientConfig.exit_manifest` is typed as the real
+    # `FamilyManifest` (unlike `submit_intent_latch`, `persistence` sits
+    # BELOW `runtime` in the layer contract, so no `object` widening is
+    # needed here either) -- `isinstance` is still the strongest available
+    # refusal at config-build time.
+    if exit_manifest is not None and not isinstance(exit_manifest, FamilyManifest):
+        raise NodeConfigError(
+            "exit_manifest must be a real breezy.persistence.family_manifest."
+            f"FamilyManifest (or None); got {type(exit_manifest).__name__!r}"
+        )
+
+    # 2026-09-24 fix: `None` when no catalog root is configured (a host with
+    # no sending family, `settings.catalog_root`'s own default) -- the
+    # resolver then has no loader and escalates instead of loading, exactly
+    # as it did before this parameter existed.
+    resolver_instrument_loader = (
+        _resolver_instrument_loader_from_catalog(settings.catalog_root)
+        if settings.catalog_root is not None
+        else None
+    )
+    # AMBIG-LATCH-RESUME (DH1): the no-id resolver may retire only if the RUNNING
+    # supervisor's decode marker lists the new reason, so a supervisor that cannot
+    # decode it never meets a RETIRED record it would read as corrupt (L-48).
+    # Read once, here, at node boot. The value rides on the exec client config;
+    # ``trade_cli._run_node`` logs the activation-proof boot line once the node
+    # (and so Nautilus logging) is live -- a record emitted here would be dropped.
+    no_id_retire_admitted = supervisor_admits_retirement_reason(
+        Path(state_store_path), "RESOLVER_NO_ID_NO_FILL"
+    )
+    resting_accept_admitted = supervisor_admits_retirement_reason(
+        Path(state_store_path), "ACCEPTED_RESTING"
+    )
+    sweep_retire_admitted = supervisor_admits_retirement_reason(
+        Path(state_store_path), "BOOT_SWEEP_RESTING_NO_FILL"
+    )
+    exec_client_config = msgspec_replace(
+        exec_client_config,
+        state_store_opener=lambda: SqliteStateStore(state_store_path),
+        submit_intent_latch=submit_intent_latch,
+        live_trading_permit=live_trading_permit,
+        retirement_reasons=RetirementReason,
+        submit_veto=submit_veto,
+        exit_manifest=exit_manifest,
+        resolver_instrument_loader=resolver_instrument_loader,
+        no_id_retire_admitted=no_id_retire_admitted,
+        resting_accept_admitted=resting_accept_admitted,
+        sweep_retire_admitted=sweep_retire_admitted,
+        max_concurrent_intents=(
+            1 if submit_intent_latch is None else submit_intent_latch.max_slots()
+        ),
+        open_exposure_bound_fraction=OPEN_EXPOSURE_BOUND_FRACTION,
+        breaker_open_ambiguous_fraction=BREAKER_OPEN_AMBIGUOUS_FRACTION,
+        frozen_cost_budget_bucket=EXEC_PAR_FROZEN_BUCKET,
+    )
+
+    # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
+    # surface), so the constructor call is typed as Any at this one boundary.
+    config: Any = TradingNodeConfig(
+        environment=Environment.LIVE,
+        trader_id=validated_trader_id(settings.trader_id),
+        logging=LoggingConfig(log_level=settings.log_level),
+        cache=CacheConfig(database=None, flush_on_start=False),
+        message_bus=None,
+        catalogs=[],
+        actors=[],
+        data_clients={POLYMARKET_US_CLIENT_NAME: data_client_config},
+        exec_clients={POLYMARKET_US_CLIENT_NAME: exec_client_config},
+        strategies=[],
+        exec_algorithms=[],
+        exec_engine=LiveExecEngineConfig(inflight_check_interval_ms=0),
+        risk_engine=build_trade_risk_engine_config(data_client_config.market_slugs),
     )
     return cast(TradingNodeConfig, config)

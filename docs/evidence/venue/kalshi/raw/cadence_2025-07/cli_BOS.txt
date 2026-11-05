@@ -1,0 +1,108 @@
+
+096 
+CDUS41 KBOX 040525
+CLIBOS
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE BOSTON/NORTON MA
+125 AM EDT FRI SEP 04 2026
+
+...................................
+
+...THE BOSTON MA CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1872 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         73    251 PM  97    1929  77     -4       76       
+  MINIMUM         63    430 AM  47    1885  62      1       58       
+                                      1893                           
+  AVERAGE         68                        70     -2       67     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.46          3.15 1972   0.11   0.35     0.00     
+  MONTH TO DATE    0.72                      0.32   0.40     0.00     
+  SINCE SEP 1      0.72                      0.32   0.40     0.00     
+  SINCE JAN 1     18.28                     28.36 -10.08    24.95     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0           0.0  2000   0.0    0.0      0.0      
+                                      2001                           
+                                      2002                           
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0      0.0      
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         1     -1        0        
+  MONTH TO DATE    0                         1     -1        0        
+  SINCE SEP 1      0                         1     -1        0        
+  SINCE JUL 1      0                        10    -10        7        
+
+ COOLING                                                              
+  YESTERDAY        3                         5     -2        2        
+  MONTH TO DATE    7                        17    -10        6        
+  SINCE SEP 1      7                        17    -10        6        
+  SINCE JAN 1    924                       717    207      763        
+...................................................................
+
+
+WIND (MPH)                                                            
+  RESULTANT WIND SPEED   4   RESULTANT WIND DIRECTION  SE (130)       
+  HIGHEST WIND SPEED    12   HIGHEST WIND DIRECTION     W (260)       
+  HIGHEST GUST SPEED    15   HIGHEST GUST DIRECTION    SE (150)       
+  AVERAGE WIND SPEED     5.9                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.9                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  HEAVY RAIN                                                          
+  RAIN                                                                
+  LIGHT RAIN                                                          
+  FOG                                                                 
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    97           400 AM                                      
+ LOWEST     78           200 AM                                      
+ AVERAGE    88                                                        
+
+..........................................................
+
+
+THE BOSTON MA CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   77        94      1884                      
+                                             1973                     
+ MINIMUM TEMPERATURE (F)   62        43      1872                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   612 AM EDT   SUNSET   713 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   614 AM EDT   SUNSET   711 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

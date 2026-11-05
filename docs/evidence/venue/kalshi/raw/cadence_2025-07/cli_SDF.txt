@@ -1,0 +1,104 @@
+
+225 
+CDUS43 KLMK 042030
+CLISDF
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE LOUISVILLE KY
+430 PM EDT FRI SEP 04 2026
+
+...................................
+
+...THE LOUISVILLE KY CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+VALID TODAY AS OF 0425 PM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1871 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM        100    234 PM 102    1954  86     14       76       
+  MINIMUM         78    631 AM  47    1952  66     12       62       
+                                      1997                           
+  AVERAGE         89                        76     13       69     
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          2.30 1923   0.10  -0.10     0.72     
+  MONTH TO DATE    0.00                      0.41  -0.41     0.76     
+  SINCE SEP 1      0.00                      0.41  -0.41     0.76     
+  SINCE JAN 1     36.56                     33.82   2.74    39.73     
+
+SNOWFALL (IN)                                                              
+  TODAY            0.0          MM      MM   0.0    0.0      0.0      
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0      0.0      
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  TODAY            0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  TODAY           24                        11     13        4        
+  MONTH TO DATE   91                        46     45       31        
+  SINCE SEP 1     91                        46     45       31        
+  SINCE JAN 1   1653                      1500    153     1613        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    14   HIGHEST WIND DIRECTION     W (280)       
+  HIGHEST GUST SPEED    18   HIGHEST GUST DIRECTION     W (290)       
+  AVERAGE WIND SPEED     2.7                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.1                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED TODAY.                             
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    82           700 AM                                      
+ LOWEST     37           300 PM                                      
+ AVERAGE    60                                                        
+
+..........................................................
+
+
+THE LOUISVILLE KY CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   86       104      1954                      
+ MINIMUM TEMPERATURE (F)   66        47      1974                      
+                                             1997                     
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   715 AM EDT   SUNSET   808 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   716 AM EDT   SUNSET   806 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

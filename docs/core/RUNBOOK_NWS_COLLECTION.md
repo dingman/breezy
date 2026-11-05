@@ -471,5 +471,5 @@ sudo journalctl --vacuum-time=30d  # keep 30 days only
 ## 12. Escalation and Support
 
 - **NWS service issues:** Check https://status.weather.gov/ and `BREEZY_USER_AGENT` contact email for NWS notices
-- **Code defects:** Consult `docs/core/PROGRESS.md` (known outstanding issues) and `docs/plans/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md` (stale plan claims)
+- **Code defects:** Consult `docs/core/PROGRESS.md` (known outstanding issues) and `docs/plans/archive/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md` (stale plan claims)
 - **Operator manual action needed:** `acknowledge_ua_trap_resolved()` is the only persistent halt that requires operator intervention; other blocks clear automatically on one successful poll

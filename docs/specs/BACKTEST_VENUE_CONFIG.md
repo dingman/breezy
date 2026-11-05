@@ -1,7 +1,9 @@
 # Backtest venue configuration — POLYMARKET_US
 
-Status: **specified, not yet implemented.** No `add_venue(...)` call for
-POLYMARKET_US exists anywhere in `src/` or `scripts/` as of 2026-08-27. This
+Status: **IMPLEMENTED.** `src/breezy/runtime/backtest_harness.py:713-714` calls
+`engine.add_venue(venue=POLYMARKET_US_VENUE, ...)` and names this document as its
+authority at `backtest_harness.py:3`. (The previous line — "specified, not yet
+implemented ... as of 2026-08-27" — was true when written and is now false.) This
 document fixes the argument values before the harness is written, so that the
 defaults — several of which are silently wrong for a 0-1 binary market — are
 chosen deliberately rather than inherited.
@@ -115,7 +117,7 @@ is `reduce_only`. The engine's own settlement leg never passes through the
 screen: `check_instrument_expiration` adds its order to the cache directly and
 publishes no `OrderInitialized` (`backtest/engine.pyx:5952-5966`).
 
-A strategy is still free to keep its own guard, and `resting_ladder` does; what
+A strategy is still free to keep its own guard, and the removed `resting_ladder` did (git tag `bc3-pre-removal-2026-10-02`); what
 changed is that forgetting one is no longer silent.
 
 `BETTING` is the tempting wrong answer and is definitively wrong.

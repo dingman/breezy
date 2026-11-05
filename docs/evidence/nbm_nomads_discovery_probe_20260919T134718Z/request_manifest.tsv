@@ -1,0 +1,12 @@
+ordinal	requested_at_utc	label	url	status	bytes	content_type	outcome	sha256
+1	2026-09-19T13:47:18+00:00	p1_blend_prod_index	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/	200	2260	text/html;charset=ISO-8859-1	ok	ad24bdefbda018bc7cc1a9bdc3b2476ac417195b24df459daf07c93876907b6d
+2	2026-09-19T13:47:20+00:00	p2_collective_nbstx	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbstx.t12z	200	29720949		ok	cb8178091293f88f81f6cc09f8258751c8a7724b558864d65b38758786b11dba
+3	2026-09-19T13:47:21+00:00	p3_conditional_bulletin	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbstx.t12z	304	0		not_modified	
+4	2026-09-19T13:47:22+00:00	p4_retention_20260918	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260918/	200	3941	text/html;charset=ISO-8859-1	ok	c63e4f8ca43614ec6e4d6e6f3464097e16b6cbe7dea91c95dadaa3d8eac1d458
+5	2026-09-19T13:47:23+00:00	p4_retention_20260912	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260912/	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880
+6	2026-09-19T13:47:24+00:00	p4_retention_20260820	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260820/	0	0		error:ForbiddenError	
+7	2026-09-19T13:47:26+00:00	p5_lag_20260919_00	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/00/text/blend_nbstx.t00z	200	29720949		ok	dc77a6aa9c1d6d6395bf6f6d123a0fd75d79984b117a5ecbd00e4a03b6609699
+8	2026-09-19T13:47:28+00:00	p5_lag_20260919_06	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/06/text/blend_nbstx.t06z	200	29611149		ok	da0473ab7dfa4b4831ace89bc7a8306f988270442dd7b25656e0661ef376e230
+9	2026-09-19T13:47:29+00:00	p5_lag_20260919_12	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbstx.t12z	200	29720949		ok	cb8178091293f88f81f6cc09f8258751c8a7724b558864d65b38758786b11dba
+10	2026-09-19T13:47:31+00:00	p5_lag_20260919_18	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/18/text/blend_nbstx.t18z	0	0		error:ForbiddenError	
+11	2026-09-19T13:47:32+00:00	p6_robots	https://nomads.ncep.noaa.gov/robots.txt	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880

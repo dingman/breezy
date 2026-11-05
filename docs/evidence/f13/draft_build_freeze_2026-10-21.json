@@ -1,0 +1,2407 @@
+{
+  "anchor_variant": "primary",
+  "by_horizon": {
+    "D-1": {
+      "lamp_missing": 9577,
+      "mos_missing": 0,
+      "nbp_missing": 39,
+      "nbp_missing_lag": 44,
+      "obs_missing": 9582,
+      "pfm_missing": 2,
+      "rows": 9582,
+      "rows_lag": 9577,
+      "truth_missing": 53
+    },
+    "D0": {
+      "lamp_missing": 34,
+      "mos_missing": 0,
+      "obs_missing": 3,
+      "pfm_missing": 1,
+      "rows": 9621,
+      "rows_lag": 9621,
+      "truth_missing": 53
+    }
+  },
+  "counts": {
+    "after_cutoff": 139176,
+    "day_not_requested": 1434,
+    "lamp_holdout_sealed_skipped": 4118,
+    "mos_coverage_gap_days": 15,
+    "nbp_holdout_excluded": 10,
+    "nbp_incomplete_windows": 0,
+    "onemin_missing_tmpf": 197303,
+    "onemin_year_payload_unavailable": 9,
+    "pfm_after_end_skipped": 4934,
+    "routine_missing": 17,
+    "routine_no_tgroup": 224,
+    "routine_pin_minute_excluded": 31,
+    "routine_rows_used": 99485
+  },
+  "degraded_reasons": [],
+  "exit_code": 0,
+  "inputs_sha256": {
+    "iem_asos_1min_non_metar": "4a5d6f8753c9623cf8bcb75743ed948330101644956853f68987367b0aa1d275",
+    "iem_mos": "8fda2ce9c30339eaebe0ff7820a07c089e4f1464d815de171b76d538ba74135f",
+    "metar_routine_manifest": "4507d62443492a8e8ed19d09599f377c1c88cd24e5e55febf81f44c7058c2ecb",
+    "nbp_manifest": "aa721c24e716728684ba0ac5a16aab4786c7e891e13eef58ea0e1b3631cbec38",
+    "prereg": "63741371263052703913d8f18f1dbec26b7c931626dec613d662887f4bf10c5d",
+    "truth": "e425d478cdd83d39fa9d7b4b1218be0a9f5b22331ac956ccae23bbcb68165e47",
+    "us_lamp_mdl": "c1a875f99ffe9e89504c353ebe99c12202519deaa7ecd9c9bfcae5f1b4d421a2",
+    "us_lav_iem": "b78e7604e1467c16fc930861c54b718937f7daf3a795edfe3ed61307a8dc64bb",
+    "us_pfm_afos": "f8e44615934f65f170060352fcb03b166d93eeb51ab3272e2e955e6f99024938"
+  },
+  "lag_file": {
+    "label_shifted": false,
+    "nbp_shifted": true,
+    "obs_available_at_ns_shifted": true,
+    "rows_lost_by_horizon": {
+      "D-1": 5
+    },
+    "shift_ns": 3600000000000,
+    "source_rows_lost": {
+      "lamp": 0,
+      "mos": 0,
+      "pfm": 0
+    }
+  },
+  "mos_model": "GFS",
+  "n_rows": {
+    "lag": 19198,
+    "primary": 19203
+  },
+  "nbp_availability_basis": "nominal: store max(LastModified, cycle + floor), flagged",
+  "obs": {
+    "cadence_seconds": 3600,
+    "d0_obs_staleness_minutes_by_station": {
+      "KLAX": {
+        "max": 187.0,
+        "mean": 67.08995502248875,
+        "min": 67.0,
+        "n": 2001,
+        "no_usable_report": 0,
+        "p50": 67.0,
+        "p90": 67.0
+      },
+      "KMDW": {
+        "max": 127.0,
+        "mean": 67.08973080757727,
+        "min": 67.0,
+        "n": 2006,
+        "no_usable_report": 1,
+        "p50": 67.0,
+        "p90": 67.0
+      },
+      "KMIA": {
+        "max": 127.0,
+        "mean": 67.06024096385542,
+        "min": 67.0,
+        "n": 1992,
+        "no_usable_report": 0,
+        "p50": 67.0,
+        "p90": 67.0
+      },
+      "KNYC": {
+        "max": 189.0,
+        "mean": 69.21951219512195,
+        "min": 69.0,
+        "n": 1640,
+        "no_usable_report": 2,
+        "p50": 69.0,
+        "p90": 69.0
+      },
+      "KSFO": {
+        "max": 244.0,
+        "mean": 64.18191005558363,
+        "min": 64.0,
+        "n": 1979,
+        "no_usable_report": 0,
+        "p50": 64.0,
+        "p90": 64.0
+      }
+    },
+    "d0_obs_staleness_note": "effective staleness of the primary D0 rows: anchor minus the newest usable routine report (available before the anchor), in minutes; no_usable_report counts D0 rows with none",
+    "descriptive_arms_feed_no_feature": true,
+    "interval_rows_not_emulated": true,
+    "interval_rows_note": "FB-R13: the NWS integer-C interval rows and METAR specials are excluded on both sides; only the routine hourly METAR reading is used",
+    "live_path": "live obs path: src/breezy/ingest/iem_observations.py (METAR T-group, tenths C, station_observation_data_type) + src/breezy/ingest/nws_observations.py; quantised by src/breezy/strategy/weather_common/running_extreme.py via breezy.domain.temperature.round_half_up_f on the local standard-time climate day; FB-R13/FB-R15: only the routine hourly METAR reading (routine-METAR store, the station's routine report minute) is emulated, never the 5-minute NWS interval rows",
+    "no_1min_fallback": true,
+    "non_metar_1min_arms_descriptive_only": true,
+    "non_metar_1min_raw_max_d0_rows_differ": 9219,
+    "non_metar_5min_whole_f_max_d0_rows_differ": 9107,
+    "non_metar_arms_note": "FB-R15: the 1-min archive disagrees with the METAR value on 16.6-22.2% of hours; its arms are descriptive, non-METAR, and null when no 1-min payload was read",
+    "obs_routine_minute_by_station": {
+      "KLAX": 53,
+      "KMDW": 53,
+      "KMIA": 53,
+      "KNYC": 51,
+      "KSFO": 56
+    },
+    "per_station": {
+      "KLAX": {
+        "routine_missing": 0,
+        "routine_no_tgroup": 9,
+        "routine_pin_minute_excluded": 3,
+        "routine_rows_used": 19984
+      },
+      "KMDW": {
+        "routine_missing": 0,
+        "routine_no_tgroup": 30,
+        "routine_pin_minute_excluded": 5,
+        "routine_rows_used": 20029
+      },
+      "KMIA": {
+        "routine_missing": 4,
+        "routine_no_tgroup": 14,
+        "routine_pin_minute_excluded": 3,
+        "routine_rows_used": 19889
+      },
+      "KNYC": {
+        "routine_missing": 13,
+        "routine_no_tgroup": 162,
+        "routine_pin_minute_excluded": 17,
+        "routine_rows_used": 19813
+      },
+      "KSFO": {
+        "routine_missing": 0,
+        "routine_no_tgroup": 9,
+        "routine_pin_minute_excluded": 3,
+        "routine_rows_used": 19770
+      }
+    },
+    "per_station_note": "routine_rows_used: rows that became readings; routine_no_tgroup: rows with no T group (tmpf_source=column), dropped exactly as the live ingest drops them and never used; routine_missing: tmpf_source=missing rows, skipped and never imputed; routine_pin_minute_excluded: rows at a minute other than the pinned routine minute. Counted within the requested climate days up to each day's last anchor.",
+    "qc_revision_risk": "the routine-METAR store is IEM's current archive and may differ from what the live path saw (later corrections); not measurable offline",
+    "quantisation": "T group tenths C -> breezy.domain.temperature.round_half_up_f (store)",
+    "routine_metar_only": true,
+    "source": "iem_routine_metar_tgroup_round_half_up_f",
+    "t_group_parser": "breezy.ingest.iem_observations.parse_metar_t_group (the live parser)"
+  },
+  "obs_coverage": {
+    "below_pin": [],
+    "excluded_station_years": [
+      {
+        "reasons": [
+          "pin-minute-excluded share 0.0206 > pins.obs_max_pin_minute_excluded_share 0.02"
+        ],
+        "station_year": "KNYC/2025"
+      }
+    ],
+    "max_pin_minute_excluded_share_pin": 0.02,
+    "min_coverage_pin": 0.95,
+    "note": "coverage = routine rows used / expected hourly reports at the pinned minute, from local-standard midnight to each requested day's last anchor; the minute histogram and pin_minute_excluded_share cover every stored row in that window (an era change in the report minute shows here); d0_mean_truth_minus_obs_so_far is descriptive (final truth Tmax minus the D0 obs_so_far) and a drift across years flags a downward obs bias",
+    "per_station_year": {
+      "KLAX/2021": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9997260273972602,
+        "d0_mean_truth_minus_obs_so_far": 5.641095890410959,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3649
+      },
+      "KLAX/2022": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.9933333333333333,
+            "expected": 300,
+            "used": 298
+          }
+        },
+        "coverage": 0.9986301369863013,
+        "d0_mean_truth_minus_obs_so_far": 6.189041095890411,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3645,
+          "54": 1
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.00027427317608337906,
+        "rows_in_window": 3646,
+        "used": 3645
+      },
+      "KLAX/2023": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 0.9806451612903225,
+            "expected": 310,
+            "used": 304
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9980716253443526,
+        "d0_mean_truth_minus_obs_so_far": 5.6088154269972454,
+        "d0_n": 363,
+        "expected": 3630,
+        "minute_histogram": {
+          "53": 3629,
+          "54": 1
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.0002754820936639118,
+        "rows_in_window": 3630,
+        "used": 3623
+      },
+      "KLAX/2024": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9997260273972602,
+        "d0_mean_truth_minus_obs_so_far": 5.5479452054794525,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3649
+      },
+      "KLAX/2025": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 0.9964285714285714,
+            "expected": 280,
+            "used": 279
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "5": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "6": {
+            "coverage": 0.9928571428571429,
+            "expected": 280,
+            "used": 278
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9983425414364641,
+        "d0_mean_truth_minus_obs_so_far": 5.707182320441989,
+        "d0_n": 362,
+        "expected": 3620,
+        "minute_histogram": {
+          "12": 1,
+          "53": 3616
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.0002764722145424385,
+        "rows_in_window": 3617,
+        "used": 3614
+      },
+      "KLAX/2026": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 0.99,
+            "expected": 300,
+            "used": 297
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 0.99,
+            "expected": 300,
+            "used": 297
+          }
+        },
+        "coverage": 0.9966850828729282,
+        "d0_mean_truth_minus_obs_so_far": 6.469613259668508,
+        "d0_n": 181,
+        "expected": 1810,
+        "minute_histogram": {
+          "53": 1805
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 1805,
+        "used": 1804
+      },
+      "KMDW/2021": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 0.9933333333333333,
+            "expected": 300,
+            "used": 298
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 0.9064516129032258,
+            "expected": 310,
+            "used": 281
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9915068493150685,
+        "d0_mean_truth_minus_obs_so_far": 7.2032967032967035,
+        "d0_n": 364,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3619
+      },
+      "KMDW/2022": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9997260273972602,
+        "d0_mean_truth_minus_obs_so_far": 7.191780821917808,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3649
+      },
+      "KMDW/2023": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9997260273972602,
+        "d0_mean_truth_minus_obs_so_far": 7.213698630136986,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "49": 1,
+          "53": 3649
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.000273972602739726,
+        "rows_in_window": 3650,
+        "used": 3649
+      },
+      "KMDW/2024": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 1.0,
+        "d0_mean_truth_minus_obs_so_far": 7.524590163934426,
+        "d0_n": 366,
+        "expected": 3660,
+        "minute_histogram": {
+          "53": 3660
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3660,
+        "used": 3660
+      },
+      "KMDW/2025": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9994520547945206,
+        "d0_mean_truth_minus_obs_so_far": 7.112328767123287,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "18": 1,
+          "39": 1,
+          "53": 3648,
+          "59": 1
+        },
+        "pin_minute_excluded": 3,
+        "pin_minute_excluded_share": 0.0008216926869350862,
+        "rows_in_window": 3651,
+        "used": 3648
+      },
+      "KMDW/2026": {
+        "by_month": {
+          "1": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 0.9833333333333333,
+            "expected": 300,
+            "used": 295
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9966850828729282,
+        "d0_mean_truth_minus_obs_so_far": 7.889502762430939,
+        "d0_n": 181,
+        "expected": 1810,
+        "minute_histogram": {
+          "50": 1,
+          "53": 1804
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.000554016620498615,
+        "rows_in_window": 1805,
+        "used": 1804
+      },
+      "KMIA/2021": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 0.9870967741935484,
+            "expected": 310,
+            "used": 306
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9989041095890411,
+        "d0_mean_truth_minus_obs_so_far": 5.926027397260274,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3646
+      },
+      "KMIA/2022": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.996551724137931,
+            "expected": 290,
+            "used": 289
+          }
+        },
+        "coverage": 0.9997237569060774,
+        "d0_mean_truth_minus_obs_so_far": 6.033149171270718,
+        "d0_n": 362,
+        "expected": 3620,
+        "minute_histogram": {
+          "48": 1,
+          "53": 3619
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.00027624309392265195,
+        "rows_in_window": 3620,
+        "used": 3619
+      },
+      "KMIA/2023": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "11": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 0.98,
+            "expected": 300,
+            "used": 294
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9975206611570248,
+        "d0_mean_truth_minus_obs_so_far": 6.242424242424242,
+        "d0_n": 363,
+        "expected": 3630,
+        "minute_histogram": {
+          "53": 3629,
+          "57": 1
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.0002754820936639118,
+        "rows_in_window": 3630,
+        "used": 3621
+      },
+      "KMIA/2024": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 0.996551724137931,
+            "expected": 290,
+            "used": 289
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "3": {
+            "coverage": 0.9870967741935484,
+            "expected": 310,
+            "used": 306
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9986301369863013,
+        "d0_mean_truth_minus_obs_so_far": 5.857534246575343,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "53": 3649
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3649,
+        "used": 3645
+      },
+      "KMIA/2025": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 1.0,
+        "d0_mean_truth_minus_obs_so_far": 6.29608938547486,
+        "d0_n": 358,
+        "expected": 3580,
+        "minute_histogram": {
+          "53": 3580
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3580,
+        "used": 3580
+      },
+      "KMIA/2026": {
+        "by_month": {
+          "1": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "3": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "4": {
+            "coverage": 0.9827586206896551,
+            "expected": 290,
+            "used": 285
+          },
+          "5": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "6": {
+            "coverage": 0.9933333333333333,
+            "expected": 300,
+            "used": 298
+          }
+        },
+        "coverage": 0.9932960893854749,
+        "d0_mean_truth_minus_obs_so_far": 7.089385474860335,
+        "d0_n": 179,
+        "expected": 1790,
+        "minute_histogram": {
+          "53": 1781,
+          "54": 1
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.0005611672278338945,
+        "rows_in_window": 1782,
+        "used": 1778
+      },
+      "KNYC/2021": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "2": {
+            "coverage": 0.9892857142857143,
+            "expected": 280,
+            "used": 277
+          },
+          "3": {
+            "coverage": 0.9838709677419355,
+            "expected": 310,
+            "used": 305
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9774193548387097,
+            "expected": 310,
+            "used": 303
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "8": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9936986301369863,
+        "d0_mean_truth_minus_obs_so_far": 7.101369863013699,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "51": 3639
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3639,
+        "used": 3627
+      },
+      "KNYC/2022": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "8": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9972602739726028,
+        "d0_mean_truth_minus_obs_so_far": 7.567123287671233,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "40": 1,
+          "51": 3642,
+          "52": 2,
+          "53": 1,
+          "55": 1
+        },
+        "pin_minute_excluded": 5,
+        "pin_minute_excluded_share": 0.0013709898546750755,
+        "rows_in_window": 3647,
+        "used": 3640
+      },
+      "KNYC/2023": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "11": {
+            "coverage": 0.9933333333333333,
+            "expected": 300,
+            "used": 298
+          },
+          "12": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "2": {
+            "coverage": 0.9964285714285714,
+            "expected": 280,
+            "used": 279
+          },
+          "3": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "4": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 0.9935483870967742,
+            "expected": 310,
+            "used": 308
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.996986301369863,
+        "d0_mean_truth_minus_obs_so_far": 7.3780821917808215,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "35": 1,
+          "51": 3644,
+          "56": 1,
+          "57": 1,
+          "58": 2
+        },
+        "pin_minute_excluded": 5,
+        "pin_minute_excluded_share": 0.0013702384214853384,
+        "rows_in_window": 3649,
+        "used": 3639
+      },
+      "KNYC/2024": {
+        "by_month": {
+          "1": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 0.964516129032258,
+            "expected": 310,
+            "used": 299
+          },
+          "2": {
+            "coverage": 0.9655172413793104,
+            "expected": 290,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9741935483870968,
+            "expected": 310,
+            "used": 302
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "9": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          }
+        },
+        "coverage": 0.9907103825136612,
+        "d0_mean_truth_minus_obs_so_far": 7.700549450549451,
+        "d0_n": 364,
+        "expected": 3660,
+        "minute_histogram": {
+          "34": 1,
+          "38": 1,
+          "43": 3,
+          "45": 1,
+          "50": 1,
+          "51": 3654,
+          "57": 1
+        },
+        "pin_minute_excluded": 8,
+        "pin_minute_excluded_share": 0.002184598580010923,
+        "rows_in_window": 3662,
+        "used": 3626
+      },
+      "KNYC/2025": {
+        "by_month": {
+          "1": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "12": {
+            "coverage": 0.9709677419354839,
+            "expected": 310,
+            "used": 301
+          },
+          "2": {
+            "coverage": 0.7071428571428572,
+            "expected": 280,
+            "used": 198
+          },
+          "3": {
+            "coverage": 0.8774193548387097,
+            "expected": 310,
+            "used": 272
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 0.9741935483870968,
+            "expected": 310,
+            "used": 302
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "7": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9614958448753462,
+        "d0_mean_truth_minus_obs_so_far": null,
+        "d0_n": 0,
+        "expected": 3610,
+        "minute_histogram": {
+          "0": 7,
+          "1": 6,
+          "12": 1,
+          "15": 1,
+          "4": 1,
+          "41": 1,
+          "50": 3,
+          "51": 3524,
+          "52": 3,
+          "53": 20,
+          "54": 5,
+          "55": 5,
+          "56": 8,
+          "57": 2,
+          "58": 4,
+          "59": 6,
+          "8": 1
+        },
+        "pin_minute_excluded": 74,
+        "pin_minute_excluded_share": 0.02056698165647582,
+        "rows_in_window": 3598,
+        "used": 3471
+      },
+      "KNYC/2026": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 1.0,
+        "d0_mean_truth_minus_obs_so_far": 7.552486187845304,
+        "d0_n": 181,
+        "expected": 1810,
+        "minute_histogram": {
+          "51": 1810
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 1810,
+        "used": 1810
+      },
+      "KSFO/2021": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "7": {
+            "coverage": 0.9956521739130435,
+            "expected": 230,
+            "used": 229
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9997150997150998,
+        "d0_mean_truth_minus_obs_so_far": 8.068376068376068,
+        "d0_n": 351,
+        "expected": 3510,
+        "minute_histogram": {
+          "56": 3510
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3510,
+        "used": 3509
+      },
+      "KSFO/2022": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "5": {
+            "coverage": 0.9806451612903225,
+            "expected": 310,
+            "used": 304
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "7": {
+            "coverage": 0.9903225806451613,
+            "expected": 310,
+            "used": 307
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9975069252077562,
+        "d0_mean_truth_minus_obs_so_far": 8.393351800554017,
+        "d0_n": 361,
+        "expected": 3610,
+        "minute_histogram": {
+          "56": 3606
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 3606,
+        "used": 3601
+      },
+      "KSFO/2023": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          }
+        },
+        "coverage": 1.0,
+        "d0_mean_truth_minus_obs_so_far": 7.7154696132596685,
+        "d0_n": 362,
+        "expected": 3620,
+        "minute_histogram": {
+          "16": 1,
+          "56": 3620
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.00027616680475006904,
+        "rows_in_window": 3621,
+        "used": 3620
+      },
+      "KSFO/2024": {
+        "by_month": {
+          "1": {
+            "coverage": 0.9967741935483871,
+            "expected": 310,
+            "used": 309
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "11": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9994520547945206,
+        "d0_mean_truth_minus_obs_so_far": 7.983561643835617,
+        "d0_n": 365,
+        "expected": 3650,
+        "minute_histogram": {
+          "54": 1,
+          "56": 3649
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.000273972602739726,
+        "rows_in_window": 3650,
+        "used": 3648
+      },
+      "KSFO/2025": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "10": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "11": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "12": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "4": {
+            "coverage": 1.0,
+            "expected": 270,
+            "used": 270
+          },
+          "5": {
+            "coverage": 0.9870967741935484,
+            "expected": 310,
+            "used": 306
+          },
+          "6": {
+            "coverage": 0.9966666666666667,
+            "expected": 300,
+            "used": 299
+          },
+          "7": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "8": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "9": {
+            "coverage": 1.0,
+            "expected": 290,
+            "used": 290
+          }
+        },
+        "coverage": 0.9983333333333333,
+        "d0_mean_truth_minus_obs_so_far": 7.522222222222222,
+        "d0_n": 360,
+        "expected": 3600,
+        "minute_histogram": {
+          "52": 1,
+          "56": 3596
+        },
+        "pin_minute_excluded": 1,
+        "pin_minute_excluded_share": 0.00027800945232137893,
+        "rows_in_window": 3597,
+        "used": 3594
+      },
+      "KSFO/2026": {
+        "by_month": {
+          "1": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "2": {
+            "coverage": 1.0,
+            "expected": 280,
+            "used": 280
+          },
+          "3": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          },
+          "4": {
+            "coverage": 0.9933333333333333,
+            "expected": 300,
+            "used": 298
+          },
+          "5": {
+            "coverage": 1.0,
+            "expected": 310,
+            "used": 310
+          },
+          "6": {
+            "coverage": 1.0,
+            "expected": 300,
+            "used": 300
+          }
+        },
+        "coverage": 0.9988888888888889,
+        "d0_mean_truth_minus_obs_so_far": 8.716666666666667,
+        "d0_n": 180,
+        "expected": 1800,
+        "minute_histogram": {
+          "56": 1798
+        },
+        "pin_minute_excluded": 0,
+        "pin_minute_excluded_share": 0.0,
+        "rows_in_window": 1798,
+        "used": 1798
+      }
+    }
+  },
+  "output_sha256": {
+    "lag": "04af1766ed5089f38e11e894eb6b1d5d249caa021b4423ea8d39a1a3e16928bd",
+    "primary": "39f5c1970d6120be457e535eddef841d7c06989fbd59c35b306369b1525a4941"
+  },
+  "pfm_iem_entered_time": "unavailable_in_archive",
+  "prereg_content_sha256": "1e9db7acc1f1b2f8797d619a662c484ee19762a7b2b8ab491bc5a749ae6e7ab7",
+  "reason": null,
+  "scoring": false,
+  "sidecar_prereg_digest": "a56d20b544afd8fee6a68dd861b79d3f9a32837a813de51f81f8f2b2634407a7",
+  "source_breaks_observed": {
+    "lamp": [
+      "2026-03-29",
+      "2026-03-30",
+      "2026-03-31"
+    ],
+    "lamp_by_horizon": {
+      "D-1": [
+        "2026-03-30",
+        "2026-03-31"
+      ],
+      "D0": [
+        "2026-03-29",
+        "2026-03-30"
+      ]
+    },
+    "nbp_versions": [
+      "2023-01-18",
+      "2024-05-15",
+      "2024-05-16",
+      "2025-05-28",
+      "2026-05-06"
+    ]
+  },
+  "source_lags": {
+    "lamp-mdl": {
+      "basis": "nominal run time + max(60 min, C1 max)",
+      "ns": 3600000000000,
+      "provisional": true
+    },
+    "lav-iem": {
+      "basis": "nominal run label + max(60 min, C1 max) + 30 min (label HH:00, real run HH:30)",
+      "ns": 5400000000000,
+      "provisional": true
+    },
+    "mos-gfs": {
+      "basis": "runtime + 5 h",
+      "ns": 18913081701834,
+      "provisional": true
+    },
+    "nbp": {
+      "basis": "nominal: store max(LastModified, cycle + floor), not a measured vintage",
+      "ns": null,
+      "provisional": true
+    },
+    "obs": {
+      "basis": "report time + 15 min",
+      "ns": 1923961500685,
+      "provisional": true
+    },
+    "pfm": {
+      "basis": "WMO issuance + 60 min (IEM entered time is not in the archive)",
+      "ns": 5953353629263,
+      "provisional": true
+    }
+  },
+  "status": "complete",
+  "truth_concordance": {
+    "status": "not_requested"
+  }
+}

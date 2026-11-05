@@ -1,0 +1,14 @@
+ordinal	requested_at_utc	label	url	status	bytes	content_type	outcome	sha256
+1	2026-09-19T13:38:14+00:00	p1_blend_prod_index	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/	200	2260	text/html;charset=ISO-8859-1	ok	1bc75bb49e089c2223e08fa237eb500e818527ddd721c5177274133560dfff13
+2	2026-09-19T13:38:15+00:00	p2_collective_nbsta	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbsta.t12z	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880
+3	2026-09-19T13:38:16+00:00	p2_per_station_nbsta_suffix	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbsta.t12z.KMIA	0	0		error:ForbiddenError	
+4	2026-09-19T13:38:17+00:00	p2_per_station_nbsta_prefix	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/KMIA.nbsta.t12z	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880
+5	2026-09-19T13:38:18+00:00	p2_per_station_nbstx	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbstx.t12z.KMIA	0	0		error:ForbiddenError	
+6	2026-09-19T13:38:20+00:00	p4_retention_20260918	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260918/	200	3941	text/html;charset=ISO-8859-1	ok	2704986784e77245b5b3028ae0fbe90415987c4a297808ddd9967bafdbb3718a
+7	2026-09-19T13:38:21+00:00	p4_retention_20260912	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260912/	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880
+8	2026-09-19T13:38:22+00:00	p4_retention_20260820	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260820/	0	0		error:ForbiddenError	
+9	2026-09-19T13:38:23+00:00	p5_lag_20260919_00	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/00/text/	200	2741	text/html;charset=ISO-8859-1	ok	52024bacf1b507275d84981d8955a63160b7ba2ff04fc8962201c6f4a408099e
+10	2026-09-19T13:38:24+00:00	p5_lag_20260919_06	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/06/text/	200	2635	text/html;charset=ISO-8859-1	ok	2d25785195e6e794b6a08f536c15aa5de7a646d9c8598575dddf6699f4379ac3
+11	2026-09-19T13:38:25+00:00	p5_lag_20260919_12	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/	200	2741	text/html;charset=ISO-8859-1	ok	8f22b980113af69b5748038af653f26fb967c42954664d547046aaf5077d3074
+12	2026-09-19T13:38:26+00:00	p5_lag_20260919_18	https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/18/text/	0	0		error:ForbiddenError	
+13	2026-09-19T13:38:27+00:00	p6_robots	https://nomads.ncep.noaa.gov/robots.txt	404	196	text/html; charset=iso-8859-1	http_404	80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880

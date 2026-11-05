@@ -1,6 +1,5 @@
 """Breezy -- a weather-prediction trading bot built natively on NautilusTrader."""
 
-
 __all__ = ["main"]
 
 

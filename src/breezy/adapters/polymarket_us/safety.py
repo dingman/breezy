@@ -119,42 +119,57 @@ import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Final, Protocol, runtime_checkable
 
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 
-#: Operator gate D4. No default, no coercion, no inference: the value must be
-#: exactly ``"1"``. ``docs/plans/GO_LIVE_PLAN.md`` §5: "No agent, and no
-#: automation in this repo, may set D4." That rule is enforced by the AST
-#: barrier ``test_no_shipped_code_can_set_the_operator_trading_gate``, which
-#: bans every environment write from ``src/`` and ``scripts/`` outright.
+#: Live-trading enablement. Must be exactly ``"1"`` -- no coercion, no
+#: truthiness. Operator ruling 2026-09-10: this is a BUILD-SIDE constant,
+#: supplied by the trade-supervisor unit, not an operator-reserved control.
+#: ``src/`` and ``scripts/`` still cannot write it: the AST barrier
+#: ``test_no_shipped_code_can_set_the_operator_trading_gate`` bans every
+#: environment write from those trees. GO_LIVE_PLAN §5's "No agent, and no
+#: automation in this repo, may set D4" is the superseded policy for this
+#: value; the two operator-reserved caps remain unwritable.
 TRADING_ENABLED_ENV_VAR: Final = "BREEZY_TRADING_ENABLED"
 
-#: Operator gate D3/D5 -- the per-order spend ceiling, in USD. No default. A
-#: missing ceiling means no trading; it is never guessed and never inferred.
+#: Per-order spend ceiling, in USD. Operator ruling 2026-09-10: when this
+#: variable is absent from the environment it is DERIVED from the operator's
+#: per-position cap; when present it takes precedence. Never written.
 MAX_ORDER_NOTIONAL_USD_ENV_VAR: Final = "BREEZY_MAX_ORDER_NOTIONAL_USD"
 
-#: Operator gate D5 -- the aggregate notional one permit may ever authorise.
-#: This is what stops a single permit authorising unbounded orders at the full
-#: per-order ceiling for its whole TTL (§8.2 item 4). No default.
+#: Aggregate notional one permit may ever authorise. Operator ruling
+#: 2026-09-10: derived from the operator's daily budget when absent; explicit
+#: wins when present. NOTE (security review 2026-09-10): the permit's three
+#: numeric fields are audit/authenticity metadata. The ENFORCEMENT path is
+#: ``DailySpendLedger.authorize_order_cost`` (``operator_controls.py``), which
+#: re-reads the raw operator caps on every submit -- so a derived per-order
+#: ceiling above the daily budget (min-1 clamp case) is refused there.
 SESSION_NOTIONAL_USD_ENV_VAR: Final = "BREEZY_MAX_SESSION_NOTIONAL_USD"
 
-#: Operator gate D5 -- the number of orders one permit may ever authorise.
-#: No default.
+#: Number of orders one permit may ever authorise. Operator ruling
+#: 2026-09-10: derived as floor(daily budget / position cost), minimum 1,
+#: when absent; explicit wins when present.
 SESSION_ORDER_COUNT_ENV_VAR: Final = "BREEZY_MAX_SESSION_ORDER_COUNT"
 
 #: The accountable human. Recorded on the permit so a journal entry names one.
 OPERATOR_ID_ENV_VAR: Final = "BREEZY_TRADING_OPERATOR_ID"
 
-#: How long an issued permit stays valid. Chosen to be shorter than any
-#: plausible unattended session: enablement should not outlive the operator's
-#: attention. Fifteen minutes, in nanoseconds. Pinned directly by
-#: ``test_the_permit_ttl_is_pinned_to_fifteen_minutes`` -- every other expiry
-#: test derives its expectation from this constant, so without that assertion
-#: the whole suite stayed green with the TTL rebound to ~317 years.
-PERMIT_TTL_NS: Final = 15 * 60 * 1_000_000_000
+#: How long an issued permit stays valid, in nanoseconds. Derivation (step 8
+#: peer review, 2026-09-04): one live-trading process is launched per trading
+#: day (``app/trade.py::main`` mints the permit exactly once, B7's one-caller
+#: pin) and is never re-minted in-process. The union of the four stations'
+#: decision windows in local standard time -- MIA [12:00,17:00) LST = 17:00
+#: UTC start, through LAX/SFO [12:00,17:00) LST = 01:00 UTC the next day end
+#: -- spans 8 hours; plus 1 hour slack on each side = 10 hours. The prior
+#: 15-minute value denied every candidate after minute 15 of an 8-hour window
+#: by construction, independent of any actual abuse. Pinned directly by
+#: ``test_the_permit_ttl_is_pinned_to_ten_hours`` -- every other expiry test
+#: derives its expectation from this constant, so without that assertion the
+#: whole suite stayed green with the TTL rebound to ~317 years.
+PERMIT_TTL_NS: Final = 10 * 60 * 60 * 1_000_000_000
 
 #: A plain money amount, to the cent. ASCII-only ``[0-9]`` rather than ``\d``
 #: (which matches fullwidth and Arabic-Indic digits) and ``\Z`` rather than
@@ -168,6 +183,17 @@ _COUNT_RE: Final = re.compile(r"^[0-9]+\Z")
 
 class LiveTradingPermissionError(PermissionError):
     """Raised when a live order submission lacks an explicit runtime permit."""
+
+
+class SessionNotionalExhausted(LiveTradingPermissionError):
+    """Operator ruling 2026-09-14: the permit's remaining USD notional budget
+    is exhausted -- session notional derives from the operator's daily
+    budget (:func:`_derived_session_notional`), so this is the same day's
+    dollar ceiling as :class:`~breezy.adapters.polymarket_us.
+    operator_controls.DailyBudgetExhausted`, checked at a different
+    chokepoint. The session ORDER-COUNT ceiling is a distinct, non-dollar
+    limit and stays a plain :class:`LiveTradingPermissionError` (R-12).
+    """
 
 
 @runtime_checkable
@@ -331,6 +357,12 @@ class _Budget:
 #: Remaining budget per issued permit, keyed by ``permit_id``.
 _PERMIT_BUDGETS: Final[dict[bytes, _Budget]] = {}
 
+#: S0 (plan rev 3, R3-1): permit ids already seeded from a durable-fill walk
+#: at boot. A second `_connect()` in the same process is a no-op keyed on
+#: this set -- the same idempotency shape `_RESTORED_BUDGET_DELTAS` gives
+#: `restore_live_trading_budget`, one call per `venue_order_id`.
+_SEEDED_PERMIT_BUDGETS: Final[set[bytes]] = set()
+
 
 def _prune_expired_nonces(now_ns: int) -> None:
     """Drop every nonce that can no longer be consumed.
@@ -359,13 +391,13 @@ class LiveTradingPermit:
     ``ValueError`` about some field it happened to get wrong.
     """
 
-    operator_id: str
-    max_order_notional_usd: Decimal
+    operator_id: str = field(repr=False)
+    max_order_notional_usd: Decimal = field(repr=False)
     issued_at_ns: int
     expires_at_ns: int
     permit_id: bytes = field(repr=False)
-    budget_notional_usd: Decimal
-    budget_order_count: int
+    budget_notional_usd: Decimal = field(repr=False)
+    budget_order_count: int = field(repr=False)
     authenticity: bytes = field(repr=False)
 
     def _payload(self) -> bytes:
@@ -414,7 +446,7 @@ class LiveOrderSubmissionAuthorization:
     """
 
     request_digest: bytes = field(repr=False)
-    order_notional_usd: Decimal
+    order_notional_usd: Decimal = field(repr=False)
     expires_at_ns: int
     nonce: bytes = field(repr=False)
     authenticity: bytes = field(repr=False)
@@ -500,6 +532,16 @@ def _require_operator_value(name: str) -> str:
     return value
 
 
+def _env_is_explicit(name: str) -> bool:
+    """True when ``name`` is present and non-blank in the process environment.
+
+    Blank is absence (same semantics as :func:`_require_operator_value`), so a
+    whitespace-only value does not count as an explicit session ceiling.
+    """
+    value = os.environ.get(name)
+    return value is not None and bool(value.strip())
+
+
 def _read_operator_money(name: str) -> Decimal:
     """Read one operator-supplied USD ceiling. No default, no inference."""
     raw = _require_operator_value(name)
@@ -524,19 +566,146 @@ def _read_operator_count(name: str) -> int:
     return count
 
 
-def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermit:
-    """Mint the ONE kind of authority the chokepoint accepts.
+def _derived_per_order_ceiling() -> Decimal:
+    """Per-order ceiling := the operator's per-position cap.
 
-    Every field is derived from operator-supplied environment. There is
-    deliberately no ``env`` parameter and no ceiling parameter: either would
-    reintroduce the original defect one level up, letting a caller hand the
-    issuer its own authority.
+    Deferred import: ``operator_controls`` already imports this module's
+    money reader, so a module-level import would cycle.
+    """
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_position_cost_usd,
+    )
+
+    return operator_max_position_cost_usd()
+
+
+def _derived_session_notional() -> Decimal:
+    """Session notional := the operator's daily budget."""
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_daily_budget_usd,
+    )
+
+    return operator_max_daily_budget_usd()
+
+
+def _derived_session_order_count() -> int:
+    """Session order count := floor(daily budget / position cost), minimum 1.
+
+    Decimal division, rounded toward zero to a whole number -- the same
+    ASCII/cent discipline as :data:`_MONEY_RE` / :data:`_COUNT_RE`. A daily
+    budget smaller than one position still permits a single order.
+    """
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_daily_budget_usd,
+        operator_max_position_cost_usd,
+    )
+
+    daily = operator_max_daily_budget_usd()
+    position = operator_max_position_cost_usd()
+    floored = int((daily / position).to_integral_value(rounding=ROUND_DOWN))
+    return max(1, floored)
+
+
+def _session_money(name: str, *, derive: Callable[[], Decimal]) -> Decimal:
+    """Explicit session money wins; otherwise derive from the operator caps.
+
+    Presence is the same test :func:`_require_operator_value` uses: unset or
+    blank means derive. A present malformed value is still refused -- it is
+    not rescued by derivation. This function never writes the environment.
+    """
+    if _env_is_explicit(name):
+        return _read_operator_money(name)
+    return derive()
+
+
+def _session_count(name: str, *, derive: Callable[[], int]) -> int:
+    """Explicit session count wins; otherwise derive from the operator caps."""
+    if _env_is_explicit(name):
+        return _read_operator_count(name)
+    return derive()
+
+
+def operator_max_order_notional_whole_usd() -> int:
+    """The operator's per-order notional ceiling, floored to whole USD.
+
+    The SAME control the permit issuer reads
+    (:data:`MAX_ORDER_NOTIONAL_USD_ENV_VAR`), through the SAME
+    explicit-or-derived path, so there is exactly one reader and one
+    refusal policy for it. A present malformed value raises here;
+    absence derives from the per-position cap (operator ruling 2026-09-10)
+    and raises only if that cap is itself absent.
+
+    Why whole USD, and why this lives with the control rather than at the call
+    site: ``RiskEngineConfig.max_notional_per_order`` is typed
+    ``dict[str, int]`` (``risk/config.py:44``), so the native cap can only
+    carry an integer. Flooring is the conservative direction -- a $25.99
+    ceiling becomes a $25 native cap, tighter than the operator asked for,
+    never looser. The exact ``Decimal`` ceiling is still enforced to the cent
+    by :func:`authorize_live_order_submission`; this is defence in depth
+    beneath it, not a replacement for it.
+
+    A ceiling below one whole USD has no integer representation: ``0`` is
+    falsy and ``risk/engine.pyx:678`` (``if max_notional_setting:``) skips the
+    check entirely for it, so a sub-dollar ceiling would silently mean NO cap.
+    That is refused rather than rounded in either direction.
+
+    Returns:
+        The floored ceiling in whole USD, always >= 1.
 
     Raises:
-        LiveTradingPermissionError: if the operator gate is absent, if any
-            ceiling is missing or malformed, if no operator identity is
-            recorded, or if the injected clock is unusable. Absence is always
-            a refusal, never a default.
+        LiveTradingPermissionError: if a present control is blank-as-explicit
+            malformation, non-positive, or cannot be expressed as a whole-USD
+            cap, or if derivation is needed and the per-position cap is
+            absent. The message names the control and never echoes its value.
+    """
+    ceiling = _session_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling)
+    whole = int(ceiling)  # Truncation toward zero; the money reader is > 0.
+    if whole < 1:
+        raise LiveTradingPermissionError(
+            f"{MAX_ORDER_NOTIONAL_USD_ENV_VAR} is below one whole USD and cannot "
+            f"be expressed as a native per-order cap: "
+            f"`RiskEngineConfig.max_notional_per_order` is typed dict[str, int] "
+            f"and a zero there disables the check outright"
+        )
+    return whole
+
+
+def issue_live_trading_permit(
+    *, clock: SupportsTimestampNs, max_expires_at_ns: int | None = None
+) -> LiveTradingPermit:
+    """Mint the ONE kind of authority the chokepoint accepts.
+
+    There is deliberately no ``env`` parameter and no WIDENING ceiling
+    parameter: either would reintroduce the original defect one level up,
+    letting a caller hand the issuer its own authority.
+
+    ``max_expires_at_ns`` is the single, narrowly-scoped exception (A-1,
+    docs/plans/POST_FORECAST_PHASE_2026-09-20.md Amendment A, security
+    review 2026-09-25): it can only CLAMP the natural ``issued_at_ns +
+    PERMIT_TTL_NS`` expiry earlier, never move it later, and it is resolved
+    by the caller (``app/trade.py``, from a supervisor-injected env var)
+    rather than read from the environment here -- this function still never
+    reads or writes an environment variable to determine its OWN
+    authority. Its purpose is bounding a mid-day-relaunched process's
+    permit to the day's FIRST boot's expiry, so cumulative daily coverage
+    stays <= ``PERMIT_TTL_NS`` + spawn grace instead of one fresh 10 h
+    window per relaunch.
+
+    Operator ruling 2026-09-10: the two reserved caps are the only
+    operator-controlled values. The three session ceilings, when absent
+    from the environment, are derived from those caps at this mint site
+    (per-order := position cost, session notional := daily budget, session
+    order count := floor(daily / position), minimum 1). Explicit session
+    env vars still win. This function never writes an environment variable.
+
+    Raises:
+        LiveTradingPermissionError: if the enablement gate is not exactly
+            ``"1"``, if a present session ceiling is malformed, if the caps
+            needed for a derivation are absent, if no operator identity is
+            recorded, if the injected clock is unusable, or if
+            ``max_expires_at_ns`` is at or before the sampled issuance
+            instant (a lapsed ceiling REFUSES; it never mints a permit with
+            a past or zero-length expiry).
     """
     if os.environ.get(TRADING_ENABLED_ENV_VAR) != "1":
         raise LiveTradingPermissionError(
@@ -544,14 +713,23 @@ def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermi
             f"there is no default and no truthiness coercion"
         )
 
-    ceiling = _read_operator_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
-    budget_notional = _read_operator_money(SESSION_NOTIONAL_USD_ENV_VAR)
-    budget_orders = _read_operator_count(SESSION_ORDER_COUNT_ENV_VAR)
+    ceiling = _session_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling)
+    budget_notional = _session_money(SESSION_NOTIONAL_USD_ENV_VAR, derive=_derived_session_notional)
+    budget_orders = _session_count(SESSION_ORDER_COUNT_ENV_VAR, derive=_derived_session_order_count)
     operator_id = _require_operator_value(OPERATOR_ID_ENV_VAR).strip()
     issued_at_ns = _read_clock(clock)
 
+    if max_expires_at_ns is not None and max_expires_at_ns <= issued_at_ns:
+        raise LiveTradingPermissionError(
+            "max_expires_at_ns leaves no positive coverage window at this "
+            "issuance instant; refusing rather than minting a permit with a "
+            "past or zero-length expiry (A-1)"
+        )
+
     permit_id = secrets.token_bytes(16)
     expires_at_ns = issued_at_ns + PERMIT_TTL_NS
+    if max_expires_at_ns is not None:
+        expires_at_ns = min(expires_at_ns, max_expires_at_ns)
     payload = _permit_payload(
         operator_id=operator_id,
         max_order_notional_usd=ceiling,
@@ -618,6 +796,155 @@ def live_trading_budget_remaining(permit: LiveTradingPermit) -> tuple[Decimal, i
     return budget.remaining_notional_usd, budget.remaining_order_count
 
 
+def seed_permit_budget_from_prior_spend(*, permit: LiveTradingPermit, spent_usd: Decimal) -> bool:
+    """S0 (plan rev 3, R3-1): reduce a freshly-issued permit's remaining
+    session notional by USD already spent today, from the SAME durable-fill
+    walk that seeds :meth:`DailySpendLedger.seed_spent` -- never from an
+    operator-reserved control and never touching the order-count budget,
+    which counts orders this permit itself authorises, not prior-process
+    spend.
+
+    Idempotent per ``permit.permit_id``: a second call for the same permit is
+    a no-op, so a second ``_connect()`` in one process cannot double-count.
+    Clamped at zero, never negative, the same conservative direction
+    :func:`restore_live_trading_budget` clamps at the permit's issued
+    ceiling.
+
+    Returns:
+        ``True`` iff this call actually applied the seed; ``False`` on an
+        idempotent no-op.
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, its budget is unknown to this
+            process, or ``spent_usd`` is not a non-negative finite
+            ``Decimal``.
+    """
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    if type(spent_usd) is not Decimal:
+        raise LiveTradingPermissionError(
+            f"spent_usd must be exactly Decimal, not {type(spent_usd).__name__}"
+        )
+    if not spent_usd.is_finite() or spent_usd < Decimal(0):
+        raise LiveTradingPermissionError("spent_usd must be a non-negative finite decimal amount")
+    with _REGISTRY_LOCK:
+        if permit.permit_id in _SEEDED_PERMIT_BUDGETS:
+            return False
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        budget.remaining_notional_usd = max(Decimal(0), budget.remaining_notional_usd - spent_usd)
+        _SEEDED_PERMIT_BUDGETS.add(permit.permit_id)
+    return True
+
+
+#: D1 (plan rev 6.1): the notional/count delta actually APPLIED by
+#: :func:`restore_live_trading_budget` for one ``(permit_id, venue_order_id)``
+#: pair. Doubles as the once-per-``venue_order_id`` idempotency guard (a
+#: second ``restore`` for a key already here is a no-op) and as the exact
+#: undo record :func:`unrestore_live_trading_budget` reverses -- reversing
+#: the RECORDED delta, not the caller's requested amount, is what makes
+#: unrestore return to precisely the pre-restore value even when the
+#: original restore was itself clamped. Process-local, like
+#: ``_PERMIT_BUDGETS``: restart never restores or unrestores anything
+#: (Resolution E -- the reminted budget already starts whole).
+_RESTORED_BUDGET_DELTAS: Final[dict[tuple[bytes, str], tuple[Decimal, int]]] = {}
+
+
+def restore_live_trading_budget(
+    *, permit: LiveTradingPermit, venue_order_id: str, order_notional_usd: Decimal
+) -> bool:
+    """Give back the one order-count slot and notional a GET-confirmed
+    terminal-zero proved this ``venue_order_id`` never actually spent
+    (Resolution D/D1, plan rev 6.1).
+
+    Idempotent per ``venue_order_id``: a second call for the same id is a
+    no-op. Both the notional and the count are clamped so a restore can
+    never push either past what the permit was ISSUED with --
+    ``min(remaining + given_back, permit.budget_*)``. Never writes an
+    environment variable and never reads an operator cap; the only inputs
+    are the permit's own issued budget (the clamp ceiling) and the amount
+    the caller asks back.
+
+    Returns:
+        ``True`` iff this call actually applied a restore (the first for
+        this ``venue_order_id``); ``False`` on an idempotent no-op.
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, or its budget is unknown to
+            this process -- mirrors :func:`live_trading_budget_remaining`.
+    """
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    with _REGISTRY_LOCK:
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        key = (permit.permit_id, venue_order_id)
+        if key in _RESTORED_BUDGET_DELTAS:
+            return False
+        new_notional = min(
+            budget.remaining_notional_usd + order_notional_usd,
+            permit.budget_notional_usd,
+        )
+        new_count = min(budget.remaining_order_count + 1, permit.budget_order_count)
+        applied_notional_delta = new_notional - budget.remaining_notional_usd
+        applied_count_delta = new_count - budget.remaining_order_count
+        budget.remaining_notional_usd = new_notional
+        budget.remaining_order_count = new_count
+        _RESTORED_BUDGET_DELTAS[key] = (applied_notional_delta, applied_count_delta)
+    return True
+
+
+def unrestore_live_trading_budget(
+    *, permit: LiveTradingPermit, venue_order_id: str, order_notional_usd: Decimal
+) -> bool:
+    """Undo exactly what :func:`restore_live_trading_budget` applied for
+    ``venue_order_id`` (Resolution D2) -- for the rare race where a
+    GET-confirmed fill surfaces for an id whose budget was already restored
+    on an earlier, superseded terminal-zero determination.
+
+    ``order_notional_usd`` is accepted for signature symmetry with
+    :func:`restore_live_trading_budget`, but is NOT what gets reversed: the
+    exact, already-CLAMPED delta recorded at restore time is, so the budget
+    returns to precisely its pre-restore value regardless of what is passed
+    here.
+
+    Returns:
+        ``True`` iff a restore record for this ``venue_order_id`` existed
+        and was reversed; ``False`` on a no-op (never restored, or already
+        unrestored).
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, or its budget is unknown to
+            this process.
+    """
+    del order_notional_usd  # signature symmetry only -- see the docstring
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    with _REGISTRY_LOCK:
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        key = (permit.permit_id, venue_order_id)
+        delta = _RESTORED_BUDGET_DELTAS.pop(key, None)
+        if delta is None:
+            return False
+        notional_delta, count_delta = delta
+        budget.remaining_notional_usd -= notional_delta
+        budget.remaining_order_count -= count_delta
+    return True
+
+
 # ---------------------------------------------------------------------------
 # The chokepoint
 # ---------------------------------------------------------------------------
@@ -641,8 +968,11 @@ def assert_live_order_submission_permitted(
     forgery is refused at use as well as at construction.
 
     Args:
-        request_fingerprint: opaque bytes identifying THIS request, computed by
-            the caller over whatever uniquely determines it. The returned
+        request_fingerprint: bytes identifying THIS request. BL-10: the
+            caller must compute this with the canonical
+            ``submit_chain.request_fingerprint(method=..., path=..., body=...)``
+            helper, over the SAME encoded body bytes about to be POSTed --
+            never an opaque or caller-invented digest. The returned
             capability is bound to it and will refuse any other.
         now_ns: the current time from the injected clock. Never sampled here.
 
@@ -706,7 +1036,7 @@ def assert_live_order_submission_permitted(
         if budget.remaining_order_count < 1:
             raise LiveTradingPermissionError("permit order-count budget is exhausted")
         if order_notional_usd > budget.remaining_notional_usd:
-            raise LiveTradingPermissionError(
+            raise SessionNotionalExhausted(
                 "order notional exceeds the permit's remaining notional budget"
             )
         budget.remaining_order_count -= 1

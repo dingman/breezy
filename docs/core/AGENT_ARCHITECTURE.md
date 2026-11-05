@@ -40,7 +40,7 @@ The two decisive evidence findings that shaped everything:
 5. **In/out/tools**: In — skills #3/#4/#5, adapters/_template/, bundled adapter as structural reference.
    Out — Python under src/breezy/ + tests. Tools: Read/Write/Edit/Bash/Grep/Glob. Deps: nautilus_trader, pyiem,
    polymarket_us SDK.
-6. **Failure modes/safeguards**: silent Nautilus behavior drift ⇒ **pin `~=1.231` + contract tests asserting each
+6. **Failure modes/safeguards**: silent Nautilus behavior drift ⇒ **exact pin `==1.231.0` + contract tests asserting each
    documented gotcha** (rev. H2 — cheapest durability control in the design); scope creep into trading ⇒
    prediction-market-reviewer gate; self-approval ⇒ prohibited, independent review mandatory.
 7. **Verdict**: REQUIRED NOW (seams b/d are unblocked today).
@@ -71,7 +71,7 @@ The two decisive evidence findings that shaped everything:
    reproduced on ≥2 markets and signed off (rev. H4); credential leak into git ⇒ pre-commit guard for
    `X-PM-Signature`/`X-PM-Access-Key` patterns and base64-Ed25519-length blobs; runaway probing ⇒ backoff +
    circuit breaker (20 req/s, 429s, 5s stopgap).
-7. **Verdict**: REQUIRED — but **PARALLEL TRACK, NOT CRITICAL PATH** (rev. C1). Gated on KYC + operator budget.
+7. **Verdict**: REQUIRED — but **PARALLEL TRACK, NOT CRITICAL PATH** (rev. C1). ~~Gated on KYC + operator budget.~~ **Venue access was RELEASED by the operator 2026-09-01 — no longer gated.**
 8. **Absorbs**: API/schema discovery, auth verification, rule-text capture, venue error taxonomy.
 
 ### 3. `nautilus-trader-patterns` — skill, PROJECT-SCOPED (`.claude/skills/`)
@@ -81,7 +81,7 @@ The two decisive evidence findings that shaped everything:
    coroutines, factory/TradingNode wiring, `@customdataclass`, ParquetDataCatalog, BacktestDataConfig, test_kit,
    env-var credential convention, and the reconnect/watchdog recipe (mirroring the bundled adapter's 60s MARKET /
    300s USER idle-timeout pattern). **Boundaries**: no venue facts, no weather domain.
-   Carries a "verified against nautilus-trader 1.231.x" banner; version-volatile gotchas are backed by contract tests (rev. M3).
+   Carries a "verified against nautilus-trader 1.231.0" banner; version-volatile gotchas are backed by contract tests (rev. M3).
 3. **Why not existing**: zero Nautilus coverage anywhere in the roster. Not code — it is knowledge that prevents
    reinvention of things Nautilus already provides, which is the project's stated prime directive.
 4. **Evidence**: §C. Highest-leverage artifact in the design: it is what stops an implementer rebuilding the
@@ -137,7 +137,7 @@ The two decisive evidence findings that shaped everything:
 **Stage 0 (unblocked, starts today)** — `nautilus-trader-patterns` (#3) → `nws-cli-settlement` (#5)
 **Stage 1 (unblocked)** — #1 seams (b)+(d): weather custom-data types, catalog, backtest replay, NWS ingestion,
   provenance/revision write path, contract tests pinning Nautilus gotchas
-**Stage 2 (PARALLEL, KYC + operator-budget gated)** — `polymarket-us-discovery` (#2) → enriches
+**Stage 2 (PARALLEL; venue access released 2026-09-01, no longer gated)** — `polymarket-us-discovery` (#2) → enriches
   `polymarket-us-integration` (#4)
 **Stage 3 (venue-dependent)** — #1 seams (a)+(c): adapter transport/auth, reconnection/watchdog, reconciliation reports
 **Continuous** — tdd-guide (RED→GREEN), python-reviewer, security-reviewer, prediction-market-reviewer, doc-updater
@@ -169,6 +169,6 @@ Critical property: **if credentials slip for weeks, Stages 0–1 still deliver t
    capital ceiling. Findings log = extracted facts only, never secrets/signatures/raw bodies.
 2. Signed-request unit-test suite (known-vector, clock-skew boundary, canonical-string construction) as a HARD GATE
    before any exec-client signing code is accepted.
-3. Exact version pins (`pyiem`, `pynws`, `metar`, `polymarket_us`, `nautilus-trader~=1.231`) + sanity-bounds
+3. Exact version pins (`pyiem`, `pynws`, `metar`, `polymarket_us`, `nautilus-trader==1.231.0`) + sanity-bounds
    validation on parser output + pre-commit guard against credential-shaped strings in `.claude/`.
 4. #1 never holds live credentials; TLS never disabled; sha256(raw_text) verified before settlement use.

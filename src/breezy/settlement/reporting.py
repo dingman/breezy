@@ -59,9 +59,7 @@ __all__ = [
 ]
 
 MDW_MANDATORY_REVIEW_CITY: Final[str] = "MDW"
-PRE_DECLARED_PRIMARY_CITIES: Final[frozenset[str]] = frozenset(
-    {"LAX", "MDW", "MIA", "SFO"}
-)
+PRE_DECLARED_PRIMARY_CITIES: Final[frozenset[str]] = frozenset({"LAX", "MDW", "MIA", "SFO"})
 
 
 class SettlementReportError(Exception):
@@ -164,9 +162,7 @@ class NoGoBasis(enum.Enum):
 @enum.unique
 class MdwAnnotation(enum.Enum):
     FAILED_AS_PRE_DECLARED = "FAILED_AS_PRE_DECLARED"
-    PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION = (
-        "PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION"
-    )
+    PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION = "PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION"
     NOT_YET_RESOLVED = "NOT_YET_RESOLVED"
     EXCLUDED_OUT_OF_SCOPE_DOM_9 = "EXCLUDED_OUT_OF_SCOPE_DOM_9"
 
@@ -203,9 +199,7 @@ class StratumFigure:
     mean_signed_error: str | None
     power_floor: PowerFloor
     note: str
-    provenance: FigureProvenance = (
-        FigureProvenance.HINDSIGHT_STRATIFIED_BY_FINAL_METAR_MAX
-    )
+    provenance: FigureProvenance = FigureProvenance.HINDSIGHT_STRATIFIED_BY_FINAL_METAR_MAX
 
     def __post_init__(self) -> None:
         has_bounds = self.wilson_lower is not None and self.break_even is not None
@@ -361,8 +355,7 @@ def build_programme_report(
         raise MdwAbsentFromProgrammeError("MDW is absent from the programme determination")
 
     lines = tuple(
-        _line_for(city, evidence_by_city[city.city])
-        for city in determination.city_determinations
+        _line_for(city, evidence_by_city[city.city]) for city in determination.city_determinations
     )
     primary_lines = tuple(line for line in lines if line.scope is CityProgrammeScope.PRIMARY)
     secondary_lines = tuple(
@@ -411,10 +404,7 @@ def render_markdown(report: ProgrammeReport) -> str:
     ]
     lines.extend(_render_line_summary(report.headline.mdw_line, prefix="MDW"))
     lines.append(f"MDW annotation: {report.headline.mdw_annotation.value}")
-    if (
-        report.headline.mdw_annotation
-        is MdwAnnotation.PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION
-    ):
+    if report.headline.mdw_annotation is MdwAnnotation.PASSED_CONTRARY_TO_PRE_DECLARED_PREDICTION:
         lines.append(
             "MDW passed contrary to the pre-declared prediction; "
             "explanation required before any GO."
@@ -692,11 +682,7 @@ def _line_by_city(lines: tuple[CityHeadlineLine, ...], city: str) -> CityHeadlin
 
 
 def _all_lines(report: ProgrammeReport) -> tuple[CityHeadlineLine, ...]:
-    return (
-        report.headline.primary_lines
-        + report.secondary_lines
-        + report.out_of_scope_lines
-    )
+    return report.headline.primary_lines + report.secondary_lines + report.out_of_scope_lines
 
 
 def _assert_exact_city_set(

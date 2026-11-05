@@ -1,0 +1,1347 @@
+{
+  "alt_truth": {
+    "k3_count": null,
+    "k3_status": "UNTESTABLE",
+    "k4_count": null,
+    "k4_status": "UNTESTABLE"
+  },
+  "audit": {
+    "expected": {
+      "n_fills": 25,
+      "n_wins": 2,
+      "net_pnl": "-2.17",
+      "tolerance": "0.005"
+    },
+    "n_fills": 25,
+    "n_refused": 0,
+    "n_wins": 2,
+    "net_pnl": "-2.1700",
+    "wins": [
+      [
+        "tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US",
+        87
+      ],
+      [
+        "tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US",
+        90
+      ]
+    ]
+  },
+  "caveats": [
+    "diagnostic, post-hoc: the audit and triage showed the headline direction before the freeze",
+    "ask_proxy is the fill's cumulative cost per unit; the decision-time ask is unauditable",
+    "P_d sums p-hat taken at different cycles and assumes marginal calibration",
+    "T-LOC is INDICATIVE and conditional on take; it never alone yields MODEL_LIMITATION/FIXABLE",
+    "T-SPREAD and T-LOC are conditional on take (adverse selection); spread vs location is not identified, so a tail rejection is never attributed to spread alone",
+    "PIN=INFERRED: the node imports the working tree at boot; the deployed commit is inferred",
+    "H0-K / H1-K use the ask break-even a + theta*a*(1-a) summed per station-day (cap 1), max over the cluster, same clamp",
+    "K3 uses the METAR/ASOS tmpf max over the local-standard day, rounded; K4 needs a venue file",
+    "the raw-median T-LOC companion is not run (no raw pmf is stored); raw error is descriptive"
+  ],
+  "class_counts": {
+    "BAND_SELECTION": 11,
+    "BOUNDARY": 3,
+    "SIBLING_WON": 2,
+    "TAIL": 7,
+    "WIN": 2
+  },
+  "consumers": [
+    {
+      "consumer": "F13 r-next / T3 input; next evidence is T1 (12-07).",
+      "finding": "MODEL_MISCALIBRATED_UNATTRIBUTED"
+    },
+    {
+      "consumer": "T2 take-rule input (minimum-ask filter, consistent with M1).",
+      "finding": "BAND_SELECTION"
+    },
+    {
+      "consumer": "T2 input only; T-EDGE is exploratory (within model-expected near-misses).",
+      "finding": "BOUNDARY"
+    },
+    {
+      "consumer": "T2 take-rule input (rung stacking).",
+      "finding": "SIBLING_WON"
+    },
+    {
+      "consumer": "PROGRESS row 'F13 r-next / T2-T3 candidate input' (descriptive baseline).",
+      "finding": "TAIL"
+    },
+    {
+      "consumer": "Closed, no action: incident already fixed (0fe98eb4 + orders-off drop-in).",
+      "finding": "K1b"
+    },
+    {
+      "consumer": "Feeds the INCONCLUSIVE forward-evidence sizing (route 1).",
+      "finding": "NOT_TESTABLE_OR_CONDITIONAL"
+    }
+  ],
+  "delivery": {
+    "slip": null,
+    "soft_target": "2026-10-20"
+  },
+  "downgrade": {
+    "decisions": {
+      "T-ART": false,
+      "T-LOC": false,
+      "T-SPREAD": false,
+      "T-WIN": true
+    },
+    "range_notes": [],
+    "scope_sensitive": []
+  },
+  "fills": [
+    {
+      "ask_proxy": 0.07,
+      "boot": 2,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-02",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 63,
+      "correction_f": 0.0,
+      "cycle_age_s": 10928.196612776,
+      "edge_dist_f": 3,
+      "fill_id": "CV3SB0HXPYG6",
+      "flags": [
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte61lt62f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.33278497783551364,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "99067d4a9e7a",
+      "pit": 0.8774657452185557,
+      "pnl": "-0.0700",
+      "raw_error_f": 2.0,
+      "raw_q50": 63.0,
+      "rungs_same_day": 3,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 65,
+      "won": false,
+      "z": 1.183178209059794
+    },
+    {
+      "ask_proxy": 0.08,
+      "boot": 2,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-02",
+      "corrected_error_f": -3.0,
+      "corrected_median_f": 90,
+      "correction_f": 0.0,
+      "cycle_age_s": 10926.191041172,
+      "edge_dist_f": 4,
+      "fill_id": "CV3SBJ492YH4",
+      "flags": [
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-02-gte91lt92f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.24369890178240902,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "99067d4a9e7a",
+      "pit": 0.11234367049432537,
+      "pnl": "-0.0900",
+      "raw_error_f": -3.0,
+      "raw_q50": 90.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 87,
+      "won": false,
+      "z": -1.2360131343654668
+    },
+    {
+      "ask_proxy": 0.03,
+      "boot": 2,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-02",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 63,
+      "correction_f": 0.0,
+      "cycle_age_s": 10927.073113035,
+      "edge_dist_f": 5,
+      "fill_id": "CV3SNMHQ6YHC",
+      "flags": [
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-02-lt61f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.15064767826261038,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "99067d4a9e7a",
+      "pit": 0.8774657452185557,
+      "pnl": "-0.0300",
+      "raw_error_f": 2.0,
+      "raw_q50": 63.0,
+      "rungs_same_day": 3,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 65,
+      "won": false,
+      "z": 1.183178209059794
+    },
+    {
+      "ask_proxy": 0.23,
+      "boot": 2,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-02",
+      "corrected_error_f": -3.0,
+      "corrected_median_f": 90,
+      "correction_f": 0.0,
+      "cycle_age_s": 10925.031242832,
+      "edge_dist_f": 2,
+      "fill_id": "CV3SSVR9WYGE",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-02-gte89lt90f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.3806357164619582,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "99067d4a9e7a",
+      "pit": 0.11234367049432537,
+      "pnl": "-0.2400",
+      "raw_error_f": -3.0,
+      "raw_q50": 90.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 87,
+      "won": false,
+      "z": -1.2360131343654668
+    },
+    {
+      "ask_proxy": 0.23,
+      "boot": 3,
+      "class": "BOUNDARY",
+      "climate_day": "2026-10-02",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 63,
+      "correction_f": 0.0,
+      "cycle_age_s": 15333.534495618,
+      "edge_dist_f": 1,
+      "fill_id": "CV4WCWVC4YHH",
+      "flags": [],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-02-gte63lt64f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.3457817976424414,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "99067d4a9e7a",
+      "pit": 0.8774657452185557,
+      "pnl": "-0.2400",
+      "raw_error_f": 2.0,
+      "raw_q50": 63.0,
+      "rungs_same_day": 3,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 65,
+      "won": false,
+      "z": 1.183178209059794
+    },
+    {
+      "ask_proxy": 0.05,
+      "boot": 4,
+      "class": "TAIL",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": 7.0,
+      "corrected_median_f": 95,
+      "correction_f": -1.0,
+      "cycle_age_s": 13847.517653418,
+      "edge_dist_f": 10,
+      "fill_id": "CVS422HYWYH0",
+      "flags": [
+        "LOC_ARTEFACT",
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-03-gte91lt92f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.15601691774184442,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "7dfd1af114c1",
+      "pit": 0.994229789322791,
+      "pnl": "-0.0500",
+      "raw_error_f": 6.0,
+      "raw_q50": 96.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 102,
+      "won": false,
+      "z": 2.557123007301888
+    },
+    {
+      "ask_proxy": 0.41,
+      "boot": 4,
+      "class": "SIBLING_WON",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": -1.0,
+      "corrected_median_f": 88,
+      "correction_f": -1.0,
+      "cycle_age_s": 13846.935657301,
+      "edge_dist_f": 1,
+      "fill_id": "CVS44D1MJYGW",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-miahigh-2026-10-03-gte88lt89f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.6368189693716056,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "7dfd1af114c1",
+      "pit": 0.11098532801973143,
+      "pnl": "-0.4300",
+      "raw_error_f": -2.0,
+      "raw_q50": 89.0,
+      "rungs_same_day": 2,
+      "station": "MIA",
+      "station_day_has_win": true,
+      "tmax_f": 87,
+      "won": false,
+      "z": -1.29784915016623
+    },
+    {
+      "ask_proxy": 0.15,
+      "boot": 5,
+      "class": "TAIL",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": 7.0,
+      "corrected_median_f": 95,
+      "correction_f": -1.0,
+      "cycle_age_s": 26432.790092624,
+      "edge_dist_f": 8,
+      "fill_id": "CVW455HKJYGE",
+      "flags": [
+        "LOC_ARTEFACT",
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.2538513678202191,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "6e99a7ae2dbe",
+      "pit": 0.994229789322791,
+      "pnl": "-0.1600",
+      "raw_error_f": 6.0,
+      "raw_q50": 96.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 102,
+      "won": false,
+      "z": 2.557123007301888
+    },
+    {
+      "ask_proxy": 0.05,
+      "boot": 6,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": 3.0,
+      "corrected_median_f": 87,
+      "correction_f": 0.0,
+      "cycle_age_s": 7276.652815988,
+      "edge_dist_f": 6,
+      "fill_id": "CVWK0YQYAYH4",
+      "flags": [
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-sfohigh-2026-10-03-gte83lt84f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.1570045734053205,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "3eb4a1085dbf",
+      "pit": 0.879870651261279,
+      "pnl": "-0.0500",
+      "raw_error_f": 3.0,
+      "raw_q50": 87.0,
+      "rungs_same_day": 2,
+      "station": "SFO",
+      "station_day_has_win": false,
+      "tmax_f": 90,
+      "won": false,
+      "z": 1.1832157912528933
+    },
+    {
+      "ask_proxy": 0.15,
+      "boot": 6,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": 3.0,
+      "corrected_median_f": 87,
+      "correction_f": 0.0,
+      "cycle_age_s": 21892.703802733,
+      "edge_dist_f": 4,
+      "fill_id": "CW0A0BQWMYHK",
+      "flags": [],
+      "instrument_id": "tc-temp-sfohigh-2026-10-03-gte85lt86f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.2545485230460768,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "3eb4a1085dbf",
+      "pit": 0.879870651261279,
+      "pnl": "-0.1600",
+      "raw_error_f": 3.0,
+      "raw_q50": 87.0,
+      "rungs_same_day": 2,
+      "station": "SFO",
+      "station_day_has_win": false,
+      "tmax_f": 90,
+      "won": false,
+      "z": 1.1832157912528933
+    },
+    {
+      "ask_proxy": 0.11,
+      "boot": 6,
+      "class": "WIN",
+      "climate_day": "2026-10-03",
+      "corrected_error_f": -1.0,
+      "corrected_median_f": 88,
+      "correction_f": -1.0,
+      "cycle_age_s": 4230.976946454,
+      "edge_dist_f": 0,
+      "fill_id": "CW1747MQAYH8",
+      "flags": [],
+      "instrument_id": "tc-temp-miahigh-2026-10-03-gte86lt87f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.24269879460625277,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "3eb4a1085dbf",
+      "pit": 0.2374367949312579,
+      "pnl": "0.8800",
+      "raw_error_f": -2.0,
+      "raw_q50": 89.0,
+      "rungs_same_day": 2,
+      "station": "MIA",
+      "station_day_has_win": true,
+      "tmax_f": 87,
+      "won": true,
+      "z": -0.7266042860935092
+    },
+    {
+      "ask_proxy": 0.15,
+      "boot": 7,
+      "class": "TAIL",
+      "climate_day": "2026-10-04",
+      "corrected_error_f": 7.0,
+      "corrected_median_f": 95,
+      "correction_f": 0.0,
+      "cycle_age_s": 13852.106608435,
+      "edge_dist_f": 8,
+      "fill_id": "CWDY5H7CGYH0",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-04-gte93lt94f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.2549915129069729,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "f45f5a6558cd",
+      "pit": 0.9942953160475749,
+      "pnl": "-0.1600",
+      "raw_error_f": 7.0,
+      "raw_q50": 95.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 102,
+      "won": false,
+      "z": 2.5666174976887857
+    },
+    {
+      "ask_proxy": 0.2,
+      "boot": 7,
+      "class": "TAIL",
+      "climate_day": "2026-10-04",
+      "corrected_error_f": 4.0,
+      "corrected_median_f": 70,
+      "correction_f": 0.0,
+      "cycle_age_s": 13920.491317475,
+      "edge_dist_f": 3,
+      "fill_id": "CWDYMBNT2YGP",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-04-gte70lt71f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.3484722983231528,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "f45f5a6558cd",
+      "pit": 0.9821074759292273,
+      "pnl": "-0.2100",
+      "raw_error_f": 4.0,
+      "raw_q50": 70.0,
+      "rungs_same_day": 1,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 74,
+      "won": false,
+      "z": 2.143922198697216
+    },
+    {
+      "ask_proxy": 0.09,
+      "boot": 7,
+      "class": "BOUNDARY",
+      "climate_day": "2026-10-04",
+      "corrected_error_f": -3.0,
+      "corrected_median_f": 86,
+      "correction_f": 1.0,
+      "cycle_age_s": 14100.716217327,
+      "edge_dist_f": 1,
+      "fill_id": "CWE078KPEYHK",
+      "flags": [
+        "LOC_ARTEFACT",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-sfohigh-2026-10-04-lt83f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.208315471621767,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "f45f5a6558cd",
+      "pit": 0.25103663768964946,
+      "pnl": "-0.1000",
+      "raw_error_f": -2.0,
+      "raw_q50": 85.0,
+      "rungs_same_day": 1,
+      "station": "SFO",
+      "station_day_has_win": false,
+      "tmax_f": 83,
+      "won": false,
+      "z": -0.6726857302927259
+    },
+    {
+      "ask_proxy": 0.15,
+      "boot": 7,
+      "class": "TAIL",
+      "climate_day": "2026-10-04",
+      "corrected_error_f": 7.0,
+      "corrected_median_f": 95,
+      "correction_f": 0.0,
+      "cycle_age_s": 19052.460171245,
+      "edge_dist_f": 6,
+      "fill_id": "CWF5VBTK2YG6",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-04-gte95lt96f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.2581816549195026,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "f45f5a6558cd",
+      "pit": 0.9942953160475749,
+      "pnl": "-0.1600",
+      "raw_error_f": 7.0,
+      "raw_q50": 95.0,
+      "rungs_same_day": 2,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 102,
+      "won": false,
+      "z": 2.5666174976887857
+    },
+    {
+      "ask_proxy": 0.07,
+      "boot": 8,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-05",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 66,
+      "correction_f": 1.0,
+      "cycle_age_s": 13830.456885617,
+      "edge_dist_f": 3,
+      "fill_id": "CX2CSDPR2YH4",
+      "flags": [
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-05-gte64lt65f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.3280609248733707,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "c893e13e603e",
+      "pit": 0.8710120326215918,
+      "pnl": "-0.0700",
+      "raw_error_f": 3.0,
+      "raw_q50": 65.0,
+      "rungs_same_day": 2,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 68,
+      "won": false,
+      "z": 1.1517571753523475
+    },
+    {
+      "ask_proxy": 0.48,
+      "boot": 8,
+      "class": "WIN",
+      "climate_day": "2026-10-05",
+      "corrected_error_f": 0.0,
+      "corrected_median_f": 90,
+      "correction_f": 0.0,
+      "cycle_age_s": 13819.7279497,
+      "edge_dist_f": 0,
+      "fill_id": "CX2D0CFYWYHK",
+      "flags": [],
+      "instrument_id": "tc-temp-miahigh-2026-10-05-gte89lt90f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.6368623583639358,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "c893e13e603e",
+      "pit": 0.6578501034613928,
+      "pnl": "0.5000",
+      "raw_error_f": 0.0,
+      "raw_q50": 90.0,
+      "rungs_same_day": 2,
+      "station": "MIA",
+      "station_day_has_win": true,
+      "tmax_f": 90,
+      "won": true,
+      "z": 0.4334677843357648
+    },
+    {
+      "ask_proxy": 0.03,
+      "boot": 8,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-05",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 66,
+      "correction_f": 1.0,
+      "cycle_age_s": 13833.151106448,
+      "edge_dist_f": 5,
+      "fill_id": "CX2D0CNW8YHK",
+      "flags": [
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-05-lt64f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.1434821596738827,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "c893e13e603e",
+      "pit": 0.8710120326215918,
+      "pnl": "-0.0300",
+      "raw_error_f": 3.0,
+      "raw_q50": 65.0,
+      "rungs_same_day": 2,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 68,
+      "won": false,
+      "z": 1.1517571753523475
+    },
+    {
+      "ask_proxy": 0.64,
+      "boot": 8,
+      "class": "TAIL",
+      "climate_day": "2026-10-05",
+      "corrected_error_f": 9.0,
+      "corrected_median_f": 92,
+      "correction_f": 0.0,
+      "cycle_age_s": 13863.548494175,
+      "edge_dist_f": 5,
+      "fill_id": "CX2D8Y2T6YHH",
+      "flags": [
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-05-lt97f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.9924313174096698,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "c893e13e603e",
+      "pit": 0.9999956718629559,
+      "pnl": "-0.6600",
+      "raw_error_f": 9.0,
+      "raw_q50": 92.0,
+      "rungs_same_day": 1,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 101,
+      "won": false,
+      "z": 4.618503681839125
+    },
+    {
+      "ask_proxy": 0.11,
+      "boot": 8,
+      "class": "SIBLING_WON",
+      "climate_day": "2026-10-05",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 88,
+      "correction_f": -2.0,
+      "cycle_age_s": 4823.208734974,
+      "edge_dist_f": 2,
+      "fill_id": "CX5F40JYMYH4",
+      "flags": [
+        "LOC_ARTEFACT"
+      ],
+      "instrument_id": "tc-temp-miahigh-2026-10-05-gte87lt88f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.48657057529244196,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "c893e13e603e",
+      "pit": 0.9046272940654607,
+      "pnl": "-0.1200",
+      "raw_error_f": 0.0,
+      "raw_q50": 90.0,
+      "rungs_same_day": 2,
+      "station": "MIA",
+      "station_day_has_win": true,
+      "tmax_f": 90,
+      "won": false,
+      "z": 1.3863010261980127
+    },
+    {
+      "ask_proxy": 0.03,
+      "boot": 9,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-06",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 72,
+      "correction_f": 1.0,
+      "cycle_age_s": 13860.357085225,
+      "edge_dist_f": 5,
+      "fill_id": "CXPTKNASJYGE",
+      "flags": [
+        "K1b",
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-06-lt70f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.14138885002842494,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "4ba7f10cd1f6",
+      "pit": 0.869116277378368,
+      "pnl": "-0.0300",
+      "raw_error_f": 3.0,
+      "raw_q50": 71.0,
+      "rungs_same_day": 2,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 74,
+      "won": false,
+      "z": 1.1425786768688906
+    },
+    {
+      "ask_proxy": 0.14,
+      "boot": 9,
+      "class": "TAIL",
+      "climate_day": "2026-10-06",
+      "corrected_error_f": 4.0,
+      "corrected_median_f": 90,
+      "correction_f": 0.0,
+      "cycle_age_s": 13879.140902916,
+      "edge_dist_f": 3,
+      "fill_id": "CXPTQ7HGEYHH",
+      "flags": [
+        "K1b",
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-laxhigh-2026-10-06-lt92f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.8295095035646637,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "4ba7f10cd1f6",
+      "pit": 0.9829292500202347,
+      "pnl": "-0.1500",
+      "raw_error_f": 4.0,
+      "raw_q50": 90.0,
+      "rungs_same_day": 1,
+      "station": "LAX",
+      "station_day_has_win": false,
+      "tmax_f": 94,
+      "won": false,
+      "z": 2.163550611411633
+    },
+    {
+      "ask_proxy": 0.1,
+      "boot": 9,
+      "class": "BOUNDARY",
+      "climate_day": "2026-10-06",
+      "corrected_error_f": -3.0,
+      "corrected_median_f": 83,
+      "correction_f": -1.0,
+      "cycle_age_s": 13850.677355631,
+      "edge_dist_f": 1,
+      "fill_id": "CXPTQWPK0YGW",
+      "flags": [
+        "K1b",
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-sfohigh-2026-10-06-gte81lt82f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.2512963216270187,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "4ba7f10cd1f6",
+      "pit": 0.18163157309720027,
+      "pnl": "-0.1100",
+      "raw_error_f": -4.0,
+      "raw_q50": 84.0,
+      "rungs_same_day": 2,
+      "station": "SFO",
+      "station_day_has_win": false,
+      "tmax_f": 80,
+      "won": false,
+      "z": -0.915112831806936
+    },
+    {
+      "ask_proxy": 0.07,
+      "boot": 9,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-06",
+      "corrected_error_f": 2.0,
+      "corrected_median_f": 72,
+      "correction_f": 1.0,
+      "cycle_age_s": 13875.327788768,
+      "edge_dist_f": 3,
+      "fill_id": "CXPV5XMJ2YGE",
+      "flags": [
+        "K1b",
+        "LOC_SOURCE",
+        "FLANK_CHEAP"
+      ],
+      "instrument_id": "tc-temp-mdwhigh-2026-10-06-gte70lt71f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.3264475320467216,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "4ba7f10cd1f6",
+      "pit": 0.869116277378368,
+      "pnl": "-0.0700",
+      "raw_error_f": 3.0,
+      "raw_q50": 71.0,
+      "rungs_same_day": 2,
+      "station": "MDW",
+      "station_day_has_win": false,
+      "tmax_f": 74,
+      "won": false,
+      "z": 1.1425786768688906
+    },
+    {
+      "ask_proxy": 0.15,
+      "boot": 9,
+      "class": "BAND_SELECTION",
+      "climate_day": "2026-10-06",
+      "corrected_error_f": -3.0,
+      "corrected_median_f": 83,
+      "correction_f": -1.0,
+      "cycle_age_s": 23462.830614398,
+      "edge_dist_f": 3,
+      "fill_id": "CXS74BRHJYH0",
+      "flags": [
+        "K1b",
+        "LOC_SOURCE"
+      ],
+      "instrument_id": "tc-temp-sfohigh-2026-10-06-gte83lt84f.POLYMARKET_US",
+      "newest_visible": true,
+      "p_hat": 0.26116383235640867,
+      "partition_incomplete": false,
+      "pin_label": "INFERRED",
+      "pin_state": "PINNED",
+      "pinned_commit": "4ba7f10cd1f6",
+      "pit": 0.18163157309720027,
+      "pnl": "-0.1600",
+      "raw_error_f": -4.0,
+      "raw_q50": 84.0,
+      "rungs_same_day": 2,
+      "station": "SFO",
+      "station_day_has_win": false,
+      "tmax_f": 80,
+      "won": false,
+      "z": -0.915112831806936
+    }
+  ],
+  "flag_counts": {
+    "FLANK_CHEAP": 10,
+    "K1b": 5,
+    "LOC_ARTEFACT": 4,
+    "LOC_SOURCE": 16
+  },
+  "footer": "diagnostic, post-hoc, n = 14 station-days in 7 clusters, non-confirmatory\nThis verdict is NOT permission to re-arm. Re-open routes are T1 (M1-v3 CONFIRM, read on or after 12-07), T2 (new family and prereg), T3 (new US source, F13), per RULING_FQ-v2-NO-TRADE_2026-10-08.\nVARIANCE does not imply positive EV.",
+  "h0k": {
+    "p_value": 0.3926493955551896,
+    "rejects": false
+  },
+  "inconclusive_route": null,
+  "phase": "B",
+  "predeclaration": {
+    "commit": "526bdd112b97600073d5f0b6d5a4fa7160eb40bc",
+    "sha256": "b26bd6a3d785a3cf46850495c41a3f16a65bdebcb7213a5067ee77c2dfa3ef04",
+    "terminal_climate_day": "2026-10-05",
+    "thresholds": {
+      "alpha_art": 0.01,
+      "alpha_primary": 0.02,
+      "audit": {
+        "n_fills": 25,
+        "n_wins": 2,
+        "net_pnl": "-2.17",
+        "tolerance": "0.005"
+      },
+      "cycle_age_max_s": 50400,
+      "delivery_soft_target": "2026-10-20",
+      "fee_theta": 0.0695,
+      "flank_cheap_ask": 0.1,
+      "forward_clusters_feasible": 60,
+      "material_delta_p": 0.01,
+      "p_clamp": 1e-09,
+      "pit_central_high": 0.9,
+      "pit_central_low": 0.1,
+      "pit_tail_high": 0.95,
+      "pit_tail_low": 0.05,
+      "power_floor": 0.8
+    }
+  },
+  "provenance": {
+    "head_blob_sha256": {
+      "scripts/analysis/fq_loss_taxonomy_battery.py": "e0b81590b429594cf1065dbf7408dde5ee736c220fd781e775bc252960b8d317",
+      "scripts/analysis/fq_loss_taxonomy_classify.py": "388d3bcf0172515b5c6e81813069c23d0186be069eb9a48c058dd2a52f68c9ca",
+      "scripts/analysis/fq_loss_taxonomy_core.py": "e67352852c938672b68580bc201e80a84820160e3d5e563bec02a858a0b5b783",
+      "scripts/analysis/fq_loss_taxonomy_fills.py": "4e3068d573764ee0b0be1b05ab637eaf9b6d850790ad2a9288ec1583a613e359",
+      "scripts/analysis/fq_loss_taxonomy_guard.py": "f7e90fa1018deba8f16738b181963e6fa0ae4612d16f7ca6b8108f5185f50fe9",
+      "scripts/analysis/fq_loss_taxonomy_inputs.py": "f6932aab7e8a5e7cb5d8be9a4942afb98ec4c27bf884cf7c087fb9f6025eee62",
+      "scripts/analysis/fq_loss_taxonomy_logs.py": "37748ea1ebe06ce409479a860019a40fc6936d7d1425eced2ffc62ebc328982a",
+      "scripts/analysis/fq_loss_taxonomy_phase_b.py": "9eb6fa445d143675ca5a54de69498c36bfa83f7c472622b1c1022c0aa2b6652f",
+      "scripts/analysis/fq_loss_taxonomy_pins.py": "25409c8aa644d342dd4e3a5c24ac3437ff6b19105a73b367ca0ea87338aead85",
+      "scripts/analysis/fq_loss_taxonomy_predecl.py": "7bb69c601508eb988df700b5fed49092c7ae58f68dc8bf16af6138eaf29d0232",
+      "scripts/analysis/fq_loss_taxonomy_provenance.py": "d2ed20da397137bfc347d0e231534d703c54816437ccb2176e19b54f4b154a9e",
+      "scripts/analysis/fq_loss_taxonomy_reconstruct.py": "019884d1b84ddbfa40667ff469839c358ea9e83e031abaf98e95c3f16ec75a4b",
+      "scripts/analysis/fq_loss_taxonomy_report.py": "d9c32256275819a024de63dcda46498662de50cd7d77aac257356712a12f5651",
+      "scripts/analysis/fq_loss_taxonomy_stats.py": "5d8fcb3ecf98b1fd4b6a19c02cd428d8adbce96068cf3600fffcf9c567faedbe",
+      "scripts/analysis/fq_loss_taxonomy_table.py": "18674c1bc4931c963fa28cc1676b4c63b4d7afd8207d6b8f9a8dedd9c7572aeb",
+      "scripts/analysis/fq_loss_taxonomy_truth.py": "1b0d4bd14bfe9dad9507890d0318d8955ea927aef5c8cf46968240fae197fb21",
+      "scripts/analysis/fq_loss_taxonomy_verdict.py": "df81ab091a17d17ba61501af4dfd11c02dba51b1f10d565c05cfeddfefdfc43d",
+      "scripts/analysis/fq_v1_loss_taxonomy.py": "1ee00a6ff305b2ca4853a3d67f8e02d9cc9aecf9f27caff921a0fdf342dc439d"
+    },
+    "phase_a_table_sha256": "d513445bfbc16bf293a1562d123aee79623af7efc625d15fcfa18d1d6a25b8ae",
+    "pins_json_sha256": "9a8e0fa6981844ce52fa88f899ed221835f22adf9bb9228f52d480e53431dd59",
+    "reflog_snapshot_sha256": "f359e070c2334a31252782fbf949643dfac84bba1c0992fda73b7ef9094e427d",
+    "script_sha256": "1ee00a6ff305b2ca4853a3d67f8e02d9cc9aecf9f27caff921a0fdf342dc439d",
+    "src_dependency_sha256": {
+      "src/breezy/adapters/polymarket_us/symbology.py": "40e46379c60d54eac67901000b074409a7092c36dd08c0e39bebf4d1baa5f85d",
+      "src/breezy/analysis/labeling/fill_source.py": "099e281679cc07b550386741f78a82b29336ed09e7d7868c03659e6327f59a57",
+      "src/breezy/analysis/labeling/instrument_facts.py": "2fffa04b4871d9de3d53f8d06316e0bf4b858f184a5d9e275d05a20368c821cc",
+      "src/breezy/analysis/labeling/settlement_source.py": "33205fa51354cb6fe74947d9a16ad56fa600ed556ec4fc004800bf3d4d9d060e",
+      "src/breezy/analysis/nbp_calibration.py": "5718264c67d2a6a524a3c3ee6c0933fb1fd91be6959c76aab89e6766287d62f6",
+      "src/breezy/domain/instrument_leg.py": "c21958e2893e209bdfa2004a97575566e2bf12467cc51079a40815f8514abeab",
+      "src/breezy/domain/nws_climate_day.py": "6ffd789603b5f748f2818c4d44ea633d053ef75666ddfa0ac6e918feae2ba1bf",
+      "src/breezy/domain/selection.py": "5a818d7207d77baab1194c9bd0f062cbb64ffd63f13555bb59143c21453c2ba0",
+      "src/breezy/domain/weather_bucket_facts.py": "c3bc8db62066c811a3f3159729e8e55cdab54b641b17e073aa41f6064662906f",
+      "src/breezy/persistence/catalog.py": "237fac3f5f9e169ae0096166189af0352b8b18cdc653c0619d3c061e79b3100b",
+      "src/breezy/registry/sites.py": "e45a12e39ada01f39acba68c37bdb9d0c72da1119b010a7115a08c2e4a9c7f65",
+      "src/breezy/registry/sites.toml": "fdf400951f9cde11614d44df013716d3ed59b1006416dbb39abd60be9f0b216f",
+      "src/breezy/settlement/settlement_truth.py": "89f64a31552da69015cc243caed003cd1ccf61ec4bd24aaedab7cb279a43c01b",
+      "src/breezy/settlement/trial_scorer.py": "5472bf81c569a00adf36afcde8b82df81b0a5663e5fbc3bb951264da7f5362d4"
+    },
+    "venue_outcomes_sha256": null
+  },
+  "ranked_classes": [
+    {
+      "class": "TAIL",
+      "count": 7,
+      "loss": "1.5500",
+      "share_of_loss": 0.43661971830985913
+    },
+    {
+      "class": "BAND_SELECTION",
+      "count": 11,
+      "loss": "1.0000",
+      "share_of_loss": 0.28169014084507044
+    },
+    {
+      "class": "SIBLING_WON",
+      "count": 2,
+      "loss": "0.5500",
+      "share_of_loss": 0.15492957746478872
+    },
+    {
+      "class": "BOUNDARY",
+      "count": 3,
+      "loss": "0.4500",
+      "share_of_loss": 0.1267605633802817
+    }
+  ],
+  "report_phrases": [
+    "T-WIN: rejected (p = 0.003469, TESTABLE)",
+    "T-LOC: NOT-TESTABLE (minimum attainable p exceeds alpha; not a null result)",
+    "T-SPREAD: did not reject (p = 0.7731, TESTABLE)",
+    "T-ART: NOT-TESTABLE (minimum attainable p exceeds alpha; not a null result)"
+  ],
+  "sensitivity": {
+    "six_cluster": {
+      "T-ART": {
+        "min_attainable_p": 0.0625,
+        "n_after_drops": 4,
+        "n_dropped": 2,
+        "n_positive": 1,
+        "n_units": 6,
+        "p_display": "0.9375",
+        "p_value": 0.9375,
+        "rejects": false,
+        "status": "NOT-TESTABLE"
+      },
+      "T-LOC": {
+        "indicative": true,
+        "min_attainable_p": 0.10538369976213995,
+        "n_after_drops": 4,
+        "n_dropped": 2,
+        "n_units": 6,
+        "p_at_pi_max": 0.587497945857931,
+        "p_at_pi_min": 0.5468439506768273,
+        "p_display": "0.5875",
+        "p_value": 0.587497945857931,
+        "rejects": false,
+        "status": "NOT-TESTABLE"
+      },
+      "T-SPREAD": {
+        "min_attainable_p": 0.00043662293686272505,
+        "n_dropped_no_pmf": 0,
+        "n_units": 6,
+        "p_display": "0.6325",
+        "p_value": 0.6325323368656225,
+        "power": 0.1395113350763966,
+        "rejects": false,
+        "status": "TESTABLE",
+        "x_obs": 2
+      },
+      "T-WIN": {
+        "h0k": {
+          "p_value": 0.47449530012034546,
+          "rejects": false
+        },
+        "leave_one_out": {
+          "dropped_station": "MIA",
+          "n_clusters": 5,
+          "p_display": "0.007064",
+          "p_value": 0.007064449637810213,
+          "rejects": true,
+          "w_obs": 1
+        },
+        "min_attainable_p": 4.842964435121526e-14,
+        "n_units": 6,
+        "p_display": "0.007064",
+        "p_value": 0.0070644497277907396,
+        "power": {
+          "power": 0.34101436566049287,
+          "power_independent": 0.34101436566049287,
+          "power_max_pc": 0.47449530012034546,
+          "w_star": 2
+        },
+        "rejects": true,
+        "status": "TESTABLE",
+        "w_obs": 2
+      },
+      "level": "cluster",
+      "n_units": 6,
+      "testability": {
+        "after_ties": {
+          "T-ART": "NOT-TESTABLE",
+          "T-LOC": "NOT-TESTABLE",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        },
+        "holm_alpha_step1": 0.02,
+        "holm_k": 1,
+        "pre_ties": {
+          "T-ART": "NOT-TESTABLE",
+          "T-LOC": "TESTABLE-CONDITIONAL",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        }
+      },
+      "tie_reevaluation": {
+        "downgraded": [
+          "T-LOC"
+        ],
+        "variance_eligible": {
+          "T-ART": false,
+          "T-LOC": false,
+          "T-SPREAD": true,
+          "T-WIN": true
+        }
+      }
+    },
+    "station_day": {
+      "T-ART": {
+        "min_attainable_p": 0.015625,
+        "n_after_drops": 6,
+        "n_dropped": 8,
+        "n_positive": 2,
+        "n_units": 14,
+        "p_display": "0.8906",
+        "p_value": 0.890625,
+        "rejects": false,
+        "status": "NOT-TESTABLE"
+      },
+      "T-LOC": {
+        "indicative": true,
+        "min_attainable_p": 4.104472244339238e-05,
+        "n_after_drops": 13,
+        "n_dropped": 1,
+        "n_units": 14,
+        "p_at_pi_max": 0.11897771271334069,
+        "p_at_pi_min": 0.11897771271334069,
+        "p_display": "0.119",
+        "p_value": 0.11897771271334069,
+        "rejects": false,
+        "status": "TESTABLE"
+      },
+      "T-SPREAD": {
+        "min_attainable_p": 6.269645599200174e-12,
+        "n_dropped_no_pmf": 0,
+        "n_units": 14,
+        "p_display": "0.0674",
+        "p_value": 0.06740109154394759,
+        "power": 0.30861023522068454,
+        "rejects": false,
+        "status": "TESTABLE",
+        "x_obs": 5
+      },
+      "T-WIN": {
+        "h0k": {
+          "p_value": 0.14177438084855368,
+          "rejects": false
+        },
+        "leave_one_out": {
+          "dropped_station": "MIA",
+          "n_clusters": 13,
+          "p_display": "1.871e-05",
+          "p_value": 1.8708074253860667e-05,
+          "rejects": true,
+          "w_obs": 1
+        },
+        "min_attainable_p": 1.1925495483921404e-16,
+        "n_units": 14,
+        "p_display": "1.871e-05",
+        "p_value": 1.8708074670963133e-05,
+        "power": {
+          "power": 0.5969678540875064,
+          "power_independent": 0.5969678540875064,
+          "power_max_pc": 0.5969678540875064,
+          "w_star": 4
+        },
+        "rejects": true,
+        "status": "TESTABLE",
+        "w_obs": 2
+      },
+      "level": "day",
+      "n_units": 14,
+      "testability": {
+        "after_ties": {
+          "T-ART": "NOT-TESTABLE",
+          "T-LOC": "TESTABLE",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        },
+        "holm_alpha_step1": 0.01,
+        "holm_k": 2,
+        "pre_ties": {
+          "T-ART": "TESTABLE",
+          "T-LOC": "TESTABLE",
+          "T-SPREAD": "TESTABLE",
+          "T-WIN": "TESTABLE"
+        }
+      },
+      "tie_reevaluation": {
+        "downgraded": [
+          "T-ART"
+        ],
+        "variance_eligible": {
+          "T-ART": false,
+          "T-LOC": true,
+          "T-SPREAD": true,
+          "T-WIN": true
+        }
+      }
+    }
+  },
+  "t_edge": {
+    "confirmatory_weight": 0,
+    "exploratory": true,
+    "n": 23,
+    "p_value": 0.9938180159183414,
+    "x_obs": 4
+  },
+  "te1_cross_check": {
+    "status": "TE-1 cross-check pending"
+  },
+  "testability": {
+    "after_ties": {
+      "T-ART": "NOT-TESTABLE",
+      "T-LOC": "NOT-TESTABLE",
+      "T-SPREAD": "TESTABLE",
+      "T-WIN": "TESTABLE"
+    },
+    "predeclared": {
+      "T-ART": "TESTABLE",
+      "T-LOC": "TESTABLE",
+      "T-SPREAD": "TESTABLE",
+      "T-WIN": "TESTABLE"
+    },
+    "predeclared_matches_recomputed": true,
+    "recomputed_pre_ties": {
+      "T-ART": "TESTABLE",
+      "T-LOC": "TESTABLE",
+      "T-SPREAD": "TESTABLE",
+      "T-WIN": "TESTABLE"
+    }
+  },
+  "tests": {
+    "T-ART": {
+      "min_attainable_p": 0.03125,
+      "n_after_drops": 5,
+      "n_dropped": 2,
+      "n_positive": 1,
+      "n_units": 7,
+      "p_display": "0.9688",
+      "p_value": 0.96875,
+      "rejects": false,
+      "status": "NOT-TESTABLE"
+    },
+    "T-LOC": {
+      "indicative": true,
+      "min_attainable_p": 0.04750132954076371,
+      "n_after_drops": 5,
+      "n_dropped": 2,
+      "n_units": 7,
+      "p_at_pi_max": 0.9409297746689649,
+      "p_at_pi_min": 0.8972709123277085,
+      "p_display": "0.9409",
+      "p_value": 0.9409297746689649,
+      "rejects": false,
+      "status": "NOT-TESTABLE"
+    },
+    "T-SPREAD": {
+      "min_attainable_p": 0.00013628261170719387,
+      "n_dropped_no_pmf": 0,
+      "n_units": 7,
+      "p_display": "0.7731",
+      "p_value": 0.7731137862152989,
+      "power": 0.09056909460275198,
+      "rejects": false,
+      "status": "TESTABLE",
+      "x_obs": 2
+    },
+    "T-WIN": {
+      "h0k": {
+        "p_value": 0.3926493955551896,
+        "rejects": false
+      },
+      "leave_one_out": {
+        "dropped_station": "MIA",
+        "n_clusters": 6,
+        "p_display": "0.003469",
+        "p_value": 0.0034690189523133184,
+        "rejects": true,
+        "w_obs": 1
+      },
+      "min_attainable_p": 2.3611381349628865e-14,
+      "n_units": 7,
+      "p_display": "0.003469",
+      "p_value": 0.0034690189997778407,
+      "power": {
+        "power": 0.24830290471692007,
+        "power_independent": 0.24830290471692007,
+        "power_max_pc": 0.3926493955551896,
+        "w_star": 2
+      },
+      "rejects": true,
+      "status": "TESTABLE",
+      "w_obs": 2
+    },
+    "level": "cluster",
+    "n_units": 7,
+    "testability": {
+      "after_ties": {
+        "T-ART": "NOT-TESTABLE",
+        "T-LOC": "NOT-TESTABLE",
+        "T-SPREAD": "TESTABLE",
+        "T-WIN": "TESTABLE"
+      },
+      "holm_alpha_step1": 0.02,
+      "holm_k": 1,
+      "pre_ties": {
+        "T-ART": "TESTABLE",
+        "T-LOC": "TESTABLE",
+        "T-SPREAD": "TESTABLE",
+        "T-WIN": "TESTABLE"
+      }
+    },
+    "tie_reevaluation": {
+      "downgraded": [
+        "T-LOC",
+        "T-ART"
+      ],
+      "variance_eligible": {
+        "T-ART": false,
+        "T-LOC": false,
+        "T-SPREAD": true,
+        "T-WIN": true
+      }
+    }
+  },
+  "tie_reevaluation": {
+    "downgraded": [
+      "T-ART",
+      "T-LOC"
+    ],
+    "variance_eligible": {
+      "T-ART": false,
+      "T-LOC": false,
+      "T-SPREAD": true,
+      "T-WIN": true
+    }
+  },
+  "verdict": {
+    "label": "MODEL_MISCALIBRATED_UNATTRIBUTED",
+    "notes": [],
+    "qualifiers": [],
+    "reason": null,
+    "sublabel": null
+  }
+}

@@ -1,7 +1,7 @@
 """Durable gap ledger: which climate days were expected, observed, missing.
 
-Governing ruling: ``docs/plans/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md`` SS3
-(WI-10), read together with ``docs/plans/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md``
+Governing ruling: ``docs/plans/archive/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md`` SS3
+(WI-10), read together with ``docs/plans/archive/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md``
 for why the design's original citations needed re-verifying against this repo.
 
 **The blind spot this closes.** ``gate.check_freshness`` (``ingest/gate.py``)
@@ -115,7 +115,10 @@ from enum import Enum
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
-from breezy.normalize.climate_day import standard_time_zone
+# Re-exported (explicit alias for mypy): the pure home is ``breezy.normalize.climate_day``.
+from breezy.normalize.climate_day import (
+    local_standard_date as local_standard_date,  # noqa: PLC0414
+)
 
 logger = logging.getLogger(__name__)
 
@@ -389,29 +392,12 @@ class _ObservedSummary:
 # ---------------------------------------------------------------------------
 
 
-def local_standard_date(now_ns: int, std_utc_offset_hours: float) -> dt.date:
-    """The calendar date `now_ns` falls on in fixed local-standard time.
-
-    Never DST-aware -- see the module docstring's two-clocks note. Matches
-    ``NwsIngestActor._most_recent_completed_climate_day``'s own conversion
-    byte-for-byte (floor division on whole seconds, not float division), so
-    this and that function agree on every instant, including ones exactly on
-    a second boundary.
-    """
-    local = dt.datetime.fromtimestamp(
-        now_ns // _NS_PER_SECOND,
-        tz=standard_time_zone(std_utc_offset_hours),
-    )
-    return local.date()
-
-
 def most_recent_completed_climate_day(now_ns: int, std_utc_offset_hours: float) -> dt.date:
     """The last climate day that has definitely ended, as of `now_ns`.
 
-    The single extracted copy of
-    ``NwsIngestActor._most_recent_completed_climate_day`` -- that method
-    should call this rather than re-implementing the arithmetic, so there is
-    exactly one copy in the repo (not built here; a separate wiring item).
+    Shared with ``NwsIngestActor`` so the gap planner and the live ingest actor
+    compute the same completed-day boundary from the same local-standard clock
+    rule.
     """
     return local_standard_date(now_ns, std_utc_offset_hours) - dt.timedelta(days=1)
 

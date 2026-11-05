@@ -1,0 +1,12 @@
+# AUT-3 r4 (final round): merged review (coordinator). mle-reviewer 94, prediction-market-reviewer 92. Final 92; zero CRITICAL or HIGH. Polish to r5.
+- **J1 [mle 1]**: WP0 (iii) measures the maximum inter-ping gap, which must be ≤ `WatchdogSec/2`. Add pings in the unshrunk, row-join, snapshot and probe stages, with a test.
+- **J2 [mle 2]**: Add a SIGTERM handler that writes `ERROR(terminated)` for every unwritten (lineage, model_class) pair. Add `test_sigterm_writes_error_records_for_unwritten_pairs`.
+- **J3 [mle 3]**: In Tier L, the repro units use the refit tier (14G/12G). Otherwise state that density reproduction is not claimed and that `REPRO_PASS` comes from `rung_recalibration` only.
+- **J4 [mle 4]**: WP0 (ii) benchmark safety. No overlap with the quote-tape-ingest timer phase, or `MemoryMax=10G` until ING-2 S3a lands. Log the minimum `MemAvailable` during the run.
+- **J5 [mle 5]**: WP7 checks that the effective `breezy-studies.slice` `MemoryMax` is ≤ 14G (ARCH V14), or records the reconciliation in the ruling.
+- **J6 [pm 1]**: Add the leakage assertion `label_outcome_matches_settlement_truth`. It recomputes `y_yes` from the FINAL settlement-truth rung bounds and excludes `outcome_mismatch`; more than 1% is CRITICAL. Add a WP5 RED test.
+- **J7 [pm 2]**: Consumption proof. Keep the request that AUT-4 cite `refit_run/v1` shas in `inputs[]` (`path_role="refit_run"`). WP9 ALSO proves consumption without that request, from the AUT-4 engine-input journal or verdict day/date linkage plus `run_id`. The proof must not depend on an unaccepted request.
+- **J8 [pm 3]**: Add `params.fit_regime="null_tuned"` and the WP9 line `OWN_OUTCOME_EVIDENCE=machinery_only`.
+- **J9 [pm 4]**: Add the parent's `Refuse(below_margin)` records within the margin band to P. Record `readmitted_takes` in `params`.
+- **J10 [pm 5]**: Add per-side Brier to `advisory_time_block` and to the `selection_population` counts.
+- The README K_max wording (R-README-2) is already fixed by the coordinator; close it.

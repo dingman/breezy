@@ -1,0 +1,884 @@
+"""``ForecastQuantileLadderStrategy`` -- V1 D+1 taker, shadow-first (SL-12/13).
+
+Plan `FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md` §7 rows SL-12
+and SL-13. SL-13 wires this class into ``app/trade.py`` (a new
+``forecast_quantile_ladder`` composition_kind branch, shadow-only: every
+manifest naming it stays ``DRAFT_NOT_REGISTERED``, so it never becomes the
+sending family) and adds :meth:`on_start` (instrument subscription and
+YES/NO-per-rung resolution) and :meth:`_maybe_submit` (the native
+order-submission path, gated by :meth:`try_submit`) below. Every SL-12
+guard/decision surface (:meth:`evaluate_snapshot`, :meth:`try_submit`,
+``decision.py``) is unmodified -- SL-13 adds a constructor-optional
+``instrument_ids`` argument and two new methods, never a rewrite.
+
+Guard shape matches ``ContinuousRungHoldStrategy`` exactly, by construction:
+
+* ``order_submission_permit: OrderSubmissionPermit | None`` -- the SAME
+  phase-0 permit guard (``None`` = shadow-only, matches the "Phase 0 ...
+  never arms anything" convention in ``continuous_strategy.py``).
+* ``submit_veto: Callable[[], str | None] | None`` -- the SAME shape
+  ``breezy.strategy.current_rung_hold.composition.family_halt_submit_veto``
+  produces.
+* ``fee_verified: Callable[[], bool] | None`` -- the SAME fee-drift-probe
+  shape used before a live submission.
+
+:meth:`try_submit` runs all three guards and returns ``None`` iff every one
+passes, else the refusal reason string -- never itself submitting anything.
+SL-13's :meth:`_maybe_submit` is the ONE caller that acts on that result: on
+a clear ``try_submit``, it resolves the take's instrument from ``self.cache``
+and calls ``self.submit_order`` through the SAME ``order_factory.limit(...)``
+shape ``ContinuousRungHoldStrategy._maybe_submit`` uses -- the exec client's
+deny chain (``adapters/polymarket_us/exec/client.py:5327-5510``) is
+therefore reached the SAME way v3 reaches it, never a second code path, and
+stays untouched, byte-for-byte, by this file either way.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Literal,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    cast,
+    runtime_checkable,
+)
+
+from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderDenied, OrderExpired, OrderFilled, OrderRejected
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.trading.strategy import Strategy
+
+from breezy.adapters.polymarket_us.symbology import (
+    instrument_id_to_slug,
+    leg_of,
+    sibling_instrument_id,
+)
+from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
+from breezy.registry.sites import default_registry
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.strategy.current_rung_hold.composition import bucket_station_instrument_ids
+from breezy.strategy.depth10 import best_order
+from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
+from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
+from breezy.strategy.forecast_quantile_ladder.decision import (
+    Decision,
+    SidedAsk,
+    Take,
+    decision_log_fields,
+    evaluate,
+)
+from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
+from breezy.strategy.forecast_quantile_ladder.margin import hours_to_settlement
+from breezy.strategy.forecast_quantile_ladder.persistent_latch import SupportsQuantileLatch
+from breezy.strategy.ladder_ev.config import LadderEvConfig
+from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
+from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
+from breezy.strategy.ladder_ev.quantile_density import Rung
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
+
+__all__ = ["ForecastQuantileLadderStrategy", "ShadowDecisionLogLine", "SupportsExpiresAtNs"]
+
+_CLASS_NAME: str = "ForecastQuantileLadderStrategy"
+_VENUE: Final[str] = "polymarket_us"
+
+
+@runtime_checkable
+class SupportsExpiresAtNs(Protocol):
+    """The narrow surface this strategy needs from an order-submission permit.
+
+    A real ``breezy.runtime.order_enablement.OrderSubmissionPermit`` (minted
+    only by its own ``.issue()``, which requires the live operator-gate
+    environment) satisfies this Protocol structurally -- SL-13's wiring
+    passes one unmodified. Declaring the DEPENDENCY as a Protocol rather than
+    importing the concrete unforgeable type keeps this module, and every
+    test of it, from ever needing to touch the operator-reserved enablement
+    environment (plan §8: never read or assign one) merely to exercise the
+    guard ORDER below.
+    """
+
+    @property
+    def expires_at_ns(self) -> int: ...
+
+
+class ShadowDecisionLogLine(TypedDict):
+    now_ns: int
+    station: str
+    climate_day: date
+    rung_id: str
+    side: Literal["yes", "no"]
+    instrument_id: str
+    kind: str
+    reason: NotRequired[str]
+    qty: NotRequired[Literal[1]]
+    ev_net: NotRequired[float]
+    p_hat: NotRequired[float]
+    p_lower: NotRequired[float]
+    p_upper: NotRequired[float]
+
+
+class ForecastQuantileLadderStrategy(Strategy):
+    """Evaluates NBP quantile-vector snapshots against a sha-pinned artefact.
+
+    Every evaluated snapshot is emitted to the injected sink, when present --
+    plan §7 row SL-12: "logs every decision (keys and inputs) as a shadow
+    decision log line."
+    """
+
+    def __init__(
+        self,
+        config: ForecastQuantileLadderConfig,
+        *,
+        quantile_actor: ForecastQuantileStateActor,
+        calibration: LiveCalibration,
+        ladder_cfg: LadderEvConfig,
+        bounds_provider: BoundsProvider,
+        latch: SupportsQuantileLatch | None = None,
+        order_submission_permit: SupportsExpiresAtNs | None = None,
+        submit_veto: Callable[[], str | None] | None = None,
+        fee_verified: Callable[[int], bool] | None = None,
+        instrument_ids: Sequence[str | InstrumentId] = (),
+        quantile_station_keys: Mapping[str, str] | None = None,
+        shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
+        d1_resolver: Callable[[], tuple[str, ...]] | None = None,
+        d1_readiness_state: MutableMapping[str, bool | None] | None = None,
+        d1_poll_interval_min: int = 5,
+        d1_poll_window_min: int = 60,
+    ) -> None:
+        super().__init__(config)
+        self._quantile_actor = quantile_actor
+        self._calibration = calibration
+        self._ladder_cfg = ladder_cfg
+        self._bounds_provider = bounds_provider
+        self._latch = latch if latch is not None else QuantileLadderLatch()
+        self._order_submission_permit = order_submission_permit
+        self._submit_veto = submit_veto
+        self._fee_verified = fee_verified
+        self._shadow_decision_sink = shadow_decision_sink
+        #: SL-13/S6 item 2 (D+1 readiness poll): re-resolves candidate YES
+        #: ids from the catalog on a native timer when NONE were present at
+        #: `on_start` -- `None` (every pre-S6 caller) disables the poll
+        #: entirely, preserving the old "subscribe whatever is in the cache
+        #: now, nothing else" behaviour.
+        self._d1_resolver = d1_resolver
+        #: Shared, mutable, ACROSS every station's composed strategy
+        #: instance in this boot (`composition.py` builds and injects ONE
+        #: dict) -- `station -> None` (pending) | `True` (subscribed) |
+        #: `False` (window expired, still zero). `None` default means this
+        #: strategy tracks itself alone (a single-station world).
+        self._d1_readiness_state: MutableMapping[str, bool | None] = (
+            d1_readiness_state if d1_readiness_state is not None else {}
+        )
+        self._d1_poll_interval_min = d1_poll_interval_min
+        self._d1_poll_window_min = d1_poll_window_min
+        self._d1_attempts = 0
+        self._d1_max_attempts = max(1, d1_poll_window_min // d1_poll_interval_min)
+        self._d1_timer_name: str | None = None
+        #: SL-13e: maps a `self.config.stations` city token to whatever key
+        #: `quantile_actor` was actually constructed with (composition.py
+        #: builds it ICAO-keyed, to match what `NbmQuantileActor` really
+        #: publishes `ForecastPoint.station` under). Defaults to empty, which
+        #: makes :meth:`evaluate_snapshot`'s lookup an identity pass-through
+        #: -- every caller that builds its own self-consistent
+        #: ``ForecastQuantileStateActor`` directly (this class's own unit
+        #: tests, the SL-13p shadow-parity harness) relies on that default
+        #: unchanged; only composition.py injects a real translation.
+        self._quantile_station_keys: Mapping[str, str] = (
+            quantile_station_keys if quantile_station_keys is not None else {}
+        )
+        #: SL-13: candidate YES-leg instrument ids to resolve from
+        #: ``self.cache`` at :meth:`on_start`. Never a msgspec ``StrategyConfig``
+        #: field (mirrors ``order_submission_permit``/``submit_veto``/
+        #: ``fee_verified`` immediately above) -- plain constructor state, not
+        #: serialised, not operator-reserved.
+        self._instrument_ids: tuple[str | InstrumentId, ...] = tuple(instrument_ids)
+        #: ``(station, climate_day.isoformat(), rung_id) -> (yes_id, no_id)``,
+        #: populated at :meth:`on_start`. Read-only outside this class; a
+        #: driver evaluating a snapshot resolves the sided instrument id here
+        #: before building the :class:`~breezy.strategy.forecast_quantile_ladder.decision.SidedAsk`
+        #: ``evaluate_snapshot`` needs.
+        self.rung_instruments: dict[tuple[str, str, str], tuple[str, str]] = {}
+        #: ``(station, climate_day.isoformat()) -> [Rung, ...]``, populated at
+        #: :meth:`on_start` from the resolved YES-leg instruments' own weather
+        #: bucket facts.
+        self.rung_ladders: dict[tuple[str, str], list[Rung]] = {}
+        #: SL-13 item 2: ``instrument_id str -> (station, climate_day_key,
+        #: rung_id, side)``, populated at :meth:`on_start` for BOTH legs of
+        #: every resolved rung -- the reverse index the tick handlers need to
+        #: turn a bare ``InstrumentId`` off a live depth/quote update back
+        #: into the (station, day, rung, side) key ``evaluate_snapshot`` wants.
+        self._instrument_context: dict[str, tuple[str, str, str, Literal["yes", "no"]]] = {}
+        #: ``(station, climate_day_key) -> the YES instrument's own native
+        #: ``expiration_ns``, populated at :meth:`on_start` for observability.
+        #: Not the settlement instant: ``h_hours`` is LST midnight ending the
+        #: climate day (``margin.hours_to_settlement``). A 05:00Z listing
+        #: ``endDate`` stays here and is not read by the tick path.
+        self.rung_expiration_ns: dict[tuple[str, str], int] = {}
+        #: ``station -> std_utc_offset_hours``, populated once at
+        #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
+        #: ``_std_utc_offset_hours_by_station``).
+        self._std_utc_offset_hours: dict[str, float] = {}
+        #: ``station -> latitude_deg``, populated once at :meth:`on_start`
+        #: via ``registry.enrichment_coordinates`` (SL-13 S2, plan D2) -- the
+        #: SAME coordinate source ``scripts/analysis/nbp_skill_study.py``'s
+        #: own ``_daylight_hours``/``_station_latitudes`` use, never a second
+        #: lookup table. :meth:`evaluate_snapshot` falls back to ``0.0`` when
+        #: a station is absent (e.g. a test driving ``evaluate_snapshot``
+        #: directly without first calling :meth:`on_start`) -- harmless
+        #: whenever the resolved calibration's own ``correction_form`` is
+        #: ``NONE`` (the latitude is unused), and never reachable in a real
+        #: boot, where :meth:`on_start` always populates every configured
+        #: station before any tick is evaluated.
+        self._latitude_deg_by_station: dict[str, float] = {}
+
+    def on_start(self) -> None:
+        """Resolve YES/NO instrument ids per rung and subscribe (SL-13).
+
+        Candidates are the configured catalog ids unioned with this station's
+        D+1 YES ids bucketed from ``self.cache.instruments()`` (the node's
+        instrument provider populates the cache before any strategy starts,
+        exactly as ``ContinuousRungHoldStrategy.on_start`` relies on). For each
+        id already present in ``self.cache``: skip a
+        non-HIGH measure, skip a station outside ``self.config.stations``,
+        skip a bare NO id (its YES sibling resolves it below, via
+        :func:`~breezy.adapters.polymarket_us.symbology.sibling_instrument_id`
+        -- never registering the same rung twice). Every accepted YES id is
+        subscribed for quotes and depth and recorded into
+        :attr:`rung_instruments`/:attr:`rung_ladders`.
+
+        SL-13 item 2: also subscribes each rung's NO-leg id (its OWN book,
+        never derived from the YES side -- ruling A-6), populates the
+        instrument -> (station, day, rung, side) reverse index
+        :attr:`_instrument_context` for both legs, the rung's listing
+        ``expiration_ns`` (:attr:`rung_expiration_ns`, observability only),
+        and each configured station's ``std_utc_offset_hours``. The offset
+        is what :meth:`on_order_book_depth`/:meth:`on_quote_tick` need to
+        call :meth:`evaluate_snapshot` without a second registry read per
+        tick; hours to settlement are the LST midnight of the climate day.
+
+        Never calls :meth:`_maybe_submit` or ``self.submit_order`` directly
+        -- only :meth:`on_order_book_depth`/:meth:`on_quote_tick` (via
+        :meth:`_maybe_submit`) do that, on a ``Take``.
+        """
+        registry = default_registry()
+        self._std_utc_offset_hours = {
+            station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+            for station in self.config.stations
+        }
+        self._latitude_deg_by_station = {
+            station: registry.enrichment_coordinates(_VENUE, station).lat
+            for station in self.config.stations
+        }
+        try:
+            subscribed = self._subscribe_ids(self._instrument_ids)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            station = self.config.stations[0]
+            self.log.error(
+                f"{_CLASS_NAME}: D+1 subscribe failed station={station} "
+                f"{type(exc).__name__}: {exc}",
+            )
+            subscribed = 0
+        if subscribed >= 1:
+            self._on_subscribed(subscribed)
+            return
+        if self._d1_resolver is None:
+            # Pre-S6 behaviour, unchanged: no readiness poll configured, so
+            # a zero-id boot stays silent (B4: never emit the marker on
+            # zero) and never retries.
+            return
+        self._arm_d1_readiness_timer()
+
+    def _d1_candidate_ids(self, catalog_ids: Sequence[str | InstrumentId]) -> tuple[str, ...]:
+        """Catalog ids union this station's D+1 YES ids from ``self.cache``.
+
+        First-seen order: catalog ids, then cache ids the catalog did not
+        already name. The cache day is ``_d_plus_1_climate_days`` on the
+        strategy clock -- the same rule composition uses -- so today's markets
+        never enter the union. De-duplicated on the id string.
+        """
+        # Lazy: ``composition`` imports this module at load time.
+        from breezy.strategy.forecast_quantile_ladder.composition import _d_plus_1_climate_days
+
+        seen: dict[str, None] = {}
+        for raw_id in catalog_ids:
+            seen.setdefault(str(raw_id), None)
+        days = _d_plus_1_climate_days(self.config.stations, now_ns=self.clock.timestamp_ns())
+        bucketed = bucket_station_instrument_ids(self.cache.instruments(), days)
+        for station in self.config.stations:
+            for instrument_id in bucketed[station]:
+                seen.setdefault(str(instrument_id), None)
+        return tuple(seen)
+
+    def _subscribe_ids(self, ids: Sequence[str | InstrumentId]) -> int:
+        """Resolve+subscribe every YES id of ``ids`` already in ``self.cache``.
+
+        Extracted from the original ``on_start`` body (SL-13) so the D+1
+        readiness poll (S6 item 2) can re-run the EXACT same resolution
+        logic on each timer fire, never a second implementation. Candidates
+        are :meth:`_d1_candidate_ids` (catalog union cache). An id already
+        in ``_instrument_context`` is never subscribed again. Returns the
+        count of rungs newly subscribed (0 means nothing new was found).
+        """
+        subscribed_count = 0
+        for raw_id in self._d1_candidate_ids(ids):
+            instrument_id = InstrumentId.from_str(raw_id)
+            if str(instrument_id) in self._instrument_context:
+                # Already subscribed on an earlier call (e.g. a previous
+                # readiness-poll fire) -- never a duplicate subscription.
+                continue
+            instrument = self.cache.instrument(instrument_id)
+            if instrument is None:
+                self.log.warning(
+                    f"no instrument {instrument_id} in the cache; skipping subscription",
+                )
+                continue
+            facts = read_weather_bucket_facts(instrument.info)
+            if facts.measure is not Measure.HIGH:
+                self.log.warning(
+                    f"{instrument_id} measures {facts.measure.value!r}; this "
+                    "strategy trades HIGH only, skipping subscription.",
+                )
+                continue
+            if facts.settlement_station not in self.config.stations:
+                self.log.warning(
+                    f"{instrument_id} settles {facts.settlement_station!r}, outside "
+                    f"{self.config.stations!r}; skipping subscription.",
+                )
+                continue
+            if leg_of(instrument_id) != "yes":
+                # The NO leg is resolved from its YES sibling below -- a bare
+                # NO id in `instrument_ids` would otherwise register the
+                # SAME rung twice.
+                continue
+            no_instrument_id = sibling_instrument_id(instrument_id)
+            climate_day_key = facts.climate_day.isoformat()
+            rung_id = f"{facts.lower_f if facts.lower_f is not None else 'lt'}_" \
+                f"{facts.upper_f if facts.upper_f is not None else 'gte'}"
+            rung = Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f)
+            rung_key = (facts.settlement_station, climate_day_key, rung_id)
+            # Subscribe before any rung state is recorded. A raise here leaves
+            # subscriptions already made on earlier rungs intact and writes no
+            # `_instrument_context` entry for a rung whose subscribe did not
+            # finish (L-16: no half-registered rung).
+            self.subscribe_quote_ticks(instrument_id)
+            self.subscribe_order_book_depth(instrument_id)
+            # SL-13 item 2: the NO leg's OWN book -- never synthesised from
+            # the YES side (ruling A-6). Subscribed unconditionally even
+            # though the NO instrument itself is never looked up in
+            # `self.cache` here -- `on_order_book_depth`/`on_quote_tick`
+            # resolve it purely from `_instrument_context`, and a missing
+            # NO instrument in the cache surfaces there as `no_instrument`,
+            # never here.
+            self.subscribe_quote_ticks(no_instrument_id)
+            self.subscribe_order_book_depth(no_instrument_id)
+            self.rung_instruments[rung_key] = (str(instrument_id), str(no_instrument_id))
+            self.rung_ladders.setdefault((facts.settlement_station, climate_day_key), []).append(
+                rung,
+            )
+            self._instrument_context[str(instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "yes",
+            )
+            self._instrument_context[str(no_instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "no",
+            )
+            self.rung_expiration_ns[(facts.settlement_station, climate_day_key)] = (
+                instrument.expiration_ns
+            )
+            self.log.info(f"{_CLASS_NAME} subscribed {instrument_id}")
+            subscribed_count += 1
+        return subscribed_count
+
+    def _on_subscribed(self, count: int) -> None:
+        """B4 (finding F7): the final marker is emitted ONLY here, on an
+        actual, non-zero subscription -- never unconditionally.
+        """
+        self.log.info(f"{_CLASS_NAME} subscribed n={count}")
+        station = self.config.stations[0]
+        self._d1_readiness_state[station] = True
+
+    # -- S6 item 2: D+1 readiness poll ---------------------------------------
+
+    def _arm_d1_readiness_timer(self) -> None:
+        """Native, Nautilus ``Clock.set_timer`` poll -- no adapter patch.
+
+        Re-resolves ``self._d1_resolver()`` every
+        ``self._d1_poll_interval_min`` minutes, for
+        ``self._d1_poll_window_min`` minutes total. A market listed after
+        this boot's own instrument-provider discovery cannot be loaded
+        mid-run (the Polymarket.us data client implements no
+        ``_request_instrument``) -- this poll closes the catalog-vs-cache
+        LAG only, never that gap.
+        """
+        station = self.config.stations[0]
+        self._d1_readiness_state.setdefault(station, None)
+        self._d1_attempts = 0
+        start_time = self.clock.utc_now()
+        interval = timedelta(minutes=self._d1_poll_interval_min)
+        self._d1_timer_name = f"fq-d1-readiness-{station}"
+        self.clock.set_timer(
+            name=self._d1_timer_name,
+            interval=interval,
+            start_time=start_time,
+            stop_time=start_time + timedelta(minutes=self._d1_poll_window_min),
+            callback=self._on_d1_readiness_timer,
+        )
+
+    def _on_d1_readiness_timer(self, event: object) -> None:  # Nautilus TimeEvent
+        self._d1_attempts += 1
+        ids = self._d1_resolver() if self._d1_resolver is not None else ()
+        try:
+            subscribed = self._subscribe_ids(ids)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            station = self.config.stations[0]
+            self.log.error(
+                f"{_CLASS_NAME}: D+1 subscribe failed station={station} "
+                f"{type(exc).__name__}: {exc}",
+            )
+            subscribed = 0
+        if subscribed >= 1:
+            if self._d1_timer_name is not None and self._d1_timer_name in self.clock.timer_names:
+                self.clock.cancel_timer(self._d1_timer_name)
+            self._on_subscribed(subscribed)
+            return
+        if self._d1_attempts < self._d1_max_attempts:
+            return
+        self._on_d1_window_expired()
+
+    def _on_d1_window_expired(self) -> None:
+        """Window exhausted with still-zero ids for THIS station.
+
+        Terminal (CRITICAL alert) only once every OTHER tracked station has
+        ALSO already failed (or there are no others -- a single-station
+        boot); otherwise this station alone logs WARN, because the family
+        as a whole may still subscribe elsewhere.
+        """
+        station = self.config.stations[0]
+        self._d1_readiness_state[station] = False
+        others = [value for key, value in self._d1_readiness_state.items() if key != station]
+        if any(value is not False for value in others):
+            self.log.warning(f"FQ_D1_NOT_READY station={station}")
+            return
+        stations = sorted(self._d1_readiness_state)
+        self.log.error(
+            f"FQ_D1_NOT_READY_TERMINAL stations={stations} "
+            f"window_min={self._d1_poll_window_min}",
+        )
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity="CRITICAL",
+                event="FQ_D1_NOT_READY",
+                site="forecast_quantile_ladder",
+                detail=f"stations={stations}",
+            ),
+        )
+
+    def current_yes_instrument_slug(self) -> str | None:
+        """The first currently-resolved YES rung's market slug, else ``None``.
+
+        S6: feeds the fee-drift probe's lazy ``slug_fn`` (``app/trade.py``)
+        -- never ``self.config.instrument_ids`` (there is no such field;
+        candidate ids are constructor-only state, S4-infra), and never a
+        snapshot taken only at construction time, so a D+1 readiness-poll
+        subscription that resolves AFTER boot is still picked up on the
+        probe's NEXT fetch.
+        """
+        for yes_id, _no_id in self.rung_instruments.values():
+            return instrument_id_to_slug(InstrumentId.from_str(yes_id))
+        return None
+
+    def _permit_covers(self, now_ns: int) -> bool:
+        permit = self._order_submission_permit
+        return permit is not None and now_ns < permit.expires_at_ns
+
+    def evaluate_snapshot(
+        self,
+        *,
+        now_ns: int,
+        std_utc_offset_hours: float,
+        station: str,
+        climate_day: date,
+        ladder: Sequence[Rung],
+        rung_id: str,
+        side: Literal["yes", "no"] = "yes",
+        ask: SidedAsk,
+        fee_coefficient: float,
+        slippage_floor_prob: float,
+        h_hours: float,
+    ) -> Decision:
+        """Evaluate one (station-day, rung, side) snapshot and log it.
+
+        Reads the visible quantile vector from ``self._quantile_actor`` at
+        ``now_ns`` -- never a catalog read, mirroring
+        ``ForecastState``'s own actor-push pattern (WP-12 Seam D).
+
+        ``station`` is translated through :attr:`_quantile_station_keys`
+        first (SL-13e): ``self._quantile_actor`` may be keyed differently
+        (e.g. ICAO) than ``station`` itself (a ``self.config.stations`` city
+        token) -- see that attribute's own docstring.
+        """
+        actor_station = self._quantile_station_keys.get(station, station)
+        vector: ForecastQuantileVector | None = self._quantile_actor.state_for(
+            actor_station,
+        ).value_at(now_ns)
+        # `on_start` always populates this for every configured station
+        # (SL-13 S2); `0.0` is a harmless placeholder for a direct
+        # `evaluate_snapshot` call that skipped `on_start` (e.g. a unit
+        # test) -- see `_latitude_deg_by_station`'s own docstring.
+        latitude_deg = self._latitude_deg_by_station.get(station, 0.0)
+        decision = evaluate(
+            now_ns=now_ns,
+            std_utc_offset_hours=std_utc_offset_hours,
+            permit_covers=self._permit_covers(now_ns),
+            vector=vector,
+            station=station,
+            climate_day=climate_day,
+            ladder=ladder,
+            rung_id=rung_id,
+            side=side,
+            ask=ask,
+            fee_coefficient=fee_coefficient,
+            slippage_floor_prob=slippage_floor_prob,
+            h_hours=h_hours,
+            cfg=self._ladder_cfg,
+            calibration=self._calibration,
+            latitude_deg=latitude_deg,
+            bounds_provider=self._bounds_provider,
+            # `decision.evaluate` (SL-12, unmodified) types `latch` nominally
+            # as `QuantileLadderLatch`; SL-13 widens THIS class's own
+            # constructor to accept any `SupportsQuantileLatch` (so a
+            # `PersistentQuantileLadderLatch` type-checks too) -- `evaluate`
+            # only ever calls `is_latched`/`latch` on it (both members of
+            # that Protocol), so this cast is type-only, never a runtime
+            # behaviour change.
+            latch=cast("QuantileLadderLatch", self._latch),
+        )
+        self._emit_shadow_decision(
+            self._shadow_log_line(
+                decision=decision,
+                now_ns=now_ns,
+                station=station,
+                climate_day=climate_day,
+                rung_id=rung_id,
+                side=side,
+                instrument_id=ask.instrument_id,
+            ),
+        )
+        return decision
+
+    def _emit_shadow_decision(self, line: ShadowDecisionLogLine) -> None:
+        sink = self._shadow_decision_sink
+        if sink is not None:
+            sink(line)
+        self.log.info(f"SHADOW_DECISION {line!r}")
+
+    def _shadow_log_line(
+        self,
+        decision: Decision,
+        *,
+        now_ns: int,
+        station: str,
+        climate_day: date,
+        rung_id: str,
+        side: Literal["yes", "no"],
+        instrument_id: str,
+    ) -> ShadowDecisionLogLine:
+        """Decision keys and inputs only -- never scored, never a catalog write.
+
+        Plan §4.4 item 1: "The shadow log carries decision keys and decision
+        inputs only." No settlement/CLI/P&L module is imported by this file.
+        Serialised via :func:`decision_log_fields`, never ``dataclasses.
+        asdict`` -- that is banned repo-wide outside the closed allowlist in
+        ``tests/unit/test_polymarket_us_credential_serialization.py``.
+        """
+        fields = decision_log_fields(decision)
+        if isinstance(decision, Take):
+            return {
+                "now_ns": now_ns,
+                "station": cast("str", fields["station"]),
+                "climate_day": cast("date", fields["climate_day"]),
+                "rung_id": cast("str", fields["rung_id"]),
+                "side": cast('Literal["yes", "no"]', fields["side"]),
+                "instrument_id": cast("str", fields["instrument_id"]),
+                "kind": type(decision).__name__,
+                "qty": cast("Literal[1]", fields["qty"]),
+                "ev_net": cast("float", fields["ev_net"]),
+                "p_hat": cast("float", fields["p_hat"]),
+                "p_lower": cast("float", fields["p_lower"]),
+                "p_upper": cast("float", fields["p_upper"]),
+            }
+        return {
+            "now_ns": now_ns,
+            "station": station,
+            "climate_day": climate_day,
+            "rung_id": rung_id,
+            "side": side,
+            "instrument_id": instrument_id,
+            "kind": type(decision).__name__,
+            "reason": cast("str", fields["reason"]),
+        }
+
+    def try_submit(self, take: Take) -> str | None:
+        """Run the phase-0 permit, family-halt-veto and fee-verified guards.
+
+        Returns ``None`` on every guard passing, or the refusal reason
+        string otherwise. Never itself calls ``self.submit_order`` -- see
+        :meth:`_maybe_submit`, SL-13's one caller that acts on this result.
+        """
+        if self._order_submission_permit is None:
+            return "phase0_permit_absent"
+        if self._submit_veto is not None:
+            veto_reason = self._submit_veto()
+            if veto_reason is not None:
+                return veto_reason
+        if self._fee_verified is not None and not self._fee_verified(self.clock.timestamp_ns()):
+            return "fee_unverified"
+        return None
+
+    def _maybe_submit(self, take: Take, *, limit_price: Decimal) -> None:
+        """SL-13: the native order-submission path. Runs :meth:`try_submit`
+        first and returns without reaching ``self.submit_order`` on any
+        refusal (including ``order_submission_permit is None`` -- the guard
+        this class was built to enforce, plan §8).
+
+        ``limit_price`` is the caller's own already-evaluated ask price
+        (the SAME :class:`~breezy.strategy.forecast_quantile_ladder.decision.SidedAsk.price`
+        that produced ``take`` -- ``Take`` itself carries no price field, by
+        SL-12 design). Mirrors ``ContinuousRungHoldStrategy._maybe_submit``'s
+        ``order_factory.limit(...)`` shape exactly: IOC, not post-only, qty
+        from ``take.qty`` (always 1, plan §3.3).
+        """
+        if self.config.shadow_only:
+            self.log.info(
+                "TAKE recorded, shadow_only=True: "
+                f"{take.instrument_id} qty={take.qty} px={limit_price} "
+                f"p_hat={take.p_hat} ev_net={take.ev_net}",
+            )
+            return
+        refusal = self.try_submit(take)
+        self._emit_decision_outcome(take, refusal)
+        if refusal is not None:
+            self.log.info(
+                "TAKE recorded, no submit "
+                f"(refusal={refusal}): {take.instrument_id} qty={take.qty} "
+                f"px={limit_price} p_hat={take.p_hat} ev_net={take.ev_net}",
+            )
+            return
+        nt_id = InstrumentId.from_str(take.instrument_id)
+        instrument = self.cache.instrument(nt_id)
+        if instrument is None:
+            self.log.error(f"instrument vanished from cache: {take.instrument_id}")
+            return
+        order = self.order_factory.limit(
+            instrument_id=nt_id,
+            order_side=OrderSide.BUY,
+            quantity=instrument.make_qty(Decimal(take.qty)),
+            price=instrument.make_price(limit_price),
+            time_in_force=TimeInForce.IOC,
+            post_only=False,
+        )
+        self.submit_order(order)
+
+    def _emit_decision_outcome(self, take: Take, refusal: str | None) -> None:
+        """FQ-S11: counts the ``try_submit`` guard outcome through the SAME
+        ``shadow_decision_sink`` channel :meth:`evaluate_snapshot` already
+        uses -- a ``Take`` that clears every guard is recorded as
+        ``kind="TrySubmit" reason="submitted"``; a refusal is recorded
+        verbatim under its own reason (``phase0_permit_absent``,
+        ``family_halt``, ``fee_unverified``, or any future veto reason).
+        Never a second sink wiring: the one aggregator the composition root
+        wires into ``shadow_decision_sink`` stays the ONE subscriber for
+        both decision kinds and submit outcomes (plan §3 S11)."""
+        self._emit_shadow_decision({
+            "now_ns": self.clock.timestamp_ns(),
+            "station": take.station,
+            "climate_day": take.climate_day,
+            "rung_id": take.rung_id,
+            "side": take.side,
+            "instrument_id": take.instrument_id,
+            "kind": "TrySubmit",
+            "reason": refusal if refusal is not None else "submitted",
+        })
+
+    # -- SL-13 item 2: the live tick loop -----------------------------------
+
+    def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        """Hunt on the venue's own Depth10 book -- the REQUIRED trigger.
+
+        Depth carries a one-sided book (e.g. an ask with no bid) that a
+        ``QuoteTick`` cannot represent (``parse_quote_tick`` requires both
+        sides) -- mirrors ``ContinuousRungHoldStrategy.on_order_book_depth``'s
+        own reasoning. ``best_order`` skips the Depth10 size-0 Arrow pad.
+        Never raises (L-16): every failure path below is a logged skip, and
+        :meth:`_evaluate_instrument_update` itself is wrapped in a catch-all.
+        """
+        ask = best_order(depth.asks)
+        self._safe_evaluate(
+            depth.instrument_id,
+            ask_price=ask.price.as_decimal() if ask is not None else None,
+            ts_event=depth.ts_event,
+            source="depth",
+        )
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        """Hunt on a live two-sided quote too, where the venue emits one."""
+        self._safe_evaluate(
+            tick.instrument_id,
+            ask_price=tick.ask_price.as_decimal(),
+            ts_event=tick.ts_event,
+            source="quote_tick",
+        )
+
+    def _safe_evaluate(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        ask_price: Decimal | None,
+        ts_event: int,
+        source: str,
+    ) -> None:
+        """L-16: a data handler must never raise. Every exception from
+        :meth:`_evaluate_instrument_update` is caught and logged here,
+        exactly once, rather than propagating into Nautilus's own event loop.
+        """
+        try:
+            self._evaluate_instrument_update(instrument_id, ask_price=ask_price, ts_event=ts_event)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            self.log.exception(
+                f"{_CLASS_NAME}: {source} handler failed for {instrument_id}", exc,
+            )
+
+    def _evaluate_instrument_update(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        ask_price: Decimal | None,
+        ts_event: int,
+    ) -> None:
+        """Resolve ``instrument_id`` to its (station, day, rung, side) via
+        :attr:`_instrument_context` (built at :meth:`on_start`), build the
+        :class:`~breezy.strategy.forecast_quantile_ladder.decision.SidedAsk`
+        from THIS instrument's own ask (never synthesised from the sibling
+        leg -- ruling A-6), call :meth:`evaluate_snapshot` (which already
+        logs the decision), and call :meth:`_maybe_submit` only on a
+        ``Take``. The latch and permit/veto/fee-verified checks all live
+        inside ``evaluate``/:meth:`try_submit` -- this method adds no second
+        gate. A D0 or D+2 instrument's own ``climate_day`` (resolved at
+        ``on_start`` from ITS weather-bucket facts, never assumed) fails
+        ``evaluate``'s own D+1 check and returns a non-``Take`` decision,
+        same as any other Refuse -- no special-casing needed here.
+        """
+        iid = str(instrument_id)
+        context = self._instrument_context.get(iid)
+        if context is None:
+            # Not one of ours -- structurally unreachable given `on_start`
+            # only ever subscribes ids it has just indexed here, but a data
+            # handler fails closed on an unexpected id rather than assuming.
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=unrecognised_instrument")
+            return
+        station, climate_day_key, rung_id, side = context
+        if ask_price is None:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_ask")
+            return
+        ladder = self.rung_ladders.get((station, climate_day_key))
+        if not ladder:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_ladder")
+            return
+        std_utc_offset_hours = self._std_utc_offset_hours.get(station)
+        if std_utc_offset_hours is None:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_std_offset")
+            return
+        climate_day = date.fromisoformat(climate_day_key)
+        h_hours = hours_to_settlement(
+            now_ns=ts_event,
+            climate_day=climate_day,
+            std_utc_offset_hours=std_utc_offset_hours,
+        )
+        decision = self.evaluate_snapshot(
+            now_ns=ts_event,
+            std_utc_offset_hours=std_utc_offset_hours,
+            station=station,
+            climate_day=climate_day,
+            ladder=ladder,
+            rung_id=rung_id,
+            side=side,
+            ask=SidedAsk(side=side, instrument_id=iid, price=float(ask_price)),
+            fee_coefficient=self.config.required_fee_coefficient,
+            slippage_floor_prob=self._ladder_cfg.slippage_floor_prob,
+            h_hours=h_hours,
+        )
+        if isinstance(decision, Take):
+            self._maybe_submit(decision, limit_price=ask_price)
+
+    # -- S6: order-event alerts (never logs an operator-reserved cap) -------
+
+    def _emit_order_alert(
+        self,
+        event_name: str,
+        *,
+        instrument_id: object,
+        client_order_id: object,
+        reason: str | None,
+        severity: Literal["INFO", "WARN", "CRITICAL"],
+    ) -> None:
+        order = self.cache.order(client_order_id) if client_order_id is not None else None
+        side = order.side.name if order is not None else "unknown"
+        reason_text = reason if reason is not None else "none"
+        detail = (
+            f"instrument={instrument_id} side={side} "
+            f"client_order_id={client_order_id} reason={reason_text}"
+        )
+        self.log.info(f"{event_name} {detail}")
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=severity,
+                event=event_name,
+                site=_CLASS_NAME,
+                detail=detail,
+            ),
+        )
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_FILLED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=None,
+            severity="INFO",
+        )
+
+    def on_order_denied(self, event: OrderDenied) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_DENIED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=event.reason,
+            severity="WARN",
+        )
+
+    def on_order_rejected(self, event: OrderRejected) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_REJECTED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=event.reason,
+            severity="WARN",
+        )
+
+    def on_order_expired(self, event: OrderExpired) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_EXPIRED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=None,
+            severity="WARN",
+        )

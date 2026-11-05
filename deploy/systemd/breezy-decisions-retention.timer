@@ -1,0 +1,24 @@
+[Unit]
+Description=09:25 UTC trigger for the Breezy F-3 decisions/ retention (gzip only)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/ops/decisions_retention.py
+
+[Timer]
+Unit=breezy-decisions-retention.service
+
+# 09:25 UTC -- five minutes after breezy-decision-funnel-digest (09:20 UTC),
+# itself twenty minutes after breezy-quote-tape-rotate (09:00 UTC). Free
+# against every other OnCalendar= in this directory
+# (tests/unit/test_deploy_timer_hours.py). Outside the protected window
+# [16:45Z, 01:15Z) / no-start [16:35Z, 01:15Z). UTC is stated explicitly so a
+# host timezone change cannot move it.
+OnCalendar=*-*-* 09:25:00 UTC
+
+# A run missed because the host was down fires once the timer is next
+# active, instead of waiting a full extra day.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

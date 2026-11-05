@@ -1,0 +1,44 @@
+[Unit]
+# AUD-08b: fold the recorder's unregistered-city sighting sidecar into the
+# ADVISORY station-candidate register (never a trading input, never a
+# subscription) and raise the one-shot BREEZY_STATION_CANDIDATE_NEW alert.
+# Started ONLY by breezy-quote-tape-rotate.service's OnSuccess= (no timer,
+# no [Install]); decoupled so it can never fail or slow the rotation.
+Description=Breezy AUD-08b station-candidate register (advisory)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/station_candidate_register.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-08-unattended-station-candidate-register.md
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# Memory ceiling -- the 2026-09-11 K1 incident (breezy-k1-daily.service,
+# 17.6 GB peak with no cap) is why every unit that loads catalog data carries
+# its own. Sized from GROWTH, not one peak (L-49). Measured 2026-09-24,
+# read-only, under a 6G scope, the covered-station-day counter:
+#   NYC, window 7 d  (0 loaded days): 757 MB peak RSS,  2.0 s
+#   NYC, window 13 d (0 loaded days): 842 MB,           2.7 s
+#   NYC, window 26 d (7 loaded days): 1.85-1.95 GB,    11.5-14.2 s
+#   5 cities, 26 d (31 loaded days):  3.16-3.45 GB,    72-81 s
+# Current RSS sampled after every day's load (5 cities) rises with the
+# heavier recent days then PLATEAUS at 2.4-2.9 GB and falls back: the loader
+# streams one day at a time, so the peak tracks the largest single day plus
+# allocator retention, not the window length. 31 loaded days is ~4x NYC's
+# current 7 and costs 3.45 GB; MemoryHigh=4G/MemoryMax=6G keeps >=3x headroom
+# over the measured single-city peak for 90+ more days of NYC capture.
+MemoryHigh=4G
+MemoryMax=6G
+Slice=breezy-studies.slice
+
+# Only the alert webhook file. No venue credential, no venue socket.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/deploy/systemd/station-candidate-register-run.sh
+
+# Measured 14 s for NYC today; bounded generously for growth and a cold cache.
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-station-candidate-register

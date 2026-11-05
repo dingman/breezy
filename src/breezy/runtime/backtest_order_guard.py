@@ -17,14 +17,29 @@ the same refusal to the instant the order is submitted.
 position passes every ``RiskEngine`` check on a CASH account, because
 ``CashAccount.balance_impact`` (``accounting/accounts/cash.pyx:489-493``)
 returns **+notional** for a SELL, so the check ``(free + balance_impact) < 0``
-(``risk/engine.pyx:949``) can never fire; and 1.231.0 exempts
-position-reducing sells outright (``:975-987``), so the only sells that reach
-that gate are the naked ones. The spec used to prescribe "a strategy-side
+(``risk/engine.pyx:949``) can never fire; and 1.231.0 routes only
+position-reducing sells AROUND that check, on a CONDITION a naked sell fails:
+``is_position_reducing_sell = order.is_reduce_only or pending_sell_qty <=
+available_long_qty`` (``risk/engine.pyx:979-982``), where ``available_long_qty``
+is the net open LONG minus already-submitted sells (``:701-739``). A naked sell
+is neither reduce-only nor within a long it does not have, so it is NOT
+exempted -- it falls THROUGH to the balance check above, which on a cash
+account cannot deny it. Either way the sell arrives unopposed; the exemption
+merely decides which unfireable gate it reaches. The spec used to prescribe "a strategy-side
 invariant", which asks every strategy author to re-derive the rule from prose
 they may never read -- and one author, writing a perfectly reasonable ladder,
 did not. Verified live: a LIMIT SELL for 500 contracts against a ZERO position
 and $1,000 of cash was accepted and filled 50, with no rejection and no
 warning. The guard therefore lives here, where it cannot be forgotten.
+
+That Nautilus exemption is quoted here to explain the mechanism it bypasses,
+not as a model for this guard's own rule below: ``reduce_only`` is an
+ordinary, attacker-settable ``OrderFactory`` kwarg, Nautilus only validates it
+when ``command.position_id is not None`` (never true on the default
+``submit_order`` path), and even when it does run the check is
+jointly-naked-blind -- N reduce-only sells each within the net long all pass.
+``_refuse_naked_short`` below therefore grants the flag no exemption at all;
+see ``docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md``.
 
 Why the message bus, and why ``OrderInitialized``
 -------------------------------------------------
@@ -52,6 +67,7 @@ about the problem at all.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -59,17 +75,27 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderInitialized
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from nautilus_trader.backtest.engine import BacktestEngine
     from nautilus_trader.cache.base import CacheFacade
+    from nautilus_trader.common.component import MessageBus
     from nautilus_trader.core.message import Event
-    from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
+    from nautilus_trader.model.orders.base import Order
     from nautilus_trader.portfolio import Portfolio
+
+    from breezy.runtime.order_enablement import ClockLike, OrderSubmissionPermit
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ORDER_EVENT_TOPIC",
     "BacktestOrderGuard",
     "NakedShortRefusedError",
+    "PermitExpiredRefusedError",
     "PostOnlyRefusedError",
+    "install_live_order_guard",
     "install_order_guard",
 ]
 
@@ -96,6 +122,46 @@ class NakedShortRefusedError(ValueError):
     fill is accepted, the account's free balance RISES, and terminal PnL
     arithmetic stays correct. The only symptom is a position that could never
     have been funded.
+
+    On Polymarket.us, NO is an outcome side on the *same* instrument/book --
+    not a separate ``InstrumentId`` with its own book -- so the live order
+    expression is ``outcomeSide=NO`` with price inversion, as recorded in
+    ``docs/evidence/no_side_instrument_probe_2026-08-31.md``.
+    """
+
+
+class PermitExpiredRefusedError(ValueError):
+    """The ``OrderSubmissionPermit`` authorising this order has LAPSED (WP-B2).
+
+    ``OrderSubmissionPermit.issue`` (``runtime/order_enablement.py``) tests
+    ``clock.timestamp_ns() > live_trading_permit.expires_at_ns`` only at MINT.
+    Once the permit object is held by a strategy, nothing re-checked expiry at
+    submit: the strategy-side gates ask only ``self._order_submission_permit
+    is not None``. The live permit is minted once at boot with a 10 h TTL
+    (``safety.PERMIT_TTL_NS``) and then lapses for ~14 h of every day while
+    the node runs healthy, with that gate still reading "granted".
+
+    Refused HERE, at the kernel chokepoint, rather than in each strategy
+    (plan ``POST_FORECAST_PHASE_2026-09-20.md`` §B-5): a per-strategy gate
+    violates DRY and a new strategy simply forgets it, while this guard's one
+    ``events.order.*`` subscription already covers every strategy in the run,
+    including one added after it was installed -- the same seam the long-only
+    (``allow_short = False``) rule uses.
+
+    DEFENCE IN DEPTH, NOT A REPLACEMENT. ``adapters.polymarket_us.safety.
+    assert_live_order_submission_permitted`` remains the AUTHORITATIVE expiry
+    check; it screens a different object (the ``LiveTradingPermit``, with its
+    authenticity tag and its single-use nonce registry) at the venue-egress
+    chokepoint, and nothing here may be read as making it redundant --
+    ``test_runtime_order_guard_permit_expiry.py::
+    test_the_exec_chokepoint_still_refuses_an_expired_permit_with_this_guard_passing``
+    pins that with this rule stubbed to pass.
+
+    This refusal NEVER extends, renews or re-mints anything. The 10 h TTL is a
+    deliberate operator-facing bound (``docs/plans/R8_OPERATOR_RUNBOOK.md``:
+    the union of the four decision windows plus slack, one process per trading
+    day); the correct response to this refusal is a new process, never a
+    longer permit.
     """
 
 
@@ -105,11 +171,64 @@ class BacktestOrderGuard:
     Holds the ``Portfolio`` rather than a snapshot of it: the net position is
     read at submit time, which is the only instant at which "naked" is a
     well-defined question.
+
+    ``_shim`` closes ``docs/plans/ORDER_LIST_BYPASS_2026-09-02.md`` Increment
+    2 (RED-12): ``Strategy.submit_order_list`` publishes every member's
+    ``OrderInitialized`` in one loop BEFORE any of them reaches
+    ``cache.add_order`` (``trading/strategy.pyx:944-981``), so the
+    cache-sourced sum in ``_working_sell_orders`` reads ``pending=0`` for
+    every member. The shim records the ``ClientOrderId``/quantity of every
+    SELL this guard has itself approved; an entry counts toward ``pending``
+    **only while** ``self._cache.order(client_order_id) is None`` (§3). That
+    makes liveness a PREDICATE evaluated fresh every screening rather than an
+    event-driven lifecycle -- there is no eviction event to miss, because
+    ``Strategy._deny_order`` calls ``cache.add_order`` before it ever applies
+    ``OrderDenied`` (G7), so every denial path makes its entry inert for
+    free. Disjoint by construction from the cache-sourced sum on that one
+    predicate, so the same order can never be counted twice regardless of
+    which sum currently sees it (RED-20).
     """
 
-    def __init__(self, portfolio: Portfolio, cache: CacheFacade) -> None:
+    def __init__(
+        self,
+        portfolio: Portfolio,
+        cache: CacheFacade,
+        *,
+        order_submission_permit: OrderSubmissionPermit | None = None,
+        clock: ClockLike | None = None,
+    ) -> None:
+        """``order_submission_permit``/``clock`` are the WP-B2 expiry rule's
+        two inputs, and both default to absent.
+
+        Absent means the rule is INERT -- never consulted, because there is no
+        permit to consult. That is the correct reading in the two modes that
+        have no permit object at all: a BACKTEST (``install_order_guard``
+        grows no permit parameter, and ``ContinuousRungHoldBacktestStrategy``
+        keeps its permit-object-free private-flag override), and a live
+        SHADOW-mode boot (``orders_enabled_requested`` False, so
+        ``app.trade.main`` mints nothing). Manufacturing a synthetic
+        ``expires_at_ns`` for either would be inventing authority where none
+        exists.
+
+        ``clock`` is INJECTED, never sampled from a wall clock here, for the
+        same reason ``safety._read_clock`` refuses one: a second time source
+        is a second policy. In production this is ``node.kernel.clock`` -- the
+        Nautilus clock of the very node whose message bus publishes the events
+        screened below.
+        """
         self._portfolio = portfolio
         self._cache = cache
+        self._shim: dict[ClientOrderId, tuple[InstrumentId, Decimal]] = {}
+        self._order_submission_permit = order_submission_permit
+        self._clock = clock
+        #: Refusals by class name, this process. A CLOSED set of exactly three
+        #: keys -- the three refusal classes this module raises -- never a
+        #: string composed from a value, so it cannot become an unbounded dict
+        #: keyed by market noise (the constraint
+        #: ``strategy.weather_common.refusals`` states for its own counter,
+        #: which is unreachable from here: ``runtime`` sits BELOW ``strategy``
+        #: in the import-linter layer contract).
+        self.refusal_counts: dict[str, int] = {}
 
     def on_order_event(self, event: Event) -> None:
         """Screen ``OrderInitialized``; ignore every other order event.
@@ -120,10 +239,100 @@ class BacktestOrderGuard:
         """
         if type(event) is not OrderInitialized:
             return
-        self._refuse_post_only(event)
-        self._refuse_naked_short(event)
+        if event.reconciliation:
+            # !! THIS BRANCH CANNOT FIRE ON nautilus_trader==1.231.0. !!
+            # It is forward-compatible insurance, NOT present protection --
+            # do not read it as "reconciliation orders are exempt". They are
+            # exempt only because the event never arrives at all. Two
+            # INDEPENDENT measured reasons, either alone sufficient:
+            #   1. Nothing publishes a reconciliation `OrderInitialized`.
+            #      Exactly three sites publish an init event -- strategy.pyx
+            #      :858, :950, algorithm.pyx:1209 -- all strategy/exec-algo
+            #      submission. `_generate_order` builds the event and returns
+            #      it WITHOUT publishing (`live/execution_engine.py:3611`).
+            #   2. `OrderInitialized.reconciliation` is a hardcoded
+            #      `return False  # Internal system event`
+            #      (`model/events/order.pyx:481`) -- it ignores the value the
+            #      constructor stored. Measured: building the event with
+            #      `reconciliation=True` and reading the property back yields
+            #      `False`, via the SAME call shape Nautilus itself uses at
+            #      `live/execution_engine.py:3608`. A Nautilus defect, and
+            #      Nautilus is immutable here, so it cannot be patched.
+            # `test_runtime_live_order_guard.py` pins both at full strength
+            # under `xfail(strict=True)`, so an XPASS -- Nautilus fixing the
+            # property -- fails the suite and forces a re-read of this block.
+            #
+            # WHY KEEP IT ANYWAY: if either reason above ever changes, this is
+            # out of jurisdiction for BOTH rules below, not just naked-short.
+            # Reconciliation copies `post_only=report.post_only` straight off
+            # the venue report (`live/execution_engine.py:3592`), so a resting
+            # post-only order found at the venue on restart would be refused by
+            # `_refuse_post_only` -- crash-looping while holding a real venue
+            # position. And unlike a tag or a ClientOrderId prefix, the flag is
+            # unforgeable: `OrderFactory` cannot set it (see
+            # `test_the_order_factory_cannot_set_the_reconciliation_flag`).
+            return
+        try:
+            # Authority BEFORE order shape: an order with no live authority is
+            # refused for that, not for being post-only -- otherwise the
+            # operator reads a fee-model complaint when the real fact is a
+            # lapsed permit. `_refuse_naked_short`'s `_shim` record runs only
+            # after every rule has passed, so refusing earlier leaves no entry
+            # behind (RED-24's ordering constraint, unchanged).
+            self._refuse_expired_permit(event)
+            self._refuse_post_only(event)
+            self._refuse_naked_short(event)
+        except (
+            PermitExpiredRefusedError,
+            PostOnlyRefusedError,
+            NakedShortRefusedError,
+        ) as exc:
+            # COUNTED, then re-raised unchanged. A silent refusal is how the
+            # 2026-09-17 fee-schedule halt hid for three days; the count is
+            # what lets "zero orders today" be told apart from "every order
+            # refused today". Counting here, once, rather than in each rule
+            # keeps the three rules pure raisers.
+            name = type(exc).__name__
+            self.refusal_counts[name] = self.refusal_counts.get(name, 0) + 1
+            raise
 
     # -- rules -------------------------------------------------------------
+
+    def _refuse_expired_permit(self, event: OrderInitialized) -> None:
+        """Refuse when the permit authorising this run has LAPSED (WP-B2).
+
+        Strict ``>``, exactly the comparison ``OrderSubmissionPermit.issue``
+        uses at mint, so the guard and the mint agree on the boundary instead
+        of inventing a second one: ``now == expires_at_ns`` is permitted at
+        mint and is permitted here.
+
+        Reads ``expires_at_ns`` and nothing else. Authenticity was established
+        at mint, at the one construction site B11 pins; re-deriving it here
+        would be a second issuer policy. The message names the failed
+        precondition and the two timestamps only -- never ``operator_id``,
+        never a cap, never any other permit field (L-22 shape).
+        """
+        permit = self._order_submission_permit
+        clock = self._clock
+        if permit is None or clock is None:
+            return
+        now_ns = clock.timestamp_ns()
+        if now_ns <= permit.expires_at_ns:
+            return
+        raise PermitExpiredRefusedError(
+            f"{event.client_order_id} on {event.instrument_id} was submitted under an "
+            f"order-submission permit that expired at {permit.expires_at_ns} ns; the "
+            f"node clock reads {now_ns} ns (lapsed "
+            f"{now_ns - permit.expires_at_ns} ns ago). The permit's expiry was checked "
+            f"ONLY at mint before WP-B2, so a node running past its 10h TTL kept "
+            f"submitting with a strategy-side gate that still read 'granted'. The "
+            f"permit is never extended, renewed or re-minted in-process: the TTL is a "
+            f"deliberate operator-facing bound of one process per trading day "
+            f"(`docs/plans/R8_OPERATOR_RUNBOOK.md`), so the correct response is a new "
+            f"process, never a longer permit. This refusal is DEFENCE IN DEPTH only -- "
+            f"`adapters.polymarket_us.safety.assert_live_order_submission_permitted` "
+            f"remains the authoritative expiry check at venue egress."
+        )
 
     def _refuse_post_only(self, event: OrderInitialized) -> None:
         if not event.post_only:
@@ -141,28 +350,105 @@ class BacktestOrderGuard:
         )
 
     def _refuse_naked_short(self, event: OrderInitialized) -> None:
-        if event.side != OrderSide.SELL or event.reduce_only:
+        """Refuse a SELL that exceeds the net long, INCLUDING a ``reduce_only`` one.
+
+        ``reduce_only`` confers no exemption here: it is an ordinary,
+        attacker-settable ``OrderFactory`` kwarg (F1,
+        `docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md`), and Nautilus's own
+        validation of it is skipped on the default ``submit_order`` path and
+        jointly-naked-blind even when it runs (F2/F3). A GENUINELY reducing
+        sell satisfies ``pending + quantity <= net`` by the definition of
+        reducing, so running the identical test for every SELL cannot refuse
+        a legitimate exit -- it can only refuse the sells that are naked
+        regardless of the flag.
+        """
+        if event.side != OrderSide.SELL:
             return
         instrument_id = event.instrument_id
         net = self._net_long(instrument_id)
-        pending = self._working_sell_quantity(instrument_id)
+        working = self._working_sell_orders(instrument_id)
+        shim_entries = self._shim_entries(instrument_id)
+        pending = sum((order.leaves_qty.as_decimal() for order in working), Decimal(0))
+        pending += sum((qty for _coid, qty in shim_entries), Decimal(0))
         quantity = event.quantity.as_decimal()
         if pending + quantity > net:
+            contributors = (
+                ", ".join(
+                    [
+                        f"{order.client_order_id} [{order.status.name}]="
+                        f"{order.leaves_qty.as_decimal()}"
+                        for order in working
+                    ]
+                    + [f"{coid} [awaiting cache]={qty}" for coid, qty in shim_entries],
+                )
+                or "none"
+            )
             raise NakedShortRefusedError(
                 f"{event.client_order_id} would SELL {quantity} of {instrument_id} "
                 f"against a net long of {net} (with {pending} already working) -- a "
                 f"naked short of {pending + quantity - net}. On a Polymarket CLOB you "
-                f"cannot sell tokens you do not hold; \"short YES\" is spelled \"buy "
-                f"NO\", which is a different InstrumentId with its own book. No "
+                f"cannot sell tokens you do not hold. On Polymarket.us, NO is an "
+                f"outcome side on the same instrument/book: the live order expression "
+                f"is `outcomeSide=NO` with price inversion. No "
                 f"Nautilus check can catch this: `CashAccount.balance_impact` returns "
                 f"+notional for a SELL, so the RiskEngine's `(free + impact) < 0` gate "
                 f"can never fire, position-reducing sells are exempted outright, and "
                 f"after the fill the account shows MORE free cash than before. "
                 f"Terminal PnL arithmetic stays correct, so the backtest looks fine. "
-                f"Size every SELL from `self.cache`/`self.portfolio.net_position(...)`.",
+                f"Size every SELL from `self.portfolio.net_position(...)` MINUS any "
+                f"already-working SELL quantity -- the same "
+                f"subtraction `_working_sell_quantity` performs -- never from "
+                f"`net_position(...)` alone, or a working exit sized to part of the "
+                f"position plus a settlement leg sized to the whole of it will "
+                f"double-count and refuse a real close. `reduce_only` is not a "
+                f"licence to skip this check: it is an ordinary, attacker-settable "
+                f"flag (any strategy can set it), so it is screened exactly like "
+                f"every other SELL -- a genuinely reducing sell still passes, "
+                f"because it satisfies this same inequality by construction. "
+                f"Orders counted toward `pending` (client_order_id [status]=leaves_qty, or "
+                f"[awaiting cache]=quantity for a not-yet-cached order-list member): "
+                f"{contributors} -- a stuck SUBMITTED order here, not a strategy that "
+                f"oversold, may be why this was refused; see "
+                f"`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §2.1.",
             )
+        # Record ONLY after both refusal rules have passed (`_refuse_post_only`
+        # ran first, in `on_order_event`; the check above is this rule's own).
+        # Recording before screening would make a refused member leave a live
+        # entry that refuses everything after it forever -- RED-24, §3's
+        # ordering constraint. The entry is redundant, never wrong, the
+        # instant `cache.add_order` runs for this same order: `_shim_entries`
+        # treats it as dead from that point on (`cache.order(coid) is not
+        # None`), which is why no eviction event is needed.
+        self._shim[event.client_order_id] = (instrument_id, quantity)
 
     # -- internals ---------------------------------------------------------
+
+    def _working_sell_orders(self, instrument_id: InstrumentId) -> list[Order]:
+        """SELL orders already committed against this instrument, not yet closed.
+
+        Reads `cache.orders(...)` -- every order this instrument has ever
+        seen, dict-backed so there is no double-count -- rather than
+        `cache.orders_open(...)`. `Order.is_open_c()` (`model/orders/base.pyx`)
+        is `ACCEPTED / TRIGGERED / PENDING_CANCEL / PENDING_UPDATE /
+        PARTIALLY_FILLED`; it excludes `INITIALIZED` and `SUBMITTED`, and
+        `Cache.add_order` never writes `_index_orders_open` (only
+        `update_order` does). So two ordinary sequential `submit_order` SELLs
+        each within the net long both screened against `orders_open() == []`
+        and both passed -- a genuine naked short, no flag and no order list
+        required (`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §0 G5/G6).
+
+        `not order.is_closed` is a strict SUPERSET of `is_open`: it adds only
+        `INITIALIZED` / `SUBMITTED` / `EMULATED` / `RELEASED`, so `pending`
+        only WIDENS and the guard's accepted set only NARROWS -- the safe
+        direction. `leaves_qty` equals the full `quantity` at `INITIALIZED`
+        and is reduced only by fills, so it is the correct outstanding
+        commitment at every status this now counts.
+        """
+        return [
+            order
+            for order in self._cache.orders(instrument_id=instrument_id)
+            if order.side == OrderSide.SELL and not order.is_closed
+        ]
 
     def _working_sell_quantity(self, instrument_id: InstrumentId) -> Decimal:
         """Unfilled quantity on SELL orders already working for this instrument.
@@ -175,17 +461,56 @@ class BacktestOrderGuard:
         `Strategy.submit_order` publishes `OrderInitialized` BEFORE it calls
         `cache.add_order` (`trading/strategy.pyx:855-871`).
 
-        `Cache.orders_open` guarantees no ordering (`cache.pyx:4719`); this is
-        a SUM, so the result does not depend on one.
+        EVERY not-yet-closed SELL counts, `reduce_only` included -- the same
+        divergence from Nautilus's own `submitted_sell_qty` (F5,
+        `docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md`) that closes the
+        jointly-naked pair of `reduce_only` sells: excluding them would make
+        the FIRST one invisible to the budget the second is screened against.
+
+        See `_working_sell_orders` for why this reads `cache.orders(...)`
+        rather than `cache.orders_open(...)`. `Cache.orders` guarantees no
+        ordering either; this is a SUM, so the result does not depend on one.
+
+        Includes the shim (`_shim_entries`) since Increment 2: a member of an
+        `OrderList` this guard has approved but that has not yet reached the
+        cache is exactly as much an outstanding commitment as a cache-visible
+        one, and the two sums are disjoint by construction (see the class
+        docstring).
         """
-        return sum(
-            (
-                order.leaves_qty.as_decimal()
-                for order in self._cache.orders_open(instrument_id=instrument_id)
-                if order.side == OrderSide.SELL and not order.is_reduce_only
-            ),
+        working_qty = sum(
+            (order.leaves_qty.as_decimal() for order in self._working_sell_orders(instrument_id)),
             Decimal(0),
         )
+        shim_qty = sum(
+            (qty for _coid, qty in self._shim_entries(instrument_id)),
+            Decimal(0),
+        )
+        return working_qty + shim_qty
+
+    def _shim_entries(self, instrument_id: InstrumentId) -> list[tuple[ClientOrderId, Decimal]]:
+        """Guard-approved SELLs for ``instrument_id`` not yet visible in the cache.
+
+        An entry is live only while ``self._cache.order(client_order_id) is
+        None`` (§3) -- once the order reaches the cache, by ANY path (a
+        normal accept, or a denial, which G7 shows always calls
+        ``cache.add_order`` first), the cache-sourced sum in
+        ``_working_sell_orders`` takes over and this entry is redundant.
+        Pruning dead entries here is memory hygiene only, never correctness:
+        an unpruned dead entry would still contribute nothing, because
+        callers only ever sum the LIVE entries this returns.
+        """
+        live: list[tuple[ClientOrderId, Decimal]] = []
+        dead: list[ClientOrderId] = []
+        for client_order_id, (shim_instrument_id, quantity) in self._shim.items():
+            if shim_instrument_id != instrument_id:
+                continue
+            if self._cache.order(client_order_id) is None:
+                live.append((client_order_id, quantity))
+            else:
+                dead.append(client_order_id)
+        for client_order_id in dead:
+            del self._shim[client_order_id]
+        return live
 
     def _net_long(self, instrument_id: InstrumentId) -> Decimal:
         """Net position, floored at zero.
@@ -194,8 +519,8 @@ class BacktestOrderGuard:
         one ever exists it is itself the failure this guard describes.
         """
         net = self._portfolio.net_position(instrument_id)
-        if net is None:
-            return Decimal(0)
+        if net is None:  # defensive floor only: `Portfolio.net_position` always
+            return Decimal(0)  # returns `Decimal`, never `None`, in this Nautilus.
         return max(Decimal(str(net)), Decimal(0))
 
 
@@ -207,4 +532,84 @@ def install_order_guard(engine: BacktestEngine) -> BacktestOrderGuard:
     """
     guard = BacktestOrderGuard(engine.portfolio, engine.cache)
     engine.kernel.msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=guard.on_order_event)
+    return guard
+
+
+def install_live_order_guard(
+    portfolio: Portfolio,
+    cache: CacheFacade,
+    msgbus: MessageBus,
+    on_refusal: Callable[[ValueError], None],
+    *,
+    order_submission_permit: OrderSubmissionPermit | None = None,
+    clock: ClockLike | None = None,
+) -> BacktestOrderGuard:
+    """Subscribe a :class:`BacktestOrderGuard` to a LIVE node's message bus.
+
+    ``BacktestOrderGuard`` is venue- and mode-agnostic despite its name: every
+    rule it enforces (unmodelled post-only economics, a naked short) is a
+    property of the ORDER, not of the engine that raised it, and this
+    function is the proof -- the same class, unmodified, is wired onto a
+    live ``MessageBus`` here exactly as it is onto a backtest one by
+    :func:`install_order_guard`. Renaming the class to say so is out of
+    scope for this increment: it is used by name in backtest tests, and
+    renaming it here would touch files this increment has no other reason to
+    change.
+
+    Mirrors :func:`install_order_guard`'s shape (``engine.kernel.msgbus`` ->
+    ``msgbus`` directly, since a live ``TradingNode`` has no engine object of
+    its own): a plain ``msgbus.subscribe(topic=..., handler=...)``, never
+    ``msgbus.request(...)`` -- ``request`` is one of the write verbs barrier
+    B4 bans syntactically, on any object, inside a venue-touching module,
+    and this module IS venue-touching (its docstrings and f-strings name the
+    venue). ``subscribe`` is not in that banned set.
+
+    ``on_refusal`` is REQUIRED, not defaulted, so a refusal on a live node can
+    never be silently swallowed by omission: a bare ``msgbus.subscribe(...,
+    handler=guard.on_order_event)`` (:func:`install_order_guard`'s shape, kept
+    for backtest) would let the refusal propagate but report nothing at the
+    instant it happens -- on the engine-queue path ``os._exit(1)`` beats the
+    CLI's own ``FATAL`` print, and on a ``LiveClock`` timer callback the
+    exception is discarded outright and the process exits 0. The subscribed
+    handler is therefore a WRAPPER around ``guard.on_order_event``, not the
+    bare bound method itself: it reports at the moment of refusal, THEN
+    re-raises, so the refusal still aborts exactly as it did before -- only
+    reporting is added.
+
+    ``order_submission_permit`` and ``clock`` are WP-B2's two inputs, passed
+    straight through to :class:`BacktestOrderGuard`. Keyword-only and
+    defaulted to absent so a shadow-mode boot -- which mints no permit at all
+    -- installs exactly the guard it installed before, with the expiry rule
+    inert rather than satisfied. See the constructor for why absence is never
+    a synthetic permit.
+
+    Returns the guard so a caller (and a test) can hold it; the node holds
+    only the bound handler.
+    """
+    guard = BacktestOrderGuard(
+        portfolio,
+        cache,
+        order_submission_permit=order_submission_permit,
+        clock=clock,
+    )
+
+    def _report_then_reraise(event: Event) -> None:
+        try:
+            guard.on_order_event(event)
+        except (
+            PermitExpiredRefusedError,
+            PostOnlyRefusedError,
+            NakedShortRefusedError,
+        ) as exc:
+            try:
+                on_refusal(exc)
+            except Exception:  # a broken reporter must not replace the cause
+                logger.exception("order-guard refusal reporter failed")
+            # Deliberately OUTSIDE the inner `try/except`, and NOT a
+            # `finally`: a bare `raise` inside a `finally` re-raises
+            # `sys.exc_info()`, which -- if `on_refusal` itself raised -- is
+            # the REPORTER's exception, not this refusal (D4's objection).
+            raise
+
+    msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=_report_then_reraise)
     return guard

@@ -1,0 +1,96 @@
+
+730 
+CDUS42 KFFC 042033
+CLIATL
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE PEACHTREE CITY GA
+433 PM EDT FRI SEP 04 2026
+
+...................................
+
+...THE ATLANTA CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+VALID TODAY AS OF 0400 PM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1878 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM         94   3:05 PM 100    1925  87      7       89        
+  MINIMUM         75   6:37 AM  57    1974  69      6       68        
+                                      1982                           
+  AVERAGE         85                        78      7       79     
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          3.67 1992   0.12  -0.12     0.00     
+  MONTH TO DATE    0.00                      0.49  -0.49     0.00     
+  SINCE SEP 1      0.00                      0.49  -0.49     0.00     
+  SINCE JAN 1     29.39                     35.27  -5.88    34.16     
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  TODAY            0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  TODAY           20                        13      7       14        
+  MONTH TO DATE   83                        52     31       43        
+  SINCE SEP 1     83                        52     31       43        
+  SINCE JAN 1   2107                      1700    407     1910        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    13   HIGHEST WIND DIRECTION    NE (50)        
+  HIGHEST GUST SPEED    17   HIGHEST GUST DIRECTION    NE (30)        
+  AVERAGE WIND SPEED     3.8                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.3                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED TODAY.                             
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    85           5:00 AM                                      
+ LOWEST     65          12:00 AM                                      
+ AVERAGE    75                                                        
+
+..........................................................
+
+
+THE ATLANTA CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   86       102      1925                      
+ MINIMUM TEMPERATURE (F)   69        53      1891                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   7:14 AM EDT   SUNSET   7:59 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   7:14 AM EDT   SUNSET   7:58 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

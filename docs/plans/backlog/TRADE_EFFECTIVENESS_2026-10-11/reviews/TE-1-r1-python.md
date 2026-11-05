@@ -1,0 +1,35 @@
+VERDICT: READY-WITH-CHANGES
+SCORE: 72/100
+
+Premises P1–P16 hold at the cited lines, apart from small line drift. The plan's own wording on the PRODUCER pin and the reader file is wrong, and several test and gate details are missing.
+
+| ID | Sev | Finding | Evidence | Required change |
+|---|---|---|---|---|
+| F1 | HIGH | WP-B says it sums "every final entry row with non-null `realized_pnl`, whatever `admissible`". Final non-admissible reasons also include CANARY, DRILL, DUPLICATE_FILL, VOIDED_PAIR, SLIPPAGE_DEFECT and QTY_NOT_ONE, so a blanket sum double counts or pollutes. Legacy-scorer rows must stay excluded, because the legacy trials are already in `total_pnl` (the `scorer_id != LEGACY_SCORER_ID` filter). | `completeness.py:52-61`; `portfolio_roi_report.py:4068-4074`, `:4216`, `:4347` | Define the accounting set explicitly: entry role, non-legacy scorer, final, reason in {UNATTRIBUTED, none}. Exclude CANARY, DRILL and DUPLICATE_FILL. Add RED tests with a canary row and a duplicate row, each of which must not count. Add a partition test that proves no fill is counted in both the legacy path and C2. |
+| F2 | HIGH | The PRODUCER_SOURCE_SHA256 step is under-specified and probably wrong as written. Only `aut6.health` is pinned, and `CLOSURE_MODULES` covers only the `autonomy_health_cli` closure. No label-run producer ID exists, and `producer_code_sha` is a `LabelRunDeps` field that `unit_wiring` must supply. Grep found no existing source for it. | `pins.py:19-21`; `closure_manifest.py:9-12`; `label_core.py:125`; `test_autonomy_pins.py:101` | State which of two things TE-1 does. Either it adds a new `aut2.label` producer ID, a closure-manifest entry, and a pin plus a closure-coverage test. Or it states that no pin is needed and says where `producer_code_sha` comes from. Note that `test_autonomy_pins.py:101` asserts the pin set is exactly `{"aut6.health"}`, so adding an ID means a reviewed widening of that test. |
+| F3 | HIGH | Schema bump: the plan names `current_rung_hold_exit_window_study.py` as holding the reader's known-version set. It does not. The set is `_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS = {1,2,3,4}` at `portfolio_roi_report.py:2208`. At least four existing tests hard-assert `== 4`. | `portfolio_roi_report.py:2198,2208`; `test_portfolio_roi_report.py:283,423,2234,2295` | Correct the file list. List those four assertions as reviewed widenings (to 5 and to the 1–5 set). `test_schema_v5_reader_accepts_1_to_5` must also prove that a v5 payload with the new keys missing is strict-rejected, so an edited document is not silently accepted. |
+| F4 | MED | S0-5 and the "legacy join" test treat the join as possibly existing. `LegacyFillInput` is constructed only in tests, so no production join exists. The scored-trial helpers (`dedupe_scored_trials`, `_default_scored_trials_dir`) live in `scripts/`. | `grep` shows `LegacyFillInput(` only under `tests/`; `portfolio_roi_report.py:1316,3606` | Say outright that WP-A moves those helpers into `src/breezy/analysis/`. `scripts/` is not in the import-linter `root_packages`, so lint-imports cannot catch a break. Keep re-exports in the script, because tests alias `_prr.dedupe_scored_trials` and `_prr.admissible_scored_trials`. Run lint-imports and require the "N kept, 0 broken" line. Check the moved module against the "analysis never directly imports Nautilus" and "autonomy core" contracts. |
+| F5 | MED | Several RED tests would fail on ImportError or a missing symbol, not on behaviour. Examples: the `unit_wiring` tests, and `test_per_fill_table...`. Only `test_c2_accounting_pnl_includes_final_non_admissible_rows` and `test_schema_v5_reader_accepts_1_to_5` fail on current code for the right reason. | The plan's RED lists | For each RED test, state the failure mode. Stub the symbol first so the test fails by assertion. Add positive controls: P&L present gives status OK; a null-P&L final row gives an alert; a planted unbridgeable fill gives UNRESOLVED. |
+| F6 | MED | The focused gate text lists "exec-import-pin, firewall, `test_autonomy_*`, lint-imports", but gives no concrete list. The memory note says focused gates keep missing the pin and contract tests. | The plan's WP section; `tests/unit/test_execution_egress_firewall_guard.py`, `tests/contract/test_autonomy_units*.py` | Name the files: `test_execution_egress_firewall_guard.py`, the exec-import-pin test, every `test_autonomy_*`, `tests/contract/test_autonomy_units_programme.py`, `test_aut2_attribution.py`, `test_runtime_import_isolation.py`, `test_run_tests_no_egress_phases.py`. Prefer the full gate, and read the EXIT code before any push. |
+| F7 | LOW | Read-only sqlite is already covered: `attribution.py:193-195` and `fill_source.py:66-68` use `mode=ro` plus `query_only`. S0-1 says "PRAGMA query_only" but not `mode=ro`. A bare connect can create a WAL or shm file on the live store. | `attribution.py:192-195` | Make S0-1 use the `mode=ro` URI. |
+| F8 | LOW | S0-7 option (a) needs no `label_core` change. `lag_start_ns` is already a `LabelRunDeps` callable, so it is the wiring's choice. Note that in the plan. | `label_core.py:128` | Pin the choice in a wiring test with a positive control: a new post-activation fill is still lag-checked. |
+
+Premises checked:
+- P1 CONFIRMED: `score-live-trials-run.sh:185-189` returns 2 for `forecast_quantile_ladder`, and `:202-217` exits 0. The loop is at `:355-369`.
+- P2 CONFIRMED: `portfolio-roi-run.sh:102-115`.
+- P3 CONFIRMED: `label_run.py:857-859`. The same refusal also appears at `:893`.
+- P4 CONFIRMED, by inspection only: `LabelRunDeps` is at `label_core.py:113-131`; I did not read `run_labels`.
+- P5 NOT VERIFIED: the data-root glob was not checked. `epoch.py:108-110` shows the pre-epoch fallback.
+- P6 CONFIRMED: `attribution.py:209-258`; `champion_at` is optional.
+- P7 CONFIRMED: `memory_gate.py:128-129`; `constants.py:106` is `TARGET=4`.
+- P8 CONFIRMED: `alert_proof.py:216`.
+- P9 CONFIRMED: `breezy-autonomy-alert-redeliver.service` ships `OnFailure=breezy-autonomy-failed@`, and only `breezy-study-failed@.service` exists.
+- P10 CONFIRMED, with drift: the realized-P&L code is at `fq_scorer.py:~417-427`, and `UNATTRIBUTED` is in `_FINAL_REASONS`.
+- P11 CONFIRMED: `c2_rows` filters on `row.admissible`, but `c2_pnl` is summed from it and `_unlabelled_fq_fills` goes to 0. The status then falls through to `None`, i.e. OK.
+- P12 CONFIRMED: `settlement_source.py:41-69`. I did not check `coverage.json`.
+- P13 CONFIRMED: the `_LABEL_OUTCOMES_ROW` binds contain no `evidence/alerts`, and the table comment says so.
+- P14 CONFIRMED: `verdicts.py:195-199`.
+- P15 CONFIRMED: the AST guard bans only `.storage_key` attribute reads outside `attribution.py`.
+- P16 CONFIRMED: the fixture has `OnFailure=breezy-autonomy-failed@` and no `MemoryMax`.
+
+I did not verify Stage 0 data facts (34 fills, fees, and similar), because the exec store path does not exist at the location I tried.
