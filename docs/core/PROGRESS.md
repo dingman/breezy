@@ -36,6 +36,7 @@ permit mint (`safety.py:552-608`). Everything else is build-side.
 - Prior backlog (ARM maker-sharp, MAKER S2–S5, BLOCKERS, calendar reads) is
   ARCHIVED, not scheduled: `docs/core/archive/PROGRESS_2026-10-22_pre-audit.md`.
   `arm/integration` (c614fb0b) is unmerged; P4 decides whether it is reused.
+- Edge screen 11-06: NO family has recorded positive expectancy after fees; GAP-1 PASS never overlapped the tape (OOF ends 06-30, tape starts 08-30) — see docs/evidence/EDGE_SCREEN_GAP1_VS_ASK_2026-11-06.md.
 
 ---
 
