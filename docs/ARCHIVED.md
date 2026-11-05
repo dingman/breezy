@@ -52,3 +52,6 @@ the Standing verdicts in `docs/core/PROGRESS.md`.
 3. Re-enable the units from `deploy/systemd/` (linked units take the absolute path):
    `systemctl --user enable /home/jon/breezy/deploy/systemd/<unit>` for each entry in
    `~/breezy-archive-2026-11-05/disable-list.txt`, then `systemctl --user daemon-reload`.
+
+## Tests and CI removed 2026-11-05 (operator order)
+The full suite and GitHub workflows exist in history up to commit 0142adec1b8ea1ab3fd550d13e49e3b1c0ca22dd; `.github/workflows/` was dropped earlier on this branch (b8fba517) and remained only on `main`; `scripts/ci/` (local gate runners) is removed here too. Restore with `git checkout 0142adec1b8ea1ab3fd550d13e49e3b1c0ca22dd -- tests scripts/ci` and `git checkout 0ab94f234e574a2b0b39c05bc79107773c86d0cb -- .github`.

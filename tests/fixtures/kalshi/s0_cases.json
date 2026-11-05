@@ -1,8 +1,0 @@
-{
-  "_provenance": "Synthetic S2 unit-test examples, hand-written; never captured venue evidence or a registered S0 look.",
-  "historical": {"end_period_ts": 1751382000, "yes_bid": {"close": "0.02"}},
-  "live": {"end_period_ts": 1751468400, "yes_bid": {"close_dollars": "0.03"}},
-  "missing_yes_bid": {"end_period_ts": 1751382000},
-  "void": {"status": "finalized", "result": "void"},
-  "straddler": {"ticker": "KXHIGHNY-26JUL03-T90", "series_ticker": "KXHIGHNY", "climate_day": "2026-07-03", "open_time": "2026-07-02T14:00:00Z", "settlement_ts": 1783137600}
-}
