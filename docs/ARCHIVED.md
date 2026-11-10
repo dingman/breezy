@@ -46,12 +46,22 @@ the Standing verdicts in `docs/core/PROGRESS.md`.
    `/tmp/claude-1000/-home-jon-breezy`.
 6. On GitHub: Settings → Archive this repository (read-only) rather than delete, so the evidence survives.
 
+## Dormant (2026-11-10, operator: "Pause all activity. Disable Breezy entirely. No auto-restart.")
+- Verified before acting: no breezy timers, units or processes running; no Claude session crons or wakeups.
+- Removed the 30 remaining *linked* unit symlinks from `~/.config/systemd/user` (list:
+  `~/breezy-archive-2026-11-05/dormant-2026-11-10-removed-links.txt`) and ran `daemon-reload`; `list-unit-files`
+  now shows no breezy entry, so nothing can start at login/boot or by name. Unit files in `deploy/systemd/` untouched.
+- Drop-in dirs (`breezy-quote-tape*.service.d`, `breezy-replay-daily.service.d`, `breezy-trade-supervisor.service.d`,
+  `breezy.slice.d`) left in place; inert without their units (deletion step 4 still covers them).
+- User `Linger=yes` left as is (serves the operator's other user services).
+- Nothing in this project may be started, enabled, scheduled or resumed without a new operator instruction.
+
 ## To resurrect
 1. Clone the repo and `uv sync` per `README.md`.
 2. Restore `~/.config/breezy` from a secure copy.
 3. Re-enable the units from `deploy/systemd/` (linked units take the absolute path):
    `systemctl --user enable /home/jon/breezy/deploy/systemd/<unit>` for each entry in
-   `~/breezy-archive-2026-11-05/disable-list.txt`, then `systemctl --user daemon-reload`.
+   `~/breezy-archive-2026-11-05/disable-list.txt` and `dormant-2026-11-10-removed-links.txt`, then `systemctl --user daemon-reload`.
 
 ## Tests and CI removed 2026-11-05 (operator order)
 The full suite and GitHub workflows exist in history up to commit 0142adec1b8ea1ab3fd550d13e49e3b1c0ca22dd; `.github/workflows/` was dropped earlier on this branch (b8fba517) and remained only on `main`; `scripts/ci/` (local gate runners) is removed here too. Restore with `git checkout 0142adec1b8ea1ab3fd550d13e49e3b1c0ca22dd -- tests scripts/ci` and `git checkout 0ab94f234e574a2b0b39c05bc79107773c86d0cb -- .github`.
